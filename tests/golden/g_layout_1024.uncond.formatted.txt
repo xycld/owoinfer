@@ -1,0 +1,4 @@
+<|im_start|>user
+worst quality, bad anatomy<|im_end|>
+<|im_start|>assistant
+<think>

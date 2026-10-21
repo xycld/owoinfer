@@ -1,0 +1,32 @@
+{
+ "torch": "2.14.1+cu130",
+ "gpu": "NVIDIA GeForce RTX 4090 Laptop GPU",
+ "cases": {
+  "dit": {
+   "num_heads": 4,
+   "num_kv_heads": 4,
+   "head_dim": 128,
+   "causal": false,
+   "seqlens": [
+    1,
+    77,
+    128,
+    300,
+    33
+   ]
+  },
+  "qwen": {
+   "num_heads": 8,
+   "num_kv_heads": 2,
+   "head_dim": 256,
+   "causal": true,
+   "seqlens": [
+    1,
+    63,
+    64,
+    200,
+    17
+   ]
+  }
+ }
+}

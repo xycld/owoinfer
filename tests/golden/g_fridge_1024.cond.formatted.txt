@@ -1,0 +1,7 @@
+<|im_start|>user
+A wide view of a refrigerator beside a kitchen counter with a fruit bowl. A small sticky note on the refrigerator door is handwritten in Chinese:“
+记得买牛奶和鸡蛋！
+牛奶两盒，鸡蛋一打。
+顺便带一袋面包。”<|im_end|>
+<|im_start|>assistant
+<think>

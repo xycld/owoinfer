@@ -1,0 +1,32 @@
+{
+ "torch": "2.14.1+cu130",
+ "gn": [
+  {
+   "name": "c96_silu",
+   "c": 96,
+   "h": 33,
+   "w": 17,
+   "silu": true,
+   "seed": 11,
+   "offset": 1.0
+  },
+  {
+   "name": "c384_offset",
+   "c": 384,
+   "h": 20,
+   "w": 18,
+   "silu": false,
+   "seed": 12,
+   "offset": 3.0
+  },
+  {
+   "name": "c64_warp",
+   "c": 64,
+   "h": 2,
+   "w": 3,
+   "silu": true,
+   "seed": 13,
+   "offset": -0.5
+  }
+ ]
+}

@@ -1,0 +1,6 @@
+build/
+build-*/
+__pycache__/
+*.pyc
+tests/golden/**/*.npy
+tests/reference_images/*.npy

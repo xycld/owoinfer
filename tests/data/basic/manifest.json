@@ -1,0 +1,336 @@
+{
+ "torch": "2.14.1+cu130",
+ "torch_cuda": "13.0",
+ "transformers": "5.20.1",
+ "gpu": "NVIDIA GeForce RTX 4090 Laptop GPU",
+ "allow_bf16_reduced_precision_reduction": true,
+ "torch_f_linear_bench": {
+  "q": {
+   "m": 4400,
+   "k": 3072,
+   "n": 3072,
+   "ms": 1.9265,
+   "tflops": 43.11
+  },
+  "up_gate": {
+   "m": 4400,
+   "k": 3072,
+   "n": 16384,
+   "ms": 9.9176,
+   "tflops": 44.66
+  },
+  "down": {
+   "m": 4400,
+   "k": 8192,
+   "n": 3072,
+   "ms": 4.5834,
+   "tflops": 48.32
+  },
+  "refiner_qkv": {
+   "m": 300,
+   "k": 3072,
+   "n": 9216,
+   "ms": 0.3096,
+   "tflops": 54.87
+  }
+ },
+ "files": {
+  "moss_norm_x": [
+   32,
+   3072
+  ],
+  "moss_norm_w": [
+   3072
+  ],
+  "moss_norm_out": [
+   32,
+   3072
+  ],
+  "moss_mod_scale": [
+   3072
+  ],
+  "moss_mod_shift": [
+   3072
+  ],
+  "moss_mod_out": [
+   32,
+   3072
+  ],
+  "moss_qnorm_x": [
+   32,
+   24,
+   128
+  ],
+  "moss_qnorm_w": [
+   128
+  ],
+  "moss_qnorm_out": [
+   32,
+   24,
+   128
+  ],
+  "gres_y": [
+   32,
+   3072
+  ],
+  "gres_gate": [
+   3072
+  ],
+  "gres_out": [
+   32,
+   3072
+  ],
+  "add_out": [
+   32,
+   3072
+  ],
+  "situ_up_gate": [
+   16,
+   16384
+  ],
+  "situ_out": [
+   16,
+   8192
+  ],
+  "moss_rope_bands": [
+   16
+  ],
+  "moss_rope_case0_hwt": [
+   3
+  ],
+  "moss_rope_case0_rows": [
+   379
+  ],
+  "moss_rope_case0_vals": [
+   379,
+   128
+  ],
+  "moss_rope_case1_hwt": [
+   3
+  ],
+  "moss_rope_case1_rows": [
+   401
+  ],
+  "moss_rope_case1_vals": [
+   401,
+   128
+  ],
+  "moss_rope_case2_hwt": [
+   3
+  ],
+  "moss_rope_case2_rows": [
+   393
+  ],
+  "moss_rope_case2_vals": [
+   393,
+   128
+  ],
+  "moss_rope_case3_hwt": [
+   3
+  ],
+  "moss_rope_case3_rows": [
+   103
+  ],
+  "moss_rope_case3_vals": [
+   103,
+   128
+  ],
+  "moss_rope_token_rows": [
+   32
+  ],
+  "moss_rope_q": [
+   32,
+   24,
+   128
+  ],
+  "moss_rope_tab": [
+   32,
+   128
+  ],
+  "moss_rope_out": [
+   32,
+   24,
+   128
+  ],
+  "qwen_norm_w": [
+   4096
+  ],
+  "qwen_norm_x_r1": [
+   1,
+   4096
+  ],
+  "qwen_norm_out_r1": [
+   1,
+   4096
+  ],
+  "qwen_norm_x_r2": [
+   2,
+   4096
+  ],
+  "qwen_norm_out_r2": [
+   2,
+   4096
+  ],
+  "qwen_norm_x_r5": [
+   5,
+   4096
+  ],
+  "qwen_norm_out_r5": [
+   5,
+   4096
+  ],
+  "qwen_norm_x_r9": [
+   9,
+   4096
+  ],
+  "qwen_norm_out_r9": [
+   9,
+   4096
+  ],
+  "qwen_norm_x_r16": [
+   16,
+   4096
+  ],
+  "qwen_norm_out_r16": [
+   16,
+   4096
+  ],
+  "qwen_norm_x_r17": [
+   17,
+   4096
+  ],
+  "qwen_norm_out_r17": [
+   17,
+   4096
+  ],
+  "qwen_qnorm_x": [
+   9,
+   16,
+   256
+  ],
+  "qwen_qnorm_w": [
+   256
+  ],
+  "qwen_qnorm_out": [
+   9,
+   16,
+   256
+  ],
+  "qwen_knorm_x": [
+   2,
+   4,
+   256
+  ],
+  "qwen_knorm_w": [
+   256
+  ],
+  "qwen_knorm_out": [
+   2,
+   4,
+   256
+  ],
+  "qwen_gnorm_x": [
+   288,
+   128
+  ],
+  "qwen_gnorm_gate": [
+   288,
+   128
+  ],
+  "qwen_gnorm_w": [
+   128
+  ],
+  "qwen_gnorm_out": [
+   288,
+   128
+  ],
+  "qwen_rope_inv_freq": [
+   32
+  ],
+  "qwen_rope_table": [
+   4096,
+   64
+  ],
+  "qwen_rope_q": [
+   24,
+   16,
+   256
+  ],
+  "qwen_rope_k": [
+   24,
+   4,
+   256
+  ],
+  "qwen_rope_q_out": [
+   24,
+   16,
+   256
+  ],
+  "qwen_rope_k_out": [
+   24,
+   4,
+   256
+  ],
+  "ew_a": [
+   16,
+   4096
+  ],
+  "ew_b": [
+   16,
+   4096
+  ],
+  "silu_out": [
+   16,
+   4096
+  ],
+  "silu_mul_out": [
+   16,
+   4096
+  ],
+  "sigmoid_mul_out": [
+   16,
+   4096
+  ],
+  "cast_f32": [
+   4096
+  ],
+  "cast_bf16": [
+   4096
+  ],
+  "gemm_q_rows": [
+   32
+  ],
+  "gemm_q_out": [
+   32,
+   3072
+  ],
+  "gemm_up_gate_rows": [
+   8
+  ],
+  "gemm_up_gate_out": [
+   8,
+   16384
+  ],
+  "gemm_down_rows": [
+   32
+  ],
+  "gemm_down_out": [
+   32,
+   3072
+  ],
+  "gemm_refiner_qkv_rows": [
+   16
+  ],
+  "gemm_refiner_qkv_out": [
+   16,
+   9216
+  ],
+  "gemm_f32_bias_rows": [
+   16
+  ],
+  "gemm_f32_bias_out": [
+   16,
+   3072
+  ]
+ }
+}

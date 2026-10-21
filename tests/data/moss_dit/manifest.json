@@ -1,0 +1,33 @@
+{
+ "text": [
+  {
+   "file": "text_g_fridge_1024_cond.npy",
+   "input": "g_fridge_1024.cond.te_last_hidden.npy",
+   "tokens": 62
+  },
+  {
+   "file": "text_g_fridge_1024_uncond.npy",
+   "input": "g_fridge_1024.uncond.te_last_hidden.npy",
+   "tokens": 10
+  },
+  {
+   "file": "text_g_layout_1456_uncond.npy",
+   "input": "g_layout_1456.uncond.te_last_hidden.npy",
+   "tokens": 16
+  }
+ ],
+ "time": [
+  {
+   "prefix": "time_00",
+   "timestep": 1000.0
+  },
+  {
+   "prefix": "time_25",
+   "timestep": 829.0
+  },
+  {
+   "prefix": "time_49",
+   "timestep": 24.0
+  }
+ ]
+}

@@ -1,0 +1,41 @@
+{
+ "torch": "2.14.1+cu130",
+ "transformers": "5.20.1",
+ "gpu": "NVIDIA GeForce RTX 4090 Laptop GPU",
+ "unique_tokens": 825,
+ "cases": {
+  "l62": {
+   "seqlens": [
+    62
+   ],
+   "rows": 62,
+   "conv_ref": true
+  },
+  "l300": {
+   "seqlens": [
+    300
+   ],
+   "rows": 150,
+   "conv_ref": false
+  },
+  "l4096": {
+   "seqlens": [
+    4096
+   ],
+   "rows": 252,
+   "conv_ref": false
+  },
+  "varlen": {
+   "seqlens": [
+    172,
+    16
+   ],
+   "rows": 188,
+   "conv_ref": true
+  }
+ },
+ "fallback_core_ms_l4096": {
+  "min": 24.493742999766255,
+  "median": 26.277436001691967
+ }
+}

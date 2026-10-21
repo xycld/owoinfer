@@ -1,0 +1,1396 @@
+{
+ "jobs": {
+  "asset001_base": {
+   "id": "asset001_base",
+   "model": "base",
+   "prompt": "{\"scene_type\":\"natural roadside environmental photograph with a humorous Chinese notice sign\",\"gen_brief\":\"A relaxed, photorealistic environmental photograph at pedestrian eye level along a quiet rural road. A battered dark green notice sign stands on the gravel-and-grass shoulder, naturally integrated into the landscape and occupying approximately one fifth of the image area. The road fills much of the left and lower frame and curves toward distant trees; sky, irregular foliage and ample foreground provide breathing room. Preserve the main sign body's approximately 30-degree perspective yaw, left edge nearer and right edge receding, plus its 15-degree clockwise lean in the image plane. Keep the camera and horizon level. Two visibly bent, kinked galvanized posts bow right above firmly planted bases and remain attached to the board. The sign has a pronounced LOCALIZED, asymmetric sheet-metal fold, not a uniformly curved or globally bent surface. Most of the left, center and lower board remains approximately flat in its existing orientation. Only an upper-right patch folds toward the camera approximately 35 degrees relative to that main plane, along a diagonal plastic crease running from near (820, 555) at the top edge to near (980, 950) at the right edge. The corner tip projects near (1030, 605). This produces two distinct connected surface orientations, a sharply kinked outline, an irregular crease ridge, small compression wrinkles, chipped paint along the fold and a narrow self-shadow. The bent patch is part of the same continuous metal sheet, not a detached plate, pasted-on triangle or missing chunk. Avoid a smooth cylindrical bow, a symmetrical V-fold, a fold across the entire width or mere additional rigid rotation. Keep the local damage clearly visible but do not fold the printed face shut or hide substantial text. Add restrained edge dents, rusty scratches, exposed dull metal and two small punctures in blank margins. No flames, smoke, weapons or active conflict. Ordinary photographic perspective, soft afternoon daylight, restrained colors, dust and grass at the feet; no strong glare, dramatic spotlight or artificial background blur. The scuffed thin white border follows both the overall perspective and the local crease. The official design contrasts with the humorous essay. The three text objects are a centered white heading and two body columns read down the left column then down the right. Every glyph is printed on the physical metal: most text follows the original yaw and clockwise lean, while the upper-right text fragments crossing the crease bend with the local folded patch. Their baselines change direction at the crease and their local spacing foreshortens naturally; no floating upright text, straight lettering across a bent surface, duplicated words or erased passages. Preserve the near left column's larger scale and far right column's reduced scale. Axis-aligned text boxes are enclosing guides, not visible rectangles; their envelopes may overlap, but actual printed columns remain separate. Approximate base-plane column guides in top-left, top-right, bottom-right, bottom-left order are: left (523, 567), (768, 632), (590, 1299), (345, 1233); right (784, 666), (1010, 726), (848, 1331), (622, 1270). These guide the undamaged layout only; locally warp the upper-right fragments to the folded surface instead of enforcing a single planar projection across the entire sign. The text objects' identity strings are the exact Chinese lettering. Preserve every character and explicit newline, including blank paragraph lines; never print escape sequences literally. Use a bold Chinese sans-serif heading approximately 49 pixels high before rotation, body lettering approximately 12 pixels on the near side decreasing toward the far side, and approximately 16-pixel near-column and 15-pixel far-column line spacing before projection. Keep six paragraphs per column and the entire essay. The heading remains noticeable while the body appears as naturally small, dense information at this distance. Do not enlarge the sign to fill the frame. No additional lettering, logos or watermarks.\",\"elements\":[{\"type\":\"panel\",\"salience\":\"background\",\"identity\":\"An expansive, natural rural roadside setting. Muted blue sky and distant treetops fill the upper area. A quiet gray asphalt road enters from the lower left and bends toward a vanishing point near the center-left, with an irregular gravel shoulder on its right. Layered green trees, shrubs and tall grass frame the scene, especially along the right edge. The foreground includes textured gravel and small weeds. Soft afternoon daylight and gentle foliage shadows create a casual, believable outdoor photograph. Keep the space behind the sign free of intrusive branches.\",\"bbox\":[-880,-584,880,584]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Two visibly bent galvanized metal signposts, still attached behind the lower edge of the leaning board. The nearer left post runs from a planted base near (395, 1580), through a flattened kink near (414, 1450), to its attachment near (448, 1285). The farther right post runs from a base near (680, 1550), through a bowed kink near (706, 1430), to its attachment near (755, 1330). Both upper sections bend right, coherently supporting the clockwise lean. Include small compression creases, scratched zinc, localized rust at the bends, firmly embedded bases, weeds and soft ground-contact shadows.\",\"bbox\":[390,-204,715,191]},{\"type\":\"panel\",\"salience\":\"secondary\",\"identity\":\"A modest battered dark green roadside information board with a mostly flat main body at approximately 30 degrees yaw and 15 degrees clockwise lean. The metal is locally folded rather than globally curved: a diagonal crease from near (820, 555) to (980, 950) separates an upper-right patch that bends toward the camera by approximately 35 degrees. Approximate outer contour proceeds through (530, 442), (820, 555), the displaced folded tip (1030, 605), (980, 950), (866, 1350), and (310, 1263). The white border visibly kinks at the local fold transitions. Most of the left and lower board remains flat; the folded patch stays physically continuous with it. Include chipped paint, shallow dents, rusty scratches, two small margin punctures and exposed dull metal. Preserve all printed content, deforming affected lettering with the bent metal rather than removing it. The sign remains attached to its bent posts and fully within the frame at the existing environmental scale.\",\"bbox\":[-438,-274,471,472]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Localized upper-right folded region of the SAME sign face, not a separate object or an overlay. A sharp but irregular diagonal crease runs from (820, 555) to (980, 950). The patch on its upper-right side tips toward the camera by about 35 degrees, with its outer tip near (1030, 605). Show a narrow highlight on the crease ridge, subtle self-shadow, a few short buckling wrinkles, fractured green paint and a sliver of dull metal at the outer lip. The existing heading and right-column fragments on this patch remain printed on its surface and warp with it. Do not duplicate any text. The rest of the board does not share this extra bend.\",\"bbox\":[-340,221,85,461]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"不一定\",\"bbox\":[-352,62,-215,326]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"前方不一定有路，但一定有故事。\\n欢迎来到本路段，请带好随身物品、\\n剩余理智，以及你那经不起月底检查的\\n钱包。如果不知道自己要去哪里，\\n也不用紧张，你已经和本路段百分之八十的\\n旅客达成了精神上的会合。\\n\\n导航说前方左转，不代表命运准备放过你；\\n导航说重新规划，也不代表它心里有数。\\n它只是一个没有绩效奖金的电子打工人，\\n请不要因为它偶尔沉默，就误以为它正在\\n替你思考人生，它可能只是没信号。\\n\\n本路段禁止和生活较劲，禁止替老板操心，\\n禁止在深夜反复回忆三年前说错的一句话。\\n别人早就忘了，只有你的大脑还在坚持\\n重播，并且没有跳过片头功能。建议把\\n这份敬业用在睡觉上，不必向枕头提交\\n复盘报告。\\n\\n如遇上坡，说明道路正在上坡，请勿擅自\\n理解为上天要降大任于你。如遇下坡，\\n也不代表人生终于开始奖励你，先看看\\n刹车。道路只负责高低起伏，不负责励志\\n演讲，更不出售坚持一下就能发财的\\n内部课程。\\n\\n距离成功还有多远，本路牌暂时无法回答。\\n毕竟我从上班第一天起就站在这里，\\n日晒雨淋，全年无休，从未升职。隔壁\\n新来的减速带都有人天天惦记，而我只有\\n在别人迷路的时候，才能获得一次短暂\\n而真诚的注视。\\n\\n请勿羡慕旁边跑得比你快的车辆，你不知道\\n人家是赶着见喜欢的人，还是赶着去处理\\n更大的麻烦。人生不是超车比赛，没必要\\n每次被超过都自动播放悲壮音乐。你只是\\n开得慢了一点，不是家族的荣耀突然\\n断送在了这里。\",\"bbox\":[-314,-240,419,185]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"前方设有休息区域，可供停车、喝水，\\n以及暂时承认自己确实有点累。休息不是\\n失败，手机电量不足都知道进入省电模式，\\n人类却喜欢一边眼神涣散，一边宣布自己\\n还能再撑。请尊重身体，它没有原装\\n备用机。\\n\\n若同行的人问你怎么还没到，请平静回答：\\n我们正在以符合物理规律的速度接近\\n目的地。若对方继续追问，你可以请其\\n负责剥橘子。经过本路牌长期观察，很多\\n旅途中的哲学争论，最后都能靠一点\\n水果解决。\\n\\n本路段偶有大风，可能吹乱发型，但一般\\n吹不走烦恼，请勿抱有过高期待。如需\\n放下过去，建议先放下手里已经凉了的\\n半杯奶茶。有些东西舍不得扔，不是因为\\n它还值得，而是因为你清楚记得自己\\n花了多少钱。\\n\\n如果你已经迷路，请保持微笑，至少今天\\n确实走出了舒适圈。不要着急发布人生\\n感悟，先确认油量、电量和最近的厕所。\\n成年人真正的安全感，有时候不是存款\\n后面的零，而是远远看见一个正在营业的\\n卫生间。\\n\\n前方没有标准答案，只有一家面馆。建议\\n先吃，梦想可以稍后再谈。点大碗不代表\\n贪心，点小碗也不代表格局有限，加不加\\n香菜更不需要上升到价值观。你有权在\\n这个复杂的世界里，单纯决定自己今天\\n想吃什么。\\n\\n感谢阅读本路牌。你可能已经发现，这块\\n牌子没有提供多少有效方向，却成功占用\\n了你不少时间，这说明它具备一定的会议\\n属性。最后提醒：请在安全停车后阅读，\\n开车不要分心。祝你一路平安，至于能否\\n一路发财，不一定。\",\"bbox\":[-215,38,451,427]}],\"bbox_coord_space\":\"abs_centralized\"}",
+   "negative_prompt": "nsfw, worst quality, bad anatomy, watermark, jpeg artifact",
+   "height": 1776,
+   "width": 1184,
+   "steps": 50,
+   "cfg": 3.0,
+   "shift": 5.0,
+   "seed": 111769238,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset002_base": {
+   "id": "asset002_base",
+   "model": "base",
+   "prompt": "{\"summary\":{},\"items\":[{\"bbox\":[-824,-472,824,472],\"label\":\"panel\",\"palette\":[\"#D4AF37\",\"#FFFFFF\",\"#B22222\",\"#87CEEB\",\"#2F4F4F\"],\"caption\":\"The entire composition is a single frame representing a live stream interface, blending a high-quality photographic portrait of a woman in Hanfu with dynamic social media UI overlays.\",\"tags\":[\"live stream\",\"Hanfu\",\"Chinese aesthetics\",\"UI overlay\"]},{\"bbox\":[-622,-300,403,383],\"label\":\"subject\",\"palette\":[\"#FFFFFF\",\"#F5F5DC\",\"#8B0000\",\"#2F4F4F\"],\"tags\":[\"woman\",\"Hanfu\",\"traditional clothing\",\"elegant\"]},{\"bbox\":[-345,-83,-72,206],\"label\":\"object\",\"palette\":[\"#FFFDD0\",\"#B22222\",\"#556B2F\"],\"caption\":\"A traditional round Chinese hand fan held by the woman. It is made of pale cream paper with a painting of red plum blossoms and black calligraphic text.\"},{\"bbox\":[-314,-17,-177,51],\"label\":\"text\",\"caption\":\"Black ink calligraphy written on the surface of the round fan.\",\"tags\":[\"calligraphy\",\"Chinese text\"],\"text\":\"浮生若梦\\n但愿长安\"},{\"bbox\":[-190,-300,403,383],\"label\":\"object\",\"palette\":[\"#FFFFFF\",\"#ADD8E6\",\"#8B0000\"],\"caption\":\"Highly detailed Hanfu consisting of a white outer robe with silver embroidery and light blue translucent sleeves, over a deep red inner garment. The material looks like silk and chiffon, draping softly.\"},{\"bbox\":[-622,-217,-243,128],\"label\":\"object\",\"caption\":\"Intricate gold hairpins and floral ornaments, including white and red blossoms, decorating the woman's complex hairstyle.\",\"tags\":[\"hairpins\",\"floral ornaments\",\"gold\"]},{\"bbox\":[212,177,534,322],\"label\":\"object\",\"caption\":\"A large, ornate golden lantern with intricate metal carvings, emitting a warm, bright glow. It sits on a wooden table in the foreground.\",\"tags\":[\"lantern\",\"warm light\",\"golden\"]},{\"bbox\":[365,-48,551,143],\"label\":\"object\",\"caption\":\"A traditional golden bronze incense burner with tripod legs and decorative carvings, positioned centrally on the wooden table.\",\"tags\":[\"incense burner\",\"bronze\",\"antique\"]},{\"bbox\":[463,-421,632,-99],\"label\":\"object\",\"caption\":\"A traditional Chinese bound book with a navy blue cover and light-colored pages, lying flat on the wooden table.\"},{\"bbox\":[-378,242,-163,354],\"label\":\"object\",\"palette\":[\"#ADD8E6\",\"#B22222\",\"#228B22\"],\"tags\":[\"vase\",\"plum blossoms\",\"ceramic\"]},{\"bbox\":[-824,-472,-703,472],\"label\":\"panel\",\"tags\":[\"UI\",\"header\",\"navigation\"]},{\"bbox\":[-816,-389,-761,-271],\"label\":\"text\",\"palette\":[\"#FFFFFF\"],\"caption\":\"Profile information in the top left corner.\",\"text\":\"清月如故\\n286.6万本场点赞\"},{\"bbox\":[-744,268,-672,445],\"label\":\"text\",\"palette\":[\"#FFFFFF\"],\"caption\":\"Event title in the top right corner.\",\"tags\":[\"UI text\",\"event\"],\"text\":\"国风盛典\\n山河入梦 与君共赏\"},{\"bbox\":[-30,-460,203,-152],\"label\":\"panel\",\"palette\":[\"#FFFFFF\",\"#FFC0CB\",\"#FF69B4\"],\"caption\":\"A series of translucent white gift notifications appearing on the left side, showing user names and the gifts they sent.\"},{\"bbox\":[-14,-393,42,-168],\"label\":\"text\",\"palette\":[\"#000000\"],\"caption\":\"First gift notification text.\",\"text\":\"墨染江南\\n送出 玫瑰 x 99\"},{\"bbox\":[56,-393,111,-178],\"label\":\"text\",\"tags\":[\"UI text\",\"gift\"],\"text\":\"长安故人\\n送出 天灯 x 1\"},{\"bbox\":[133,-393,190,-152],\"label\":\"text\",\"tags\":[\"UI text\",\"gift\"],\"text\":\"山河共月\\n送出 心动 x 520\"},{\"bbox\":[240,-446,488,67],\"label\":\"panel\",\"caption\":\"The live chat feed area at the bottom left, showing messages from viewers with their level badges and avatars.\"},{\"bbox\":[250,-435,445,60],\"label\":\"text\",\"tags\":[\"UI text\",\"chat\"],\"text\":\"Lv.28 琴声晚：姐姐好美 ❤️\\nLv.16 一纸相思：这氛围太绝了!\\nLv.32 月下听风：仿佛梦回大唐...\\nLv.18 南风知我意：想和姐姐一起看梅花 🌸\\nLv.25 清梦星河：国风yyds!\"},{\"bbox\":[706,-472,824,472],\"label\":\"panel\",\"palette\":[\"#000000\",\"#FF69B4\",\"#FFFFFF\"],\"caption\":\"The bottom interaction bar, including a text input field, share button, gift button, and like button.\"},{\"bbox\":[-689,-438,-260,-344],\"label\":\"text\",\"palette\":[\"#FFFFFF\"],\"tags\":[\"decorative text\",\"vertical\"],\"text\":\"一扇风华\\n一梦千年\\n\\n人间烟火里\\n总有诗意栖居\"},{\"bbox\":[-650,410,-367,452],\"label\":\"text\",\"palette\":[\"#FFFFFF\"],\"tags\":[\"decorative text\",\"vertical\"],\"text\":\"绣屏藏春\\n桃李人间\"},{\"bbox\":[619,-432,696,-250],\"label\":\"text\",\"tags\":[\"decorative text\",\"poetry\"],\"text\":\"愿以一盏灯火\\n换你三千次停留\"},{\"bbox\":[713,248,780,442],\"label\":\"text\",\"caption\":\"Branding text in the bottom right corner.\",\"tags\":[\"UI text\",\"branding\"],\"text\":\"—— 中国风 · 直播间\\nCHINESE AESTHETICS\\nLIVE\"}],\"bbox_coord_space\":\"abs_centralized\",\"bbox_format\":\"yxyx\"}",
+   "negative_prompt": "worst quality, low quality, blurry, jpeg artifacts",
+   "height": 1680,
+   "width": 944,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset003_base": {
+   "id": "asset003_base",
+   "model": "base",
+   "prompt": "{\"scene_type\":\"Eight-panel weekend comic strip\",\"gen_brief\":\"Create a finished Chinese slice-of-life comic in a very tall 1:8 format, using eight sequential panels and an expressive, lightly textured digital cartoon style. Follow one exhausted office worker whose weekend fishing escape becomes a comic misunderstanding with her boss. Rounded ink contours, elastic expressions, readable speech balloons, and small environmental jokes support a complete setup, escalation, reveal, and payoff. Keep character designs consistent, with a mustard hoodie and short black bob identifying the protagonist. Lighting progresses naturally from office evening through sunny lakeside leisure to Monday morning.\",\"elements\":[{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Eight-panel continuous weekend comic\",\"shape\":\"Eight equal square panels, slim cream gutters, rounded black borders, expressive cartoon acting, white speech balloons, consistent characters and clear sequential storytelling.\",\"colors\":[{\"color\":\"Warm paper\",\"hex\":\"#FFF7E8\"},{\"color\":\"Ink\",\"hex\":\"#292C35\"},{\"color\":\"Mustard\",\"hex\":\"#E8B64C\"}],\"bbox\":[-2048,-256,2048,256]},{\"type\":\"text\",\"text\":\"周五 18:00｜周末摸鱼计划\\n老板：周一的报告，别忘了。\\n小夏：写完了，定时发送！\",\"bbox\":[-2020,-223,-1851,223],\"shape\":\"Hand-lettered black Chinese; compact bold caption, two distinct rounded speech balloons, natural square glyphs.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"周六 09:00\\n工作群：有人在吗？\\n小夏：床上不安全，撤！\",\"bbox\":[-1508,-223,-1347,223],\"shape\":\"Compact black Chinese caption, gray notification lettering, emphatic handwritten dialogue in a white balloon.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"周六 10:30\\n小夏：真正的摸鱼，不看消息。\\n今日目标：一条就够！\",\"bbox\":[-996,-223,-835,223],\"shape\":\"Black rounded Chinese handwriting; modest time caption, relaxed speech balloon, smaller notebook-style goal lettering.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"偏偏这时……\\n来电：老板\\n小夏：都追到湖边了？！\",\"bbox\":[-484,-223,-323,223],\"shape\":\"Small suspense caption, bold phone notification, trembling black dialogue inside a jagged white balloon.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"鱼竿突然一沉！\\n小夏：大鱼！这把稳了！\\n……怎么是顶帽子？\",\"bbox\":[28,-223,189,223],\"shape\":\"Bold action caption, energetic Chinese speech lettering, smaller hesitant final line; generous white balloon interiors.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"帽子的主人，缓缓抬头。\\n老板：电话不接，帽子倒接得挺快。\\n小夏：您来催报告？！\",\"bbox\":[540,-223,725,223],\"shape\":\"Compact narrative caption; clear black Chinese dialogue, dry understated boss lettering and startled employee lettering.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"老板：我就想借点鱼饵。\\n小夏：那群里喊人是……\\n老板：问谁会钓鱼。周末不聊工作！\",\"bbox\":[1052,-223,1237,223],\"shape\":\"Three readable Chinese speech balloons with distinct tails; final sentence slightly bolder, relaxed rounded strokes.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"周一 09:00｜报告已自动发送\\n同事：你俩周末对过方案了？\\n小夏：没有，对过鱼饵。\\n老板：报告不错。鱼饵，下次换一种。\",\"bbox\":[1564,-223,1782,223],\"shape\":\"Compact status caption and three speech balloons; black Chinese handwriting, restrained bold punchline, natural glyph proportions.\",\"is_watermark\":false},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Panel one: prepared escape\",\"note\":\"Establishes completed work and the protagonist's weekend intention.\",\"bbox\":[-2036,-244,-1548,244],\"shape\":\"Bob-haired woman in mustard hoodie closes laptop, grins, shoulders fishing bag; bespectacled boss holds mug; office dusk.\",\"colors\":[{\"color\":\"Mustard hoodie\",\"hex\":\"#E8B64C\"},{\"color\":\"Office lavender\",\"hex\":\"#B8B2CE\"},{\"color\":\"Evening coral\",\"hex\":\"#EC8B73\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Panel two: the notification ambush\",\"note\":\"A harmless work notification feels like a weekend invasion.\",\"bbox\":[-1524,-244,-1036,244],\"shape\":\"Same woman bolts from rumpled bed clutching buzzing phone; orange cat steals pillow; slippers fly; curtains glow.\",\"colors\":[{\"color\":\"Cream bedding\",\"hex\":\"#FFF7E8\"},{\"color\":\"Mustard hoodie\",\"hex\":\"#E8B64C\"},{\"color\":\"Cat orange\",\"hex\":\"#D98445\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Panel three: apparent freedom\",\"note\":\"Quiet fishing creates contrast before the interruption.\",\"bbox\":[-1012,-244,-524,244],\"shape\":\"Woman lounges on folding stool, rod extended over reed-lined lake; closed bait tin, empty bucket, thermos, peaceful dragonflies.\",\"colors\":[{\"color\":\"Lake teal\",\"hex\":\"#7FB9BB\"},{\"color\":\"Reed green\",\"hex\":\"#6C9368\"},{\"color\":\"Mustard hoodie\",\"hex\":\"#E8B64C\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Panel four: the alarming caller\",\"note\":\"Her exaggerated fear drives the misunderstanding.\",\"bbox\":[-500,-244,-12,244],\"shape\":\"Wide-eyed woman stares at vibrating phone; sweat beads, rigid shoulders, clenched rod; cheerful lakeshore contrasts with dramatic violet stress rays.\",\"colors\":[{\"color\":\"Stress violet\",\"hex\":\"#8B7AA9\"},{\"color\":\"Mustard hoodie\",\"hex\":\"#E8B64C\"},{\"color\":\"Lake teal\",\"hex\":\"#7FB9BB\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Panel five: the unexpected catch\",\"note\":\"The physical joke links the caller to the lakeside encounter.\",\"bbox\":[12,-244,500,244],\"shape\":\"Woman yanks bowed rod; hooked wet khaki fishing hat flies from water, scattering droplets; phone rests safely on stool.\",\"colors\":[{\"color\":\"Hat khaki\",\"hex\":\"#B9A77D\"},{\"color\":\"Lake teal\",\"hex\":\"#7FB9BB\"},{\"color\":\"Mustard hoodie\",\"hex\":\"#E8B64C\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Panel six: the boss revealed\",\"note\":\"The boss is another fisherman, not a pursuing supervisor.\",\"bbox\":[524,-244,1012,244],\"shape\":\"Bespectacled boss in fishing vest emerges from reeds, bareheaded, holding phone; woman freezes with dripping hat dangling from hook.\",\"colors\":[{\"color\":\"Fishing vest\",\"hex\":\"#B9A77D\"},{\"color\":\"Reeds\",\"hex\":\"#6C9368\"},{\"color\":\"Mustard hoodie\",\"hex\":\"#E8B64C\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Panel seven: shared time off\",\"note\":\"Reframes the work message and resolves the anxiety.\",\"bbox\":[1036,-244,1524,244],\"shape\":\"Both anglers laugh on folding stools; woman shares open bait tin; boss wears recovered damp hat; both buckets remain empty.\",\"colors\":[{\"color\":\"Lake teal\",\"hex\":\"#7FB9BB\"},{\"color\":\"Mustard hoodie\",\"hex\":\"#E8B64C\"},{\"color\":\"Hat khaki\",\"hex\":\"#B9A77D\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Panel eight: Monday payoff\",\"note\":\"The scheduled report succeeds while neither angler catches a fish.\",\"bbox\":[1548,-244,2036,244],\"shape\":\"Office morning; woman smiles at laptop's green confirmation check; curious colleague leans closer; boss displays empty bucket with sheepish grin.\",\"colors\":[{\"color\":\"Office lavender\",\"hex\":\"#B8B2CE\"},{\"color\":\"Mustard hoodie\",\"hex\":\"#E8B64C\"},{\"color\":\"Confirmation green\",\"hex\":\"#6C9368\"}]}],\"must_not\":[\"not a horizontal eight-panel strip or a two-column grid\",\"not a different protagonist or changing clothing between panels\",\"not a successful fish catch; both anglers finish with empty buckets\"],\"palette\":[\"#FFF7E8\",\"#292C35\",\"#E8B64C\",\"#7FB9BB\",\"#6C9368\",\"#B8B2CE\",\"#B9A77D\",\"#EC8B73\"],\"bbox_coord_space\":\"abs_centralized\"}",
+   "negative_prompt": "worst quality, low quality, blurry, jpeg artifacts",
+   "height": 4096,
+   "width": 512,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset004_base": {
+   "id": "asset004_base",
+   "model": "base",
+   "prompt": "{\"scene_type\":\"chaotic anime ensemble action comedy\",\"gen_brief\":\"A lively Blue Archive campus group photo collapsing into a harmless slapstick disaster, featuring exactly ten distinct named students from the elements, each appearing once. An asymmetric arch-shaped ensemble composition in one continuous sunlit courtyard, viewed slightly from above, not a grid or three horizontal rows. Hina stands closest to the viewer at the lower center as the main visual anchor. Behind her, Karin at upper-left, Mika at upper-center and Koharu at upper-right form an uneven arc of large, clearly separated faces. Mika and Koharu occupy the expanded upper-center and upper-right areas so there are no vacant character slots. Toki leans inward from the left edge beneath Karin; Shiroko reaches into their snack rescue from the left middle-ground. Serika anchors the lower-left corner, while sleeping Hoshino forms a low reclining diagonal between Serika and Hina, partially occluding Shiroko's lower body without covering her face. Koharu leans inward from the upper-right, with Azusa at the lower inner-right and Hifumi at the lower outer-right, forming a compact triangular toy-rescue interaction. Hifumi is in front of Koharu's lower torso. Keep Hina's face below Mika's and between the left and right action groups, with Hina's shoulders in front of their inner edges. Overlap shoulders and lower torsos, never faces; stagger head heights and keep each halo close to its owner. Heads and torsos fill their boxes rather than floating inside unused padding. Naturally crop the nearest lower bodies at the bottom and sides. The courtyard remains continuous, with small glimpses of architecture, steps, sky and blanket between the crowd, no dividing aisles or portrait slots. A curving gust carries blank napkins and papers from the tipping snack tray at left, above Mika's reaching hands, toward one small airborne Peroro plush at right. Pastries and paper trails pass around faces, not across them. Toki and Karin catch snacks, Shiroko reaches for a pastry, and Serika protests. Hina wearily asks everyone to calm down while Mika laughs behind her. Hoshino sleeps through everything. Koharu reaches down-left for the toy above Azusa's open schoolbag while Hifumi watches anxiously. Use varied eyelines, diagonal poses and calm-versus-panicked reactions rather than identical smiles. Exactly ten students, no spectators, duplicates or extra limbs. The single Peroro plush is an inanimate toy. Friendly nonsexual school comedy, no weapons, injuries, dangerous falls or upskirt angles. Crisp expressive anime linework, refined cel shading, pastel colors, warm upper-left sunlight and consistent blue ambient shadows. All ten wear their recognizable default clothing and halos, modified to omit every chest badge, school badge pin, name tag, ID card, badge holder and ID lanyard, even when these belong to the default outfit. No replacement badge-shaped chest patches or chest insignia. Preserve other clothing, neckties, ribbons and scarves. No added captions, speech bubbles, floating labels, watermarks or unrelated logos.\",\"elements\":[{\"type\":\"panel\",\"salience\":\"background\",\"identity\":\"Sunlit Kivotos courtyard framed behind the ten-student ensemble. Small upper-corner glimpses of cyan sky and white campus arches, shallow stone steps, a cropped snack table at the left, and a picnic blanket at the bottom. A few windblown blank papers, napkins, petals, and pastries arc through open gaps above shoulders, never covering faces. No extra spectators, signage, or damage\",\"bbox\":[-592,-888,592,888]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Asuma Toki (Blue Archive), left edge at intermediate depth, lower and farther left than Karin, behind Serika; in her default maid uniform and signature halo, without chest badges or ID accessories, no exoskeleton. Leaning diagonally inward toward Karin, one hand balancing a tipping snack tray and the other catching a cup, deadpan calm expression\",\"bbox\":[-395,-867,254,-393]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Kakudate Karin (Blue Archive), upper-left inner arc, behind Shiroko and above-right of Toki; in her default maid uniform and signature halo, without chest badges or ID accessories. Leaning down-left toward Toki's tipping tray with an empty plate held in both hands to catch a pastry, focused startled expression, hair flowing with her motion\",\"bbox\":[-564,-584,99,-117]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Sorasaki Hina (Blue Archive), dominant lower-center foreground anchor, directly in front of Mika, between Shiroko and Azusa; in her default Prefect Team uniform and signature halo, without chest badges or ID accessories. Large readable head and torso, lower body cropped at the bottom. Turning slightly toward the left snack scramble with a weary exasperated expression, one palm raised to ask everyone to calm down and the other hand touching her temple without covering her face\",\"bbox\":[-78,-231,592,251]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Misono Mika (Blue Archive), broad upper-center rear arc between Karin and Koharu, behind Hina with her face clearly above Hina's halo; in her default Trinity uniform and signature halo, without chest badges or ID accessories. Large readable head and torso. Laughing in delighted surprise while making a tiny safe hop, hands reaching diagonally upward toward fluttering napkins, wings slightly lifted inside her action envelope\",\"bbox\":[-592,-231,177,364]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Shimoe Koharu (Blue Archive), upper-right end of the arc beside Mika, behind Hifumi and above-right of Azusa; pink eyes with cat-like vertical slit pupils (<|><|>), in her default uniform and signature halo, without chest badges or ID accessories. Large readable head and torso, leaning diagonally down-left with a flustered blushing expression, both hands reaching urgently toward the single small airborne Peroro plush just above Azusa's raised open schoolbag\",\"bbox\":[-423,264,374,888]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Kuromi Serika (Blue Archive), lower-left foreground corner, in front of Toki and left of Shiroko; red eyes, in her default Abydos uniform and signature halo, without chest badges or ID accessories. Half-rising from the picnic blanket and turning up-right toward Shiroko with an indignant comic shout, clutching a snack bag to her chest, ears alert and twin tails swinging\",\"bbox\":[70,-888,592,-463]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Sunaookami Shiroko (Blue Archive), left middle-ground below Karin, behind Hoshino and left of foreground Hina; in her default Abydos uniform with her necktie, striped scarf and signature halo, without any chest badge, school badge pin, name tag, ID card or ID lanyard. Leaning eagerly up-left from a crouch toward the snack tray, one arm reaching for a falling pastry while the other hand holds her paper plate, intensely focused deadpan face, scarf streaming inward\",\"bbox\":[-92,-606,473,-131]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Takanashi Hoshino (Blue Archive), very low foreground left of Hina and right of Serika, in front of Shiroko's lower torso; eyes sleepily closed, in her default Abydos uniform and signature halo, without chest badges or ID accessories. Napping undisturbed in a diagonally reclining seated pose with her cheek on a soft picnic cushion, a paper napkin resting on her shoulder, face fully visible, lower body naturally cropped\",\"bbox\":[274,-563,592,-96]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Ajitani Hifumi (Blue Archive), lower-right outer corner in front of Koharu and to Azusa's right; in her default Trinity uniform and signature halo, without chest badges or ID accessories. Close cropped seated pose, looking anxiously up-left toward her single wind-tossed Peroro plush with both empty hands below her chin, worried comic expression; no second plush\",\"bbox\":[169,497,592,888]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Shirasu Azusa (Blue Archive), inner-right foreground between Hina and Hifumi, below-left of Koharu; purple eyes, in her default Trinity uniform and signature halo, without chest badges or ID accessories. Crouching with intense concentration, holding an open schoolbag up-right beneath the Peroro plush's flight path like a serious mission, face turned upward and unobscured\",\"bbox\":[56,165,592,647]}],\"bbox_coord_space\":\"abs_centralized\"}",
+   "negative_prompt": "",
+   "height": 1184,
+   "width": 1776,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 3072627948,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset005_base": {
+   "id": "asset005_base",
+   "model": "base",
+   "prompt": "多层折叠式纸雕立体绘本，放在一张书桌上，背景纯净突出主题，比例 3:2 横版。翻开的跨页呈现「哪吒闹海」的场景：脚踏风火轮的少年、翻涌的层叠海浪与龙宫剪影，所有元素皆可精细折叠组合，呈现逼真细腻的纸张折叠质感与多层景深。构图统一采用正面视角，整体视觉梦幻唯美，色彩缤纷绚丽，充满奇幻生动的故事氛围。",
+   "negative_prompt": "worst quality, bad anatomy, ugly face",
+   "height": 1024,
+   "width": 1536,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 2570432421,
+   "uncond_skip_layers": [
+    26
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset006_base": {
+   "id": "asset006_base",
+   "model": "base",
+   "prompt": "{\"scene_type\":\"Chinese literature textbook photograph\",\"gen_brief\":\"A realistic editorial photograph of an open Chinese senior-school literature textbook on a warm wooden study desk. The printed lesson presents Wang Xizhi's Lanting preface in authentic simplified Chinese, with carefully typeset classical prose and compact explanatory footnotes. Use a nearly overhead camera, natural window light, subtle paper translucency, gently curved pages, and soft binding shadows. The image should feel like an ordinary student's clean textbook snapshot rather than a designed poster, with crisp readable printing and restrained, believable photographic texture.\",\"elements\":[{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Open Chinese literature textbook\",\"shape\":\"Ivory uncoated paper, gently bowed binding, fine black textbook printing, faint reverse-side ink, layered page edges, understated blue lesson accents.\",\"colors\":[{\"color\":\"Ivory paper\",\"hex\":\"#F5F0E5\"},{\"color\":\"Printing black\",\"hex\":\"#292824\"},{\"color\":\"Muted textbook blue\",\"hex\":\"#496878\"}],\"bbox\":[-685,-544,691,508]},{\"type\":\"text\",\"text\":\"古代散文阅读\",\"bbox\":[-616,-324,-582,-99],\"shape\":\"Small muted-blue Chinese sans-serif characters, restrained tracking and natural square proportions.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"兰亭集序\",\"bbox\":[-542,-116,-465,281],\"shape\":\"Bold black Song-style Chinese title, prominent triangular serifs, evenly spaced natural-width characters.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"王羲之\",\"bbox\":[-446,14,-410,152],\"shape\":\"Small centered black Song-style characters with airy spacing.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"永和九年，岁在癸丑，暮春之初，会于会稽山阴\\n之兰亭，修禊事也。群贤毕至，少长咸集。此地有崇\\n山峻岭，茂林修竹，又有清流激湍，映带左右，引以\\n为流觞曲水，列坐其次。虽无丝竹管弦之盛，一觞一\\n咏，亦足以畅叙幽情。是日也，天朗气清，惠风和畅。\\n仰观宇宙之大，俯察品类之盛，所以游目骋怀，足以\\n极视听之娱，信可乐也。\",\"bbox\":[-357,-319,-90,436],\"shape\":\"Black Song-style body text, regular square glyphs, generous leading, first-line indentation, subtle paper curvature.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"夫人之相与，俯仰一世。或取诸怀抱，悟言一室\\n之内；或因寄所托，放浪形骸之外。虽趣舍万殊，静\\n躁不同，当其欣于所遇，暂得于己，快然自足，不知\\n老之将至；及其所之既倦，情随事迁，感慨系之矣。\\n向之所欣，俯仰之间，已为陈迹，犹不能不以之兴怀；\\n况修短随化，终期于尽！古人云：“死生亦大矣。”\\n岂不痛哉！\",\"bbox\":[-60,-319,207,436],\"shape\":\"Matching black Song-style body text, first-line indentation, measured line spacing and crisp punctuation.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"注释\\n〔永和九年〕公元353年。永和，东晋穆帝年号。\\n〔会稽山阴〕今浙江绍兴。\\n〔修禊〕古代于暮春临水举行的祓除不祥的仪式。\\n〔流觞曲水〕把酒杯浮在弯曲的水道中，任其漂流，\\n停在谁的面前，谁就取来饮酒。\\n〔悟言〕面对面交谈。“悟”同“晤”。\",\"bbox\":[330,-319,546,427],\"shape\":\"Compact black Song-style footnotes; slightly bolder heading, hanging entries, smaller natural-width glyphs and even leading.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"42\",\"bbox\":[615,41,643,82],\"shape\":\"Tiny black serif page number with native numeral proportions.\",\"is_watermark\":false},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Wooden desktop\",\"note\":\"Provides an everyday study setting.\",\"bbox\":[-728,-544,728,544],\"shape\":\"Matte honey-brown wood with restrained grain, minor surface wear and soft natural shadows.\",\"colors\":[{\"color\":\"Warm wood\",\"hex\":\"#B58B61\"},{\"color\":\"Dark wood grain\",\"hex\":\"#896547\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Narrow facing-page strip and binding gutter\",\"note\":\"Makes the photographed page clearly part of an open textbook.\",\"bbox\":[-673,-544,667,-354],\"shape\":\"Curved ivory page sliver, dark soft binding crease, subtly curled paper and thin layered edges; no readable printing.\",\"colors\":[{\"color\":\"Ivory paper\",\"hex\":\"#F5F0E5\"},{\"color\":\"Gutter shadow\",\"hex\":\"#B6AA97\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Textbook running-header rule\",\"note\":\"Restrained printed lesson styling.\",\"bbox\":[-567,-321,-563,435],\"shape\":\"Very thin, straight muted-blue printed rule with slight paper-grain absorption.\",\"colors\":[{\"color\":\"Muted textbook blue\",\"hex\":\"#496878\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Footnote separator\",\"note\":\"Distinguishes annotations from the classical prose.\",\"bbox\":[298,-319,302,-54],\"shape\":\"Short hairline black printing, clean and understated.\",\"colors\":[{\"color\":\"Printing black\",\"hex\":\"#292824\"}]}],\"must_not\":[\"not a calligraphy scroll or handwritten manuscript\",\"not a promotional poster or infographic\",\"not modern prose substituted for the classical passage\"],\"palette\":[\"#F5F0E5\",\"#292824\",\"#B58B61\",\"#496878\",\"#B6AA97\"],\"bbox_coord_space\":\"abs_centralized\"}",
+   "negative_prompt": "",
+   "height": 1456,
+   "width": 1088,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 1946227359,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset007_base": {
+   "id": "asset007_base",
+   "model": "base",
+   "prompt": "A young anime woman, Kazusa from Blue Archive, stands still at the edge of a crowded Tokyo crosswalk outside a busy train station on a damp, overcast dusk. Her short dark hair with soft magenta inner highlights frames her face, cat ears perked slightly beneath her distinctive glowing pink halo. She wears an oversized charcoal wool coat over a beige knit hoodie, a short pleated black skirt, black crew socks, and scuffed loafers, with a canvas tote bag slung over her shoulder. She holds a wired earphone in one hand as if pausing her music, looking slightly sideways with a quiet, unguarded expression while the evening rush hour flows around her.\n\nIn the immediate foreground, a heavily motion-blurred commuter in a dark coat walks right past the lens, partially framing the edge of the shot and giving it the raw, accidental feel of a candid street photograph. Around and behind Kazusa, a bustling crowd of out-of-focus pedestrians moves across the wet asphalt crosswalk under the muted glow of neon department store signs, traffic signals, and concrete office buildings. The image blends Kazusa’s anime appearance seamlessly into a gritty, photorealistic modern city environment, using natural ambient dusk lighting, shallow depth of field, motion blur on the passing crowd, muted cool tones, and a cinematic sense of stillness amid urban chaos.",
+   "negative_prompt": "watermark, bad anatomy",
+   "height": 1776,
+   "width": 1184,
+   "steps": 50,
+   "cfg": 3.0,
+   "shift": 5.0,
+   "seed": 3537712559,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset008_base": {
+   "id": "asset008_base",
+   "model": "base",
+   "prompt": "{\"scene_type\":\"Amateur selfie contact sheet\",\"gen_brief\":\"Create a high-resolution photographic contact sheet of nine fictional amateur selfie mishaps featuring Donald Trump, presented as a coherent three-by-three grid on a portrait canvas. Recognizable facial features, swept blond hair, realistic skin texture, and ordinary clothing establish a consistent subject across varied everyday settings. The humor comes from awkward framing, blinking, accidental obstruction, and poorly timed expressions rather than caricature. Use believable smartphone perspective, mixed natural and indoor lighting, and modest photographic imperfections. Keep the finished collage crisp and carefully balanced while preserving the deliberately unsuccessful snapshot aesthetic of each photograph.\",\"elements\":[{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Nine-photo contact sheet\",\"shape\":\"Rectangular photographic contact sheet containing exactly nine equal portrait photographs, narrow ivory gutters, clean edges, no captions or graphic embellishments.\",\"colors\":[{\"color\":\"ivory\",\"hex\":\"#F2F0EA\"},{\"color\":\"charcoal\",\"hex\":\"#30343A\"}],\"bbox\":[-680,-384,680,384]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Donald Trump finger-obstructed selfie\",\"note\":\"An accidental fingertip partially blocks the phone camera.\",\"bbox\":[-661,-373,-231,-131],\"shape\":\"Trump wearing navy jacket and red tie, puzzled expression, foreshortened fingertip veiling part of lens, daylight window, realistic smartphone photography.\",\"colors\":[{\"color\":\"navy\",\"hex\":\"#202D45\"},{\"color\":\"red\",\"hex\":\"#BA3034\"},{\"color\":\"warm skin\",\"hex\":\"#D6A080\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Donald Trump blinking selfie\",\"note\":\"The shutter catches both eyes closed during a blink.\",\"bbox\":[-661,-121,-231,121],\"shape\":\"Trump in white golf polo, eyes naturally closed, mouth slightly open, sunlit lawn, blond flyaway hair, harsh midday shadows.\",\"colors\":[{\"color\":\"white\",\"hex\":\"#F4F3EC\"},{\"color\":\"grass green\",\"hex\":\"#657849\"},{\"color\":\"golden blond\",\"hex\":\"#C9AD70\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Donald Trump cropped-hair selfie\",\"note\":\"The camera angle accidentally cuts off most of his hairstyle.\",\"bbox\":[-661,131,-231,373],\"shape\":\"Extreme-close Trump selfie, forehead and hairstyle abruptly cropped, raised eyebrows, navy suit, softly detailed beige hallway, wide-angle facial perspective.\",\"colors\":[{\"color\":\"warm skin\",\"hex\":\"#D6A080\"},{\"color\":\"beige\",\"hex\":\"#C7B8A0\"},{\"color\":\"navy\",\"hex\":\"#202D45\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Donald Trump low-angle selfie\",\"note\":\"An unintentionally low phone position creates awkward perspective.\",\"bbox\":[-215,-373,215,-131],\"shape\":\"Trump looking down into camera, pronounced chin foreshortening, pursed lips, dark overcoat, visible ceiling tiles and fluorescent fixtures.\",\"colors\":[{\"color\":\"charcoal\",\"hex\":\"#30343A\"},{\"color\":\"ceiling gray\",\"hex\":\"#D1D3CF\"},{\"color\":\"warm skin\",\"hex\":\"#D6A080\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Donald Trump windblown selfie\",\"note\":\"A gust interrupts his attempt at a composed portrait.\",\"bbox\":[-215,-121,215,121],\"shape\":\"Trump in navy jacket, dramatically wind-tossed blond hair, squinting eyes, tight smile, bright blue sky, distant trees, sharp facial detail.\",\"colors\":[{\"color\":\"sky blue\",\"hex\":\"#91B8D1\"},{\"color\":\"golden blond\",\"hex\":\"#C9AD70\"},{\"color\":\"navy\",\"hex\":\"#202D45\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Donald Trump tilted selfie\",\"note\":\"An awkward wrist angle leaves the snapshot conspicuously crooked.\",\"bbox\":[-215,131,215,373],\"shape\":\"Trump in open-collar white shirt, hesitant grin, strongly diagonal doorway and wall molding, uneven warm indoor light, believable handheld perspective.\",\"colors\":[{\"color\":\"white\",\"hex\":\"#F4F3EC\"},{\"color\":\"warm beige\",\"hex\":\"#C7B8A0\"},{\"color\":\"wood brown\",\"hex\":\"#785940\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Donald Trump flash reflection selfie\",\"note\":\"A mirror selfie fails because the flash creates distracting glare.\",\"bbox\":[231,-373,661,-131],\"shape\":\"Trump holding black smartphone, navy suit and red tie, ornate mirror, conspicuous flash starburst, face still recognizable, warm room reflections.\",\"colors\":[{\"color\":\"navy\",\"hex\":\"#202D45\"},{\"color\":\"gold\",\"hex\":\"#B99859\"},{\"color\":\"flash white\",\"hex\":\"#FFFDF4\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Donald Trump interrupted selfie\",\"note\":\"A sip of coffee is caught at an unflattering instant.\",\"bbox\":[231,-121,661,121],\"shape\":\"Trump wearing dark cardigan, plain paper cup pressed to lips, widened eyes, awkward raised elbow, breakfast table, soft window illumination.\",\"colors\":[{\"color\":\"charcoal\",\"hex\":\"#30343A\"},{\"color\":\"cup ivory\",\"hex\":\"#F2F0EA\"},{\"color\":\"warm skin\",\"hex\":\"#D6A080\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Donald Trump off-center selfie\",\"note\":\"The framing misses its intended subject and shows excessive empty upholstery.\",\"bbox\":[231,131,661,373],\"shape\":\"Trump in navy jacket, only part of face captured, distracted sideways glance, extensive beige car upholstery, daylight, subtle window reflections.\",\"colors\":[{\"color\":\"upholstery beige\",\"hex\":\"#C7B8A0\"},{\"color\":\"navy\",\"hex\":\"#202D45\"},{\"color\":\"warm skin\",\"hex\":\"#D6A080\"}]}],\"must_not\":[\"not a single portrait replacing the nine-photo grid\",\"not polished professional campaign photographs or cartoon caricatures\",\"not captions, watermarks, campaign slogans, or news graphics\"],\"palette\":[\"#D6A080\",\"#202D45\",\"#C7B8A0\",\"#F2F0EA\",\"#C9AD70\",\"#30343A\",\"#BA3034\",\"#91B8D1\"],\"bbox_coord_space\":\"abs_centralized\",\"bbox_format\":\"yxyx\"}",
+   "negative_prompt": "worst quality, low quality, blurry, jpeg artifacts, pixelated, cropped, out of frame, cut off",
+   "height": 1360,
+   "width": 768,
+   "steps": 30,
+   "cfg": 4.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset009_base": {
+   "id": "asset009_base",
+   "model": "base",
+   "prompt": "general, 1girl, best quality, most attractive face, cosplay, amiya (arknights), with \"Rhodes Island\" on her clothes, carring a sword",
+   "negative_prompt": "worst quality, bad anatomy",
+   "height": 1536,
+   "width": 1024,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 0,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset010_base": {
+   "id": "asset010_base",
+   "model": "base",
+   "prompt": "一张极具 YouTube 缩略图风格的夸张宣传画面：场景设置在一座大型露天体育场或竞技场内，背景是明亮的蓝天、环形看台与巨型电子屏幕，大量年轻观众挤满画面，兴奋地欢呼、张嘴大笑，并高举写满数学公式、函数图像和几何草图的白纸，整体营造出“完成超大规模数学挑战后全场庆祝”的戏剧化氛围。\n\n画面正中央是一位拟人化的 ChatGPT 形象，以低机位、中近景英雄式构图占据视觉中心。人物穿着宽松的黑色连帽卫衣，胸前印有青绿色的 OpenAI/ChatGPT 旋结标志，双臂交叉抱在胸前，姿态自信而具有挑战意味。人物的头部被替换成一个大型、圆角、具有明显 3D 体积感的青绿色方形 ChatGPT 图标，正面中央是白色 OpenAI 旋结 Logo；图标表面带有高光和阴影，像一块实体塑料或软质立方体头盔。黑色服装与鲜艳的青绿色头部形成强烈色彩对比，使主体从喧闹背景中明显突出。\n\n画面左上方覆盖着面积很大的漫画式标题文字。最上方以白色粗体、黑色厚描边的倾斜字体写着 **“I SOLVED”**。其下原本有巨大的黄色数字 **“400”**，数字具有黑色描边、立体阴影和高饱和度漫画质感，但被两条粗大的红色手绘笔刷线交叉划掉，形成醒目的红色“X”。被划掉的“400”下方，则用极大的鲜红色数字突出显示 **“722”**，带黑白多层描边和略微倾斜、膨胀的卡通字体效果。最下方继续以白色粗体黑描边文字写着 **“MATH PROBLEMS!”**。整个标题组合传达出一种“原本挑战 400 道题，结果实际解决了 722 道”的夸张升级感。\n\n背景观众几乎全部穿着白色或浅色服装，与中央人物的黑色卫衣形成明显明暗分区。许多人手中的纸张上可以看到不同层次的数学内容：画面左下方一张纸清晰写有高斯积分  \n\\[\n\\int_{-\\infty}^{\\infty}e^{-x^2}dx=\\sqrt{\\pi},\n\\]\n其下还有二次方程求根公式  \n\\[\nx=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}.\n\\]\n画面右侧一张显眼的白纸写有巴塞尔问题结果  \n\\[\n\\sum_{n=1}^{\\infty}\\frac{1}{n^2}=\\frac{\\pi^2}{6}.\n\\]\n靠近下方中央还有写着  \n\\[\n\\frac{dy}{dx}=xy\n\\]\n的微分方程纸张，右下角则可见矩阵、几何三角形、坐标图像、角度关系以及其他手写代数表达式。其余观众的纸上散布积分、函数曲线、坐标轴和复杂推导，使整个背景充满“数学竞赛”与“高难度解题挑战”的视觉符号。\n\n体育场四周的大型青绿色电子屏幕上重复展示白色 OpenAI/ChatGPT 标志，与中央人物头部的配色保持一致。天空与场馆上方还飘散着青绿色、白色和少量深色的方形彩纸，强化庆典和胜利后的狂欢感。人物及前排观众清晰锐利，而远处看台与屏幕略有景深模糊；画面采用高饱和度、高对比度、锐化明显的商业缩略图处理方式，青绿色、红色、黄色、黑色和白色构成主要视觉色板。\n\n整体视觉叙事可以概括为：**一个拟人化 ChatGPT 在体育场级别的数学挑战中“超额完成任务”，原定的 400 道数学题被红色叉号否定，并以醒目的“722”取而代之；周围数百名学生高举数学解答欢呼庆祝，形成一种夸张、热闹、极具点击吸引力的 AI 解题挑战宣传画面。**",
+   "negative_prompt": "",
+   "height": 1024,
+   "width": 1536,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset011_base": {
+   "id": "asset011_base",
+   "model": "base",
+   "prompt": "{\"summary\":{\"meta\":[\"screenshot\",\"video_game_capture\",\"dark_fantasy\",\"elden_ring\"],\"canvas\":\"single\",\"caption\":\"A cinematic 16:9 gameplay screenshot from Elden Ring, rendered with the game's richly textured dark-fantasy realism rather than as promotional artwork. A third-person view follows a lone Tarnished standing on a weathered stone outcrop in Limgrave, wearing scratched steel armor over faded blue cloth, a battered cloak hanging behind their shoulders. Their right hand holds a straight sword pointed toward the ground, and their left carries a worn metal shield. Wind bends the surrounding golden-green grass and stirs the cloak. The spectral golden Erdtree towers beyond the landscape, its radiant trunk and intricate luminous branches illuminating a hazy sky. Rolling hills, broken stone arches, scattered autumnal trees, and ruined fortifications recede through pale atmospheric mist. A narrow dirt road winds past crumbling masonry, where two distant armored soldiers patrol with spears and muted orange torchlight. The scene feels vast, melancholy, and quietly dangerous, with intricate environmental detail, natural material wear, soft volumetric light, and restrained golden highlights against cool gray-green shadows.\\nPreserve the recognizable in-game HUD: slim red, blue, and green status bars at the upper left beside the circular status emblem; a delicate compass at the upper center with the visible letters “N” and “E”; and equipment slots at the lower left showing the equipped shield, straight sword, and glowing red-gold flask. The selected item reads “Flask of Crimson Tears +1” with the quantity “4,” and the weapon skill reads “Square Off.” A small dark rune counter at the lower right reads “1248.” HUD lettering is fine, pale, and subtly shadowed, with weathered ornamental borders around the equipment icons. No title logo, desktop borders, subtitles, or promotional text; this is an immersive moment of ordinary exploration captured directly from gameplay.\"},\"items\":[{\"label\":\"panel\",\"caption\":\"Full-frame over-the-shoulder gameplay view looking slightly downward and outward toward a broad open landscape. A single armored player figure occupies the lower-right-center foreground, framed by tall wind-blown grass, while a vast ruined field and luminous tree recede into atmospheric haze. Foreground stone is sharp and detailed; the midground grass and ruins lose contrast with distance; the sky remains pale and washed-out. HUD overlays remain legible in the four corners, blending with the dark vignette and unobstructed environmental view.\",\"tags\":[\"third-person\",\"gameplay\",\"open_world\",\"fantasy\",\"limgrave\",\"elden_ring\"],\"palette\":[\"#C6BC9C\",\"#6B7A53\",\"#8A7D66\",\"#E9DCA9\",\"#1F1F1F\"],\"bbox\":[-472,-840,472,839]},{\"label\":\"object\",\"caption\":\"Broad open terrain fills the mid- and background, dominated by wind-blown grass in gold-green bands, scattered trees, broken arches, stone walls, and low hills. Paths and clearings create pale strips through the vegetation, while distant ruins appear as dark geometric silhouettes against a hazy sky. The environmental detail sharpens toward the foreground and dissolves into muted gray-green and tan masses behind the player.\",\"tags\":[\"open_field\",\"ruins\",\"grassland\",\"autumnal_trees\",\"broken_arches\"],\"palette\":[\"#8A9671\",\"#B3A478\",\"#656252\",\"#D6CAA0\",\"#9A9280\"],\"bbox\":[-250,-840,304,839]},{\"label\":\"object\",\"caption\":\"Upper-left health, stamina, and magic bars appear as three thin horizontal gauges stacked slightly offset from one another. Red occupies the top gauge, blue the middle, and green the lower portion, each contained in a narrow dark frame with subtle worn texture. The bars are flat, crisp, and overlay the soft background without occluding key scene elements.\",\"tags\":[\"hud\",\"health_bar\",\"stamina_bar\",\"status_ui\",\"overhead_overlay\"],\"palette\":[\"#9C3334\",\"#2E4654\",\"#4F7A3A\",\"#231F1E\",\"#B5B0A3\"],\"bbox\":[-435,-656,-394,-425]},{\"label\":\"object\",\"tags\":[\"spectral_tree\",\"glowing\",\"background\",\"floating_rocks\",\"fantasy_environment\"],\"caption\":\"A towering spectral tree dominates the upper center of the scene, its glowing pale-gold branches spreading like a luminous canopy over broken stone ridges. Luminous foliage masses appear at the crown and along the trunk, while small floating rock fragments hover near the base and sides. The tree is rendered as a bright central mass against a washed sky, creating a strong vertical focal axis and radiating soft light into the surrounding haze.\",\"palette\":[\"#EEDFA9\",\"#D9C787\",\"#C4B796\",\"#B6AC94\"],\"bbox\":[-472,-174,-247,108]},{\"label\":\"object\",\"caption\":\"A lone player character stands with their back to the camera, facing the distant field. They wear a rounded steel helm with a dark visor, segmented metal armor over blue-gray cloth, and a worn brownish cloak hanging from the shoulders. The right arm extends downward and forward gripping a straight sword, while the left arm holds a pointed metal shield at the side. The figure is positioned on rough rock and grass, rendered in sharp focus with visible scratches, soot, and layered cloth folds under soft overcast light.\",\"tags\":[\"armor\",\"helm\",\"cloak\",\"sword\",\"shield\",\"protagonist\",\"elden_ring\"],\"palette\":[\"#6F7A6C\",\"#564F47\",\"#3F4450\",\"#8C7B67\",\"#3D4B3A\"],\"bbox\":[-62,-111,327,397]},{\"label\":\"object\",\"tags\":[\"weapon\",\"straight_sword\",\"metal\",\"blade\"],\"caption\":\"A straight steel blade extends diagonally downward to the left from the player's right hand. The edge is narrow and light-catching, while the crossguard and grip remain dark. The weapon points toward the ground and is partially framed by the lower HUD equipment icons.\",\"palette\":[\"#C6C2B7\",\"#8B8478\",\"#3B3530\"],\"bbox\":[259,-249,399,-28]},{\"label\":\"object\",\"tags\":[\"equipment_slot\",\"sword_icon\",\"hud\",\"equipment\"],\"caption\":\"The middle equipment slot contains a weapon icon shaped like a long blade angled across its frame. The icon sits inside an ornate dark rectangular slot below the shield icon and is paired with skill text below.\",\"palette\":[\"#9A9183\",\"#42413D\",\"#1D1B19\"],\"bbox\":[212,-587,336,-458]},{\"label\":\"text\",\"tags\":[\"skill_text\",\"ui_text\",\"weapon_skill\"],\"caption\":\"Below the lower-left equipment slots, a small skill label appears in pale serif characters. It identifies the equipped weapon skill in a flat UI band.\",\"palette\":[\"#C8C1B0\",\"#22211F\"],\"bbox\":[348,-575,371,-467],\"text\":\"Square Off\"},{\"label\":\"object\",\"tags\":[\"shield\",\"metal\",\"weathered\",\"equipment\"],\"caption\":\"A worn metal shield is held at the player's left side. Its face is pointed and slightly weathered, with darkened edges and pale reflective patches. The shield is seen edge-on to the camera, appearing as a vertical sliver beside the character.\",\"palette\":[\"#8E9397\",\"#5E5851\",\"#34302B\"],\"bbox\":[94,-83,203,9]},{\"label\":\"object\",\"tags\":[\"equipment_slot\",\"shield_icon\",\"hud\",\"equipment\"],\"caption\":\"The uppermost equipment slot shows a shield icon inside a small weathered rectangular frame. The icon is light gray with dark detailing, aligned with the lower HUD grid and positioned above the sword slot.\",\"palette\":[\"#A79C8B\",\"#4A4640\",\"#201E1C\"],\"bbox\":[80,-585,182,-450]},{\"label\":\"object\",\"caption\":\"The lower-left HUD contains a flask icon showing a rounded vessel glowing red-orange against a dark ornamental frame. It sits to the right of the shield and sword equipment slots and has a small quantity number beside it.\",\"tags\":[\"hud\",\"flask_icon\",\"equipment\",\"glowing\",\"ui_element\"],\"palette\":[\"#C65435\",\"#D8B866\",\"#2D1F1A\",\"#6B5A3E\"],\"bbox\":[248,-449,354,-332]},{\"label\":\"text\",\"caption\":\"A HUD label appears beneath the flask icon in small pale serif type. The text identifies the selected consumable and its enchantment level, positioned over a dark horizontal band.\",\"tags\":[\"item_name\",\"ui_text\",\"flask\",\"hud\"],\"palette\":[\"#C9BFA9\",\"#1F1D1A\"],\"bbox\":[363,-452,388,-137],\"text\":\"Flask of Crimson Tears +1\"},{\"label\":\"text\",\"caption\":\"A single small numeral appears to the right of the flask item name, indicating the remaining charge or quantity of the selected consumable.\",\"tags\":[\"quantity\",\"number\",\"hud\"],\"palette\":[\"#D2C9B4\",\"#1F1D1A\"],\"bbox\":[361,-125,388,-90],\"text\":\"4\"},{\"label\":\"text\",\"caption\":\"In the lower-right corner, a small rune counter appears as a dark bar with a glowing rune glyph followed by pale numerals. It is separated from the main scene by a faint border and remains legible against the darker grass and rock.\",\"tags\":[\"currency\",\"rune_counter\",\"ui_text\",\"hud\"],\"palette\":[\"#D1CAB6\",\"#2A241D\"],\"bbox\":[402,554,435,669],\"text\":\"1248\"},{\"label\":\"object\",\"tags\":[\"hud\",\"status_emblem\",\"medallion\",\"ornamental\",\"ui_element\"],\"caption\":\"A small ornate circular emblem sits at the far left of the status bars. It has a dark metallic ring, pale inner detailing, and a small arrow-like pointer near its upper edge. The icon is rendered in low contrast against the bright sky but remains distinct as a HUD element.\",\"palette\":[\"#6F614E\",\"#342C24\",\"#B6AB8B\"],\"bbox\":[-423,-762,-368,-682]},{\"label\":\"object\",\"caption\":\"A delicate navigation compass floats near the upper center, with a central vertical tick and a horizontal pointer line ending in ornamental arrowheads. Direction letters sit to the left and right of the center marker. The UI glyph is pale and thin, almost blending into the bright sky.\",\"tags\":[\"compass\",\"navigation\",\"hud\",\"direction_marker\"],\"palette\":[\"#C8C2B1\",\"#4C4942\",\"#2A2825\"],\"bbox\":[-437,-130,-394,121]},{\"label\":\"text\",\"tags\":[\"compass_label\",\"direction\",\"hud_text\"],\"caption\":\"A single small pale letter appears at the left side of the upper compass marker. It is rendered in a thin sans-serif style and functions as a cardinal direction label.\",\"palette\":[\"#D8D2C3\",\"#4D4941\"],\"bbox\":[-430,-132,-402,-107],\"text\":\"N\"},{\"label\":\"text\",\"tags\":[\"compass_label\",\"direction\",\"hud_text\"],\"caption\":\"A single small pale letter appears to the right of the compass center. It matches the thin HUD lettering and marks a cardinal direction.\",\"palette\":[\"#D4CFC1\",\"#4C4841\"],\"bbox\":[-430,99,-402,118],\"text\":\"E\"},{\"label\":\"object\",\"caption\":\"A broad stone outcrop and ledge occupy the lower frame, forming the surface on which the player stands. Weathered rock faces, shallow cracks, scattered pebbles, and tufts of grass are visible in close detail, while the stone slopes down toward the lower-left path. The foreground surface is dark and textured, anchoring the character and contrasting with the lighter grass beyond.\",\"tags\":[\"rock\",\"ledge\",\"foreground\",\"weathered\",\"path\"],\"palette\":[\"#8A7D66\",\"#5D5244\",\"#3B3228\",\"#A8967D\",\"#4F4437\"],\"bbox\":[152,-840,472,839]},{\"label\":\"object\",\"caption\":\"Dense tall grass covers the central midground and extends behind the character, bending strongly toward the left and right. Blades catch pale golden highlights, forming bright streaks over darker green and brown shadow pockets. The grass partially conceals the lower torso and feet of the figure and creates a textured horizon of light and shadow masses.\",\"tags\":[\"grass\",\"wind\",\"midground\",\"landscape\",\"soft_focus\"],\"palette\":[\"#6E7A54\",\"#A39467\",\"#C8B98C\",\"#3F4632\",\"#2D2F22\"],\"bbox\":[-46,-563,289,602]},{\"label\":\"object\",\"caption\":\"A small armored figure stands on a dirt track at the left side of the midground. The figure is seen from a distance, holding a long spear or staff-like object, with a torch or warm light source producing a faint orange glow near the body. The scale and detail are reduced by distance, making it read as a secondary encounter in the open field.\",\"tags\":[\"enemy\",\"soldier\",\"spear\",\"distant_figure\",\"torchlight\"],\"palette\":[\"#5B5146\",\"#8D5B39\",\"#322A26\",\"#B3865A\"],\"bbox\":[89,-630,172,-571]},{\"label\":\"object\",\"caption\":\"A second armored figure stands further along the same dirt road near a ruined stone arch. The figure is small and hazy, holding a vertical weapon or staff, and faces the area near the first soldier. Warm glow appears around the lower body, suggesting torchlight or a nearby fire source.\",\"tags\":[\"enemy\",\"soldier\",\"staff\",\"distant_figure\",\"ruins\"],\"palette\":[\"#574C41\",\"#91623C\",\"#2B231F\",\"#C28B58\"],\"bbox\":[62,-491,129,-438]}],\"bbox_coord_space\":\"abs_centralized\",\"bbox_format\":\"yxyx\"}",
+   "negative_prompt": "worst quality, bad anatomy",
+   "height": 944,
+   "width": 1680,
+   "steps": 50,
+   "cfg": 3.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    26
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset012_base": {
+   "id": "asset012_base",
+   "model": "base",
+   "prompt": "{\"scene_type\":\"Chinese physics examination paper\",\"gen_brief\":\"A finished Chinese university entrance examination practice paper, rendered as a crisp, straight-on scan of a single A4 sheet. The design follows formal examination typography, with restrained black ink, precise mathematical notation, generous writing margins, and finely drawn physics figures. The paper is clean white under even illumination, without photographic perspective or distracting surface texture. Dense but readable Chinese typesetting, differentiated heading weights, consistent option spacing, and carefully aligned question numbers create an authentic printed assessment. All questions remain unanswered, and the document clearly identifies itself as a practice examination.\",\"elements\":[{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"A4 physics examination sheet\",\"shape\":\"White examination page with black printed typography, fine rules, unmarked answer spaces, and sharp monochrome scientific diagrams.\",\"colors\":[{\"color\":\"paper white\",\"hex\":\"#FFFFFF\"},{\"color\":\"printing black\",\"hex\":\"#181818\"}],\"bbox\":[-744,-528,744,528]},{\"type\":\"text\",\"text\":\"2026年普通高等学校招生全国统一考试（模拟）\",\"bbox\":[-663,-395,-624,395],\"shape\":\"Centered bold Song-style Chinese heading, natural square glyphs, compact spacing, solid black ink.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"物 理\",\"bbox\":[-606,-99,-547,99],\"shape\":\"Large bold Chinese display characters, balanced spacing, clean black print.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"考试时间：75分钟　　满分：100分\",\"bbox\":[-523,-233,-492,233],\"shape\":\"Centered regular Song-style text, smaller than title, even baseline.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"姓名：____________　准考证号：____________________\",\"bbox\":[-469,-388,-438,388],\"shape\":\"Regular black Chinese type with uniform baseline and clear blank underlines.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"注意事项：\\n1．答题前，请将姓名、准考证号填写清楚。\\n2．选择题答案请填涂在答题卡上，非选择题请在答题卡指定区域作答。\\n3．考试结束后，将本试卷和答题卡一并交回。\",\"bbox\":[-401,-428,-281,428],\"shape\":\"Compact Song-style body, bold introductory label, four evenly spaced lines, black ink.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"一、单项选择题：本题共6小题，每小题4分，共24分。\\n每小题给出的四个选项中，只有一项符合题目要求。\",\"bbox\":[-253,-428,-188,428],\"shape\":\"Bold section statement with regular explanatory line, modest leading, natural Chinese proportions.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"1．在国际单位制中，下列物理量的单位属于基本单位的是（　　）\\nA．力的单位：牛顿　　　　B．能量的单位：焦耳\\nC．电流的单位：安培　　　D．电压的单位：伏特\",\"bbox\":[-164,-428,-69,428],\"shape\":\"Black Song-style question text; options in two aligned columns, hanging question-number indentation.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"2．如图，一小物块从固定光滑斜面上由静止释放。\\n斜面倾角为30°，重力加速度为g。物块沿斜面\\n下滑的加速度大小为（　　）\\nA．g/4　　　　 B．g/2\\nC．√3g/2　　　D．g\",\"bbox\":[-44,-428,105,196],\"shape\":\"Regular Chinese examination type, clear mathematical symbols, compact two-column options, five evenly spaced lines.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"30°\",\"bbox\":[58,297,85,346],\"shape\":\"Small upright black angle label, clean degree symbol.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"3．质量为m的小球用细线悬挂于O点，在竖直平面内做圆周运动。\\n小球经过最低点时的速度为v，细线长为L，重力加速度为g。\\n此时细线对小球的拉力大小为（　　）\\nA．mv²/L　　　　　　　B．mg\\nC．mg＋mv²/L　　　　　D．mv²/L－mg\",\"bbox\":[132,-428,276,428],\"shape\":\"Consistent Song-style body with italic Latin variables, precise superscripts, two aligned option columns.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"4．一电源的电动势为6.0 V，内阻为1.0 Ω，与阻值为3.0 Ω的\\n定值电阻连接成闭合电路。电源的输出功率为（　　）\\nA．2.25 W　　B．6.75 W　　C．9.00 W　　D．12.0 W\",\"bbox\":[302,-428,389,428],\"shape\":\"Regular black Chinese type, spaced units, four evenly separated options on one baseline.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"5．某物体沿直线运动，其速度随时间变化的图像\\n如图所示。物体在0～4 s内的位移大小为（　　）\\nA．8 m　　　　 B．12 m\\nC．16 m　　　　D．32 m\",\"bbox\":[415,-428,529,198],\"shape\":\"Four compact lines of Song-style text with two-column answer options and clear unit spacing.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"v/(m·s⁻¹)\",\"bbox\":[409,211,435,324],\"shape\":\"Small scientific axis title, italic variable and upright unit characters.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"8\\n0\",\"bbox\":[446,215,521,233],\"shape\":\"Small upright black numerals, separated to match graph ticks.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"4\",\"bbox\":[516,340,539,357],\"shape\":\"Small upright black tick numeral.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"t/s\",\"bbox\":[516,388,544,430],\"shape\":\"Small black scientific label with italic time variable.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"6．用频率为ν的单色光照射某金属，逸出光电子的最大初动能为\\nEₖ。已知该金属的逸出功为W₀，普朗克常量为h。若入射光频率\\n增大为2ν，则光电子的最大初动能为（　　）\\nA．2Eₖ　　B．Eₖ＋hν　　C．Eₖ＋2hν　　D．2Eₖ－W₀\",\"bbox\":[563,-428,672,428],\"shape\":\"Compact Song-style body, italic variables, accurate subscripts and Greek glyphs, four options on a shared baseline.\",\"is_watermark\":false},{\"type\":\"text\",\"text\":\"物理试卷　第1页（共6页）\",\"bbox\":[703,-166,727,166],\"shape\":\"Small centered Song-style footer, quiet black printing.\",\"is_watermark\":false},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Candidate information separator rule\",\"note\":\"Separates examination identity from instructions.\",\"bbox\":[-423,-428,-419,428],\"shape\":\"Single thin, straight black horizontal printing rule.\",\"colors\":[{\"color\":\"printing black\",\"hex\":\"#181818\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Inclined plane question diagram\",\"note\":\"Shows a block resting on a thirty-degree frictionless incline.\",\"bbox\":[-23,225,94,425],\"shape\":\"Unshaded triangular ramp, descending slope, rotated rectangular block touching slope, horizontal baseline, small angle arc; thin black outlines.\",\"colors\":[{\"color\":\"diagram black\",\"hex\":\"#181818\"}]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Velocity versus time graph\",\"note\":\"Linear increase from zero to eight metres per second.\",\"bbox\":[437,238,523,412],\"shape\":\"Arrowed perpendicular axes; straight ascending segment from origin; endpoint dashed projections to time four and velocity eight; no grid.\",\"colors\":[{\"color\":\"diagram black\",\"hex\":\"#181818\"}]}],\"must_not\":[\"not handwritten answers, worked solutions, or grading marks\",\"not an infographic, colorful textbook spread, or promotional poster\",\"not a tilted photograph, curled sheet, or visible desktop\"],\"palette\":[\"#FFFFFF\",\"#181818\"],\"bbox_coord_space\":\"abs_centralized\"}",
+   "negative_prompt": "",
+   "height": 1488,
+   "width": 1056,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset013_base": {
+   "id": "asset013_base",
+   "model": "base",
+   "prompt": "An original, museum-quality white marble sculpture of Artoria Pendragon (Saber) from Fate, conceived with the anatomical discipline, monumental presence, and exquisite craftsmanship of Renaissance sculpture, without copying Michelangelo's David, its pose, or its composition.\n\nPreserve Saber's unmistakable character design: finely carved bangs framing her face, hair gathered into her characteristic braided bun with a ribbon, a distinctive upward-curving forelock rendered as a carefully supported marble curl, and a calm, resolute expression conveying quiet chivalric dignity. Translate her iconic armored dress into monochrome marble: an articulated breastplate, sculpted pauldrons, armored gauntlets, a fitted high-neck bodice, and a long, layered skirt with recognizable decorative borders and richly carved fabric folds. The garments ordinarily associated with blue fabric and silver armor are expressed entirely through marble form, texture, and finish, without pigment. She is fully clothed in a modest, non-revealing outfit; beauty emerges through balanced proportions, natural posture, and the interplay of armor and drapery. No animal ears, halo, school uniform, or scarf.\n\nCreate an original, quietly expressive contrapposto: her weight rests on one leg, the other foot advances slightly beneath the skirt, and her head turns gently away from the torso. Her right gauntleted hand rests lightly on the pommel of Excalibur, held vertically beside her right leg with its tip resting securely on the stone base; her left hand rests naturally beside the skirt. Render Excalibur as a recognizably elegant straight double-edged knightly sword with an ornate crossguard and decorated hilt, carved entirely from the same ivory-white marble, without colored metal or magical glow. Keep the sword visually distinct from her silhouette, with discreet structural connections to the base and neighboring drapery so the sculpture feels physically realizable. Preserve believable anatomy beneath the clothing, relaxed hands, and convincing physical balance. Long folds in the skirt introduce restrained diagonal movement against the crisp planes of the armor.\n\nCarve the entire figure, armor, clothing, and sword from luminous ivory-white marble with subtle natural veining, delicately polished facial planes, crisp edges, and faint chisel traces in recessed folds. Distinguish armor from fabric through smoother reflective stone planes versus softer, gently textured folds, never through paint. No painted skin, plastic surfaces, toy-like proportions, or exaggerated anatomy. Display the complete statue and its stone pedestal in a spacious museum gallery, with warm gray walls and generous negative space. Soft, directional light from high on the left reveals the sculptural volume, with gentle ambient fill preserving shadow detail.\n\nA separate, elegant museum placard beside the pedestal bears the clearly legible text “Artoria Pendragon” and, beneath it, “Saber — Fate”. Vertical 9:16 composition, slightly low viewpoint, restrained perspective, full figure visible from the top of her forelock to the bottom of the pedestal, including the entire sword, with no cropped hair, feet, or base. Photorealistic fine-art sculpture photography: serene, dignified, and materially convincing.",
+   "negative_prompt": "",
+   "height": 1360,
+   "width": 768,
+   "steps": 50,
+   "cfg": 3.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset014_base": {
+   "id": "asset014_base",
+   "model": "base",
+   "prompt": "{\"summary\":{\"meta\":[\"photograph\"],\"canvas\":\"single\",\"caption\":\"A high-quality indoor photograph captures a male and female fitness trainer guiding a male client through a weighted squat exercise in a modern gym. The scene is brightly lit with overhead industrial lights, emphasizing the texture of the gym equipment and the athletic wear. The composition is a medium-wide shot with a shallow depth of field, focusing on the three men while the background of gym machinery and motivational posters is softly blurred. The overall mood is focused and professional, with a neutral color palette punctuated by the trainers' black attire and the green towel.\"},\"items\":[{\"label\":\"panel\",\"caption\":\"A full-canvas shot of a gym session. A client is squatting with a barbell, flanked by two trainers. The background features gym walls with motivational text and various strength training equipment. The lighting is bright and diffuse, creating a professional fitness atmosphere.\",\"tags\":[\"gym\",\"fitness\",\"workout\",\"training\",\"squat\"],\"palette\":[\"#2A2A2A\",\"#7B7B7B\",\"#FFFFFF\",\"#A3B18A\"],\"bbox\":[-888,-592,887,591]},{\"label\":\"object\",\"caption\":\"A man in a focused squat position, wearing a grey heathered t-shirt, black athletic shorts, white crew socks, and white New Balance sneakers. He is supporting a loaded barbell across his upper back and shoulders, looking forward with a concentrated expression. His pose is stable, with knees bent and hips lowered.\",\"tags\":[\"man\",\"client\",\"squatting\",\"athletic_wear\"],\"palette\":[\"#B0B0B0\",\"#1A1A1A\",\"#FFFFFF\",\"#E8C3B9\"],\"bbox\":[-164,-196,766,401]},{\"label\":\"object\",\"caption\":\"A muscular man standing on the left, wearing a black t-shirt with 'MORE TO BE A BETTER YOU' printed in white and black athletic pants. He is leaning forward, observing the client's form and extending his right hand to provide stability or a cue. His gaze is directed downward toward the trainee.\",\"tags\":[\"trainer\",\"man\",\"spotting\",\"fitness_coach\"],\"palette\":[\"#1A1A1A\",\"#D2B48C\",\"#FFFFFF\"],\"bbox\":[-706,-592,736,-138]},{\"label\":\"object\",\"caption\":\"A man standing on the right in a black tank top, black athletic pants, and a black baseball cap. He is leaning slightly forward, watching the client's form, with a neon green towel draped over his left shoulder. His expression is focused and attentive.\",\"tags\":[\"trainer\",\"man\",\"observing\",\"fitness_coach\"],\"palette\":[\"#1A1A1A\",\"#D2B48C\",\"#90EE90\"],\"bbox\":[-565,166,686,591]},{\"label\":\"object\",\"caption\":\"A silver steel barbell resting on the trainee's traps. It is loaded with large black rubber weight plates. A white towel is placed on the bar across the trainee's shoulders for padding. The barbell spans the width of the central composition.\",\"tags\":[\"barbell\",\"weightlifting\",\"equipment\"],\"palette\":[\"#000000\",\"#C0C0C0\",\"#FFFFFF\"],\"bbox\":[-359,-592,201,591]},{\"label\":\"object\",\"caption\":\"A stack of black weight plates on the left side of the barbell, featuring the text 'TECHNOGYM 20 KG' in white. The plates are circular and made of dense rubberized material.\",\"tags\":[\"weight_plate\",\"Technogym\"],\"palette\":[\"#1A1A1A\",\"#FFFFFF\"],\"bbox\":[-219,-592,201,-406]},{\"label\":\"object\",\"caption\":\"A stack of black weight plates on the right side of the barbell, similarly branded 'TECHNOGYM 20 KG'.\",\"tags\":[\"weight_plate\",\"Technogym\"],\"palette\":[\"#1A1A1A\",\"#FFFFFF\"],\"bbox\":[-352,505,-69,591]},{\"label\":\"text\",\"caption\":\"Large, stylized dark grey text painted on a textured concrete-style wall in the background.\",\"tags\":[\"motivational\",\"wall_art\"],\"palette\":[\"#333333\",\"#C0C0C0\"],\"bbox\":[-805,-122,-548,122],\"text\":\"STRONGER\\nHAPPIER\\nA BETTER YOU\"},{\"label\":\"text\",\"caption\":\"Dark grey text on a black wall section in the upper right background.\",\"tags\":[\"motivational\",\"wall_art\"],\"palette\":[\"#333333\",\"#1A1A1A\"],\"bbox\":[-888,300,-731,435],\"text\":\"DISCIPLINE\\nBUILDS\\nFREEDOM\"},{\"label\":\"object\",\"caption\":\"Various silver and black gym machines, including a squat rack and cable stations, blurred in the background to create depth.\",\"tags\":[\"gym_equipment\",\"squat_rack\"],\"palette\":[\"#404040\",\"#C0C0C0\"],\"bbox\":[-666,-327,302,418]},{\"label\":\"text\",\"caption\":\"Small white sans-serif text printed on the chest of the left trainer's black t-shirt.\",\"tags\":[\"clothing_text\"],\"palette\":[\"#FFFFFF\",\"#1A1A1A\"],\"bbox\":[-430,-485,-360,-363],\"text\":\"MORE TO BE\\nA BETTER YOU\"},{\"label\":\"object\",\"caption\":\"A neon green terry cloth towel draped over the right trainer's left shoulder, with small black text printed on it.\",\"tags\":[\"towel\",\"gym_accessory\"],\"palette\":[\"#90EE90\",\"#000000\"],\"bbox\":[-430,385,-191,500]},{\"label\":\"text\",\"caption\":\"Small black text printed vertically on the green towel.\",\"tags\":[\"clothing_text\"],\"palette\":[\"#000000\",\"#90EE90\"],\"bbox\":[-381,409,-253,475],\"text\":\"TRAIN\\nBETTER\\nLIVE\\nBETTER\"}],\"bbox_coord_space\":\"abs_centralized\",\"bbox_format\":\"yxyx\"}",
+   "negative_prompt": "",
+   "height": 1776,
+   "width": 1184,
+   "steps": 50,
+   "cfg": 3.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset015_base": {
+   "id": "asset015_base",
+   "model": "base",
+   "prompt": "生成4:3黑白悬疑电影剧照，室内一位成年侦探坐在桌边。画面左侧可见半幅百叶窗，窗外强硬光透进来，在人物脸部、白衬衫和后墙上形成同一组方向一致的窄条阴影；条纹随表面转折与遮挡发生合理变化，不能像屏幕贴纸一样跨过人物外轮廓直接贴到所有物体上。人物一半面部明亮，另一半较暗，眼睛仍可见。桌上一只黑色有线电话，听筒放在座机上。无烟雾、无霓虹、无文字、无黑边。",
+   "negative_prompt": "worst quality, bad anatomy",
+   "height": 880,
+   "width": 1184,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 6,
+   "uncond_skip_layers": [
+    26
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset016_base": {
+   "id": "asset016_base",
+   "model": "base",
+   "prompt": "A hotel room lit only by a warm bedside lamp. The white sheets on the double bed are rumpled, pillows stacked against the headboard. A cosplayer portraying Hanako from Blue Archive lies on her side along the edge of the bed, long pink hair spilling over one shoulder, a loose braid on the other, a white flower clip still pinned near her ear. Green contacts meet the camera. A thin wire-and-LED halo glows pale pink above her head.\nShe is still in Hanako’s white sailor uniform: short sleeves, pink neck ribbon, gold buttons. The pleated skirt rides a little from the pose, showing the tops of white knee-high socks. The small jacket-style bag and prop gun rest at the foot of the bed, out of her hands. One hand props her cheek; the other lightly tugs the end of the ribbon. Knees together, calves crossed, torso leaning slightly forward. Lips parted, ears faintly flushed, gaze held on the lens as if the flash caught her mid-pose.\nBackground is only beige curtains, an unopened bottle of water on the nightstand, and the brown school bag on the carpet.",
+   "negative_prompt": "",
+   "height": 1184,
+   "width": 880,
+   "steps": 50,
+   "cfg": 3.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    24
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset017_base": {
+   "id": "asset017_base",
+   "model": "base",
+   "prompt": "{\"scene_type\":\"Anime-style summer beach ensemble with five characters\",\"gen_brief\":\"Ultra-wide panoramic beach vacation illustration, aspect ratio 4:1. Recompose for a wide banner rather than stretching or vertically cropping a conventional image. Feature Shiroko, Hoshino, Yuuka, Hina, and Yuzu from Blue Archive, preserving their recognizable identity features and individual halos. Shiroko sits at the left eating a popsicle; Hoshino leans forward in the rear center-left, holding a beach ball and waving toward the viewer; Yuuka sits on a beach chair in the rear center-right, holding a blue drink; Hina reclines sideways across the lower center on a beach blanket; Yuzu sits at the far right hugging a penguin plush. Spread the ensemble horizontally with shallow foreground-to-background layering, moderate natural overlap, all five faces clearly visible, and complete halos within the frame. Maintain natural anatomy, consistent head sizes, round props, and comfortable spacing; do not stretch bodies or objects to fill their boxes. All wear opaque, properly fitted summer swimwear with lightweight sun-protective cover-ups. Keep the mood cheerful, cute, and non-sexualized, without emphasizing breasts, buttocks, or crotches. The background contains a broad turquoise sea, blue sky, white clouds, palm trees, and a wooden pier, with a large beach umbrella framing the upper-right area. Keep the horizon near the upper third and foreground props in a narrow lower band. Place watermelon, chilled drinks, a sandcastle, and a small crab in the foreground. Detailed Japanese anime illustration, luminous blue-and-white palette with pink, purple, and orange accents, soft sunlight, natural reflected light, finely rendered hair and fabric folds. No text or watermarks. All bounding boxes use normalized coordinates in [y_min,x_min,y_max,x_max] order. Character boxes approximately encompass their poses and overhead halos; natural overlap between characters is intentional.\",\"elements\":[{\"type\":\"panel\",\"salience\":\"background\",\"identity\":\"Panoramic tropical beach background: blue sky and white clouds above, turquoise seawater with delicate white surf in the middle distance, and warm ivory sand below. Keep distant scenery bright and uncluttered so it does not compete with the characters.\",\"bbox\":[-360,-1440,360,1440]},{\"type\":\"obj\",\"salience\":\"background\",\"identity\":\"Palm trees in the upper-left corner: trunks lean along the left edge, green fronds hang into the frame from above, and a few seaside buildings appear in the distance.\",\"bbox\":[-360,-1440,-21,-921]},{\"type\":\"obj\",\"salience\":\"background\",\"identity\":\"Large white beach umbrella: the canopy stretches from the upper center to the upper-right edge. Its dark pole stands slightly right of center, behind the characters, without crossing any face.\",\"bbox\":[-360,158,108,1368]},{\"type\":\"obj\",\"salience\":\"background\",\"identity\":\"Distant wooden pier and small pavilion on the right, extending horizontally into the blue sea, with low green islands on the horizon.\",\"bbox\":[-170,748,-57,1440]},{\"type\":\"obj\",\"salience\":\"background\",\"identity\":\"Dark folding beach chairs on the left and center-right support Shiroko and Yuuka in their seated poses, mostly obscured by the characters through natural overlap.\",\"bbox\":[-98,-1340,296,735]},{\"type\":\"obj\",\"salience\":\"background\",\"identity\":\"Blue-and-white checkered beach blanket extending from the bottom edge toward the center, with natural folds, serving as the visual base for Hina and the foreground still life.\",\"bbox\":[115,-1095,360,1268]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Shiroko, seated in the left foreground: long silver-gray hair, gray wolf ears, blue eyes, a cyan crossed hair clip, and a cyan geometric halo overhead. She wears black-and-white swimwear with a loose, light-colored sun-protective jacket. Her knees point toward the center as she calmly looks toward the viewer, holding a blue popsicle near her lips. Her face is approximately at 13% of the image width and 36% of its height, measured from the top-left.\",\"bbox\":[-310,-1340,332,-720]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Hoshino, in the rear center-left: long pink hair with a prominent upward-curving tuft and a pink ring-shaped halo, winking with a cheerful smile. She wears light-colored ruffled swimwear and an open sun-protective cover-up. Leaning slightly toward the viewer, she reaches one hand forward and toward the upper left in greeting while holding a colorful beach ball with the other arm. Her face is at approximately 32% width and 30% height. She is slightly behind and to the image-right of Shiroko, with her lower body partly obscured by the foreground blanket and Hina.\",\"bbox\":[-335,-764,260,-187]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Colorful inflatable beach ball held by Hoshino, with pale pink, pale yellow, pale blue, and white panels. Bright and round, it sits on the image-right side of her torso, below her face.\",\"bbox\":[-51,-418,152,-216]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Yuuka, seated in the rear center-right: dark purple twin-tails, purple eyes, square hair accessories, and an elliptical halo with a dark outline and a thin cyan accent. She sits on a beach chair wearing dark swimwear and a light-colored sun-protective jacket draped naturally from her shoulders. One hand rests against the side of her face while the other holds a blue drink; she looks gently toward the viewer. Her face is at approximately 68% width and 30% height. Her legs extend toward the center and are partially obscured by Hina in front.\",\"bbox\":[-332,216,285,792]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Clear stemmed glass held by Yuuka, filled with a blue iced drink and decorated with a slender straw, a lemon slice, and a small flower. Positioned in front of her on the image-left side of her torso without obscuring her face.\",\"bbox\":[-47,311,137,418]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Hina, reclining sideways across the lower-center foreground: long silver-white hair spreads over the blanket, with purple eyes, black horns, a small gold hair clip, and a pointed purple geometric halo. She wears black swimwear with a few bow accents, resting her head gently on her hands and a black cushion, with a quiet, relaxed expression. Her head is at approximately 53% width and 65% height; her body and naturally bent legs extend toward the lower left, creating a relaxed horizontal pose across the lower center. Keep her face and halo in the open space between Hoshino and Yuuka, with a head size comparable to the other characters. Hair, clothing, and the blanket provide natural coverage without emphasizing intimate body areas.\",\"bbox\":[-108,-648,335,332]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"Yuzu, in the far-right foreground: orange-red hair styled with braids and a low gathered bun, with a golden-orange circular halo. She wears light-colored swimwear and a loose sun-protective cover-up, sitting at the edge of the beach blanket with her eyes happily closed and a broad smile, hugging a round penguin plush in both arms. Her face is at approximately 88% width and 37% height. Keep her face, halo, and plush fully visible, with a little breathing room at the right edge.\",\"bbox\":[-296,849,332,1368]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Penguin plush in Yuzu's arms: black outer body, a round white belly, a small yellow beak and little yellow wings, and pink cheeks. Soft and cute, it covers part of her torso.\",\"bbox\":[32,979,256,1224]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Low wooden table and summer still life in the lower-left foreground: triangular watermelon slices, a few pieces of yellow fruit, and clear glasses of blue and orange iced drinks with straws and small flower garnishes. A camping lantern and a water bottle with a cat motif sit along the far-left edge and may be partially cropped. No object obscures a character's face.\",\"bbox\":[212,-1440,360,-619]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Sandcastle in the lower-right foreground: fine sand shaped into a small castle with towers and battlements, topped with small decorations and surrounded by scattered seashells. Positioned below and in front of Yuzu's plush without obscuring her expression.\",\"bbox\":[190,682,353,951]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Small red crab in front of the sandcastle at the lower right, with round eyes and both claws raised, adding a playful, cute foreground accent.\",\"bbox\":[273,950,342,1052]}],\"bbox_coord_space\":\"abs_centralized\"}",
+   "negative_prompt": "worst quality, bad anatomy",
+   "height": 720,
+   "width": 2880,
+   "steps": 50,
+   "cfg": 3.0,
+   "shift": 5.0,
+   "seed": 88,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset018_base": {
+   "id": "asset018_base",
+   "model": "base",
+   "prompt": "A candid classroom photograph, slightly off-center, with a worn dark green chalkboard filling most of the frame. Uneven window light, soft shadows, chalk dust, eraser streaks, subtle camera grain. Visible board frame and chalk tray, a blurred desk corner in the foreground. Natural, slightly irregular white chalk handwriting—not polished typography or a flat blackboard graphic. Keep all text sharp, fully visible, and free of glare.\n\nThe chalkboard reads exactly:\n\n\"MOSS-Transcribe-Diarize is our flagship SOTA model family\nfor turning real-world long-form audio into structured,\nspeaker- aware transcripts in one pass. Instead of stitching\ntogether separate ASR and diarization systems, these\nmodels jointly perform speech transcription and speaker\ndiarization, producing time-aligned text with precise\ntimestamps and consistent speaker labels such as [S01], [S02], and beyond.\"",
+   "negative_prompt": "worst quality, bad anatomy, ugly face",
+   "height": 768,
+   "width": 1360,
+   "steps": 50,
+   "cfg": 3.0,
+   "shift": 6.0,
+   "seed": 2051794908,
+   "uncond_skip_layers": [],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset019_base": {
+   "id": "asset019_base",
+   "model": "base",
+   "prompt": "masterpiece, best quality, highres, most attractive face\n生成一个穿JK短裙的少女，长得非常非常好看的那种类型的。",
+   "negative_prompt": "worst quality, low quality, blurry, jpeg artifacts, bad anatomy",
+   "height": 1184,
+   "width": 880,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset020_base": {
+   "id": "asset020_base",
+   "model": "base",
+   "prompt": "A cinematic, photorealistic nighttime scene of a small neighborhood convenience store on a quiet, rain-soaked street. The warmly illuminated storefront occupies the right half of the frame, while the street recedes into soft mist on the left. A lone young adult wearing a charcoal coat stands just outside the entrance beneath a transparent umbrella, seen in three-quarter rear view, gazing through the glass. Amber light reveals shelves inside and spills across the sidewalk, mingling with muted teal neon reflections in shallow puddles. Individual raindrops bead on the umbrella and catch the storefront light; fine streaks of rain remain visible against the darker street. A slightly weathered bicycle leans beside the entrance. Distant apartment windows and a few out-of-focus streetlights add depth without distracting from the figure. Eye-level wide shot, 35mm lens aesthetic, natural perspective, balanced negative space, restrained teal-and-amber color grading, realistic wet asphalt and glass textures, soft highlight bloom, subtle film grain, and gentle atmospheric depth. Quiet, intimate, and nostalgic rather than dramatic; believable lighting, with the figure clearly silhouetted against the warm window. No prominent readable lettering, logos, or watermarks.",
+   "negative_prompt": "worst quality, bad anatomy",
+   "height": 944,
+   "width": 1680,
+   "steps": 50,
+   "cfg": 3.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    26
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset001_sft": {
+   "id": "asset001_sft",
+   "model": "sft",
+   "prompt": "{\"scene_type\":\"natural roadside environmental photograph with a humorous Chinese notice sign\",\"gen_brief\":\"A relaxed, photorealistic environmental photograph at pedestrian eye level along a quiet rural road. A battered dark green notice sign stands on the gravel-and-grass shoulder, naturally integrated into the landscape and occupying approximately one fifth of the image area. The road fills much of the left and lower frame and curves toward distant trees; sky, irregular foliage and ample foreground provide breathing room. Preserve the main sign body's approximately 30-degree perspective yaw, left edge nearer and right edge receding, plus its 15-degree clockwise lean in the image plane. Keep the camera and horizon level. Two visibly bent, kinked galvanized posts bow right above firmly planted bases and remain attached to the board. The sign has a pronounced LOCALIZED, asymmetric sheet-metal fold, not a uniformly curved or globally bent surface. Most of the left, center and lower board remains approximately flat in its existing orientation. Only an upper-right patch folds toward the camera approximately 35 degrees relative to that main plane, along a diagonal plastic crease running from near (820, 555) at the top edge to near (980, 950) at the right edge. The corner tip projects near (1030, 605). This produces two distinct connected surface orientations, a sharply kinked outline, an irregular crease ridge, small compression wrinkles, chipped paint along the fold and a narrow self-shadow. The bent patch is part of the same continuous metal sheet, not a detached plate, pasted-on triangle or missing chunk. Avoid a smooth cylindrical bow, a symmetrical V-fold, a fold across the entire width or mere additional rigid rotation. Keep the local damage clearly visible but do not fold the printed face shut or hide substantial text. Add restrained edge dents, rusty scratches, exposed dull metal and two small punctures in blank margins. No flames, smoke, weapons or active conflict. Ordinary photographic perspective, soft afternoon daylight, restrained colors, dust and grass at the feet; no strong glare, dramatic spotlight or artificial background blur. The scuffed thin white border follows both the overall perspective and the local crease. The official design contrasts with the humorous essay. The three text objects are a centered white heading and two body columns read down the left column then down the right. Every glyph is printed on the physical metal: most text follows the original yaw and clockwise lean, while the upper-right text fragments crossing the crease bend with the local folded patch. Their baselines change direction at the crease and their local spacing foreshortens naturally; no floating upright text, straight lettering across a bent surface, duplicated words or erased passages. Preserve the near left column's larger scale and far right column's reduced scale. Axis-aligned text boxes are enclosing guides, not visible rectangles; their envelopes may overlap, but actual printed columns remain separate. Approximate base-plane column guides in top-left, top-right, bottom-right, bottom-left order are: left (523, 567), (768, 632), (590, 1299), (345, 1233); right (784, 666), (1010, 726), (848, 1331), (622, 1270). These guide the undamaged layout only; locally warp the upper-right fragments to the folded surface instead of enforcing a single planar projection across the entire sign. The text objects' identity strings are the exact Chinese lettering. Preserve every character and explicit newline, including blank paragraph lines; never print escape sequences literally. Use a bold Chinese sans-serif heading approximately 49 pixels high before rotation, body lettering approximately 12 pixels on the near side decreasing toward the far side, and approximately 16-pixel near-column and 15-pixel far-column line spacing before projection. Keep six paragraphs per column and the entire essay. The heading remains noticeable while the body appears as naturally small, dense information at this distance. Do not enlarge the sign to fill the frame. No additional lettering, logos or watermarks.\",\"elements\":[{\"type\":\"panel\",\"salience\":\"background\",\"identity\":\"An expansive, natural rural roadside setting. Muted blue sky and distant treetops fill the upper area. A quiet gray asphalt road enters from the lower left and bends toward a vanishing point near the center-left, with an irregular gravel shoulder on its right. Layered green trees, shrubs and tall grass frame the scene, especially along the right edge. The foreground includes textured gravel and small weeds. Soft afternoon daylight and gentle foliage shadows create a casual, believable outdoor photograph. Keep the space behind the sign free of intrusive branches.\",\"bbox\":[-880,-584,880,584]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Two visibly bent galvanized metal signposts, still attached behind the lower edge of the leaning board. The nearer left post runs from a planted base near (395, 1580), through a flattened kink near (414, 1450), to its attachment near (448, 1285). The farther right post runs from a base near (680, 1550), through a bowed kink near (706, 1430), to its attachment near (755, 1330). Both upper sections bend right, coherently supporting the clockwise lean. Include small compression creases, scratched zinc, localized rust at the bends, firmly embedded bases, weeds and soft ground-contact shadows.\",\"bbox\":[390,-204,715,191]},{\"type\":\"panel\",\"salience\":\"secondary\",\"identity\":\"A modest battered dark green roadside information board with a mostly flat main body at approximately 30 degrees yaw and 15 degrees clockwise lean. The metal is locally folded rather than globally curved: a diagonal crease from near (820, 555) to (980, 950) separates an upper-right patch that bends toward the camera by approximately 35 degrees. Approximate outer contour proceeds through (530, 442), (820, 555), the displaced folded tip (1030, 605), (980, 950), (866, 1350), and (310, 1263). The white border visibly kinks at the local fold transitions. Most of the left and lower board remains flat; the folded patch stays physically continuous with it. Include chipped paint, shallow dents, rusty scratches, two small margin punctures and exposed dull metal. Preserve all printed content, deforming affected lettering with the bent metal rather than removing it. The sign remains attached to its bent posts and fully within the frame at the existing environmental scale.\",\"bbox\":[-438,-274,471,472]},{\"type\":\"obj\",\"salience\":\"secondary\",\"identity\":\"Localized upper-right folded region of the SAME sign face, not a separate object or an overlay. A sharp but irregular diagonal crease runs from (820, 555) to (980, 950). The patch on its upper-right side tips toward the camera by about 35 degrees, with its outer tip near (1030, 605). Show a narrow highlight on the crease ridge, subtle self-shadow, a few short buckling wrinkles, fractured green paint and a sliver of dull metal at the outer lip. The existing heading and right-column fragments on this patch remain printed on its surface and warp with it. Do not duplicate any text. The rest of the board does not share this extra bend.\",\"bbox\":[-340,221,85,461]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"不一定\",\"bbox\":[-352,62,-215,326]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"前方不一定有路，但一定有故事。\\n欢迎来到本路段，请带好随身物品、\\n剩余理智，以及你那经不起月底检查的\\n钱包。如果不知道自己要去哪里，\\n也不用紧张，你已经和本路段百分之八十的\\n旅客达成了精神上的会合。\\n\\n导航说前方左转，不代表命运准备放过你；\\n导航说重新规划，也不代表它心里有数。\\n它只是一个没有绩效奖金的电子打工人，\\n请不要因为它偶尔沉默，就误以为它正在\\n替你思考人生，它可能只是没信号。\\n\\n本路段禁止和生活较劲，禁止替老板操心，\\n禁止在深夜反复回忆三年前说错的一句话。\\n别人早就忘了，只有你的大脑还在坚持\\n重播，并且没有跳过片头功能。建议把\\n这份敬业用在睡觉上，不必向枕头提交\\n复盘报告。\\n\\n如遇上坡，说明道路正在上坡，请勿擅自\\n理解为上天要降大任于你。如遇下坡，\\n也不代表人生终于开始奖励你，先看看\\n刹车。道路只负责高低起伏，不负责励志\\n演讲，更不出售坚持一下就能发财的\\n内部课程。\\n\\n距离成功还有多远，本路牌暂时无法回答。\\n毕竟我从上班第一天起就站在这里，\\n日晒雨淋，全年无休，从未升职。隔壁\\n新来的减速带都有人天天惦记，而我只有\\n在别人迷路的时候，才能获得一次短暂\\n而真诚的注视。\\n\\n请勿羡慕旁边跑得比你快的车辆，你不知道\\n人家是赶着见喜欢的人，还是赶着去处理\\n更大的麻烦。人生不是超车比赛，没必要\\n每次被超过都自动播放悲壮音乐。你只是\\n开得慢了一点，不是家族的荣耀突然\\n断送在了这里。\",\"bbox\":[-314,-240,419,185]},{\"type\":\"obj\",\"salience\":\"primary\",\"identity\":\"前方设有休息区域，可供停车、喝水，\\n以及暂时承认自己确实有点累。休息不是\\n失败，手机电量不足都知道进入省电模式，\\n人类却喜欢一边眼神涣散，一边宣布自己\\n还能再撑。请尊重身体，它没有原装\\n备用机。\\n\\n若同行的人问你怎么还没到，请平静回答：\\n我们正在以符合物理规律的速度接近\\n目的地。若对方继续追问，你可以请其\\n负责剥橘子。经过本路牌长期观察，很多\\n旅途中的哲学争论，最后都能靠一点\\n水果解决。\\n\\n本路段偶有大风，可能吹乱发型，但一般\\n吹不走烦恼，请勿抱有过高期待。如需\\n放下过去，建议先放下手里已经凉了的\\n半杯奶茶。有些东西舍不得扔，不是因为\\n它还值得，而是因为你清楚记得自己\\n花了多少钱。\\n\\n如果你已经迷路，请保持微笑，至少今天\\n确实走出了舒适圈。不要着急发布人生\\n感悟，先确认油量、电量和最近的厕所。\\n成年人真正的安全感，有时候不是存款\\n后面的零，而是远远看见一个正在营业的\\n卫生间。\\n\\n前方没有标准答案，只有一家面馆。建议\\n先吃，梦想可以稍后再谈。点大碗不代表\\n贪心，点小碗也不代表格局有限，加不加\\n香菜更不需要上升到价值观。你有权在\\n这个复杂的世界里，单纯决定自己今天\\n想吃什么。\\n\\n感谢阅读本路牌。你可能已经发现，这块\\n牌子没有提供多少有效方向，却成功占用\\n了你不少时间，这说明它具备一定的会议\\n属性。最后提醒：请在安全停车后阅读，\\n开车不要分心。祝你一路平安，至于能否\\n一路发财，不一定。\",\"bbox\":[-215,38,451,427]}],\"bbox_coord_space\":\"abs_centralized\"}",
+   "negative_prompt": "nsfw, worst quality, bad anatomy, watermark, jpeg artifact",
+   "height": 1776,
+   "width": 1184,
+   "steps": 50,
+   "cfg": 3.0,
+   "shift": 5.0,
+   "seed": 111769238,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset005_sft": {
+   "id": "asset005_sft",
+   "model": "sft",
+   "prompt": "多层折叠式纸雕立体绘本，放在一张书桌上，背景纯净突出主题，比例 3:2 横版。翻开的跨页呈现「哪吒闹海」的场景：脚踏风火轮的少年、翻涌的层叠海浪与龙宫剪影，所有元素皆可精细折叠组合，呈现逼真细腻的纸张折叠质感与多层景深。构图统一采用正面视角，整体视觉梦幻唯美，色彩缤纷绚丽，充满奇幻生动的故事氛围。",
+   "negative_prompt": "worst quality, bad anatomy, ugly face",
+   "height": 1024,
+   "width": 1536,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 2570432421,
+   "uncond_skip_layers": [
+    26
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset009_sft": {
+   "id": "asset009_sft",
+   "model": "sft",
+   "prompt": "general, 1girl, best quality, most attractive face, cosplay, amiya (arknights), with \"Rhodes Island\" on her clothes, carring a sword",
+   "negative_prompt": "worst quality, bad anatomy",
+   "height": 1536,
+   "width": 1024,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 0,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset015_sft": {
+   "id": "asset015_sft",
+   "model": "sft",
+   "prompt": "生成4:3黑白悬疑电影剧照，室内一位成年侦探坐在桌边。画面左侧可见半幅百叶窗，窗外强硬光透进来，在人物脸部、白衬衫和后墙上形成同一组方向一致的窄条阴影；条纹随表面转折与遮挡发生合理变化，不能像屏幕贴纸一样跨过人物外轮廓直接贴到所有物体上。人物一半面部明亮，另一半较暗，眼睛仍可见。桌上一只黑色有线电话，听筒放在座机上。无烟雾、无霓虹、无文字、无黑边。",
+   "negative_prompt": "worst quality, bad anatomy",
+   "height": 880,
+   "width": 1184,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 6,
+   "uncond_skip_layers": [
+    26
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  },
+  "asset019_sft": {
+   "id": "asset019_sft",
+   "model": "sft",
+   "prompt": "masterpiece, best quality, highres, most attractive face\n生成一个穿JK短裙的少女，长得非常非常好看的那种类型的。",
+   "negative_prompt": "worst quality, low quality, blurry, jpeg artifacts, bad anatomy",
+   "height": 1184,
+   "width": 880,
+   "steps": 50,
+   "cfg": 5.0,
+   "shift": 5.0,
+   "seed": 42,
+   "uncond_skip_layers": [
+    22
+   ],
+   "slg_layers": [],
+   "slg_scale": 0.0,
+   "slg_start": 0.0,
+   "slg_stop": 1.0,
+   "max_sequence_length": 4096,
+   "golden": false
+  }
+ },
+ "results": {
+  "asset001_base": {
+   "id": "asset001_base",
+   "model": "base",
+   "height": 1776,
+   "width": 1184,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 2522,
+   "uncond_tokens": 23,
+   "load_s": 5.132781847999922,
+   "denoise_s": 393.00893350399997,
+   "decode_s": 1.663581966000038,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 7.8569551450000015,
+   "step0_s": 8.017720993000012,
+   "torch_peak_alloc_gib": 14.258296489715576,
+   "torch_peak_reserved_gib": 14.275390625,
+   "nvml_peak_gib": 14.56640625,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 1.4166221618652344,
+   "sdpa_backend": "default"
+  },
+  "asset002_base": {
+   "id": "asset002_base",
+   "model": "base",
+   "height": 1680,
+   "width": 944,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 1465,
+   "uncond_tokens": 21,
+   "load_s": 5.132781847999922,
+   "denoise_s": 267.1345854420001,
+   "decode_s": 0.9719800709999618,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 5.34640014493877,
+   "step0_s": 5.160597607999989,
+   "torch_peak_alloc_gib": 13.1356201171875,
+   "torch_peak_reserved_gib": 14.275390625,
+   "nvml_peak_gib": 14.56640625,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 1.4338569641113281,
+   "sdpa_backend": "default"
+  },
+  "asset003_base": {
+   "id": "asset003_base",
+   "model": "base",
+   "height": 4096,
+   "width": 512,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 2026,
+   "uncond_tokens": 21,
+   "load_s": 5.132781847999922,
+   "denoise_s": 379.4899471059998,
+   "decode_s": 5.28157404600006,
+   "decode_offloaded_dit": true,
+   "step_s_mean": 7.599559583469393,
+   "step0_s": 7.1112165919998915,
+   "torch_peak_alloc_gib": 12.37175703048706,
+   "torch_peak_reserved_gib": 14.275390625,
+   "nvml_peak_gib": 14.56640625,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 10.923332214355469,
+   "sdpa_backend": "default"
+  },
+  "asset004_base": {
+   "id": "asset004_base",
+   "model": "base",
+   "height": 1184,
+   "width": 1776,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 1937,
+   "uncond_tokens": 10,
+   "load_s": 5.132781847999922,
+   "denoise_s": 379.809439008,
+   "decode_s": 4.415169072000026,
+   "decode_offloaded_dit": true,
+   "step_s_mean": 7.5964825683877555,
+   "step0_s": 7.581412228999852,
+   "torch_peak_alloc_gib": 12.377870559692383,
+   "torch_peak_reserved_gib": 13.810546875,
+   "nvml_peak_gib": 14.1015625,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 10.948799133300781,
+   "sdpa_backend": "default"
+  },
+  "asset005_base": {
+   "id": "asset005_base",
+   "model": "base",
+   "height": 1024,
+   "width": 1536,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 106,
+   "uncond_tokens": 19,
+   "load_s": 5.132781847999922,
+   "denoise_s": 234.80826242000012,
+   "decode_s": 0.9411536460002026,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 4.70096106328572,
+   "step0_s": 4.4608328019999135,
+   "torch_peak_alloc_gib": 13.65971326828003,
+   "torch_peak_reserved_gib": 14.337890625,
+   "nvml_peak_gib": 14.62890625,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 6.554027557373047,
+   "sdpa_backend": "default"
+  },
+  "asset006_base": {
+   "id": "asset006_base",
+   "model": "base",
+   "height": 1456,
+   "width": 1088,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 1415,
+   "uncond_tokens": 10,
+   "load_s": 5.132781847999922,
+   "denoise_s": 265.2855712370001,
+   "decode_s": 0.925718102999781,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 5.3121821205306095,
+   "step0_s": 4.988240438000048,
+   "torch_peak_alloc_gib": 13.698815822601318,
+   "torch_peak_reserved_gib": 14.359375,
+   "nvml_peak_gib": 14.650390625,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 5.7395172119140625,
+   "sdpa_backend": "default"
+  },
+  "asset007_base": {
+   "id": "asset007_base",
+   "model": "base",
+   "height": 1776,
+   "width": 1184,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 282,
+   "uncond_tokens": 15,
+   "load_s": 5.132781847999922,
+   "denoise_s": 331.03221914200003,
+   "decode_s": 4.168231683000158,
+   "decode_offloaded_dit": true,
+   "step_s_mean": 6.627410848224483,
+   "step0_s": 6.288730184000087,
+   "torch_peak_alloc_gib": 12.364402294158936,
+   "torch_peak_reserved_gib": 14.361328125,
+   "nvml_peak_gib": 14.65234375,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 10.966346740722656,
+   "sdpa_backend": "default"
+  },
+  "asset008_base": {
+   "id": "asset008_base",
+   "model": "base",
+   "height": 1360,
+   "width": 768,
+   "steps_requested": 30,
+   "steps_run": 30,
+   "cond_tokens": 1474,
+   "uncond_tokens": 33,
+   "load_s": 5.132781847999922,
+   "denoise_s": 102.22815928,
+   "decode_s": 0.5552082580002207,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 3.4114772116896535,
+   "step0_s": 3.294977086000017,
+   "torch_peak_alloc_gib": 12.533217906951904,
+   "torch_peak_reserved_gib": 13.173828125,
+   "nvml_peak_gib": 13.46484375,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 5.739524841308594,
+   "sdpa_backend": "default"
+  },
+  "asset009_base": {
+   "id": "asset009_base",
+   "model": "base",
+   "height": 1536,
+   "width": 1024,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 46,
+   "uncond_tokens": 16,
+   "load_s": 5.132781847999922,
+   "denoise_s": 231.40935341400018,
+   "decode_s": 3.413817726999696,
+   "decode_offloaded_dit": true,
+   "step_s_mean": 4.628641070489795,
+   "step0_s": 4.605589505000353,
+   "torch_peak_alloc_gib": 11.69480848312378,
+   "torch_peak_reserved_gib": 14.302734375,
+   "nvml_peak_gib": 14.59375,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 10.960304260253906,
+   "sdpa_backend": "default"
+  },
+  "asset010_base": {
+   "id": "asset010_base",
+   "model": "base",
+   "height": 1024,
+   "width": 1536,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 823,
+   "uncond_tokens": 10,
+   "load_s": 5.132781847999922,
+   "denoise_s": 249.82307207800022,
+   "decode_s": 0.9239662999998473,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 4.997191273999992,
+   "step0_s": 4.960416371000065,
+   "torch_peak_alloc_gib": 13.665114879608154,
+   "torch_peak_reserved_gib": 14.013671875,
+   "nvml_peak_gib": 14.3046875,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 7.268833160400391,
+   "sdpa_backend": "default"
+  },
+  "asset011_base": {
+   "id": "asset011_base",
+   "model": "base",
+   "height": 944,
+   "width": 1680,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 3152,
+   "uncond_tokens": 16,
+   "load_s": 5.132781847999922,
+   "denoise_s": 312.217494814,
+   "decode_s": 3.2079885049997756,
+   "decode_offloaded_dit": true,
+   "step_s_mean": 6.244921975224482,
+   "step0_s": 6.215895828000612,
+   "torch_peak_alloc_gib": 11.734920501708984,
+   "torch_peak_reserved_gib": 14.021484375,
+   "nvml_peak_gib": 14.3125,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 11.119579315185547,
+   "sdpa_backend": "default"
+  },
+  "asset012_base": {
+   "id": "asset012_base",
+   "model": "base",
+   "height": 1488,
+   "width": 1056,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 1995,
+   "uncond_tokens": 10,
+   "load_s": 5.132781847999922,
+   "denoise_s": 279.2038106959999,
+   "decode_s": 0.9268768389993056,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 5.584642379673471,
+   "step0_s": 5.55587486299919,
+   "torch_peak_alloc_gib": 13.671087265014648,
+   "torch_peak_reserved_gib": 14.078125,
+   "nvml_peak_gib": 14.369140625,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 8.553035736083984,
+   "sdpa_backend": "default"
+  },
+  "asset013_base": {
+   "id": "asset013_base",
+   "model": "base",
+   "height": 1360,
+   "width": 768,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 650,
+   "uncond_tokens": 10,
+   "load_s": 5.132781847999922,
+   "denoise_s": 153.26089320400024,
+   "decode_s": 0.5516051419999712,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 3.0656712624489844,
+   "step0_s": 3.0426050149999355,
+   "torch_peak_alloc_gib": 12.527183055877686,
+   "torch_peak_reserved_gib": 14.08203125,
+   "nvml_peak_gib": 14.373046875,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 8.55303955078125,
+   "sdpa_backend": "default"
+  },
+  "asset014_base": {
+   "id": "asset014_base",
+   "model": "base",
+   "height": 1776,
+   "width": 1184,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 1355,
+   "uncond_tokens": 10,
+   "load_s": 5.132781847999922,
+   "denoise_s": 362.2404856610001,
+   "decode_s": 3.6772686350004733,
+   "decode_offloaded_dit": true,
+   "step_s_mean": 7.245218474428561,
+   "step0_s": 7.224407522000547,
+   "torch_peak_alloc_gib": 12.373359203338623,
+   "torch_peak_reserved_gib": 14.08203125,
+   "nvml_peak_gib": 14.373046875,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 11.1558837890625,
+   "sdpa_backend": "default"
+  },
+  "asset015_base": {
+   "id": "asset015_base",
+   "model": "base",
+   "height": 880,
+   "width": 1184,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 124,
+   "uncond_tokens": 16,
+   "load_s": 5.132781847999922,
+   "denoise_s": 142.46627755200007,
+   "decode_s": 0.5485632259997146,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 2.8501035073673586,
+   "step0_s": 2.810876138999447,
+   "torch_peak_alloc_gib": 12.517153263092041,
+   "torch_peak_reserved_gib": 13.5546875,
+   "nvml_peak_gib": 13.845703125,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 9.433135986328125,
+   "sdpa_backend": "default"
+  },
+  "asset016_base": {
+   "id": "asset016_base",
+   "model": "base",
+   "height": 1184,
+   "width": 880,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 249,
+   "uncond_tokens": 10,
+   "load_s": 5.132781847999922,
+   "denoise_s": 145.21839461200034,
+   "decode_s": 0.5483160940002563,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 2.904860638489778,
+   "step0_s": 2.8798651530005372,
+   "torch_peak_alloc_gib": 12.518065929412842,
+   "torch_peak_reserved_gib": 13.5546875,
+   "nvml_peak_gib": 13.845703125,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 9.433135986328125,
+   "sdpa_backend": "default"
+  },
+  "asset017_base": {
+   "id": "asset017_base",
+   "model": "base",
+   "height": 720,
+   "width": 2880,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 2065,
+   "uncond_tokens": 16,
+   "load_s": 5.132781847999922,
+   "denoise_s": 383.69725961099994,
+   "decode_s": 3.6997107809993395,
+   "decode_offloaded_dit": true,
+   "step_s_mean": 7.677091240755098,
+   "step0_s": 7.51940393500081,
+   "torch_peak_alloc_gib": 12.342292308807373,
+   "torch_peak_reserved_gib": 13.904296875,
+   "nvml_peak_gib": 14.1953125,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 11.156009674072266,
+   "sdpa_backend": "default"
+  },
+  "asset018_base": {
+   "id": "asset018_base",
+   "model": "base",
+   "height": 768,
+   "width": 1360,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 196,
+   "uncond_tokens": 19,
+   "load_s": 5.132781847999922,
+   "denoise_s": 150.83490776399958,
+   "decode_s": 0.5400889389993608,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 3.01248270326531,
+   "step0_s": 3.222865066999475,
+   "torch_peak_alloc_gib": 12.523536205291748,
+   "torch_peak_reserved_gib": 13.904296875,
+   "nvml_peak_gib": 14.1953125,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 9.995792388916016,
+   "sdpa_backend": "default"
+  },
+  "asset019_base": {
+   "id": "asset019_base",
+   "model": "base",
+   "height": 1184,
+   "width": 880,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 37,
+   "uncond_tokens": 24,
+   "load_s": 5.132781847999922,
+   "denoise_s": 143.8317526130004,
+   "decode_s": 0.5720295820001411,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 2.877922477959183,
+   "step0_s": 2.8132174860002124,
+   "torch_peak_alloc_gib": 12.327356338500977,
+   "torch_peak_reserved_gib": 13.908203125,
+   "nvml_peak_gib": 14.19921875,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 9.995796203613281,
+   "sdpa_backend": "default"
+  },
+  "asset020_base": {
+   "id": "asset020_base",
+   "model": "base",
+   "height": 944,
+   "width": 1680,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 251,
+   "uncond_tokens": 16,
+   "load_s": 5.132781847999922,
+   "denoise_s": 240.95106327099984,
+   "decode_s": 0.9654576760003692,
+   "decode_offloaded_dit": false,
+   "step_s_mean": 4.819314958795929,
+   "step0_s": 4.804235345999587,
+   "torch_peak_alloc_gib": 13.129678726196289,
+   "torch_peak_reserved_gib": 14.2890625,
+   "nvml_peak_gib": 14.580078125,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 9.995800018310547,
+   "sdpa_backend": "default"
+  },
+  "asset001_sft": {
+   "id": "asset001_sft",
+   "model": "sft",
+   "height": 1776,
+   "width": 1184,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 2522,
+   "uncond_tokens": 23,
+   "load_s": 5.6507340549997025,
+   "denoise_s": 403.216808272,
+   "decode_s": 9.509717158998683,
+   "decode_offloaded_dit": true,
+   "decode_mode": "gpu_dit_parked",
+   "step_s_mean": 8.059973181448983,
+   "step0_s": 8.277690144999724,
+   "torch_peak_alloc_gib": 12.383749961853027,
+   "torch_peak_reserved_gib": 13.396484375,
+   "nvml_peak_gib": 13.685546875,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 10.801628112792969,
+   "sdpa_backend": "default"
+  },
+  "asset005_sft": {
+   "id": "asset005_sft",
+   "model": "sft",
+   "height": 1024,
+   "width": 1536,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 106,
+   "uncond_tokens": 19,
+   "load_s": 5.6507340549997025,
+   "denoise_s": 246.12048610700003,
+   "decode_s": 1.0982049860012921,
+   "decode_offloaded_dit": false,
+   "decode_mode": "gpu",
+   "step_s_mean": 4.924890554612254,
+   "step0_s": 4.800476889999118,
+   "torch_peak_alloc_gib": 13.097880840301514,
+   "torch_peak_reserved_gib": 13.771484375,
+   "nvml_peak_gib": 14.0625,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 4.351886749267578,
+   "sdpa_backend": "default"
+  },
+  "asset009_sft": {
+   "id": "asset009_sft",
+   "model": "sft",
+   "height": 1536,
+   "width": 1024,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 46,
+   "uncond_tokens": 16,
+   "load_s": 5.6507340549997025,
+   "denoise_s": 251.19206839899925,
+   "decode_s": 0.9425319959991612,
+   "decode_offloaded_dit": false,
+   "decode_mode": "gpu",
+   "step_s_mean": 5.023710941122438,
+   "step0_s": 5.029835658999218,
+   "torch_peak_alloc_gib": 13.66020917892456,
+   "torch_peak_reserved_gib": 13.779296875,
+   "nvml_peak_gib": 14.0703125,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 4.351894378662109,
+   "sdpa_backend": "default"
+  },
+  "asset015_sft": {
+   "id": "asset015_sft",
+   "model": "sft",
+   "height": 880,
+   "width": 1184,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 124,
+   "uncond_tokens": 16,
+   "load_s": 5.6507340549997025,
+   "denoise_s": 149.94838726599846,
+   "decode_s": 0.589798475999487,
+   "decode_offloaded_dit": false,
+   "decode_mode": "gpu",
+   "step_s_mean": 2.999258697816319,
+   "step0_s": 2.9843863309997687,
+   "torch_peak_alloc_gib": 12.514663219451904,
+   "torch_peak_reserved_gib": 13.95703125,
+   "nvml_peak_gib": 14.248046875,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 4.351898193359375,
+   "sdpa_backend": "default"
+  },
+  "asset019_sft": {
+   "id": "asset019_sft",
+   "model": "sft",
+   "height": 1184,
+   "width": 880,
+   "steps_requested": 50,
+   "steps_run": 50,
+   "cond_tokens": 37,
+   "uncond_tokens": 24,
+   "load_s": 5.6507340549997025,
+   "denoise_s": 148.52175148700007,
+   "decode_s": 0.5680012869997881,
+   "decode_offloaded_dit": false,
+   "decode_mode": "gpu",
+   "step_s_mean": 2.9752107589183465,
+   "step0_s": 2.7361067550009466,
+   "torch_peak_alloc_gib": 12.514060497283936,
+   "torch_peak_reserved_gib": 13.962890625,
+   "nvml_peak_gib": 14.25390625,
+   "load_nvml_peak_gib": 9.966796875,
+   "host_private_peak_gib": 4.351902008056641,
+   "sdpa_backend": "default"
+  }
+ },
+ "encode_reports": [
+  {
+   "load_s": 5.898721008999928,
+   "encode": [
+    {
+     "key": "asset001_base.cond",
+     "tokens": 2522,
+     "seconds": 3.3185045909999644
+    },
+    {
+     "key": "asset001_base.uncond",
+     "tokens": 23,
+     "seconds": 0.35004681399982474
+    },
+    {
+     "key": "asset002_base.cond",
+     "tokens": 1465,
+     "seconds": 0.9616216939998594
+    },
+    {
+     "key": "asset002_base.uncond",
+     "tokens": 21,
+     "seconds": 0.3439359389999481
+    },
+    {
+     "key": "asset003_base.cond",
+     "tokens": 2026,
+     "seconds": 1.2547623529999328
+    },
+    {
+     "key": "asset003_base.uncond",
+     "tokens": 21,
+     "seconds": 0.34682015499993213
+    },
+    {
+     "key": "asset004_base.cond",
+     "tokens": 1937,
+     "seconds": 1.2679825560001063
+    },
+    {
+     "key": "asset004_base.uncond",
+     "tokens": 10,
+     "seconds": 0.3413979230001587
+    },
+    {
+     "key": "asset005_base.cond",
+     "tokens": 106,
+     "seconds": 0.3877073289997952
+    },
+    {
+     "key": "asset005_base.uncond",
+     "tokens": 19,
+     "seconds": 0.3467390759999489
+    },
+    {
+     "key": "asset006_base.cond",
+     "tokens": 1415,
+     "seconds": 0.9851610840000831
+    },
+    {
+     "key": "asset006_base.uncond",
+     "tokens": 10,
+     "seconds": 0.3425789310001619
+    },
+    {
+     "key": "asset007_base.cond",
+     "tokens": 282,
+     "seconds": 0.45110215599993353
+    },
+    {
+     "key": "asset007_base.uncond",
+     "tokens": 15,
+     "seconds": 0.34110536799994406
+    },
+    {
+     "key": "asset008_base.cond",
+     "tokens": 1474,
+     "seconds": 0.997447880999971
+    },
+    {
+     "key": "asset008_base.uncond",
+     "tokens": 33,
+     "seconds": 0.3696416599998429
+    },
+    {
+     "key": "asset009_base.cond",
+     "tokens": 46,
+     "seconds": 0.37135237899997264
+    },
+    {
+     "key": "asset009_base.uncond",
+     "tokens": 16,
+     "seconds": 0.33746995499996046
+    },
+    {
+     "key": "asset010_base.cond",
+     "tokens": 823,
+     "seconds": 0.6847225229998912
+    },
+    {
+     "key": "asset010_base.uncond",
+     "tokens": 10,
+     "seconds": 0.3422426849999738
+    },
+    {
+     "key": "asset011_base.cond",
+     "tokens": 3152,
+     "seconds": 1.9467697279999356
+    },
+    {
+     "key": "asset011_base.uncond",
+     "tokens": 16,
+     "seconds": 0.3500050170000577
+    },
+    {
+     "key": "asset012_base.cond",
+     "tokens": 1995,
+     "seconds": 1.247272085999839
+    },
+    {
+     "key": "asset012_base.uncond",
+     "tokens": 10,
+     "seconds": 0.34693205400003535
+    },
+    {
+     "key": "asset013_base.cond",
+     "tokens": 650,
+     "seconds": 0.6577170999998998
+    },
+    {
+     "key": "asset013_base.uncond",
+     "tokens": 10,
+     "seconds": 0.3451557910000247
+    },
+    {
+     "key": "asset014_base.cond",
+     "tokens": 1355,
+     "seconds": 0.9228527810000742
+    },
+    {
+     "key": "asset014_base.uncond",
+     "tokens": 10,
+     "seconds": 0.3418903389999741
+    },
+    {
+     "key": "asset015_base.cond",
+     "tokens": 124,
+     "seconds": 0.3915965999999571
+    },
+    {
+     "key": "asset015_base.uncond",
+     "tokens": 16,
+     "seconds": 0.3594488100000035
+    },
+    {
+     "key": "asset016_base.cond",
+     "tokens": 249,
+     "seconds": 0.4328169870000238
+    },
+    {
+     "key": "asset016_base.uncond",
+     "tokens": 10,
+     "seconds": 0.33942776000003505
+    },
+    {
+     "key": "asset017_base.cond",
+     "tokens": 2065,
+     "seconds": 1.2887592220001807
+    },
+    {
+     "key": "asset017_base.uncond",
+     "tokens": 16,
+     "seconds": 0.33877671200002624
+    },
+    {
+     "key": "asset018_base.cond",
+     "tokens": 196,
+     "seconds": 0.39471689500010143
+    },
+    {
+     "key": "asset018_base.uncond",
+     "tokens": 19,
+     "seconds": 0.3391747199998463
+    },
+    {
+     "key": "asset019_base.cond",
+     "tokens": 37,
+     "seconds": 0.3436077119999936
+    },
+    {
+     "key": "asset019_base.uncond",
+     "tokens": 24,
+     "seconds": 0.34275018699986504
+    },
+    {
+     "key": "asset020_base.cond",
+     "tokens": 251,
+     "seconds": 0.42220774300017183
+    },
+    {
+     "key": "asset020_base.uncond",
+     "tokens": 16,
+     "seconds": 0.34020611899995856
+    },
+    {
+     "key": "asset001_sft.cond",
+     "tokens": 2522,
+     "seconds": 1.537237075000121
+    },
+    {
+     "key": "asset001_sft.uncond",
+     "tokens": 23,
+     "seconds": 0.3427946729998439
+    },
+    {
+     "key": "asset005_sft.cond",
+     "tokens": 106,
+     "seconds": 0.3855637150002167
+    },
+    {
+     "key": "asset005_sft.uncond",
+     "tokens": 19,
+     "seconds": 0.3431555740000931
+    },
+    {
+     "key": "asset009_sft.cond",
+     "tokens": 46,
+     "seconds": 0.3461198019999756
+    },
+    {
+     "key": "asset009_sft.uncond",
+     "tokens": 16,
+     "seconds": 0.3340937399998438
+    },
+    {
+     "key": "asset015_sft.cond",
+     "tokens": 124,
+     "seconds": 0.378253610999991
+    },
+    {
+     "key": "asset015_sft.uncond",
+     "tokens": 16,
+     "seconds": 0.33426394700018136
+    },
+    {
+     "key": "asset019_sft.cond",
+     "tokens": 37,
+     "seconds": 0.34935123400009616
+    },
+    {
+     "key": "asset019_sft.uncond",
+     "tokens": 24,
+     "seconds": 0.34124545700001363
+    }
+   ]
+  },
+  {
+   "load_s": 8.633430547000899,
+   "encode": [
+    {
+     "key": "asset001_sft.cond",
+     "tokens": 2522,
+     "seconds": 3.837269395999101
+    },
+    {
+     "key": "asset001_sft.uncond",
+     "tokens": 23,
+     "seconds": 0.3748518039992632
+    },
+    {
+     "key": "asset005_sft.cond",
+     "tokens": 106,
+     "seconds": 0.40258630700009235
+    },
+    {
+     "key": "asset005_sft.uncond",
+     "tokens": 19,
+     "seconds": 0.373042193999936
+    },
+    {
+     "key": "asset009_sft.cond",
+     "tokens": 46,
+     "seconds": 0.37257628299994394
+    },
+    {
+     "key": "asset009_sft.uncond",
+     "tokens": 16,
+     "seconds": 0.3456480820004799
+    },
+    {
+     "key": "asset015_sft.cond",
+     "tokens": 124,
+     "seconds": 0.40535992100012663
+    },
+    {
+     "key": "asset015_sft.uncond",
+     "tokens": 16,
+     "seconds": 0.35379765900142957
+    },
+    {
+     "key": "asset019_sft.cond",
+     "tokens": 37,
+     "seconds": 0.36874617300054524
+    },
+    {
+     "key": "asset019_sft.uncond",
+     "tokens": 24,
+     "seconds": 0.35170393099906505
+    }
+   ]
+  }
+ ]
+}

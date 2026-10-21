@@ -1,0 +1,173 @@
+{
+ "torch": "2.14.1+cu130",
+ "cudnn": 92400,
+ "gpu": "NVIDIA GeForce RTX 4090 Laptop GPU",
+ "samples": 8192,
+ "cases": {
+  "conv_mid_conv1": {
+   "weight": "decoder.mid_block.resnets.0.conv1",
+   "h": 128,
+   "w": 128,
+   "c": 384,
+   "k": 384,
+   "r": 3,
+   "x_seed": 100,
+   "res_seed": null
+  },
+  "conv_up0_conv2_res": {
+   "weight": "decoder.up_blocks.0.resnets.0.conv2",
+   "h": 91,
+   "w": 91,
+   "c": 384,
+   "k": 384,
+   "r": 3,
+   "x_seed": 101,
+   "res_seed": 201
+  },
+  "conv_up2_conv1": {
+   "weight": "decoder.up_blocks.2.resnets.0.conv1",
+   "h": 96,
+   "w": 80,
+   "c": 384,
+   "k": 192,
+   "r": 3,
+   "x_seed": 102,
+   "res_seed": null
+  },
+  "conv_up3_conv1": {
+   "weight": "decoder.up_blocks.3.resnets.1.conv1",
+   "h": 256,
+   "w": 256,
+   "c": 96,
+   "k": 96,
+   "r": 3,
+   "x_seed": 103,
+   "res_seed": null
+  },
+  "conv_up3_shortcut": {
+   "weight": "decoder.up_blocks.3.resnets.0.conv_shortcut",
+   "h": 256,
+   "w": 256,
+   "c": 192,
+   "k": 96,
+   "r": 1,
+   "x_seed": 104,
+   "res_seed": null
+  },
+  "conv_conv_in": {
+   "weight": "decoder.conv_in",
+   "h": 91,
+   "w": 91,
+   "c": 32,
+   "k": 384,
+   "r": 3,
+   "x_seed": 105,
+   "res_seed": null
+  },
+  "conv_post_quant": {
+   "weight": "post_quant_conv",
+   "h": 64,
+   "w": 64,
+   "c": 32,
+   "k": 32,
+   "r": 1,
+   "x_seed": 106,
+   "res_seed": null
+  },
+  "conv_conv_out": {
+   "weight": "decoder.conv_out",
+   "h": 256,
+   "w": 256,
+   "c": 96,
+   "k": 3,
+   "r": 3,
+   "x_seed": 107,
+   "res_seed": null
+  },
+  "conv_bf16_mid_conv1": {
+   "weight": "decoder.mid_block.resnets.0.conv1",
+   "h": 64,
+   "w": 64,
+   "x_seed": 300
+  },
+  "conv_bf16_up3_conv1": {
+   "weight": "decoder.up_blocks.3.resnets.1.conv1",
+   "h": 128,
+   "w": 128,
+   "x_seed": 301
+  },
+  "conv_bf16_conv_out": {
+   "weight": "decoder.conv_out",
+   "h": 128,
+   "w": 128,
+   "x_seed": 302
+  },
+  "conv_bf16_post_quant": {
+   "weight": "post_quant_conv",
+   "h": 64,
+   "w": 64,
+   "x_seed": 303
+  },
+  "gn_mid_norm1": {
+   "norm": "decoder.mid_block.resnets.0.norm1",
+   "c": 384,
+   "h": 128,
+   "w": 128,
+   "silu": true,
+   "x_seed": 400
+  },
+  "gn_up3_norm2": {
+   "norm": "decoder.up_blocks.3.resnets.1.norm2",
+   "c": 96,
+   "h": 256,
+   "w": 256,
+   "silu": false,
+   "x_seed": 401
+  },
+  "gn_norm_out": {
+   "norm": "decoder.conv_norm_out",
+   "c": 96,
+   "h": 200,
+   "w": 120,
+   "silu": true,
+   "x_seed": 402
+  },
+  "attn_core_33124": {
+   "h": 182,
+   "w": 182,
+   "seeds": [
+    500,
+    501,
+    502,
+    503
+   ]
+  },
+  "attn_core_100": {
+   "h": 10,
+   "w": 10,
+   "seeds": [
+    510,
+    511,
+    512,
+    513
+   ]
+  },
+  "attn_core_1000": {
+   "h": 25,
+   "w": 40,
+   "seeds": [
+    520,
+    521,
+    522,
+    523
+   ]
+  },
+  "attn_block": {
+   "h": 128,
+   "w": 128,
+   "x_seed": 600,
+   "coarse_seed": 601
+  }
+ },
+ "bn_unpack_source": "golden final_latent[:, :, 20:26, 30:40]"
+}
