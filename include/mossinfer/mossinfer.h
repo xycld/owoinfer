@@ -164,6 +164,18 @@ typedef enum mi_model_format {
   MI_MODEL_FORMAT_MAX_ENUM = 0x7fffffff
 } mi_model_format;
 
+/* DiT block implementation. All give the same image bits; they differ in speed and memory. */
+typedef enum mi_block_path {
+  MI_BLOCK_PATH_DEFAULT = 0,      /* the engine's default: fused */
+  MI_BLOCK_PATH_OP_BY_OP = 1,     /* one kernel per op */
+  /* Fused GEMM epilogues and QK-norm+RoPE. Runs op by op when the engine's startup self-check finds the fused GEMMs
+   * not bit-identical on this GPU (mi_result_block_path_note() then says why). */
+  MI_BLOCK_PATH_FUSED = 2,
+  /* Fused, replayed from CUDA graphs when every DiT block is resident (else fused, eagerly). Holds graph memory. */
+  MI_BLOCK_PATH_FUSED_GRAPHS = 3,
+  MI_BLOCK_PATH_MAX_ENUM = 0x7fffffff
+} mi_block_path;
+
 typedef struct mi_engine_params {
   size_t struct_size;
   const char* model_path;          /* required: bundle directory */
@@ -179,6 +191,8 @@ typedef struct mi_engine_params {
   const char* cache_dir;           /* embedding-cache disk spill directory; NULL or "" (default) = memory only */
   int32_t embedding_cache;         /* reuse text embeddings of repeated prompts; default 1 */
   int32_t direct_io;               /* O_DIRECT weight reads (cold-cache behaviour); default 0 */
+  mi_block_path block_path;        /* default MI_BLOCK_PATH_DEFAULT */
+  int32_t _reserved1;              /* must be 0 */
 } mi_engine_params;
 
 /* Fills `params` with the defaults; struct_size must be sizeof(mi_engine_params) of the caller's header. */
@@ -304,6 +318,23 @@ typedef struct mi_memory_stats {
   uint64_t host_private_peak_bytes;
 } mi_memory_stats;
 
+/* DiT block streaming over the whole denoise (all zero when every block was resident). The DiT streams when it does
+ * not fit the device budget, or in MI_MODE_MIN_MEMORY: the streamed blocks are copied to the device every step, ahead
+ * of their compute. */
+typedef struct mi_dit_stream_stats {
+  size_t struct_size;
+  int32_t streamed;         /* some blocks were streamed */
+  int32_t resident_blocks;  /* of 42 */
+  int32_t buffers;          /* device block buffers the streamed blocks rotate through */
+  int32_t stalls;           /* streamed blocks the compute waited for (> 50 us each) */
+  uint64_t bytes;           /* copied to the device, all steps */
+  double copy_seconds;      /* copy streams busy */
+  double stall_seconds;     /* compute waiting for streamed weights */
+  double h2d_gbps;          /* bytes / copy_seconds, in GB/s (1e9) */
+  double hidden_fraction;   /* share of the copy time hidden behind compute, 0..1 */
+  char source[16];          /* "file" (page cache or disk), "host_pinned", or "" when nothing streamed */
+} mi_dit_stream_stats;
+
 MOSSINFER_API int32_t mi_result_width(const mi_result* result);
 MOSSINFER_API int32_t mi_result_height(const mi_result* result);
 /* Row-major RGB8 [height][width][3], owned by the result; NULL when cancelled. `out_bytes` may be NULL. */
@@ -315,6 +346,12 @@ MOSSINFER_API int32_t mi_result_steps_run(const mi_result* result);
 /* `out` has struct_size set by the caller. */
 MOSSINFER_API mi_status mi_result_timings(const mi_result* result, mi_timings* out);
 MOSSINFER_API mi_status mi_result_memory(const mi_result* result, mi_memory_stats* out);
+MOSSINFER_API mi_status mi_result_dit_stream(const mi_result* result, mi_dit_stream_stats* out);
+/* The DiT block path the denoise actually ran (never MI_BLOCK_PATH_DEFAULT, except for a NULL result). It can differ
+ * from mi_engine_params.block_path; mi_result_block_path_note() then says why. */
+MOSSINFER_API mi_block_path mi_result_block_path(const mi_result* result);
+/* Why the block path differs from the requested one; "" when it does not. Owned by the result. */
+MOSSINFER_API const char* mi_result_block_path_note(const mi_result* result);
 /* The execution plan in several human-readable lines; owned by the result. */
 MOSSINFER_API const char* mi_result_plan_explanation(const mi_result* result);
 /* The generation report as one JSON document, the same shape as `moss-infer generate --json-report` ("image" is the

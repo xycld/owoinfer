@@ -39,6 +39,9 @@ struct Generation {
   mi_timings timings{};
   mi_memory_stats memory{};
   std::string plan_explanation;
+  mi_block_path block_path = MI_BLOCK_PATH_DEFAULT;  // what ran
+  std::string block_path_note;
+  mi_dit_stream_stats dit_stream{};
   // The `moss-infer generate --json-report` document is report_head + <image path as a JSON string> + report_tail.
   std::string report_head, report_tail;
 };
@@ -65,12 +68,9 @@ class PipelineAdapter {
 // The `moss-infer generate --json-report` document of `generation`, with `image_path_utf8` as its "image".
 std::string report_json(const Generation& generation, const std::string& image_path_utf8);
 
-// Fills generation.report_head / report_tail from a pipeline request and result. Locale-independent: numbers never
-// follow the C or C++ global locale. Called by generate(); public for the CPU tests.
+// Fills generation.report_head / report_tail from a pipeline request and result, with the shared renderer
+// (pipeline/report_json.h, locale-independent). Called by generate(); public for the CPU tests.
 void render_report(const pipeline::Request& q, const pipeline::Result& r, Generation& g);
-
-// A JSON number with %.6g precision, locale-independent; "null" for NaN and infinities.
-std::string json_number(double d);
 
 // Atomic PNG write of a generation's image. Throws std::invalid_argument without an image, std::runtime_error on I/O.
 void write_png(const Generation& generation, const std::string& path_utf8);

@@ -231,6 +231,17 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertError(self.server.call("load", {"model": 5}, id=11), "invalid_params", 11)
         self.assertError(self.server.call("load", {"model": "/x", "mode": "fast"}, id=12), "invalid_params", 12)
         self.assertError(self.server.call("load", {"model": "/x", "device": -1}, id=13), "invalid_params", 13)
+        r = self.server.call("load", {"model": "/x", "block_path": "turbo"}, id=14)
+        self.assertError(r, "invalid_params", 14)
+        self.assertIn("block_path", r["error"]["message"])
+        self.assertError(self.server.call("load", {"model": "/x", "block_path": 2}, id=15), "invalid_params", 15)
+        # Every valid value (and null, the default) passes the server and reaches the engine's own checks.
+        missing = os.path.join(self.tmp, "missing")
+        for i, path in enumerate(("default", "op_by_op", "fused", "fused_graphs", None)):
+            r = self.server.call("load", {"model": missing, "block_path": path}, id=20 + i)
+            self.assertError(r, "invalid_argument", 20 + i)
+            self.assertIn("not found", r["error"]["message"])
+        self.assertEqual(self.server.call("status")["result"], {"state": "unloaded"})
 
     def test_load_errors_are_engine_statuses(self):
         missing = os.path.join(self.tmp, "missing")
@@ -377,7 +388,7 @@ class GpuProtocolTest(ProtocolTestBase):
         base = os.path.join(WEIGHTS, "base")
         if not os.path.isdir(os.path.join(base, "transformer")):
             self.skipTest("weights not present: " + base)
-        r = self.server.call("load", {"model": base, "mode": "balanced"})
+        r = self.server.call("load", {"model": base, "mode": "balanced", "block_path": "fused"})
         self.assertIn("result", r, r)
         self.assertEqual(r["result"]["model"], base)
         return base
@@ -419,8 +430,15 @@ class GpuProtocolTest(ProtocolTestBase):
         self.assertEqual(report["steps_run"], 2)
         self.assertFalse(report["cancelled"])
         self.assertTrue(report["decode"]["ran"])
-        for key in ("plan", "timings_s", "memory_gib", "host_memory_gib", "embedding_cache"):
+        for key in ("plan", "timings_s", "memory_gib", "host_memory_gib", "embedding_cache", "hardware"):
             self.assertIn(key, report)
+        # The default block path is fused; op by op only after a failed self-check, and the note says why.
+        blocks = report["dit_blocks"]
+        self.assertIn(blocks["path"], ("fused", "op_by_op"), blocks)
+        self.assertEqual(blocks["note"] == "", blocks["path"] == "fused", blocks)
+        # 256^2, balanced: every DiT block resident on the dev box.
+        self.assertFalse(report["dit_stream"]["streamed"], report["dit_stream"])
+        self.assertEqual(report["dit_stream"]["steps"], [])
         kinds = [e["event"] for e in events]
         self.assertEqual(kinds.count("plan"), 1)
         plan = next(e for e in events if e["event"] == "plan")

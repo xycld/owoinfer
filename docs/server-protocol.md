@@ -100,6 +100,7 @@ Creates the engine. A loaded engine is released first, because two engines would
 | `cache_dir` | string | none | embedding-cache disk spill |
 | `embedding_cache` | bool | true | |
 | `direct_io` | bool | false | |
+| `block_path` | string | `"default"` (fused) | DiT block implementation: `"default"`, `"op_by_op"`, `"fused"`, `"fused_graphs"`. All give the same image; the path that ran is the report's `dit_blocks.path`. |
 
 ```
 >> {"id": 2, "method": "load", "params": {"model": "/models/MOSS-Image/base", "mode": "balanced"}}
@@ -177,7 +178,9 @@ The fields of `done` depend on `status`:
 `report` is the same document as `moss-infer generate --json-report`:
 - `request`, `seed_used`, `steps_scheduled`, `steps_run`, `cancelled`, `cond_tokens`, `uncond_tokens`
 - `image`, `latents` (always `""` here), `mode`, `plan`, `embedding_cache`, `decode`
-- `timings_s`, `memory_gib`, `host_memory_gib`
+- `dit_blocks` (`path` that ran, `note` saying why it differs from the requested one, or `""`)
+- `timings_s`, `memory_gib`, `host_memory_gib`, `hardware`
+- `dit_stream`: DiT block streaming (`streamed`, `resident_blocks`, `buffers`, `source`, `bytes`, `copy_s`, `stall_s`, `stalls`, `h2d_gbps`, `hidden`, and per-step `steps`)
 
 The server is idle again by the time `done` is written, so the next `generate` can follow it immediately.
 
@@ -236,11 +239,11 @@ send({"id": 3, "method": "shutdown"})
 | ctest name | Label | What it runs |
 |---|---|---|
 | `server_protocol` | `cpu` | No GPU or weights needed (details below) |
-| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown |
+| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown |
 
 `server_protocol` covers:
 - `hello`, `status`, and idle `cancel` / `unload`
-- malformed input of every kind, unknown methods and params, and NUL in strings
+- malformed input of every kind, unknown methods and params (an unknown or non-string `block_path` included), and NUL in strings
 - `load` errors mapped from engine statuses
 - `shutdown`, end of input, and `--version` / usage errors
 - stdout set up with stderr sent to a file, to `DEVNULL`, merged into stdout, or closed. On Linux, `/proc` shows exactly one fd on the protocol pipe, at 3 or higher, close-on-exec.

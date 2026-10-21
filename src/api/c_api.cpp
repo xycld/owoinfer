@@ -45,7 +45,7 @@ namespace {
 // tests/c/test_abi_layout.c checks the same table from C.
 static_assert(sizeof(void*) == 8 && sizeof(std::size_t) == 8, "the C API layouts are defined for 64-bit targets");
 static_assert(sizeof(mi_status) == 4 && sizeof(mi_mode) == 4 && sizeof(mi_model_format) == 4 &&
-              sizeof(mi_sampler) == 4 && sizeof(mi_phase) == 4, "C API enums are 32-bit");
+              sizeof(mi_sampler) == 4 && sizeof(mi_phase) == 4 && sizeof(mi_block_path) == 4, "C API enums are 32-bit");
 #define MI_LAYOUT(type, field, offset) static_assert(offsetof(type, field) == (offset), #type "." #field)
 static_assert(sizeof(mi_device_info) == 592);
 MI_LAYOUT(mi_device_info, struct_size, 0);
@@ -71,7 +71,7 @@ MI_LAYOUT(mi_probe_info, build_flavour, 28);
 MI_LAYOUT(mi_probe_info, recommended_flavour, 44);
 MI_LAYOUT(mi_probe_info, message, 60);
 MI_LAYOUT(mi_probe_info, _reserved0, 572);
-static_assert(sizeof(mi_engine_params) == 72);
+static_assert(sizeof(mi_engine_params) == 80);
 MI_LAYOUT(mi_engine_params, struct_size, 0);
 MI_LAYOUT(mi_engine_params, model_path, 8);
 MI_LAYOUT(mi_engine_params, model_format, 16);
@@ -84,6 +84,8 @@ MI_LAYOUT(mi_engine_params, host_ram_budget_bytes, 48);
 MI_LAYOUT(mi_engine_params, cache_dir, 56);
 MI_LAYOUT(mi_engine_params, embedding_cache, 64);
 MI_LAYOUT(mi_engine_params, direct_io, 68);
+MI_LAYOUT(mi_engine_params, block_path, 72);
+MI_LAYOUT(mi_engine_params, _reserved1, 76);
 static_assert(sizeof(mi_progress) == 40);
 MI_LAYOUT(mi_progress, struct_size, 0);
 MI_LAYOUT(mi_progress, phase, 8);
@@ -140,6 +142,18 @@ MI_LAYOUT(mi_memory_stats, device_peak_bytes, 24);
 MI_LAYOUT(mi_memory_stats, device_free_at_start_bytes, 32);
 MI_LAYOUT(mi_memory_stats, host_private_start_bytes, 40);
 MI_LAYOUT(mi_memory_stats, host_private_peak_bytes, 48);
+static_assert(sizeof(mi_dit_stream_stats) == 80);
+MI_LAYOUT(mi_dit_stream_stats, struct_size, 0);
+MI_LAYOUT(mi_dit_stream_stats, streamed, 8);
+MI_LAYOUT(mi_dit_stream_stats, resident_blocks, 12);
+MI_LAYOUT(mi_dit_stream_stats, buffers, 16);
+MI_LAYOUT(mi_dit_stream_stats, stalls, 20);
+MI_LAYOUT(mi_dit_stream_stats, bytes, 24);
+MI_LAYOUT(mi_dit_stream_stats, copy_seconds, 32);
+MI_LAYOUT(mi_dit_stream_stats, stall_seconds, 40);
+MI_LAYOUT(mi_dit_stream_stats, h2d_gbps, 48);
+MI_LAYOUT(mi_dit_stream_stats, hidden_fraction, 56);
+MI_LAYOUT(mi_dit_stream_stats, source, 64);
 #undef MI_LAYOUT
 
 thread_local std::string t_last_error;
@@ -216,7 +230,10 @@ void check_reserved(std::int32_t value, const char* name) {
   if (value != 0) throw std::invalid_argument(std::string(name) + " must be 0.");
 }
 
-void check_reserved(const mi_engine_params& p) { check_reserved(p._reserved0, "mi_engine_params._reserved0"); }
+void check_reserved(const mi_engine_params& p) {
+  check_reserved(p._reserved0, "mi_engine_params._reserved0");
+  check_reserved(p._reserved1, "mi_engine_params._reserved1");
+}
 
 void check_reserved(const mi_gen_params& p) {
   check_reserved(p._reserved0, "mi_gen_params._reserved0");
@@ -503,6 +520,24 @@ mi_status mi_result_memory(const mi_result* result, mi_memory_stats* out) {
     *out = result->generation.memory;
     return MI_OK;
   });
+}
+
+mi_status mi_result_dit_stream(const mi_result* result, mi_dit_stream_stats* out) {
+  return guarded([&] {
+    require(result, "result");
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_dit_stream_stats), "mi_dit_stream_stats");
+    *out = result->generation.dit_stream;
+    return MI_OK;
+  });
+}
+
+mi_block_path mi_result_block_path(const mi_result* result) {
+  return get(result, MI_BLOCK_PATH_DEFAULT, [](const mi::api::Generation& g) { return g.block_path; });
+}
+
+const char* mi_result_block_path_note(const mi_result* result) {
+  return get(result, static_cast<const char*>(nullptr), [](const mi::api::Generation& g) { return g.block_path_note.c_str(); });
 }
 
 const char* mi_result_plan_explanation(const mi_result* result) {

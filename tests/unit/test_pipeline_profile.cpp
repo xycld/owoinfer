@@ -296,8 +296,9 @@ TEST(HardwareProfile, JsonWritersIgnoreTheProcessLocale) {
   EXPECT_EQ(v.at("dit").at("expected_hidden").as_double(), 0.96875);
   EXPECT_EQ(v.at("vae").at("relative_cost").as_double(), 2.5);
   EXPECT_EQ(v.at("time_s").at("denoise").as_double(), 61.25);
-  // The CLI report formats its numbers the same way (it is not linked into the tests: checked at the source).
-  for (const char* src : {"/src/tools/cli/cmd_generate.cpp", "/src/planner/planner.cpp", "/src/pipeline/hardware_profile.cpp"}) {
+  // The CLI and C-API report (pipeline/report_json.cpp, run under a locale by PipelineReport.* and CApiReport.*)
+  // formats its numbers the same way; checked at the source too.
+  for (const char* src : {"/src/pipeline/report_json.cpp", "/src/planner/planner.cpp", "/src/pipeline/hardware_profile.cpp"}) {
     std::ifstream in(std::string(MOSSINFER_SOURCE_DIR) + src);
     const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(code.empty()) << src;

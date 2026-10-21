@@ -25,6 +25,7 @@ int main(void) {
   check("sizeof(mi_model_format)", sizeof(mi_model_format), 4);
   check("sizeof(mi_sampler)", sizeof(mi_sampler), 4);
   check("sizeof(mi_phase)", sizeof(mi_phase), 4);
+  check("sizeof(mi_block_path)", sizeof(mi_block_path), 4);
 
   SIZE(mi_device_info, 592);
   FIELD(mi_device_info, struct_size, 0);
@@ -52,7 +53,7 @@ int main(void) {
   FIELD(mi_probe_info, message, 60);
   FIELD(mi_probe_info, _reserved0, 572);
 
-  SIZE(mi_engine_params, 72);
+  SIZE(mi_engine_params, 80);
   FIELD(mi_engine_params, struct_size, 0);
   FIELD(mi_engine_params, model_path, 8);
   FIELD(mi_engine_params, model_format, 16);
@@ -65,6 +66,8 @@ int main(void) {
   FIELD(mi_engine_params, cache_dir, 56);
   FIELD(mi_engine_params, embedding_cache, 64);
   FIELD(mi_engine_params, direct_io, 68);
+  FIELD(mi_engine_params, block_path, 72);
+  FIELD(mi_engine_params, _reserved1, 76);
 
   SIZE(mi_progress, 40);
   FIELD(mi_progress, struct_size, 0);
@@ -125,6 +128,19 @@ int main(void) {
   FIELD(mi_memory_stats, device_free_at_start_bytes, 32);
   FIELD(mi_memory_stats, host_private_start_bytes, 40);
   FIELD(mi_memory_stats, host_private_peak_bytes, 48);
+
+  SIZE(mi_dit_stream_stats, 80);
+  FIELD(mi_dit_stream_stats, struct_size, 0);
+  FIELD(mi_dit_stream_stats, streamed, 8);
+  FIELD(mi_dit_stream_stats, resident_blocks, 12);
+  FIELD(mi_dit_stream_stats, buffers, 16);
+  FIELD(mi_dit_stream_stats, stalls, 20);
+  FIELD(mi_dit_stream_stats, bytes, 24);
+  FIELD(mi_dit_stream_stats, copy_seconds, 32);
+  FIELD(mi_dit_stream_stats, stall_seconds, 40);
+  FIELD(mi_dit_stream_stats, h2d_gbps, 48);
+  FIELD(mi_dit_stream_stats, hidden_fraction, 56);
+  FIELD(mi_dit_stream_stats, source, 64);
 
   printf("%s: C struct layouts %s the frozen ABI %d table\n", failures ? "FAIL" : "ok",
          failures ? "differ from" : "match", MI_ABI_VERSION);

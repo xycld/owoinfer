@@ -37,7 +37,7 @@ cmake --build <build> --target mossinfer_example_c
 - **Versioned structs** start with `size_t struct_size`. Always fill them with `*_init(&s, sizeof s)`, then change the fields you need.
   - The library rejects a `struct_size` it does not know with `MI_ERR_ABI_MISMATCH`.
   - Structs only grow at the end. A newer library will accept every older size and default the missing fields.
-  - Output structs (`mi_timings`, `mi_memory_stats`, `mi_probe_info`, `mi_device_info`) need `struct_size` set by the caller before the call.
+  - Output structs (`mi_timings`, `mi_memory_stats`, `mi_dit_stream_stats`, `mi_probe_info`, `mi_device_info`) need `struct_size` set by the caller before the call.
   - Padding is explicit: the gaps are `int32_t _reserved*` fields (see [Frozen layout](#frozen-layout-abi-1)). `*_init()` zeroes them. `mi_engine_create()`, `mi_generate()` and `mi_gen_params_validate()` reject a nonzero one with `MI_ERR_INVALID_ARGUMENT`. The library zeroes them in output structs.
 - **Enums** are 32-bit: each one has a `*_MAX_ENUM = 0x7fffffff` member. Unknown values are rejected with `MI_ERR_INVALID_ARGUMENT`.
 - **Errors.** Every fallible call returns `mi_status`. `mi_last_error_message()` returns the reason for the last failure on the calling thread. It is thread-local, never NULL, not cleared by successful calls, and valid until the next failing call on that thread.
@@ -98,6 +98,7 @@ The weights load on the first `mi_generate()`. The DiT stays resident across gen
 | `cache_dir` | NULL = memory only | embedding-cache disk spill |
 | `embedding_cache` | 1 | reuse the text embeddings of repeated prompts |
 | `direct_io` | 0 | O_DIRECT weight reads |
+| `block_path` | `DEFAULT` (fused) | DiT block implementation: `OP_BY_OP`, `FUSED` or `FUSED_GRAPHS`; all give the same image bits. `FUSED` runs op by op when the startup self-check finds the fused GEMMs not bit-identical on this GPU, and `FUSED_GRAPHS` replays CUDA graphs only when every DiT block is resident. `mi_result_block_path()` reports what ran. |
 
 ## Generation
 
@@ -124,6 +125,8 @@ The callbacks:
 | `mi_result_width/height/seed/steps_run/steps_scheduled/cancelled` | scalars |
 | `mi_result_timings(r, &t)` | `total, load, encode, denoise, decode` and their parts, in seconds |
 | `mi_result_memory(r, &m)` | arena capacity and high-water, device peak, host private start and peak |
+| `mi_result_dit_stream(r, &s)` | DiT block streaming over the denoise: streamed, resident blocks, buffers, stalls, bytes copied, copy and stall seconds, GB/s, hidden fraction, source (`"file"` / `"host_pinned"`). All zero when every block was resident. |
+| `mi_result_block_path(r)` / `mi_result_block_path_note(r)` | the DiT block path that ran (`OP_BY_OP`, `FUSED` or `FUSED_GRAPHS`), and why it differs from the requested one (`""` when it does not) |
 | `mi_result_plan_explanation(r)` | the execution plan as text |
 | `mi_result_report_json(r)` | the `moss-infer generate --json-report` document; `"image"` is the last path given to `mi_save_png()` |
 | `mi_save_png(r, path)` | atomic PNG write (temporary file, then rename) |
@@ -158,13 +161,14 @@ The enums are 4 bytes. ABI 1 is defined by this table: a change to it needs `MI_
 |---|---|---|
 | `mi_device_info` | 592 | `struct_size` 0, `index` 8, `name[256]` 12, `pci_bus_id[32]` 268, `compute_major` 300, `compute_minor` 304, `_reserved0` 308, `total_memory_bytes` 312, `free_memory_bytes` 320, `supported` 328, `unsupported_reason[256]` 332, `_reserved1` 588 |
 | `mi_probe_info` | 576 | `struct_size` 0, `driver_cuda_version` 8, `runtime_cuda_version` 12, `driver_compatible` 16, `device_count` 20, `supported_device_count` 24, `build_flavour[16]` 28, `recommended_flavour[16]` 44, `message[512]` 60, `_reserved0` 572 |
-| `mi_engine_params` | 72 | `struct_size` 0, `model_path` 8, `model_format` 16, `mode` 20, `device_index` 24, `_reserved0` 28, `vram_budget_bytes` 32, `vram_reserve_bytes` 40, `host_ram_budget_bytes` 48, `cache_dir` 56, `embedding_cache` 64, `direct_io` 68 |
+| `mi_engine_params` | 80 | `struct_size` 0, `model_path` 8, `model_format` 16, `mode` 20, `device_index` 24, `_reserved0` 28, `vram_budget_bytes` 32, `vram_reserve_bytes` 40, `host_ram_budget_bytes` 48, `cache_dir` 56, `embedding_cache` 64, `direct_io` 68, `block_path` 72, `_reserved1` 76 |
 | `mi_progress` | 40 | `struct_size` 0, `phase` 8, `step` 12, `total_steps` 16, `_reserved0` 20, `step_seconds` 24, `elapsed_seconds` 32 |
 | `mi_gen_params` | 168 | `struct_size` 0, `prompt` 8, `negative_prompt` 16, `width` 24, `height` 28, `steps` 32, `_reserved0` 36, `cfg` 40, `shift` 48, `seed` 56, `uncond_skip_layers` 64, `uncond_skip_layers_count` 72, `slg_layers` 80, `slg_layers_count` 88, `slg_scale` 96, `slg_start` 104, `slg_stop` 112, `max_sequence_length` 120, `sampler` 124, `progress_callback` 128, `plan_callback` 136, `preview_callback` 144, `preview_interval` 152, `_reserved1` 156, `user_data` 160 |
 | `mi_timings` | 104 | `struct_size` 0, then 12 doubles from 8 in header order (`total_s` … `vae_load_s` at 96) |
 | `mi_memory_stats` | 56 | `struct_size` 0, then 6 `uint64_t` from 8 in header order (`arena_capacity_bytes` … `host_private_peak_bytes` at 48) |
+| `mi_dit_stream_stats` | 80 | `struct_size` 0, `streamed` 8, `resident_blocks` 12, `buffers` 16, `stalls` 20, `bytes` 24, `copy_seconds` 32, `stall_seconds` 40, `h2d_gbps` 48, `hidden_fraction` 56, `source[16]` 64 (no padding needed) |
 
-The padding was made explicit on 2026-10-21, before any release. `MI_ABI_VERSION` stays 1, and binaries built against the earlier header must be rebuilt.
+The padding was made explicit on 2026-10-21, before any release. The same day, still before any release, `mi_engine_params` grew `block_path` and `_reserved1` (72 → 80 bytes) and `mi_dit_stream_stats` was added. `MI_ABI_VERSION` stays 1, and binaries built against an earlier header must be rebuilt.
 
 ## Symbol visibility
 
@@ -182,18 +186,20 @@ On ELF platforms `MOSSINFER_API` is always `visibility("default")`. The shared l
 |---|---|
 | `src/api/c_api.cpp` | the entry points, exception → status mapping, the busy/cancel state |
 | `src/api/pipeline_adapter.{h,cpp}` | the only code that touches `pipeline::Pipeline`: converts the C structs into `Request` / `PipelineOptions`, and flattens `pipeline::Result` into C-API types and the JSON report |
+| `src/pipeline/report_json.{h,cpp}` | the report renderer shared with `moss-infer generate --json-report`, so both documents are the same field for field |
 
 When the `Pipeline` fields change (P4), the adapter is the whole rebase.
 
 ## Tests
 
 Label `cpu` (`tests/unit/test_c_api.cpp`):
-- **`CApi.*`** covers versions and ABI, defaults against `pipeline::Request` / `PipelineOptions`, `struct_size` checks, reserved fields, NULL handles, invalid generation and engine parameters (with messages), the thread-local error, `mi_engine_free` leaving the error alone, and the probe.
-- **`CApiReport.*`** renders the report from a synthetic result under a comma-decimal C++ locale with digit grouping, and under a comma-decimal C locale where the system has one. It checks for valid JSON, exact numbers, and `null` for NaN and infinity.
+- **`CApi.*`** covers versions and ABI, defaults against `pipeline::Request` / `PipelineOptions`, `struct_size` checks, reserved fields, NULL handles, invalid generation and engine parameters (with messages, unknown `block_path` values included), the thread-local error, `mi_engine_free` leaving the error alone, and the probe.
+- **`CApiReport.*`** renders the report (through the adapter and the shared renderer) from a synthetic result under a comma-decimal C++ locale with digit grouping, and under a comma-decimal C locale where the system has one. It checks for valid JSON, exact numbers, `null` for NaN and infinity, the `dit_blocks` and `dit_stream` keys, and that the document is the CLI's fields in braces.
+- **`PipelineReport.*`** (`tests/unit/test_pipeline_report.cpp`) covers the shared renderer itself: every key, the head/tail split around the image path, U+FFFD for ill-formed UTF-8, `null` for non-finite numbers, and the classic locale.
 
 Label `gpu`:
 - **`GpuCApiProbe.*`**: after `mi_probe_device()`, the process holds no CUDA context. This is checked through the driver's primary-context state and NVML's process list.
-- **`GpuCApi.*`** covers the device probe, and a 256², 2-step generation with callbacks, a concurrent call rejected as busy, and PNG and report checks. It also covers cancel from another thread with no carry-over, and the caller's current context restored by create, generate and free.
+- **`GpuCApi.*`** covers the device probe, and a 256², 2-step generation with callbacks, a concurrent call rejected as busy, the block path accessors and `mi_result_dit_stream()` (nothing streamed in balanced mode on the dev box), and PNG and report checks. It also covers cancel from another thread with no carry-over, and the caller's current context restored by create, generate and free.
 
 Run the GPU tests on the dev box under the GPU lock:
 

@@ -426,7 +426,7 @@ class Server {
 
   std::string load(const Params& p, const std::string& id) {
     p.only({"model", "mode", "device", "vram_budget_bytes", "vram_reserve_bytes", "host_ram_budget_bytes", "cache_dir",
-            "embedding_cache", "direct_io"});
+            "embedding_cache", "direct_io", "block_path"});
     if (generating()) throw RequestError("busy", "a generation is running; cancel it or wait for its done event");
     mi_engine_params e;
     if (const mi_status s = mi_engine_params_init(&e, sizeof e); s != MI_OK) throw_status(s);
@@ -448,6 +448,14 @@ class Server {
     if (cache_dir) e.cache_dir = cache_dir->c_str();
     if (const auto v = p.boolean("embedding_cache")) e.embedding_cache = *v ? 1 : 0;
     if (const auto v = p.boolean("direct_io")) e.direct_io = *v ? 1 : 0;
+    if (const auto path = p.string("block_path")) {
+      if (*path == "default") e.block_path = MI_BLOCK_PATH_DEFAULT;
+      else if (*path == "op_by_op") e.block_path = MI_BLOCK_PATH_OP_BY_OP;
+      else if (*path == "fused") e.block_path = MI_BLOCK_PATH_FUSED;
+      else if (*path == "fused_graphs") e.block_path = MI_BLOCK_PATH_FUSED_GRAPHS;
+      else throw RequestError("invalid_params",
+                              "\"block_path\" must be \"default\", \"op_by_op\", \"fused\" or \"fused_graphs\"");
+    }
     // The old engine goes first: two engines would hold two arenas.
     join_worker();
     mi_engine_free(engine_);

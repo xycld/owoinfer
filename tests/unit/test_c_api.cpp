@@ -21,6 +21,7 @@
 #include "api/pipeline_adapter.h"
 #include "cuda_context_check.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/report_json.h"
 #include "test_util.h"
 #include "util/json.h"
 
@@ -108,6 +109,9 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_EQ(e.cache_dir, nullptr);
   EXPECT_EQ(e.embedding_cache, o.embedding_cache ? 1 : 0);
   EXPECT_EQ(e.direct_io, o.direct_io ? 1 : 0);
+  EXPECT_EQ(e.block_path, MI_BLOCK_PATH_DEFAULT);  // PipelineOptions' default, fused
+  EXPECT_EQ(o.block_path, mi::moss_dit::BlockPath::kFused);
+  EXPECT_EQ(e._reserved1, 0);
 
   mi_gen_params valid = g;
   valid.prompt = "a cat";
@@ -183,6 +187,12 @@ TEST(CApi, NullHandlesAndPointers) {
   mi_memory_stats m{};
   m.struct_size = sizeof m;
   EXPECT_EQ(mi_result_memory(nullptr, &m), MI_ERR_INVALID_ARGUMENT);
+  mi_dit_stream_stats ds{};
+  ds.struct_size = sizeof ds;
+  EXPECT_EQ(mi_result_dit_stream(nullptr, &ds), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("result is NULL"), std::string::npos) << last_error();
+  EXPECT_EQ(mi_result_block_path(nullptr), MI_BLOCK_PATH_DEFAULT);
+  EXPECT_EQ(mi_result_block_path_note(nullptr), nullptr);
   EXPECT_EQ(mi_save_png(nullptr, "x.png"), MI_ERR_INVALID_ARGUMENT);
 }
 
@@ -271,6 +281,10 @@ TEST(CApi, InvalidEngineParams) {
       {"unknown format", with([](mi_engine_params& p) { p.model_format = static_cast<mi_model_format>(9); }),
        MI_ERR_INVALID_ARGUMENT, "model_format"},
       {"unknown mode", with([](mi_engine_params& p) { p.mode = static_cast<mi_mode>(5); }), MI_ERR_INVALID_ARGUMENT, "mode"},
+      {"unknown block path", with([](mi_engine_params& p) { p.block_path = static_cast<mi_block_path>(4); }),
+       MI_ERR_INVALID_ARGUMENT, "block_path: unknown value 4"},
+      {"block path max enum", with([](mi_engine_params& p) { p.block_path = MI_BLOCK_PATH_MAX_ENUM; }),
+       MI_ERR_INVALID_ARGUMENT, "block_path"},
       {"tiny vram budget", with([](mi_engine_params& p) { p.vram_budget_bytes = 1000; }), MI_ERR_INVALID_ARGUMENT,
        "vram_budget_bytes"},
       {"huge host budget", with([](mi_engine_params& p) { p.host_ram_budget_bytes = std::uint64_t{1} << 50; }),
@@ -309,6 +323,11 @@ TEST(CApi, ReservedFieldsMustBeZero) {
   EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT);  // before CUDA is touched
   EXPECT_EQ(engine, nullptr);
   EXPECT_NE(last_error().find("mi_engine_params._reserved0"), std::string::npos) << last_error();
+  e._reserved0 = 0;
+  e._reserved1 = 2;
+  EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(engine, nullptr);
+  EXPECT_NE(last_error().find("mi_engine_params._reserved1"), std::string::npos) << last_error();
 
   // Output structs come back with their padding zeroed, whatever the caller left in it.
   mi_probe_info info;
@@ -327,8 +346,9 @@ TEST(CApi, EngineFreeLeavesLastErrorAlone) {
 }
 
 // The report's numbers never follow the global locale: a host application may call setlocale() or
-// std::locale::global(). A synthetic pipeline result goes through the adapter's renderer under a comma-decimal C++
-// locale with digit grouping (always available), and under a comma-decimal C locale where the system has one.
+// std::locale::global(). A synthetic pipeline result goes through the adapter (the shared renderer,
+// pipeline/report_json.h, in braces) under a comma-decimal C++ locale with digit grouping (always available), and
+// under a comma-decimal C locale where the system has one.
 TEST(CApiReport, NumbersAreLocaleIndependent) {
   struct CommaNumpunct : std::numpunct<char> {
     char do_decimal_point() const override { return ','; }
@@ -350,6 +370,13 @@ TEST(CApiReport, NumbersAreLocaleIndependent) {
   r.timings.decode_s = std::numeric_limits<double>::infinity();
   r.timings.step_s = {0.25, 1e-7};
   r.memory.arena_capacity = std::size_t{3} << 29;  // 1.5 GiB
+  r.block_path = mi::moss_dit::BlockPath::kFused;
+  r.block_path_note = "CUDA graphs need every DiT block resident: blocks ran fused, eagerly";
+  r.dit_stream.streamed = true;
+  r.dit_stream.resident_blocks = 20;
+  r.dit_stream.bytes = 12345678901ull;
+  r.dit_stream.copy_s = 0.5;
+  r.dit_stream.steps = {{24.5, 0.75, 0.0625, 2}};
 
   const std::locale old_cpp = std::locale::global(std::locale(std::locale::classic(), new CommaNumpunct));
   const std::string old_c = std::setlocale(LC_NUMERIC, nullptr);
@@ -363,7 +390,7 @@ TEST(CApiReport, NumbersAreLocaleIndependent) {
   mi::api::Generation g;
   mi::api::render_report(q, r, g);
   const std::string json = mi::api::report_json(g, "out.png");
-  const std::string one_and_a_half = mi::api::json_number(1.5);
+  const std::string one_and_a_half = mi::pipeline::json_number(1.5);
   std::setlocale(LC_NUMERIC, old_c.c_str());
   std::locale::global(old_cpp);
   std::printf("[c_api] report rendered under C locale %s and a comma-decimal C++ locale\n", c_locale.c_str());
@@ -383,12 +410,15 @@ TEST(CApiReport, NumbersAreLocaleIndependent) {
   EXPECT_EQ(doc.at("timings_s").at("steps").as_array().at(1).as_double(), 1e-7);
   EXPECT_EQ(doc.at("memory_gib").at("arena_capacity").as_double(), 1.5);
   EXPECT_EQ(doc.at("image").as_string(), "out.png");
-  // %.6g spelling, as before.
-  EXPECT_EQ(mi::api::json_number(0.1234567), "0.123457");
-  EXPECT_EQ(mi::api::json_number(1e-7), "1e-07");
-  EXPECT_EQ(mi::api::json_number(1234567.0), "1.23457e+06");
-  EXPECT_EQ(mi::api::json_number(-0.0), "-0");
-  EXPECT_EQ(mi::api::json_number(-std::numeric_limits<double>::infinity()), "null");
+  EXPECT_EQ(doc.at("latents").as_string(), "");
+  EXPECT_EQ(doc.at("dit_blocks").at("path").as_string(), "fused");
+  EXPECT_EQ(doc.at("dit_blocks").at("note").as_string(), r.block_path_note);
+  EXPECT_TRUE(doc.at("dit_stream").at("streamed").as_bool());
+  EXPECT_EQ(doc.at("dit_stream").at("bytes").as_int(), 12345678901);
+  EXPECT_EQ(doc.at("dit_stream").at("h2d_gbps").as_double(), 24.6914);  // 12345678901 / 0.5 / 1e9, %.6g
+  EXPECT_EQ(doc.at("dit_stream").at("steps").as_array().at(0).at("h2d_gbps").as_double(), 24.5);
+  // One document: the CLI's report fields in braces.
+  EXPECT_EQ(json, "{\n" + mi::pipeline::report_fields(q, r, "out.png", "") + "\n}\n");
 }
 
 TEST(CApi, LastErrorIsThreadLocal) {
@@ -609,6 +639,31 @@ TEST_F(GpuCApi, Generate256TwoSteps) {
   EXPECT_GT(m.host_private_peak_bytes, 0u);
   EXPECT_GT(std::strlen(mi_result_plan_explanation(r)), 0u);
 
+  // The default block path is fused; op by op only when the startup self-check failed, and then the note says why.
+  const mi_block_path path = mi_result_block_path(r);
+  const char* note = mi_result_block_path_note(r);
+  ASSERT_NE(note, nullptr);
+  EXPECT_TRUE(path == MI_BLOCK_PATH_FUSED || (path == MI_BLOCK_PATH_OP_BY_OP && *note != '\0')) << path << ": " << note;
+  if (path == MI_BLOCK_PATH_FUSED) {
+    EXPECT_STREQ(note, "");
+  }
+  // 256^2 in balanced mode on the 16 GiB dev box: every DiT block resident, nothing streamed.
+  mi_dit_stream_stats ds;
+  std::memset(&ds, 0xab, sizeof ds);
+  ds.struct_size = sizeof ds;
+  ASSERT_EQ(mi_result_dit_stream(r, &ds), MI_OK) << last_error();
+  EXPECT_EQ(ds.struct_size, sizeof ds);
+  EXPECT_EQ(ds.streamed, 0);
+  EXPECT_EQ(ds.bytes, 0u);
+  EXPECT_EQ(ds.stalls, 0);
+  EXPECT_EQ(ds.copy_seconds, 0.0);
+  EXPECT_STREQ(ds.source, "");
+  ds.struct_size = sizeof ds - 8;
+  EXPECT_EQ(mi_result_dit_stream(r, &ds), MI_ERR_ABI_MISMATCH);
+  mi_dit_stream_stats* no_out = nullptr;
+  EXPECT_EQ(mi_result_dit_stream(r, no_out), MI_ERR_INVALID_ARGUMENT);
+  std::printf("[c_api] DiT blocks %s%s%s\n", path == MI_BLOCK_PATH_FUSED ? "fused" : "op_by_op", *note ? ": " : "", note);
+
   mi::testing::TempDir dir("c_api_gen");
   const std::string png = mi::util::path_utf8(dir.path() / "out.png");
   ASSERT_EQ(mi_save_png(r, png.c_str()), MI_OK) << last_error();
@@ -627,9 +682,13 @@ TEST_F(GpuCApi, Generate256TwoSteps) {
   EXPECT_FALSE(doc.at("cancelled").as_bool());
   EXPECT_TRUE(doc.at("decode").at("ran").as_bool());
   EXPECT_EQ(doc.at("mode").as_string(), "balanced");
-  for (const char* key : {"plan", "embedding_cache", "timings_s", "memory_gib", "host_memory_gib", "latents", "seed_used"}) {
+  for (const char* key : {"plan", "embedding_cache", "timings_s", "memory_gib", "host_memory_gib", "latents", "seed_used",
+                          "hardware"}) {
     EXPECT_NE(doc.find(key), nullptr) << key;
   }
+  EXPECT_EQ(doc.at("dit_blocks").at("path").as_string(), path == MI_BLOCK_PATH_FUSED ? "fused" : "op_by_op");
+  EXPECT_EQ(doc.at("dit_blocks").at("note").as_string(), note);
+  EXPECT_FALSE(doc.at("dit_stream").at("streamed").as_bool());
   mi_result_free(r);
 }
 
