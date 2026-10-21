@@ -1,0 +1,356 @@
+#include "api/pipeline_adapter.h"
+
+#include <cuda_runtime.h>
+
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <locale>
+#include <sstream>
+#include <string_view>
+#include <system_error>
+#include <utility>
+
+#include "backend/cuda_driver.h"
+#include "core/cuda_check.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/png_writer.h"
+#include "pipeline/sampler.h"
+#include "planner/planner.h"
+#include "util/path.h"
+
+namespace mi::api {
+namespace {
+
+namespace fs = std::filesystem;
+using Clock = std::chrono::steady_clock;
+
+// ---------------------------------------------------------------- JSON report (`moss-infer generate --json-report`)
+// Same document as src/tools/cli/cmd_generate.cpp run_json(); kept field for field so launchers can parse either.
+
+// Length of the well-formed UTF-8 sequence at s[i] (Unicode Table 3-7), or 0 if it is ill-formed.
+std::size_t utf8_sequence_length(std::string_view s, std::size_t i) {
+  const auto at = [&](std::size_t k) { return static_cast<unsigned char>(s[k]); };
+  const unsigned char c = at(i);
+  if (c < 0x80) return 1;
+  std::size_t n = 0;
+  unsigned char lo = 0x80, hi = 0xbf;  // valid range of the second byte
+  if (c >= 0xc2 && c <= 0xdf) n = 2;
+  else if (c >= 0xe0 && c <= 0xef) n = 3, lo = c == 0xe0 ? 0xa0 : 0x80, hi = c == 0xed ? 0x9f : 0xbf;
+  else if (c >= 0xf0 && c <= 0xf4) n = 4, lo = c == 0xf0 ? 0x90 : 0x80, hi = c == 0xf4 ? 0x8f : 0xbf;
+  else return 0;
+  if (i + n > s.size() || at(i + 1) < lo || at(i + 1) > hi) return 0;
+  for (std::size_t k = 2; k < n; ++k) {
+    if (at(i + k) < 0x80 || at(i + k) > 0xbf) return 0;
+  }
+  return n;
+}
+
+// JSON string literal; ill-formed UTF-8 becomes U+FFFD per bad byte so the report stays valid JSON.
+std::string json_escape(std::string_view s) {
+  std::string out = "\"";
+  for (std::size_t i = 0; i < s.size();) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    if (c >= 0x80) {
+      const std::size_t n = utf8_sequence_length(s, i);
+      if (n == 0) {
+        out += "\\ufffd";
+        ++i;
+      } else {
+        out.append(s, i, n);
+        i += n;
+      }
+      continue;
+    }
+    ++i;
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out += static_cast<char>(c);
+        }
+    }
+  }
+  return out + "\"";
+}
+
+std::string json_layers(const std::vector<int>& v) {
+  std::string out = "[";
+  for (std::size_t i = 0; i < v.size(); ++i) out += (i ? ", " : "") + std::to_string(v[i]);
+  return out + "]";
+}
+
+const char* tf(bool b) { return b ? "true" : "false"; }
+
+}  // namespace
+
+// %.6g without the C locale's decimal separator (a host application may have called setlocale); JSON has no
+// NaN or infinity, so those become null.
+std::string json_number(double d) {
+  if (!std::isfinite(d)) return "null";
+  char buf[32];
+  const std::to_chars_result res = std::to_chars(buf, buf + sizeof(buf), d, std::chars_format::general, 6);
+  if (res.ec != std::errc()) return "null";  // cannot happen: 6 significant digits fit
+  return std::string(buf, res.ptr);
+}
+
+void render_report(const pipeline::Request& q, const pipeline::Result& r, Generation& g) {
+  const auto num = json_number;
+  const auto& t = r.timings;
+  const auto& m = r.memory;
+  const double gib = 1024.0 * 1024.0 * 1024.0;
+  const auto gb = [&](std::size_t bytes) { return num(static_cast<double>(bytes) / gib); };
+  std::ostringstream o;
+  o.imbue(std::locale::classic());  // integers too: a global C++ locale could add digit grouping ("1.024")
+  o << "{\n";
+  o << " \"request\": {\"model\": " << json_escape(util::path_utf8(q.model)) << ", \"prompt\": " << json_escape(q.prompt)
+    << ", \"negative_prompt\": " << json_escape(q.negative_prompt) << ", \"height\": " << q.height << ", \"width\": " << q.width
+    << ", \"steps\": " << q.steps << ", \"cfg\": " << num(q.cfg) << ", \"shift\": " << num(q.shift) << ", \"seed\": " << q.seed
+    << ", \"uncond_skip_layers\": " << json_layers(q.uncond_skip_layers) << ", \"slg_layers\": " << json_layers(q.slg_layers)
+    << ", \"slg_scale\": " << num(q.slg_scale) << ", \"slg_start\": " << num(q.slg_start) << ", \"slg_stop\": " << num(q.slg_stop)
+    << ", \"max_sequence_length\": " << q.max_sequence_length << ", \"sampler\": \"" << pipeline::sampler_name(q.sampler) << "\"},\n";
+  o << " \"seed_used\": " << r.seed << ", \"steps_scheduled\": " << r.steps_scheduled << ", \"steps_run\": " << r.steps_run
+    << ", \"cancelled\": " << tf(r.cancelled) << ", \"cond_tokens\": " << r.cond_tokens
+    << ", \"uncond_tokens\": " << r.uncond_tokens << ",\n";
+  o << " \"image\": ";
+  g.report_head = o.str();
+  o.str("");
+  o << ", \"latents\": \"\",\n";
+  o << " \"mode\": \"" << planner::mode_name(r.plan.mode) << "\",\n";
+  o << " \"plan\": " << r.plan.to_json() << ",\n";
+  o << " \"embedding_cache\": {\"hits\": " << r.te_cache_hits << ", \"te_skipped\": " << tf(r.te_skipped) << "},\n";
+  o << " \"decode\": {\"ran\": " << tf(!r.rgb.empty()) << ", \"tiled\": " << tf(r.decode_tiled) << ", \"schedule\": "
+    << json_escape(r.decode_schedule) << ", \"planned_tiled\": " << tf(r.plan.vae.run && r.plan.vae.kind == planner::VaeDecodeKind::kTiled)
+    << ", \"planned_tile\": " << r.plan.vae.tile << "},\n";
+  const double load = t.index_load_s + t.dit_load_s + t.vae_load_s;
+  const double encode = t.tokenize_s + t.text_encode_s + t.refine_s;
+  o << " \"timings_s\": {\"total\": " << num(t.total_s) << ", \"load\": " << num(load) << ", \"encode\": " << num(encode)
+    << ", \"denoise\": " << num(t.denoise_s) << ", \"decode\": " << num(t.decode_s) << ", \"index_load\": " << num(t.index_load_s)
+    << ", \"tokenize\": " << num(t.tokenize_s) << ", \"plan\": " << num(t.plan_s) << ", \"text_encode\": " << num(t.text_encode_s)
+    << ", \"te_weight_load\": " << num(t.te_weight_load_s) << ", \"te_weight_wait\": " << num(t.te_weight_wait_s)
+    << ", \"te_compute\": " << num(t.te_compute_s) << ", \"dit_load\": " << num(t.dit_load_s) << ", \"refine\": " << num(t.refine_s)
+    << ", \"vae_load\": " << num(t.vae_load_s) << ", \"steps\": [";
+  for (std::size_t i = 0; i < t.step_s.size(); ++i) o << (i ? ", " : "") << num(t.step_s[i]);
+  o << "]},\n";
+  o << " \"memory_gib\": {\"arena_capacity\": " << gb(m.arena_capacity) << ", \"arena_high_water\": " << gb(m.arena_high_water)
+    << ", \"device_peak\": " << gb(m.device_peak) << ", \"free_at_start\": " << gb(m.free_at_start)
+    << ", \"arena_creations\": " << m.arena_creations << ", \"dit_parked_for_text_encoder\": " << tf(m.dit_parked_for_text_encoder)
+    << ", \"dit_parked_for_decode\": " << tf(m.dit_parked_for_decode) << ", \"dit_reloaded\": " << tf(m.dit_reloaded) << "},\n";
+  o << " \"host_memory_gib\": {\"start\": " << gb(m.host_private_start) << ", \"private_peak\": " << gb(m.host_private_peak) << "}\n}\n";
+  g.report_tail = o.str();
+}
+
+namespace {
+
+// ---------------------------------------------------------------- C structs -> pipeline types
+
+std::vector<int> layer_list(const int32_t* layers, std::size_t count, const char* name) {
+  if (count == 0) return {};
+  if (layers == nullptr) throw std::invalid_argument(std::string(name) + ": NULL array with a nonzero count.");
+  if (count > 1024) throw std::invalid_argument(std::string(name) + ": too many entries.");
+  return std::vector<int>(layers, layers + count);
+}
+
+pipeline::Request to_request(const mi_gen_params& p) {
+  if (p.prompt == nullptr) throw std::invalid_argument("Enter a prompt.");
+  pipeline::Request q;
+  q.prompt = p.prompt;
+  q.negative_prompt = p.negative_prompt != nullptr ? p.negative_prompt : "";
+  q.width = p.width;
+  q.height = p.height;
+  q.steps = p.steps;
+  q.cfg = p.cfg;
+  q.shift = p.shift;
+  q.seed = p.seed;
+  q.uncond_skip_layers = layer_list(p.uncond_skip_layers, p.uncond_skip_layers_count, "uncond_skip_layers");
+  q.slg_layers = layer_list(p.slg_layers, p.slg_layers_count, "slg_layers");
+  q.slg_scale = p.slg_scale;
+  q.slg_start = p.slg_start;
+  q.slg_stop = p.slg_stop;
+  q.max_sequence_length = p.max_sequence_length;
+  switch (p.sampler) {
+    case MI_SAMPLER_EULER: q.sampler = pipeline::SamplerKind::kEuler; break;
+    case MI_SAMPLER_AB2: q.sampler = pipeline::SamplerKind::kAb2; break;
+    default: throw std::invalid_argument("sampler: unknown value " + std::to_string(static_cast<int>(p.sampler)) + ".");
+  }
+  if (p.preview_interval < 1) throw std::invalid_argument("preview_interval must be at least 1.");
+  pipeline::validate(q);
+  return q;
+}
+
+std::size_t budget_bytes(std::uint64_t bytes, const char* name) {
+  return pipeline::vram_option_bytes(static_cast<double>(bytes), 1.0, name);
+}
+
+pipeline::PipelineOptions to_options(const mi_engine_params& p) {
+  pipeline::PipelineOptions o;
+  switch (p.mode) {
+    case MI_MODE_MIN_MEMORY: o.mode = planner::Mode::kMinMemory; break;
+    case MI_MODE_BALANCED: o.mode = planner::Mode::kBalanced; break;
+    case MI_MODE_MAX_SPEED: o.mode = planner::Mode::kMaxSpeed; break;
+    default: throw std::invalid_argument("mode: unknown value " + std::to_string(static_cast<int>(p.mode)) + ".");
+  }
+  o.vram_budget = p.vram_budget_bytes != 0 ? budget_bytes(p.vram_budget_bytes, "vram_budget_bytes") : 0;
+  o.vram_reserve = p.vram_reserve_bytes != 0 ? budget_bytes(p.vram_reserve_bytes, "vram_reserve_bytes") : 0;
+  o.host_ram_budget = p.host_ram_budget_bytes != 0 ? budget_bytes(p.host_ram_budget_bytes, "host_ram_budget_bytes") : 0;
+  o.embedding_cache = p.embedding_cache != 0;
+  o.direct_io = p.direct_io != 0;
+  if (p.cache_dir != nullptr && *p.cache_dir != '\0') o.cache_dir = util::path_from_utf8(p.cache_dir);
+  return o;
+}
+
+// The bundle directory `p` names, after the format checks.
+fs::path model_dir(const mi_engine_params& p) {
+  if (p.model_path == nullptr || *p.model_path == '\0') throw std::invalid_argument("model_path is required.");
+  const fs::path path = util::path_from_utf8(p.model_path);
+  std::error_code ec;
+  const fs::file_status st = fs::status(path, ec);
+  if (p.model_format == MI_MODEL_FORMAT_COMFYUI || (p.model_format == MI_MODEL_FORMAT_AUTO && fs::is_regular_file(st))) {
+    throw NotSupportedError("ComfyUI model files are not supported yet; pass a Hugging Face bundle directory.");
+  }
+  if (p.model_format != MI_MODEL_FORMAT_AUTO && p.model_format != MI_MODEL_FORMAT_HF_BUNDLE) {
+    throw std::invalid_argument("model_format: unknown value " + std::to_string(static_cast<int>(p.model_format)) + ".");
+  }
+  if (!fs::is_directory(st)) throw std::invalid_argument("model bundle not found: " + std::string(p.model_path));
+  for (const char* component : {"text_encoder", "tokenizer", "transformer", "vae"}) {
+    if (!fs::is_directory(path / component, ec)) {
+      throw ModelError("not a MOSS-Image bundle (no " + std::string(component) + "/ directory): " + std::string(p.model_path));
+    }
+  }
+  return path;
+}
+
+mi_phase to_phase(pipeline::Phase phase) {
+  switch (phase) {
+    case pipeline::Phase::kTextEncoder: return MI_PHASE_TEXT_ENCODER;
+    case pipeline::Phase::kDitLoad: return MI_PHASE_DIT_LOAD;
+    case pipeline::Phase::kDenoise: return MI_PHASE_DENOISE;
+    case pipeline::Phase::kDecode: return MI_PHASE_DECODE;
+  }
+  return MI_PHASE_TEXT_ENCODER;
+}
+
+}  // namespace
+
+void validate(const mi_gen_params& params) { to_request(params); }
+
+struct PipelineAdapter::Impl {
+  fs::path model;
+  int device = 0;
+  std::unique_ptr<pipeline::Pipeline> pipe;
+};
+
+PipelineAdapter::PipelineAdapter(const mi_engine_params& params) : impl_(std::make_unique<Impl>()) {
+  impl_->model = model_dir(params);
+  const pipeline::PipelineOptions options = to_options(params);
+  const backend::ScopedCurrentContext restore;  // the caller's CUDA context is current again on return
+  int count = 0;
+  MI_CUDA_CHECK(cudaGetDeviceCount(&count));
+  if (params.device_index < 0 || params.device_index >= count) {
+    throw std::invalid_argument("device_index " + std::to_string(params.device_index) + " out of range (" +
+                                std::to_string(count) + " CUDA devices).");
+  }
+  impl_->device = params.device_index;
+  MI_CUDA_CHECK(cudaSetDevice(impl_->device));
+  impl_->pipe = std::make_unique<pipeline::Pipeline>(options);
+}
+
+PipelineAdapter::~PipelineAdapter() {
+  // The pipeline frees its device memory on the engine's device, whichever context the caller has current.
+  const backend::ScopedCurrentContext restore;
+  if (cudaSetDevice(impl_->device) != cudaSuccess) cudaGetLastError();
+  impl_->pipe.reset();
+}
+
+Generation PipelineAdapter::generate(const mi_gen_params& params, const std::atomic<bool>& cancel) {
+  const auto t0 = Clock::now();
+  pipeline::Request q = to_request(params);
+  q.model = impl_->model;
+  // The CUDA device is per host thread; the caller's thread may not be the one that created the engine.
+  const backend::ScopedCurrentContext restore;
+  MI_CUDA_CHECK(cudaSetDevice(impl_->device));
+  const int total_steps = pipeline::moss_schedule(q.steps, q.shift).num_steps();
+  const auto elapsed = [&] { return std::chrono::duration<double>(Clock::now() - t0).count(); };
+  const auto report = [&](mi_phase phase, int step, int total, double step_s) {
+    if (params.progress_callback == nullptr) return;
+    mi_progress p{};
+    p.struct_size = sizeof p;
+    p.phase = phase;
+    p.step = step;
+    p.total_steps = total;
+    p.step_seconds = step_s;
+    p.elapsed_seconds = elapsed();
+    params.progress_callback(&p, params.user_data);
+  };
+  pipeline::GenerateControl control;
+  control.cancel = &cancel;
+  control.on_phase = [&](pipeline::Phase phase) {
+    report(to_phase(phase), 0, total_steps, 0.0);
+    return true;
+  };
+  control.on_step = [&](const pipeline::StepInfo& s) {
+    report(MI_PHASE_DENOISE, s.step, s.num_steps, s.step_seconds);
+    return true;
+  };
+  if (params.plan_callback != nullptr) {
+    control.on_plan = [&](const planner::ExecutionPlan& plan) {
+      params.plan_callback(plan.explanation.c_str(), plan.to_json().c_str(), params.user_data);
+    };
+  }
+  pipeline::Result r = impl_->pipe->generate(q, control);
+
+  Generation g;
+  render_report(q, r, g);  // before r.rgb is moved out
+  g.width = r.width;
+  g.height = r.height;
+  g.cancelled = r.cancelled;
+  if (!r.cancelled) g.rgb = std::move(r.rgb);
+  g.seed = r.seed;
+  g.steps_scheduled = r.steps_scheduled;
+  g.steps_run = r.steps_run;
+  const pipeline::Timings& t = r.timings;
+  g.timings.struct_size = sizeof g.timings;
+  g.timings.total_s = t.total_s;
+  g.timings.load_s = t.index_load_s + t.dit_load_s + t.vae_load_s;
+  g.timings.encode_s = t.tokenize_s + t.text_encode_s + t.refine_s;
+  g.timings.denoise_s = t.denoise_s;
+  g.timings.decode_s = t.decode_s;
+  g.timings.index_load_s = t.index_load_s;
+  g.timings.tokenize_s = t.tokenize_s;
+  g.timings.plan_s = t.plan_s;
+  g.timings.text_encode_s = t.text_encode_s;
+  g.timings.dit_load_s = t.dit_load_s;
+  g.timings.refine_s = t.refine_s;
+  g.timings.vae_load_s = t.vae_load_s;
+  const pipeline::MemoryStats& m = r.memory;
+  g.memory.struct_size = sizeof g.memory;
+  g.memory.arena_capacity_bytes = m.arena_capacity;
+  g.memory.arena_high_water_bytes = m.arena_high_water;
+  g.memory.device_peak_bytes = m.device_peak;
+  g.memory.device_free_at_start_bytes = m.free_at_start;
+  g.memory.host_private_start_bytes = m.host_private_start;
+  g.memory.host_private_peak_bytes = m.host_private_peak;
+  g.plan_explanation = r.plan.explanation;
+  return g;
+}
+
+std::string report_json(const Generation& generation, const std::string& image_path_utf8) {
+  return generation.report_head + json_escape(image_path_utf8) + generation.report_tail;
+}
+
+void write_png(const Generation& generation, const std::string& path_utf8) {
+  if (generation.rgb.empty()) throw std::invalid_argument("the result has no image (the generation was cancelled).");
+  pipeline::write_png_rgb8(util::path_from_utf8(path_utf8), generation.rgb, generation.width, generation.height);
+}
+
+}  // namespace mi::api

@@ -1,0 +1,62 @@
+# Tag v<MAJOR>.<MINOR>.<PATCH>: build and check all four flavours (build.yml), then publish their archives and a
+# SHA256SUMS file as a GitHub release. The tag must equal the MI_VERSION_* of include/mossinfer/mossinfer.h.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Tag matches the header version
+        shell: bash
+        run: |
+          v=$(python3 - <<'EOF'
+          import re
+          text = open("include/mossinfer/mossinfer.h", encoding="utf-8").read()
+          parts = [re.search(rf"^#define MI_VERSION_{p} +(\d+)", text, re.M).group(1) for p in ("MAJOR", "MINOR", "PATCH")]
+          print(".".join(parts))
+          EOF
+          )
+          echo "header version $v, tag $GITHUB_REF_NAME"
+          test "v$v" = "$GITHUB_REF_NAME"
+
+  build:
+    needs: version
+    uses: ./.github/workflows/build.yml
+    with:
+      retention-days: 30
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: mossinfer-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        shell: bash
+        working-directory: dist
+        run: |
+          rm -f ./*.sha256
+          sha256sum mossinfer-*.zip mossinfer-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          ls -l
+      - uses: softprops/action-gh-release@v3.0.3
+        with:
+          files: |
+            dist/mossinfer-*.zip
+            dist/mossinfer-*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
