@@ -1,4 +1,4 @@
-// Shared checks, tile choice, interleave_up_gate and the plain GEMM (see fused_gemm.h).
+// Shared checks, tile choice and the plain GEMM (see fused_gemm.h).
 #include <algorithm>
 #include <atomic>
 #include <climits>
@@ -25,6 +25,20 @@ std::int64_t row_stride(const Tensor& t) {
 }
 
 bool aligned16(const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16 == 0; }
+
+// SMs of the current device, cached per device (tile_for runs on every launch).
+int sm_count() {
+  constexpr int kMaxDevices = 64;
+  static std::atomic<int> cached[kMaxDevices];
+  int dev = 0;
+  MI_CUDA_CHECK(cudaGetDevice(&dev));
+  int n = dev >= 0 && dev < kMaxDevices ? cached[dev].load(std::memory_order_relaxed) : 0;
+  if (n == 0) {
+    MI_CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
+    if (dev >= 0 && dev < kMaxDevices) cached[dev].store(n, std::memory_order_relaxed);
+  }
+  return n;
+}
 
 }  // namespace
 
@@ -56,10 +70,11 @@ Problem check_problem(const char* op, const Tensor& out, const Tensor& x, const 
 GemmTile tile_for(const Problem& p) {
   const GemmTile forced = g_tile_override.load();
   if (forced != GemmTile::kAuto) return forced;
-  // Measured on sm_89 at the DiT shapes (M = 4k..21k): 256x128 for the wide ffn_up_gate (N = 16384),
-  // 128x256 otherwise; below one wave of 128x256 tiles the 128x128 tile keeps more SMs busy.
+  // Measured on sm_89 (76 SMs) at the DiT shapes (M = 4k..21k): 256x128 for the wide ffn_up_gate (N = 16384),
+  // 128x256 otherwise; below two waves of 128x256 tiles the 128x128 tile keeps more SMs busy. The large tiles are
+  // within ~3% of each other there (power-capped clocks, GpuFusedGemm.Throughput sweeps them).
   const std::int64_t tiles = (static_cast<std::int64_t>(p.m) + 127) / 128 * ((p.n + 255) / 256);
-  if (tiles < 2 * 76) return GemmTile::k128x128;
+  if (tiles < 2 * static_cast<std::int64_t>(sm_count())) return GemmTile::k128x128;
   return p.n >= 16384 ? GemmTile::k256x128 : GemmTile::k128x256;
 }
 
@@ -80,47 +95,20 @@ void plain(const Problem& p, const Tensor& out, const Tensor& x, const Tensor& w
   launch<Gemm>("gemm", args, stream);
 }
 
-// out row 2*g*G + s*G + i <- w row s*F + g*G + i; one thread per 16-byte chunk of a row.
-__global__ void interleave_kernel(const uint4* w, uint4* out, std::int64_t f, std::int64_t chunks_per_row) {
-  const std::int64_t total = 2 * f * chunks_per_row;
-  for (std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
-       idx += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
-    const std::int64_t row = idx / chunks_per_row, c = idx % chunks_per_row;
-    const std::int64_t g = row / (2 * kUpGateGroup), s = (row / kUpGateGroup) % 2, i = row % kUpGateGroup;
-    out[idx] = w[(s * f + g * kUpGateGroup + i) * chunks_per_row + c];
-  }
-}
-
 }  // namespace
 }  // namespace detail
 
 void set_gemm_tile_override(GemmTile tile) { detail::g_tile_override.store(tile); }
 
+bool matches_cublaslt(const kernels::Gemm::AlgoConfig& algo) {
+  const bool k_ordered = algo.id == 5 || algo.id == 6 || algo.id == 21;
+  return k_ordered && algo.split_k <= 1 && algo.reduction_scheme == 0 && algo.custom_option == 0;
+}
+
 void gemm(const Tensor& out, const Tensor& x, const Tensor& w, cudaStream_t stream) {
   const detail::Problem p = detail::check_problem("gemm", out, x, w, w.dim(0));
   if (p.m == 0) return;
-  switch (detail::tile_for(p)) {
-    case GemmTile::k256x128: detail::plain<detail::Tile256x128>(p, out, x, w, stream); break;
-    case GemmTile::k128x128: detail::plain<detail::Tile128x128>(p, out, x, w, stream); break;
-    default: detail::plain<detail::Tile128x256>(p, out, x, w, stream); break;
-  }
-}
-
-void interleave_up_gate(const Tensor& w, const Tensor& out, cudaStream_t stream) {
-  constexpr const char* op = "interleave_up_gate";
-  const bool ok = w.device == Device::kCUDA && out.device == Device::kCUDA && w.dtype == DType::kBF16 &&
-                  out.dtype == DType::kBF16 && w.rank == 2 && out.rank == 2 && w.is_contiguous() && out.is_contiguous() &&
-                  w.dim(0) == out.dim(0) && w.dim(1) == out.dim(1) && w.dim(0) % (2 * kUpGateGroup) == 0 &&
-                  w.dim(1) % 8 == 0 && detail::aligned16(w.data) && detail::aligned16(out.data) && w.data != out.data;
-  if (!ok) {
-    detail::fail(op, "expected distinct contiguous 16-byte aligned bf16 [2F, K] tensors (F % 4 == 0, K % 8 == 0), got " +
-                         w.describe() + " -> " + out.describe());
-  }
-  const std::int64_t f = w.dim(0) / 2, chunks = w.dim(1) / 8;
-  const std::int64_t total = 2 * f * chunks;
-  const auto blocks = static_cast<unsigned>(std::min<std::int64_t>((total + 255) / 256, 65535));
-  detail::interleave_kernel<<<blocks, 256, 0, stream>>>(w.ptr<const uint4>(), out.ptr<uint4>(), f, chunks);
-  MI_CUDA_CHECK_LAUNCH();
+  detail::with_tile(detail::tile_for(p), [&](auto tile) { detail::plain<decltype(tile)>(p, out, x, w, stream); });
 }
 
 }  // namespace mi::kernels::fused

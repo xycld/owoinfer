@@ -141,15 +141,22 @@ class MossDitTest : public ::testing::Test {
     // Largest workload here: 1456^2 (91x91 latent grid) with a 4096-token cond row and a 16-token uncond row.
     const std::int64_t lengths[] = {4096, 16};
     // encode_text and forward never overlap on the stack.
-    const std::size_t bytes = MossDit::persistent_bytes(*index_) +
-                              std::max(MossDit::workspace_bytes(91, 91, lengths), MossDit::encode_text_workspace_bytes(4096));
-    std::printf("[moss_dit] arena %.3f GiB (free %.3f GiB)\n", static_cast<double>(bytes) / kGiB,
-                static_cast<double>(mi::runtime::DeviceArena::free_device_bytes()) / kGiB);
+    const std::size_t work = std::max(MossDit::workspace_bytes(91, 91, lengths), MossDit::encode_text_workspace_bytes(4096));
+    // Every block resident when it fits; otherwise (other applications hold device memory) the blocks that fit, the
+    // rest streamed: bit-identical (test_dit_stream), so the parity tests hold either way.
+    const std::size_t free = mi::runtime::DeviceArena::free_device_bytes() - (std::size_t{256} << 20);
+    for (residency_.resident_blocks = mi::moss_dit::kNumBlocks; residency_.resident_blocks > 0; --residency_.resident_blocks) {
+      if (MossDit::persistent_bytes(*index_, residency_) + work + MossDit::stream_workspace_bytes(*index_, residency_) <= free) break;
+    }
+    const std::size_t bytes =
+        MossDit::persistent_bytes(*index_, residency_) + work + MossDit::stream_workspace_bytes(*index_, residency_);
+    std::printf("[moss_dit] arena %.3f GiB (free %.3f GiB), %d of 42 blocks resident\n", static_cast<double>(bytes) / kGiB,
+                static_cast<double>(mi::runtime::DeviceArena::free_device_bytes()) / kGiB, residency_.resident_blocks);
     arena_ = std::make_unique<mi::runtime::DeviceArena>(bytes);
     // MOSS_DIT_DIRECT_IO=1 loads with O_DIRECT (cold-cache behaviour) instead of buffered reads.
     const char* direct_env = std::getenv("MOSS_DIT_DIRECT_IO");
     const bool direct = direct_env != nullptr && std::string(direct_env) == "1";
-    model_ = std::make_unique<MossDit>(*index_, *arena_, *streams_, direct);
+    model_ = std::make_unique<MossDit>(*index_, *arena_, *streams_, direct, nullptr, residency_);
     const auto& st = model_->load_stats();
     std::printf("[moss_dit] load: %.2f GiB in %.2f s (%.2f GB/s, %s reads), persistent %.3f GiB\n",
                 static_cast<double>(st.bytes) / kGiB, st.seconds, static_cast<double>(st.bytes) / st.seconds / 1e9,
@@ -205,12 +212,14 @@ class MossDitTest : public ::testing::Test {
   static std::unique_ptr<mi::runtime::StreamSet> streams_;
   static std::unique_ptr<mi::runtime::DeviceArena> arena_;
   static std::unique_ptr<MossDit> model_;
+  static mi::moss_dit::Residency residency_;
 };
 
 std::unique_ptr<mi::weights::ModelIndex> MossDitTest::index_;
 std::unique_ptr<mi::runtime::StreamSet> MossDitTest::streams_;
 std::unique_ptr<mi::runtime::DeviceArena> MossDitTest::arena_;
 std::unique_ptr<MossDit> MossDitTest::model_;
+mi::moss_dit::Residency MossDitTest::residency_;
 
 // Sub-model parity against tools/reference/gen_moss_dit_vectors.py (tests/data/moss_dit/).
 Compare compare_bf16(const std::vector<std::uint16_t>& ref, const std::vector<std::uint16_t>& got) {
@@ -361,7 +370,7 @@ TEST_F(MossDitTest, VarlenBatchBitExactPerRow) {
       const std::size_t n = set.rows.size();
       std::vector<std::int64_t> lengths;
       for (const Row& r : set.rows) lengths.push_back(r.text.dim(0));
-      ASSERT_LE(MossDit::workspace_bytes(g.h, g.w, lengths), arena_->available());
+      ASSERT_LE(MossDit::workspace_bytes(g.h, g.w, lengths) + MossDit::stream_workspace_bytes(*index_, residency_), arena_->available());
       std::vector<std::unique_ptr<DevTensor>> batched, alone;
       std::vector<Tensor> outs;
       for (std::size_t r = 0; r < n; ++r) {
@@ -463,7 +472,8 @@ TEST_F(MossDitTest, StepMemoryAndTiming) {
     const Row rows[] = {{cond->t, SkipSet{}}, {uncond->t, skip}};
     const Tensor outs[] = {oc.t, ou.t};
     const std::int64_t lengths[] = {sh.s_cond, sh.s_uncond};
-    const std::size_t predicted = MossDit::workspace_bytes(sh.grid, sh.grid, lengths);
+    const std::size_t predicted =
+        MossDit::workspace_bytes(sh.grid, sh.grid, lengths) + MossDit::stream_workspace_bytes(*index_, residency_);
 
     MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
     arena_->reset_high_water();

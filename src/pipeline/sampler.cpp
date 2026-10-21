@@ -97,14 +97,15 @@ bool Guidance::slg_active(int step, int num_steps) const {
 }
 
 std::size_t denoise_workspace_bytes(std::int64_t height, std::int64_t width, std::int64_t cond_tokens,
-                                    std::int64_t uncond_tokens, const Guidance& guidance, SamplerKind sampler) {
+                                    std::int64_t uncond_tokens, const Guidance& guidance, SamplerKind sampler,
+                                    moss_dit::BlockPath path) {
   std::vector<std::int64_t> lengths = {cond_tokens};
   if (guidance.do_cfg()) lengths.push_back(uncond_tokens);
   if (guidance.slg_layers.any() && guidance.slg_scale > 0) lengths.push_back(cond_tokens);
   const std::size_t latent = runtime::align_up(static_cast<std::size_t>(moss_dit::kLatentChannels * height * width) * sizeof(float));
   // One velocity per row, the guided prediction, and AB2's previous prediction.
   const std::size_t buffers = lengths.size() + 1 + (sampler == SamplerKind::kAb2 ? 1 : 0);
-  return buffers * latent + moss_dit::MossDit::workspace_bytes(height, width, lengths);
+  return buffers * latent + moss_dit::MossDit::workspace_bytes(height, width, lengths, path);
 }
 
 int denoise(moss_dit::MossDit& dit, runtime::DeviceArena& arena, const Tensor& cond_text, const Tensor& uncond_text,

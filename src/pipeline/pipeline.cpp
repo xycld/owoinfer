@@ -6,13 +6,19 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <exception>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -21,6 +27,7 @@
 #include "models/moss_dit/moss_dit.h"
 #include "models/qwen35_text/text_encoder.h"
 #include "pipeline/embedding_cache.h"
+#include "pipeline/hardware_profile.h"
 #include "pipeline/rng_torch_compat.h"
 #include "planner/host_memory.h"
 #include "runtime/device_arena.h"
@@ -92,6 +99,112 @@ std::unique_ptr<Bundle> open_bundle(const std::filesystem::path& dir) {
   auto b = std::unique_ptr<Bundle>(new Bundle{dir, std::move(index), tok::Tokenizer::load(dir / "tokenizer" / "tokenizer.json"), 0});
   b->te_hash = text_encoder_hash(b->index);
   return b;
+}
+
+// Transfer rates of this machine (P4b), measured in ~0.2 s: pinned host -> device (best of 4 copies), and the weight
+// files -> pinned host memory with the DiT streamer's 4 readers over one DiT block (the better of two passes after a
+// first one: page cache; the first pass counts as a cold read only when clearly slower). Throws on CUDA errors (e.g. no room for its buffers); I/O
+// errors leave the defaults.
+planner::HardwareProfile probe_hardware(const weights::ModelIndex& index, cudaStream_t stream) {
+  planner::HardwareProfile hw;
+  constexpr std::size_t kSlice = std::size_t{16} << 20;
+  constexpr int kReaders = 4;
+  struct Pinned {
+    void* p = nullptr;
+    ~Pinned() {
+      if (p != nullptr) cudaFreeHost(p);
+    }
+  } host;
+  MI_CUDA_CHECK(cudaHostAlloc(&host.p, kSlice * kReaders, cudaHostAllocDefault));
+  {
+    DeviceBuffer dev(kSlice * kReaders);
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
+    MI_CUDA_CHECK(cudaEventCreate(&e0));
+    MI_CUDA_CHECK(cudaEventCreate(&e1));
+    MI_CUDA_CHECK(cudaMemcpyAsync(dev.get(), host.p, kSlice * kReaders, cudaMemcpyHostToDevice, stream));  // warm-up
+    // Best of a few copies: the bus is shared with whatever else runs on the machine.
+    float best = 0;
+    for (int i = 0; i < 4; ++i) {
+      MI_CUDA_CHECK(cudaEventRecord(e0, stream));
+      MI_CUDA_CHECK(cudaMemcpyAsync(dev.get(), host.p, kSlice * kReaders, cudaMemcpyHostToDevice, stream));
+      MI_CUDA_CHECK(cudaEventRecord(e1, stream));
+      MI_CUDA_CHECK(cudaEventSynchronize(e1));
+      float ms = 0;
+      MI_CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+      if (ms > 0 && (best == 0 || ms < best)) best = ms;
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    if (best > 0) hw.h2d_gbps = static_cast<double>(kSlice * kReaders) / (static_cast<double>(best) * 1e6);
+  }
+  const weights::WeightGroup* g = index.find_group(weights::Component::kTransformer, "block.21");
+  if (g == nullptr || g->tensors.empty()) return hw;
+  try {
+    // One file's contiguous span of the group (all of it unless the group straddles a shard boundary).
+    const std::uint32_t file = g->tensors.front().file;
+    std::uint64_t begin = std::numeric_limits<std::uint64_t>::max(), end = 0;
+    for (const auto& t : g->tensors) {
+      if (t.file != file) continue;
+      begin = std::min(begin, t.offset);
+      end = std::max(end, t.offset + t.nbytes);
+    }
+    weights::ReaderCache readers(index, false);
+    const weights::FileReader& f = readers.get(file);
+    const auto pass = [&] {
+      const auto t0 = Clock::now();
+      std::vector<std::thread> threads;
+      std::exception_ptr error;
+      std::mutex mu;
+      const auto join = [&] {
+        for (auto& t : threads) t.join();
+      };
+      try {
+        for (int r = 0; r < kReaders; ++r) {
+          threads.emplace_back([&, r] {
+            try {
+              std::byte* dst = static_cast<std::byte*>(host.p) + static_cast<std::size_t>(r) * kSlice;
+              for (std::uint64_t o = begin + static_cast<std::uint64_t>(r) * kSlice; o < end; o += kSlice * kReaders) {
+                f.read_at(o, dst, static_cast<std::size_t>(std::min<std::uint64_t>(kSlice, end - o)));
+              }
+            } catch (...) {
+              std::lock_guard<std::mutex> lock(mu);
+              error = std::current_exception();
+            }
+          });
+        }
+      } catch (...) {
+        join();  // a thread that could not be created: the started ones still read into `host`
+        throw;
+      }
+      join();
+      if (error) std::rethrow_exception(error);
+      return since(t0);
+    };
+    const double cold = pass(), warm = std::min(pass(), pass());
+    const double bytes = static_cast<double>(end - begin);
+    if (warm > 0) hw.host_gbps = bytes / warm / 1e9;
+    if (cold > 3 * warm && cold > 0) hw.disk_gbps = bytes / cold / 1e9;
+  } catch (const std::exception&) {
+    return hw;  // unreadable weights fail later, with a better error
+  }
+  hw.measured = true;
+  return hw;
+}
+
+// Seconds since the Unix epoch (the profile's age).
+std::int64_t unix_now() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// The fused-block self-check result of each hardware key this process has checked (first use per process).
+std::optional<moss_dit::FusedCheck> process_fused_check(const std::string& key, const moss_dit::FusedCheck* set = nullptr) {
+  static std::mutex mu;
+  static std::map<std::string, moss_dit::FusedCheck> checks;
+  std::lock_guard<std::mutex> lock(mu);
+  if (set != nullptr) checks[key] = *set;
+  const auto it = checks.find(key);
+  if (it == checks.end()) return std::nullopt;
+  return it->second;
 }
 
 }  // namespace
@@ -245,8 +358,13 @@ struct Pipeline::Impl {
   const Bundle* vae_bundle = nullptr;
   // Bundle whose resident DiT was last dropped outside the plan's parking (its next load is a reload).
   const Bundle* dit_lost = nullptr;
-  // Learned from the last file-streamed text-encoder pass (planner::weights_cached_from_stream).
-  bool weights_cached = true;
+  // Transfer rates for the cost model and whether the weight files are page-cached: probed (or read from the cache
+  // directory) at the first generate(), refined from every pass (pipeline/hardware_profile.h). Unset with
+  // options.hardware.
+  std::optional<ProfileLearner> learner;
+  std::string hw_key;  // hardware_key() of the learner's profile
+  // This pipeline's fused-block self-check (from the profile, the process, or run at the first fused generate()).
+  std::optional<moss_dit::FusedCheck> fused_check;
   const std::uint64_t te_numerics = qwen35_text::numerics_id();  // embedding-cache key part
 
   // Per generate() call.
@@ -316,6 +434,115 @@ struct Pipeline::Impl {
     mem->arena_capacity = std::max(mem->arena_capacity, arena->capacity());
   }
 
+  moss_dit::Residency dit_residency(const planner::DitPlan& d) const {
+    moss_dit::Residency r;
+    if (d.residency != planner::DitResidency::kStreamed) return r;
+    r.resident_blocks = d.resident_blocks;
+    r.buffers = d.buffers;
+    r.source = d.source == planner::DitSource::kHostPinned ? moss_dit::StreamSource::kHostPinned : moss_dit::StreamSource::kFile;
+    r.direct_io = options.direct_io;
+    return r;
+  }
+
+  std::filesystem::path profile_path() const {
+    return options.cache_dir.empty() ? std::filesystem::path() : options.cache_dir / "hardware_profile.json";
+  }
+
+  bool weights_cached() const { return !learner || learner->te_weights_cached(); }
+  bool dit_weights_cached() const { return !learner || learner->dit_weights_cached(); }
+
+  planner::HardwareProfile hardware(const Bundle& b) {
+    if (options.hardware) return *options.hardware;
+    if (learner) return learner->current();
+    hw_key = hardware_key();
+    const std::int64_t now = unix_now();
+    std::optional<StoredProfile> stored;
+    if (!profile_path().empty()) stored = read_profile(profile_path(), hw_key, now);
+    if (!stored) {
+      StoredProfile p;
+      try {
+        p.probe = probe_hardware(b.index, streams.compute());
+      } catch (const std::exception&) {
+        p.probe = planner::HardwareProfile{};  // e.g. no room for the probe's 64 MiB buffers: plan with the defaults
+      }
+      p.learned = p.probe;
+      p.probed_at = now;
+      stored = p;
+      if (p.probe.measured) save_profile(*stored);
+    }
+    learner.emplace(*stored);
+    return learner->current();
+  }
+
+  void save_profile(const StoredProfile& p) const {
+    if (!profile_path().empty() && p.probe.measured) write_profile(profile_path(), hw_key, p);
+  }
+
+  // The fused GEMMs' self-check: the profile's (once it ran on this hardware key with these fused kernels), else this
+  // process's, else run now (~1 s, before any arena exists on the first call) and cached in both; a passed check's
+  // configurations are installed for fused_route(). A check that cannot run (no device memory) is not stored, but this
+  // pipeline keeps its outcome: op by op for its lifetime, never switching block path between calls.
+  moss_dit::FusedCheck check_fused() {
+    if (fused_check) return *fused_check;
+    std::optional<moss_dit::FusedCheck> c;
+    if (learner && learner->stored().fused_check) {
+      c = learner->stored().fused_check;
+    } else {
+      const std::string key = learner ? hw_key : hardware_key();
+      c = process_fused_check(key);
+      if (!c) {
+        try {
+          c = moss_dit::check_fused_gemms(streams.compute());
+        } catch (const std::exception& e) {
+          fused_check = moss_dit::FusedCheck{false, std::string("self-check could not run: ") + e.what(), {}};
+          return *fused_check;
+        }
+        process_fused_check(key, &*c);
+      }
+      if (learner) {
+        learner->stored().fused_check = c;
+        save_profile(learner->stored());
+      }
+    }
+    moss_dit::install_fused_check(*c);
+    fused_check = c;
+    return *c;
+  }
+
+  // The block path for this call: options.block_path unless the fused GEMMs failed their self-check.
+  moss_dit::BlockPath block_path(std::string& note) {
+    if (options.block_path == moss_dit::BlockPath::kOpByOp) return options.block_path;
+    const moss_dit::FusedCheck c = check_fused();
+    if (c.ok) return options.block_path;
+    note = std::string("fused DiT blocks disabled, running op by op: ") + c.detail;
+    return moss_dit::BlockPath::kOpByOp;
+  }
+
+  // What a finished denoise measured, for the next plans (ProfileLearner decides what sticks):
+  //  - compute: the median step minus its streaming stalls against the plan's compute estimate gives a TFLOPS estimate;
+  //  - a file-streamed DiT's median rate to the device: page-cached or cold, and the page-cache rate.
+  void learn_from_denoise(const Result& r) {
+    if (!learner || options.hardware) return;
+    bool changed = false;
+    const std::vector<double>& steps = r.timings.step_s;
+    if (steps.size() >= 3 && r.plan.dit.compute_s > 0) {
+      std::vector<double> sorted(steps.begin() + 1, steps.end());  // the first step pays warm-up (GEMM plans)
+      std::sort(sorted.begin(), sorted.end());
+      const double stall = r.dit_stream.streamed ? r.dit_stream.stall_s / static_cast<double>(steps.size()) : 0.0;
+      const double compute = sorted[sorted.size() / 2] - stall;
+      if (compute > 0) changed = learner->observe_tflops(r.hardware.bf16_tflops * r.plan.dit.compute_s / compute);
+    }
+    // The median step's rate: the first step may read blocks the page cache did not hold yet.
+    const DitStreamStats& st = r.dit_stream;
+    if (st.streamed && st.source == "file" && st.steps.size() >= 2 && !options.direct_io) {
+      std::vector<double> rates;
+      for (std::size_t i = 1; i < st.steps.size(); ++i) rates.push_back(st.steps[i].gbps);
+      std::sort(rates.begin(), rates.end());
+      changed = learner->observe_dit_stream(rates[rates.size() / 2]) || changed;
+    }
+    if (changed) save_profile(learner->stored());
+  }
+
   void ensure_te(const Bundle& b, const qwen35_text::EncoderOptions& o) {
     if (te && te_bundle == &b) {
       const qwen35_text::EncoderOptions& cur = te->options();
@@ -328,16 +555,21 @@ struct Pipeline::Impl {
 
   // The plan counts the DiT and every resident model, so a resident DiT is never expected to be dropped here; when
   // it is (the arena found does not match the plan), the reload is reported as MemoryStats::dit_reloaded.
-  void ensure_dit(const Bundle& b, std::size_t stack_need, const std::atomic<bool>* cancel, Timings& tm) {
-    if (dit && dit_bundle == &b && arena->available() >= stack_need) return;
-    const std::size_t persistent = moss_dit::MossDit::persistent_bytes(b.index);
-    if (dit || arena->available() < persistent + stack_need) reset_arena(arena->capacity());
+  // `stack_need` excludes the streamed blocks' device buffers (added here from `residency`). A loaded DiT with another
+  // residency is replaced: a planned change, not a reload.
+  void ensure_dit(const Bundle& b, const moss_dit::Residency& residency, std::size_t stack_need, const std::atomic<bool>* cancel,
+                  Timings& tm) {
+    stack_need += moss_dit::MossDit::stream_workspace_bytes(b.index, residency);
+    const bool same = dit && dit_bundle == &b && dit->residency() == residency;
+    if (same && arena->available() >= stack_need) return;
+    const std::size_t persistent = moss_dit::MossDit::persistent_bytes(b.index, residency);
+    if (dit || arena->available() < persistent + stack_need) reset_arena(arena->capacity(), dit && !same);
     if (arena->available() < persistent + stack_need) {
       throw runtime::BudgetError(persistent + stack_need, arena->available());
     }
     const auto t0 = Clock::now();
     try {
-      dit = std::make_unique<moss_dit::MossDit>(b.index, *arena, streams, options.direct_io, cancel);
+      dit = std::make_unique<moss_dit::MossDit>(b.index, *arena, streams, options.direct_io, cancel, residency);
     } catch (...) {
       // A partial load (cancelled or failed) leaves its weights in the persistent region: start over clean.
       reset_arena(arena->capacity());
@@ -374,6 +606,7 @@ struct Pipeline::Impl {
   // it runs: on a full embedding-cache hit the encoder's held memory stays in the baseline.
   std::size_t held_host_bytes(bool te_runs) const {
     std::size_t held = cache ? cache->stats().bytes : 0;
+    if (dit) held += dit->host_bytes();  // a streamed DiT's rings or pinned copy: the planner counts its own
     if (te_runs && te && te_bundle != nullptr) {
       qwen35_text::EncoderOptions file = te->options();
       file.source = qwen35_text::WeightSource::kFile;
@@ -408,6 +641,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     tm.total_s = since(t_total);
     m.sample_memory();
     m.mem = nullptr;
+    if (m.learner) m.learner->end_generation();
     return std::move(r);
   };
   // The models keep the call's cancel flag only for the call (the flag may not outlive it).
@@ -470,6 +704,10 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   std::vector<std::int64_t> te_lengths;
   for (const std::size_t i : missing) te_lengths.push_back(static_cast<std::int64_t>(seqs[i].size()));
 
+  // Machine profile and block path (the first call probes and self-checks; both are cached).
+  r.hardware = m.hardware(b);
+  const moss_dit::BlockPath block_path = m.block_path(r.block_path_note);
+
   // Exact stack need of the phases this request runs, and the plan.
   const std::int64_t h = req.height / 16, w = req.width / 16;
   const std::size_t latent_bytes = align_up(static_cast<std::size_t>(moss_dit::kLatentChannels * h * w) * sizeof(float));
@@ -478,12 +716,13 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   const std::size_t refine_need = bf16_rows(sc, moss_dit::kTextDim) + (g.do_cfg() ? bf16_rows(su, moss_dit::kTextDim) : 0) +
                                   moss_dit::MossDit::encode_text_workspace_bytes(std::max(sc, su));
   const std::size_t denoise_need =
-      refined_bytes + std::max(refine_need, latent_bytes + denoise_workspace_bytes(h, w, sc, su, g, req.sampler));
+      refined_bytes + std::max(refine_need, latent_bytes + denoise_workspace_bytes(h, w, sc, su, g, req.sampler, block_path));
   const flux2_vae::DecodeMode decode_mode = flux2_vae::DecodeMode::reference();
 
   planner::PlanInputs in;
   in.shapes = planner::shapes_from_index(b.index);
   in.shapes.dit_bytes = moss_dit::MossDit::persistent_bytes(b.index);
+  in.shapes.dit_block_bytes = align_up(moss_dit::BlockWeights::block_device_bytes(b.index));  // the buffers' size
   in.shapes.vae_bytes = flux2_vae::Flux2VaeDecoder::persistent_bytes(b.index);
   in.request.height = req.height;
   in.request.width = req.width;
@@ -494,7 +733,8 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   in.request.te_lengths = te_lengths;
   in.request.decode = req.decode;
   in.request.te_cached = missing.empty();
-  in.request.weights_cached = m.weights_cached;
+  in.request.weights_cached = m.weights_cached();
+  in.request.dit_weights_cached = m.dit_weights_cached();
   in.request.vae_resident = m.vae != nullptr;
   in.workspaces.text_encoder = [&](planner::TeResidency residency, int buffers) {
     return qwen35_text::TextEncoder::workspace_bytes(b.index, te_lengths, m.te_options(residency, buffers));
@@ -523,6 +763,16 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   in.caps.te_ring_bytes = qwen35_text::TextEncoder::host_bytes(b.index, m.te_options(planner::TeResidency::kStreamed, 2));
   in.caps.te_host_resident = true;
   in.caps.dit_parking = true;
+  in.caps.dit_streaming = true;
+  in.caps.dit_max_buffers = 3;
+  {
+    moss_dit::Residency file;
+    file.resident_blocks = 0;
+    in.caps.dit_ring_bytes = moss_dit::BlockWeights::host_bytes(b.index, file);
+  }
+  in.caps.dit_host_pinned = true;
+  in.caps.dit_graph_bytes = block_path == moss_dit::BlockPath::kFusedGraphs ? moss_dit::graph_cache_bytes() : 0;
+  in.hardware = r.hardware;
   in.budgets.vram_free = runtime::DeviceArena::free_device_bytes() + (m.arena ? m.arena->capacity() : 0);
   in.budgets.vram_reserve = m.options.vram_reserve;
   in.budgets.vram_budget = m.options.vram_budget;
@@ -543,15 +793,31 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     r.plan = planner::plan(in);
     drop_resident = true;
   }
+  // A loaded DiT stays (in its held arena, with its residency) unless the request's own plan saves more than reloading
+  // it costs: no reload churn when request sizes alternate or the free device memory moves a little.
+  bool kept = false;
+  if (m.arena && m.dit && m.dit_bundle == &b && !drop_resident) {
+    const moss_dit::Residency& loaded = m.dit->residency();
+    planner::HeldDit held;
+    held.arena_bytes = m.arena->capacity();
+    held.graph_bytes = m.dit->graph_bytes();
+    if (loaded.streamed()) {
+      held.dit.residency = planner::DitResidency::kStreamed;
+      held.dit.resident_blocks = loaded.resident_blocks;
+      held.dit.buffers = loaded.buffers;
+      held.dit.source = loaded.source == moss_dit::StreamSource::kHostPinned ? planner::DitSource::kHostPinned : planner::DitSource::kFile;
+    }
+    r.plan = planner::prefer_held(in, std::move(r.plan), held, &kept);
+  }
   const planner::ExecutionPlan& plan = r.plan;
   if (m.cache) m.cache->set_max_bytes(plan.cache.host_bytes);
   tm.plan_s = since(t0);
   if (control.on_plan) control.on_plan(plan);
 
   // The plan's arena. A larger existing one is kept (its resident models with it) unless the request needs less than
-  // arena_shrink_below of it.
-  const bool shrink = m.arena && static_cast<double>(plan.arena_bytes) <
-                                     m.options.arena_shrink_below * static_cast<double>(m.arena->capacity());
+  // arena_shrink_below of it and the plan does not keep the loaded DiT.
+  const bool shrink = m.arena && !kept &&
+                      static_cast<double>(plan.arena_bytes) < m.options.arena_shrink_below * static_cast<double>(m.arena->capacity());
   if (!m.arena || m.arena->capacity() < plan.arena_bytes || drop_resident || shrink) m.reset_arena(plan.arena_bytes);
   m.arena->reset_high_water();
   r.memory.arena_capacity = std::max(r.memory.arena_capacity, m.arena->capacity());
@@ -583,8 +849,8 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     tm.te_weight_load_s = st.weight_load_s;
     tm.te_weight_wait_s = st.weight_wait_s;
     tm.te_compute_s = st.compute_s;
-    if (m.te->options().source == qwen35_text::WeightSource::kFile) {
-      m.weights_cached = planner::weights_cached_from_stream(st.weight_bytes, st.weight_load_s, st.weight_wait_s, in.hardware);
+    if (m.te->options().source == qwen35_text::WeightSource::kFile && m.learner && !m.options.direct_io) {
+      m.learner->observe_te_stream(planner::weights_cached_from_stream(st.weight_bytes, st.weight_load_s, st.weight_wait_s, in.hardware));
     }
     m.sample_memory();
     for (std::size_t k = 0; k < missing.size(); ++k) {
@@ -599,13 +865,25 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
 
   // 2. DiT, resident across calls.
   if (!keep_going(Phase::kDitLoad)) return finish();
+  const moss_dit::Residency residency = m.dit_residency(plan.dit);
   try {
-    m.ensure_dit(b, denoise_need, control.cancel, tm);
+    m.ensure_dit(b, residency, denoise_need, control.cancel, tm);
   } catch (const moss_dit::Cancelled&) {
     r.cancelled = true;
     return finish();
   }
   m.dit->set_cancel(control.cancel);
+  // A DiT read from the weight files: page-cached or cold (the loader's one reader; O_DIRECT reads say nothing).
+  const moss_dit::LoadStats& ls = m.dit->load_stats();
+  if (tm.dit_load_s > 0 && m.learner && !m.options.direct_io && ls.seconds > 0 && ls.bytes >= (std::uint64_t{1} << 30)) {
+    m.learner->observe_dit_load(static_cast<double>(ls.bytes) / ls.seconds / 1e9);
+  }
+  if (m.dit->block_path() != block_path) m.dit->set_block_path(block_path);
+  r.block_path = block_path;
+  if (block_path == moss_dit::BlockPath::kFusedGraphs && residency.streamed()) {
+    r.block_path = moss_dit::BlockPath::kFused;  // streamed blocks wait on host-driven copies: never captured
+    if (r.block_path_note.empty()) r.block_path_note = "CUDA graphs need every DiT block resident: blocks ran fused, eagerly";
+  }
 
   // 3. Text refiner once per row, then the sampling loop.
   if (!keep_going(Phase::kDenoise)) return finish();
@@ -634,7 +912,32 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       MI_CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
+    // Streaming diagnostics per step: the provider's running totals (read after the step's synchronization).
+    DitStreamStats& ds = r.dit_stream;
+    ds.streamed = residency.streamed();
+    if (ds.streamed) {
+      ds.resident_blocks = residency.resident_blocks;
+      ds.buffers = residency.buffers;
+      ds.source = moss_dit::stream_source_name(residency.source);
+      m.dit->reset_stream_stats();
+    }
+    moss_dit::StreamStats seen;
     const StepCallback on_step = [&](const StepInfo& info) {
+      if (ds.streamed) {
+        const moss_dit::StreamStats& total = m.dit->total_stream_stats();
+        DitStreamStats::Step st;
+        const double copy_s = total.copy_s - seen.copy_s;
+        st.gbps = copy_s > 0 ? static_cast<double>(total.bytes - seen.bytes) / copy_s / 1e9 : 0.0;
+        st.stall_s = total.stall_s - seen.stall_s;
+        st.hidden = copy_s > 0 ? std::max(0.0, 1.0 - st.stall_s / copy_s) : 0.0;
+        st.stalls = total.stalls - seen.stalls;
+        ds.steps.push_back(st);
+        seen = total;
+        ds.bytes = total.bytes;
+        ds.copy_s = total.copy_s;
+        ds.stall_s = total.stall_s;
+        ds.stalls = total.stalls;
+      }
       tm.step_s.push_back(info.step_seconds);
       if (control.on_step && !control.on_step(info)) r.cancelled = true;
       if (cancel_requested()) r.cancelled = true;
@@ -649,6 +952,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       r.steps_run = static_cast<int>(tm.step_s.size());
     }
     tm.denoise_s = since(t0);
+    if (!r.cancelled) m.learn_from_denoise(r);
     m.sample_memory();
     r.latents.resize(static_cast<std::size_t>(latents.numel()));
     MI_CUDA_CHECK(cudaMemcpyAsync(r.latents.data(), latents.data, latents.nbytes(), cudaMemcpyDeviceToHost, stream));

@@ -29,6 +29,7 @@
 #include "core/cuda_check.h"
 #include "models/flux2_vae/flux2_vae.h"
 #include "models/moss_dit/moss_dit.h"
+#include "pipeline/hardware_profile.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/png_writer.h"
 #include "pipeline/rng_torch_compat.h"
@@ -679,7 +680,7 @@ TEST(PipelineEndToEnd, FourStepLatentsMatchReference) {
 TEST(PipelineEndToEnd, BudgetBelowMinimumFailsBeforeTextEncoder) {
   if (!have_weights()) GTEST_SKIP() << "weights not present";
   mi::pipeline::PipelineOptions options;
-  options.vram_budget = std::size_t{1} << 30;  // the DiT alone needs ~9.5 GiB
+  options.vram_budget = std::size_t{1} << 30;  // even a fully streamed DiT keeps ~0.64 GiB resident + 2 block buffers
   mi::pipeline::Pipeline pipe(options);
   mi::pipeline::Request req;
   req.model = weights_root() / "base";
@@ -1003,6 +1004,217 @@ TEST(PipelineEndToEnd, CancelsWithinPhases) {
               EXPECT_TRUE(r.rgb.empty());
               EXPECT_LT(latency, 0.25 * ref.timings.decode_s + 0.1);
             });
+}
+
+// Free device memory grows between two requests (another application exits): the plan for the second would like a
+// larger arena (the whole DiT resident), which means dropping and reloading the loaded, partly streamed DiT. The
+// pipeline plans inside the held arena instead when that costs less than the reload: no new arena, no reload, the
+// same residency and the same bits. (P3's flaky dit_reloaded came from this: a free-memory change between calls.)
+TEST(PipelineEndToEnd, KeepsHeldArenaInsteadOfReloadingTheDit) {
+  if (!have_weights()) GTEST_SKIP() << "weights not present";
+  mi::pipeline::Request req;
+  req.model = weights_root() / "base";
+  req.prompt = "a lighthouse on a rocky coast at dusk, oil painting";
+  req.negative_prompt = "blurry";
+  req.height = req.width = 512;
+  req.steps = 3;
+  mi::pipeline::PipelineOptions options;
+  // Fixed rates (the dev box's, warm page cache): the keep-or-grow decision must not depend on what the page cache
+  // holds while other tests run.
+  mi::planner::HardwareProfile hw;
+  hw.h2d_gbps = 24.0;
+  hw.host_gbps = 19.5;
+  hw.disk_gbps = 2.3;
+  hw.bf16_tflops = 60.0;
+  hw.measured = true;
+  options.hardware = hw;
+  mi::pipeline::Pipeline pipe(options);
+  // Other applications hold all but a 6 GiB arena: the DiT streams some of its blocks.
+  const std::size_t free_now = mi::runtime::DeviceArena::free_device_bytes();
+  const std::size_t want_free = (std::size_t{6} << 30) + options.vram_reserve;
+  ASSERT_GE(free_now, want_free + (std::size_t{4} << 30)) << "the scenario needs ~10.4 GiB of free device memory";
+  auto hold = std::make_unique<mi::DeviceBuffer>(free_now - want_free);
+  const mi::pipeline::Result first = pipe.generate(req);
+  ASSERT_FALSE(first.cancelled);
+  ASSERT_EQ(first.plan.dit.residency, mi::planner::DitResidency::kStreamed) << first.plan.explanation;
+  EXPECT_GT(first.plan.dit.resident_blocks, 0);
+  hold.reset();  // the other application exits
+  const mi::pipeline::Result second = pipe.generate(req);
+  EXPECT_EQ(second.memory.arena_creations, 0) << second.plan.explanation;
+  EXPECT_EQ(second.timings.dit_load_s, 0.0);
+  EXPECT_FALSE(second.memory.dit_reloaded);
+  EXPECT_EQ(second.plan.dit.resident_blocks, first.plan.dit.resident_blocks);
+  EXPECT_NE(second.plan.explanation.find("Planned inside the held"), std::string::npos) << second.plan.explanation;
+  EXPECT_EQ(bit_mismatches(second.latents, first.latents), 0u);
+  EXPECT_TRUE(second.rgb == first.rgb);
+  // A request the held arena cannot serve with the loaded DiT gets the larger arena, and the DiT the plan's residency.
+  mi::pipeline::Request big = req;
+  big.height = big.width = 1456;
+  big.steps = 1;
+  big.decode = false;
+  const mi::pipeline::Result third = pipe.generate(big);
+  EXPECT_FALSE(third.cancelled);
+  EXPECT_EQ(third.memory.arena_creations, 1) << third.plan.explanation;
+  EXPECT_GT(third.timings.dit_load_s, 0.0);
+  EXPECT_EQ(third.plan.explanation.find("Planned inside the held"), std::string::npos) << third.plan.explanation;
+}
+
+// P4: the DiT streamed (min_memory: every block; balanced under a 7 GiB budget: the blocks that fit stay resident)
+// gives the resident pipeline's latents and image bit for bit over several steps, within the plan's arena, with
+// per-step streaming diagnostics. Then AC12 while streaming: a cancel inside a step lands within about one block, the
+// streamed DiT stays loaded (no reload), and the next generate() is identical again.
+TEST(PipelineEndToEnd, StreamedDitMatchesResidentAndCancels) {
+  if (!have_weights()) GTEST_SKIP() << "weights not present";
+  using Clock = std::chrono::steady_clock;
+  mi::pipeline::Request req;
+  req.model = weights_root() / "base";
+  req.prompt = "a lighthouse on a rocky coast at dusk, oil painting";
+  req.negative_prompt = "blurry";
+  req.height = req.width = 512;
+  req.steps = 4;
+  mi::pipeline::Result ref;
+  {
+    mi::pipeline::Pipeline pipe;
+    ref = pipe.generate(req);
+  }
+  ASSERT_EQ(ref.plan.dit.residency, mi::planner::DitResidency::kResident) << ref.plan.explanation;
+  ASSERT_FALSE(ref.dit_stream.streamed);
+  ASSERT_EQ(ref.timings.step_s.size(), 4u);
+
+  struct Variant {
+    const char* name;
+    mi::planner::Mode mode;
+    double budget_gib;
+  };
+  for (const Variant v : {Variant{"min_memory", mi::planner::Mode::kMinMemory, 0.0},
+                          Variant{"balanced, 7 GiB budget", mi::planner::Mode::kBalanced, 7.0}}) {
+    mi::pipeline::PipelineOptions options;
+    options.mode = v.mode;
+    if (v.budget_gib > 0) options.vram_budget = static_cast<std::size_t>(v.budget_gib * (1 << 30));
+    mi::pipeline::Pipeline pipe(options);
+    const mi::pipeline::Result r = pipe.generate(req);
+    ASSERT_FALSE(r.cancelled) << v.name;
+    ASSERT_EQ(r.plan.dit.residency, mi::planner::DitResidency::kStreamed) << v.name << "\n" << r.plan.explanation;
+    if (v.mode == mi::planner::Mode::kMinMemory) {
+      EXPECT_EQ(r.plan.dit.resident_blocks, 0);
+      EXPECT_LT(r.memory.arena_capacity, std::size_t{3} << 30);
+    } else {
+      EXPECT_GT(r.plan.dit.resident_blocks, 0);
+      EXPECT_LT(r.plan.dit.resident_blocks, 42);
+    }
+    EXPECT_EQ(bit_mismatches(r.latents, ref.latents), 0u) << v.name;
+    EXPECT_TRUE(r.rgb == ref.rgb) << v.name;
+    EXPECT_LE(r.memory.arena_high_water, r.plan.arena_bytes) << v.name;
+    EXPECT_FALSE(r.memory.dit_reloaded);
+    const mi::pipeline::DitStreamStats& ds = r.dit_stream;
+    ASSERT_TRUE(ds.streamed) << v.name;
+    EXPECT_EQ(ds.resident_blocks, r.plan.dit.resident_blocks);
+    EXPECT_EQ(ds.buffers, r.plan.dit.buffers);
+    EXPECT_EQ(ds.source, "file");
+    ASSERT_EQ(ds.steps.size(), 4u);
+    EXPECT_GE(ds.bytes, 4 * static_cast<std::uint64_t>(r.plan.dit.stream_bytes) * 99 / 100);
+    for (const auto& st : ds.steps) {
+      EXPECT_GT(st.gbps, 1.0);
+      EXPECT_GE(st.hidden, 0.0);
+      EXPECT_LE(st.hidden, 1.0);
+    }
+    EXPECT_TRUE(r.hardware.measured);
+    std::printf("[pipeline stream] %s: %d of 42 resident, %d buffers; arena %.2f GiB (high-water %.2f), device peak "
+                "%.2f GiB, host private peak %.2f GiB; %.1f GB/s, %.1f%% hidden, %d stalls; steps",
+                v.name, ds.resident_blocks, ds.buffers, static_cast<double>(r.memory.arena_capacity) / (1 << 30),
+                static_cast<double>(r.memory.arena_high_water) / (1 << 30), static_cast<double>(r.memory.device_peak) / (1 << 30),
+                static_cast<double>(r.memory.host_private_peak) / (1 << 30), ds.gbps(), 100.0 * ds.hidden(), ds.stalls);
+    for (const double t : r.timings.step_s) std::printf(" %.3f", t);
+    std::printf(" s (resident:");
+    for (const double t : ref.timings.step_s) std::printf(" %.3f", t);
+    std::printf(" s)\n");
+
+    if (v.mode != mi::planner::Mode::kMinMemory) continue;
+    std::atomic<bool> cancel{false};
+    DelayedCancel dc{cancel};
+    mi::pipeline::GenerateControl control;
+    control.cancel = &cancel;
+    const double step_s = r.timings.step_s[2];
+    control.on_step = [&](const mi::pipeline::StepInfo& s) {
+      if (s.step == 2) dc.arm(0.4 * step_s);  // lands inside step 3
+      return true;
+    };
+    const mi::pipeline::Result c = pipe.generate(req, control);
+    const auto done = Clock::now();
+    dc.join();
+    EXPECT_TRUE(c.cancelled);
+    EXPECT_EQ(c.steps_run, 2);
+    EXPECT_TRUE(c.rgb.empty());
+    std::printf("[pipeline stream] cancel mid-step while streaming: returned %.0f ms after the flag (step %.3f s)\n",
+                dc.until(done) * 1e3, step_s);
+    EXPECT_LT(dc.until(done), 0.3 * step_s + 0.1);  // about one block of a 42-block step
+    const mi::pipeline::Result again = pipe.generate(req);
+    EXPECT_FALSE(again.cancelled);
+    EXPECT_EQ(bit_mismatches(again.latents, ref.latents), 0u);
+    EXPECT_TRUE(again.rgb == ref.rgb);
+    EXPECT_FALSE(again.memory.dit_reloaded);
+    EXPECT_EQ(again.timings.dit_load_s, 0.0);
+    EXPECT_EQ(again.memory.arena_creations, 0);
+  }
+}
+
+// M1/M2: the DiT block path. The default (fused) and the opt-in fused_graphs report themselves and give op_by_op's
+// latents bit for bit; a failed fused self-check (injected through the cached hardware profile of this GPU) makes the
+// pipeline run op by op and say why, with the same latents.
+TEST(PipelineEndToEnd, BlockPathFollowsTheSelfCheck) {
+  if (!have_weights()) GTEST_SKIP() << "weights not present";
+  using mi::moss_dit::BlockPath;
+  mi::pipeline::Request req;
+  req.model = weights_root() / "base";
+  req.prompt = "a lighthouse on a rocky coast at dusk, oil painting";
+  req.negative_prompt = "blurry";
+  req.height = req.width = 256;
+  req.steps = 3;
+  req.decode = false;
+  mi::testing::TempDir shared("block_path_cache");  // embedding cache spill + profile shared by the healthy runs
+  std::vector<float> want;
+  for (const BlockPath path : {BlockPath::kOpByOp, BlockPath::kFused, BlockPath::kFusedGraphs}) {
+    mi::pipeline::PipelineOptions o;
+    o.block_path = path;
+    o.cache_dir = shared.path();
+    mi::pipeline::Pipeline pipe(o);
+    const mi::pipeline::Result r = pipe.generate(req);
+    ASSERT_FALSE(r.cancelled);
+    EXPECT_EQ(r.block_path, path) << r.block_path_note;
+    EXPECT_TRUE(r.block_path_note.empty()) << r.block_path_note;
+    if (path == BlockPath::kFusedGraphs) {
+      EXPECT_GT(r.plan.dit.graph_bytes, 0u);
+    }
+    if (want.empty()) {
+      want = r.latents;
+    } else {
+      EXPECT_EQ(bit_mismatches(r.latents, want), 0u) << mi::moss_dit::block_path_name(path);
+    }
+  }
+  const auto stored = mi::pipeline::read_profile(shared.path() / "hardware_profile.json", mi::pipeline::hardware_key(),
+                                                 std::chrono::duration_cast<std::chrono::seconds>(
+                                                     std::chrono::system_clock::now().time_since_epoch()).count());
+  ASSERT_TRUE(stored.has_value());
+  ASSERT_TRUE(stored->fused_check.has_value());
+  EXPECT_TRUE(stored->fused_check->ok) << stored->fused_check->detail;
+  EXPECT_FALSE(stored->fused_check->validated.empty());
+
+  mi::testing::TempDir injected("block_path_injected");
+  mi::pipeline::StoredProfile bad = *stored;
+  bad.fused_check = mi::moss_dit::FusedCheck{false, "injected mismatch (o_proj at 84 rows)", {}};
+  bad.learned.h2d_gbps = 23.25;  // marks that this profile was used
+  ASSERT_TRUE(mi::pipeline::write_profile(injected.path() / "hardware_profile.json", mi::pipeline::hardware_key(), bad));
+  mi::pipeline::PipelineOptions o;
+  o.cache_dir = injected.path();
+  mi::pipeline::Pipeline pipe(o);
+  const mi::pipeline::Result r = pipe.generate(req);
+  ASSERT_FALSE(r.cancelled);
+  EXPECT_EQ(r.hardware.h2d_gbps, 23.25);
+  EXPECT_EQ(r.block_path, BlockPath::kOpByOp);
+  EXPECT_NE(r.block_path_note.find("injected mismatch (o_proj at 84 rows)"), std::string::npos) << r.block_path_note;
+  EXPECT_EQ(bit_mismatches(r.latents, want), 0u);
+  std::printf("[pipeline] block path after a failed self-check: %s (%s)\n", mi::moss_dit::block_path_name(r.block_path),
+              r.block_path_note.c_str());
 }
 
 }  // namespace

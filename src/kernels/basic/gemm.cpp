@@ -155,8 +155,10 @@ std::size_t Gemm::cached_plans() const {
   return impl_->plans.size();
 }
 
-void Gemm::linear(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias, void* workspace,
-                  std::size_t workspace_bytes, cudaStream_t stream) {
+namespace {
+
+// Validates linear()'s operands and returns their plan key; m or n of 0 means there is nothing to compute.
+Key linear_key(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias, std::size_t workspace_bytes) {
   constexpr const char* op = "linear";
   detail::check_rows(op, "x", x, DType::kBF16);
   const std::int64_t k = x.dim(-1);
@@ -179,14 +181,57 @@ void Gemm::linear(const Tensor& out, const Tensor& x, const Tensor& w, const Ten
     if (bias->numel() != n) detail::fail(op, "bias must be [N], got " + bias->describe());
     bias_type = static_cast<int>(bias->dtype);
   }
+  const void* bias_ptr = bias != nullptr ? bias->data : nullptr;
+  return Key{m, n, k, ldx, ldw, ldo, static_cast<int>(out.dtype), bias_type, workspace_bytes,
+             alignment(x.data), alignment(w.data), alignment(out.data), bias_ptr ? alignment(bias_ptr) : 0u};
+}
+
+template <class T>
+T algo_attribute(const cublasLtMatmulAlgo_t& algo, cublasLtMatmulAlgoConfigAttributes_t attr) {
+  T v{};
+  std::size_t written = 0;
+  MI_LT_CHECK(cublasLtMatmulAlgoConfigGetAttribute(&algo, attr, &v, sizeof(v), &written));
+  return v;
+}
+
+}  // namespace
+
+std::string Gemm::AlgoConfig::describe() const {
+  return "algo " + std::to_string(id) + " tile " + std::to_string(tile) + " stages " + std::to_string(stages) +
+         " split_k " + std::to_string(split_k) + " reduction " + std::to_string(reduction_scheme) + " swizzle " +
+         std::to_string(swizzle) + " custom " + std::to_string(custom_option) + " inner " + std::to_string(inner_shape) +
+         " cluster " + std::to_string(cluster_shape) + " workspace " + std::to_string(workspace_bytes);
+}
+
+Gemm::AlgoConfig Gemm::algo_config(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias,
+                                   std::size_t workspace_bytes) {
+  const Key key = linear_key(out, x, w, bias, workspace_bytes);
+  if (key.m == 0 || key.n == 0) return {};
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  const Plan& plan = impl_->plan_for(key, bias != nullptr ? bias->data : nullptr);
+  AlgoConfig c;
+  c.id = algo_attribute<std::int32_t>(plan.algo, CUBLASLT_ALGO_CONFIG_ID);
+  c.tile = algo_attribute<std::uint32_t>(plan.algo, CUBLASLT_ALGO_CONFIG_TILE_ID);
+  c.split_k = algo_attribute<std::int32_t>(plan.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM);
+  c.reduction_scheme = algo_attribute<std::uint32_t>(plan.algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME);
+  c.swizzle = algo_attribute<std::uint32_t>(plan.algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING);
+  c.custom_option = algo_attribute<std::uint32_t>(plan.algo, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION);
+  c.stages = algo_attribute<std::uint32_t>(plan.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID);
+  c.inner_shape = algo_attribute<std::uint16_t>(plan.algo, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID);
+  c.cluster_shape = algo_attribute<std::uint16_t>(plan.algo, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID);
+  c.workspace_bytes = plan.workspace;
+  return c;
+}
+
+void Gemm::linear(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias, void* workspace,
+                  std::size_t workspace_bytes, cudaStream_t stream) {
+  const Key key = linear_key(out, x, w, bias, workspace_bytes);
   if (workspace_bytes > 0 && (workspace == nullptr || alignment(workspace) < 256)) {
-    detail::fail(op, "workspace must be 256-byte aligned");
+    detail::fail("linear", "workspace must be 256-byte aligned");
   }
-  if (m == 0 || n == 0) return;
+  if (key.m == 0 || key.n == 0) return;
 
   const void* bias_ptr = bias != nullptr ? bias->data : nullptr;
-  const Key key{m, n, k, ldx, ldw, ldo, static_cast<int>(out.dtype), bias_type, workspace_bytes,
-                alignment(x.data), alignment(w.data), alignment(out.data), bias_ptr ? alignment(bias_ptr) : 0u};
   std::lock_guard<std::mutex> lock(impl_->mutex);
   Plan& plan = impl_->plan_for(key, bias_ptr);
   if (bias_ptr != nullptr) {

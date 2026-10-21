@@ -10,8 +10,19 @@
 // runs exactly tiled if the untiled one does not fit next to it; the DiT is evicted ("parked": the arena is recreated
 // without it, the weights reloaded for the next denoise) only when the plan says so, which it does as a last resort.
 // One text encoder (its pinned rings and streams) lives across calls while the arena does.
+// P4: when the whole DiT does not fit (or in min_memory), the plan streams DiT blocks: some stay resident, the others
+// are copied every step from the weight files (page cache) or a pinned host copy into device block buffers, ahead of
+// the compute on copy streams; bit-identical to the resident DiT. The transfer rates the plan's cost model uses are
+// measured once (a short probe, cached as <cache_dir>/hardware_profile.json when a cache directory is set) and then
+// refined from every streamed denoise (pipeline/hardware_profile.h). A loaded DiT is kept (inside its held arena, with
+// its residency) unless the request's own plan saves more time than reloading the DiT costs (planner::prefer_held).
+// P5: the DiT blocks run fused (PipelineOptions::block_path) once a startup self-check (once per GPU, driver, cuBLASLt
+// version and fused-kernels version, cached with the profile) found the fused GEMMs bit-identical to the op-by-op ones
+// here, each in the cuBLASLt configurations it validated (the others run op by op); otherwise op by op, and Result
+// says why.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +30,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -95,6 +107,12 @@ struct PipelineOptions {
   // does not pin the device memory of its largest request forever (resident models are reloaded then, reported as
   // MemoryStats::dit_reloaded). 0 = never shrink.
   double arena_shrink_below = 0.5;
+  // Fixed machine rates for the planner's cost model (a launcher's own profile, reproducible tests): no probe, no
+  // learning from measured passes. Unset: probed at the first generate() and refined from every pass.
+  std::optional<planner::HardwareProfile> hardware;
+  // DiT block implementation (all give the same bits). kFused (default) falls back to kOpByOp when the startup
+  // self-check fails; kFusedGraphs adds CUDA graphs (opt-in: ~0 measured gain, holds graph memory).
+  moss_dit::BlockPath block_path = moss_dit::BlockPath::kFused;
 };
 
 struct Timings {
@@ -129,6 +147,26 @@ struct MemoryStats {
   std::size_t host_private_peak = 0;   // its peak, sampled at phase boundaries
 };
 
+// DiT block streaming of one generate() (P4 step 28), from CUDA events on the GPU timeline (moss_dit::StreamStats).
+struct DitStreamStats {
+  bool streamed = false;   // some blocks were streamed
+  int resident_blocks = 0;
+  int buffers = 0;
+  std::string source;      // "file" (page cache or disk) or "host_pinned"
+  std::uint64_t bytes = 0;  // copied to the device over every step
+  double copy_s = 0;        // copy streams busy
+  double stall_s = 0;       // compute stream waiting for streamed weights
+  int stalls = 0;           // streamed blocks that made the compute stream wait (> 50 us)
+  double gbps() const { return copy_s > 0 ? static_cast<double>(bytes) / copy_s / 1e9 : 0.0; }
+  // Fraction of the copy time hidden behind compute (AC10).
+  double hidden() const { return copy_s > 0 ? std::max(0.0, 1.0 - stall_s / copy_s) : 0.0; }
+  struct Step {
+    double gbps = 0, hidden = 0, stall_s = 0;
+    int stalls = 0;
+  };
+  std::vector<Step> steps;  // per finished step
+};
+
 struct Result {
   int height = 0, width = 0;
   std::vector<std::uint8_t> rgb;  // [height, width, 3]; empty if !decode or cancelled
@@ -150,6 +188,12 @@ struct Result {
   bool decode_tiled = false;
   std::string decode_schedule;
   planner::ExecutionPlan plan;
+  planner::HardwareProfile hardware;  // the transfer rates the plan was made with
+  // DiT block path the denoise ran (fused_graphs only when every block was resident), and why it differs from
+  // PipelineOptions::block_path (empty when it does not).
+  moss_dit::BlockPath block_path = moss_dit::BlockPath::kFused;
+  std::string block_path_note;
+  DitStreamStats dit_stream;
   Timings timings;
   MemoryStats memory;
 };

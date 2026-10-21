@@ -9,7 +9,9 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <string>
 
 #include "core/tensor.h"
 
@@ -33,6 +35,23 @@ class Gemm {
   // Thread-safe; launches on `stream` only.
   void linear(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias, void* workspace,
               std::size_t workspace_bytes, cudaStream_t stream);
+
+  // The cuBLASLt algorithm configuration (CUBLASLT_ALGO_CONFIG_*) linear() selects for these operands. Plans and
+  // caches exactly as linear() does (the same plan is then launched); launches nothing and never reads the operands'
+  // contents, only their shapes, strides and address alignment. Lets callers check whether another kernel reproduces
+  // cuBLASLt's accumulation order (kernels/fused: no split-K).
+  struct AlgoConfig {
+    int id = 0;
+    std::uint32_t tile = 0, stages = 0, swizzle = 0, custom_option = 0;
+    std::int32_t split_k = 1;            // K split into this many partial sums (1: none)
+    std::uint32_t reduction_scheme = 0;  // cublasLtReductionScheme_t of the split-K partials (0: none)
+    std::uint16_t inner_shape = 0, cluster_shape = 0;
+    std::size_t workspace_bytes = 0;     // what the algorithm uses of the workspace
+    bool operator==(const AlgoConfig&) const = default;
+    std::string describe() const;
+  };
+  AlgoConfig algo_config(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias,
+                         std::size_t workspace_bytes);
 
   std::size_t cached_plans() const;
 

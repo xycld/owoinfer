@@ -28,11 +28,9 @@ void gemm_gated_residual(const Tensor& residual, const Tensor& x, const Tensor& 
     throw std::invalid_argument(std::string("mi::kernels::fused::") + op + ": gate must be 16-byte aligned");
   }
   if (p.m == 0) return;
-  switch (detail::tile_for(p)) {
-    case GemmTile::k256x128: detail::gated_residual<detail::Tile256x128>(p, residual, x, w, gate, stream); break;
-    case GemmTile::k128x128: detail::gated_residual<detail::Tile128x128>(p, residual, x, w, gate, stream); break;
-    default: detail::gated_residual<detail::Tile128x256>(p, residual, x, w, gate, stream); break;
-  }
+  detail::with_tile(detail::tile_for(p), [&](auto tile) {
+    detail::gated_residual<decltype(tile)>(p, residual, x, w, gate, stream);
+  });
 }
 
 }  // namespace mi::kernels::fused

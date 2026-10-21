@@ -14,7 +14,9 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/gemm/device/gemm_universal.h"
 #include "cutlass/gemm/device/gemm_universal_with_broadcast.h"
+#include "cutlass/layout/permute.h"
 #include "kernels/basic/detail.h"
 #include "kernels/fused/fused_gemm.h"
 
@@ -38,6 +40,16 @@ using Tile128x256 = TileCfg<128, 256, 32, 64, 64, 3>;
 using Tile256x128 = TileCfg<256, 128, 32, 64, 64, 3>;
 using Tile128x128 = TileCfg<128, 128, 32, 64, 64, 4>;
 
+// Calls f(Tile{}) with the tile configuration of `tile` (kAuto must be resolved first).
+template <class F>
+void with_tile(GemmTile tile, F&& f) {
+  switch (tile) {
+    case GemmTile::k256x128: f(Tile256x128{}); break;
+    case GemmTile::k128x128: f(Tile128x128{}); break;
+    default: f(Tile128x256{}); break;
+  }
+}
+
 // One torch-eager op per step, as kernels/basic (detail.h); _rn intrinsics keep nvcc from contracting into FMAs.
 using kernels::detail::mul;
 using kernels::detail::rbf;
@@ -55,9 +67,13 @@ __device__ __forceinline__ std::uint16_t bf16_bits_rn(float v) {
   return __bfloat16_as_ushort(__float2bfloat16_rn(v));
 }
 
+// Hidden/gate columns per group in gemm_situ_glu's permuted B: GEMM column n reads weight row
+// ((n / G) % 2) * F + (n / 2G) * G + n % G, so columns [2Gj, 2Gj + 2G) are hidden Gj..Gj+G-1 then their gates.
+inline constexpr int kUpGateGroup = 4;
+
 // Standard-epilogue functor of gemm_situ_glu. The D operand is declared as bytes: an access of 8 accumulator
-// columns [8j, 8j + 8) = hidden 4j..4j+3 then gate 4j..4j+3 (interleave_up_gate, G = 4) produces 4 bf16 results
-// = 8 bytes at byte column 8j, which is bf16 column 4j of the [M, F] output.
+// columns [8j, 8j + 8) = hidden 4j..4j+3 then gate 4j..4j+3 produces 4 bf16 results = 8 bytes at byte column 8j,
+// which is bf16 column 4j of the [M, F] output.
 struct SituGluOp {
   static_assert(kUpGateGroup == 4, "SituGluOp assumes groups of 4 hidden + 4 gate columns per access");
   using ElementOutput = std::uint8_t;
@@ -132,6 +148,29 @@ struct GatedResidualOp {
   }
 };
 
+// B-operand address map of gemm_situ_glu (kUpGateGroup): logical B column n reads its row of the stored
+// [hidden | gate] weight, so no permuted weight copy is needed (streamed blocks included). Only the strided (N)
+// coordinate is permuted; each 16-byte access still runs along K, and every element's dot product is unchanged.
+class UpGatePermuteB : public cutlass::layout::PermuteBase {
+ public:
+  CUTLASS_HOST_DEVICE UpGatePermuteB(cutlass::layout::PitchLinearCoord extent, Index stride)
+      : half_(extent.strided() / 2), stride_(stride) {}
+  CUTLASS_HOST_DEVICE UpGatePermuteB(cutlass::MatrixCoord extent, Index stride)
+      : half_(extent.column() / 2), stride_(stride) {}
+  CUTLASS_HOST_DEVICE LongIndex operator()(cutlass::layout::PitchLinearCoord coord) const {
+    const Index n = coord.strided();
+    const Index row = ((n / kUpGateGroup) % 2) * half_ + (n / (2 * kUpGateGroup)) * kUpGateGroup + n % kUpGateGroup;
+    return LongIndex(row) * LongIndex(stride_) + coord.contiguous();
+  }
+  CUTLASS_HOST_DEVICE LongIndex operator()(cutlass::MatrixCoord coord) const {
+    return (*this)(cutlass::layout::PitchLinearCoord(coord.row(), coord.column()));
+  }
+
+ private:
+  Index half_;
+  Index stride_;
+};
+
 using PlainOp = cutlass::epilogue::thread::LinearCombination<bf16, kAlign, float, float,
                                                              cutlass::epilogue::thread::ScaleType::Nothing>;
 
@@ -140,6 +179,14 @@ using DeviceGemm = cutlass::gemm::device::Gemm<bf16, RowMajor, bf16, ColumnMajor
                                                cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
                                                typename Tile::Threadblock, typename Tile::Warp, InstructionShape, Op,
                                                Swizzle, Tile::stages, kAlign, kAlign>;
+
+template <class Tile>
+using DeviceGemmSituGlu = cutlass::gemm::device::GemmUniversal<
+    bf16, RowMajor, bf16, ColumnMajor, std::uint8_t, RowMajor, float, cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80, typename Tile::Threadblock, typename Tile::Warp, InstructionShape, SituGluOp, Swizzle,
+    Tile::stages, kAlign, kAlign, cutlass::arch::OpMultiplyAdd, cutlass::ComplexTransform::kNone,
+    cutlass::ComplexTransform::kNone, /*GatherA=*/false, /*GatherB=*/false, /*ScatterD=*/false,
+    cutlass::layout::NoPermute, cutlass::layout::NoPermute, UpGatePermuteB>;
 
 template <class Tile>
 using DeviceGemmGatedResidual = cutlass::gemm::device::GemmUniversalWithBroadcast<

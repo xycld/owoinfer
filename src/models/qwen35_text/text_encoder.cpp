@@ -240,6 +240,10 @@ float elapsed_ms(cudaEvent_t a, cudaEvent_t b) {
   return ms;
 }
 
+// Submits the stream's enqueued work before this thread blocks on a host-side wait (WDDM batches submissions in the
+// driver). cudaErrorNotReady is the expected answer; real errors surface at the next checked call.
+void flush(cudaStream_t s) { static_cast<void>(cudaStreamQuery(s)); }
+
 }  // namespace
 
 struct TextEncoder::Impl {
@@ -514,6 +518,7 @@ void TextEncoder::Impl::reader_loop(std::size_t r, const std::vector<LayerPlan>&
     const auto b = static_cast<std::size_t>(k % nbuf);
     if (hook) hook(static_cast<int>(r), k);
     if (k >= nbuf) {
+      flush(me.stream);
       sync.wait_issued(k - nbuf + 1);
       MI_CUDA_CHECK(cudaStreamWaitEvent(me.stream, compute_done[b], 0));
     }
@@ -537,6 +542,7 @@ void TextEncoder::Impl::reader_loop(std::size_t r, const std::vector<LayerPlan>&
     }
     layer_bytes[static_cast<std::size_t>(k)] = me.ring ? me.ring->stats().bytes - before : pinned;
     MI_CUDA_CHECK(cudaEventRecord(me.copy_done[b], me.stream));
+    flush(me.stream);
     sync.set_enqueued(r, k + 1);
   }
   if (hook) hook(static_cast<int>(r), kNumLayers);
@@ -608,6 +614,7 @@ void TextEncoder::Impl::run_layers_streaming(const std::vector<std::vector<std::
         if (k >= 2) MI_CUDA_CHECK(cudaEventSynchronize(timing[static_cast<std::size_t>(kEvLayerEnd + k - 2)]));
         if (cancel_requested(options)) throw Cancelled();
       }
+      flush(stream);
       sync.wait_enqueued(k + 1);
       for (const Reader& r : rd) MI_CUDA_CHECK(cudaStreamWaitEvent(stream, r.copy_done[buf], 0));
       MI_CUDA_CHECK(cudaEventRecord(timing[static_cast<std::size_t>(kEvLayerStart + k)], stream));

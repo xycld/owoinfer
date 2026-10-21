@@ -4,9 +4,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "planner/host_memory.h"
@@ -61,6 +63,9 @@ struct Scenario {
   bool streaming = false;
   bool parking = true;
   bool te_cached = false;
+  bool host_pinned = false;     // the DiT streamer can hold a pinned host copy
+  bool dit_weights_cached = true;  // the page cache holds the DiT's weight files
+  HardwareProfile hardware;
 
   PlanInputs inputs() const {
     PlanInputs in;
@@ -70,6 +75,8 @@ struct Scenario {
     in.request.steps = 50;
     in.request.rows_per_step = 2;
     in.request.te_cached = te_cached;
+    in.request.dit_weights_cached = dit_weights_cached;
+    in.hardware = hardware;
     const ModelShapes s = in.shapes;
     std::int64_t tokens = 0;
     for (const auto l : lengths) tokens += l;
@@ -88,6 +95,7 @@ struct Scenario {
     in.caps.dit_parking = parking;
     in.caps.dit_streaming = streaming;
     in.caps.dit_ring_bytes = std::size_t{256} << 20;
+    in.caps.dit_host_pinned = host_pinned;
     in.budgets.vram_free = gib(vram_free_gib);
     in.budgets.host_available = gib(host_available_gib);
     in.budgets.host_private_now = gib(host_now_gib);
@@ -491,6 +499,337 @@ TEST(Planner, RejectsIncompleteInputs) {
   in = Scenario{}.inputs();
   in.shapes.dit_bytes = 0;
   EXPECT_THROW(plan(in), std::invalid_argument);
+}
+
+// The dev box's measured transfer rates (E9, P4): pinned 24 GB/s, page cache -> device 19.5 GB/s.
+HardwareProfile dev_box() {
+  HardwareProfile hw;
+  hw.h2d_gbps = 24.0;
+  hw.host_gbps = 19.5;
+  hw.disk_gbps = 2.3;
+  hw.bf16_tflops = 60.0;
+  hw.measured = true;
+  return hw;
+}
+
+// P4 on 6, 8, 12 and 16 GiB cards (free = card - desktop/context share): min_memory streams every block and stays
+// under AC8's 7.5 GiB device peak with <= 4 GiB host private; balanced keeps the DiT whole where it fits and
+// otherwise streams with as many resident blocks as fit; nothing is refused that streaming can serve.
+TEST(Planner, StreamingAcrossCardSizes) {
+  struct Card {
+    double gib, free;
+  };
+  for (const Card card : {Card{6, 5.4}, Card{8, 7.3}, Card{12, 11.2}, Card{16, 15.2}}) {
+    for (const int size : {1024, 1456, 2048}) {
+      Scenario s;
+      s.size = size;
+      s.lengths = {282, 15};
+      s.vram_free_gib = card.free;
+      s.streaming = true;
+      s.hardware = dev_box();
+      s.mode = Mode::kMinMemory;
+      const ExecutionPlan min = plan(s.inputs());
+      expect_consistent(min);
+      const std::string where = std::to_string(static_cast<int>(card.gib)) + " GiB card, " + std::to_string(size) + "^2";
+      EXPECT_EQ(min.dit.residency, DitResidency::kStreamed) << where;
+      EXPECT_EQ(min.dit.resident_blocks, 0) << where;
+      EXPECT_GE(min.dit.buffers, 2) << where;
+      EXPECT_EQ(min.dit.prefetch_blocks, min.dit.buffers - 1) << where;
+      EXPECT_LE(min.host_private_bytes, gib(4.0)) << where;
+      if (size == 1024) {
+        EXPECT_LE(min.device_peak_bytes, gib(7.5)) << where << "\n" << min.explanation;  // AC8
+      }
+      EXPECT_GE(min.dit.hidden, 0.8) << where << "\n" << min.explanation;  // AC10 at the dev box's rates
+
+      s.mode = Mode::kBalanced;
+      const ExecutionPlan bal = plan(s.inputs());
+      expect_consistent(bal);
+      EXPECT_LE(min.arena_bytes, bal.arena_bytes) << where;
+      const bool whole_fits = card.gib >= 16 || (card.gib >= 12 && size <= 1456);
+      if (whole_fits) {
+        EXPECT_EQ(bal.dit.residency, DitResidency::kResident) << where << "\n" << bal.explanation;
+      } else {
+        EXPECT_EQ(bal.dit.residency, DitResidency::kStreamed) << where << "\n" << bal.explanation;
+      }
+      if (bal.dit.residency == DitResidency::kStreamed) {
+        EXPECT_EQ(bal.dit.source, DitSource::kFile) << where;
+        if (card.gib >= 12 || (card.gib >= 8 && size <= 1456)) {
+          EXPECT_GT(bal.dit.resident_blocks, 0) << where;
+        }
+        // As many resident blocks as fit: one more would exceed the cap.
+        EXPECT_GT(bal.arena_bytes + moss_shapes().dit_block_bytes, bal.arena_cap_bytes) << where << "\n" << bal.explanation;
+        EXPECT_NE(bal.explanation.find("does not fit"), std::string::npos) << bal.explanation;
+      }
+    }
+  }
+}
+
+// AC16 with other applications holding ~3 GiB on the dev box: 2048^2 streams instead of being refused (E11).
+TEST(Planner, TightDevBoxStreams2048) {
+  Scenario s;
+  s.size = 2048;
+  s.lengths = {282, 15};
+  s.vram_free_gib = 10.9;
+  s.hardware = dev_box();
+  s.streaming = false;
+  EXPECT_THROW(plan(s.inputs()), BudgetError);  // P3: refused
+  s.streaming = true;
+  const ExecutionPlan p = plan(s.inputs());
+  expect_consistent(p);
+  EXPECT_EQ(p.dit.residency, DitResidency::kStreamed);
+  EXPECT_GT(p.dit.resident_blocks, 10);
+  EXPECT_GE(p.dit.hidden, 0.9 - 1e-9);  // ~8 s of compute per step hides the copy (the model's 90% cap)
+  EXPECT_FALSE(p.dit.park_for_decode);
+}
+
+// The explanation states the residency, the per-step copy against compute, the expected overlap and the rates.
+TEST(Planner, StreamingExplanationAndJson) {
+  Scenario s;
+  s.size = 1456;
+  s.lengths = {4096, 15};
+  s.vram_free_gib = 7.3;
+  s.streaming = true;
+  s.hardware = dev_box();
+  s.mode = Mode::kMinMemory;
+  const ExecutionPlan p = plan(s.inputs());
+  for (const char* part : {"0 of 42 blocks resident", "copied every step from the weight files (page cache)",
+                           "block lookahead", "of the copy hidden", "Transfer rates (measured): pinned H2D 24.0 GB/s",
+                           "min_memory streams"}) {
+    EXPECT_NE(p.explanation.find(part), std::string::npos) << part << "\n" << p.explanation;
+  }
+  EXPECT_NEAR(p.dit.transfer_s, 42.0 * static_cast<double>(moss_shapes().dit_block_bytes) / 19.5e9, 1e-6);
+  EXPECT_GT(p.dit.compute_s, 4 * p.dit.transfer_s);
+  const mi::json::Value v = mi::json::parse(p.to_json());
+  const mi::json::Value& d = v.at("dit");
+  EXPECT_EQ(d.at("residency").as_string(), "streamed");
+  EXPECT_EQ(d.at("source").as_string(), "file");
+  EXPECT_EQ(d.at("resident_blocks").as_int(), 0);
+  EXPECT_EQ(d.at("buffers").as_int(), p.dit.buffers);
+  EXPECT_EQ(static_cast<std::size_t>(d.at("stream_bytes_per_step").as_int()), 42 * moss_shapes().dit_block_bytes);
+  EXPECT_NEAR(d.at("expected_hidden").as_double(), p.dit.hidden, 1e-5);
+}
+
+// More buffers cost device memory and buy overlap: min_memory takes 2 when the denoise phase sets the peak, the
+// cost model prefers 3 where memory is not the objective.
+TEST(Planner, StreamBufferCount) {
+  Scenario s;
+  s.size = 1024;
+  s.lengths = {282, 15};
+  s.vram_free_gib = 7.3;
+  s.streaming = true;
+  s.te_cached = true;  // no text-encoder phase: the denoise is the peak
+  s.tiles = true;
+  s.mode = Mode::kMinMemory;
+  const ExecutionPlan min = plan(s.inputs());
+  EXPECT_EQ(min.dit.buffers, 2) << min.explanation;
+  s.mode = Mode::kBalanced;
+  const ExecutionPlan bal = plan(s.inputs());
+  EXPECT_EQ(bal.dit.buffers, 3) << bal.explanation;
+  EXPECT_GT(bal.dit.hidden, min.dit.hidden - 1e-12);
+}
+
+// A pinned host copy is the source only where the page cache is not expected to serve the weights (or in
+// max_speed); it costs host private memory, so min_memory's 4 GiB target keeps the file source.
+TEST(Planner, HostPinnedSourceForColdWeights) {
+  Scenario s;
+  s.size = 1024;
+  s.lengths = {282, 15};
+  s.vram_free_gib = 7.3;
+  s.streaming = true;
+  s.host_pinned = true;
+  s.hardware = dev_box();
+  const ExecutionPlan warm = plan(s.inputs());
+  EXPECT_EQ(warm.dit.source, DitSource::kFile);
+  s.dit_weights_cached = false;
+  const ExecutionPlan cold = plan(s.inputs());
+  expect_consistent(cold);
+  EXPECT_EQ(cold.dit.source, DitSource::kHostPinned) << cold.explanation;
+  EXPECT_GE(cold.host_private_bytes, cold.dit.stream_bytes);
+  EXPECT_LE(cold.host_private_bytes, cold.host_target_bytes);
+  EXPECT_LT(cold.time.denoise_s, warm.time.denoise_s * 2.0);
+  s.mode = Mode::kMinMemory;
+  const ExecutionPlan min = plan(s.inputs());
+  EXPECT_EQ(min.dit.source, DitSource::kFile);
+  EXPECT_LE(min.host_private_bytes, gib(4.0));
+}
+
+// M3: the pipeline's keep-or-reload decision with a fixed budget. Requests alternate between 1024^2 and 2048^2 (which
+// want different numbers of resident blocks) and the free device memory swings by +-150 MiB; the simulated pipeline
+// reloads the DiT whenever the chosen plan's residency differs from the loaded one or needs a larger arena. With
+// prefer_held it settles after the first switch; planning each request alone reloads on every alternation.
+TEST(Planner, HeldDitAvoidsReloadChurn) {
+  struct Sim {
+    bool use_held;
+    std::optional<HeldDit> held;
+    int reloads = 0;
+    void request(const PlanInputs& in) {
+      ExecutionPlan p = plan(in);
+      bool kept = false;
+      if (use_held && held) p = prefer_held(in, std::move(p), *held, &kept);
+      const bool same = held && (p.dit.residency == DitResidency::kStreamed) == (held->dit.residency == DitResidency::kStreamed) &&
+                        (p.dit.residency != DitResidency::kStreamed ||
+                         (p.dit.resident_blocks == held->dit.resident_blocks && p.dit.buffers == held->dit.buffers &&
+                          p.dit.source == held->dit.source));
+      const bool grow = held && p.arena_bytes > held->arena_bytes;
+      EXPECT_FALSE(kept && (!same || grow)) << p.explanation;
+      if (!held || !same || grow) {
+        reloads += held ? 1 : 0;
+        held = HeldDit{grow || !held ? p.arena_bytes : std::max(held->arena_bytes, p.arena_bytes), p.dit};
+      }
+    }
+  };
+  const auto inputs = [](int size, double free_gib) {
+    Scenario s;
+    s.size = size;
+    s.lengths = {282, 15};
+    s.vram_free_gib = free_gib;
+    s.streaming = true;
+    s.te_cached = true;
+    s.hardware = dev_box();
+    PlanInputs in = s.inputs();
+    in.request.steps = 20;
+    return in;
+  };
+  for (const bool use_held : {false, true}) {
+    Sim sim{use_held, std::nullopt, 0};
+    for (int i = 0; i < 8; ++i) sim.request(inputs(i % 2 == 0 ? 1024 : 2048, 10.9));
+    std::printf("[planner] alternating 1024^2 / 2048^2 at 10.9 GiB free, %s: %d DiT reloads in 7 switches\n",
+                use_held ? "prefer_held" : "fresh plans", sim.reloads);
+    if (use_held) {
+      EXPECT_LE(sim.reloads, 1);
+    } else {
+      EXPECT_GE(sim.reloads, 6);  // the scenario does churn without it
+    }
+    Sim swing{use_held, std::nullopt, 0};
+    for (int i = 0; i < 10; ++i) swing.request(inputs(1456, 10.9 + (i % 3 - 1) * 0.15));
+    std::printf("[planner] 1456^2 with +-150 MiB free-memory swings, %s: %d DiT reloads\n",
+                use_held ? "prefer_held" : "fresh plans", swing.reloads);
+    if (use_held) {
+      EXPECT_EQ(swing.reloads, 0);
+    }
+  }
+}
+
+// A held DiT is dropped when the request's own plan saves more than the reload costs, and the explanation says so.
+TEST(Planner, HeldDitGivesWayWhenReloadPaysOff) {
+  Scenario s;
+  s.size = 1024;
+  s.lengths = {282, 15};
+  s.vram_free_gib = 15.2;
+  s.streaming = true;
+  s.te_cached = true;
+  s.hardware = dev_box();
+  PlanInputs in = s.inputs();
+  in.request.steps = 50;
+  const ExecutionPlan fresh = plan(in);
+  ASSERT_EQ(fresh.dit.residency, DitResidency::kResident);
+  HeldDit held;  // a fully streamed DiT from an earlier min_memory request, in a small arena
+  held.dit.residency = DitResidency::kStreamed;
+  held.dit.buffers = 2;
+  held.arena_bytes = gib(3.0);
+  bool kept = true;
+  const ExecutionPlan p = prefer_held(in, fresh, held, &kept);
+  EXPECT_FALSE(kept);
+  EXPECT_EQ(p.dit.residency, DitResidency::kResident);
+  EXPECT_NE(p.explanation.find("Reloads the DiT"), std::string::npos) << p.explanation;
+  // Same residency and room in the held arena: nothing to decide.
+  held.dit = fresh.dit;
+  held.arena_bytes = fresh.arena_bytes + gib(1.0);
+  const ExecutionPlan same = prefer_held(in, fresh, held, &kept);
+  EXPECT_FALSE(kept);
+  EXPECT_EQ(same.explanation, fresh.explanation);
+}
+
+// L1: with fewer streamed blocks than buffers, only one buffer per streamed block is counted.
+TEST(Planner, StreamBuffersCappedAtStreamedBlocks) {
+  Scenario s;
+  s.size = 1024;
+  s.lengths = {282, 15};
+  s.vram_free_gib = 11.4;
+  s.streaming = true;
+  s.te_cached = true;
+  s.parking = false;
+  s.hardware = dev_box();
+  const ExecutionPlan p = plan(s.inputs());
+  if (p.dit.residency == DitResidency::kStreamed) {
+    const int streamed = 42 - p.dit.resident_blocks;
+    const std::size_t nonblock = moss_shapes().dit_bytes - 42 * moss_shapes().dit_block_bytes;
+    EXPECT_EQ(p.dit.device_bytes, nonblock + static_cast<std::size_t>(42 - streamed + std::min(p.dit.buffers, streamed)) *
+                                                  moss_shapes().dit_block_bytes)
+        << p.explanation;
+  }
+  PlanInputs in = s.inputs();
+  in.keep_dit = DitPlan{};
+  in.keep_dit->residency = DitResidency::kStreamed;
+  in.keep_dit->resident_blocks = 41;
+  in.keep_dit->buffers = 3;
+  in.budgets.vram_free = gib(15.2);
+  const ExecutionPlan one = plan(in);
+  EXPECT_EQ(one.dit.device_bytes, moss_shapes().dit_bytes) << "41 resident + 1 buffer = the whole DiT";
+}
+
+// L4: CUDA graphs of a resident DiT count against the cap and the device peak (not against streamed plans).
+TEST(Planner, GraphMemoryCountsForResidentDit) {
+  Scenario s;
+  s.size = 1024;
+  s.lengths = {282, 15};
+  s.vram_free_gib = 12.0;
+  s.streaming = true;
+  s.hardware = dev_box();
+  PlanInputs in = s.inputs();
+  const ExecutionPlan without = plan(in);
+  ASSERT_EQ(without.dit.residency, DitResidency::kResident);
+  in.caps.dit_graph_bytes = std::size_t{42} << 20;
+  const ExecutionPlan with = plan(in);
+  EXPECT_EQ(with.dit.graph_bytes, std::size_t{42} << 20);
+  EXPECT_EQ(with.device_peak_bytes, with.arena_bytes + in.budgets.context_bytes + with.dit.graph_bytes);
+  EXPECT_LE(with.arena_bytes + with.dit.graph_bytes, with.arena_cap_bytes);
+  EXPECT_EQ(mi::json::parse(with.to_json()).at("dit").at("graph_bytes").as_int(), 42 << 20);
+  // A cap the chosen plan only fits without the graphs: with them it takes another configuration (a smaller decode
+  // or streaming) whose arena and graphs fit together.
+  in.caps.dit_graph_bytes = 0;
+  in.budgets.vram_free = without.arena_bytes + in.budgets.vram_reserve + (std::size_t{8} << 20);
+  const ExecutionPlan base = plan(in);
+  in.caps.dit_graph_bytes = std::size_t{64} << 20;
+  const ExecutionPlan tight = plan(in);
+  EXPECT_LE(tight.arena_bytes + tight.dit.graph_bytes, tight.arena_cap_bytes) << tight.explanation;
+  EXPECT_LT(tight.arena_bytes, base.arena_bytes) << tight.explanation;
+  EXPECT_EQ(tight.dit.graph_bytes, tight.dit.residency == DitResidency::kStreamed ? 0u : in.caps.dit_graph_bytes);
+}
+
+// N4: a held resident DiT's live CUDA graphs are reused by the kept plan. vram_free (live free memory plus the arena)
+// does not count them, and the kept plan's own graph reservation must not be charged to the held arena again: a
+// request that fits the held arena with the held graphs keeps the loaded DiT.
+TEST(Planner, HeldDitGraphsAreNotCountedTwice) {
+  Scenario s;
+  s.size = 1024;
+  s.lengths = {282, 15};
+  s.vram_free_gib = 12.0;
+  s.streaming = true;
+  s.te_cached = true;
+  s.hardware = dev_box();
+  PlanInputs in = s.inputs();
+  in.caps.dit_graph_bytes = std::size_t{42} << 20;
+  const ExecutionPlan first = plan(in);
+  ASSERT_EQ(first.dit.residency, DitResidency::kResident);
+  ASSERT_EQ(first.dit.graph_bytes, in.caps.dit_graph_bytes);
+  // Loaded in exactly the arena it needs, its graphs captured; nothing else is free on the device.
+  const HeldDit held{first.arena_bytes, first.dit, first.dit.graph_bytes};
+  in.budgets.vram_free = first.arena_bytes + in.budgets.vram_reserve;
+  // The request's own plan wants a larger arena (it would reload): the kept plan fits the held arena and graphs.
+  ExecutionPlan larger = first;
+  larger.arena_bytes = first.arena_bytes + gib(1.0);
+  bool kept = false;
+  const ExecutionPlan p = prefer_held(in, larger, held, &kept);
+  EXPECT_TRUE(kept) << p.explanation;
+  EXPECT_EQ(p.arena_bytes, first.arena_bytes) << p.explanation;
+  EXPECT_EQ(p.dit.graph_bytes, first.dit.graph_bytes);
+  EXPECT_LE(p.arena_bytes + p.dit.graph_bytes, p.arena_cap_bytes);
+  // Without the held graphs counted (none captured yet), the same budget leaves no room for them: the kept plan must
+  // shrink (or the request's own plan stands).
+  const HeldDit no_graphs{first.arena_bytes, first.dit, 0};
+  const ExecutionPlan q = prefer_held(in, larger, no_graphs, &kept);
+  EXPECT_FALSE(kept && q.arena_bytes == first.arena_bytes) << q.explanation;
 }
 
 TEST(Planner, ShapesFromIndex) {

@@ -1,6 +1,9 @@
 // `moss-infer generate`: prompt or parameters.json -> PNG (and optionally the final latents and a JSON report).
 #include <atomic>
+#include <charconv>
+#include <cmath>
 #include <csignal>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -32,11 +35,13 @@ constexpr const char* kUsage =
     "                           [--slg-scale X] [--slg-start X] [--slg-stop X] [--max-seq N] [--sampler euler|ab2]\n"
     "                           [--mode min_memory|balanced|max_speed] [--vram-budget GiB] [--vram-reserve MiB]\n"
     "                           [--host-ram-budget GiB] [--cache-dir <dir>] [--then-prompt <text>]... [--direct-io]\n"
-    "                           [--quiet]\n"
+    "                           [--dit-blocks op_by_op|fused|fused_graphs] [--quiet]\n"
     "Flags override values read from --params. At least one of -o / --latent-out is required;\n"
     "without -o the VAE decode is skipped. --vram-budget caps the process's GPU memory (CUDA context included).\n"
     "Each --then-prompt generates one more image in the same engine session (same settings, warm models and\n"
-    "embedding cache), written to <out>.<n>.png and reported under \"followups\".\n";
+    "embedding cache), written to <out>.<n>.png and reported under \"followups\".\n"
+    "--dit-blocks (default fused, or the MOSSINFER_DIT_BLOCKS environment variable) picks the DiT block implementation;\n"
+    "all give the same image. fused falls back to op_by_op when its startup self-check fails; fused_graphs adds CUDA graphs.\n";
 
 std::atomic<bool> g_cancel{false};
 // First Ctrl-C: cancel (within a text-encoder layer, DiT block or decode band). A second one terminates (default action restored).
@@ -135,10 +140,12 @@ std::string json_layers(const std::vector<int>& v) {
   return out + "]";
 }
 
+// Locale-independent (std::to_chars ignores LC_NUMERIC); JSON has no inf/nan.
 std::string num(double d) {
+  if (!std::isfinite(d)) return "null";
   char buf[32];
-  std::snprintf(buf, sizeof(buf), "%.6g", d);
-  return buf;
+  const auto res = std::to_chars(buf, buf + sizeof(buf), d, std::chars_format::general, 6);
+  return std::string(buf, res.ptr);
 }
 
 // NumPy .npy v1.0, little-endian fp32, C order.
@@ -180,6 +187,8 @@ std::string run_json(const pipeline::Request& q, const pipeline::Result& r, cons
     << ", \"uncond_tokens\": " << r.uncond_tokens << ",\n";
   o << " \"image\": " << json_escape(image) << ", \"latents\": " << json_escape(latent) << ",\n";
   o << " \"mode\": \"" << planner::mode_name(r.plan.mode) << "\",\n";
+  o << " \"dit_blocks\": {\"path\": \"" << moss_dit::block_path_name(r.block_path) << "\", \"note\": "
+    << json_escape(r.block_path_note) << "},\n";
   o << " \"plan\": " << r.plan.to_json() << ",\n";
   o << " \"embedding_cache\": {\"hits\": " << r.te_cache_hits << ", \"te_skipped\": " << tf(r.te_skipped) << "},\n";
   // What ran (it may differ from plan.vae: the decode takes the fastest schedule the arena it finds leaves room for).
@@ -200,7 +209,22 @@ std::string run_json(const pipeline::Request& q, const pipeline::Result& r, cons
     << ", \"device_peak\": " << g(m.device_peak) << ", \"free_at_start\": " << g(m.free_at_start)
     << ", \"arena_creations\": " << m.arena_creations << ", \"dit_parked_for_text_encoder\": " << tf(m.dit_parked_for_text_encoder)
     << ", \"dit_parked_for_decode\": " << tf(m.dit_parked_for_decode) << ", \"dit_reloaded\": " << tf(m.dit_reloaded) << "},\n";
-  o << " \"host_memory_gib\": {\"start\": " << g(m.host_private_start) << ", \"private_peak\": " << g(m.host_private_peak) << "}";
+  o << " \"host_memory_gib\": {\"start\": " << g(m.host_private_start) << ", \"private_peak\": " << g(m.host_private_peak) << "},\n";
+  const auto& hw = r.hardware;
+  o << " \"hardware\": {\"measured\": " << tf(hw.measured) << ", \"h2d_gbps\": " << num(hw.h2d_gbps) << ", \"host_gbps\": "
+    << num(hw.host_gbps) << ", \"disk_gbps\": " << num(hw.disk_gbps) << ", \"bf16_tflops\": " << num(hw.bf16_tflops) << "},\n";
+  // P4 step 28: DiT block streaming, per step and over the run (hidden = fraction of the copy time behind compute).
+  const auto& ds = r.dit_stream;
+  o << " \"dit_stream\": {\"streamed\": " << tf(ds.streamed) << ", \"resident_blocks\": " << ds.resident_blocks
+    << ", \"buffers\": " << ds.buffers << ", \"source\": " << json_escape(ds.source) << ", \"bytes\": " << ds.bytes
+    << ", \"copy_s\": " << num(ds.copy_s) << ", \"stall_s\": " << num(ds.stall_s) << ", \"stalls\": " << ds.stalls
+    << ", \"h2d_gbps\": " << num(ds.gbps()) << ", \"hidden\": " << num(ds.hidden()) << ", \"steps\": [";
+  for (std::size_t i = 0; i < ds.steps.size(); ++i) {
+    const auto& st = ds.steps[i];
+    o << (i ? ", " : "") << "{\"h2d_gbps\": " << num(st.gbps) << ", \"hidden\": " << num(st.hidden) << ", \"stall_s\": "
+      << num(st.stall_s) << ", \"stalls\": " << st.stalls << "}";
+  }
+  o << "]}";
   return o.str();
 }
 
@@ -222,7 +246,7 @@ void print_summary(const pipeline::Result& r) {
   const auto& t = r.timings;
   std::fprintf(stderr,
                "seed %llu, %d steps, %d+%d tokens%s: total %.2f s (load %.2f, encode %.2f, denoise %.2f, decode %.2f%s); "
-               "device peak %.2f GiB (arena high-water %.2f GiB), host private peak %.2f GiB%s\n",
+               "device peak %.2f GiB (arena high-water %.2f GiB), host private peak %.2f GiB%s; DiT blocks %s\n",
                static_cast<unsigned long long>(r.seed), r.steps_run, r.cond_tokens, r.uncond_tokens,
                r.te_skipped ? " (embedding cache hit)" : "", t.total_s, t.index_load_s + t.dit_load_s + t.vae_load_s,
                t.tokenize_s + t.text_encode_s + t.refine_s, t.denoise_s, t.decode_s, r.decode_tiled ? ", tiled" : "",
@@ -230,7 +254,15 @@ void print_summary(const pipeline::Result& r) {
                static_cast<double>(r.memory.host_private_peak) / (1 << 30),
                r.memory.dit_parked_for_decode || r.memory.dit_parked_for_text_encoder ? ", DiT parked"
                : r.memory.dit_reloaded                                                ? ", DiT reloaded"
-                                                                                      : "");
+                                                                                      : "",
+               moss_dit::block_path_name(r.block_path));
+  if (!r.block_path_note.empty()) std::fprintf(stderr, "%s\n", r.block_path_note.c_str());
+  const auto& ds = r.dit_stream;
+  if (ds.streamed) {
+    std::fprintf(stderr, "DiT streamed: %d of 42 blocks resident, %d buffers from %s; %.1f GB/s, %.1f%% of the copy hidden, "
+                 "%d stalls (%.2f s)\n",
+                 ds.resident_blocks, ds.buffers, ds.source.c_str(), ds.gbps(), 100.0 * ds.hidden(), ds.stalls, ds.stall_s);
+  }
 }
 
 }  // namespace
@@ -261,6 +293,10 @@ int cmd_generate(const std::vector<std::string>& args) {
   if (!params.empty()) req = pipeline::request_from_parameters(json::parse(read_file(params)));
   constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
   try {
+    // The environment variable overrides the default block path (A/B runs); --dit-blocks overrides both.
+    if (const char* env = std::getenv("MOSSINFER_DIT_BLOCKS"); env != nullptr && *env != '\0') {
+      options.block_path = moss_dit::parse_block_path(env);
+    }
     for (const auto& [f, v] : flags) {
       if (f == "--params") continue;
       else if (f == "--prompt") req.prompt = v, have_prompt = true;
@@ -295,6 +331,7 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--cache-dir") options.cache_dir = path_from_utf8(v);
       else if (f == "--then-prompt") then_prompts.push_back(v);
       else if (f == "--direct-io") options.direct_io = true;
+      else if (f == "--dit-blocks") options.block_path = moss_dit::parse_block_path(v);
       else if (f == "--quiet") quiet = true;
       else throw std::invalid_argument("unknown flag " + f);
     }

@@ -83,9 +83,10 @@ void euler_update(const Tensor& x, const Tensor& v, float h, cudaStream_t stream
 void ab2_update(const Tensor& x, const Tensor& v, const Tensor& v_prev, float h, float a, float b, cudaStream_t stream);
 
 // Stack bytes denoise() allocates itself (velocities, guidance buffers) plus the DiT forward workspace for the
-// largest row set of the run, for a latent grid of height x width.
+// largest row set of the run, for a latent grid of height x width and the DiT's block path.
 std::size_t denoise_workspace_bytes(std::int64_t height, std::int64_t width, std::int64_t cond_tokens,
-                                    std::int64_t uncond_tokens, const Guidance& guidance, SamplerKind sampler);
+                                    std::int64_t uncond_tokens, const Guidance& guidance, SamplerKind sampler,
+                                    moss_dit::BlockPath path = moss_dit::BlockPath::kFused);
 
 // Runs the sampling loop in place on `latents` (CUDA fp32 [128, h, w], the initial noise on entry).
 // cond_text / uncond_text: refined text tokens (MossDit::encode_text output, CUDA bf16 [S, 3072]); uncond_text is

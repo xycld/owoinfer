@@ -33,8 +33,15 @@ using weights::WeightGroup;
 const float kAttnScale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHeadDim)));
 constexpr std::int64_t kQkvDim = 3 * kDim;
 constexpr std::int64_t kUpGateDim = 2 * kFfnDim;
-// The big activation buffer holds [qkv | attn] during attention and [up_gate | ffn] during the FFN.
+// The big activation buffer holds [qkv | attn] during attention and [up_gate | ffn] during the FFN (op-by-op and the
+// text refiner); the fused block stores up_gate only for runs whose ffn_up_gate goes op by op (fused_big_cols).
 constexpr std::int64_t kBigCols = std::max<std::int64_t>(kQkvDim + kDim, kUpGateDim + kFfnDim);
+static_assert(kBigCols == kOpByOpBigCols);
+static_assert(kFusedBigCols == kQkvDim + kDim && kFusedBigCols >= kFfnDim && kFusedBigCols >= kLatentChannels);
+
+std::int64_t big_cols(BlockPath path, std::int64_t hw, std::span<const std::int64_t> text_lengths) {
+  return path == BlockPath::kOpByOp ? kBigCols : fused_big_cols(hw, text_lengths);
+}
 
 [[noreturn]] void fail(const std::string& msg) { throw std::invalid_argument("mi::moss_dit: " + msg); }
 
@@ -102,11 +109,13 @@ void check_device(const Tensor& t, DType dt, const char* what) {
 
 }  // namespace
 
-// Activation buffers of one forward() (`step`) or encode_text() call over `tokens` joint tokens.
+// Activation buffers of one forward() (`step`) or encode_text() call over `tokens` joint tokens, with a big buffer of
+// `big_cols` per token (kBigCols: every view; kFusedBigCols: qkv and attn, the fused block's own views of `big`).
 struct MossDit::Activations {
   Tensor x, y;          // bf16 [L, kDim]: residual stream (caller-provided in encode_text), scratch
+  Tensor big;           // bf16 [L, big_cols], contiguous
   Tensor qkv, attn;     // bf16 [L, 3*kDim], [L, kDim]  (big buffer, attention phase)
-  Tensor up_gate, ffn;  // bf16 [L, 2*kFfnDim], [L, kFfnDim]  (big buffer, FFN phase)
+  Tensor up_gate, ffn;  // bf16 [L, 2*kFfnDim], [L, kFfnDim]  (big buffer, FFN phase; kBigCols only)
   Tensor rope;          // bf16 [rope_rows, 128]
   Tensor cu_seqlens;    // int32 pool: zero-based cu_seqlens of every row run (see cu_pool_ints)
   void* lse = nullptr;
@@ -114,15 +123,18 @@ struct MossDit::Activations {
   // step only: bf16 [6*kDim] block modulation, [2*kDim] head modulation.
   Tensor mod, head;
 
-  Activations(StackPlan& p, std::int64_t tokens, std::int64_t rope_rows, std::int64_t rows, bool step) {
+  Activations(StackPlan& p, std::int64_t tokens, std::int64_t rope_rows, std::int64_t rows, bool step,
+              std::int64_t big_cols = kBigCols) {
     if (step) x = p.tensor(DType::kBF16, {tokens, kDim});
     y = p.tensor(DType::kBF16, {tokens, kDim});
-    const Tensor big = p.tensor(DType::kBF16, {tokens, kBigCols});
+    big = p.tensor(DType::kBF16, {tokens, big_cols});
     auto* b = static_cast<std::uint16_t*>(big.data);
     qkv = Tensor::view(b, DType::kBF16, Device::kCUDA, {tokens, kQkvDim});
     attn = Tensor::view(b + tokens * kQkvDim, DType::kBF16, Device::kCUDA, {tokens, kDim});
-    up_gate = Tensor::view(b, DType::kBF16, Device::kCUDA, {tokens, kUpGateDim});
-    ffn = Tensor::view(b + tokens * kUpGateDim, DType::kBF16, Device::kCUDA, {tokens, kFfnDim});
+    if (big_cols >= kBigCols) {
+      up_gate = Tensor::view(b, DType::kBF16, Device::kCUDA, {tokens, kUpGateDim});
+      ffn = Tensor::view(b + tokens * kUpGateDim, DType::kBF16, Device::kCUDA, {tokens, kFfnDim});
+    }
     rope = p.tensor(DType::kBF16, {rope_rows, kernels::kMossRopeDim});
     cu_seqlens = p.tensor(DType::kI32, {cu_pool_ints(rows)});
     lse_bytes = attention::flash_fwd_workspace_bytes(tokens, kHeads);
@@ -133,6 +145,37 @@ struct MossDit::Activations {
     }
   }
 };
+
+const char* block_path_name(BlockPath p) {
+  switch (p) {
+    case BlockPath::kOpByOp: return "op_by_op";
+    case BlockPath::kFused: return "fused";
+    case BlockPath::kFusedGraphs: return "fused_graphs";
+  }
+  return "?";
+}
+
+BlockPath parse_block_path(std::string_view name) {
+  for (const BlockPath p : {BlockPath::kOpByOp, BlockPath::kFused, BlockPath::kFusedGraphs}) {
+    if (name == block_path_name(p)) return p;
+  }
+  throw std::invalid_argument("DiT block path must be op_by_op, fused or fused_graphs, got \"" + std::string(name) + "\"");
+}
+
+std::size_t graph_cache_bytes() {
+  // Measured ~100 KiB of device memory per instantiated block graph on sm_89 (cudaMemGetInfo around 42 captures,
+  // tests/unit/test_dit_block_fused); 256 KiB leaves room for other drivers and GPUs.
+  constexpr std::size_t kPerGraph = std::size_t{256} << 10;
+  return kPerGraph * kGraphCapacity;
+}
+
+std::size_t MossDit::graph_bytes() const { return graphs_.size() * (graph_cache_bytes() / kGraphCapacity); }
+
+void MossDit::set_block_path(BlockPath path) {
+  path_ = path;
+  graphs_.clear();
+  last_step_hash_ = 0;
+}
 
 std::size_t MossDit::persistent_bytes(const weights::ModelIndex& index) { return persistent_bytes(index, Residency{}); }
 
@@ -321,10 +364,11 @@ void MossDit::time_modulation(float timestep, const Tensor& mod, const Tensor& h
   linear(Tensor::view(head.data, DType::kBF16, Device::kCUDA, {1, 2 * kDim}), t.time, head_modulation_, stream);
 }
 
-std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths) {
+std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
+                                     BlockPath path) {
   const std::int64_t total = token_offsets(height, width, text_lengths).back();
   StackPlan plan(nullptr);
-  Activations(plan, total, total, static_cast<std::int64_t>(text_lengths.size()), true);
+  Activations(plan, total, total, static_cast<std::int64_t>(text_lengths.size()), true, big_cols(path, height * width, text_lengths));
   TimeScratch{plan};
   return plan.total();
 }
@@ -380,9 +424,9 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
 
   runtime::StackScope scope(arena_);
   StackPlan plan(&arena_);
-  Activations a(plan, total, total, static_cast<std::int64_t>(rows.size()), true);
+  Activations a(plan, total, total, static_cast<std::int64_t>(rows.size()), true, big_cols(path_, hw, lengths));
   // Streamed blocks: device buffers after the activations; the first copies overlap the setup below.
-  BlockWeights::Pass weights(*blocks_, stream);
+  BlockWeights::Pass weights(*blocks_, stream, cancel_);
 
   // Each maximal run of contiguous rows that executes a block is one varlen sub-batch with its own
   // zero-based cu_seqlens (flash_fwd's contract); without skips that is one run over all rows.
@@ -427,7 +471,7 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
 
   // Per-row RoPE tables (P:250, text length differs per row) and the joint inputs [video_r | text_r] (P:247-252).
   // The video embedding is the same for every row: computed once, copied to the other rows.
-  const Tensor tokens = Tensor::view(a.up_gate.data, DType::kBF16, Device::kCUDA, {hw, kLatentChannels});
+  const Tensor tokens = Tensor::view(a.big.data, DType::kBF16, Device::kCUDA, {hw, kLatentChannels});
   latent_to_tokens(latents, tokens, stream);
   linear(a.x.slice0(0, hw), tokens, video_embedder_, stream);
   const std::size_t row_bytes = kDim * sizeof(std::uint16_t);
@@ -442,6 +486,26 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
                                   static_cast<std::size_t>(lengths[r]) * row_bytes, cudaMemcpyDeviceToDevice, stream));
   }
 
+  // Fused blocks: kernels/fused + cuBLASLt QKV on the same activations. With kFusedGraphs and every block resident (a
+  // streamed block's acquire/release are host handshakes and cross-stream waits, never captured), each block is
+  // replayed from a CUDA graph keyed by the exact step shape and every address it binds; graphs are captured only once
+  // a step shape repeats (a one-off forward stays eager). The cancel throttle and the hook run between blocks, outside
+  // the graphs, so cancel latency is unchanged.
+  const FusedBlockBuffers fused{a.x, a.y, a.big, a.rope, a.mod, a.lse, a.lse_bytes};
+  const QkvGemm qkv_gemm{&gemm_, gemm_workspace_, kernels::Gemm::kWorkspaceBytes};
+  StepGraphKey key;
+  bool use_graphs = false;
+  if (path_ == BlockPath::kFusedGraphs && !blocks_->residency().streamed() && stream != nullptr) {
+    key.height = height;
+    key.width = width;
+    key.text_lengths = lengths;
+    for (const Row& r : rows) key.skips.push_back(r.skip);
+    key.addresses = {a.x.data, a.y.data, a.big.data, a.rope.data, a.mod.data, a.cu_seqlens.data, a.lse, gemm_workspace_};
+    const std::uint64_t h = key.hash();
+    use_graphs = h == last_step_hash_;
+    last_step_hash_ = h;
+  }
+
   for (int bi = 0; bi < kLayers; ++bi) {
     if (cancel_ != nullptr) {
       // Issue block bi only once block bi - 2 has finished: at most one block is queued ahead of the running one.
@@ -452,7 +516,18 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
       }
     }
     const Block& b = weights.acquire(bi);
-    for (const Run& run : block_runs[static_cast<std::size_t>(bi)]) run_block(b, a, run, stream);
+    const std::vector<Run>& runs = block_runs[static_cast<std::size_t>(bi)];
+    if (path_ == BlockPath::kOpByOp) {
+      for (const Run& run : runs) run_block(b, a, run, stream);
+    } else if (!use_graphs) {
+      for (const Run& run : runs) run_block_fused(b, fused, run, qkv_gemm, stream);
+    } else {
+      key.block_begin = bi;
+      key.block_end = bi + 1;
+      graphs_.run(key, stream, [&](cudaStream_t s) {
+        for (const Run& run : runs) run_block_fused(b, fused, run, qkv_gemm, s);
+      });
+    }
     weights.release(bi);
     if (hook) hook(bi, a.x);
     if (cancel_ != nullptr) MI_CUDA_CHECK(cudaEventRecord(block_done_[bi % 2], stream));
@@ -460,7 +535,7 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   weights.finish();
 
   // Head (P:256-259): final norm with head modulation (shift = head[0], scale = head[1]), linear, transpose.
-  const Tensor proj = Tensor::view(a.up_gate.data, DType::kBF16, Device::kCUDA, {hw, kLatentChannels});
+  const Tensor proj = Tensor::view(a.big.data, DType::kBF16, Device::kCUDA, {hw, kLatentChannels});
   for (std::size_t r = 0; r < rows.size(); ++r) {
     const Tensor xv = a.x.slice0(off[r], off[r] + hw), yv = a.y.slice0(off[r], off[r] + hw);
     kernels::rms_norm_modulate_moss(xv, final_norm_, vec(a.head, 1), vec(a.head, 0), yv, stream);

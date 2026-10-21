@@ -11,12 +11,18 @@
 // limit, then rank by the mode's objective:
 //   min_memory  smallest device peak, then smallest host private, then least time
 //   balanced    least time, then smallest device peak
-//   max_speed   least time (bigger host target and embedding cache, CUDA graphs)
+//   max_speed   least time (bigger host target and embedding cache)
 // Exact-but-wasteful fallbacks rank last: in balanced and max_speed, parking the DiT (reloading 9.5 GiB per
 // generation, a disk read when the page cache cannot hold it) is chosen only when nothing else fits; min_memory parks
-// only when that lowers the device peak. In every mode, candidates over the mode's host-private target are chosen
-// only when nothing within it fits. When no candidate fits at all, plan() throws BudgetError
-// carrying the smallest requirement over every configuration (the request cannot fit in any mode).
+// only when that lowers the device peak.
+// DiT block streaming (P4) is exact too. Streamed candidates keep either no block resident (least memory) or as many
+// as fit the cap, with 2..dit_max_buffers device block buffers, from the weight files or (when the page cache is not
+// expected to hold the weights, or in max_speed) a pinned host copy. Their time is the step's compute plus the part of
+// the copy not hidden behind it. balanced and max_speed stream only when no plan keeps the whole DiT resident (then
+// before parking it), keeping as many blocks resident as fit; min_memory streams whenever that lowers the device peak.
+// In every mode, candidates over the mode's host-private target are chosen only when nothing within it fits. When no
+// candidate fits at all, plan() throws BudgetError carrying the smallest requirement over every configuration (the
+// request cannot fit in any mode).
 #pragma once
 
 #include <cstddef>
@@ -46,7 +52,12 @@ Mode parse_mode(std::string_view name);
 enum class DitResidency {
   kResident,  // every weight in the arena's persistent region, through every phase and across generations
   kParked,    // resident for the denoise; evicted when another phase needs the room and reloaded for the next one
-  kStreamed,  // P4: resident_blocks stay, the rest stream from the weight files (page cache) through the pinned ring
+  kStreamed,  // P4: resident_blocks stay in the arena, the other blocks are copied in every step (DitSource)
+};
+// Where streamed DiT blocks come from (moss_dit::StreamSource).
+enum class DitSource {
+  kFile,        // the weight files through small pinned rings: page cache (file-backed, not private) or disk
+  kHostPinned,  // a pinned host copy of the streamed blocks (host private memory: their full size)
 };
 enum class Precision { kBf16 };  // P6 adds fp8 / int8 storage and compute paths
 enum class TeResidency {
@@ -58,15 +69,18 @@ enum class VaeDecodeKind { kUntiled, kTiled };
 
 const char* residency_name(DitResidency r);
 const char* residency_name(TeResidency r);
+const char* source_name(DitSource s);
 
-// Machine throughput the cost model uses. Defaults are conservative for a desktop PC; `moss-infer profile` (P4b)
-// fills a measured one. Dev box: 23.9 GB/s pinned H2D, 2.4-3.1 GB/s NVMe, 40-48 TFLOPS bf16 (docs/p2-report.md).
+// Machine throughput the cost model uses. Defaults are conservative for a desktop PC; the pipeline replaces the
+// transfer rates with measured ones (pipeline.h: a probe at first use, cached on disk with the embedding cache, then
+// updated from every streamed DiT pass). Dev box: 23.9-24.0 GB/s pinned H2D, 19.5 GB/s page cache -> device with 4
+// readers, 2.3-3.1 GB/s cold reads (btrfs zstd), 40-72 TFLOPS bf16 (docs/experiment-log.md E9, E10).
 struct HardwareProfile {
   double h2d_gbps = 12.0;     // pinned host -> device
   double disk_gbps = 2.0;     // weight files -> host with a cold page cache
-  double host_gbps = 8.0;     // page cache or pageable host memory -> pinned staging
+  double host_gbps = 8.0;     // page cache or pageable host memory -> pinned staging -> device (the readers' rate)
   double bf16_tflops = 40.0;  // sustained dense bf16 GEMM
-  bool measured = false;
+  bool measured = false;      // the transfer rates were measured on this machine
 };
 
 // Sizes of the model's weight groups (ModelIndex group totals).
@@ -106,6 +120,9 @@ struct RequestShape {
   // Weight files expected in the page cache (cost model only). The pipeline learns it from the last file-streamed
   // text-encoder pass (weights_cached_from_stream); false makes a host-resident text encoder pay off.
   bool weights_cached = true;
+  // The DiT's weight files in the page cache (streamed blocks and reloads read them): learned from the last
+  // file-streamed denoise; false makes a pinned host copy of the streamed blocks pay off.
+  bool dit_weights_cached = true;
   // The VAE decoder already sits in the arena's persistent region from an earlier request: its bytes count in every
   // phase even when this request does not decode (only recreating the arena drops it).
   bool vae_resident = false;
@@ -147,8 +164,11 @@ struct Capabilities {
   bool te_vram_resident = false;
   bool dit_parking = true;         // P2 stopgap: evict the DiT for the text encoder or the decode
   bool dit_streaming = false;      // P4
-  int dit_prefetch_blocks = 2;     // P4 lookahead (device buffers = prefetch + 1)
-  std::size_t dit_ring_bytes = 0;  // P4 pinned host staging
+  int dit_max_buffers = 3;         // P4 device block buffers (>= 2; buffers - 1 blocks of lookahead)
+  // P5 CUDA graphs of a wholly resident (or parked) DiT: device memory they hold outside the arena (0: none).
+  std::size_t dit_graph_bytes = 0;
+  std::size_t dit_ring_bytes = 0;  // P4 pinned host staging of the file source (its readers' rings)
+  bool dit_host_pinned = false;    // P4 a pinned host copy of the streamed blocks as the source
 };
 
 struct Budgets {
@@ -167,11 +187,20 @@ struct Budgets {
 struct DitPlan {
   DitResidency residency = DitResidency::kResident;
   Precision precision = Precision::kBf16;
-  int resident_blocks = 0;  // kStreamed: blocks kept resident (the others stream)
-  int prefetch_blocks = 0;  // kStreamed: lookahead on the copy stream
+  int resident_blocks = 0;  // kStreamed: blocks kept resident (the others stream); otherwise every block
+  int buffers = 0;          // kStreamed: device block buffers (>= 2; min(buffers, streamed blocks) are allocated)
+  int prefetch_blocks = 0;  // kStreamed: lookahead on the copy streams (buffers - 1)
+  DitSource source = DitSource::kFile;  // kStreamed
+  // kStreamed, per step (cost model): bytes copied, copy time at the expected rate, compute time, and the fraction
+  // of the copy expected to run hidden behind compute.
+  std::size_t stream_bytes = 0;
+  double transfer_s = 0;
+  double compute_s = 0;
+  double hidden = 1.0;
   bool park_for_text_encoder = false;  // kParked only
   bool park_for_decode = false;        // kParked only
   std::size_t device_bytes = 0;        // persistent + streaming buffers during the denoise
+  std::size_t graph_bytes = 0;         // CUDA graphs held outside the arena (Capabilities::dit_graph_bytes)
 };
 
 struct TePlan {
@@ -183,7 +212,9 @@ struct TePlan {
 struct VaePlan {
   bool run = true;
   VaeDecodeKind kind = VaeDecodeKind::kUntiled;
-  bool smallest = false;     // tiled: the smallest schedule (else the fastest that fits next to the resident models)
+  // tiled: the fastest schedule within the other phases' peak, else the smallest (false: the fastest that fits the
+  // cap next to the resident models)
+  bool smallest = false;
   int tile = 0;              // tiled: band height in image pixels (full-width row bands)
   std::size_t stack_bytes = 0;  // decode-phase stack bytes
   double cost = 1.0;         // time relative to the untiled decode
@@ -220,7 +251,7 @@ struct ExecutionPlan {
   CachePolicy cache;
   PhasePeaks peaks;
   std::size_t arena_bytes = 0;         // arena capacity to reserve: the largest phase peak + kArenaSlack
-  std::size_t device_peak_bytes = 0;   // estimated process device peak: arena + context
+  std::size_t device_peak_bytes = 0;   // estimated process device peak: arena + context + CUDA graphs
   std::size_t arena_cap_bytes = 0;     // the arena cap the plan was made against
   std::size_t host_private_bytes = 0;  // estimated process private memory at its peak
   std::size_t host_target_bytes = 0;   // the mode's host-private target (or the explicit budget)
@@ -252,6 +283,9 @@ struct PlanInputs {
   HardwareProfile hardware;
   Mode mode = Mode::kBalanced;
   bool cache_disk_spill = false;
+  // Only plans with this DiT residency (residency, and when streamed: resident blocks, buffers, source): the pipeline
+  // asks whether its loaded DiT can serve the request before dropping it.
+  std::optional<DitPlan> keep_dit;
 };
 
 // Arena cap the budgets allow: min(vram_free - vram_reserve, vram_budget - context_bytes - vram_reserve) when an
@@ -260,5 +294,23 @@ std::size_t arena_cap(const Budgets& budgets);
 
 // Throws BudgetError (no configuration fits) or std::invalid_argument (incomplete inputs).
 ExecutionPlan plan(const PlanInputs& inputs);
+
+// A pipeline's loaded DiT: the arena it lives in and its residency (residency; when streamed: resident_blocks,
+// buffers, source). Every non-streamed residency is "all blocks resident".
+struct HeldDit {
+  std::size_t arena_bytes = 0;
+  DitPlan dit;
+  // Device memory the loaded DiT's CUDA graphs hold now, outside the arena. Budgets::vram_free (live free memory plus
+  // the arena) does not count it, yet a kept plan reuses it: prefer_held adds it to the free memory and the cap.
+  std::size_t graph_bytes = 0;
+};
+
+// Chooses between `fresh` (= plan(inputs)) and the plan that keeps the loaded DiT: the request planned inside the held
+// arena with the loaded residency. Whenever running `fresh` would drop the loaded DiT (another residency, or an arena
+// larger than the held one), the kept plan wins unless `fresh` saves more time than reloading the DiT costs (its
+// persistent bytes, plus a pinned host copy, at the weight-file rate). Alternating request sizes or small swings of
+// the free device memory therefore settle on one residency instead of reloading the DiT every time. `kept`: set to
+// whether the returned plan is the kept one (the caller must then not recreate the arena).
+ExecutionPlan prefer_held(const PlanInputs& inputs, ExecutionPlan fresh, const HeldDit& held, bool* kept = nullptr);
 
 }  // namespace mi::planner

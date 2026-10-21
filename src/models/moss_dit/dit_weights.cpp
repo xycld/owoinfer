@@ -1,5 +1,6 @@
 #include "models/moss_dit/dit_weights.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <exception>
 #include <mutex>
@@ -65,6 +66,14 @@ std::size_t ring_slot_bytes(const Residency& r) {
 }
 
 int reader_count(const Residency& r) { return r.source == StreamSource::kFile ? r.reader_threads : 1; }
+
+// Device block buffers a pass carves: no more than there are streamed blocks.
+int buffer_count(const Residency& r) { return r.streamed() ? std::min(r.buffers, kNumBlocks - r.resident_blocks) : 0; }
+
+// Submits the stream's enqueued work before this thread blocks on a host-side wait. WDDM batches submissions in the
+// driver: work another thread (or the GPU) is waited for must not sit unsubmitted. cudaErrorNotReady (still running)
+// is the expected answer, and real errors surface at the next checked call.
+void flush(cudaStream_t s) { static_cast<void>(cudaStreamQuery(s)); }
 
 float elapsed_ms(cudaEvent_t a, cudaEvent_t b) {
   float ms = 0;
@@ -154,17 +163,22 @@ struct BlockWeights::Reader {
 // side waits here until the other has recorded the event it is about to wait on: a reader refilling a buffer for
 // sequence index j waits until block j - buffers was released (its compute-done event recorded); the compute thread
 // waits until every reader recorded block j's copy-done event.
+// abort is also read without the lock by the readers between chunks, and a reader that sees the cancel flag stops the
+// pass, so a cancel lands within one chunk even while the compute thread waits for a block on slow storage.
 struct BlockWeights::Sync {
   struct Aborted {};
   std::mutex mu;
   std::condition_variable cv;
   int released = 0;
   std::vector<int> enqueued;
-  bool abort = false;
+  std::atomic<bool> abort{false};
+  std::atomic<bool> cancel_seen{false};  // a reader stopped the pass for the cancel flag
   std::exception_ptr error;
+  const std::atomic<bool>* cancel = nullptr;
 
-  explicit Sync(std::size_t readers) : enqueued(readers, 0) {}
+  Sync(std::size_t readers, const std::atomic<bool>* cancel_flag) : enqueued(readers, 0), cancel(cancel_flag) {}
 
+  bool cancelled() const { return cancel != nullptr && cancel->load(); }
   void fail(std::exception_ptr e) {
     std::lock_guard<std::mutex> lock(mu);
     if (!error) error = e;
@@ -176,10 +190,19 @@ struct BlockWeights::Sync {
     abort = true;
     cv.notify_all();
   }
+  // Between chunks (reader threads): throws Aborted once the pass stops or the cancel flag is set (then stopping it).
+  void check() {
+    if (abort.load()) throw Aborted{};
+    if (cancelled()) {
+      cancel_seen = true;
+      stop();
+      throw Aborted{};
+    }
+  }
   void wait_released(int n) {
     std::unique_lock<std::mutex> lock(mu);
-    cv.wait(lock, [&] { return abort || released >= n; });
-    if (abort) throw Aborted{};
+    cv.wait(lock, [&] { return abort.load() || released >= n; });
+    if (abort.load()) throw Aborted{};
   }
   void set_released(int n) {
     std::lock_guard<std::mutex> lock(mu);
@@ -193,9 +216,12 @@ struct BlockWeights::Sync {
   }
   void wait_enqueued(int n) {
     std::unique_lock<std::mutex> lock(mu);
-    cv.wait(lock, [&] { return abort || std::all_of(enqueued.begin(), enqueued.end(), [&](int e) { return e >= n; }); });
+    cv.wait(lock, [&] { return abort.load() || std::all_of(enqueued.begin(), enqueued.end(), [&](int e) { return e >= n; }); });
     if (error) std::rethrow_exception(error);
-    if (abort) throw std::runtime_error("mi::moss_dit: block streaming aborted");
+    if (abort.load()) {
+      if (cancel_seen.load()) throw Cancelled();
+      throw std::runtime_error("mi::moss_dit: block streaming aborted");
+    }
   }
 };
 
@@ -217,8 +243,7 @@ std::size_t BlockWeights::resident_bytes(const weights::ModelIndex& index, const
 
 std::size_t BlockWeights::buffer_bytes(const weights::ModelIndex& index, const Residency& residency) {
   check_residency(residency);
-  if (!residency.streamed()) return 0;
-  return static_cast<std::size_t>(residency.buffers) * runtime::align_up(block_device_bytes(index));
+  return static_cast<std::size_t>(buffer_count(residency)) * runtime::align_up(block_device_bytes(index));
 }
 
 std::size_t BlockWeights::host_bytes(const weights::ModelIndex& index, const Residency& residency) {
@@ -241,6 +266,7 @@ BlockWeights::BlockWeights(const weights::ModelIndex& index, runtime::DeviceAren
     : index_(index), arena_(arena), residency_(residency) {
   check_residency(residency);
   mask_ = resident_mask(residency.resident_blocks);
+  nbuf_ = buffer_count(residency);
   block_bytes_ = runtime::align_up(block_device_bytes(index));
   seq_of_.assign(kNumBlocks, -1);
   resident_.resize(kNumBlocks);
@@ -276,7 +302,7 @@ void BlockWeights::create_streaming_resources() {
     rd_.push_back(std::make_unique<Reader>());
     Reader& me = *rd_.back();
     MI_CUDA_CHECK(cudaStreamCreateWithFlags(&me.stream, cudaStreamNonBlocking));
-    for (int b = 0; b < residency_.buffers; ++b) {
+    for (int b = 0; b < nbuf_; ++b) {
       MI_CUDA_CHECK(cudaEventCreateWithFlags(&me.copy_done.emplace_back(), cudaEventDisableTiming));
     }
     for (std::size_t j = 0; j < s; ++j) {
@@ -288,7 +314,7 @@ void BlockWeights::create_streaming_resources() {
                                                       ring_slot_bytes(residency_));
     }
   }
-  for (int b = 0; b < residency_.buffers; ++b) {
+  for (int b = 0; b < nbuf_; ++b) {
     MI_CUDA_CHECK(cudaEventCreateWithFlags(&compute_done_.emplace_back(), cudaEventDisableTiming));
   }
   MI_CUDA_CHECK(cudaEventCreateWithFlags(&buffers_free_, cudaEventDisableTiming));
@@ -344,20 +370,22 @@ BlockTensors BlockWeights::make_views(int block, const TensorMap& m) const {
 
 void BlockWeights::reader_loop(std::size_t r, const std::vector<std::vector<Chunk>>& chunks, Sync& sync) {
   Reader& me = *rd_[r];
-  const int nbuf = residency_.buffers;
+  const int nbuf = nbuf_;
   const std::size_t stride = rd_.size();
   // The buffers were just carved out of the arena stack: work queued earlier on the compute stream may still use that
   // memory, so no copy may land before it is done.
   MI_CUDA_CHECK(cudaStreamWaitEvent(me.stream, buffers_free_, 0));
   for (std::size_t j = 0; j < chunks.size(); ++j) {
     const auto b = j % static_cast<std::size_t>(nbuf);
-    if (hook_) hook_(static_cast<int>(r), streamed_[j]);
     if (j >= static_cast<std::size_t>(nbuf)) {
+      flush(me.stream);
       sync.wait_released(static_cast<int>(j) - nbuf + 1);
       MI_CUDA_CHECK(cudaStreamWaitEvent(me.stream, compute_done_[b], 0));
     }
     MI_CUDA_CHECK(cudaEventRecord(me.copy_begin[j], me.stream));
     for (std::size_t i = r; i < chunks[j].size(); i += stride) {
+      sync.check();
+      if (hook_) hook_(static_cast<int>(r), streamed_[j]);
       const Chunk& c = chunks[j][i];
       if (residency_.source == StreamSource::kFile) {
         me.ring->copy_range(readers_->get(c.tensor->file), c.tensor->offset + c.rel, c.size, c.dst);
@@ -367,6 +395,7 @@ void BlockWeights::reader_loop(std::size_t r, const std::vector<std::vector<Chun
     }
     MI_CUDA_CHECK(cudaEventRecord(me.copy_end[j], me.stream));
     MI_CUDA_CHECK(cudaEventRecord(me.copy_done[b], me.stream));
+    flush(me.stream);  // the compute stream waits on copy_done once the compute thread sees it enqueued
     sync.set_enqueued(r, static_cast<int>(j) + 1);
   }
 }
@@ -416,10 +445,10 @@ void BlockWeights::reset_total() {
   total_ = StreamStats{};
 }
 
-BlockWeights::Pass::Pass(BlockWeights& w, cudaStream_t stream) : w_(w), stream_(stream) {
+BlockWeights::Pass::Pass(BlockWeights& w, cudaStream_t stream, const std::atomic<bool>* cancel) : w_(w), stream_(stream) {
   if (!w.residency_.streamed()) return;
   if (w.stats_pending_) w.collect_stats();  // the previous pass's events are about to be re-recorded
-  const auto nbuf = static_cast<std::size_t>(w.residency_.buffers);
+  const auto nbuf = static_cast<std::size_t>(w.nbuf_);
   std::vector<void*> bufs;
   for (std::size_t b = 0; b < nbuf; ++b) bufs.push_back(w.arena_.alloc_stack(w.block_bytes_));
   chunks_.resize(w.streamed_.size());
@@ -437,7 +466,7 @@ BlockWeights::Pass::Pass(BlockWeights& w, cudaStream_t stream) : w_(w), stream_(
       }
     }
   }
-  w.sync_ = std::make_unique<Sync>(w.rd_.size());
+  w.sync_ = std::make_unique<Sync>(w.rd_.size(), cancel);
   int device = 0;
   MI_CUDA_CHECK(cudaGetDevice(&device));
   // Recorded before the readers start, so their waits bind to these records.
@@ -482,9 +511,13 @@ void BlockWeights::Pass::abort() noexcept {
 const BlockTensors& BlockWeights::Pass::acquire(int block) {
   if (w_.resident(block)) return w_.resident_[static_cast<std::size_t>(block)];
   const int j = w_.seq_of_[static_cast<std::size_t>(block)];
-  const auto b = static_cast<std::size_t>(j % w_.residency_.buffers);
-  w_.sync_->wait_enqueued(j + 1);
+  const auto b = static_cast<std::size_t>(j % w_.nbuf_);
+  // Recorded before the host waits for the readers to enqueue the block: the stall then covers the whole time the
+  // compute stream is ready and the block is not (a transfer-bound reader enqueues its last chunk only just before
+  // the copy completes, so a wait recorded after the enqueue would miss most of it).
   MI_CUDA_CHECK(cudaEventRecord(w_.wait_begin_[static_cast<std::size_t>(j)], stream_));
+  flush(stream_);  // the previous blocks' kernels run (and release their buffers) while this thread waits
+  w_.sync_->wait_enqueued(j + 1);
   for (const auto& r : w_.rd_) MI_CUDA_CHECK(cudaStreamWaitEvent(stream_, r->copy_done[b], 0));
   MI_CUDA_CHECK(cudaEventRecord(w_.wait_end_[static_cast<std::size_t>(j)], stream_));
   return views_[static_cast<std::size_t>(j)];
@@ -493,7 +526,7 @@ const BlockTensors& BlockWeights::Pass::acquire(int block) {
 void BlockWeights::Pass::release(int block) {
   if (w_.resident(block)) return;
   const int j = w_.seq_of_[static_cast<std::size_t>(block)];
-  MI_CUDA_CHECK(cudaEventRecord(w_.compute_done_[static_cast<std::size_t>(j % w_.residency_.buffers)], stream_));
+  MI_CUDA_CHECK(cudaEventRecord(w_.compute_done_[static_cast<std::size_t>(j % w_.nbuf_)], stream_));
   w_.sync_->set_released(j + 1);
 }
 

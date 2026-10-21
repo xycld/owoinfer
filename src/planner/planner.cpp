@@ -1,6 +1,7 @@
 #include "planner/planner.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -8,6 +9,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace mi::planner {
 namespace {
@@ -27,9 +29,12 @@ constexpr std::size_t kCacheFloor = std::size_t{64} << 20;
 // (~0.6 s/MP at 40 TFLOPS); tiled schedules report their own cost relative to it.
 constexpr double kDecodeSecondsPerMegapixel = 0.6;
 constexpr double kDecodeReferenceTflops = 40.0;
-// Fraction of a streamed DiT step's copy time hidden behind compute when the copy is shorter (AC10 asks >= 80%);
-// the rest (synchronization, memory-bandwidth contention) adds to the step, so resident blocks always pay off.
+// Fraction of a streamed DiT step's copy time hidden behind compute when the copy is shorter (AC10 asks >= 80%;
+// measured 98-100% with 3 buffers, docs/experiment-log.md E13); the rest (synchronization, memory-bandwidth
+// contention) adds to the step, so resident blocks always pay off. Two buffers (one block of lookahead) absorb less
+// jitter between the copy and compute of neighbouring blocks.
 constexpr double kStreamOverlap = 0.9;
+constexpr double kStreamOverlapTwoBuffers = 0.8;
 
 std::string gib(std::size_t bytes) {
   char buf[32];
@@ -55,6 +60,7 @@ struct Candidate {
   TimeEstimate time;
 
   bool parks() const { return dit.residency == DitResidency::kParked; }
+  std::size_t device() const { return arena + dit.graph_bytes; }  // what the arena cap must hold
 };
 
 class Planner {
@@ -82,11 +88,17 @@ class Planner {
     }
   }
 
+  // Seconds to load the DiT of `d` from the weight files: its persistent bytes, plus a pinned host copy.
+  double load_seconds(const DitPlan& d) const {
+    const std::size_t bytes = dit_persistent(d) + (d.source == DitSource::kHostPinned ? dit_streamed_bytes(d) : 0);
+    return static_cast<double>(bytes) / (weight_rate_gbps(false, r_.dit_weights_cached) * 1e9);
+  }
+
   ExecutionPlan run() {
     std::vector<Candidate> all = enumerate();
     std::vector<const Candidate*> feasible;
     for (const Candidate& c : all) {
-      if (c.arena <= cap_ && c.host_without_cache + kCacheFloor <= host_limit_) feasible.push_back(&c);
+      if (c.device() <= cap_ && c.host_without_cache + kCacheFloor <= host_limit_) feasible.push_back(&c);
     }
     if (feasible.empty()) throw_budget_error(all);
     const Candidate* best = *std::min_element(feasible.begin(), feasible.end(),
@@ -106,13 +118,20 @@ class Planner {
     if (d.residency != DitResidency::kStreamed) return s_.dit_bytes;
     return dit_nonblock_bytes() + static_cast<std::size_t>(d.resident_blocks) * s_.dit_block_bytes;
   }
+  // Device block buffers a streamed plan allocates: no more than there are streamed blocks.
+  int dit_buffers(const DitPlan& d) const { return std::min(d.buffers, s_.dit_blocks - d.resident_blocks); }
   std::size_t dit_denoise(const DitPlan& d) const {
     if (d.residency != DitResidency::kStreamed) return s_.dit_bytes;
-    return dit_persistent(d) + static_cast<std::size_t>(d.prefetch_blocks + 1) * s_.dit_block_bytes;
+    return dit_persistent(d) + static_cast<std::size_t>(dit_buffers(d)) * s_.dit_block_bytes;
+  }
+  std::size_t dit_streamed_bytes(const DitPlan& d) const {
+    if (d.residency != DitResidency::kStreamed) return 0;
+    return static_cast<std::size_t>(s_.dit_blocks - d.resident_blocks) * s_.dit_block_bytes;
   }
 
-  double weight_rate_gbps(bool from_host) const {
-    const double src = from_host || r_.weights_cached ? hw_.host_gbps : hw_.disk_gbps;
+  // `cached`: the files are expected in the page cache.
+  double weight_rate_gbps(bool from_host, bool cached) const {
+    const double src = from_host || cached ? hw_.host_gbps : hw_.disk_gbps;
     return std::max(1e-3, std::min(src, hw_.h2d_gbps));
   }
   double tflops() const { return std::max(1e-3, hw_.bf16_tflops); }
@@ -124,7 +143,7 @@ class Planner {
     // ~2 FLOPs per bf16 weight (1 param) per token.
     const double compute = static_cast<double>(s_.te_stream_bytes) * static_cast<double>(tokens) / (tflops() * 1e12);
     if (te.residency == TeResidency::kVramResident) return compute;
-    const double rate = weight_rate_gbps(te.residency == TeResidency::kHostResident) * 1e9;
+    const double rate = weight_rate_gbps(te.residency == TeResidency::kHostResident, r_.weights_cached) * 1e9;
     const double load = static_cast<double>(s_.te_stream_bytes) / rate;
     // One buffer: every layer's copy and compute in series. Two or more: copies overlap compute except for one
     // layer's worth (the first copy or the last compute).
@@ -132,7 +151,8 @@ class Planner {
     return load + compute;
   }
 
-  double denoise_seconds(const DitPlan& d) const {
+  // One step: compute, plus the part of the streamed blocks' copy not hidden behind it (fills d's per-step fields).
+  double step_seconds(DitPlan& d) const {
     const double image_tokens = static_cast<double>(r_.height / 16) * static_cast<double>(r_.width / 16);
     const double dim = s_.dit_dim > 0 ? s_.dit_dim : 3072;
     double flops = 0;
@@ -143,13 +163,21 @@ class Planner {
       // GEMMs: 2 FLOPs per weight per token; attention: QK^T and PV, 2 * L^2 * dim each, per block.
       flops += static_cast<double>(s_.dit_bytes) * l + 4.0 * l * l * dim * s_.dit_blocks;
     }
-    double step = flops / (tflops() * 1e12);
-    if (d.residency == DitResidency::kStreamed) {
-      const double moved = static_cast<double>(s_.dit_blocks - d.resident_blocks) * static_cast<double>(s_.dit_block_bytes);
-      const double transfer = moved / (weight_rate_gbps(false) * 1e9);
-      step = std::max(step, transfer) + (1.0 - kStreamOverlap) * std::min(step, transfer);
+    const double compute = flops / (tflops() * 1e12);
+    d.compute_s = compute;
+    d.stream_bytes = dit_streamed_bytes(d);
+    if (d.stream_bytes == 0) {
+      d.transfer_s = 0;
+      d.hidden = 1.0;
+      return compute;
     }
-    return step * r_.steps;
+    const double rate = d.source == DitSource::kHostPinned ? std::max(1e-3, hw_.h2d_gbps) : weight_rate_gbps(false, r_.dit_weights_cached);
+    const double transfer = static_cast<double>(d.stream_bytes) / (rate * 1e9);
+    const double overlap = dit_buffers(d) >= 3 ? kStreamOverlap : kStreamOverlapTwoBuffers;
+    const double exposed = std::max(0.0, transfer - compute) + (1.0 - overlap) * std::min(transfer, compute);
+    d.transfer_s = transfer;
+    d.hidden = 1.0 - exposed / transfer;
+    return compute + exposed;
   }
 
   double decode_seconds(const VaePlan& v) const {
@@ -173,11 +201,13 @@ class Planner {
       if (c.vae.kind == VaeDecodeKind::kUntiled) {
         c.vae.stack_bytes = in_.workspaces.decode;
       } else {
-        // The fastest schedule in what the resident models leave of the cap; if none fits, the smallest (then the
-        // candidate is infeasible, but still describes the requirement).
+        // The fastest schedule in what the resident models leave of the cap, or (smallest) of the other phases' peak
+        // so the decode never sets the arena size unless it must; if none fits, the smallest (then the candidate may
+        // be infeasible, but still describes the requirement).
         std::optional<TiledDecode> t;
-        const std::size_t room = sat_sub(cap_, resident + kArenaSlack);
-        if (!c.vae.smallest && room > 0) t = in_.workspaces.decode_tiled(room);
+        const std::size_t room = c.vae.smallest ? sat_sub(std::max(c.peaks.text_encoder, c.peaks.denoise), resident)
+                                                : sat_sub(cap_, resident + kArenaSlack);
+        if (room > 0) t = in_.workspaces.decode_tiled(room);
         if (!t) t = in_.workspaces.decode_tiled(0);
         if (!t) throw std::invalid_argument("planner: the tiled decode query has no smallest schedule");
         c.vae.stack_bytes = t->bytes;
@@ -187,18 +217,23 @@ class Planner {
       c.peaks.decode = resident + c.vae.stack_bytes;
     }
     c.dit.device_bytes = dit_denoise(c.dit);
+    // Graphs capture only wholly resident blocks (a streamed block's copies are host-driven).
+    c.dit.graph_bytes = c.dit.residency == DitResidency::kStreamed ? 0 : in_.caps.dit_graph_bytes;
     c.arena = std::max({c.peaks.text_encoder, c.peaks.denoise, c.peaks.decode}) + kArenaSlack;
 
     std::size_t host = in_.budgets.host_private_now + in_.workspaces.host_buffers;
     if (c.te.run && c.te.residency != TeResidency::kVramResident) host += in_.caps.te_ring_bytes;
     if (c.te.residency == TeResidency::kHostResident) host += s_.te_stream_bytes;
-    // Streamed DiT blocks are read from the weight files (page cache: file-backed, not private) into the ring.
-    if (c.dit.residency == DitResidency::kStreamed) host += in_.caps.dit_ring_bytes;
+    // Streamed DiT blocks are read from the weight files (page cache: file-backed, not private) into the readers'
+    // rings, or held as a pinned host copy.
+    if (c.dit.residency == DitResidency::kStreamed) {
+      host += c.dit.source == DitSource::kFile ? in_.caps.dit_ring_bytes : dit_streamed_bytes(c.dit);
+    }
     c.host_without_cache = host;
 
     c.time.text_encoder_s = te_seconds(c.te);
-    c.time.dit_load_s = c.parks() ? static_cast<double>(s_.dit_bytes) / (weight_rate_gbps(false) * 1e9) : 0;
-    c.time.denoise_s = denoise_seconds(c.dit);
+    c.time.dit_load_s = c.parks() ? static_cast<double>(s_.dit_bytes) / (weight_rate_gbps(false, r_.dit_weights_cached) * 1e9) : 0;
+    c.time.denoise_s = step_seconds(c.dit) * r_.steps;
     c.time.decode_s = decode_seconds(c.vae);
   }
 
@@ -245,16 +280,33 @@ class Planner {
           evaluate(c);
           out.push_back(c);
         }
-        if (in_.caps.dit_streaming) {
-          // P4: no resident blocks (least memory), and as many as fit the arena cap (peaks grow linearly with them).
+        if (in_.keep_dit && in_.keep_dit->residency == DitResidency::kStreamed) {
           Candidate c{{}, te, vae, {}, 0, 0, {}};
           c.dit.residency = DitResidency::kStreamed;
-          c.dit.prefetch_blocks = std::max(1, in_.caps.dit_prefetch_blocks);
+          c.dit.resident_blocks = in_.keep_dit->resident_blocks;
+          c.dit.buffers = in_.keep_dit->buffers;
+          c.dit.prefetch_blocks = c.dit.buffers - 1;
+          c.dit.source = in_.keep_dit->source;
           evaluate(c);
           out.push_back(c);
-          if (c.arena < cap_ && s_.dit_block_bytes > 0) {
-            const std::size_t fit = (cap_ - c.arena) / s_.dit_block_bytes;
-            const int extra = static_cast<int>(std::min<std::size_t>(fit, static_cast<std::size_t>(s_.dit_blocks - 1)));
+        }
+        if (!in_.caps.dit_streaming) continue;
+        // P4: no resident blocks (least memory), and as many as fit the arena cap; every buffer count; the pinned
+        // host source only where it can pay for its host memory (cold page cache, or max_speed's host budget).
+        std::vector<DitSource> sources{DitSource::kFile};
+        if (in_.caps.dit_host_pinned && (!r_.dit_weights_cached || in_.mode == Mode::kMaxSpeed)) {
+          sources.push_back(DitSource::kHostPinned);
+        }
+        for (const DitSource src : sources) {
+          for (int buffers = 2; buffers <= std::max(2, in_.caps.dit_max_buffers); ++buffers) {
+            Candidate c{{}, te, vae, {}, 0, 0, {}};
+            c.dit.residency = DitResidency::kStreamed;
+            c.dit.buffers = buffers;
+            c.dit.prefetch_blocks = buffers - 1;
+            c.dit.source = src;
+            evaluate(c);
+            out.push_back(c);
+            const int extra = blocks_that_fit(c);
             if (extra > 0) {
               c.dit.resident_blocks = extra;
               evaluate(c);
@@ -264,7 +316,34 @@ class Planner {
         }
       }
     }
+    if (in_.keep_dit) {
+      const DitPlan& k = *in_.keep_dit;
+      std::erase_if(out, [&](const Candidate& c) {
+        if (c.dit.residency != k.residency) return true;
+        if (k.residency == DitResidency::kParked) {
+          return c.dit.park_for_text_encoder != k.park_for_text_encoder || c.dit.park_for_decode != k.park_for_decode;
+        }
+        return k.residency == DitResidency::kStreamed &&
+               (c.dit.resident_blocks != k.resident_blocks || c.dit.buffers != k.buffers || c.dit.source != k.source);
+      });
+      if (out.empty()) throw std::invalid_argument("planner: keep_dit names a residency this build cannot plan");
+    }
     return out;
+  }
+
+  // Resident blocks to add to the 0-resident candidate `c` so that it still fits the cap (< every block). Each one
+  // adds its bytes to every phase except where a tiled decode gives the room back, so step down from the linear
+  // estimate until the candidate fits.
+  int blocks_that_fit(const Candidate& c) const {
+    if (c.device() >= cap_ || s_.dit_block_bytes == 0) return 0;
+    int n = static_cast<int>(std::min<std::size_t>((cap_ - c.arena) / s_.dit_block_bytes, static_cast<std::size_t>(s_.dit_blocks - 1)));
+    for (; n > 0; --n) {
+      Candidate t = c;
+      t.dit.resident_blocks = n;
+      evaluate(t);
+      if (t.device() <= cap_) break;
+    }
+    return n;
   }
 
   std::size_t cache_bytes(const Candidate& c) const {
@@ -274,30 +353,43 @@ class Planner {
     return std::max(kCacheFloor, std::min(preset, sat_sub(host_target_, c.host_without_cache)));
   }
 
-  using RankKey = std::tuple<bool, bool, std::size_t, std::size_t, double, double>;
+  // balanced / max_speed: a DiT that fits whole stays whole (streaming only when it does not, even where streaming a
+  // few blocks would buy an untiled decode for less than its copy costs: a stable residency keeps the DiT loaded
+  // across requests), and streaming beats parking.
+  using RankKey = std::tuple<bool, bool, bool, std::size_t, std::size_t, double, double>;
   RankKey rank(const Candidate& c) const {
     const bool over_target = c.host_without_cache + cache_bytes(c) > host_target_;
     const std::size_t host = c.host_without_cache + cache_bytes(c);
     if (in_.mode == Mode::kMinMemory) {
-      return {over_target, false, c.arena, host, c.time.total_s(), 0.0};
+      return {over_target, false, false, c.arena, host, c.time.total_s(), 0.0};
     }
-    return {over_target, c.parks(), 0, 0, c.time.total_s(), static_cast<double>(c.arena)};
+    return {over_target, c.parks(), c.dit.residency == DitResidency::kStreamed, 0, 0, c.time.total_s(),
+            static_cast<double>(c.arena)};
   }
 
   std::string describe_dit(const DitPlan& d) const {
     switch (d.residency) {
       case DitResidency::kResident:
-        return "resident bf16 (" + gib(s_.dit_bytes) + "), never parked";
+        return "resident bf16 (" + gib(s_.dit_bytes) + "), never parked" +
+               (d.graph_bytes > 0 ? ", CUDA graphs up to " + gib(d.graph_bytes) + " outside the arena" : std::string());
       case DitResidency::kParked: {
         std::string when = d.park_for_text_encoder && d.park_for_decode ? "the text encoder and the decode"
                            : d.park_for_text_encoder                    ? "the text encoder"
                                                                         : "the decode";
         return "parked bf16 (" + gib(s_.dit_bytes) + "): evicted for " + when + " and reloaded for the next denoise";
       }
-      case DitResidency::kStreamed:
+      case DitResidency::kStreamed: {
+        char rate[160];
+        std::snprintf(rate, sizeof(rate), "%.2f GB per step in ~%.2f s against ~%.2f s of compute: ~%.0f%% of the copy hidden",
+                      static_cast<double>(d.stream_bytes) / 1e9, d.transfer_s, d.compute_s, 100.0 * d.hidden);
+        const std::string from = d.source == DitSource::kHostPinned ? "a pinned host copy (" + gib(d.stream_bytes) + ")"
+                                 : r_.dit_weights_cached            ? std::string("the weight files (page cache)")
+                                                                    : std::string("the weight files (cold: disk)");
         return "streamed bf16: " + std::to_string(d.resident_blocks) + " of " + std::to_string(s_.dit_blocks) +
-               " blocks resident, the rest stream with " + std::to_string(d.prefetch_blocks) + "-block lookahead (" +
-               gib(d.device_bytes) + " on the device)";
+               " blocks resident, the other " + std::to_string(s_.dit_blocks - d.resident_blocks) + " copied every step from " +
+               from + " through " + std::to_string(d.buffers) + " device block buffers (" +
+               std::to_string(d.prefetch_blocks) + "-block lookahead), " + gib(d.device_bytes) + " on the device; " + rate;
+      }
     }
     return {};
   }
@@ -353,16 +445,32 @@ class Planner {
     if (best.vae.run && best.vae.kind == VaeDecodeKind::kTiled) {
       for (const Candidate& c : all) {
         if (c.vae.run && c.vae.kind == VaeDecodeKind::kUntiled && c.dit.residency == best.dit.residency &&
-            c.dit.resident_blocks == best.dit.resident_blocks && c.te.residency == best.te.residency &&
+            c.dit.resident_blocks == best.dit.resident_blocks && c.dit.buffers == best.dit.buffers &&
+            c.dit.source == best.dit.source && c.te.residency == best.te.residency &&
             c.te.buffers == best.te.buffers && c.parks() == best.parks()) {
-          s += "\nUntiled decode would need a " + gib(c.arena) + " arena (decode peak " + gib(c.peaks.decode) +
-               "), over the " + gib(cap_) + " cap; tiling keeps the DiT resident.";
+          s += "\nUntiled decode would need a " + gib(c.arena) + " arena (decode peak " + gib(c.peaks.decode) + ")" +
+               (c.device() > cap_ ? ", over the " + gib(cap_) + " cap; tiling keeps the DiT resident."
+                               : std::string("; tiling keeps the device peak lower."));
           break;
         }
       }
     }
     if (best.parks()) {
       s += "\nParking is the fallback: no configuration keeping the DiT resident fits the " + gib(cap_) + " cap.";
+    }
+    if (best.dit.residency == DitResidency::kStreamed) {
+      if (in_.mode == Mode::kMinMemory) {
+        s += "\nmin_memory streams the DiT blocks to keep the device peak low.";
+      } else {
+        const Candidate* lean = nullptr;
+        for (const Candidate& c : all) {
+          if (c.dit.residency != DitResidency::kStreamed && (lean == nullptr || c.device() < lean->device())) lean = &c;
+        }
+        if (lean != nullptr) {
+          s += "\nThe whole DiT does not fit: keeping it " + std::string(residency_name(lean->dit.residency)) +
+               " would need a " + gib(lean->device()) + " arena, over the " + gib(cap_) + " cap.";
+        }
+      }
     }
     return s;
   }
@@ -379,7 +487,7 @@ class Planner {
     p.cache.disk_spill = in_.cache_disk_spill;
     p.peaks = c.peaks;
     p.arena_bytes = c.arena;
-    p.device_peak_bytes = c.arena + in_.budgets.context_bytes;
+    p.device_peak_bytes = c.device() + in_.budgets.context_bytes;
     p.arena_cap_bytes = cap_;
     p.host_private_bytes = c.host_without_cache + p.cache.host_bytes;
     p.host_target_bytes = host_target_;
@@ -401,6 +509,11 @@ class Planner {
     e += "\nEst. time " + secs(c.time.total_s()) + " (text " + secs(c.time.text_encoder_s) + ", DiT reload " +
          secs(c.time.dit_load_s) + ", denoise " + secs(c.time.denoise_s) + ", decode " + secs(c.time.decode_s) + ")" +
          (hw_.measured ? "." : ", default hardware profile.");
+    char rates[200];
+    std::snprintf(rates, sizeof(rates),
+                  "\nTransfer rates (%s): pinned H2D %.1f GB/s, page cache %.1f GB/s, cold disk %.1f GB/s; bf16 %.0f TFLOPS.",
+                  hw_.measured ? "measured" : "defaults", hw_.h2d_gbps, hw_.host_gbps, hw_.disk_gbps, hw_.bf16_tflops);
+    if (c.dit.residency == DitResidency::kStreamed || c.te.run) e += rates;
     p.explanation = std::move(e);
     return p;
   }
@@ -408,19 +521,19 @@ class Planner {
   [[noreturn]] void throw_budget_error(const std::vector<Candidate>& all) const {
     const Candidate* lean = &all.front();
     for (const Candidate& c : all) {
-      if (std::make_pair(c.arena, c.host_without_cache) < std::make_pair(lean->arena, lean->host_without_cache)) lean = &c;
+      if (std::make_pair(c.device(), c.host_without_cache) < std::make_pair(lean->device(), lean->host_without_cache)) lean = &c;
     }
     const std::string config = "DiT " + describe_dit(lean->dit) + "; text encoder " + describe_te(lean->te) + "; VAE " +
                                describe_vae(lean->vae) + "; " + describe_peaks(*lean);
-    if (lean->arena > cap_) {
+    if (lean->device() > cap_) {
       throw BudgetError("not enough GPU memory for " + request_text() + " in any mode: the leanest plan needs a " +
-                            gib(lean->arena) + " arena (" + config + "), but only " + gib(cap_) + " is available (" +
+                            gib(lean->device()) + " arena (" + config + "), but only " + gib(cap_) + " is available (" +
                             budget_text() + "). Close other GPU applications, raise the budget or lower the resolution.",
-                        lean->arena, cap_, lean->host_without_cache + kCacheFloor, host_limit_);
+                        lean->device(), cap_, lean->host_without_cache + kCacheFloor, host_limit_);
     }
     const Candidate* host_lean = nullptr;
     for (const Candidate& c : all) {
-      if (c.arena <= cap_ && (host_lean == nullptr || c.host_without_cache < host_lean->host_without_cache)) host_lean = &c;
+      if (c.device() <= cap_ && (host_lean == nullptr || c.host_without_cache < host_lean->host_without_cache)) host_lean = &c;
     }
     throw BudgetError("not enough host memory for " + request_text() + " in any mode: the leanest plan that fits the GPU " +
                           "needs " + gib(host_lean->host_without_cache + kCacheFloor) + " of private host memory, over the " +
@@ -457,10 +570,12 @@ std::string json_string(const std::string& s) {
   return out + "\"";
 }
 
+// Locale-independent (to_chars ignores LC_NUMERIC); JSON has no inf/nan.
 std::string json_num(double d) {
+  if (!std::isfinite(d)) return "null";
   char buf[32];
-  std::snprintf(buf, sizeof(buf), "%.6g", d);
-  return buf;
+  const auto res = std::to_chars(buf, buf + sizeof(buf), d, std::chars_format::general, 6);
+  return std::string(buf, res.ptr);
 }
 
 const char* b2s(bool b) { return b ? "true" : "false"; }
@@ -488,6 +603,14 @@ const char* residency_name(DitResidency r) {
     case DitResidency::kResident: return "resident";
     case DitResidency::kParked: return "parked";
     case DitResidency::kStreamed: return "streamed";
+  }
+  return "?";
+}
+
+const char* source_name(DitSource s) {
+  switch (s) {
+    case DitSource::kFile: return "file";
+    case DitSource::kHostPinned: return "host_pinned";
   }
   return "?";
 }
@@ -558,13 +681,70 @@ std::size_t arena_cap(const Budgets& b) {
 
 ExecutionPlan plan(const PlanInputs& inputs) { return Planner(inputs).run(); }
 
+namespace {
+
+// Same device residency of the DiT: every block resident (resident or parked), or streamed alike.
+bool same_residency(const DitPlan& a, const DitPlan& b) {
+  const bool sa = a.residency == DitResidency::kStreamed, sb = b.residency == DitResidency::kStreamed;
+  if (!sa || !sb) return sa == sb;
+  return a.resident_blocks == b.resident_blocks && a.buffers == b.buffers && a.source == b.source;
+}
+
+}  // namespace
+
+ExecutionPlan prefer_held(const PlanInputs& inputs, ExecutionPlan fresh, const HeldDit& held, bool* kept) {
+  if (kept != nullptr) *kept = false;
+  if (same_residency(fresh.dit, held.dit) && fresh.arena_bytes <= held.arena_bytes) return fresh;  // no reload
+  PlanInputs in = inputs;
+  // Arena + graph cap = the held arena (vram_free already counts it as free) and the held graphs (it does not).
+  in.budgets.vram_free += held.graph_bytes;
+  in.budgets.vram_budget = held.arena_bytes + held.graph_bytes + in.budgets.context_bytes + in.budgets.vram_reserve;
+  if (inputs.budgets.vram_budget != 0) in.budgets.vram_budget = std::min(in.budgets.vram_budget, inputs.budgets.vram_budget);
+  DitPlan keep;
+  if (held.dit.residency == DitResidency::kStreamed) {
+    keep.residency = DitResidency::kStreamed;
+    keep.resident_blocks = held.dit.resident_blocks;
+    keep.buffers = held.dit.buffers;
+    keep.source = held.dit.source;
+  }
+  in.keep_dit = keep;
+  ExecutionPlan k;
+  try {
+    k = plan(in);
+  } catch (const BudgetError&) {
+    return fresh;  // the request does not fit the held arena with the loaded DiT
+  }
+  if (!same_residency(k.dit, held.dit) || k.arena_bytes > held.arena_bytes) return fresh;
+  const double reload_s = Planner(inputs).load_seconds(fresh.dit);
+  const double saved_s = k.time.total_s() - fresh.time.total_s();
+  if (saved_s > reload_s) {
+    char why[200];
+    std::snprintf(why, sizeof(why), "\nReloads the DiT (~%.1f s) to save ~%.1f s against the loaded one in the held %.2f GiB arena.",
+                  reload_s, saved_s, static_cast<double>(held.arena_bytes) / static_cast<double>(kGiB));
+    fresh.explanation += why;
+    return fresh;
+  }
+  char why[200];
+  std::snprintf(why, sizeof(why),
+                "\nPlanned inside the held %.2f GiB arena with the loaded DiT: the %.2f GiB plan would reload it (~%.1f s) to save ~%.1f s.",
+                static_cast<double>(held.arena_bytes) / static_cast<double>(kGiB),
+                static_cast<double>(fresh.arena_bytes) / static_cast<double>(kGiB), reload_s, std::max(0.0, saved_s));
+  k.explanation += why;
+  if (kept != nullptr) *kept = true;
+  return k;
+}
+
 std::string ExecutionPlan::to_json() const {
   std::string o = "{";
   o += "\"mode\": \"" + std::string(mode_name(mode)) + "\"";
   o += ", \"dit\": {\"residency\": \"" + std::string(residency_name(dit.residency)) + "\", \"precision\": \"bf16\"" +
-       ", \"resident_blocks\": " + std::to_string(dit.resident_blocks) + ", \"prefetch_blocks\": " +
-       std::to_string(dit.prefetch_blocks) + ", \"park_for_text_encoder\": " + b2s(dit.park_for_text_encoder) +
-       ", \"park_for_decode\": " + b2s(dit.park_for_decode) + ", \"device_bytes\": " + std::to_string(dit.device_bytes) + "}";
+       ", \"resident_blocks\": " + std::to_string(dit.resident_blocks) + ", \"buffers\": " + std::to_string(dit.buffers) +
+       ", \"prefetch_blocks\": " + std::to_string(dit.prefetch_blocks) + ", \"source\": \"" + source_name(dit.source) +
+       "\", \"stream_bytes_per_step\": " + std::to_string(dit.stream_bytes) + ", \"transfer_s_per_step\": " +
+       json_num(dit.transfer_s) + ", \"compute_s_per_step\": " + json_num(dit.compute_s) + ", \"expected_hidden\": " +
+       json_num(dit.hidden) + ", \"park_for_text_encoder\": " + b2s(dit.park_for_text_encoder) +
+       ", \"park_for_decode\": " + b2s(dit.park_for_decode) + ", \"device_bytes\": " + std::to_string(dit.device_bytes) +
+       ", \"graph_bytes\": " + std::to_string(dit.graph_bytes) + "}";
   o += ", \"text_encoder\": {\"run\": " + std::string(b2s(te.run)) + ", \"residency\": \"" + residency_name(te.residency) +
        "\", \"buffers\": " + std::to_string(te.buffers) + "}";
   o += ", \"vae\": {\"run\": " + std::string(b2s(vae.run)) + ", \"tiled\": " + b2s(vae.kind == VaeDecodeKind::kTiled) +

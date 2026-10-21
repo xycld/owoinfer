@@ -7,30 +7,28 @@ namespace {
 
 template <class Tile>
 void situ_glu(const Problem& p, const Tensor& out, const Tensor& x, const Tensor& w, cudaStream_t stream) {
-  using Gemm = DeviceGemm<Tile, SituGluOp, std::uint8_t>;
+  using Gemm = DeviceGemmSituGlu<Tile>;
   // D as bytes: [M, 2F] bytes with a row stride of 2 * ldo bytes is exactly the bf16 [M, F] output.
   auto* d = static_cast<std::uint8_t*>(out.data);
-  const typename Gemm::Arguments args({p.m, p.n, p.k}, {x.ptr<const bf16>(), p.ldx}, {w.ptr<const bf16>(), p.ldw},
-                                      {d, 2 * p.ldo}, {d, 2 * p.ldo}, typename SituGluOp::Params());
+  const typename Gemm::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {p.m, p.n, p.k}, /*batch_count=*/1,
+                                      typename SituGluOp::Params(), x.data, w.data, d, d, 0, 0, 0, 0, p.ldx, p.ldw,
+                                      2 * p.ldo, 2 * p.ldo);
   launch<Gemm>("gemm_situ_glu", args, stream);
 }
 
 }  // namespace
 }  // namespace detail
 
-void gemm_situ_glu(const Tensor& out, const Tensor& x, const Tensor& w_interleaved, cudaStream_t stream) {
+void gemm_situ_glu(const Tensor& out, const Tensor& x, const Tensor& w_up_gate, cudaStream_t stream) {
   constexpr const char* op = "gemm_situ_glu";
-  if (w_interleaved.rank != 2 || w_interleaved.dim(0) % (2 * kUpGateGroup) != 0) {
+  if (w_up_gate.rank != 2 || w_up_gate.dim(0) % (2 * detail::kUpGateGroup) != 0) {
     throw std::invalid_argument(std::string("mi::kernels::fused::") + op + ": w must be [2F, K] with F % 4 == 0, got " +
-                                w_interleaved.describe());
+                                w_up_gate.describe());
   }
-  const detail::Problem p = detail::check_problem(op, out, x, w_interleaved, w_interleaved.dim(0) / 2);
+  const detail::Problem p = detail::check_problem(op, out, x, w_up_gate, w_up_gate.dim(0) / 2);
   if (p.m == 0) return;
-  switch (detail::tile_for(p)) {
-    case GemmTile::k128x256: detail::situ_glu<detail::Tile128x256>(p, out, x, w_interleaved, stream); break;
-    case GemmTile::k128x128: detail::situ_glu<detail::Tile128x128>(p, out, x, w_interleaved, stream); break;
-    default: detail::situ_glu<detail::Tile256x128>(p, out, x, w_interleaved, stream); break;
-  }
+  detail::with_tile(detail::tile_for(p),
+                    [&](auto tile) { detail::situ_glu<decltype(tile)>(p, out, x, w_up_gate, stream); });
 }
 
 }  // namespace mi::kernels::fused

@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
@@ -46,7 +47,8 @@ const char* stream_source_name(StreamSource s);
 
 struct Residency {
   int resident_blocks = kNumBlocks;  // blocks kept in device memory; the other blocks stream every forward()
-  int buffers = 3;                   // device block buffers when streaming (>= 2): buffers - 1 blocks of lookahead
+  int buffers = 3;                   // device block buffers when streaming (>= 2; at most one per streamed block is
+                                     // allocated): buffers - 1 blocks of lookahead
   StreamSource source = StreamSource::kFile;
   bool direct_io = false;            // kFile: O_DIRECT reads
   int reader_threads = 4;            // kFile: concurrent readers, each with its own pinned ring and copy stream
@@ -69,8 +71,8 @@ struct BlockTensors {
   Tensor o, up_gate, down;
 };
 
-// Fault injection (tests): called on reader thread `reader` before it copies its share of streamed block `block`;
-// an exception thrown here fails the forward() (rethrown on the compute thread), leaving the model usable.
+// Fault and delay injection (tests): called on reader thread `reader` before each chunk of its share of streamed block
+// `block`; an exception thrown here fails the forward() (rethrown on the compute thread), leaving the model usable.
 using CopyHook = std::function<void(int reader, int block)>;
 
 // Streaming diagnostics of one forward() (P4 step 28), from CUDA events on the GPU timeline.
@@ -107,7 +109,8 @@ class BlockWeights {
   static std::size_t block_device_bytes(const weights::ModelIndex& index);
   // Persistent arena bytes of the resident blocks.
   static std::size_t resident_bytes(const weights::ModelIndex& index, const Residency& residency);
-  // Arena stack bytes a streaming forward() adds (the device block buffers); 0 when every block is resident.
+  // Arena stack bytes a streaming forward() adds (min(buffers, streamed blocks) device block buffers); 0 when every
+  // block is resident.
   static std::size_t buffer_bytes(const weights::ModelIndex& index, const Residency& residency);
   // Host memory the provider holds while it lives: pinned rings (kFile) or the pinned copy (kHostPinned).
   static std::size_t host_bytes(const weights::ModelIndex& index, const Residency& residency);
@@ -146,15 +149,18 @@ class BlockWeights {
   // One forward()'s block weights. Construct after the forward's own stack allocations (it carves the buffers out of
   // the arena stack and starts the readers), then acquire(b) / release(b) every block in order 0..41, then finish().
   // Destroying an unfinished pass (an exception, a cancel) stops the readers and waits for every queued copy and
-  // kernel, so the caller's stack rollback is safe.
+  // kernel, so the caller's stack rollback is safe. `cancel` (optional, outlives the pass): the readers check it
+  // between chunks and stop the pass, and acquire() then throws Cancelled, so a cancel lands within one chunk even
+  // when the weights come from slow storage.
   class Pass {
    public:
-    Pass(BlockWeights& w, cudaStream_t stream);
+    Pass(BlockWeights& w, cudaStream_t stream, const std::atomic<bool>* cancel = nullptr);
     ~Pass();
     Pass(const Pass&) = delete;
     Pass& operator=(const Pass&) = delete;
 
-    // The compute stream waits until the block's weights are on the device.
+    // The compute stream waits until the block's weights are on the device. Throws Cancelled (moss_dit.h) when the
+    // pass's cancel flag stopped the readers.
     const BlockTensors& acquire(int block);
     // The block's kernels are all enqueued: its buffer may be refilled once they have run.
     void release(int block);
@@ -186,6 +192,7 @@ class BlockWeights {
   runtime::DeviceArena& arena_;
   Residency residency_;
   std::bitset<kNumBlocks> mask_;
+  int nbuf_ = 0;  // device block buffers of a pass
   std::size_t block_bytes_ = 0;
   std::vector<weights::WeightGroup> ordered_;  // per block, fused tensors first
   std::vector<BlockTensors> resident_;         // per block (empty views when streamed)

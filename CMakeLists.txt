@@ -1,12 +1,19 @@
 cmake_minimum_required(VERSION 3.28)
+# Default GPU targets unless -DCMAKE_CUDA_ARCHITECTURES or CUDAARCHS chose them. Decided before project(), which sets
+# CMAKE_CUDA_ARCHITECTURES to the compiler's default (sm_75 for CUDA 13); applied after it, once the CUDA version is
+# known (project()'s compiler check must not build for sm_120 with CUDA < 12.8). Cached, so a re-configure keeps it.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
+  set(_mi_default_cuda_archs ON)
+endif()
 project(MossInfer LANGUAGES C CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-if(NOT CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 80 86 89 120)
+if(_mi_default_cuda_archs)
+  set(CMAKE_CUDA_ARCHITECTURES 80 86 89 120 CACHE STRING "CUDA architectures" FORCE)
+  unset(_mi_default_cuda_archs)
 endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -15,14 +22,26 @@ option(MOSSINFER_ASAN "Build host code with AddressSanitizer" OFF)
 option(MOSSINFER_TESTS "Build unit tests" ON)
 
 find_package(CUDAToolkit 12.4 REQUIRED)
+# sm_120 (Blackwell GeForce) needs CUDA 12.8.
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
+  set(_mi_archs ${CMAKE_CUDA_ARCHITECTURES})
+  list(FILTER _mi_archs EXCLUDE REGEX "^120")
+  if(NOT _mi_archs STREQUAL CMAKE_CUDA_ARCHITECTURES)
+    message(STATUS "CUDA ${CMAKE_CUDA_COMPILER_VERSION} < 12.8: dropping sm_120 from CMAKE_CUDA_ARCHITECTURES (${_mi_archs})")
+    set(CMAKE_CUDA_ARCHITECTURES ${_mi_archs})
+  endif()
+  unset(_mi_archs)
+endif()
 
 if(MSVC)
   set(MOSSINFER_WARN /W4 /permissive- /utf-8)
+  set(MOSSINFER_CUDA_HOST_WARN -Xcompiler=/W3)  # cl's /Wall (what -Wall means to it) floods the CUDA headers
   if(MOSSINFER_WERROR)
     list(APPEND MOSSINFER_WARN /WX)
   endif()
 else()
   set(MOSSINFER_WARN -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion)
+  set(MOSSINFER_CUDA_HOST_WARN -Xcompiler=-Wall)
   if(MOSSINFER_WERROR)
     list(APPEND MOSSINFER_WARN -Werror)
   endif()
@@ -64,7 +83,7 @@ target_compile_options(mossinfer_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${MOSSIN
 # CUDA: host warnings via -Xcompiler (kept below -Werror level: CUTLASS/CuTe headers are not -Wshadow clean),
 # device code with line info for profilers.
 target_compile_options(mossinfer_core PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -lineinfo -Xcompiler=-Wall>)
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -lineinfo ${MOSSINFER_CUDA_HOST_WARN}>)
 # Vendored CUTLASS/CuTe headers (BSD-3, see third_party/cutlass/VENDORED.md), CUDA translation units only.
 target_include_directories(mossinfer_core SYSTEM PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:${CMAKE_SOURCE_DIR}/third_party/cutlass/include ${CMAKE_SOURCE_DIR}/third_party/cutlass/tools/util/include>)
