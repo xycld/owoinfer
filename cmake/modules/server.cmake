@@ -6,13 +6,17 @@ if(NOT MOSSINFER_BUILD_API)
   return()
 endif()
 
+# The C targets' warning flags: MSVC's /permissive- is a C++ conformance switch, so it stays off them.
+set(_mi_c_warn ${MOSSINFER_WARN})
+list(REMOVE_ITEM _mi_c_warn /permissive-)
+
 # The frozen C struct layouts seen from a C compiler (the library checks the same table in C++). Header only.
 if(MOSSINFER_TESTS AND EXISTS ${CMAKE_SOURCE_DIR}/tests/c/test_abi_layout.c)
   enable_testing()
   add_executable(mossinfer_abi_layout_c ${CMAKE_SOURCE_DIR}/tests/c/test_abi_layout.c)
   set_target_properties(mossinfer_abi_layout_c PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
   target_include_directories(mossinfer_abi_layout_c PRIVATE ${CMAKE_SOURCE_DIR}/include)
-  target_compile_options(mossinfer_abi_layout_c PRIVATE ${MOSSINFER_WARN})
+  target_compile_options(mossinfer_abi_layout_c PRIVATE ${_mi_c_warn})
   add_test(NAME c_abi_layout COMMAND mossinfer_abi_layout_c)
   set_tests_properties(c_abi_layout PROPERTIES LABELS cpu)
 endif()
@@ -33,7 +37,7 @@ if(NOT MOSSINFER_ONLY AND EXISTS ${CMAKE_SOURCE_DIR}/tools/server/main.cpp)
   # C99 without extensions: also checks that mossinfer.h is plain C.
   add_executable(mossinfer_example_c ${CMAKE_SOURCE_DIR}/examples/c/minimal.c)
   set_target_properties(mossinfer_example_c PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
-  target_compile_options(mossinfer_example_c PRIVATE ${MOSSINFER_WARN})
+  target_compile_options(mossinfer_example_c PRIVATE ${_mi_c_warn})
   if(TARGET mossinfer)
     target_link_libraries(mossinfer_example_c PRIVATE mossinfer)
   else()
@@ -53,8 +57,11 @@ if(NOT MOSSINFER_ONLY AND EXISTS ${CMAKE_SOURCE_DIR}/tools/server/main.cpp)
       set_tests_properties(server_protocol_gpu PROPERTIES LABELS gpu
         ENVIRONMENT "MOSS_SERVER=$<TARGET_FILE:moss-server>;MOSSINFER_GPU_TESTS=1;MOSS_WEIGHTS=${MOSSINFER_TEST_WEIGHTS}")
     endif()
-    add_test(NAME c_example_minimal COMMAND mossinfer_example_c ${MOSSINFER_TEST_WEIGHTS}/base
-             ${CMAKE_BINARY_DIR}/c_example_minimal.png "a red apple on a wooden table" 256 2)
-    set_tests_properties(c_example_minimal PROPERTIES LABELS gpu)
+    # Skipped, not failed, when the weights are absent (the driver script prints the marker).
+    add_test(NAME c_example_minimal COMMAND ${CMAKE_COMMAND} -DEXAMPLE=$<TARGET_FILE:mossinfer_example_c>
+             -DBUNDLE=${MOSSINFER_TEST_WEIGHTS}/base -DOUT=${CMAKE_BINARY_DIR}/c_example_minimal.png
+             -P ${CMAKE_SOURCE_DIR}/tests/c/run_c_example.cmake)
+    set_tests_properties(c_example_minimal PROPERTIES LABELS gpu SKIP_REGULAR_EXPRESSION "MOSSINFER_TEST_SKIPPED")
   endif()
 endif()
+unset(_mi_c_warn)

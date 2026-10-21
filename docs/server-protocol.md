@@ -22,6 +22,14 @@ A launcher that crashes or is killed normally closes the server's stdin, and the
 
 If `<pid>` is not running at startup, the server exits with status 1. A malformed value is a usage error (status 2).
 
+## Security
+
+The server trusts its launcher completely: whoever writes to its stdin has the server's file-system rights. The protocol is a local pipe between a launcher and the child it spawned, not an interface for untrusted input.
+- **No network surface.** The server opens no socket and listens on no port. Its only input is stdin.
+- **Paths are used as given.** `generate`'s `output` is written wherever it points, and an existing file there is overwritten (atomically: a temporary file renamed over it). `load`'s `model` and `cache_dir` are read, and the cache directory is written to. The server does not confine any path to a directory, resolve symlinks, or check ownership.
+- **The launcher validates paths.** A launcher that takes `output`, `model` or `cache_dir` from a user, a web page, a workflow file or another program must check them first. For example, it can confine outputs to its own output directory, reject `..` components and symlinks it did not create, and refuse to overwrite files it does not own.
+- **Run it as the user.** Run the server with the launcher's own (unprivileged) rights, never elevated.
+
 ## Framing
 
 - **One message per line.** Each message is a JSON object encoded as UTF-8 and terminated by `\n` (`\r\n` is accepted).
@@ -175,7 +183,7 @@ The fields of `done` depend on `status`:
 | `"cancelled"` | `steps_run`, `report` (no image is written) |
 | `"error"` | `error: {code, message}`, plus `report` when only the PNG write failed |
 
-`report` is the same document as `moss-infer generate --json-report`:
+`report` is the same document as `moss-infer generate --json-report`, or `null` in the rare case that the library could not render it (`mi_result_report_json()` returned NULL, e.g. out of host memory):
 - `request`, `seed_used`, `steps_scheduled`, `steps_run`, `cancelled`, `cond_tokens`, `uncond_tokens`
 - `image`, `latents` (always `""` here), `mode`, `plan`, `embedding_cache`, `decode`
 - `dit_blocks` (`path` that ran, `note` saying why it differs from the requested one, or `""`)
@@ -234,7 +242,7 @@ send({"id": 3, "method": "shutdown"})
 
 ## Tests
 
-`tests/server/test_protocol.py` uses the standard library only.
+`tests/server/test_protocol.py` uses the standard library only. The server's JSON output helpers (`tools/server/json_out.h`; the server links only the C API, so it cannot use the pipeline's report renderer) are checked by the `cpu` gtest suite `ServerJson.*` (`tests/unit/test_server_json.cpp`): strings and numbers are written exactly as `pipeline::json_escape` / `json_number` write them, numbers ignore the C and C++ locales, and a NULL report becomes `null`.
 
 | ctest name | Label | What it runs |
 |---|---|---|

@@ -253,6 +253,7 @@ ProbeResult probe(const ProbeOptions& options) {
     // Never through the runtime: cudaMemGetInfo would create a primary context that stays for the life of the process.
     for (DeviceInfo& d : r.devices) {
       if (!d.supported) continue;  // devices the engine will not use are not touched
+      if (options.free_memory_device >= 0 && d.index != options.free_memory_device) continue;
       std::optional<MemoryInfo> m;
       if (options.free_memory_method != FreeMemoryMethod::kDriver) {
         m = nvml_memory_info(d.pci_bus_id.c_str());

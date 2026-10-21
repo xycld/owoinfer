@@ -10,7 +10,6 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -46,6 +45,7 @@
 #endif
 #endif
 
+#include "json_out.h"
 #include "mossinfer/mossinfer.h"
 #include "util/json.h"
 
@@ -59,78 +59,12 @@ using mi::json::Value;
 
 // ---------------------------------------------------------------- JSON output
 
-// Length of the well-formed UTF-8 sequence at s[i] (Unicode Table 3-7), or 0 if it is ill-formed.
-std::size_t utf8_sequence_length(std::string_view s, std::size_t i) {
-  const auto at = [&](std::size_t k) { return static_cast<unsigned char>(s[k]); };
-  const unsigned char c = at(i);
-  if (c < 0x80) return 1;
-  std::size_t n = 0;
-  unsigned char lo = 0x80, hi = 0xbf;
-  if (c >= 0xc2 && c <= 0xdf) n = 2;
-  else if (c >= 0xe0 && c <= 0xef) n = 3, lo = c == 0xe0 ? 0xa0 : 0x80, hi = c == 0xed ? 0x9f : 0xbf;
-  else if (c >= 0xf0 && c <= 0xf4) n = 4, lo = c == 0xf0 ? 0x90 : 0x80, hi = c == 0xf4 ? 0x8f : 0xbf;
-  else return 0;
-  if (i + n > s.size() || at(i + 1) < lo || at(i + 1) > hi) return 0;
-  for (std::size_t k = 2; k < n; ++k) {
-    if (at(i + k) < 0x80 || at(i + k) > 0xbf) return 0;
-  }
-  return n;
-}
-
-// JSON string literal; ill-formed UTF-8 becomes U+FFFD per bad byte.
-std::string str(std::string_view s) {
-  std::string out = "\"";
-  for (std::size_t i = 0; i < s.size();) {
-    const unsigned char c = static_cast<unsigned char>(s[i]);
-    if (c >= 0x80) {
-      const std::size_t n = utf8_sequence_length(s, i);
-      if (n == 0) {
-        out += "\\ufffd";
-        ++i;
-      } else {
-        out.append(s, i, n);
-        i += n;
-      }
-      continue;
-    }
-    ++i;
-    switch (c) {
-      case '"': out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
-      default:
-        if (c < 0x20) {
-          char buf[8];
-          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-          out += buf;
-        } else {
-          out += static_cast<char>(c);
-        }
-    }
-  }
-  return out + "\"";
-}
-
-std::string num(double d) {
-  if (!std::isfinite(d)) return "null";
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "%.6g", d);
-  return buf;
-}
+using mi::server::num;
+using mi::server::one_line;
+using mi::server::str;
+using mi::server::utf8_sequence_length;
 
 const char* tf(bool b) { return b ? "true" : "false"; }
-
-// A JSON document from the engine (report, plan) as one line: raw newlines can only be whitespace between tokens
-// (inside strings they are escaped), so dropping them keeps the document intact.
-std::string one_line(const char* json) {
-  std::string out;
-  for (const char* p = json; *p != '\0'; ++p) {
-    if (*p != '\n' && *p != '\r') out += *p;
-  }
-  return out;
-}
 
 // Re-serializes a request id (string, integer or null) for the response.
 std::string id_json(const Value* id) {
@@ -615,8 +549,8 @@ class Server {
       if (const mi_status ws = mi_save_png(r, w.output.c_str()); ws == MI_OK) {
         done += ",\"status\":\"ok\",\"image\":" + str(w.output) + ",\"report\":" + one_line(mi_result_report_json(r));
       } else {
-        done += ",\"status\":\"error\",\"error\":" + error_json(status_code(ws), mi_last_error_message()) +
-                ",\"report\":" + one_line(mi_result_report_json(r));
+        done += ",\"status\":\"error\",\"error\":" + error_json(status_code(ws), mi_last_error_message());
+        done += ",\"report\":" + one_line(mi_result_report_json(r));  // after the message: a failing report would replace it
       }
     } else if (s == MI_CANCELLED) {
       done += ",\"status\":\"cancelled\",\"steps_run\":" + std::to_string(mi_result_steps_run(r)) +

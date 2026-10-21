@@ -104,6 +104,8 @@ struct ProbeOptions {
   // Off: free_bytes stays 0.
   bool query_free_memory = true;
   FreeMemoryMethod free_memory_method = FreeMemoryMethod::kAuto;
+  // With query_free_memory: only this device ordinal is measured (mi_probe_device); -1 = every supported device.
+  int free_memory_device = -1;
 };
 
 // Enumerates devices and evaluates them. Never throws for a missing driver or device.

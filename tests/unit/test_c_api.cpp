@@ -289,6 +289,15 @@ TEST(CApi, InvalidEngineParams) {
        "vram_budget_bytes"},
       {"huge host budget", with([](mi_engine_params& p) { p.host_ram_budget_bytes = std::uint64_t{1} << 50; }),
        MI_ERR_INVALID_ARGUMENT, "host_ram_budget_bytes"},
+      // The three sizes share one rule: 0 or [1 MiB, 1 TiB].
+      {"huge vram budget", with([](mi_engine_params& p) { p.vram_budget_bytes = (std::uint64_t{1} << 40) + 1; }),
+       MI_ERR_INVALID_ARGUMENT, "vram_budget_bytes must be at most 1024 GiB"},
+      {"tiny vram reserve", with([](mi_engine_params& p) { p.vram_reserve_bytes = (std::uint64_t{1} << 20) - 1; }),
+       MI_ERR_INVALID_ARGUMENT, "vram_reserve_bytes must be at least 1 MiB"},
+      {"huge vram reserve", with([](mi_engine_params& p) { p.vram_reserve_bytes = (std::uint64_t{1} << 40) + 1; }),
+       MI_ERR_INVALID_ARGUMENT, "vram_reserve_bytes must be at most 1024 GiB"},
+      {"tiny host budget", with([](mi_engine_params& p) { p.host_ram_budget_bytes = (std::uint64_t{1} << 20) - 1; }),
+       MI_ERR_INVALID_ARGUMENT, "host_ram_budget_bytes must be at least 1 MiB"},
   };
   for (const Case& c : cases) {
     mi_engine* engine = nullptr;
@@ -471,6 +480,8 @@ TEST(CApi, ProbeWithoutRequiringAGpu) {
 
 // mi_probe_device measures free memory without leaving a CUDA context behind (no engine in this suite).
 TEST(GpuCApiProbe, ProbeDeviceLeavesNoCudaContext) {
+  // Only meaningful in a context-free process. ctest runs each test in its own process, so this skips only when the
+  // whole binary runs in one process after a test that created a context (GpuCApi.* create engines).
   if (!mi::testing::cuda_context_report().empty()) GTEST_SKIP() << "the process already holds a CUDA context";
   mi_probe_info info{};
   info.struct_size = sizeof info;
@@ -484,6 +495,13 @@ TEST(GpuCApiProbe, ProbeDeviceLeavesNoCudaContext) {
       EXPECT_GT(dev.free_memory_bytes, 0u) << i;
     }
   }
+  // An index past the last device is rejected before any device is probed.
+  mi_device_info dev{};
+  dev.struct_size = sizeof dev;
+  EXPECT_EQ(mi_probe_device(info.device_count, &dev), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("(" + std::to_string(info.device_count) + " CUDA devices)"), std::string::npos)
+      << last_error();
+  EXPECT_EQ(dev.name[0], '\0');
   EXPECT_EQ(mi::testing::cuda_context_report(), "");
 }
 

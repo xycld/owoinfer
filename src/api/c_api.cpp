@@ -11,6 +11,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "api/pipeline_adapter.h"
@@ -336,10 +337,21 @@ mi_status mi_probe_device(int32_t index, mi_device_info* info) {
   return guarded([&] {
     require(info, "info");
     check_size(info->struct_size, sizeof(mi_device_info), "mi_device_info");
-    const mi::backend::ProbeResult r = mi::backend::probe();
-    if (index < 0 || static_cast<std::size_t>(index) >= r.devices.size()) {
-      throw std::invalid_argument("device index " + std::to_string(index) + " out of range (" +
-                                  std::to_string(r.devices.size()) + " CUDA devices).");
+    // The index first: a bad one must not cost a free-memory query (a driver context) on every device.
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess) {
+      cudaGetLastError();  // no driver or device: count 0, like mi_probe()
+      count = 0;
+    }
+    if (index < 0 || index >= count) {
+      throw std::invalid_argument("device index " + std::to_string(index) + " out of range (" + std::to_string(count) +
+                                  " CUDA devices).");
+    }
+    mi::backend::ProbeOptions options;
+    options.free_memory_device = index;
+    const mi::backend::ProbeResult r = mi::backend::probe(options);
+    if (static_cast<std::size_t>(index) >= r.devices.size()) {
+      throw StatusError(MI_ERR_CUDA, "device " + std::to_string(index) + " disappeared during the probe.");
     }
     const mi::backend::DeviceInfo& d = r.devices[static_cast<std::size_t>(index)];
     info->_reserved0 = 0;
@@ -386,14 +398,10 @@ mi_status mi_engine_create(const mi_engine_params* params, mi_engine** out_engin
   });
 }
 
-void mi_engine_free(mi_engine* engine) {
-  // Destructors free device memory; a CUDA error there has nowhere to go, and the documented contract is "never fails",
-  // so the thread's last-error message is not touched either.
-  try {
-    delete engine;
-  } catch (...) {
-  }
-}
+// No try/catch: destructors are noexcept, so there is nothing it could catch. ~PipelineAdapter and the pipeline below it
+// tear down with CUDA's C API and ignore its errors (never MI_CUDA_CHECK), and the thread's last error stays untouched.
+static_assert(std::is_nothrow_destructible_v<mi_engine>);
+void mi_engine_free(mi_engine* engine) { delete engine; }
 
 mi_status mi_cancel(mi_engine* engine) {
   return guarded([&] {

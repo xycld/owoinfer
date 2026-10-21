@@ -141,8 +141,9 @@ typedef struct mi_probe_info {
 /* Fills `info` (struct_size set by the caller). Works without a GPU: a machine without driver or device returns MI_OK
  * with device_count == 0 and the reason in `message`. Creates no CUDA context. */
 MOSSINFER_API mi_status mi_probe(mi_probe_info* info);
-/* Fills `info` (struct_size set by the caller) for device `index` in [0, device_count). The free memory comes from NVML
- * when the driver ships it, else from a temporary CUDA context (driver API) that is released before returning: the
+/* Fills `info` (struct_size set by the caller) for device `index` in [0, device_count); any other index fails with
+ * MI_ERR_INVALID_ARGUMENT before a device is queried. Only device `index` has its free memory measured: from NVML
+ * when the driver ships it, else from a temporary CUDA context (driver API) that is released before returning. The
  * call leaves no CUDA context behind and does not change the calling thread's current context. */
 MOSSINFER_API mi_status mi_probe_device(int32_t index, mi_device_info* info);
 
@@ -183,10 +184,11 @@ typedef struct mi_engine_params {
   mi_mode mode;                    /* default MI_MODE_BALANCED */
   int32_t device_index;            /* CUDA device ordinal, default 0 */
   int32_t _reserved0;              /* must be 0 */
-  /* Cap on this process's device memory, CUDA context included; 0 (default) = free memory - vram_reserve_bytes.
-   * Nonzero values must be in [1 MiB, 1 TiB]. */
+  /* The three sizes share one range rule: 0, or a value in [1 MiB, 1 TiB]; anything else fails mi_engine_create()
+   * with MI_ERR_INVALID_ARGUMENT. vram_budget_bytes caps this process's device memory, CUDA context included;
+   * 0 (default) = free memory - vram_reserve_bytes. */
   uint64_t vram_budget_bytes;
-  uint64_t vram_reserve_bytes;     /* device memory left outside the engine's arena; default 384 MiB */
+  uint64_t vram_reserve_bytes;     /* device memory left outside the engine's arena; default 384 MiB, 0 = none */
   uint64_t host_ram_budget_bytes;  /* cap on private host memory; 0 (default) = the mode's target */
   const char* cache_dir;           /* embedding-cache disk spill directory; NULL or "" (default) = memory only */
   int32_t embedding_cache;         /* reuse text embeddings of repeated prompts; default 1 */
@@ -348,7 +350,9 @@ MOSSINFER_API mi_status mi_result_timings(const mi_result* result, mi_timings* o
 MOSSINFER_API mi_status mi_result_memory(const mi_result* result, mi_memory_stats* out);
 MOSSINFER_API mi_status mi_result_dit_stream(const mi_result* result, mi_dit_stream_stats* out);
 /* The DiT block path the denoise actually ran (never MI_BLOCK_PATH_DEFAULT, except for a NULL result). It can differ
- * from mi_engine_params.block_path; mi_result_block_path_note() then says why. */
+ * from mi_engine_params.block_path; mi_result_block_path_note() then says why. When a cancel landed before the DiT
+ * was ready for the denoise (text encoder or DiT load), no block ran and this is MI_BLOCK_PATH_FUSED, the engine
+ * default, whatever was requested. */
 MOSSINFER_API mi_block_path mi_result_block_path(const mi_result* result);
 /* Why the block path differs from the requested one; "" when it does not. Owned by the result. */
 MOSSINFER_API const char* mi_result_block_path_note(const mi_result* result);
@@ -356,7 +360,8 @@ MOSSINFER_API const char* mi_result_block_path_note(const mi_result* result);
 MOSSINFER_API const char* mi_result_plan_explanation(const mi_result* result);
 /* The generation report as one JSON document, the same shape as `moss-infer generate --json-report` ("image" is the
  * last path given to mi_save_png(), "" before). Owned by the result, valid until the next call of this function or
- * mi_save_png() on it. */
+ * mi_save_png() on it. NULL (with mi_last_error_message() set) for a NULL result or when rendering fails (out of
+ * memory). */
 MOSSINFER_API const char* mi_result_report_json(mi_result* result);
 /* Writes the image as a PNG (atomically: a temporary file renamed over `path`). MI_ERR_INVALID_ARGUMENT when the
  * result has no image (cancelled). */

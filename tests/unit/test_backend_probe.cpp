@@ -232,6 +232,8 @@ TEST(GpuBackendProbe, EnumeratesDevices) {
 // Measuring free memory leaves no CUDA context behind, with NVML and with the driver-API fallback; the calling
 // thread's current context is untouched.
 TEST(GpuBackendProbe, FreeMemoryLeavesNoContext) {
+  // Only meaningful in a context-free process. ctest runs each test in its own process, so this skips only when the
+  // whole binary runs in one process after a test that created a context (e.g. ContextCheckSeesARuntimeContext).
   if (!mi::testing::cuda_context_report().empty()) GTEST_SKIP() << "the process already holds a CUDA context";
   const auto ctx_before = mi::testing::current_context();
   using mi::backend::FreeMemoryMethod;
@@ -253,6 +255,30 @@ TEST(GpuBackendProbe, FreeMemoryLeavesNoContext) {
     EXPECT_EQ(mi::testing::cuda_context_report(), "") << "after method " << static_cast<int>(method);
   }
   EXPECT_EQ(mi::testing::current_context(), ctx_before);
+}
+
+// ProbeOptions::free_memory_device measures that device only; an ordinal no device has measures none.
+TEST(GpuBackendProbe, FreeMemoryOfOneDevice) {
+  mi::backend::ProbeOptions options;
+  options.free_memory_device = 0;
+  const ProbeResult one = mi::backend::probe(options);
+  ASSERT_FALSE(one.devices.empty()) << one.reason;
+  for (const DeviceInfo& d : one.devices) {
+    if (d.index == 0 && d.supported) {
+      EXPECT_GT(d.free_bytes, 0u);
+      EXPECT_FALSE(d.free_memory_source.empty());
+    } else {
+      EXPECT_EQ(d.free_bytes, 0u) << d.index;
+      EXPECT_EQ(d.free_memory_source, "") << d.index;
+    }
+  }
+  options.free_memory_device = static_cast<int>(one.devices.size());
+  const ProbeResult none = mi::backend::probe(options);
+  ASSERT_EQ(none.devices.size(), one.devices.size());
+  for (const DeviceInfo& d : none.devices) {
+    EXPECT_EQ(d.free_bytes, 0u) << d.index;
+    EXPECT_EQ(d.free_memory_source, "") << d.index;
+  }
 }
 
 // The context check itself sees a context the runtime creates (so the test above cannot pass vacuously).

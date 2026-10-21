@@ -13,7 +13,7 @@ jobs:
   version:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Tag matches the header version
         shell: bash
         run: |
@@ -39,7 +39,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: mossinfer-*
           path: dist
@@ -52,7 +52,7 @@ jobs:
           sha256sum mossinfer-*.zip mossinfer-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
           ls -l
-      - uses: softprops/action-gh-release@v3.0.3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             dist/mossinfer-*.zip

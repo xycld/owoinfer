@@ -162,6 +162,8 @@ PipelineAdapter::PipelineAdapter(const mi_engine_params& params) : impl_(std::ma
   impl_->pipe = std::make_unique<pipeline::Pipeline>(options);
 }
 
+// Must not throw (mi_engine_free() has no way to report it): only CUDA C calls whose errors are ignored, and the
+// pipeline's destructors release with plain CUDA calls as well.
 PipelineAdapter::~PipelineAdapter() {
   // The pipeline frees its device memory on the engine's device, whichever context the caller has current.
   const backend::ScopedCurrentContext restore;

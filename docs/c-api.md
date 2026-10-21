@@ -92,13 +92,15 @@ The weights load on the first `mi_generate()`. The DiT stays resident across gen
 | `model_format` | `AUTO` | `AUTO`: a directory is an HF bundle, a file is a ComfyUI checkpoint (not supported yet) |
 | `mode` | `BALANCED` | `MIN_MEMORY` / `BALANCED` / `MAX_SPEED` (planner objective) |
 | `device_index` | 0 | CUDA ordinal |
-| `vram_budget_bytes` | 0 = free memory − reserve | cap on the process's device memory, CUDA context included; nonzero values in [1 MiB, 1 TiB] |
-| `vram_reserve_bytes` | 384 MiB | device memory left outside the arena |
+| `vram_budget_bytes` | 0 = free memory − reserve | cap on the process's device memory, CUDA context included |
+| `vram_reserve_bytes` | 384 MiB | device memory left outside the arena; 0 = none |
 | `host_ram_budget_bytes` | 0 = the mode's target | cap on private host memory |
 | `cache_dir` | NULL = memory only | embedding-cache disk spill |
 | `embedding_cache` | 1 | reuse the text embeddings of repeated prompts |
 | `direct_io` | 0 | O_DIRECT weight reads |
 | `block_path` | `DEFAULT` (fused) | DiT block implementation: `OP_BY_OP`, `FUSED` or `FUSED_GRAPHS`; all give the same image bits. `FUSED` runs op by op when the startup self-check finds the fused GEMMs not bit-identical on this GPU, and `FUSED_GRAPHS` replays CUDA graphs only when every DiT block is resident. `mi_result_block_path()` reports what ran. |
+
+The three sizes (`vram_budget_bytes`, `vram_reserve_bytes`, `host_ram_budget_bytes`) share one range rule: 0, or a value in [1 MiB, 1 TiB]. Anything else fails `mi_engine_create()` with `MI_ERR_INVALID_ARGUMENT`, naming the field.
 
 ## Generation
 
@@ -126,9 +128,9 @@ The callbacks:
 | `mi_result_timings(r, &t)` | `total, load, encode, denoise, decode` and their parts, in seconds |
 | `mi_result_memory(r, &m)` | arena capacity and high-water, device peak, host private start and peak |
 | `mi_result_dit_stream(r, &s)` | DiT block streaming over the denoise: streamed, resident blocks, buffers, stalls, bytes copied, copy and stall seconds, GB/s, hidden fraction, source (`"file"` / `"host_pinned"`). All zero when every block was resident. |
-| `mi_result_block_path(r)` / `mi_result_block_path_note(r)` | the DiT block path that ran (`OP_BY_OP`, `FUSED` or `FUSED_GRAPHS`), and why it differs from the requested one (`""` when it does not) |
+| `mi_result_block_path(r)` / `mi_result_block_path_note(r)` | the DiT block path that ran (`OP_BY_OP`, `FUSED` or `FUSED_GRAPHS`), and why it differs from the requested one (`""` when it does not). A cancel that landed before the denoise (text encoder or DiT load) ran no block; the path is then `FUSED`, the engine default, whatever was requested. |
 | `mi_result_plan_explanation(r)` | the execution plan as text |
-| `mi_result_report_json(r)` | the `moss-infer generate --json-report` document; `"image"` is the last path given to `mi_save_png()` |
+| `mi_result_report_json(r)` | the `moss-infer generate --json-report` document; `"image"` is the last path given to `mi_save_png()`. NULL, with the message set, for a NULL result or when rendering fails (out of memory). |
 | `mi_save_png(r, path)` | atomic PNG write (temporary file, then rename) |
 
 Strings returned by accessors are owned by the result. They stay valid until `mi_result_free()`; the report string stays valid until the next `mi_result_report_json()` or `mi_save_png()` call on the same result.
@@ -143,7 +145,7 @@ Strings returned by accessors are owned by the result. They stay valid until `mi
 
 It works on machines without a driver or GPU and creates no CUDA context.
 
-`mi_probe_device(i)` adds the name, PCI bus id, compute capability, total and free memory, and whether this build supports the device (and why not). It is implemented by `src/backend/probe.h`. It also leaves no CUDA context behind:
+`mi_probe_device(i)` adds the name, PCI bus id, compute capability, total and free memory, and whether this build supports the device (and why not). It is implemented by `src/backend/probe.h`. An `i` outside [0, device count) fails with `MI_ERR_INVALID_ARGUMENT` before any device is queried, and only device `i` has its free memory measured (`ProbeOptions::free_memory_device`). It also leaves no CUDA context behind:
 - **Free memory comes from NVML** (`libnvidia-ml.so.1` / `nvml.dll`, loaded at run time; `nvmlDeviceGetMemoryInfo` by PCI bus id). NVML needs no context.
 - **Fallback without NVML:** the driver API (`libcuda.so.1` / `nvcuda.dll`). It retains the device's primary context, calls `cuMemGetInfo` and releases the context again. The last release destroys it. If an engine already holds that context, the probe shares it and creates nothing.
 - **Never** through the CUDA runtime (whose context would stay for the life of the process), and never `cudaDeviceReset`.
