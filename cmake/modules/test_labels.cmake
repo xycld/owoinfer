@@ -26,7 +26,7 @@ file(CONFIGURE OUTPUT ${_mi_labels_script} @ONLY CONTENT [==[
 # Generated from cmake/modules/test_labels.cmake.
 # Names are [Instantiation/]Suite.Test[/Param]; matched on "Suite." (whole suite) or "Suite.Test" (one test).
 set(_mi_prefix "^([A-Za-z0-9_]+/)?")
-set(_mi_gpu_re "${_mi_prefix}(Gpu[A-Za-z0-9_]*\\.|DeviceArena\\.|GraphCache\\.|PinnedRing\\.|RingFiles\\.|StreamSet\\.|WeightUploadReal\\.|WeightUploadSynthetic\\.|Vae[A-Za-z0-9_]*\\.|Flux2VaeTest\\.|Flux2VaeTiledTest\\.|Flux2VaeTorchGroupNorm\\.|MossDitGolden\\.|MossDitTest\\.|Qwen35Text\\.|Qwen35TextStream\\.|PipelineLoop\\.|PipelineKernels\\.|PipelineEndToEnd\\.|Varlen\\.UploadAndValidateOnDevice$)")
+set(_mi_gpu_re "${_mi_prefix}(Gpu[A-Za-z0-9_]*\\.|DeviceArena\\.|GraphCache\\.|PinnedRing\\.|RingFiles\\.|StreamSet\\.|WeightUploadReal\\.|WeightUploadSynthetic\\.|Vae[A-Za-z0-9_]*\\.|Flux2VaeTest\\.|Flux2VaeTiledTest\\.|Flux2VaeTorchGroupNorm\\.|MossDitGolden\\.|MossDitTest\\.|DitStreamTest\\.|Qwen35Text\\.|Qwen35TextStream\\.|PipelineLoop\\.|PipelineKernels\\.|PipelineEndToEnd\\.|Varlen\\.UploadAndValidateOnDevice$)")
 set(_mi_golden_re "${_mi_prefix}(Flux2VaeTest\\.|Flux2VaeTiledTest\\.|MossDitGolden\\.|MossDitTest\\.|Qwen35Text\\.|Qwen35TextStream\\.|PipelineLoop\\.|PipelineEndToEnd\\.|RngTorchCompat\\.|Npy\\.LoadsGolden|Npy\\.ToVectorChecksDtype$|PipelineSchedule\\.GoldenSigmasAndTimestepsBitExact$|TokenizerTest\\.GoldenTokenIds$)")
 set(_mi_bitexact_re "${_mi_prefix}(GpuKernelsBasic[A-Za-z0-9_]*\\.|RngTorchCompat\\.)")
 foreach(_mi_test IN LISTS mossinfer_tests_TESTS)
