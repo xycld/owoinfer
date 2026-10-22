@@ -221,7 +221,7 @@ std::unique_ptr<mi::runtime::DeviceArena> MossDitTest::arena_;
 std::unique_ptr<MossDit> MossDitTest::model_;
 mi::moss_dit::Residency MossDitTest::residency_;
 
-// Sub-model parity against tools/reference/gen_moss_dit_vectors.py (tests/data/moss_dit/).
+// Sub-model parity against vectors from the PyTorch reference (tests/data/moss_dit/).
 Compare compare_bf16(const std::vector<std::uint16_t>& ref, const std::vector<std::uint16_t>& got) {
   std::vector<float> r(ref.size());
   for (std::size_t i = 0; i < ref.size(); ++i) r[i] = from_bf16(ref[i]);
@@ -448,7 +448,7 @@ TEST_F(MossDitTest, CancelBetweenBlocksAndBeforeLoading) {
 struct StepShape {
   const char* name;
   std::int64_t grid, s_cond, s_uncond;
-  double p0_seconds;  // docs/p0-report.md, eager GPU-resident reference
+  double p0_seconds;  // P0 measurement on the dev box, eager GPU-resident reference
 };
 
 // Memory high-water and steady-state timing of one CFG step (cond + uncond with skip {22}).

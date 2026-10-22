@@ -39,8 +39,9 @@ constexpr std::int64_t kBigCols = std::max<std::int64_t>(kQkvDim + kDim, kUpGate
 static_assert(kBigCols == kOpByOpBigCols);
 static_assert(kFusedBigCols == kQkvDim + kDim && kFusedBigCols >= kFfnDim && kFusedBigCols >= kLatentChannels);
 
-std::int64_t big_cols(BlockPath path, std::int64_t hw, std::span<const std::int64_t> text_lengths) {
-  return path == BlockPath::kOpByOp ? kBigCols : fused_big_cols(hw, text_lengths);
+std::int64_t big_cols(BlockPath path, std::int64_t hw, std::span<const std::int64_t> text_lengths,
+                      const FusedRouteSnapshot& route) {
+  return path == BlockPath::kOpByOp ? kBigCols : fused_big_cols(hw, text_lengths, route);
 }
 
 [[noreturn]] void fail(const std::string& msg) { throw std::invalid_argument("mi::moss_dit: " + msg); }
@@ -367,8 +368,10 @@ void MossDit::time_modulation(float timestep, const Tensor& mod, const Tensor& h
 std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
                                      BlockPath path) {
   const std::int64_t total = token_offsets(height, width, text_lengths).back();
+  const FusedRouteSnapshot route = path == BlockPath::kOpByOp ? FusedRouteSnapshot{} : fused_route_snapshot();
   StackPlan plan(nullptr);
-  Activations(plan, total, total, static_cast<std::int64_t>(text_lengths.size()), true, big_cols(path, height * width, text_lengths));
+  Activations(plan, total, total, static_cast<std::int64_t>(text_lengths.size()), true,
+              big_cols(path, height * width, text_lengths, route));
   TimeScratch{plan};
   return plan.total();
 }
@@ -422,9 +425,12 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   const std::int64_t total = off.back();
   if (total > INT32_MAX) fail("too many tokens");
 
+  // One route for the whole forward (its big buffer, graph keys and every block): an install_fused_check meanwhile, e.g.
+  // another pipeline's poisoning, applies from the next forward on instead of failing this one's buffer check.
+  const FusedRouteSnapshot route = path_ == BlockPath::kOpByOp ? FusedRouteSnapshot{} : fused_route_snapshot();
   runtime::StackScope scope(arena_);
   StackPlan plan(&arena_);
-  Activations a(plan, total, total, static_cast<std::int64_t>(rows.size()), true, big_cols(path_, hw, lengths));
+  Activations a(plan, total, total, static_cast<std::int64_t>(rows.size()), true, big_cols(path_, hw, lengths, route));
   // Streamed blocks: device buffers after the activations; the first copies overlap the setup below.
   BlockWeights::Pass weights(*blocks_, stream, cancel_);
 
@@ -501,7 +507,7 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     key.text_lengths = lengths;
     for (const Row& r : rows) key.skips.push_back(r.skip);
     key.addresses = {a.x.data, a.y.data, a.big.data, a.rope.data, a.mod.data, a.cu_seqlens.data, a.lse, gemm_workspace_};
-    key.route_generation = fused_route_generation();
+    key.route_generation = route.generation;
     const std::uint64_t h = key.hash();
     use_graphs = h == last_step_hash_;
     last_step_hash_ = h;
@@ -521,12 +527,12 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     if (path_ == BlockPath::kOpByOp) {
       for (const Run& run : runs) run_block(b, a, run, stream);
     } else if (!use_graphs) {
-      for (const Run& run : runs) run_block_fused(b, fused, run, qkv_gemm, stream);
+      for (const Run& run : runs) run_block_fused(b, fused, run, qkv_gemm, route, stream);
     } else {
       key.block_begin = bi;
       key.block_end = bi + 1;
       graphs_.run(key, stream, [&](cudaStream_t s) {
-        for (const Run& run : runs) run_block_fused(b, fused, run, qkv_gemm, s);
+        for (const Run& run : runs) run_block_fused(b, fused, run, qkv_gemm, route, s);
       });
     }
     weights.release(bi);

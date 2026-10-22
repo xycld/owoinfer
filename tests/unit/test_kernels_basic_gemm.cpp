@@ -1,5 +1,5 @@
 // kernels/basic GEMM (cuBLASLt linear) against torch F.linear at the real DiT shapes, plus throughput.
-// Inputs are hashed full-mantissa bf16 (synth_bf16 mirrors gen_basic_vectors.py), so only sampled torch
+// Inputs are hashed full-mantissa bf16 (synth_bf16 mirrors the vector generator's), so only sampled torch
 // output rows are stored.
 #include <gtest/gtest.h>
 

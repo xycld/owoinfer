@@ -76,7 +76,7 @@ TEST(RngTorchCompat, MatchesAllNoiseGoldens) {
   EXPECT_EQ(on_disk, checked);
 }
 
-// Vectors from tools/reference/gen_rng_vectors.py: large seeds, the numel < 16 scalar path, and
+// Vectors from torch's generator: large seeds, the numel < 16 scalar path, and
 // tails with numel % 16 != 0.
 TEST(RngTorchCompat, MatchesGeneratedVectors) {
   const std::uint64_t seeds[] = {0,           111769238,         2570432421ull, 3072627948ull,

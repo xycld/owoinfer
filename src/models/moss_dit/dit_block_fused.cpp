@@ -140,14 +140,28 @@ void install_fused_check(const FusedCheck& check) {
     return;
   }
   std::vector<FusedConfig>& installed = st.validated[device];
+  const bool poisoned = st.poisoned.contains(device);  // the route stays op by op: kept, but no new generation
   for (const FusedConfig& c : check.validated) {
     const bool known = std::any_of(installed.begin(), installed.end(),
                                    [&](const FusedConfig& v) { return v.op == c.op && v.config == c.config; });
     if (!known) {
       installed.push_back(c);
-      ++st.generation[device];
+      if (!poisoned) ++st.generation[device];
     }
   }
+}
+
+FusedRouteSnapshot fused_route_snapshot() {
+  int device = 0;
+  MI_CUDA_CHECK(cudaGetDevice(&device));
+  RouteState& st = route_state();
+  std::lock_guard<std::mutex> lock(st.mu);
+  FusedRouteSnapshot snap;
+  const auto g = st.generation.find(device);
+  if (g != st.generation.end()) snap.generation = g->second;
+  const auto v = st.validated.find(device);
+  if (v != st.validated.end() && !st.poisoned.contains(device)) snap.validated = v->second;
+  return snap;
 }
 
 std::uint64_t fused_route_generation() {
@@ -160,6 +174,11 @@ std::uint64_t fused_route_generation() {
 }
 
 std::int64_t fused_big_cols(std::int64_t hw, std::span<const std::int64_t> text_lengths) {
+  return fused_big_cols(hw, text_lengths, fused_route_snapshot());
+}
+
+std::int64_t fused_big_cols(std::int64_t hw, std::span<const std::int64_t> text_lengths,
+                            const FusedRouteSnapshot& route) {
   // Every subset of the rows: runs are contiguous rows of a forward's row set, and callers size the workspace for the
   // largest row set (a step without SLG runs a subset of it).
   const std::size_t n = text_lengths.size();
@@ -173,16 +192,17 @@ std::int64_t fused_big_cols(std::int64_t hw, std::span<const std::int64_t> text_
     sums.insert(m);
   }
   for (const std::int64_t m : sums) {
-    if (!fused_route(m).up_gate) return kOpByOpBigCols;
+    if (!fused_route(m, route.validated).up_gate) return kOpByOpBigCols;
   }
   return kFusedBigCols;
 }
 
 void run_block_fused(const BlockTensors& w, const FusedBlockBuffers& a, const BlockRun& run, const QkvGemm& qkv_gemm,
-                     cudaStream_t stream) {
+                     const FusedRouteSnapshot& snapshot, cudaStream_t stream) {
   const std::int64_t l = a.x.dim(0);
-  const FusedRoute route = fused_route(run.t1 - run.t0);
+  const FusedRoute route = fused_route(run.t1 - run.t0, snapshot.validated);
   const std::int64_t big_cols = route.up_gate ? kFusedBigCols : kOpByOpBigCols;
+  // A programming error (big not sized by fused_big_cols with this snapshot), never a route change during a forward.
   if (qkv_gemm.gemm == nullptr || !a.big.is_contiguous() || a.big.numel() < l * big_cols || a.mod.numel() != 6 * kDimB) {
     throw std::invalid_argument("mi::moss_dit::run_block_fused: buffers do not match x " + a.x.describe() + ": big " +
                                 a.big.describe() + " (" + std::to_string(big_cols) + " per token), mod " + a.mod.describe());
@@ -293,6 +313,8 @@ std::size_t check_bytes(int op, std::int64_t rows) {
 // Every CUTLASS tile a fused launch can run: kAuto picks by row count and SM count (128x128 below two waves, else
 // 128x256, or 256x128 for ffn_up_gate's N), and set_gemm_tile_override can force any of them.
 using kernels::fused::GemmTile;
+// Rows past a check's row count whose sentinel must survive each fused run (a launch writing past its rows fails it).
+constexpr std::int64_t kGuardRows = 256;
 constexpr GemmTile kCheckTiles[] = {GemmTile::k128x128, GemmTile::k128x256, GemmTile::k256x128};
 const char* tile_name(GemmTile t) {
   return t == GemmTile::k128x128 ? "128x128" : t == GemmTile::k128x256 ? "128x256" : "256x128";
@@ -325,31 +347,51 @@ FusedCheck check_fused_gemms(cudaStream_t stream, const FusedCheckHook& hook) {
   std::vector<FusedConfig> checked;
   std::string mismatch;
   std::size_t unchecked = 0;
-  // The fused op under every tile, each on inputs reset by `prepare`; returns the first f.rows rows of each result.
-  const auto run_tiles = [&](const FusedConfig& f, const DevMatrix& got, auto&& prepare, auto&& fused) {
+  // The fused op under every tile, each on inputs reset by `prepare`: the first f.rows rows of each result, and how
+  // many of the up to kGuardRows rows after them (as far as `got` has rows) lost the sentinel they held during the run.
+  struct TileRuns {
     std::vector<std::vector<std::uint16_t>> out;
+    std::vector<std::size_t> overwritten;
+    std::size_t guard_values = 0;
+  };
+  const auto run_tiles = [&](const FusedConfig& f, const DevMatrix& got, auto&& prepare, auto&& fused) {
+    const std::int64_t cols = got.t.dim(1), guard_rows = std::min(kGuardRows, got.t.dim(0) - f.rows);
+    std::vector<std::uint16_t> sentinel(static_cast<std::size_t>(guard_rows * cols)), after(sentinel.size());
+    for (std::size_t i = 0; i < sentinel.size(); ++i) sentinel[i] = static_cast<std::uint16_t>(0x7F81u + i % 61);  // NaNs
+    void* guard = static_cast<std::uint16_t*>(got.t.data) + f.rows * cols;
+    const std::size_t guard_bytes = sentinel.size() * sizeof(std::uint16_t);
+    TileRuns runs;
+    runs.guard_values = sentinel.size();
     for (const GemmTile tile : kCheckTiles) {
       prepare();
+      if (guard_bytes > 0) MI_CUDA_CHECK(cudaMemcpyAsync(guard, sentinel.data(), guard_bytes, cudaMemcpyHostToDevice, stream));
       fused(tile);
       MI_CUDA_CHECK(cudaStreamSynchronize(stream));
       if (hook) hook(f.op.c_str(), f.rows, got.t.slice0(0, f.rows));
       MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-      out.push_back(got.download(f.rows));
+      runs.out.push_back(got.download(f.rows));
+      if (guard_bytes > 0) MI_CUDA_CHECK(cudaMemcpy(after.data(), guard, guard_bytes, cudaMemcpyDeviceToHost));
+      std::size_t overwritten = 0;
+      for (std::size_t i = 0; i < sentinel.size(); ++i) overwritten += after[i] != sentinel[i];
+      runs.overwritten.push_back(overwritten);
     }
-    return out;
+    return runs;
   };
-  const auto compare = [&](const FusedConfig& f, const std::vector<std::uint16_t>& want,
-                           const std::vector<std::vector<std::uint16_t>>& got) {
+  const auto compare = [&](const FusedConfig& f, const std::vector<std::uint16_t>& want, const TileRuns& got) {
     bool same = true;
-    for (std::size_t t = 0; t < got.size(); ++t) {
+    for (std::size_t t = 0; t < got.out.size(); ++t) {
       std::size_t diff = 0;
-      for (std::size_t i = 0; i < want.size(); ++i) diff += got[t][i] != want[i];
-      if (diff == 0) continue;
+      for (std::size_t i = 0; i < want.size(); ++i) diff += got.out[t][i] != want[i];
+      if (diff == 0 && got.overwritten[t] == 0) continue;
       same = false;
       if (mismatch.empty()) {
-        mismatch = f.op + " at " + std::to_string(f.rows) + " rows: " + std::to_string(diff) + " of " +
-                   std::to_string(want.size()) + " outputs differ from cuBLASLt + the unfused op (" + f.config.describe() +
-                   ", CUTLASS tile " + tile_name(kCheckTiles[t]) + ")";
+        const std::string where = " (" + f.config.describe() + ", CUTLASS tile " + tile_name(kCheckTiles[t]) + ")";
+        mismatch = f.op + " at " + std::to_string(f.rows) + " rows: " +
+                   (diff != 0 ? std::to_string(diff) + " of " + std::to_string(want.size()) +
+                                    " outputs differ from cuBLASLt + the unfused op"
+                              : "wrote past its rows (" + std::to_string(got.overwritten[t]) + " of " +
+                                    std::to_string(got.guard_values) + " sentinel values after them overwritten)") +
+                   where;
       }
     }
     if (same) checked.push_back(f);

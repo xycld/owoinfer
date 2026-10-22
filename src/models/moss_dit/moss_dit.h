@@ -18,7 +18,7 @@
 //     batched ops are row-local, and torch's norm reduction order only depends on the row count below 16 rows (a row
 //     has >= 16 joint tokens for any image of 64x64 or more). The text refiner and the head, where a row may be
 //     shorter, run per row.
-// Every op follows the reference's order and bf16/fp32 rounding (docs/model-notes.md §6).
+// Every op follows the reference's order and bf16/fp32 rounding.
 //
 // Memory: weights in the arena's persistent region (load), activations on its stack region for the
 // duration of one call (sized by *_workspace_bytes). Stack memory is released when a call returns,
@@ -103,7 +103,7 @@ enum class BlockPath {
   kOpByOp,       // P2 engine: one kernel per reference op, cuBLASLt GEMMs (A/B baseline and fallback)
   kFused,        // run_block_fused, eager (the default)
   kFusedGraphs,  // run_block_fused, each block replayed from a CUDA graph when every block is resident (opt-in:
-                 // ~0 measured gain on an idle host, docs/experiment-log.md E13; holds graph memory)
+                 // ~0 measured gain on an idle host; holds graph memory)
 };
 const char* block_path_name(BlockPath p);
 // "op_by_op", "fused" or "fused_graphs"; throws std::invalid_argument otherwise.
@@ -171,7 +171,8 @@ class MossDit {
 
   // Stack bytes forward() needs for a latent grid of height x width (= image size / 16) and the rows'
   // text lengths, in row order, with block path `path`; also enough for any subset of these rows. The fused paths
-  // ask cuBLASLt on the current device (fused_big_cols).
+  // ask cuBLASLt on the current device under the route installed now (fused_big_cols); forward() snapshots the route
+  // at its start, so a poisoning in between makes it need the op-by-op size.
   static std::size_t workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
                                      BlockPath path = BlockPath::kFused);
   // Token offset of each row in the joint sequence, plus the total as the last element.

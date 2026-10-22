@@ -1,5 +1,5 @@
-// FlashAttention-2 forward (src/kernels/attention) against torch SDPA vectors (tests/data/attention, from
-// tools/reference/gen_attention_vectors.py) and against a plain fp32 reference kernel at the full
+// FlashAttention-2 forward (src/kernels/attention) against torch SDPA vectors (tests/data/attention, generated with
+// the PyTorch reference) and against a plain fp32 reference kernel at the full
 // MOSS-Image shapes, plus varlen/causal isolation, strided views, argument checks and throughput.
 #include <gtest/gtest.h>
 
@@ -504,8 +504,8 @@ double time_ms(const Buffers& buf, const Problem& p, int iters = 20) {
   return ms / iters;
 }
 
-// Records TFLOPS (4·L²·H·d per sequence) for the DiT shapes; compare with
-// `gen_attention_vectors.py --bench` (torch SDPA flash backend) on the same GPU.
+// Records TFLOPS (4·L²·H·d per sequence) for the DiT shapes; compare with torch SDPA (flash backend) on the same
+// GPU.
 TEST(GpuAttentionPerf, DitShapes) {
   const std::vector<std::vector<int>> cases = {{8281 + 300}, {8281 + 4096}, {8281 + 4096, 8281 + 16}};
   for (const auto& seqlens : cases) {

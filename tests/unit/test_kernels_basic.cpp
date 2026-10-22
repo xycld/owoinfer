@@ -1,5 +1,5 @@
 // kernels/basic norms, modulation, RoPE, SiTU and elementwise ops: bit-exact against torch eager
-// vectors from tools/reference/gen_basic_vectors.py (real-magnitude DiT/TE activations and weights).
+// vectors from the PyTorch reference (real-magnitude DiT/TE activations and weights).
 #include <gtest/gtest.h>
 
 #include <algorithm>

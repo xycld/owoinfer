@@ -30,7 +30,7 @@ constexpr std::size_t kCacheFloor = std::size_t{64} << 20;
 constexpr double kDecodeSecondsPerMegapixel = 0.6;
 constexpr double kDecodeReferenceTflops = 40.0;
 // Fraction of a streamed DiT step's copy time hidden behind compute when the copy is shorter (AC10 asks >= 80%;
-// measured 98-100% with 3 buffers, docs/experiment-log.md E13); the rest (synchronization, memory-bandwidth
+// measured 98-100% with 3 buffers); the rest (synchronization, memory-bandwidth
 // contention) adds to the step, so resident blocks always pay off. Two buffers (one block of lookahead) absorb less
 // jitter between the copy and compute of neighbouring blocks.
 constexpr double kStreamOverlap = 0.9;

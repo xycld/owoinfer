@@ -1,4 +1,4 @@
-// GPU ops for the FLUX.2 VAE decoder (AutoencoderKLFlux2, third_party/reference/configs/vae_config.json).
+// GPU ops for the FLUX.2 VAE decoder (diffusers AutoencoderKLFlux2 with the MOSS-Image bundle's VAE config).
 //
 // Activations are NHWC inside the decoder; the only NCHW tensors are the DiT latents going in (consumed by
 // bn_denorm_unpack, which writes NHWC directly) and an optional NCHW export of the decoded image.

@@ -1,14 +1,14 @@
 // MOSS-Image sampling: the sigma schedule (MOSSImageScheduler.set_timesteps, P:269-287 + diffusers
 // FlowMatchEulerDiscreteScheduler.set_timesteps), classifier-free guidance with block skipping (P:405-425) and
-// the flow-matching integrators (scheduler.step's Euler, plus the 2nd-order Adams-Bashforth option of
-// tools/reference/sampler_study.py).
+// the flow-matching integrators (scheduler.step's Euler, plus a 2nd-order Adams-Bashforth option studied against
+// the reference sampler).
 //
 // Every fp32 operation follows the reference's rounding order, one rounding per torch op:
 //   CFG     pred = uncond + g * (cond - uncond)                     (P:418)
 //   SLG     pred = pred + s * (cond - skipped), pred = skipped if g == 1  (P:419-424)
 //   Euler   x = x + h * v,  h = sigma[i+1] - sigma[i] in fp32         (scheduler.step)
 //   AB2     x = x + h * ((1 + r) * v - r * v_prev),  r = h / (2 h_prev) in double, scalars cast to fp32
-// Latents and predictions stay fp32 throughout (docs/model-notes.md §4, §6).
+// Latents and predictions stay fp32 throughout, as in the reference.
 #pragma once
 
 #include <cuda_runtime.h>

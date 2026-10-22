@@ -1,5 +1,5 @@
 // Qwen3.5 text encoder as MOSS-Image uses it: Qwen3_5Model(input_ids).last_hidden_state for text-only
-// input, no cache (docs/model-notes.md §7). 32 decoder layers (GatedDeltaNet, full gated attention every
+// input, no cache. 32 decoder layers (GatedDeltaNet, full gated attention every
 // 4th), each RMSNorm -> token mixer -> residual -> RMSNorm -> SiLU MLP -> residual, then the final norm.
 //
 // Execution: the embedding table stays host-resident (memory-mapped; only the gathered rows are uploaded).

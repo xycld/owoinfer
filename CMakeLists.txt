@@ -1,9 +1,11 @@
 cmake_minimum_required(VERSION 3.28)
 project(MossInfer LANGUAGES C CXX)
-# Default GPU targets unless -DCMAKE_CUDA_ARCHITECTURES, CUDAARCHS or the toolchain file chose them. Decided after the
-# C/C++ project() (which reads the toolchain file) and before enabling CUDA, which sets CMAKE_CUDA_ARCHITECTURES to the
-# compiler's default (sm_75 for CUDA 13); applied after that, once the CUDA version is known (the compiler check must
-# not build for sm_120 with CUDA < 12.8). FORCE then only replaces that default. Cached, so a re-configure keeps it.
+# Default GPU targets, in three steps: (1) here, after project(C CXX) has read any toolchain file, note whether
+# -DCMAKE_CUDA_ARCHITECTURES, CUDAARCHS or the toolchain chose targets; (2) enable_language(CUDA) then runs its
+# compiler check with CMake's default, the compiler's own (sm_75 for CUDA 13), so it never builds sm_120 with a CUDA
+# < 12.8 that cannot; (3) only if nothing chose targets, the list below replaces that default (FORCE, cached so a
+# re-configure keeps it). Below find_package(CUDAToolkit), sm_120 is dropped from the targets when the compiler is
+# < 12.8, whoever chose them.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
   set(_mi_default_cuda_archs ON)
 endif()
@@ -124,7 +126,7 @@ endif()
 
 if(MOSSINFER_TESTS)
   enable_testing()
-  find_package(GTest REQUIRED)
+  find_package(GTest 1.12 REQUIRED)  # GTEST_FLAG_GET / GTEST_FLAG_SET
   file(GLOB MOSSINFER_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/unit/*.cpp ${CMAKE_SOURCE_DIR}/tests/unit/*.cu)
   mossinfer_filter(MOSSINFER_TEST_SOURCES "${MOSSINFER_TEST_SOURCES}" ${CMAKE_SOURCE_DIR}/tests/unit "${MOSSINFER_TESTS_ONLY}")
   add_executable(mossinfer_tests ${MOSSINFER_TEST_SOURCES})

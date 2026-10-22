@@ -1,4 +1,4 @@
-// src/pipeline: sigma schedule (bit-exact vs tests/golden and tools/reference/gen_pipeline_vectors.py), the fp32
+// src/pipeline: sigma schedule (bit-exact vs tests/golden and vectors from the PyTorch reference), the fp32
 // guidance/integrator kernels (bit-exact vs a host emulation of the torch ops), request parsing and validation,
 // the PNG writer, and with real weights: the DiT + sampler loop against short torch runs on golden text-encoder
 // states, and the whole pipeline (own tokenizer + text encoder) against the same runs.
@@ -227,7 +227,11 @@ TEST(PipelineKernels, GuidanceAndIntegratorsMatchTorchOpOrder) {
 // ---------------------------------------------------------------- requests
 
 TEST(PipelineRequest, ParsesAssetParameters) {
+  // The official app's example parameters: a local checkout of the reference, not part of the repository.
   const fs::path assets = fs::path(MOSSINFER_SOURCE_DIR) / "third_party/reference/moss-image-official/assets/images";
+  if (!fs::is_regular_file(assets / "007" / "parameters.json") || !fs::is_regular_file(assets / "018" / "parameters.json")) {
+    GTEST_SKIP() << "official app example parameters absent (" << assets << ")";
+  }
   const mi::pipeline::Request r7 = mi::pipeline::request_from_parameters(read_json(assets / "007" / "parameters.json"));
   EXPECT_EQ(r7.height, 1776);
   EXPECT_EQ(r7.width, 1184);
@@ -245,7 +249,9 @@ TEST(PipelineRequest, ParsesAssetParameters) {
   const mi::pipeline::Request r18 = mi::pipeline::request_from_parameters(read_json(assets / "018" / "parameters.json"));
   EXPECT_TRUE(r18.uncond_skip_layers.empty());
   EXPECT_EQ(r18.shift, 6.0);
+}
 
+TEST(PipelineRequest, ParsesParameterVariants) {
   // Bare object, array layers, null seed; schema version 1 renames.
   const auto bare = mi::pipeline::request_from_parameters(
       mi::json::parse(R"({"prompt": "x", "uncond_skip_layers": [24, 26], "slg_layers": " 3 , 4", "seed": null})"));
@@ -1019,20 +1025,33 @@ TEST(PipelineEndToEnd, TiledAndUntiledDecodeGiveTheSameImage) {
   req.steps = 2;
   mi::pipeline::PipelineOptions options;
   options.embedding_cache = false;
+  const mi::planner::Budgets defaults;
+  // The default budget is the free device memory, and a larger vram_budget cannot add memory, only cap it. So the
+  // untiled run may tile only on a GPU without room for the resident DiT plus the untiled decode (1 GiB of slack for
+  // the planner's other terms); with room, tiling would be a planner regression.
+  const std::size_t untiled_need =
+      mi::moss_dit::MossDit::persistent_bytes(index) + mi::flux2_vae::Flux2VaeDecoder::persistent_bytes(index) +
+      mi::flux2_vae::Flux2VaeDecoder::workspace_bytes(1024, 1024) + defaults.context_bytes + options.vram_reserve +
+      (std::size_t{1} << 30);
+  const bool room_for_untiled = mi::runtime::DeviceArena::free_device_bytes() >= untiled_need;
   mi::pipeline::Result untiled;
   {
     mi::pipeline::Pipeline pipe(options);
     untiled = pipe.generate(req);
   }
+  if (untiled.decode_tiled) {
+    ASSERT_FALSE(room_for_untiled) << "free memory fits the untiled decode, but the plan tiled it: "
+                                   << untiled.plan.explanation;
+    GTEST_SKIP() << "the untiled 1024^2 decode does not fit in this GPU's free memory (the plan tiled it): "
+                 << untiled.plan.explanation;
+  }
   const std::size_t cap = mi::moss_dit::MossDit::persistent_bytes(index) + mi::flux2_vae::Flux2VaeDecoder::persistent_bytes(index) +
                           (std::size_t{1280} << 20);
-  const mi::planner::Budgets defaults;
   options.vram_budget = cap + defaults.context_bytes + options.vram_reserve;
   mi::pipeline::Pipeline pipe(options);
   const mi::pipeline::Result tiled = pipe.generate(req);
   std::printf("[pipeline decode] untiled %.2f s (%s); tiled %.2f s (%s)\n", untiled.timings.decode_s,
               untiled.decode_schedule.c_str(), tiled.timings.decode_s, tiled.decode_schedule.c_str());
-  ASSERT_FALSE(untiled.decode_tiled) << untiled.plan.explanation;
   ASSERT_TRUE(tiled.decode_tiled) << tiled.plan.explanation;
   EXPECT_EQ(bit_mismatches(tiled.latents, untiled.latents), 0u);
   ASSERT_EQ(untiled.rgb.size(), static_cast<std::size_t>(1024 * 1024 * 3));

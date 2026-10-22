@@ -1,5 +1,5 @@
 // GatedDeltaNet kernels vs the transformers pure-torch fallback on real Qwen3.5 layer-0 activations
-// (tools/reference/gen_gdn_vectors.py -> tests/data/gdn/), plus the token-by-token oracle kernel.
+// (generated with the PyTorch reference into tests/data/gdn/), plus the token-by-token oracle kernel.
 #include <gtest/gtest.h>
 
 #include <cuda_runtime.h>

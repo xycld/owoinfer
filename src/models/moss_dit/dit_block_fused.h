@@ -62,24 +62,39 @@ struct FusedRoute {
   bool down = true;     // ffn_down + gated residual
 };
 FusedRoute fused_route(std::int64_t rows);
-// The same with `validated` in place of the installed configurations and regardless of poisoning (tests).
+// The same with `validated` in place of the installed configurations and regardless of poisoning (route snapshots,
+// tests).
 FusedRoute fused_route(std::int64_t rows, std::span<const FusedConfig> validated);
 
-// Big-buffer elements per token of a fused forward over rows of `hw + text_lengths[r]` tokens: kOpByOpBigCols when
-// some set of these rows (a run of the rows that execute a block) gets ffn_up_gate op by op, else kFusedBigCols.
-// It follows the installed route: after a poisoning it is kOpByOpBigCols, and a forward planned before with
-// kFusedBigCols fails run_block_fused's buffer check (std::invalid_argument) instead of overrunning the buffer.
+// The current device's installed route at one moment, read under one lock: the configurations fused_route() runs
+// fused (empty without an installed check or once the device is poisoned) and fused_route_generation().
+// MossDit::forward takes one at its start and sizes `big`, keys its graphs and routes every block from it, so an
+// install_fused_check during a forward (another pipeline's poisoning or new configurations) applies from the next
+// forward on.
+struct FusedRouteSnapshot {
+  std::vector<FusedConfig> validated;
+  std::uint64_t generation = 0;
+};
+FusedRouteSnapshot fused_route_snapshot();
+
+// Big-buffer elements per token of a fused forward over rows of `hw + text_lengths[r]` tokens routed by `route`:
+// kOpByOpBigCols when some set of these rows (a run of the rows that execute a block) gets ffn_up_gate op by op, else
+// kFusedBigCols. Without `route`, from a fresh snapshot: after a poisoning it is kOpByOpBigCols.
 std::int64_t fused_big_cols(std::int64_t hw, std::span<const std::int64_t> text_lengths);
+std::int64_t fused_big_cols(std::int64_t hw, std::span<const std::int64_t> text_lengths,
+                            const FusedRouteSnapshot& route);
 
 // Startup self-check (once per GPU, library version and kernels::fused::kFusedKernelsVersion, see
 // pipeline/hardware_profile.h). Asks cuBLASLt (no launches) for each op's configuration at every realistic run length
 // (1..61506 rows: every count up to 1536, then sampled), collects the distinct ones matches_cublaslt accepts, and runs
 // each on synthetic inputs at the smallest row count that gets it, op by op once and fused under every CUTLASS tile
 // (kernels::fused::GemmTile: the tile a launch picks depends on its row count, so production row counts run tiles the
-// smallest one does not). A configuration whose operands would exceed ~0.25 GiB stays unvalidated: op by op. ok iff at
-// least one configuration was checked and every checked one is bit-identical under every tile; then `validated` lists
-// them. detail says what was checked, what differed, or that nothing would run fused. Throws CudaError when it cannot
-// allocate its operands. `hook` (tests) may alter each fused result (its f.rows rows) before it is compared.
+// smallest one does not), each also required to leave the up to 256 rows after its own untouched (those the output
+// buffer, sized for the op's largest checked row count, has). A configuration whose operands would exceed ~0.25 GiB
+// stays unvalidated: op by op. ok iff at least one configuration was checked and every checked one is bit-identical
+// under every tile; then `validated` lists them. detail says what was checked, what differed, or that nothing would
+// run fused. Throws CudaError when it cannot allocate its operands. `hook` (tests) may alter each fused result (its
+// f.rows rows) before it is compared.
 struct FusedCheck {
   bool ok = false;
   std::string detail;
@@ -91,7 +106,8 @@ FusedCheck check_fused_gemms(cudaStream_t stream, const FusedCheckHook& hook = {
 // Lets fused_route() run the configurations of a passed check (check.ok) fused on the current device, added to any
 // installed before (a set only grows: workspaces sized for an earlier route stay large enough). A failed check poisons
 // the device instead: fused_route() runs every pair op by op there from then on, whatever any pipeline installed
-// before or after, since the fused kernels just disagreed with cuBLASLt on it.
+// before or after, since the fused kernels just disagreed with cuBLASLt on it (a forward already running keeps its
+// FusedRouteSnapshot: the poisoning applies from the next forward on).
 void install_fused_check(const FusedCheck& check);
 // Changes whenever install_fused_check changes the current device's route (new configurations, a poisoning). CUDA
 // graphs of fused blocks key on it, so a graph captured under an older route is never replayed.
@@ -101,7 +117,7 @@ std::uint64_t fused_route_generation();
 struct FusedBlockBuffers {
   Tensor x;     // bf16 [L, kDim] residual stream, updated in place
   Tensor y;     // bf16 [L, kDim] scratch
-  Tensor big;   // bf16 [L, fused_big_cols(...)] contiguous
+  Tensor big;   // bf16 [L, fused_big_cols(..., route)] contiguous, with the route run_block_fused gets
   Tensor rope;  // bf16 [L, 128] RoPE rows of every token
   Tensor mod;   // bf16 [6 * kDim]: shift_a, scale_a, gate_a, shift_f, scale_f, gate_f (P:139)
   void* lse = nullptr;  // flash_fwd workspace for L tokens
@@ -123,9 +139,11 @@ struct QkvGemm {
   std::size_t workspace_bytes = 0;
 };
 
-// The block on run `run` of `a` with weights `w` (BlockTensors as loaded: up_gate is the stored [hidden | gate]).
-// Operands must be 256-byte aligned (arena allocations, kArenaAlign weights): fused_route() assumes so.
+// The block on run `run` of `a` with weights `w` (BlockTensors as loaded: up_gate is the stored [hidden | gate]),
+// each pair fused as `route` says (fused_route(rows, route.validated)). Operands must be 256-byte aligned (arena
+// allocations, kArenaAlign weights): fused_route() assumes so. A `big` smaller than fused_big_cols(..., route) per
+// token is a programming error: std::invalid_argument before any launch.
 void run_block_fused(const BlockTensors& w, const FusedBlockBuffers& a, const BlockRun& run, const QkvGemm& qkv_gemm,
-                     cudaStream_t stream);
+                     const FusedRouteSnapshot& route, cudaStream_t stream);
 
 }  // namespace mi::moss_dit

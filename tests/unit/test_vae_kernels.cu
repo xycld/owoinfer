@@ -1,4 +1,4 @@
-// kernels/vae against torch (tools/reference/gen_vae_kernels_vectors.py): convs with the real decoder weights
+// kernels/vae against torch (vectors from the PyTorch reference): convs with the real decoder weights
 // at realistic shapes (sampled outputs vs cuDNN TF32 and strict fp32, plus a full-tensor fp32 direct-conv
 // oracle), GroupNorm (+ two-pass/tiled equality), fp32 attention, the mid-block attention block, and the
 // exact ops (upsample, BN unpack, RGB8 postprocess, layout, residual add) bit for bit. Ends with a micro
@@ -50,7 +50,7 @@ std::vector<T> load(const std::string& name) {
   return mi::npy::load(kData / (name + ".npy")).to_vector<T>();
 }
 
-// Mirrors gen_vae_kernels_vectors.py hash_u32 / synth_normal bit for bit (the arithmetic has no a*b+c pattern
+// Mirrors the vector generator's hash_u32 / synth_normal bit for bit (the arithmetic has no a*b+c pattern
 // for the compiler to contract).
 std::uint32_t hash_u32(std::uint32_t seed, std::uint32_t i) {
   std::uint32_t x = i * 0x9E3779B1u + seed * 0x85EBCA77u;

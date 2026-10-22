@@ -74,7 +74,7 @@ const char* source_name(DitSource s);
 // Machine throughput the cost model uses. Defaults are conservative for a desktop PC; the pipeline replaces the
 // transfer rates with measured ones (pipeline.h: a probe at first use, cached on disk with the embedding cache, then
 // updated from every streamed DiT pass). Dev box: 23.9-24.0 GB/s pinned H2D, 19.5 GB/s page cache -> device with 4
-// readers, 2.3-3.1 GB/s cold reads (btrfs zstd), 40-72 TFLOPS bf16 (docs/experiment-log.md E9, E10).
+// readers, 2.3-3.1 GB/s cold reads (btrfs zstd), 40-72 TFLOPS bf16.
 struct HardwareProfile {
   double h2d_gbps = 12.0;     // pinned host -> device
   double disk_gbps = 2.0;     // weight files -> host with a cold page cache

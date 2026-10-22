@@ -15,8 +15,8 @@ Python's `unicodedata`, because the Rust crate bundles three different Unicode s
 confirmed or corrected by probing `tokenizers`. Differences from `unicodedata` are printed so a
 library upgrade that moves a table is visible in the diff of this script's output.
 
-Dev-only. Run with the reference venv (CPU only):
-  CUDA_VISIBLE_DEVICES= tools/reference/.venv/bin/python tools/gen/gen_unicode_tables.py
+Dev-only. Run with a Python 3 env with `tokenizers` installed (CPU only):
+  CUDA_VISIBLE_DEVICES= python3 tools/gen/gen_unicode_tables.py
 """
 
 import sys

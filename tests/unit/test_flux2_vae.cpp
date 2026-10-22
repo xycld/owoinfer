@@ -1,6 +1,6 @@
 // FLUX.2 VAE decoder against the reference pipeline's images: every golden final latent
 // (tests/golden/<case>/final_latent.npy -> image.png), the 2048^2 bench latent and a non-square asset.
-// Also: the torch-identical GroupNorm against torch (tests/data/flux2_vae, tools/reference/gen_flux2_vae_vectors.py),
+// Also: the torch-identical GroupNorm against torch (tests/data/flux2_vae, from the PyTorch reference),
 // host vs device output, the workspace query vs the arena's high-water mark, and decode timing per mode.
 // Exact tiled decode: byte-identical to the untiled decode in the same mode for every latent size, band height and
 // budget tried (tiny bands near the halo limit, bands not dividing the image), with its memory high-water and time.
@@ -139,7 +139,7 @@ const char* mode_name(const DecodeMode& m) {
   return m.torch_group_norm ? "torch reference (tf32x3 attn, torch GN)" : "reference (tf32 convs, tf32x3 attn)";
 }
 
-// tools/reference/gen_flux2_vae_vectors.py synth(): float32 ops only, reproduced exactly.
+// The vector generator's synth(): float32 ops only, reproduced exactly.
 std::vector<float> synth(std::uint64_t seed, std::size_t n, float offset) {
   std::vector<float> v(n);
   for (std::size_t i = 0; i < n; ++i) {
@@ -348,7 +348,7 @@ TEST_F(Flux2VaeTest, DecodeTiming) {
   struct Case {
     const char* name;
     fs::path latent;
-    double ref_min_s, ref_max_s;  // P0 torch decode (docs/p0-report.md), incl. DiT parking at 1456/2048
+    double ref_min_s, ref_max_s;  // P0 torch decode, measured on the dev box, incl. DiT parking at 1456/2048
   };
   // Asserted bound: the slow end of torch's range (at 1024^2 the reference mode runs at torch's speed: same exact
   // TF32 conv numerics).

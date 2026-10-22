@@ -6,7 +6,7 @@
 // second arena, each captured input is pushed through (a) a test-local copy of MossDit::run_block and (b)
 // run_block_fused, and both must reproduce the engine's next residual stream bit for bit, also through 41 chained blocks.
 // Speed: per-op, per-block and 42-block-step timings of op-by-op vs fused vs fused + CUDA graphs, interleaved A/B in
-// one process (the laptop GPU's clock drifts with CPU load, docs/experiment-log.md E10), at 1024^2 (real activations)
+// one process (the laptop GPU's clock drifts with CPU load), at 1024^2 (real activations)
 // and 1456^2 + 4096 tokens (synthetic activations).
 #include <gtest/gtest.h>
 
@@ -47,6 +47,7 @@
 #include "runtime/device_arena.h"
 #include "runtime/pinned_ring.h"
 #include "runtime/stream_set.h"
+#include "test_util.h"
 #include "util/json.h"
 #include "util/npy.h"
 #include "weights/model_index.h"
@@ -554,7 +555,8 @@ class DitBlockFused : public ::testing::Test {
     for (int b = first; b <= last; ++b) {
       for (const md::BlockRun& run : runs.per_block[static_cast<std::size_t>(b)]) {
         if (fused) {
-          md::run_block_fused(views_[static_cast<std::size_t>(b)], a.fused(), run, qkv_gemm(), stream());
+          md::run_block_fused(views_[static_cast<std::size_t>(b)], a.fused(), run, qkv_gemm(), md::fused_route_snapshot(),
+                              stream());
         } else {
           OpByOp{*gemm_, gemm_ws_}.run(views_[static_cast<std::size_t>(b)], a, run, stream());
         }
@@ -902,6 +904,12 @@ TEST(DitGraph, CapturesReplaysAndEvicts) {
   MI_CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
+// The self-check's wall time where timings are asserted: ~3x its typical 0.56 s on an idle 4090 Laptop GPU.
+constexpr double kSelfCheckMaxSeconds = 1.7;
+// Device memory the self-check may take beyond its operands and workspace (lazily loaded kernel modules, handles):
+// measured ~17 MiB on the 4090 Laptop GPU.
+constexpr std::size_t kSelfCheckSlackBytes = std::size_t{128} << 20;
+
 // The GPU and library the routing facts asserted below were measured on: sm_89 with cuBLASLt 13.
 bool measured_platform() {
   int device = 0;
@@ -932,12 +940,19 @@ TEST(FusedSelfCheck, PassesAndReportsAnInjectedMismatch) {
   cudaStream_t stream = nullptr;
   MI_CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+  // Measured device memory: the lowest free memory seen inside the hook (after each fused run, every operand of the
+  // op allocated) against the free memory before the check.
+  const std::size_t free_before = mi::runtime::DeviceArena::free_device_bytes();
+  std::size_t free_low = free_before;
   const auto t0 = std::chrono::steady_clock::now();
-  const md::FusedCheck ok = md::check_fused_gemms(stream);
+  const md::FusedCheck ok = md::check_fused_gemms(stream, [&](const char*, std::int64_t, const Tensor&) {
+    free_low = std::min(free_low, mi::runtime::DeviceArena::free_device_bytes());
+  });
   const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  // Device memory the check allocates: per op, its operands at the largest row count it checked, plus the GEMM
-  // workspace (ffn_up_gate: x, w, the [rows, 2F] op-by-op output, ref and got; the others: x, w, gate, the op-by-op
-  // output, ref and got).
+  const std::size_t measured_bytes = free_before - free_low;
+  // Device memory the check allocates by its formula: per op, its operands at the largest row count it checked, plus
+  // the GEMM workspace (ffn_up_gate: x, w, the [rows, 2F] op-by-op output, ref and got; the others: x, w, gate, the
+  // op-by-op output, ref and got).
   std::size_t operand_bytes = 0;
   for (const auto& [op, k, n] : {std::tuple{"o_proj", kDim, kDim}, std::tuple{"ffn_up_gate", kDim, kUpGate},
                                   std::tuple{"ffn_down", std::int64_t{md::kFfnDim}, kDim}}) {
@@ -948,16 +963,22 @@ TEST(FusedSelfCheck, PassesAndReportsAnInjectedMismatch) {
     operand_bytes = std::max(operand_bytes, static_cast<std::size_t>(elems) * 2);
   }
   const std::size_t check_bytes = operand_bytes + mi::kernels::Gemm::kWorkspaceBytes;
-  std::printf("[fused self-check] %s: %s (%.2f s, %.0f MiB device memory)\n", ok.ok ? "ok" : "FAILED", ok.detail.c_str(), s,
-              static_cast<double>(check_bytes) / (1 << 20));
+  std::printf("[fused self-check] %s: %s (%.2f s, %.0f MiB device memory by the formula, %.0f MiB measured)\n",
+              ok.ok ? "ok" : "FAILED", ok.detail.c_str(), s, static_cast<double>(check_bytes) / (1 << 20),
+              static_cast<double>(measured_bytes) / (1 << 20));
   for (const md::FusedConfig& f : ok.validated) {
     std::printf("[fused self-check]   %-11s @ %5lld rows: %s\n", f.op.c_str(), static_cast<long long>(f.rows),
                 f.config.describe().c_str());
   }
   ASSERT_TRUE(ok.ok) << ok.detail;
   ASSERT_FALSE(ok.validated.empty());  // a pass checked something
-  EXPECT_LE(s, 30.0);                  // a hang guard: ~1 s on an idle 4090 Laptop GPU, slower under load or ASan
+  EXPECT_LE(s, 30.0);  // a hang guard, also where timings are not asserted (slower under load, ASan, debug)
+  if (mi::testing::kAssertTimings) {
+    EXPECT_LE(s, kSelfCheckMaxSeconds);
+  }
   EXPECT_LE(check_bytes, std::size_t{1} << 28);
+  // Loose: CUDA loads the fused kernels' modules lazily on their first launch, and other processes share the device.
+  EXPECT_LE(measured_bytes, check_bytes + kSelfCheckSlackBytes);
   // Each validated configuration routes fused at its row count with the validated set, and op by op without it (a
   // configuration the check did not validate never runs fused).
   for (std::size_t i = 0; i < ok.validated.size(); ++i) {
@@ -1017,12 +1038,36 @@ TEST(FusedSelfCheck, PassesAndReportsAnInjectedMismatch) {
   EXPECT_TRUE(bad.validated.empty());
   EXPECT_NE(bad.detail.find(where + ": 1 of"), std::string::npos) << bad.detail;
   EXPECT_NE(bad.detail.find("CUTLASS tile 128x256"), std::string::npos) << bad.detail;  // the second tile run
+  // A write one row past a fused result fails the check too: at a configuration below its op's largest checked row
+  // count (its output buffer has rows after its own), on its first tile run (hook call 3i + 1: three tiles per
+  // configuration, in validated order).
+  std::map<std::string, std::int64_t> max_rows;
+  for (const md::FusedConfig& f : ok.validated) max_rows[f.op] = std::max(max_rows[f.op], f.rows);
+  std::size_t guarded = 0;
+  while (guarded < ok.validated.size() && ok.validated[guarded].rows == max_rows[ok.validated[guarded].op]) ++guarded;
+  if (guarded < ok.validated.size()) {
+    const md::FusedConfig& g = ok.validated[guarded];
+    calls = 0;
+    const md::FusedCheck past = md::check_fused_gemms(stream, [&](const char*, std::int64_t, const Tensor& out) {
+      if (++calls != static_cast<int>(3 * guarded + 1)) return;
+      const std::uint16_t one = 0x3F80;  // row out.dim(0), column 0
+      MI_CUDA_CHECK(cudaMemcpy(static_cast<std::uint16_t*>(out.data) + out.numel(), &one, 2, cudaMemcpyHostToDevice));
+    });
+    std::printf("[fused self-check] write past %s at %lld rows: %s\n", g.op.c_str(), static_cast<long long>(g.rows),
+                past.detail.c_str());
+    EXPECT_FALSE(past.ok);
+    EXPECT_NE(past.detail.find(g.op + " at " + std::to_string(g.rows) + " rows: wrote past its rows (1 of"), std::string::npos)
+        << past.detail;
+  } else {
+    std::printf("[fused self-check] every op checked one configuration: no guard rows to write into\n");
+    EXPECT_FALSE(measured_platform()) << "sm_89 checks several configurations of some op";
+  }
   MI_CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
 // A failed self-check poisons the device: configurations another check installed (before or after) never run fused
-// again, workspaces are sized for the op-by-op ffn_up_gate, a fused block over a buffer sized for the old route refuses
-// to run, and the graph key changes. In a child process: the poisoning is process-wide and permanent.
+// again, workspaces are sized for the op-by-op ffn_up_gate, a fused block routed by a snapshot taken after it refuses a
+// buffer sized for the old route (a programming error), and the graph key changes. In a child process: the poisoning is process-wide and permanent.
 int poisoned_route_failures() {
   int failures = 0;
   const auto expect = [&](bool cond, const std::string& what) {
@@ -1051,8 +1096,12 @@ int poisoned_route_failures() {
   const std::uint64_t gen_poisoned = md::fused_route_generation();
   expect(gen_poisoned != gen_ok, "poisoning changes the generation");
   md::install_fused_check(ok);  // another pipeline's passed check afterwards
+  md::FusedCheck unseen = ok;   // one with a configuration not installed yet: kept, but the route stays op by op
+  unseen.validated.resize(1);
+  unseen.validated[0].config.stages += 1000;
+  md::install_fused_check(unseen);
   md::install_fused_check(md::FusedCheck{false, "again", {}});
-  expect(md::fused_route_generation() == gen_poisoned, "nothing else changes the generation");
+  expect(md::fused_route_generation() == gen_poisoned, "nothing else changes the generation, not even new configurations");
   for (const md::FusedConfig& f : ok.validated) {
     const md::FusedRoute r = md::fused_route(f.rows);
     expect(!(r.o || r.up_gate || r.down), f.op + " @ " + std::to_string(f.rows) + " runs op by op");
@@ -1063,7 +1112,8 @@ int poisoned_route_failures() {
   expect(md::MossDit::workspace_bytes(64, 64, lengths, md::BlockPath::kFused) ==
              md::MossDit::workspace_bytes(64, 64, lengths, md::BlockPath::kOpByOp),
          "fused workspace = op-by-op workspace after poisoning");
-  // A block over a big buffer sized for the fused route (kFusedBigCols per token) is refused before any launch.
+  // A block routed by the poisoned snapshot over a big buffer sized for the fused route (kFusedBigCols per token) is
+  // refused before any launch.
   constexpr int kRows = 16;
   mi::DeviceBuffer x(kRows * kDim * 2), y(kRows * kDim * 2), big(kRows * md::kFusedBigCols * 2), mod(6 * kDim * 2);
   const md::FusedBlockBuffers a{Tensor::view(x.get(), DType::kBF16, mi::Device::kCUDA, {kRows, kDim}),
@@ -1075,7 +1125,8 @@ int poisoned_route_failures() {
   const md::QkvGemm qkv{&gemm, nullptr, 0};
   std::string error;
   try {
-    md::run_block_fused(md::BlockTensors{}, a, md::BlockRun{0, kRows, Tensor{}, kRows}, qkv, stream);
+    md::run_block_fused(md::BlockTensors{}, a, md::BlockRun{0, kRows, Tensor{}, kRows}, qkv, md::fused_route_snapshot(),
+                        stream);
   } catch (const std::invalid_argument& e) {
     error = e.what();
   }
@@ -1086,9 +1137,143 @@ int poisoned_route_failures() {
   return failures;
 }
 
+// "threadsafe" death tests for the scope of one test: the child re-executes the binary, so it gets a fresh CUDA
+// context and route state.
+class ThreadsafeDeathTests {
+ public:
+  ThreadsafeDeathTests() { GTEST_FLAG_SET(death_test_style, "threadsafe"); }
+  ~ThreadsafeDeathTests() { GTEST_FLAG_SET(death_test_style, saved_); }
+  ThreadsafeDeathTests(const ThreadsafeDeathTests&) = delete;
+  ThreadsafeDeathTests& operator=(const ThreadsafeDeathTests&) = delete;
+
+ private:
+  std::string saved_ = GTEST_FLAG_GET(death_test_style);
+};
+
 TEST(FusedSelfCheck, FailedCheckPoisonsTheDevice) {
-  GTEST_FLAG_SET(death_test_style, "threadsafe");  // re-executes the binary: a fresh CUDA context and route state
+  const ThreadsafeDeathTests style;
   EXPECT_EXIT(std::exit(poisoned_route_failures()), ::testing::ExitedWithCode(0), "poisoned route: ok");
+}
+
+// A poisoning during a fused forward (another pipeline's failed check after the forward sized its big buffer for the
+// fused route, here after block 0) applies from the next forward on: the running forward keeps its route snapshot and
+// completes (it used to throw from its next block, whose route wanted the op-by-op buffer), the next one sizes the
+// op-by-op big buffer and runs every pair op by op, and both give op-by-op's velocities bit for bit. 512^2 CFG with a
+// 20-token prompt: runs of 1044 and 2078 rows, whose ffn_up_gate runs fused on sm_89. In a child process, as above.
+int in_flight_poisoning_failures() {
+  int failures = 0;
+  const auto expect = [&](bool cond, const std::string& what) {
+    if (!cond) {
+      ++failures;
+      std::fprintf(stderr, "in-flight poisoning: FAILED %s\n", what.c_str());
+    }
+  };
+  const mi::weights::ModelIndex index = mi::weights::load_index(bundle_dir() / "moss.mossidx", bundle_dir());
+  mi::runtime::StreamSet streams;
+  const cudaStream_t stream = streams.compute();
+  install_self_check(stream);
+  constexpr std::int64_t kGrid = 32, kCond = 20, kUncond = 10;
+  const std::int64_t lengths[] = {kCond, kUncond};
+  const std::size_t work_fused = md::MossDit::workspace_bytes(kGrid, kGrid, lengths, md::BlockPath::kFused);
+  const std::size_t work_op = md::MossDit::workspace_bytes(kGrid, kGrid, lengths, md::BlockPath::kOpByOp);
+  const bool fused_buffer = md::fused_big_cols(kGrid * kGrid, lengths) == md::kFusedBigCols;
+  std::fprintf(stderr, "in-flight poisoning: workspace %.1f MiB fused, %.1f MiB op by op\n",
+               static_cast<double>(work_fused) / (1 << 20), static_cast<double>(work_op) / (1 << 20));
+  if (measured_platform()) expect(fused_buffer && work_fused < work_op, "sm_89 sizes the fused big buffer");
+  const std::size_t io = mi::runtime::align_up(static_cast<std::size_t>(kCond * kDim * 2)) +
+                         mi::runtime::align_up(static_cast<std::size_t>(kUncond * kDim * 2)) +
+                         3 * mi::runtime::align_up(static_cast<std::size_t>(128 * kGrid * kGrid * 4));
+  md::Residency residency;
+  const std::size_t free_now = mi::runtime::DeviceArena::free_device_bytes();
+  if (free_now <= (std::size_t{512} << 20)) {
+    expect(false, "at least 512 MiB of free device memory");
+    return failures;
+  }
+  const std::size_t free = free_now - (std::size_t{512} << 20);
+  const auto arena_bytes = [&] {
+    return md::MossDit::persistent_bytes(index, residency) + io + work_op + md::MossDit::stream_workspace_bytes(index, residency);
+  };
+  while (residency.resident_blocks > 0 && arena_bytes() > free) --residency.resident_blocks;
+  mi::runtime::DeviceArena arena(arena_bytes());
+  md::MossDit model(index, arena, streams, false, nullptr, residency);
+  const Tensor cond = arena.alloc_persistent_tensor(DType::kBF16, {kCond, kDim});
+  const Tensor uncond = arena.alloc_persistent_tensor(DType::kBF16, {kUncond, kDim});
+  upload(cond, synth_bf16(61, static_cast<std::size_t>(kCond * kDim), 0));
+  upload(uncond, synth_bf16(62, static_cast<std::size_t>(kUncond * kDim), 0));
+  const Tensor latents = arena.alloc_persistent_tensor(DType::kF32, {128, kGrid, kGrid});
+  std::vector<float> lv(static_cast<std::size_t>(latents.numel()));
+  for (std::size_t i = 0; i < lv.size(); ++i) lv[i] = std::sin(0.37f * static_cast<float>(i));
+  MI_CUDA_CHECK(cudaMemcpy(latents.data, lv.data(), lv.size() * 4, cudaMemcpyHostToDevice));
+  const Tensor outs[] = {arena.alloc_persistent_tensor(DType::kF32, {128, kGrid, kGrid}),
+                         arena.alloc_persistent_tensor(DType::kF32, {128, kGrid, kGrid})};
+  md::SkipSet skip22;
+  skip22.set(22);
+  const md::Row rows[] = {{cond, {}}, {uncond, skip22}};
+  const auto velocities = [&] {
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<std::uint32_t> v(static_cast<std::size_t>(2 * latents.numel()));
+    for (std::size_t i = 0; i < 2; ++i) {
+      MI_CUDA_CHECK(cudaMemcpy(v.data() + i * static_cast<std::size_t>(latents.numel()), outs[i].data, outs[i].nbytes(),
+                               cudaMemcpyDeviceToHost));
+    }
+    return v;
+  };
+  const auto differ = [](const std::vector<std::uint32_t>& a, const std::vector<std::uint32_t>& b) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) n += a[i] != b[i];
+    return n;
+  };
+  model.set_block_path(md::BlockPath::kOpByOp);
+  model.forward(latents, 500.0f, rows, outs, stream);
+  const auto want = velocities();
+
+  // The forward's own stack: its high-water mark above what the arena holds outside forward().
+  const auto forward_stack = [&](const md::BlockHook& hook, std::string& error) {
+    const std::size_t base = arena.capacity() - arena.available();
+    arena.reset_high_water();
+    try {
+      model.forward(latents, 500.0f, rows, outs, stream, hook);
+    } catch (const std::exception& e) {
+      error = e.what();
+    }
+    return arena.high_water() - base;
+  };
+  model.set_block_path(md::BlockPath::kFused);
+  const std::uint64_t gen_before = md::fused_route_generation();
+  int blocks = 0;
+  std::string error;
+  const std::size_t stack_in_flight = forward_stack(
+      [&](int block, const Tensor&) {
+        if (block == 0) md::install_fused_check(md::FusedCheck{false, "injected failure during a forward", {}});
+        ++blocks;
+      },
+      error);
+  expect(error.empty(), "the forward running during the poisoning completes: '" + error + "'");
+  expect(blocks == md::kLayers, "every block ran (" + std::to_string(blocks) + ")");
+  expect(md::fused_route_generation() != gen_before, "the poisoning changed the route during the forward");
+  if (error.empty()) expect(differ(velocities(), want) == 0, "the forward running during the poisoning == op_by_op");
+
+  for (const std::int64_t m : run_lengths(kGrid * kGrid, lengths)) {
+    const md::FusedRoute r = md::fused_route(m);
+    expect(!(r.o || r.up_gate || r.down), "every pair runs op by op at " + std::to_string(m) + " rows after it");
+  }
+  error.clear();
+  const std::size_t stack_next = forward_stack({}, error);
+  expect(error.empty(), "the next forward runs: '" + error + "'");
+  if (error.empty()) expect(differ(velocities(), want) == 0, "the next forward == op_by_op");
+  std::fprintf(stderr, "in-flight poisoning: forward stack %.1f MiB during the poisoning, %.1f MiB after\n",
+               static_cast<double>(stack_in_flight) / (1 << 20), static_cast<double>(stack_next) / (1 << 20));
+  // The running forward kept the buffer it planned for the fused route; the next one plans the op-by-op buffer.
+  expect(stack_next - stack_in_flight == work_op - work_fused, "the next forward sizes the op-by-op big buffer");
+  if (!fused_buffer) std::fprintf(stderr, "in-flight poisoning: this GPU sizes the op-by-op buffer anyway\n");
+  if (failures == 0) std::fprintf(stderr, "in-flight poisoning: ok\n");
+  return failures;
+}
+
+TEST(FusedSelfCheck, PoisoningDuringAForwardAppliesFromTheNextOne) {
+  if (!fs::is_regular_file(bundle_dir() / "moss.mossidx")) GTEST_SKIP() << "weights not present (" << bundle_dir() << ")";
+  const ThreadsafeDeathTests style;
+  EXPECT_EXIT(std::exit(in_flight_poisoning_failures()), ::testing::ExitedWithCode(0), "in-flight poisoning: ok");
 }
 
 // Small images, where cuBLASLt's algorithm (and so fused_route) changes with the run length: MossDit::forward with the

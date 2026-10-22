@@ -4,7 +4,7 @@
 // AC4's per-row bound when only its attention kernel (SDPA MATH instead of memory-efficient) or its GEMM
 // kernels (cuBLASLt instead of cuBLAS) change: ULP-level reordering is amplified over 32 layers, up to
 // fully decorrelated rows in the 4096-token case. tests/data/qwen35_text/noise_floor.json records that
-// floor (tools/reference/gen_qwen35_text_vectors.py). The engine differs from torch in both kernels at
+// floor (measured with the PyTorch reference). The engine differs from torch in both kernels at
 // once, so at layer 31 and the output (where the amplification has saturated) it is held to twice the
 // floor's deviation per sequence. Layers 0 and 3 (before amplification) have fixed bounds a real defect
 // would break: GEMM noise of 1 bf16 ULP gives row rel-L2 up to ~7e-3 at layer 0 and ~1.3e-2 at layer 3.

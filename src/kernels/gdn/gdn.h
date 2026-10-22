@@ -1,6 +1,6 @@
 // Qwen3.5 GatedDeltaNet prefill kernels (no conv/recurrent state cache, no decode): causal depthwise
 // conv1d + SiLU, the beta/g gates, and the chunked gated delta rule with a slow token-by-token oracle.
-// Numerics follow the transformers pure-torch fallback the goldens used (docs/model-notes.md §7):
+// Numerics follow the transformers pure-torch fallback the goldens used:
 // conv in bf16 (fp32 accumulate, rounded, then SiLU rounded), gates in fp32, the rule entirely in fp32.
 //
 // Varlen: `cu_seqlens` is an i32 [N+1] device tensor of token offsets (cu[0] = 0, cu[N] = total tokens T),
