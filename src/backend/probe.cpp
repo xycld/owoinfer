@@ -236,7 +236,9 @@ ProbeResult probe(const ProbeOptions& options) {
   // Each call below reports a missing driver as an error code; none of them aborts. cudaGetLastError() clears the
   // runtime's last-error state so callers that check it later are not confused by the probe.
   if (cudaDriverGetVersion(&r.driver_version) != cudaSuccess) r.driver_version = 0;
-  if (cudaRuntimeGetVersion(&r.runtime_version) != cudaSuccess) r.runtime_version = 0;
+  // The static CUDA 13.3 runtime on Windows fails this call when no driver is installed (seen in CI); report the
+  // runtime version this build was compiled against instead of 0.
+  if (cudaRuntimeGetVersion(&r.runtime_version) != cudaSuccess) r.runtime_version = CUDART_VERSION;
   const int min_driver =
       r.build_flavour == Flavour::kNone ? r.build_cuda_version / 1000 * 1000 : min_driver_version(r.build_flavour);
   r.driver_ok = r.driver_version >= min_driver && r.driver_version > 0;
