@@ -2,7 +2,7 @@
 
 A native C++/CUDA inference engine for the MOSS-Image text-to-image model (5B DiT, Qwen3.5 text encoder, FLUX.2 VAE), with no PyTorch or Python at run time. It plans memory against the GPU it finds and streams the model when it does not fit.
 
-Pre-release (0.1.0). Supported now: Linux x86-64 with CUDA 13. Planned: Windows and CUDA 12 builds. The full support matrix is in [docs/integration.md](docs/integration.md#support-status).
+Pre-release (0.2.0). Supported now: Linux x86-64 with CUDA 13. Planned: Windows and CUDA 12 builds. The full support matrix is in [docs/integration.md](docs/integration.md#support-status).
 
 - [docs/integration.md](docs/integration.md): building the engine into an application. Start here.
 - [docs/c-api.md](docs/c-api.md): the C library, `include/mossinfer/mossinfer.h`.

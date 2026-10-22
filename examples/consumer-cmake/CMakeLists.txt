@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.21)
 project(MossInferConsumer LANGUAGES C)
 
-find_package(MossInfer 0.1 REQUIRED CONFIG)
+find_package(MossInfer 0.2 REQUIRED CONFIG)
 
 add_executable(mossinfer_consumer main.c)
 target_link_libraries(mossinfer_consumer PRIVATE MossInfer::mossinfer)

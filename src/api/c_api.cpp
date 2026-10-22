@@ -2,6 +2,7 @@
 // plus the thread-local message, so nothing C++ crosses the C boundary.
 #include "mossinfer/mossinfer.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -46,7 +48,11 @@ namespace {
 // tests/c/test_abi_layout.c checks the same table from C.
 static_assert(sizeof(void*) == 8 && sizeof(std::size_t) == 8, "the C API layouts are defined for 64-bit targets");
 static_assert(sizeof(mi_status) == 4 && sizeof(mi_mode) == 4 && sizeof(mi_model_format) == 4 &&
-              sizeof(mi_sampler) == 4 && sizeof(mi_phase) == 4 && sizeof(mi_block_path) == 4, "C API enums are 32-bit");
+              sizeof(mi_sampler) == 4 && sizeof(mi_phase) == 4 && sizeof(mi_block_path) == 4 && sizeof(mi_tier) == 4 &&
+              sizeof(mi_attention) == 4 && sizeof(mi_precision) == 4 && sizeof(mi_scheduler) == 4 &&
+              sizeof(mi_noise_layout) == 4 && sizeof(mi_noise_source) == 4 && sizeof(mi_result_text_kind) == 4 &&
+              sizeof(mi_message_kind) == 4,
+              "C API enums are 32-bit");
 #define MI_LAYOUT(type, field, offset) static_assert(offsetof(type, field) == (offset), #type "." #field)
 static_assert(sizeof(mi_device_info) == 592);
 MI_LAYOUT(mi_device_info, struct_size, 0);
@@ -72,7 +78,7 @@ MI_LAYOUT(mi_probe_info, build_flavour, 28);
 MI_LAYOUT(mi_probe_info, recommended_flavour, 44);
 MI_LAYOUT(mi_probe_info, message, 60);
 MI_LAYOUT(mi_probe_info, _reserved0, 572);
-static_assert(sizeof(mi_engine_params) == 80);
+static_assert(sizeof(mi_engine_params) == 120);
 MI_LAYOUT(mi_engine_params, struct_size, 0);
 MI_LAYOUT(mi_engine_params, model_path, 8);
 MI_LAYOUT(mi_engine_params, model_format, 16);
@@ -86,7 +92,14 @@ MI_LAYOUT(mi_engine_params, cache_dir, 56);
 MI_LAYOUT(mi_engine_params, embedding_cache, 64);
 MI_LAYOUT(mi_engine_params, direct_io, 68);
 MI_LAYOUT(mi_engine_params, block_path, 72);
-MI_LAYOUT(mi_engine_params, _reserved1, 76);
+MI_LAYOUT(mi_engine_params, _reserved1, 76);  // the 0.1 layout ends here (80 bytes)
+MI_LAYOUT(mi_engine_params, dit_file, 80);
+MI_LAYOUT(mi_engine_params, text_encoder_file, 88);
+MI_LAYOUT(mi_engine_params, vae_file, 96);
+MI_LAYOUT(mi_engine_params, tier, 104);
+MI_LAYOUT(mi_engine_params, attention, 108);
+MI_LAYOUT(mi_engine_params, lora_strict, 112);
+MI_LAYOUT(mi_engine_params, _reserved2, 116);
 static_assert(sizeof(mi_progress) == 40);
 MI_LAYOUT(mi_progress, struct_size, 0);
 MI_LAYOUT(mi_progress, phase, 8);
@@ -95,7 +108,7 @@ MI_LAYOUT(mi_progress, total_steps, 16);
 MI_LAYOUT(mi_progress, _reserved0, 20);
 MI_LAYOUT(mi_progress, step_seconds, 24);
 MI_LAYOUT(mi_progress, elapsed_seconds, 32);
-static_assert(sizeof(mi_gen_params) == 168);
+static_assert(sizeof(mi_gen_params) == 240);
 MI_LAYOUT(mi_gen_params, struct_size, 0);
 MI_LAYOUT(mi_gen_params, prompt, 8);
 MI_LAYOUT(mi_gen_params, negative_prompt, 16);
@@ -120,7 +133,22 @@ MI_LAYOUT(mi_gen_params, plan_callback, 136);
 MI_LAYOUT(mi_gen_params, preview_callback, 144);
 MI_LAYOUT(mi_gen_params, preview_interval, 152);
 MI_LAYOUT(mi_gen_params, _reserved1, 156);
-MI_LAYOUT(mi_gen_params, user_data, 160);
+MI_LAYOUT(mi_gen_params, user_data, 160);  // the 0.1 layout ends here (168 bytes)
+MI_LAYOUT(mi_gen_params, scheduler, 168);
+MI_LAYOUT(mi_gen_params, noise_layout, 172);
+MI_LAYOUT(mi_gen_params, noise_source, 176);
+MI_LAYOUT(mi_gen_params, save_metadata, 180);
+MI_LAYOUT(mi_gen_params, flow_multiplier, 184);
+MI_LAYOUT(mi_gen_params, eta, 192);
+MI_LAYOUT(mi_gen_params, s_noise, 200);
+MI_LAYOUT(mi_gen_params, dataspace_path, 208);
+MI_LAYOUT(mi_gen_params, loras, 216);
+MI_LAYOUT(mi_gen_params, loras_count, 224);
+MI_LAYOUT(mi_gen_params, include_prompts, 232);
+MI_LAYOUT(mi_gen_params, _reserved2, 236);
+static_assert(sizeof(mi_lora) == 16);  // array element: no struct_size, frozen
+MI_LAYOUT(mi_lora, path, 0);
+MI_LAYOUT(mi_lora, strength, 8);
 static_assert(sizeof(mi_timings) == 104);
 MI_LAYOUT(mi_timings, struct_size, 0);
 MI_LAYOUT(mi_timings, total_s, 8);
@@ -155,7 +183,37 @@ MI_LAYOUT(mi_dit_stream_stats, stall_seconds, 40);
 MI_LAYOUT(mi_dit_stream_stats, h2d_gbps, 48);
 MI_LAYOUT(mi_dit_stream_stats, hidden_fraction, 56);
 MI_LAYOUT(mi_dit_stream_stats, source, 64);
+static_assert(sizeof(mi_tier_info) == 32);
+MI_LAYOUT(mi_tier_info, struct_size, 0);
+MI_LAYOUT(mi_tier_info, requested, 8);
+MI_LAYOUT(mi_tier_info, effective, 12);
+MI_LAYOUT(mi_tier_info, attention, 16);
+MI_LAYOUT(mi_tier_info, certified, 20);
+MI_LAYOUT(mi_tier_info, dit_precision, 24);
+MI_LAYOUT(mi_tier_info, text_encoder_precision, 28);
+static_assert(sizeof(mi_prompt_tokens) == 32);
+MI_LAYOUT(mi_prompt_tokens, struct_size, 0);
+MI_LAYOUT(mi_prompt_tokens, total_tokens, 8);
+MI_LAYOUT(mi_prompt_tokens, kept_tokens, 12);
+MI_LAYOUT(mi_prompt_tokens, prompt_tokens, 16);
+MI_LAYOUT(mi_prompt_tokens, dropped_tokens, 20);
+MI_LAYOUT(mi_prompt_tokens, max_length, 24);
+MI_LAYOUT(mi_prompt_tokens, truncated, 28);
+static_assert(sizeof(mi_lora_report) == 32);
+MI_LAYOUT(mi_lora_report, struct_size, 0);
+MI_LAYOUT(mi_lora_report, adapters, 8);
+MI_LAYOUT(mi_lora_report, side_branch, 12);
+MI_LAYOUT(mi_lora_report, merged, 16);
+MI_LAYOUT(mi_lora_report, unknown_keys, 20);
+MI_LAYOUT(mi_lora_report, warnings, 24);
+MI_LAYOUT(mi_lora_report, notes, 28);
 #undef MI_LAYOUT
+
+// Every size a versioned input struct has had: the 0.1 layout, then today's. A struct of an older size is read as
+// its prefix over the defaults.
+constexpr std::size_t kEngineParamsSizes[] = {offsetof(mi_engine_params, dit_file), sizeof(mi_engine_params)};
+constexpr std::size_t kGenParamsSizes[] = {offsetof(mi_gen_params, scheduler), sizeof(mi_gen_params)};
+static_assert(kEngineParamsSizes[0] == 80 && kGenParamsSizes[0] == 168, "the 0.1 layouts");
 
 thread_local std::string t_last_error;
 // Set instead of t_last_error when copying a message failed (no memory): mi_last_error_message() must stay valid.
@@ -234,20 +292,101 @@ void check_reserved(std::int32_t value, const char* name) {
 void check_reserved(const mi_engine_params& p) {
   check_reserved(p._reserved0, "mi_engine_params._reserved0");
   check_reserved(p._reserved1, "mi_engine_params._reserved1");
+  check_reserved(p._reserved2, "mi_engine_params._reserved2");
 }
 
 void check_reserved(const mi_gen_params& p) {
   check_reserved(p._reserved0, "mi_gen_params._reserved0");
   check_reserved(p._reserved1, "mi_gen_params._reserved1");
+  check_reserved(p._reserved2, "mi_gen_params._reserved2");
 }
 
-// Versioned structs: this library knows exactly one size of each (ABI 1). A later minor version accepts every size
-// from the first to the current layout.
-void check_size(std::size_t got, std::size_t known, const char* name) {
-  if (got != known) {
-    throw StatusError(MI_ERR_ABI_MISMATCH, std::string(name) + ".struct_size is " + std::to_string(got) +
-                                               "; this library expects " + std::to_string(known) + ".");
+// Versioned structs: `known` lists every size the struct has had (ABI 1: it only grows at the end).
+void check_size(std::size_t got, std::span<const std::size_t> known, const char* name) {
+  std::string sizes;
+  for (const std::size_t k : known) {
+    if (got == k) return;
+    sizes += (sizes.empty() ? "" : " or ") + std::to_string(k);
   }
+  throw StatusError(MI_ERR_ABI_MISMATCH, std::string(name) + ".struct_size is " + std::to_string(got) +
+                                             "; this library accepts " + sizes + ".");
+}
+
+void check_size(std::size_t got, std::size_t known, const char* name) { check_size(got, std::span(&known, 1), name); }
+
+// The defaults of a struct of `size` bytes (a known size). The fields after that layout are not the caller's: they take
+// the values that keep that layout's behaviour.
+mi_engine_params engine_params_defaults(std::size_t /*size*/ = sizeof(mi_engine_params)) {
+  mi_engine_params p{};
+  p.struct_size = sizeof p;
+  p.model_format = MI_MODEL_FORMAT_AUTO;
+  p.mode = MI_MODE_BALANCED;
+  p.vram_reserve_bytes = std::uint64_t{384} << 20;  // PipelineOptions::vram_reserve
+  p.embedding_cache = 1;
+  p.tier = MI_TIER_AUTO;
+  p.attention = MI_ATTENTION_DEFAULT;
+  return p;
+}
+
+constexpr std::int32_t kDefaultUncondSkip[] = {22};
+
+mi_gen_params gen_params_defaults(std::size_t size = sizeof(mi_gen_params)) {
+  mi_gen_params p{};
+  p.struct_size = sizeof p;
+  p.prompt = nullptr;
+  p.negative_prompt = nullptr;
+  p.width = 1024;
+  p.height = 1024;
+  p.steps = 50;
+  p.cfg = 3.0;
+  p.shift = 5.0;
+  p.seed = 42;
+  p.uncond_skip_layers = kDefaultUncondSkip;
+  p.uncond_skip_layers_count = 1;
+  p.slg_stop = 1.0;
+  p.max_sequence_length = 4096;
+  p.sampler = MI_SAMPLER_EULER;
+  p.preview_interval = 1;
+  p.scheduler = MI_SCHEDULER_MOSS;
+  p.noise_layout = MI_NOISE_LAYOUT_OFFICIAL;
+  p.noise_source = MI_NOISE_SOURCE_PHILOX;
+  p.save_metadata = 1;
+  p.flow_multiplier = 1.0;
+  p.eta = 1.0;
+  p.s_noise = 1.0;
+  p.include_prompts = 1;
+  // A 0.1.0 program (168 bytes) wrote PNGs without metadata: it keeps doing so.
+  if (size < sizeof p) p.save_metadata = p.include_prompts = 0;
+  return p;
+}
+
+// *_init(): the first `size` bytes of the defaults (a caller built against an older header has a shorter struct).
+template <class T>
+void init_prefix(void* out, const T& defaults, std::size_t size) {
+  T p = defaults;
+  p.struct_size = size;
+  std::memcpy(out, &p, size);
+}
+
+// Input structs: the caller's struct_size bytes (a known size) over the defaults of that size. Reads nothing past them
+// and never views the caller's (possibly shorter) object as a full T.
+template <class T>
+T read_input(const void* in, std::span<const std::size_t> known, T (*defaults)(std::size_t), const char* name) {
+  std::size_t size = 0;
+  std::memcpy(&size, in, sizeof size);  // struct_size is the first member of every versioned struct
+  check_size(size, known, name);
+  T p = defaults(size);
+  std::memcpy(&p, in, size);
+  p.struct_size = sizeof p;
+  return p;
+}
+
+// Output structs: only the caller's struct_size bytes (checked by the caller with check_size) are written.
+template <class T>
+void write_output(T* out, T value) {
+  const std::size_t size = out->struct_size;
+  value.struct_size = size;
+  std::memcpy(out, &value, std::min(size, sizeof value));
 }
 
 // Getters with no status: NULL -> 0 and the message.
@@ -260,7 +399,23 @@ T get(const mi_result* r, T fallback, F&& f) noexcept {
   return f(r->generation);
 }
 
-constexpr std::int32_t kDefaultUncondSkip[] = {22};
+// A string of the result, or NULL with `out_of_range` as the message.
+const char* item(const std::vector<std::string>& items, int32_t index, const char* out_of_range) noexcept {
+  if (index < 0 || static_cast<std::size_t>(index) >= items.size()) {
+    set_error(out_of_range);
+    return nullptr;
+  }
+  return items[static_cast<std::size_t>(index)].c_str();
+}
+
+const std::vector<std::string>* messages(const mi::api::Generation& g, mi_message_kind kind) {
+  switch (kind) {
+    case MI_MESSAGE_LORA_WARNING: return &g.lora_warnings;
+    case MI_MESSAGE_LORA_NOTE: return &g.lora_notes;
+    case MI_MESSAGE_MAX_ENUM: break;
+  }
+  return nullptr;
+}
 
 // Truncating copy into a fixed char array (always NUL-terminated).
 template <std::size_t N>
@@ -311,7 +466,9 @@ const char* mi_last_error_message(void) {
   return t_last_error_static != nullptr ? t_last_error_static : t_last_error.c_str();
 }
 
-uint32_t mi_capabilities(void) { return 0; }
+uint32_t mi_capabilities(void) {
+  return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS;
+}
 
 mi_status mi_probe(mi_probe_info* info) {
   return guarded([&] {
@@ -320,15 +477,16 @@ mi_status mi_probe(mi_probe_info* info) {
     mi::backend::ProbeOptions options;
     options.query_free_memory = false;
     const mi::backend::ProbeResult r = mi::backend::probe(options);
-    info->_reserved0 = 0;
-    info->driver_cuda_version = r.driver_version;
-    info->runtime_cuda_version = r.build_cuda_version;
-    info->driver_compatible = r.driver_ok ? 1 : 0;
-    info->device_count = static_cast<int32_t>(r.devices.size());
-    info->supported_device_count = r.supported_devices;
-    copy_string(info->build_flavour, flavour_string(r.build_flavour));
-    copy_string(info->recommended_flavour, flavour_string(r.recommended));
-    copy_string(info->message, r.reason);
+    mi_probe_info out{};
+    out.driver_cuda_version = r.driver_version;
+    out.runtime_cuda_version = r.build_cuda_version;
+    out.driver_compatible = r.driver_ok ? 1 : 0;
+    out.device_count = static_cast<int32_t>(r.devices.size());
+    out.supported_device_count = r.supported_devices;
+    copy_string(out.build_flavour, flavour_string(r.build_flavour));
+    copy_string(out.recommended_flavour, flavour_string(r.recommended));
+    copy_string(out.message, r.reason);
+    write_output(info, out);
     return MI_OK;
   });
 }
@@ -350,17 +508,17 @@ mi_status mi_probe_device(int32_t index, mi_device_info* info) {
       throw StatusError(MI_ERR_CUDA, "device " + std::to_string(index) + " disappeared during the probe.");
     }
     const mi::backend::DeviceInfo& d = r.devices[static_cast<std::size_t>(index)];
-    info->_reserved0 = 0;
-    info->_reserved1 = 0;
-    info->index = d.index;
-    copy_string(info->name, d.name);
-    copy_string(info->pci_bus_id, d.pci_bus_id);
-    info->compute_major = d.cc_major;
-    info->compute_minor = d.cc_minor;
-    info->total_memory_bytes = d.total_bytes;
-    info->free_memory_bytes = d.free_bytes;
-    info->supported = d.supported ? 1 : 0;
-    copy_string(info->unsupported_reason, d.reason);
+    mi_device_info out{};
+    out.index = d.index;
+    copy_string(out.name, d.name);
+    copy_string(out.pci_bus_id, d.pci_bus_id);
+    out.compute_major = d.cc_major;
+    out.compute_minor = d.cc_minor;
+    out.total_memory_bytes = d.total_bytes;
+    out.free_memory_bytes = d.free_bytes;
+    out.supported = d.supported ? 1 : 0;
+    copy_string(out.unsupported_reason, d.reason);
+    write_output(info, out);
     return MI_OK;
   });
 }
@@ -368,14 +526,8 @@ mi_status mi_probe_device(int32_t index, mi_device_info* info) {
 mi_status mi_engine_params_init(mi_engine_params* params, size_t struct_size) {
   return guarded([&] {
     require(params, "params");
-    check_size(struct_size, sizeof(mi_engine_params), "mi_engine_params");
-    mi_engine_params p{};
-    p.struct_size = sizeof p;
-    p.model_format = MI_MODEL_FORMAT_AUTO;
-    p.mode = MI_MODE_BALANCED;
-    p.vram_reserve_bytes = std::uint64_t{384} << 20;  // PipelineOptions::vram_reserve
-    p.embedding_cache = 1;
-    *params = p;
+    check_size(struct_size, kEngineParamsSizes, "mi_engine_params");
+    init_prefix(params, engine_params_defaults(struct_size), struct_size);
     return MI_OK;
   });
 }
@@ -385,10 +537,11 @@ mi_status mi_engine_create(const mi_engine_params* params, mi_engine** out_engin
   return guarded([&] {
     require(params, "params");
     require(out_engine, "out_engine");
-    check_size(params->struct_size, sizeof(mi_engine_params), "mi_engine_params");
-    check_reserved(*params);
+    const mi_engine_params p =
+        read_input<mi_engine_params>(params, kEngineParamsSizes, engine_params_defaults, "mi_engine_params");
+    check_reserved(p);
     auto engine = std::make_unique<mi_engine>();
-    engine->adapter = std::make_unique<mi::api::PipelineAdapter>(*params);
+    engine->adapter = std::make_unique<mi::api::PipelineAdapter>(p);
     *out_engine = engine.release();
     return MI_OK;
   });
@@ -411,24 +564,8 @@ mi_status mi_cancel(mi_engine* engine) {
 mi_status mi_gen_params_init(mi_gen_params* params, size_t struct_size) {
   return guarded([&] {
     require(params, "params");
-    check_size(struct_size, sizeof(mi_gen_params), "mi_gen_params");
-    mi_gen_params p{};
-    p.struct_size = sizeof p;
-    p.prompt = nullptr;
-    p.negative_prompt = nullptr;
-    p.width = 1024;
-    p.height = 1024;
-    p.steps = 50;
-    p.cfg = 3.0;
-    p.shift = 5.0;
-    p.seed = 42;
-    p.uncond_skip_layers = kDefaultUncondSkip;
-    p.uncond_skip_layers_count = 1;
-    p.slg_stop = 1.0;
-    p.max_sequence_length = 4096;
-    p.sampler = MI_SAMPLER_EULER;
-    p.preview_interval = 1;
-    *params = p;
+    check_size(struct_size, kGenParamsSizes, "mi_gen_params");
+    init_prefix(params, gen_params_defaults(struct_size), struct_size);
     return MI_OK;
   });
 }
@@ -436,9 +573,9 @@ mi_status mi_gen_params_init(mi_gen_params* params, size_t struct_size) {
 mi_status mi_gen_params_validate(const mi_gen_params* params) {
   return guarded([&] {
     require(params, "params");
-    check_size(params->struct_size, sizeof(mi_gen_params), "mi_gen_params");
-    check_reserved(*params);
-    mi::api::validate(*params);
+    const mi_gen_params p = read_input<mi_gen_params>(params, kGenParamsSizes, gen_params_defaults, "mi_gen_params");
+    check_reserved(p);
+    mi::api::validate(p);
     return MI_OK;
   });
 }
@@ -449,8 +586,8 @@ mi_status mi_generate(mi_engine* engine, const mi_gen_params* params, mi_result*
     require(engine, "engine");
     require(params, "params");
     require(out_result, "out_result");
-    check_size(params->struct_size, sizeof(mi_gen_params), "mi_gen_params");
-    check_reserved(*params);
+    const mi_gen_params p = read_input<mi_gen_params>(params, kGenParamsSizes, gen_params_defaults, "mi_gen_params");
+    check_reserved(p);
     {
       const std::lock_guard<std::mutex> lock(engine->state);
       if (engine->busy) throw StatusError(MI_ERR_BUSY, "the engine is already generating (one generation at a time).");
@@ -466,7 +603,7 @@ mi_status mi_generate(mi_engine* engine, const mi_gen_params* params, mi_result*
       }
     } idle{*engine};
     auto result = std::make_unique<mi_result>();
-    result->generation = engine->adapter->generate(*params, engine->cancel);
+    result->generation = engine->adapter->generate(p, engine->cancel);
     const bool cancelled = result->generation.cancelled;
     *out_result = result.release();
     return cancelled ? MI_CANCELLED : MI_OK;
@@ -508,30 +645,30 @@ int32_t mi_result_steps_run(const mi_result* result) {
 
 mi_status mi_result_timings(const mi_result* result, mi_timings* out) {
   return guarded([&] {
-    require(result, "result");
     require(out, "out");
     check_size(out->struct_size, sizeof(mi_timings), "mi_timings");
-    *out = result->generation.timings;
+    require(result, "result");
+    write_output(out, result->generation.timings);
     return MI_OK;
   });
 }
 
 mi_status mi_result_memory(const mi_result* result, mi_memory_stats* out) {
   return guarded([&] {
-    require(result, "result");
     require(out, "out");
     check_size(out->struct_size, sizeof(mi_memory_stats), "mi_memory_stats");
-    *out = result->generation.memory;
+    require(result, "result");
+    write_output(out, result->generation.memory);
     return MI_OK;
   });
 }
 
 mi_status mi_result_dit_stream(const mi_result* result, mi_dit_stream_stats* out) {
   return guarded([&] {
-    require(result, "result");
     require(out, "out");
     check_size(out->struct_size, sizeof(mi_dit_stream_stats), "mi_dit_stream_stats");
-    *out = result->generation.dit_stream;
+    require(result, "result");
+    write_output(out, result->generation.dit_stream);
     return MI_OK;
   });
 }
@@ -572,6 +709,109 @@ mi_status mi_save_png(mi_result* result, const char* path) {
       throw StatusError(MI_ERR_IO, e.what());  // the PNG writer reports I/O failures as runtime_error
     }
     result->image_path = path;
+    return MI_OK;
+  });
+}
+
+mi_status mi_result_tier(const mi_result* result, mi_tier_info* out) {
+  return guarded([&] {
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_tier_info), "mi_tier_info");
+    require(result, "result");
+    write_output(out, result->generation.tier);
+    return MI_OK;
+  });
+}
+
+const char* mi_result_text(const mi_result* result, mi_result_text_kind kind) {
+  return get(result, static_cast<const char*>(nullptr), [&](const mi::api::Generation& g) -> const char* {
+    switch (kind) {
+      case MI_TEXT_TIER_REASON: return g.tier_reason.c_str();
+      case MI_TEXT_CERTIFICATE: return g.certificate.c_str();
+      case MI_TEXT_GPU_ARCH: return g.gpu_arch.c_str();
+      case MI_TEXT_DIT_SOURCE: return g.dit_source.c_str();
+      case MI_TEXT_TEXT_ENCODER_SOURCE: return g.te_source.c_str();
+      case MI_TEXT_VAE_SOURCE: return g.vae_source.c_str();
+      case MI_TEXT_QUALITY_JSON: return g.quality_json.c_str();
+      case MI_TEXT_MAX_ENUM: break;
+    }
+    set_error("mi_result_text: unknown kind.");
+    return nullptr;
+  });
+}
+
+mi_status mi_result_prompt_tokens(const mi_result* result, int32_t negative, mi_prompt_tokens* out) {
+  return guarded([&] {
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_prompt_tokens), "mi_prompt_tokens");
+    require(result, "result");
+    if (negative != 0 && negative != 1) throw std::invalid_argument("negative must be 0 (the prompt) or 1 (the negative prompt).");
+    write_output(out, result->generation.tokens[negative]);
+    return MI_OK;
+  });
+}
+
+int32_t mi_result_lora_count(const mi_result* result) {
+  return get(result, 0, [](const mi::api::Generation& g) { return static_cast<int32_t>(g.loras.size()); });
+}
+
+mi_status mi_result_lora(const mi_result* result, int32_t index, mi_lora_report* out) {
+  return guarded([&] {
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_lora_report), "mi_lora_report");
+    require(result, "result");
+    const std::vector<mi_lora_report>& loras = result->generation.loras;
+    if (index < 0 || static_cast<std::size_t>(index) >= loras.size()) {
+      throw std::invalid_argument("LoRA index " + std::to_string(index) + " out of range (" + std::to_string(loras.size()) +
+                                  " LoRAs).");
+    }
+    write_output(out, loras[static_cast<std::size_t>(index)]);
+    return MI_OK;
+  });
+}
+
+const char* mi_result_lora_file(const mi_result* result, int32_t index) {
+  return get(result, static_cast<const char*>(nullptr), [&](const mi::api::Generation& g) {
+    return item(g.lora_files, index, "mi_result_lora_file: index out of range.");
+  });
+}
+
+int32_t mi_result_message_count(const mi_result* result, mi_message_kind kind) {
+  return get(result, 0, [&](const mi::api::Generation& g) {
+    const std::vector<std::string>* m = messages(g, kind);
+    if (m == nullptr) set_error("mi_result_message_count: unknown kind.");
+    return m != nullptr ? static_cast<int32_t>(m->size()) : 0;
+  });
+}
+
+const char* mi_result_message(const mi_result* result, mi_message_kind kind, int32_t index) {
+  return get(result, static_cast<const char*>(nullptr), [&](const mi::api::Generation& g) -> const char* {
+    const std::vector<std::string>* m = messages(g, kind);
+    if (m == nullptr) {
+      set_error("mi_result_message: unknown kind.");
+      return nullptr;
+    }
+    return item(*m, index, "mi_result_message: index out of range.");
+  });
+}
+
+mi_status mi_write_png(const char* path, const uint8_t* rgb, int32_t width, int32_t height) {
+  return guarded([&] {
+    require(path, "path");
+    require(rgb, "rgb");
+    if (*path == '\0') throw std::invalid_argument("path is empty.");
+    constexpr int32_t kMaxSide = 16384;  // the image-input side limit
+    if (width < 1 || height < 1 || width > kMaxSide || height > kMaxSide) {
+      throw std::invalid_argument("image size " + std::to_string(width) + "x" + std::to_string(height) +
+                                  ": each side must be in [1, " + std::to_string(kMaxSide) + "].");
+    }
+    try {
+      mi::api::write_png_rgb(path, rgb, width, height);
+    } catch (const std::invalid_argument&) {
+      throw;
+    } catch (const std::runtime_error& e) {
+      throw StatusError(MI_ERR_IO, e.what());  // the PNG writer reports I/O failures as runtime_error
+    }
     return MI_OK;
   });
 }

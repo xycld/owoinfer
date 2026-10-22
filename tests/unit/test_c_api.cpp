@@ -12,15 +12,19 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <locale>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "api/pipeline_adapter.h"
 #include "cuda_context_check.h"
+#include "models/lora/lora.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/png_writer.h"
 #include "pipeline/report_json.h"
 #include "test_util.h"
 #include "util/json.h"
@@ -60,8 +64,10 @@ TEST(CApi, VersionAndAbi) {
                                std::to_string(MI_VERSION_PATCH);
   EXPECT_EQ(std::string(mi_version()), expected);
   EXPECT_EQ(mi_abi_version(), MI_ABI_VERSION);
-  EXPECT_EQ(mi_capabilities() & MI_CAP_PREVIEW, 0u);
+  // P6: preview, component files, LoRA, tiers and the extended samplers; a ComfyUI file as model_path is not.
+  EXPECT_EQ(mi_capabilities(), MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS);
   EXPECT_EQ(mi_capabilities() & MI_CAP_COMFYUI_MODELS, 0u);
+  EXPECT_EQ(MI_CAP_PREVIEW | MI_CAP_COMFYUI_MODELS | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS, 0x3fu);
   EXPECT_STREQ(mi_status_string(MI_OK), "MI_OK");
   EXPECT_STREQ(mi_status_string(MI_CANCELLED), "MI_CANCELLED");
   EXPECT_STREQ(mi_status_string(MI_ERR_BUSY), "MI_ERR_BUSY");
@@ -95,6 +101,23 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_EQ(g.preview_callback, nullptr);
   EXPECT_EQ(g.preview_interval, 1);
   EXPECT_EQ(g.user_data, nullptr);
+  // P6 fields.
+  EXPECT_EQ(g.scheduler, MI_SCHEDULER_MOSS);
+  EXPECT_EQ(q.scheduler, mi::pipeline::SchedulerKind::kMoss);
+  EXPECT_EQ(g.noise_layout, MI_NOISE_LAYOUT_OFFICIAL);
+  EXPECT_EQ(q.noise_layout, mi::pipeline::NoiseLayout::kOfficial);
+  EXPECT_EQ(g.noise_source, MI_NOISE_SOURCE_PHILOX);
+  EXPECT_EQ(q.noise_source, mi::pipeline::NoiseSource::kPhilox);
+  EXPECT_EQ(g.save_metadata, q.save_metadata ? 1 : 0);
+  EXPECT_EQ(g.flow_multiplier, q.flow_multiplier);
+  EXPECT_EQ(g.eta, q.eta);
+  EXPECT_EQ(g.s_noise, q.s_noise);
+  EXPECT_EQ(g.dataspace_path, nullptr);
+  EXPECT_TRUE(q.dataspace_path.empty());
+  EXPECT_EQ(g.loras, nullptr);
+  EXPECT_EQ(g.loras_count, q.loras.size());
+  EXPECT_EQ(g.include_prompts, mi::pipeline::GenerationMetadata{}.include_prompts ? 1 : 0);
+  EXPECT_EQ(g._reserved2, 0);
 
   const mi_engine_params e = engine_defaults();
   const mi::pipeline::PipelineOptions o;
@@ -112,10 +135,468 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_EQ(e.block_path, MI_BLOCK_PATH_DEFAULT);  // PipelineOptions' default, fused
   EXPECT_EQ(o.block_path, mi::moss_dit::BlockPath::kFused);
   EXPECT_EQ(e._reserved1, 0);
+  // P6 fields.
+  EXPECT_EQ(e.dit_file, nullptr);
+  EXPECT_EQ(e.text_encoder_file, nullptr);
+  EXPECT_EQ(e.vae_file, nullptr);
+  EXPECT_TRUE(o.dit_file.empty() && o.text_encoder_file.empty() && o.vae_file.empty());
+  EXPECT_EQ(e.tier, MI_TIER_AUTO);
+  EXPECT_EQ(o.tier, mi::planner::Tier::kAuto);
+  EXPECT_EQ(e.attention, MI_ATTENTION_DEFAULT);
+  EXPECT_FALSE(o.attention.has_value());
+  EXPECT_EQ(e.lora_strict, o.lora_strict ? 1 : 0);
+  EXPECT_EQ(e._reserved2, 0);
 
+  // The adapter turns the defaults into the pipeline's defaults.
   mi_gen_params valid = g;
   valid.prompt = "a cat";
   EXPECT_EQ(mi_gen_params_validate(&valid), MI_OK) << last_error();
+  const mi::pipeline::Request r = mi::api::to_request(valid);
+  EXPECT_EQ(r.sampler, q.sampler);
+  EXPECT_EQ(r.scheduler, q.scheduler);
+  EXPECT_EQ(r.noise_layout, q.noise_layout);
+  EXPECT_EQ(r.noise_source, q.noise_source);
+  EXPECT_EQ(r.save_metadata, q.save_metadata);
+  EXPECT_EQ(r.loras.size(), 0u);
+  const mi::pipeline::PipelineOptions ro = mi::api::to_options(e);
+  EXPECT_EQ(ro.tier, o.tier);
+  EXPECT_EQ(ro.attention, o.attention);
+  EXPECT_EQ(ro.lora_strict, o.lora_strict);
+  EXPECT_EQ(ro.block_path, o.block_path);
+}
+
+// Every C enum value maps to the pipeline value of the same name; anything else is rejected.
+TEST(CApi, EnumsMapToThePipeline) {
+  mi::testing::TempDir dir("c_api_enums");
+  const fs::path ds = dir.path() / "dataspace.safetensors";
+  std::ofstream(ds) << "x";
+  const std::string ds_s = mi::util::path_utf8(ds);
+  const auto request = [&](auto edit) {
+    mi_gen_params p = gen_defaults();
+    p.prompt = "a cat";
+    p.dataspace_path = ds_s.c_str();  // MI_SAMPLER_DATASPACE needs it; the others ignore it
+    edit(p);
+    return p;
+  };
+  const char* samplers[] = {"euler", "ab2", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "er_sde",
+                            "res_multistep", "dataspace"};
+  for (int i = 0; i < 9; ++i) {
+    const mi_gen_params p = request([&](mi_gen_params& g) { g.sampler = static_cast<mi_sampler>(i); });
+    EXPECT_EQ(mi_gen_params_validate(&p), MI_OK) << samplers[i] << ": " << last_error();
+    EXPECT_STREQ(mi::pipeline::sampler_name(mi::api::to_request(p).sampler), samplers[i]);
+  }
+  EXPECT_EQ(MI_SAMPLER_DATASPACE, 8);
+  const char* schedulers[] = {"moss", "simple", "normal", "karras", "exponential", "beta", "sgm_uniform"};
+  for (int i = 0; i < 7; ++i) {
+    const mi_gen_params p = request([&](mi_gen_params& g) { g.scheduler = static_cast<mi_scheduler>(i); });
+    EXPECT_EQ(mi_gen_params_validate(&p), MI_OK) << schedulers[i] << ": " << last_error();
+    EXPECT_STREQ(mi::pipeline::scheduler_name(mi::api::to_request(p).scheduler), schedulers[i]);
+  }
+  const char* layouts[] = {"official", "batch_stream"};
+  for (int i = 0; i < 2; ++i) {
+    const mi_gen_params p = request([&](mi_gen_params& g) { g.noise_layout = static_cast<mi_noise_layout>(i); });
+    EXPECT_STREQ(mi::pipeline::noise_layout_name(mi::api::to_request(p).noise_layout), layouts[i]);
+  }
+  const char* sources[] = {"philox", "philox_device", "brownian_tree"};
+  for (int i = 0; i < 3; ++i) {
+    const mi_gen_params p = request([&](mi_gen_params& g) { g.noise_source = static_cast<mi_noise_source>(i); });
+    EXPECT_STREQ(mi::pipeline::noise_source_name(mi::api::to_request(p).noise_source), sources[i]);
+  }
+  struct Bad {
+    const char* field;
+    void (*edit)(mi_gen_params&);
+  };
+  const Bad bad[] = {
+      {"sampler", [](mi_gen_params& p) { p.sampler = static_cast<mi_sampler>(9); }},
+      {"sampler", [](mi_gen_params& p) { p.sampler = MI_SAMPLER_MAX_ENUM; }},
+      {"scheduler", [](mi_gen_params& p) { p.scheduler = static_cast<mi_scheduler>(7); }},
+      {"scheduler", [](mi_gen_params& p) { p.scheduler = MI_SCHEDULER_MAX_ENUM; }},
+      {"noise_layout", [](mi_gen_params& p) { p.noise_layout = static_cast<mi_noise_layout>(2); }},
+      {"noise_source", [](mi_gen_params& p) { p.noise_source = static_cast<mi_noise_source>(3); }},
+  };
+  for (const Bad& b : bad) {
+    const mi_gen_params p = request(b.edit);
+    EXPECT_EQ(mi_gen_params_validate(&p), MI_ERR_INVALID_ARGUMENT) << b.field;
+    EXPECT_NE(last_error().find(std::string(b.field) + ": unknown value"), std::string::npos) << last_error();
+  }
+
+  // Engine enums: tier (C order AUTO first) and attention (DEFAULT = unset).
+  const mi::planner::Tier tiers[] = {mi::planner::Tier::kAuto, mi::planner::Tier::kReference, mi::planner::Tier::kHigh,
+                                     mi::planner::Tier::kTurbo};
+  for (int i = 0; i < 4; ++i) {
+    mi_engine_params e = engine_defaults();
+    e.tier = static_cast<mi_tier>(i);
+    EXPECT_EQ(mi::api::to_options(e).tier, tiers[i]) << i;
+  }
+  EXPECT_FALSE(mi::api::to_options(engine_defaults()).attention.has_value());
+  const char* attentions[] = {"exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc"};
+  for (int i = 1; i < 6; ++i) {
+    mi_engine_params e = engine_defaults();
+    e.attention = static_cast<mi_attention>(i);
+    const std::optional<mi::planner::AttentionMode> a = mi::api::to_options(e).attention;
+    ASSERT_TRUE(a.has_value()) << i;
+    EXPECT_STREQ(mi::planner::attention_name(*a), attentions[i - 1]);
+  }
+  mi_engine_params e = engine_defaults();
+  e.tier = static_cast<mi_tier>(4);
+  EXPECT_THROW(mi::api::to_options(e), std::invalid_argument);
+  e = engine_defaults();
+  e.attention = static_cast<mi_attention>(6);
+  EXPECT_THROW(mi::api::to_options(e), std::invalid_argument);
+  e = engine_defaults();
+  e.lora_strict = 1;
+  EXPECT_TRUE(mi::api::to_options(e).lora_strict);
+}
+
+// The 0.1 sizes (mi_engine_params 80, mi_gen_params 168) are accepted: init fills only that prefix, and the library
+// reads only that prefix (the later fields keep their defaults).
+TEST(CApi, OldStructSizes) {
+  constexpr std::size_t kGen01 = 168, kEngine01 = 80;
+  mi_gen_params g;
+  std::memset(&g, 0x5a, sizeof g);
+  ASSERT_EQ(mi_gen_params_init(&g, kGen01), MI_OK) << last_error();
+  EXPECT_EQ(g.struct_size, kGen01);
+  EXPECT_EQ(g.width, 1024);
+  EXPECT_EQ(g.user_data, nullptr);
+  const auto* bytes = reinterpret_cast<const unsigned char*>(&g);
+  for (std::size_t i = kGen01; i < sizeof g; ++i) ASSERT_EQ(bytes[i], 0x5a) << "byte " << i << " written";
+  // The tail holds garbage (unknown enum values, nonzero _reserved2, a NULL LoRA array with a count): never read.
+  g.prompt = "a cat";
+  g.loras_count = 3;
+  EXPECT_EQ(mi_gen_params_validate(&g), MI_OK) << last_error();
+  g.width = 1000;
+  EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_INVALID_ARGUMENT);  // the prefix is still checked
+  EXPECT_NE(last_error().find("multiples of 16"), std::string::npos) << last_error();
+  g.width = 1024;
+  g._reserved1 = 1;
+  EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("_reserved1"), std::string::npos) << last_error();
+  // The current size reads the tail: the same garbage is rejected.
+  g._reserved1 = 0;
+  g.struct_size = sizeof g;
+  EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_INVALID_ARGUMENT);
+  for (const std::size_t bad : {kGen01 - 8, kGen01 + 8, sizeof g - 8}) {
+    g.struct_size = bad;
+    EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_ABI_MISMATCH) << bad;
+    EXPECT_NE(last_error().find("168 or 240"), std::string::npos) << last_error();
+  }
+
+  mi_engine_params e;
+  std::memset(&e, 0x5a, sizeof e);
+  ASSERT_EQ(mi_engine_params_init(&e, kEngine01), MI_OK) << last_error();
+  EXPECT_EQ(e.struct_size, kEngine01);
+  EXPECT_EQ(e.mode, MI_MODE_BALANCED);
+  EXPECT_EQ(e._reserved1, 0);
+  bytes = reinterpret_cast<const unsigned char*>(&e);
+  for (std::size_t i = kEngine01; i < sizeof e; ++i) ASSERT_EQ(bytes[i], 0x5a) << "byte " << i << " written";
+  // Create reads the prefix only: the tail's nonzero _reserved2 is not seen, the model path check is reached.
+  mi::testing::TempDir dir("c_api_old_sizes");
+  const std::string missing = mi::util::path_utf8(dir.path() / "missing");
+  e.model_path = missing.c_str();
+  mi_engine* engine = nullptr;
+  EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("not found"), std::string::npos) << last_error();
+  EXPECT_EQ(engine, nullptr);
+  e.struct_size = sizeof e;
+  EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("_reserved2"), std::string::npos) << last_error();
+  for (const std::size_t bad : {kEngine01 - 8, kEngine01 + 8, sizeof e + 8}) {
+    EXPECT_EQ(mi_engine_params_init(&e, bad), MI_ERR_ABI_MISMATCH) << bad;
+    EXPECT_NE(last_error().find("80 or 120"), std::string::npos) << last_error();
+  }
+}
+
+// Runtime LoRAs and the dataspace file are checked without a GPU, their files included.
+TEST(CApi, LoraAndDataspaceValidation) {
+  mi::testing::TempDir dir("c_api_lora");
+  const fs::path file = dir.path() / "style.safetensors";
+  std::ofstream(file) << "x";
+  const std::string file_s = mi::util::path_utf8(file);
+  const std::string missing_s = mi::util::path_utf8(dir.path() / "missing.safetensors");
+  const std::string dir_s = mi::util::path_utf8(dir.path());
+  struct Case {
+    const char* what;
+    std::vector<mi_lora> list;
+    std::size_t count;  // loras_count; the array is NULL when `list` is empty
+    const char* message;
+  };
+  const double inf = std::numeric_limits<double>::infinity();
+  const Case cases[] = {
+      {"NULL array", {}, 2, "loras: NULL array"},
+      {"too many", std::vector<mi_lora>(65, mi_lora{file_s.c_str(), 1.0}), 65, "at most 64"},
+      {"NULL path", {{nullptr, 1.0}}, 1, "loras[0].path is required"},
+      {"empty path", {{file_s.c_str(), 1.0}, {"", 1.0}}, 2, "loras[1].path is required"},
+      {"infinite strength", {{file_s.c_str(), inf}}, 1, "loras[0].strength"},
+      {"NaN strength", {{file_s.c_str(), std::nan("")}}, 1, "loras[0].strength"},
+      {"beyond float", {{file_s.c_str(), 1e300}}, 1, "loras[0].strength"},
+      {"missing file", {{missing_s.c_str(), 1.0}}, 1, "not found"},
+      {"directory", {{dir_s.c_str(), 1.0}}, 1, "not a regular file"},
+  };
+  for (const Case& c : cases) {
+    mi_gen_params p = gen_defaults();
+    p.prompt = "a cat";
+    p.loras = c.list.empty() ? nullptr : c.list.data();
+    p.loras_count = c.count;
+    EXPECT_EQ(mi_gen_params_validate(&p), MI_ERR_INVALID_ARGUMENT) << c.what;
+    EXPECT_NE(last_error().find(c.message), std::string::npos) << c.what << ": " << last_error();
+  }
+  // Valid: in order, with float strengths (negative allowed); 64 is the cap.
+  const mi_lora ok[] = {{file_s.c_str(), 0.75}, {file_s.c_str(), -0.5}};
+  mi_gen_params p = gen_defaults();
+  p.prompt = "a cat";
+  p.loras = ok;
+  p.loras_count = 2;
+  ASSERT_EQ(mi_gen_params_validate(&p), MI_OK) << last_error();
+  const mi::pipeline::Request q = mi::api::to_request(p);
+  ASSERT_EQ(q.loras.size(), 2u);
+  EXPECT_EQ(q.loras[0].path, file);
+  EXPECT_EQ(q.loras[0].strength, 0.75f);
+  EXPECT_EQ(q.loras[1].strength, -0.5f);
+  const std::vector<mi_lora> max(64, mi_lora{file_s.c_str(), 1.0});
+  p.loras = max.data();
+  p.loras_count = max.size();
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_OK) << last_error();
+  p.loras = nullptr;
+  p.loras_count = 0;
+
+  // The dataspace sampler needs its file, and it must exist; the other samplers ignore dataspace_path.
+  p.sampler = MI_SAMPLER_DATASPACE;
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("dataspace"), std::string::npos) << last_error();
+  p.dataspace_path = "";
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_ERR_INVALID_ARGUMENT);
+  p.dataspace_path = missing_s.c_str();
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("dataspace_path: file not found"), std::string::npos) << last_error();
+  p.dataspace_path = file_s.c_str();
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_OK) << last_error();
+  EXPECT_EQ(mi::api::to_request(p).dataspace_path, file);
+  p.sampler = MI_SAMPLER_EULER;
+  p.dataspace_path = missing_s.c_str();
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_OK) << last_error();
+
+  // The other new numbers go through the pipeline's checks.
+  p.dataspace_path = nullptr;
+  p.flow_multiplier = 0;
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("Flow multiplier"), std::string::npos) << last_error();
+  p.flow_multiplier = 1;
+  p.eta = -1;
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("eta"), std::string::npos) << last_error();
+  p.eta = 1;
+  p.s_noise = std::nan("");
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("s_noise"), std::string::npos) << last_error();
+}
+
+// Component files: each given one must exist and be a file (checked before CUDA); "" means the bundle's.
+TEST(CApi, ComponentFiles) {
+  mi::testing::TempDir dir("c_api_files");
+  make_fake_bundle(dir.path() / "bundle");
+  const std::string bundle = mi::util::path_utf8(dir.path() / "bundle");
+  const fs::path dit = dir.path() / "moss_int8.safetensors";
+  std::ofstream(dit) << "x";
+  const std::string dit_s = mi::util::path_utf8(dit);
+  const std::string missing = mi::util::path_utf8(dir.path() / "missing.safetensors");
+  const std::string folder = mi::util::path_utf8(dir.path());
+  for (const char* field : {"dit_file", "text_encoder_file", "vae_file"}) {
+    for (const std::string* path : {&missing, &folder}) {
+      mi_engine_params e = engine_defaults();
+      e.model_path = bundle.c_str();
+      const char*& slot = std::string(field) == "dit_file"            ? e.dit_file
+                          : std::string(field) == "text_encoder_file" ? e.text_encoder_file
+                                                                      : e.vae_file;
+      slot = path->c_str();
+      mi_engine* engine = nullptr;
+      EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT) << field;
+      EXPECT_EQ(engine, nullptr);
+      EXPECT_NE(last_error().find(std::string(field) + ": "), std::string::npos) << last_error();
+    }
+  }
+  mi_engine_params e = engine_defaults();
+  e.dit_file = dit_s.c_str();
+  e.text_encoder_file = "";
+  e.vae_file = nullptr;
+  const mi::pipeline::PipelineOptions o = mi::api::to_options(e);
+  EXPECT_EQ(o.dit_file, dit);
+  EXPECT_TRUE(o.text_encoder_file.empty());
+  EXPECT_TRUE(o.vae_file.empty());
+  // Unknown tier / attention values fail mi_engine_create before CUDA.
+  e = engine_defaults();
+  e.model_path = bundle.c_str();
+  e.tier = MI_TIER_MAX_ENUM;
+  mi_engine* engine = nullptr;
+  EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("tier: unknown value"), std::string::npos) << last_error();
+  e.tier = MI_TIER_AUTO;
+  e.attention = static_cast<mi_attention>(6);
+  EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("attention: unknown value 6"), std::string::npos) << last_error();
+  EXPECT_EQ(engine, nullptr);
+}
+
+// A synthetic pipeline result through the adapter: every P6 accessor's data and the PNG metadata.
+TEST(CApi, GenerationFromAPipelineResult) {
+  mi::pipeline::Request q;
+  q.model = "/models/MOSS-Image/base";
+  q.prompt = "a secret prompt";
+  q.negative_prompt = "blurry";
+  q.sampler = mi::pipeline::SamplerKind::kDpmpp2m;
+  q.scheduler = mi::pipeline::SchedulerKind::kKarras;
+  q.loras = {{"/loras/style.safetensors", 0.5f}};
+  mi::pipeline::Result r;
+  r.width = r.height = 16;
+  r.rgb.assign(16 * 16 * 3, 7);
+  r.seed = 42;
+  r.tier.requested = mi::planner::Tier::kAuto;
+  r.tier.effective = mi::planner::Tier::kHigh;
+  r.tier.precision = mi::planner::Precision::kInt8;
+  r.tier.attention = mi::planner::AttentionMode::kQ8Fp8;
+  r.tier.certified = true;
+  r.tier.certificate = "/models/moss_int8.mossinfer-cert.json";
+  r.tier.reason = "auto: certified q8_fp8";
+  r.gpu_arch = "sm_89";
+  r.dit_source = "/models/moss_int8.safetensors";
+  r.te_source = "/models/te_w4a8.safetensors";
+  r.te_precision = "w4a8";
+  r.vae_source = "/models/MOSS-Image/base/vae";
+  r.cond_token_report.total_tokens = 40;
+  r.cond_token_report.kept_tokens = 16;
+  r.cond_token_report.template_tokens = 12;
+  r.cond_token_report.max_length = 16;
+  r.cond_token_report.truncated = true;
+  r.uncond_token_report.total_tokens = 14;
+  r.uncond_token_report.kept_tokens = 14;
+  r.uncond_token_report.template_tokens = 12;
+  r.uncond_token_report.max_length = 16;
+  mi::lora::FileReport f;
+  f.file = "/loras/style.safetensors";
+  f.adapters = 6;
+  f.side_branch = 4;
+  f.merged = 2;
+  f.unknown = {"a: x", "b: y"};
+  f.warnings = {"blocks.0.attn.qkv: requantized"};
+  f.notes = {"alpha 8 from the metadata"};
+  r.loras = {f};
+  r.lora_warnings = f.warnings;
+  r.lora_notes = f.notes;
+
+  for (const bool include_prompts : {true, false}) {
+    mi::pipeline::Result copy = r;
+    const mi::api::Generation g = mi::api::to_generation(q, copy, include_prompts);
+    EXPECT_EQ(g.rgb.size(), 16u * 16 * 3);
+    EXPECT_EQ(g.tier.struct_size, sizeof(mi_tier_info));
+    EXPECT_EQ(g.tier.requested, MI_TIER_AUTO);
+    EXPECT_EQ(g.tier.effective, MI_TIER_HIGH);
+    EXPECT_EQ(g.tier.attention, MI_ATTENTION_Q8_FP8);
+    EXPECT_EQ(g.tier.certified, 1);
+    EXPECT_EQ(g.tier.dit_precision, MI_PRECISION_INT8);
+    EXPECT_EQ(g.tier.text_encoder_precision, MI_PRECISION_W4A8);
+    EXPECT_EQ(g.tier_reason, r.tier.reason);
+    EXPECT_EQ(g.certificate, r.tier.certificate);
+    EXPECT_EQ(g.gpu_arch, "sm_89");
+    EXPECT_EQ(g.dit_source, r.dit_source);
+    EXPECT_EQ(g.te_source, r.te_source);
+    EXPECT_EQ(g.vae_source, r.vae_source);
+    EXPECT_NO_THROW(mi::json::parse(g.quality_json)) << g.quality_json;
+    EXPECT_EQ(g.tokens[0].total_tokens, 40);
+    EXPECT_EQ(g.tokens[0].kept_tokens, 16);
+    EXPECT_EQ(g.tokens[0].prompt_tokens, 28);
+    EXPECT_EQ(g.tokens[0].dropped_tokens, 24);
+    EXPECT_EQ(g.tokens[0].max_length, 16);
+    EXPECT_EQ(g.tokens[0].truncated, 1);
+    EXPECT_EQ(g.tokens[1].prompt_tokens, 2);
+    EXPECT_EQ(g.tokens[1].truncated, 0);
+    ASSERT_EQ(g.loras.size(), 1u);
+    EXPECT_EQ(g.loras[0].struct_size, sizeof(mi_lora_report));
+    EXPECT_EQ(g.loras[0].adapters, 6);
+    EXPECT_EQ(g.loras[0].side_branch, 4);
+    EXPECT_EQ(g.loras[0].merged, 2);
+    EXPECT_EQ(g.loras[0].unknown_keys, 2);
+    EXPECT_EQ(g.loras[0].warnings, 1);
+    EXPECT_EQ(g.loras[0].notes, 1);
+    EXPECT_EQ(g.lora_files, std::vector<std::string>{f.file});
+    EXPECT_EQ(g.lora_warnings, f.warnings);
+    EXPECT_EQ(g.lora_notes, f.notes);
+    // The CLI's metadata chunks; the prompts only when asked.
+    ASSERT_EQ(g.png_text.size(), 2u);
+    EXPECT_EQ(g.png_text[0].first, "generation");
+    EXPECT_EQ(g.png_text[1].first, "parameters");
+    const mi::json::Value meta = mi::json::parse(g.png_text[0].second);
+    EXPECT_EQ(meta.at("schema").as_string(), "mossinfer.generation/1");
+    EXPECT_EQ(meta.at("sampler").as_string(), "dpmpp_2m");
+    EXPECT_EQ(meta.at("scheduler").as_string(), "karras");
+    EXPECT_EQ(meta.at("engine").at("tier").as_string(), "high");
+    EXPECT_EQ(meta.at("loras").as_array().at(0).at("name").as_string(), "style.safetensors");
+    EXPECT_EQ(meta.find("prompt") != nullptr, include_prompts);
+    EXPECT_EQ(g.png_text[1].second.find("a secret prompt") != std::string::npos, include_prompts);
+  }
+  // save_metadata off, or cancelled: no chunks.
+  mi::pipeline::Request no_meta = q;
+  no_meta.save_metadata = false;
+  mi::pipeline::Result copy = r;
+  EXPECT_TRUE(mi::api::to_generation(no_meta, copy, true).png_text.empty());
+  copy = r;
+  copy.cancelled = true;
+  EXPECT_TRUE(mi::api::to_generation(q, copy, true).png_text.empty());
+  // An empty te_precision is the bundle's bf16 text encoder; a bf16 DiT is BF16.
+  copy = r;
+  copy.te_precision.clear();
+  copy.tier.precision = mi::planner::Precision::kBf16;
+  const mi::api::Generation g = mi::api::to_generation(q, copy, true);
+  EXPECT_EQ(g.tier.text_encoder_precision, MI_PRECISION_BF16);
+  EXPECT_EQ(g.tier.dit_precision, MI_PRECISION_BF16);
+  // Reference needs no certificate: certified, also in the default decision of a generation cancelled before its tier
+  // was resolved.
+  mi::pipeline::Result early;
+  early.cancelled = true;
+  ASSERT_FALSE(early.tier.certified);
+  const mi::api::Generation e = mi::api::to_generation(q, early, true);
+  EXPECT_EQ(e.tier.requested, MI_TIER_AUTO);
+  EXPECT_EQ(e.tier.effective, MI_TIER_REFERENCE);
+  EXPECT_EQ(e.tier.attention, MI_ATTENTION_EXACT);
+  EXPECT_EQ(e.tier.certified, 1);
+  EXPECT_TRUE(e.png_text.empty());
+  // An uncertified lossy run stays uncertified.
+  copy = r;
+  copy.tier.certified = false;
+  EXPECT_EQ(mi::api::to_generation(q, copy, true).tier.certified, 0);
+}
+
+// mi_write_png: RGB8 to an atomic PNG without metadata.
+TEST(CApi, WritePng) {
+  mi::testing::TempDir dir("c_api_write_png");
+  const std::string path = mi::util::path_utf8(dir.path() / "preview.png");
+  std::vector<std::uint8_t> rgb(3 * 2 * 3);
+  for (std::size_t i = 0; i < rgb.size(); ++i) rgb[i] = static_cast<std::uint8_t>(i * 13);
+  ASSERT_EQ(mi_write_png(path.c_str(), rgb.data(), 3, 2), MI_OK) << last_error();
+  std::ifstream in(path, std::ios::binary);
+  const std::vector<std::uint8_t> png((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  ASSERT_GE(png.size(), 33u);
+  EXPECT_EQ(std::memcmp(png.data(), "\x89PNG\r\n\x1a\n", 8), 0);
+  const auto be32 = [&](std::size_t at) {
+    return (std::uint32_t{png[at]} << 24) | (std::uint32_t{png[at + 1]} << 16) | (std::uint32_t{png[at + 2]} << 8) | png[at + 3];
+  };
+  EXPECT_EQ(std::memcmp(png.data() + 12, "IHDR", 4), 0);
+  EXPECT_EQ(be32(16), 3u);  // width
+  EXPECT_EQ(be32(20), 2u);  // height
+  EXPECT_TRUE(mi::pipeline::read_png_text(png).empty());
+  // The same bytes as the pipeline's encoder.
+  EXPECT_EQ(png, mi::pipeline::encode_png_rgb8(rgb, 3, 2));
+
+  EXPECT_EQ(mi_write_png(nullptr, rgb.data(), 3, 2), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_write_png("", rgb.data(), 3, 2), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_write_png(path.c_str(), nullptr, 3, 2), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_write_png(path.c_str(), rgb.data(), 0, 2), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_write_png(path.c_str(), rgb.data(), 3, -2), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("[1, 16384]"), std::string::npos) << last_error();
+  EXPECT_EQ(mi_write_png(path.c_str(), rgb.data(), 16385, 1), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_write_png(path.c_str(), rgb.data(), 1, 16385), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_write_png(path.c_str(), rgb.data(), INT32_MAX, INT32_MAX), MI_ERR_INVALID_ARGUMENT);
+  const std::vector<std::uint8_t> row(16384 * 3, 9);  // the largest side is accepted
+  EXPECT_EQ(mi_write_png(path.c_str(), row.data(), 16384, 1), MI_OK) << last_error();
+  EXPECT_EQ(mi_write_png(mi::util::path_utf8(dir.path() / "no_such_dir" / "x.png").c_str(), rgb.data(), 3, 2), MI_ERR_IO);
 }
 
 TEST(CApi, StructSizeChecks) {
@@ -194,6 +675,36 @@ TEST(CApi, NullHandlesAndPointers) {
   EXPECT_EQ(mi_result_block_path(nullptr), MI_BLOCK_PATH_DEFAULT);
   EXPECT_EQ(mi_result_block_path_note(nullptr), nullptr);
   EXPECT_EQ(mi_save_png(nullptr, "x.png"), MI_ERR_INVALID_ARGUMENT);
+  // P6 accessors.
+  mi_tier_info tier{};
+  tier.struct_size = sizeof tier;
+  EXPECT_EQ(mi_result_tier(nullptr, &tier), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("result is NULL"), std::string::npos) << last_error();
+  EXPECT_EQ(mi_result_text(nullptr, MI_TEXT_TIER_REASON), nullptr);
+  EXPECT_EQ(mi_result_text(nullptr, MI_TEXT_QUALITY_JSON), nullptr);
+  mi_prompt_tokens tokens{};
+  tokens.struct_size = sizeof tokens;
+  EXPECT_EQ(mi_result_prompt_tokens(nullptr, 0, &tokens), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_result_lora_count(nullptr), 0);
+  mi_lora_report lr{};
+  lr.struct_size = sizeof lr;
+  EXPECT_EQ(mi_result_lora(nullptr, 0, &lr), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_result_lora_file(nullptr, 0), nullptr);
+  EXPECT_EQ(mi_result_message_count(nullptr, MI_MESSAGE_LORA_WARNING), 0);
+  EXPECT_EQ(mi_result_message(nullptr, MI_MESSAGE_LORA_NOTE, 0), nullptr);
+  EXPECT_NE(last_error().find("result is NULL"), std::string::npos) << last_error();
+  // The output struct's size is checked before the handle: a wrong one is an ABI mismatch.
+  tier.struct_size = sizeof tier - 4;
+  EXPECT_EQ(mi_result_tier(nullptr, &tier), MI_ERR_ABI_MISMATCH);
+  EXPECT_NE(last_error().find("mi_tier_info.struct_size"), std::string::npos) << last_error();
+  tokens.struct_size = sizeof tokens + 8;
+  EXPECT_EQ(mi_result_prompt_tokens(nullptr, 0, &tokens), MI_ERR_ABI_MISMATCH);
+  EXPECT_NE(last_error().find("mi_prompt_tokens.struct_size"), std::string::npos) << last_error();
+  lr.struct_size = 0;
+  EXPECT_EQ(mi_result_lora(nullptr, 0, &lr), MI_ERR_ABI_MISMATCH);
+  EXPECT_NE(last_error().find("mi_lora_report.struct_size"), std::string::npos) << last_error();
+  t.struct_size = 8;
+  EXPECT_EQ(mi_result_timings(nullptr, &t), MI_ERR_ABI_MISMATCH);
 }
 
 // Invalid requests fail with the pipeline's (the official app's) wording, without an engine.
@@ -222,7 +733,7 @@ TEST(CApi, InvalidGenParams) {
       {"layer out of range", [](mi_gen_params& p) { p.uncond_skip_layers = kOutOfRange, p.uncond_skip_layers_count = 1; },
        "block indices"},
       {"duplicate layers", [](mi_gen_params& p) { p.slg_layers = kDuplicate, p.slg_layers_count = 2; }, "unique"},
-      {"unknown sampler", [](mi_gen_params& p) { p.sampler = static_cast<mi_sampler>(7); }, "sampler"},
+      {"unknown sampler", [](mi_gen_params& p) { p.sampler = static_cast<mi_sampler>(9); }, "sampler"},
       {"preview interval", [](mi_gen_params& p) { p.preview_interval = 0; }, "preview_interval"},
   };
   for (const Case& c : cases) {
@@ -320,6 +831,11 @@ TEST(CApi, ReservedFieldsMustBeZero) {
   g._reserved0 = -1;
   EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_INVALID_ARGUMENT);
   EXPECT_NE(last_error().find("mi_gen_params._reserved0"), std::string::npos) << last_error();
+  g._reserved0 = 0;
+  EXPECT_EQ(g._reserved2, 0);
+  g._reserved2 = 3;
+  EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("mi_gen_params._reserved2"), std::string::npos) << last_error();
 
   mi::testing::TempDir dir("c_api_reserved");
   make_fake_bundle(dir.path() / "bundle");
@@ -337,6 +853,12 @@ TEST(CApi, ReservedFieldsMustBeZero) {
   EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT);
   EXPECT_EQ(engine, nullptr);
   EXPECT_NE(last_error().find("mi_engine_params._reserved1"), std::string::npos) << last_error();
+  e._reserved1 = 0;
+  EXPECT_EQ(e._reserved2, 0);
+  e._reserved2 = -4;
+  EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(engine, nullptr);
+  EXPECT_NE(last_error().find("mi_engine_params._reserved2"), std::string::npos) << last_error();
 
   // Output structs come back with their padding zeroed, whatever the caller left in it.
   mi_probe_info info;
@@ -707,6 +1229,123 @@ TEST_F(GpuCApi, Generate256TwoSteps) {
   EXPECT_EQ(doc.at("dit_blocks").at("path").as_string(), path == MI_BLOCK_PATH_FUSED ? "fused" : "op_by_op");
   EXPECT_EQ(doc.at("dit_blocks").at("note").as_string(), note);
   EXPECT_FALSE(doc.at("dit_stream").at("streamed").as_bool());
+  mi_result_free(r);
+}
+
+struct Previews {
+  std::vector<int> steps;
+  int width = 0, height = 0;
+  double mean = 0;
+};
+
+void on_preview(const uint8_t* rgb, int32_t width, int32_t height, int32_t step, void* user) {
+  auto& pv = *static_cast<Previews*>(user);
+  pv.steps.push_back(step);
+  pv.width = width;
+  pv.height = height;
+  double sum = 0;
+  const std::size_t n = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3;
+  for (std::size_t i = 0; i < n; ++i) sum += rgb[i];
+  pv.mean = sum / static_cast<double>(n);
+}
+
+// P6 options end to end: DPM++ 2M on the Karras schedule, previews, the PNG metadata, the tier and token accessors.
+TEST_F(GpuCApi, SamplerPreviewMetadataAndTier) {
+  Previews pv;
+  mi_gen_params p = small_request(3);
+  p.sampler = MI_SAMPLER_DPMPP_2M;
+  p.scheduler = MI_SCHEDULER_KARRAS;
+  p.preview_callback = on_preview;
+  p.preview_interval = 2;  // previews after step 2 and after the last step
+  p.save_metadata = 1;
+  p.user_data = &pv;
+  mi_result* r = nullptr;
+  ASSERT_EQ(mi_generate(engine_, &p, &r), MI_OK) << last_error();
+  EXPECT_EQ(pv.steps, (std::vector<int>{2, 3}));
+  EXPECT_EQ(pv.width, 256);
+  EXPECT_EQ(pv.height, 256);
+  EXPECT_GT(pv.mean, 1.0);
+  EXPECT_EQ(mi_result_steps_run(r), 3);
+
+  mi::testing::TempDir dir("c_api_p6");
+  const std::string png = mi::util::path_utf8(dir.path() / "meta.png");
+  ASSERT_EQ(mi_save_png(r, png.c_str()), MI_OK) << last_error();
+  std::ifstream in(png, std::ios::binary);
+  const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const std::vector<mi::pipeline::PngText> text = mi::pipeline::read_png_text(bytes);
+  ASSERT_EQ(text.size(), 2u);
+  EXPECT_EQ(text[0].keyword, "generation");
+  const mi::json::Value meta = mi::json::parse(text[0].text);
+  EXPECT_EQ(meta.at("sampler").as_string(), "dpmpp_2m");
+  EXPECT_EQ(meta.at("scheduler").as_string(), "karras");
+  EXPECT_EQ(meta.at("prompt").as_string(), p.prompt);
+  EXPECT_EQ(meta.at("steps").as_int(), 3);
+
+  mi_tier_info tier;
+  std::memset(&tier, 0xab, sizeof tier);
+  tier.struct_size = sizeof tier;
+  ASSERT_EQ(mi_result_tier(r, &tier), MI_OK) << last_error();
+  EXPECT_EQ(tier.struct_size, sizeof tier);
+  EXPECT_EQ(tier.requested, MI_TIER_AUTO);
+  EXPECT_NE(tier.effective, MI_TIER_AUTO);
+  EXPECT_NE(tier.attention, MI_ATTENTION_DEFAULT);
+  EXPECT_EQ(tier.dit_precision, MI_PRECISION_BF16);  // the bundle's DiT
+  EXPECT_EQ(tier.text_encoder_precision, MI_PRECISION_BF16);
+  if (tier.effective == MI_TIER_REFERENCE) {
+    EXPECT_EQ(tier.attention, MI_ATTENTION_EXACT);
+    EXPECT_EQ(tier.certified, 1);
+  }
+  const char* reason = mi_result_text(r, MI_TEXT_TIER_REASON);
+  ASSERT_NE(reason, nullptr);
+  std::printf("[c_api] tier auto -> effective %d, attention %d, certified %d: %s\n", tier.effective, tier.attention,
+              tier.certified, reason);
+  EXPECT_STRNE(mi_result_text(r, MI_TEXT_DIT_SOURCE), "");
+  EXPECT_STRNE(mi_result_text(r, MI_TEXT_GPU_ARCH), "");
+  EXPECT_NO_THROW(mi::json::parse(mi_result_text(r, MI_TEXT_QUALITY_JSON)));
+  EXPECT_EQ(mi_result_text(r, MI_TEXT_MAX_ENUM), nullptr);
+
+  mi_prompt_tokens tokens{};
+  tokens.struct_size = sizeof tokens;
+  ASSERT_EQ(mi_result_prompt_tokens(r, 0, &tokens), MI_OK) << last_error();
+  EXPECT_GT(tokens.prompt_tokens, 0);
+  EXPECT_GT(tokens.total_tokens, tokens.prompt_tokens);
+  EXPECT_EQ(tokens.kept_tokens, tokens.total_tokens);
+  EXPECT_EQ(tokens.truncated, 0);
+  EXPECT_EQ(tokens.max_length, 4096);
+  ASSERT_EQ(mi_result_prompt_tokens(r, 1, &tokens), MI_OK) << last_error();
+  EXPECT_GT(tokens.prompt_tokens, 0);  // "blurry" under CFG 3
+  EXPECT_EQ(mi_result_prompt_tokens(r, 2, &tokens), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_result_lora_count(r), 0);
+  mi_lora_report lr{};
+  lr.struct_size = sizeof lr;
+  EXPECT_EQ(mi_result_lora(r, 0, &lr), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_result_lora_file(r, 0), nullptr);
+  EXPECT_EQ(mi_result_message_count(r, MI_MESSAGE_LORA_WARNING), 0);
+  EXPECT_EQ(mi_result_message(r, MI_MESSAGE_LORA_WARNING, 0), nullptr);
+  EXPECT_EQ(mi_result_message_count(r, static_cast<mi_message_kind>(5)), 0);
+  const mi::json::Value doc = mi::json::parse(mi_result_report_json(r));
+  EXPECT_EQ(doc.at("request").at("sampler").as_string(), "dpmpp_2m");
+  mi_result_free(r);
+}
+
+// A program built against the 0.1.0 header (168-byte mi_gen_params) keeps the 0.1.0 behaviour: PNGs without metadata.
+TEST_F(GpuCApi, OldSizeWritesNoMetadata) {
+  mi_gen_params p;
+  std::memset(&p, 0x5a, sizeof p);  // the tail is not the caller's
+  ASSERT_EQ(mi_gen_params_init(&p, 168), MI_OK) << last_error();
+  p.prompt = "a red apple on a wooden table";
+  p.width = p.height = 256;
+  p.steps = 2;
+  mi_result* r = nullptr;
+  ASSERT_EQ(mi_generate(engine_, &p, &r), MI_OK) << last_error();
+  mi::testing::TempDir dir("c_api_old_size");
+  const std::string png = mi::util::path_utf8(dir.path() / "old.png");
+  ASSERT_EQ(mi_save_png(r, png.c_str()), MI_OK) << last_error();
+  std::ifstream in(png, std::ios::binary);
+  const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  EXPECT_TRUE(mi::pipeline::read_png_text(bytes).empty());
+  const mi::json::Value doc = mi::json::parse(mi_result_report_json(r));
+  EXPECT_EQ(doc.at("request").at("scheduler").as_string(), "moss");  // the later fields took their defaults
   mi_result_free(r);
 }
 

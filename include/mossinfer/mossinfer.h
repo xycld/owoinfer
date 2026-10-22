@@ -11,7 +11,9 @@
  *   the fields you need:
  *       mi_gen_params p;
  *       mi_gen_params_init(&p, sizeof p);
- *   The library rejects a struct_size it does not know with MI_ERR_ABI_MISMATCH. Structs only grow at the end;
+ *   Structs only grow at the end, and the library accepts every size a struct has had (the 0.1.0 sizes and today's):
+ *   it reads only the caller's struct_size bytes of an input struct (the later fields keep their defaults) and writes
+ *   only struct_size bytes of an output struct. Any other struct_size is rejected with MI_ERR_ABI_MISMATCH.
  *   MI_ABI_VERSION changes when an existing field or function changes meaning.
  * - Struct layouts are explicit: every field sits at its natural alignment with no compiler-inserted padding, and the
  *   gaps are named `_reserved*` int32 fields. *_init() zeroes them; input structs with a nonzero one are rejected with
@@ -64,7 +66,7 @@ extern "C" {
 /* ------------------------------------------------------------------------------------------------ version */
 
 #define MI_VERSION_MAJOR 0
-#define MI_VERSION_MINOR 1
+#define MI_VERSION_MINOR 2
 #define MI_VERSION_PATCH 0
 /* Incremented on every incompatible change of an existing function, struct field or enum value. */
 #define MI_ABI_VERSION 1
@@ -99,7 +101,13 @@ MOSSINFER_API const char* mi_last_error_message(void);
 /* ------------------------------------------------------------------------------------------------ capabilities */
 
 #define MI_CAP_PREVIEW 0x1u        /* mi_gen_params.preview_callback is called */
-#define MI_CAP_COMFYUI_MODELS 0x2u /* MI_MODEL_FORMAT_COMFYUI is accepted */
+#define MI_CAP_COMFYUI_MODELS 0x2u /* MI_MODEL_FORMAT_COMFYUI (a ComfyUI file as model_path) is accepted */
+/* mi_engine_params.dit_file / text_encoder_file / vae_file: single component files, ComfyUI / community INT8 ConvRot
+ * and W4A8 files included. */
+#define MI_CAP_MODEL_FILES 0x4u
+#define MI_CAP_LORA 0x8u           /* mi_gen_params.loras, mi_engine_params.lora_strict, mi_result_lora() */
+#define MI_CAP_TIERS 0x10u         /* mi_engine_params.tier / attention, mi_result_tier() */
+#define MI_CAP_SAMPLERS 0x20u      /* the samplers after MI_SAMPLER_AB2, the schedulers and the noise options */
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -161,7 +169,9 @@ typedef enum mi_mode {
 typedef enum mi_model_format {
   MI_MODEL_FORMAT_AUTO = 0,      /* a directory is a Hugging Face bundle; a file is a ComfyUI checkpoint */
   MI_MODEL_FORMAT_HF_BUNDLE = 1, /* {text_encoder, tokenizer, transformer, vae} directory (base or sft) */
-  MI_MODEL_FORMAT_COMFYUI = 2,   /* reserved: ComfyUI models folder / single file (MI_ERR_NOT_SUPPORTED for now) */
+  /* Reserved: a ComfyUI models folder / single file as model_path (MI_ERR_NOT_SUPPORTED for now). ComfyUI component
+   * files load through dit_file / text_encoder_file / vae_file next to a bundle (MI_CAP_MODEL_FILES). */
+  MI_MODEL_FORMAT_COMFYUI = 2,
   MI_MODEL_FORMAT_MAX_ENUM = 0x7fffffff
 } mi_model_format;
 
@@ -176,6 +186,36 @@ typedef enum mi_block_path {
   MI_BLOCK_PATH_FUSED_GRAPHS = 3,
   MI_BLOCK_PATH_MAX_ENUM = 0x7fffffff
 } mi_block_path;
+
+/* Quality tier (MI_CAP_TIERS). The weights fix the GEMM precision (an INT8 DiT runs INT8 GEMMs); the tier decides the
+ * attention kernel. A refused combination fails mi_generate() with MI_ERR_INVALID_ARGUMENT, naming the conflict. */
+typedef enum mi_tier {
+  MI_TIER_AUTO = 0,      /* the fastest certified configuration of the loaded models; else Reference for a bf16 DiT */
+  MI_TIER_REFERENCE = 1, /* bf16 DiT and text encoder, exact attention; refused for quantized files */
+  MI_TIER_HIGH = 2,      /* the loaded DiT's precision plus 8-bit attention (Q8_FP8 unless `attention` says otherwise) */
+  MI_TIER_TURBO = 3,     /* reserved: refused by this build */
+  MI_TIER_MAX_ENUM = 0x7fffffff
+} mi_tier;
+
+/* DiT attention kernel (MI_CAP_TIERS). The 8-bit modes are lossy (SageAttention-style). */
+typedef enum mi_attention {
+  MI_ATTENTION_DEFAULT = 0, /* the tier's choice */
+  MI_ATTENTION_EXACT = 1,   /* FlashAttention-2 */
+  MI_ATTENTION_Q8_FP16 = 2,
+  MI_ATTENTION_Q8_FP16_F32ACC = 3,
+  MI_ATTENTION_Q8_FP8 = 4,
+  MI_ATTENTION_Q8_FP8_F32ACC = 5,
+  MI_ATTENTION_MAX_ENUM = 0x7fffffff
+} mi_attention;
+
+/* Weight precision of a loaded model, for reporting (mi_tier_info). */
+typedef enum mi_precision {
+  MI_PRECISION_BF16 = 0, /* the bundle, or a bf16 single file */
+  MI_PRECISION_INT8 = 1, /* INT8 ConvRot (a DiT with any INT8 linear counts as INT8) */
+  MI_PRECISION_W4A8 = 2, /* 4-bit weights, 8-bit activations (text encoder files) */
+  MI_PRECISION_W4A4 = 3, /* 4-bit weights and activations (reserved) */
+  MI_PRECISION_MAX_ENUM = 0x7fffffff
+} mi_precision;
 
 typedef struct mi_engine_params {
   size_t struct_size;
@@ -195,12 +235,24 @@ typedef struct mi_engine_params {
   int32_t direct_io;               /* O_DIRECT weight reads (cold-cache behaviour); default 0 */
   mi_block_path block_path;        /* default MI_BLOCK_PATH_DEFAULT */
   int32_t _reserved1;              /* must be 0 */
+  /* Fields after the 0.1.0 layout (80 bytes), since 0.2.0. */
+  /* Component files used instead of the bundle's folders (MI_CAP_MODEL_FILES); the tokenizer and configs always come
+   * from model_path. UTF-8; NULL or "" = the bundle's. A given file must exist. */
+  const char* dit_file;            /* single-file DiT: INT8 ConvRot, mixed INT8/bf16 or bf16 (ComfyUI layout) */
+  const char* text_encoder_file;   /* INT8 ConvRot or W4A8 Qwen3.5 text encoder */
+  const char* vae_file;            /* single FLUX.2 VAE file */
+  mi_tier tier;                    /* default MI_TIER_AUTO */
+  mi_attention attention;          /* default MI_ATTENTION_DEFAULT */
+  int32_t lora_strict;             /* unknown LoRA keys and lossy merges fail the generation (MI_ERR_MODEL); default 0 */
+  int32_t _reserved2;              /* must be 0 */
 } mi_engine_params;
 
-/* Fills `params` with the defaults; struct_size must be sizeof(mi_engine_params) of the caller's header. */
+/* Fills the first `struct_size` bytes of `params` with the defaults. struct_size is sizeof(mi_engine_params) of the
+ * caller's header: 120, or 80 for a program built against the 0.1.0 header. */
 MOSSINFER_API mi_status mi_engine_params_init(mi_engine_params* params, size_t struct_size);
 
-/* Creates an engine on `params->device_index`. Checks the parameters and the model path and initializes CUDA; the
+/* Creates an engine on `params->device_index`. Checks the parameters, the model path and that the component files exist
+ * (their format is checked when they load, at the first mi_generate(): MI_ERR_MODEL) and initializes CUDA; the
  * weights load on the first mi_generate() (and stay resident as the plan allows). The strings are copied. The calling
  * thread's current CUDA context is restored before returning (also by mi_generate()). */
 MOSSINFER_API mi_status mi_engine_create(const mi_engine_params* params, mi_engine** out_engine);
@@ -218,10 +270,51 @@ MOSSINFER_API mi_status mi_cancel(mi_engine* engine);
 typedef struct mi_result mi_result;
 
 typedef enum mi_sampler {
-  MI_SAMPLER_EULER = 0, /* the reference flow-matching Euler step (default) */
-  MI_SAMPLER_AB2 = 1,   /* 2nd-order Adams-Bashforth */
+  MI_SAMPLER_EULER = 0,           /* the reference flow-matching Euler step (default) */
+  MI_SAMPLER_AB2 = 1,             /* 2nd-order Adams-Bashforth */
+  /* MI_CAP_SAMPLERS. The stochastic ones (EULER_ANCESTRAL, DPMPP_2M_SDE, ER_SDE) draw their noise from `seed`. */
+  MI_SAMPLER_EULER_ANCESTRAL = 2, /* uses eta and s_noise */
+  MI_SAMPLER_HEUN = 3,            /* 2 model calls per step */
+  MI_SAMPLER_DPMPP_2M = 4,
+  MI_SAMPLER_DPMPP_2M_SDE = 5,    /* uses eta and s_noise */
+  MI_SAMPLER_ER_SDE = 6,          /* uses s_noise */
+  MI_SAMPLER_RES_MULTISTEP = 7,
+  MI_SAMPLER_DATASPACE = 8,       /* few-step data-space sampler: needs dataspace_path; its schedule is the file's */
   MI_SAMPLER_MAX_ENUM = 0x7fffffff
 } mi_sampler;
+
+/* Sigma schedule (MI_CAP_SAMPLERS). MOSS with MI_SAMPLER_EULER is the official pipeline, bit for bit. */
+typedef enum mi_scheduler {
+  MI_SCHEDULER_MOSS = 0, /* the official grid snapped to the training sigmas (default; ignores flow_multiplier) */
+  MI_SCHEDULER_SIMPLE = 1,
+  MI_SCHEDULER_NORMAL = 2,
+  MI_SCHEDULER_KARRAS = 3,
+  MI_SCHEDULER_EXPONENTIAL = 4,
+  MI_SCHEDULER_BETA = 5,
+  MI_SCHEDULER_SGM_UNIFORM = 6,
+  MI_SCHEDULER_MAX_ENUM = 0x7fffffff
+} mi_scheduler;
+
+/* Layout of the initial noise (MI_CAP_SAMPLERS). */
+typedef enum mi_noise_layout {
+  MI_NOISE_LAYOUT_OFFICIAL = 0,     /* one draw per image, seeded per image (default) */
+  MI_NOISE_LAYOUT_BATCH_STREAM = 1, /* image 0 of one batch-shaped draw from the seed */
+  MI_NOISE_LAYOUT_MAX_ENUM = 0x7fffffff
+} mi_noise_layout;
+
+/* Noise of the stochastic samplers (MI_CAP_SAMPLERS). */
+typedef enum mi_noise_source {
+  MI_NOISE_SOURCE_PHILOX = 0,        /* torch's CUDA generator on a GPU-independent grid: the same on every GPU (default) */
+  MI_NOISE_SOURCE_PHILOX_DEVICE = 1, /* the same algorithm on this GPU's grid (torch.randn on this device) */
+  MI_NOISE_SOURCE_BROWNIAN_TREE = 2, /* k-diffusion's Brownian tree, on the CPU (up to ~380 MB of host memory at 4 MP) */
+  MI_NOISE_SOURCE_MAX_ENUM = 0x7fffffff
+} mi_noise_source;
+
+/* One runtime LoRA (MI_CAP_LORA). A fixed 16-byte layout without struct_size. */
+typedef struct mi_lora {
+  const char* path;  /* UTF-8, required; the file must exist */
+  double strength;   /* finite; 1 = as trained */
+} mi_lora;
 
 typedef enum mi_phase {
   MI_PHASE_TEXT_ENCODER = 0, /* entered even on a full embedding-cache hit */
@@ -246,7 +339,9 @@ typedef void (*mi_progress_fn)(const mi_progress* progress, void* user_data);
 /* Called once per generation, after planning and before the first phase. `explanation` is the plan in several
  * human-readable lines, `plan_json` the plan as one JSON object. Both are valid during the call only. */
 typedef void (*mi_plan_fn)(const char* explanation, const char* plan_json, void* user_data);
-/* Low-resolution RGB8 preview of the current latents. Not called unless mi_capabilities() has MI_CAP_PREVIEW. */
+/* Latent preview (MI_CAP_PREVIEW): RGB8 [height][width][3] at the requested image size, a linear latent -> RGB map of
+ * the x0 estimate after sampling step `step` (no VAE). Called after every preview_interval-th step and after the last
+ * one, before that step's progress callback. `rgb` is valid during the call only. */
 typedef void (*mi_preview_fn)(const uint8_t* rgb, int32_t width, int32_t height, int32_t step, void* user_data);
 
 /* One generation. Defaults mirror the MOSS-Image app's parameters.json. */
@@ -276,14 +371,36 @@ typedef struct mi_gen_params {
   mi_progress_fn progress_callback; /* optional */
   mi_plan_fn plan_callback;         /* optional */
   mi_preview_fn preview_callback;   /* optional; see MI_CAP_PREVIEW */
-  int32_t preview_interval;         /* steps between previews; default 1 */
+  int32_t preview_interval;         /* steps between previews, >= 1; default 1 */
   int32_t _reserved1;               /* must be 0 */
   void* user_data;                  /* passed to every callback */
+  /* Fields after the 0.1.0 layout (168 bytes), since 0.2.0. */
+  mi_scheduler scheduler;           /* default MI_SCHEDULER_MOSS */
+  mi_noise_layout noise_layout;     /* default MI_NOISE_LAYOUT_OFFICIAL */
+  mi_noise_source noise_source;     /* default MI_NOISE_SOURCE_PHILOX */
+  /* mi_save_png() embeds the generation settings ("generation" and "parameters" text chunks); default 1 (0 for a
+   * 168-byte struct). */
+  int32_t save_metadata;
+  double flow_multiplier;           /* flow sigma multiplier, finite and > 0; default 1.0 */
+  double eta;                       /* EULER_ANCESTRAL, DPMPP_2M_SDE; finite and >= 0; default 1.0 */
+  double s_noise;                   /* stochastic samplers' noise multiplier; finite and >= 0; default 1.0 */
+  /* MI_SAMPLER_DATASPACE's parameters file (UTF-8; required by it, and then it must exist); ignored by the other
+   * samplers. Default NULL. */
+  const char* dataspace_path;
+  /* Runtime LoRAs (MI_CAP_LORA), applied in order; at most 64. The array is read during mi_generate() only. A result
+   * with LoRAs is uncertified. Default none. */
+  const mi_lora* loras;
+  size_t loras_count;
+  int32_t include_prompts;          /* the metadata includes the prompt and negative prompt; default 1 (168 bytes: 0) */
+  int32_t _reserved2;               /* must be 0 */
 } mi_gen_params;
 
-/* Fills `params` with the defaults; struct_size must be sizeof(mi_gen_params) of the caller's header. */
+/* Fills the first `struct_size` bytes of `params` with the defaults. struct_size is sizeof(mi_gen_params) of the
+ * caller's header: 240, or 168 for a program built against the 0.1.0 header
+ * (whose generations then keep the 0.1.0 behaviour: save_metadata and include_prompts are 0). */
 MOSSINFER_API mi_status mi_gen_params_init(mi_gen_params* params, size_t struct_size);
-/* Checks `params` the way mi_generate() does, without an engine or GPU. MI_ERR_INVALID_ARGUMENT names the problem. */
+/* Checks `params` the way mi_generate() does, without an engine or GPU, the existence of the LoRA and dataspace files
+ * included. MI_ERR_INVALID_ARGUMENT names the problem. */
 MOSSINFER_API mi_status mi_gen_params_validate(const mi_gen_params* params);
 
 /* Runs one generation to completion. Returns MI_OK with the image, or MI_CANCELLED after mi_cancel() (the result then
@@ -363,9 +480,82 @@ MOSSINFER_API const char* mi_result_plan_explanation(const mi_result* result);
  * mi_save_png() on it. NULL (with mi_last_error_message() set) for a NULL result or when rendering fails (out of
  * memory). */
 MOSSINFER_API const char* mi_result_report_json(mi_result* result);
-/* Writes the image as a PNG (atomically: a temporary file renamed over `path`). MI_ERR_INVALID_ARGUMENT when the
- * result has no image (cancelled). */
+/* Writes the image as a PNG (atomically: a temporary file renamed over `path`). When mi_gen_params.save_metadata was
+ * set, the PNG carries the generation settings as text chunks (without the prompts when include_prompts was 0).
+ * MI_ERR_INVALID_ARGUMENT when the result has no image (cancelled). */
 MOSSINFER_API mi_status mi_save_png(mi_result* result, const char* path);
+
+/* The tier that ran (MI_CAP_TIERS). A generation cancelled before its tier was resolved reports requested AUTO and
+ * effective REFERENCE. */
+typedef struct mi_tier_info {
+  size_t struct_size;
+  mi_tier requested;                   /* mi_engine_params.tier */
+  mi_tier effective;                   /* never MI_TIER_AUTO */
+  mi_attention attention;              /* what ran; never MI_ATTENTION_DEFAULT */
+  int32_t certified;                   /* a quality certificate covers what ran (always 1 for REFERENCE) */
+  mi_precision dit_precision;          /* BF16 or INT8 */
+  mi_precision text_encoder_precision; /* BF16, INT8 or W4A8 */
+} mi_tier_info;
+/* `out` has struct_size set by the caller. */
+MOSSINFER_API mi_status mi_result_tier(const mi_result* result, mi_tier_info* out);
+
+typedef enum mi_result_text_kind {
+  MI_TEXT_TIER_REASON = 0,         /* what the tier chose and why */
+  MI_TEXT_CERTIFICATE = 1,         /* the certificate file used; "" for none */
+  MI_TEXT_GPU_ARCH = 2,            /* the GPU class certificates are matched on, e.g. "sm_89" */
+  MI_TEXT_DIT_SOURCE = 3,          /* the bundle's transformer folder, or dit_file */
+  MI_TEXT_TEXT_ENCODER_SOURCE = 4, /* the bundle's text_encoder folder, or text_encoder_file */
+  MI_TEXT_VAE_SOURCE = 5,          /* the bundle's vae folder, or vae_file */
+  MI_TEXT_QUALITY_JSON = 6,        /* the report's "quality" object, as JSON */
+  MI_TEXT_MAX_ENUM = 0x7fffffff
+} mi_result_text_kind;
+/* Owned by the result; "" when empty (e.g. cancelled early). NULL for a NULL result or an unknown kind. */
+MOSSINFER_API const char* mi_result_text(const mi_result* result, mi_result_text_kind kind);
+
+/* Token counts of one prompt as the text encoder saw it (chat template included). */
+typedef struct mi_prompt_tokens {
+  size_t struct_size;
+  int32_t total_tokens;    /* the formatted sequence before truncation */
+  int32_t kept_tokens;     /* min(total_tokens, max_length): what the text encoder received */
+  int32_t prompt_tokens;   /* tokens of the prompt text itself (total_tokens minus the template's) */
+  int32_t dropped_tokens;  /* total_tokens - kept_tokens */
+  int32_t max_length;      /* mi_gen_params.max_sequence_length */
+  int32_t truncated;       /* total_tokens > max_length: the end of the prompt was cut */
+} mi_prompt_tokens;
+/* negative = 0: the prompt; 1: the negative prompt (all zero when CFG is off). `out` has struct_size set by the
+ * caller. */
+MOSSINFER_API mi_status mi_result_prompt_tokens(const mi_result* result, int32_t negative, mi_prompt_tokens* out);
+
+/* How one LoRA file was read and applied (MI_CAP_LORA), in mi_gen_params.loras order. */
+typedef struct mi_lora_report {
+  size_t struct_size;
+  int32_t adapters;      /* adapters applied (a fused qkv adapter counts as three) */
+  int32_t side_branch;   /* of them run as side branches (a strength change is instant) */
+  int32_t merged;        /* of them merged into the DiT at load */
+  int32_t unknown_keys;  /* tensors not applied */
+  int32_t warnings;      /* adapters applied with a loss (e.g. requantized on INT8 GEMMs) */
+  int32_t notes;         /* remarks on how the file was read (e.g. the metadata alpha applied) */
+} mi_lora_report;
+MOSSINFER_API int32_t mi_result_lora_count(const mi_result* result);
+/* `index` in [0, mi_result_lora_count()); `out` has struct_size set by the caller. */
+MOSSINFER_API mi_status mi_result_lora(const mi_result* result, int32_t index, mi_lora_report* out);
+/* The file of LoRA `index`; owned by the result. NULL for a NULL result or an index out of range. */
+MOSSINFER_API const char* mi_result_lora_file(const mi_result* result, int32_t index);
+
+typedef enum mi_message_kind {
+  MI_MESSAGE_LORA_WARNING = 0, /* losses to show the user, "<module>: <reason>" */
+  MI_MESSAGE_LORA_NOTE = 1,    /* how the files were read */
+  MI_MESSAGE_MAX_ENUM = 0x7fffffff
+} mi_message_kind;
+/* 0 for a NULL result or an unknown kind. */
+MOSSINFER_API int32_t mi_result_message_count(const mi_result* result, mi_message_kind kind);
+/* Owned by the result. NULL for a NULL result, an unknown kind or an index out of range. */
+MOSSINFER_API const char* mi_result_message(const mi_result* result, mi_message_kind kind, int32_t index);
+
+/* Writes RGB8 [height][width][3] as a PNG without metadata, atomically (a temporary file renamed over `path`); meant
+ * for previews. MI_ERR_INVALID_ARGUMENT for a NULL or empty path, NULL `rgb` or a side outside [1, 16384]; MI_ERR_IO when
+ * the file cannot be written. */
+MOSSINFER_API mi_status mi_write_png(const char* path, const uint8_t* rgb, int32_t width, int32_t height);
 /* NULL is a no-op. */
 MOSSINFER_API void mi_result_free(mi_result* result);
 

@@ -47,6 +47,7 @@
 
 #include "json_out.h"
 #include "mossinfer/mossinfer.h"
+#include "names.h"
 #include "util/json.h"
 
 namespace {
@@ -132,10 +133,15 @@ class Params {
   // Rejects members not in `known` (typos would otherwise be silently ignored).
   void only(std::initializer_list<std::string_view> known) const {
     if (obj_ == nullptr) return;
-    for (const auto& [k, v] : *obj_) {
+    for (std::size_t i = 0; i < obj_->size(); ++i) {
+      const std::string& k = (*obj_)[i].first;
       bool ok = false;
       for (const std::string_view n : known) ok = ok || k == n;
       if (!ok) throw RequestError("invalid_params", "unknown parameter \"" + k + "\"");
+      // A repeated parameter would silently lose one of its values.
+      for (std::size_t j = 0; j < i; ++j) {
+        if ((*obj_)[j].first == k) throw RequestError("invalid_params", "parameter \"" + k + "\" given more than once");
+      }
     }
   }
   const Value* find(std::string_view key) const {
@@ -206,6 +212,52 @@ class Params {
       }
       out.push_back(static_cast<std::int32_t>(std::stoi(digits)));
       pos = comma + 1;
+    }
+    return out;
+  }
+
+  // One of the names in `table` (names.h), as its C enum value.
+  template <class E, std::size_t N>
+  std::optional<E> name(std::string_view key, const mi::server::Name<E> (&table)[N]) const {
+    const std::optional<std::string> v = string(key);
+    if (!v) return std::nullopt;
+    std::string names;
+    for (std::size_t i = 0; i < N; ++i) {
+      if (*v == table[i].name) return table[i].value;
+      names += std::string(i == 0 ? "" : i + 1 == N ? " or " : ", ") + "\"" + std::string(table[i].name) + "\"";
+    }
+    throw bad(key, names);
+  }
+  // `loras`: an array of {"path": string, "strength": number (default 1)}.
+  std::optional<std::vector<std::pair<std::string, double>>> loras(std::string_view key) const {
+    const Value* v = find(key);
+    if (v == nullptr) return std::nullopt;
+    if (!v->is_array()) throw bad(key, "an array of {\"path\", \"strength\"} objects");
+    std::vector<std::pair<std::string, double>> out;
+    for (const Value& e : v->as_array()) {
+      const std::string item = std::string(key) + "[" + std::to_string(out.size()) + "]";
+      if (!e.is_object()) throw bad(item, "an object {\"path\": string, \"strength\": number}");
+      std::optional<std::string> path;
+      double strength = 1.0;
+      bool have_strength = false;
+      for (const auto& [k, m] : e.as_object()) {
+        if ((k == "path" && path) || (k == "strength" && have_strength)) {
+          throw RequestError("invalid_params", "\"" + item + "\" has \"" + k + "\" more than once");
+        }
+        if (k == "path") {
+          if (!m.is_string() || m.as_string().empty()) throw bad(item + ".path", "a non-empty string (the LoRA file)");
+          if (m.as_string().find('\0') != std::string::npos) throw bad(item + ".path", "a string without NUL characters");
+          path = m.as_string();
+        } else if (k == "strength") {
+          if (!m.is_number()) throw bad(item + ".strength", "a number");
+          strength = m.as_double();
+          have_strength = true;
+        } else {
+          throw RequestError("invalid_params", "\"" + item + "\" has an unknown member \"" + k + "\"");
+        }
+      }
+      if (!path) throw RequestError("invalid_params", "\"" + item + ".path\" (the LoRA file) is required");
+      out.emplace_back(*path, strength);
     }
     return out;
   }
@@ -350,7 +402,9 @@ class Server {
     return "{\"protocol_version\":" + std::to_string(kProtocolVersion) + ",\"server\":\"moss-server\",\"version\":" +
            str(mi_version()) + ",\"abi_version\":" + std::to_string(mi_abi_version()) +
            ",\"capabilities\":{\"preview\":" + tf(caps & MI_CAP_PREVIEW) + ",\"comfyui_models\":" +
-           tf(caps & MI_CAP_COMFYUI_MODELS) + "},\"probe\":{\"driver_cuda_version\":" +
+           tf(caps & MI_CAP_COMFYUI_MODELS) + ",\"model_files\":" + tf(caps & MI_CAP_MODEL_FILES) + ",\"lora\":" +
+           tf(caps & MI_CAP_LORA) + ",\"tiers\":" + tf(caps & MI_CAP_TIERS) + ",\"samplers\":" + tf(caps & MI_CAP_SAMPLERS) +
+           "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
            ",\"supported_device_count\":" + std::to_string(probe.supported_device_count) +
@@ -360,7 +414,8 @@ class Server {
 
   std::string load(const Params& p, const std::string& id) {
     p.only({"model", "mode", "device", "vram_budget_bytes", "vram_reserve_bytes", "host_ram_budget_bytes", "cache_dir",
-            "embedding_cache", "direct_io", "block_path"});
+            "embedding_cache", "direct_io", "block_path", "dit_file", "text_encoder_file", "vae_file", "tier", "attention",
+            "lora_strict"});
     if (generating()) throw RequestError("busy", "a generation is running; cancel it or wait for its done event");
     mi_engine_params e;
     if (const mi_status s = mi_engine_params_init(&e, sizeof e); s != MI_OK) throw_status(s);
@@ -390,6 +445,15 @@ class Server {
       else throw RequestError("invalid_params",
                               "\"block_path\" must be \"default\", \"op_by_op\", \"fused\" or \"fused_graphs\"");
     }
+    const std::optional<std::string> dit_file = p.string("dit_file");
+    const std::optional<std::string> te_file = p.string("text_encoder_file");
+    const std::optional<std::string> vae_file = p.string("vae_file");
+    if (dit_file) e.dit_file = dit_file->c_str();
+    if (te_file) e.text_encoder_file = te_file->c_str();
+    if (vae_file) e.vae_file = vae_file->c_str();
+    if (const auto v = p.name("tier", mi::server::kTierNames)) e.tier = *v;
+    if (const auto v = p.name("attention", mi::server::kAttentionNames)) e.attention = *v;
+    if (const auto v = p.boolean("lora_strict")) e.lora_strict = *v ? 1 : 0;
     // The old engine goes first: two engines would hold two arenas.
     join_worker();
     mi_engine_free(engine_);
@@ -408,9 +472,9 @@ class Server {
 
   std::string generate(const Params& p, const std::string& id) {
     p.only({"output", "prompt", "negative_prompt", "width", "height", "steps", "cfg", "shift", "seed", "uncond_skip_layers",
-            "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length", "sampler"});
-    if (engine_ == nullptr) throw RequestError("no_engine", "no model loaded; send \"load\" first");
-    if (generating()) throw RequestError("busy", "a generation is running; cancel it or wait for its done event");
+            "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length", "sampler", "scheduler",
+            "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise", "dataspace", "loras", "save_metadata",
+            "include_prompts", "preview_output", "preview_every"});
     auto w = std::make_unique<Work>();
     mi_gen_params& g = w->params;
     if (const mi_status s = mi_gen_params_init(&g, sizeof g); s != MI_OK) throw_status(s);
@@ -446,14 +510,46 @@ class Server {
     if (const auto v = p.number("slg_start")) g.slg_start = *v;
     if (const auto v = p.number("slg_stop")) g.slg_stop = *v;
     if (const auto v = p.integer("max_sequence_length", 0, kI32)) g.max_sequence_length = static_cast<std::int32_t>(*v);
-    if (const auto v = p.string("sampler")) {
-      if (*v == "euler") g.sampler = MI_SAMPLER_EULER;
-      else if (*v == "ab2") g.sampler = MI_SAMPLER_AB2;
-      else throw RequestError("invalid_params", "\"sampler\" must be \"euler\" or \"ab2\"");
+    if (const auto v = p.name("sampler", mi::server::kSamplerNames)) g.sampler = *v;
+    if (const auto v = p.name("scheduler", mi::server::kSchedulerNames)) g.scheduler = *v;
+    if (const auto v = p.name("noise_layout", mi::server::kNoiseLayoutNames)) g.noise_layout = *v;
+    if (const auto v = p.name("noise_source", mi::server::kNoiseSourceNames)) g.noise_source = *v;
+    if (const auto v = p.number("flow_multiplier")) g.flow_multiplier = *v;
+    if (const auto v = p.number("eta")) g.eta = *v;
+    if (const auto v = p.number("s_noise")) g.s_noise = *v;
+    if (const auto v = p.string("dataspace")) {
+      w->dataspace = *v;
+      g.dataspace_path = w->dataspace.c_str();
+    }
+    if (auto v = p.loras("loras")) {
+      // Every path is stored before the array points into them.
+      for (auto& [path, strength] : *v) w->lora_paths.push_back(std::move(path));
+      for (std::size_t i = 0; i < v->size(); ++i) w->loras.push_back({w->lora_paths[i].c_str(), (*v)[i].second});
+      g.loras = w->loras.data();
+      g.loras_count = w->loras.size();
+    }
+    if (const auto v = p.boolean("save_metadata")) g.save_metadata = *v ? 1 : 0;
+    if (const auto v = p.boolean("include_prompts")) g.include_prompts = *v ? 1 : 0;
+    const auto preview_every = p.integer("preview_every", 1, kI32);
+    if (const auto v = p.string("preview_output")) {
+      if (v->empty()) throw RequestError("invalid_params", "\"preview_output\" must be a PNG path");
+      w->preview = *v;
+      g.preview_interval = static_cast<std::int32_t>(preview_every.value_or(1));
+    } else if (preview_every) {
+      throw RequestError("invalid_params", "\"preview_every\" needs \"preview_output\"");
     }
     if (const mi_status s = mi_gen_params_validate(&g); s != MI_OK) {
-      throw RequestError(s == MI_ERR_INVALID_ARGUMENT ? "invalid_params" : status_code(s), mi_last_error_message());
+      // The engine names its C field; the protocol's parameter is "dataspace".
+      std::string message = mi_last_error_message();
+      for (std::size_t at = 0; (at = message.find("dataspace_path", at)) != std::string::npos;) {
+        message.replace(at, 14, "dataspace");
+        at += 9;
+      }
+      throw RequestError(s == MI_ERR_INVALID_ARGUMENT ? "invalid_params" : status_code(s), message);
     }
+    // The request is checked first (no engine or GPU needed), then the server's state.
+    if (engine_ == nullptr) throw RequestError("no_engine", "no model loaded; send \"load\" first");
+    if (generating()) throw RequestError("busy", "a generation is running; cancel it or wait for its done event");
     join_worker();
     job_ = std::make_unique<Job>();
     job_->id = id;
@@ -461,6 +557,7 @@ class Server {
     w->out = &out_;
     g.progress_callback = on_progress;
     g.plan_callback = on_plan;
+    if (!w->preview.empty()) g.preview_callback = on_preview;
     g.user_data = w.get();
     // Busy before the thread exists (it clears the flag when it finishes, possibly before std::thread returns), and
     // idle again if the thread cannot be started.
@@ -512,8 +609,10 @@ class Server {
   // One generation's inputs; owned by the worker thread.
   struct Work {
     mi_gen_params params{};
-    std::string output, prompt, negative;
+    std::string output, prompt, negative, dataspace, preview;
     std::vector<std::int32_t> uncond, slg;
+    std::vector<std::string> lora_paths;
+    std::vector<mi_lora> loras;  // points into lora_paths
     Job* job = nullptr;
     Output* out = nullptr;
     mi_engine* engine = nullptr;
@@ -539,6 +638,40 @@ class Server {
                 ",\"plan\":" + one_line(plan_json) + "}");
   }
 
+  // Rewrites the preview PNG, then announces it. A failed write is logged; the generation goes on.
+  static void on_preview(const std::uint8_t* rgb, std::int32_t width, std::int32_t height, std::int32_t step, void* user) {
+    Work& w = *static_cast<Work*>(user);
+    Job& job = *w.job;
+    if (mi_write_png(w.preview.c_str(), rgb, width, height) != MI_OK) {
+      w.out->log("warning", "preview not written: " + std::string(mi_last_error_message()), job.id);
+      return;
+    }
+    w.out->emit("{\"event\":\"preview\",\"id\":" + job.id + ",\"step\":" + std::to_string(step) + ",\"total_steps\":" +
+                std::to_string(job.total_steps.load()) + ",\"image\":" + str(w.preview) + ",\"width\":" +
+                std::to_string(width) + ",\"height\":" + std::to_string(height) + "}");
+  }
+
+  // done.warnings: the LoRA warnings and prompt truncation, for launchers that do not read the report.
+  static std::string warnings_json(const mi_result* r) {
+    std::string out;
+    const auto add = [&](const std::string& w) { out += (out.empty() ? "" : ",") + str(w); };
+    if (r != nullptr) {
+      const std::int32_t n = mi_result_message_count(r, MI_MESSAGE_LORA_WARNING);
+      for (std::int32_t i = 0; i < n; ++i) {
+        if (const char* m = mi_result_message(r, MI_MESSAGE_LORA_WARNING, i)) add(std::string("LoRA ") + m);
+      }
+      for (const std::int32_t negative : {0, 1}) {
+        mi_prompt_tokens t{};
+        t.struct_size = sizeof t;
+        if (mi_result_prompt_tokens(r, negative, &t) != MI_OK || !t.truncated) continue;
+        add(std::string(negative ? "negative prompt" : "prompt") + " truncated to " + std::to_string(t.kept_tokens) + " of " +
+            std::to_string(t.total_tokens) + " tokens (" + std::to_string(t.dropped_tokens) +
+            " dropped; max_sequence_length " + std::to_string(t.max_length) + ")");
+      }
+    }
+    return "[" + out + "]";
+  }
+
   void run(Work& w) {
     w.engine = engine_;
     Job& job = *w.job;
@@ -558,6 +691,7 @@ class Server {
     } else {
       done += ",\"status\":\"error\",\"error\":" + error_json(status_code(s), mi_last_error_message());
     }
+    done += ",\"warnings\":" + warnings_json(r);
     mi_result_free(r);
     // Idle before the done line goes out: a client may send the next generate as soon as it reads it.
     running_.store(false);

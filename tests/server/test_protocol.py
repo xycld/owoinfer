@@ -44,6 +44,39 @@ def process_gone(pid):
         return False
 
 
+def png_chunks(path):
+    """(type, data) of every chunk of the PNG at `path`."""
+    with open(path, "rb") as f:
+        data = f.read()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG: " + path
+    pos, chunks = 8, []
+    while pos < len(data):
+        n = int.from_bytes(data[pos:pos + 4], "big")
+        chunks.append((data[pos + 4:pos + 8], data[pos + 8:pos + 8 + n]))
+        pos += 12 + n
+    return chunks
+
+
+def png_size(path):
+    ihdr = png_chunks(path)[0][1]
+    return int.from_bytes(ihdr[0:4], "big"), int.from_bytes(ihdr[4:8], "big")
+
+
+def png_text(path):
+    """keyword -> text of the tEXt and uncompressed iTXt chunks."""
+    out = {}
+    for kind, body in png_chunks(path):
+        if kind == b"tEXt":
+            key, _, text = body.partition(b"\0")
+            out[key.decode("latin-1")] = text.decode("latin-1")
+        elif kind == b"iTXt":
+            key, _, rest = body.partition(b"\0")
+            if rest[0] == 0:  # uncompressed: flag, method, language\0, translated keyword\0, text
+                rest = rest[2:].split(b"\0", 2)[2]
+                out[key.decode("latin-1")] = rest.decode("utf-8")
+    return out
+
+
 def wait_gone(pid, timeout):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -178,7 +211,8 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertEqual(res["server"], "moss-server")
         self.assertRegex(res["version"], r"^\d+\.\d+\.\d+$")
         self.assertEqual(res["abi_version"], 1)
-        self.assertEqual(res["capabilities"], {"preview": False, "comfyui_models": False})
+        self.assertEqual(res["capabilities"], {"preview": True, "comfyui_models": False, "model_files": True,
+                                               "lora": True, "tiers": True, "samplers": True})
         probe = res["probe"]
         self.assertGreaterEqual(probe["device_count"], probe["supported_device_count"])
         self.assertIn(probe["recommended_flavour"], ("cu12", "cu13", ""))
@@ -242,6 +276,90 @@ class CpuProtocolTest(ProtocolTestBase):
             self.assertError(r, "invalid_argument", 20 + i)
             self.assertIn("not found", r["error"]["message"])
         self.assertEqual(self.server.call("status")["result"], {"state": "unloaded"})
+
+    def test_p6_load_params(self):
+        missing = os.path.join(self.tmp, "missing")
+        bad = [({"tier": "fast"}, "tier"), ({"tier": 1}, "tier"), ({"attention": "q8"}, "attention"),
+               ({"attention": "auto"}, "attention"), ({"lora_strict": 1}, "lora_strict"), ({"dit_file": 5}, "dit_file"),
+               ({"text_encoder_file": ["x"]}, "text_encoder_file"), ({"vae_file": "a\u0000b"}, "vae_file")]
+        for i, (params, name) in enumerate(bad):
+            r = self.server.call("load", dict(params, model=missing), id=i)
+            self.assertError(r, "invalid_params", i)
+            self.assertIn(name, r["error"]["message"])
+        # Every name passes the server and reaches the engine's own checks (here: the missing bundle).
+        for i, tier in enumerate(("auto", "reference", "high", "turbo")):
+            r = self.server.call("load", {"model": missing, "tier": tier}, id="t%d" % i)
+            self.assertError(r, "invalid_argument", "t%d" % i)
+        for i, att in enumerate(("default", "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc")):
+            r = self.server.call("load", {"model": missing, "attention": att, "lora_strict": True}, id="a%d" % i)
+            self.assertError(r, "invalid_argument", "a%d" % i)
+            self.assertIn("not found", r["error"]["message"])
+        # Component files must exist (checked before CUDA); "" means the bundle's.
+        bundle = self.fake_bundle()
+        for key in ("dit_file", "text_encoder_file", "vae_file"):
+            r = self.server.call("load", {"model": bundle, key: missing}, id=key)
+            self.assertError(r, "invalid_argument", key)
+            self.assertIn(key, r["error"]["message"])
+        r = self.server.call("load", {"model": bundle, "dit_file": "", "vram_budget_bytes": 1000}, id="empty")
+        self.assertError(r, "invalid_argument", "empty")
+        self.assertIn("vram_budget_bytes", r["error"]["message"])
+        self.assertEqual(self.server.call("status")["result"], {"state": "unloaded"})
+
+    def test_p6_generate_params(self):
+        # The request is checked before the server's state: no engine is needed for these.
+        lora = os.path.join(self.tmp, "style.safetensors")
+        open(lora, "wb").close()
+        base = {"prompt": "a cat", "output": os.path.join(self.tmp, "x.png")}
+        bad = [
+            ({"sampler": "euler_a"}, "sampler"), ({"sampler": 2}, "sampler"), ({"scheduler": "Karras"}, "scheduler"),
+            ({"noise_layout": "batch"}, "noise_layout"), ({"noise_source": "cpu"}, "noise_source"),
+            ({"flow_multiplier": "1"}, "flow_multiplier"), ({"flow_multiplier": 0}, "Flow multiplier"),
+            ({"eta": -1}, "eta"), ({"s_noise": True}, "s_noise"), ({"dataspace": 3}, "dataspace"),
+            ({"sampler": "dataspace"}, "dataspace"),
+            ({"sampler": "dataspace", "dataspace": os.path.join(self.tmp, "missing.safetensors")}, "not found"),
+            ({"loras": {"path": lora}}, "loras"), ({"loras": [lora]}, "loras[0]"),
+            ({"loras": [{"strength": 1}]}, "loras[0].path"), ({"loras": [{"path": ""}]}, "loras[0].path"),
+            ({"loras": [{"path": lora, "scale": 1}]}, "scale"), ({"loras": [{"path": lora, "strength": "1"}]}, "strength"),
+            ({"loras": [{"path": lora}, {"path": os.path.join(self.tmp, "missing.safetensors")}]}, "loras[1].path"),
+            ({"loras": [{"path": lora, "strength": 1e300}]}, "strength"),
+            ({"save_metadata": 1}, "save_metadata"), ({"include_prompts": "no"}, "include_prompts"),
+            ({"preview_every": 2}, "preview_output"), ({"preview_output": ""}, "preview_output"),
+            ({"preview_output": 5}, "preview_output"),
+            ({"preview_output": os.path.join(self.tmp, "p.png"), "preview_every": 0}, "preview_every"),
+        ]
+        for i, (params, text) in enumerate(bad):
+            r = self.server.call("generate", dict(base, **params), id=i)
+            self.assertError(r, "invalid_params", i)
+            self.assertIn(text, r["error"]["message"], params)
+        # Every name of every enum, and the other new params, pass validation: the answer is then no_engine.
+        names = {"sampler": ["euler", "ab2", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "er_sde",
+                             "res_multistep"],
+                 "scheduler": ["moss", "simple", "normal", "karras", "exponential", "beta", "sgm_uniform"],
+                 "noise_layout": ["official", "batch_stream"], "noise_source": ["philox", "philox_device", "brownian_tree"]}
+        for key, values in names.items():
+            for v in values:
+                self.assertError(self.server.call("generate", dict(base, **{key: v}), id=v), "no_engine", v)
+        ok = dict(base, sampler="dataspace", dataspace=lora, loras=[{"path": lora, "strength": 0.5}, {"path": lora}],
+                  flow_multiplier=1.5, eta=0.5, s_noise=1.0, save_metadata=False, include_prompts=False,
+                  preview_output=os.path.join(self.tmp, "p.png"), preview_every=2)
+        self.assertError(self.server.call("generate", ok, id="ok"), "no_engine", "ok")
+        self.assertError(self.server.call("generate", dict(base, loras=[]), id="none"), "no_engine", "none")
+        # The dataspace errors name the protocol's parameter, not the C field.
+        for i, extra in enumerate(({}, {"dataspace": os.path.join(self.tmp, "missing.safetensors")})):
+            r = self.server.call("generate", dict(base, sampler="dataspace", **extra), id="ds%d" % i)
+            self.assertError(r, "invalid_params", "ds%d" % i)
+            self.assertIn("dataspace", r["error"]["message"])
+            self.assertNotIn("dataspace_path", r["error"]["message"])
+        # Repeated members are rejected, in a LoRA entry and among the params (raw lines: json.dumps cannot repeat).
+        out = json.dumps(base["output"])
+        for i, params in enumerate(('"loras": [{"path": %s, "path": %s}]' % (json.dumps(lora), json.dumps(lora)),
+                                    '"loras": [{"path": %s, "strength": 1, "strength": 2}]' % json.dumps(lora),
+                                    '"steps": 2, "steps": 3', '"sampler": "heun", "sampler": "euler"')):
+            line = '{"id": "dup%d", "method": "generate", "params": {"prompt": "a cat", "output": %s, %s}}\n' % (i, out, params)
+            self.server.send_raw(line.encode("utf-8"))
+            r = self.server.read()
+            self.assertError(r, "invalid_params", "dup%d" % i)
+            self.assertIn("more than once", r["error"]["message"])
 
     def test_load_errors_are_engine_statuses(self):
         missing = os.path.join(self.tmp, "missing")
@@ -458,6 +576,63 @@ class GpuProtocolTest(ProtocolTestBase):
         self.assertIn("NUL", r["error"]["message"])
         self.assertEqual(self.server.call("shutdown")["result"], {})
         self.assertEqual(self.server.proc.wait(timeout=TIMEOUT), 0)
+
+    def test_p6_preview_sampler_metadata(self):
+        self.load_base()
+        out = os.path.join(self.tmp, "p6.png")
+        preview = os.path.join(self.tmp, "preview.png")
+        events = []
+        # max_sequence_length 16 truncates the prompt (its chat template alone is longer): done.warnings says so.
+        gid = self.server.send("generate", {"prompt": "a red apple on a wooden table, studio light, high detail",
+                                            "width": 256, "height": 256, "steps": 3, "seed": 7,
+                                            "sampler": "euler_ancestral", "scheduler": "karras", "eta": 1.0,
+                                            "save_metadata": True, "max_sequence_length": 16,
+                                            "preview_output": preview, "output": out}, id="p6")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        # While it runs, an invalid request still gets invalid_params (validation comes before busy).
+        bad = self.server.send("generate", {"prompt": "x", "sampler": "euler_a", "output": out}, id="bad-while-busy")
+        r = self.server.response(bad, events=events)
+        self.assertError(r, "invalid_params", "bad-while-busy")
+        self.assertIn("sampler", r["error"]["message"])
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "ok", done)
+        previews = [e for e in events if e["event"] == "preview"]
+        self.assertEqual([e["step"] for e in previews], [1, 2, 3])
+        for e in previews:
+            self.assertEqual((e["id"], e["image"], e["width"], e["height"], e["total_steps"]), ("p6", preview, 256, 256, 3))
+        # Each preview event follows its write and precedes that step's progress event.
+        kinds = [(e["event"], e["step"]) for e in events
+                 if e["event"] == "preview" or (e["event"] == "progress" and e["phase"] == "denoise")]
+        self.assertEqual(kinds, [("progress", 0), ("preview", 1), ("progress", 1), ("preview", 2), ("progress", 2),
+                                 ("preview", 3), ("progress", 3)])
+        self.assertEqual(png_size(preview), (256, 256))
+        self.assertNotIn("generation", png_text(preview))
+        text = png_text(out)
+        meta = json.loads(text["generation"])
+        self.assertEqual((meta["sampler"], meta["scheduler"], meta["steps"], meta["seed"]), ("euler_ancestral", "karras", 3, 7))
+        self.assertIn("prompt", meta)
+        self.assertIn("parameters", text)
+        report = done["report"]
+        self.assertEqual(report["request"]["sampler"], "euler_ancestral")
+        self.assertTrue(report["tokens"]["prompt"]["truncated"])
+        self.assertIn("quality", report)
+        self.assertIsInstance(done["warnings"], list)
+        self.assertTrue(any(w.startswith("prompt truncated to 16 of ") for w in done["warnings"]), done["warnings"])
+        # Without metadata or prompts.
+        gid = self.server.send("generate", {"prompt": "a secret prompt", "width": 256, "height": 256, "steps": 2,
+                                            "include_prompts": False, "output": out}, id="np")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "ok", done)
+        self.assertEqual(done["warnings"], [])
+        text = png_text(out)
+        self.assertNotIn("prompt", json.loads(text["generation"]))
+        self.assertNotIn("a secret prompt", text["parameters"])
+        gid = self.server.send("generate", {"prompt": "a cat", "width": 256, "height": 256, "steps": 2,
+                                            "save_metadata": False, "output": out}, id="nm")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        self.assertEqual(self.wait_done(gid, events)["status"], "ok")
+        self.assertEqual(png_text(out), {})
 
     def test_cancel_mid_run(self):
         self.load_base()
