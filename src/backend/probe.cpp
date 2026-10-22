@@ -7,6 +7,7 @@
 #include <tuple>
 
 #include "backend/cuda_driver.h"
+#include "core/cuda_check.h"
 
 // The CMake architecture list of this build, set on this file only by cmake/modules/backend.cmake.
 #ifndef MOSSINFER_CUDA_ARCHITECTURES
@@ -243,7 +244,7 @@ ProbeResult probe(const ProbeOptions& options) {
   int count = 0;
   if (const cudaError_t err = cudaGetDeviceCount(&count); err != cudaSuccess) {
     cudaGetLastError();
-    r.reason = std::string("no usable CUDA device: ") + cudaGetErrorName(err) + " (" + cudaGetErrorString(err) + ")";
+    r.reason = "no usable CUDA device: " + cuda_error_name(err) + " (" + cuda_error_string(err) + ")";
     // A driver older than this build's CUDA: the runtime lists nothing, but the driver API still does, so the
     // recommendation can name the flavour this driver runs (cu12 under a cu13 build).
     if (err == cudaErrorInsufficientDriver) {
@@ -265,7 +266,7 @@ ProbeResult probe(const ProbeOptions& options) {
     cudaDeviceProp p{};
     if (const cudaError_t err = cudaGetDeviceProperties(&p, i); err != cudaSuccess) {
       cudaGetLastError();
-      d.reason = std::string("device properties unavailable: ") + cudaGetErrorName(err);
+      d.reason = "device properties unavailable: " + cuda_error_name(err);
       r.devices.push_back(std::move(d));
       continue;
     }

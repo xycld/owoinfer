@@ -17,6 +17,17 @@ struct CudaError : std::runtime_error {
 
 [[noreturn]] void throw_cuda_error(cudaError_t err, const char* expr, const char* file, int line);
 
+// cudaGetErrorName / cudaGetErrorString, never null: the static CUDA 13 runtime on Windows returns null for both when
+// no driver is installed (seen with CUDA 13.3 and no nvcuda.dll).
+inline std::string cuda_error_name(cudaError_t err) {
+  const char* s = cudaGetErrorName(err);
+  return s != nullptr ? s : "cudaError " + std::to_string(static_cast<int>(err));
+}
+inline std::string cuda_error_string(cudaError_t err) {
+  const char* s = cudaGetErrorString(err);
+  return s != nullptr ? s : "no description from the CUDA runtime";
+}
+
 #define MI_CUDA_CHECK(expr)                                                  \
   do {                                                                       \
     cudaError_t mi_cuda_err_ = (expr);                                       \

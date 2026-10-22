@@ -171,7 +171,8 @@ def main():
         failures.append("shared library libmossinfer.so / mossinfer.dll not in the tree")
     for lib in libs:
         syms = exported_symbols(lib)
-        foreign = [s for s in syms if not s.startswith("mi_")]
+        # cudart_static.lib (Windows) exports NvOptimusEnablementCuda itself, a DWORD hint for Optimus laptops.
+        foreign = [s for s in syms if not s.startswith("mi_") and s != "NvOptimusEnablementCuda"]
         print(f"ABI {os.path.relpath(lib, prefix)}: {len(syms)} exported symbols, {len(foreign)} not mi_*")
         if not syms or foreign:
             failures.append(f"ABI: exports other than mi_*: {foreign[:20]}")

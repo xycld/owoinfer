@@ -3,7 +3,7 @@
 namespace mi {
 
 void throw_cuda_error(cudaError_t err, const char* expr, const char* file, int line) {
-  throw CudaError(std::string("CUDA error ") + cudaGetErrorName(err) + " (" + cudaGetErrorString(err) + ") in " +
+  throw CudaError("CUDA error " + cuda_error_name(err) + " (" + cuda_error_string(err) + ") in " +
                   expr + " at " + file + ":" + std::to_string(line));
 }
 
