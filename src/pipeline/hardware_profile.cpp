@@ -17,6 +17,9 @@
 
 #ifdef _WIN32
 #include <process.h>
+
+#include <chrono>
+#include <thread>
 #else
 #include <unistd.h>
 #endif
@@ -188,7 +191,8 @@ bool write_profile(const std::filesystem::path& path, const std::string& key, co
   // Unique per process and call: concurrent writers never share a temporary file; the rename replaces atomically.
   char suffix[64];
   std::snprintf(suffix, sizeof(suffix), ".tmp.%d.%08x", process_id(), static_cast<unsigned>(std::random_device{}()));
-  const std::filesystem::path tmp = path.string() + suffix;
+  std::filesystem::path tmp = path;  // not path.string(): the ANSI code page on Windows
+  tmp += suffix;
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     out << doc;
@@ -199,6 +203,13 @@ bool write_profile(const std::filesystem::path& path, const std::string& key, co
     }
   }
   std::filesystem::rename(tmp, path, ec);
+#ifdef _WIN32
+  // Windows refuses to replace a file that a reader or a concurrent writer has open at that moment: retry briefly.
+  for (int i = 0; ec && i < 200; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::filesystem::rename(tmp, path, ec);
+  }
+#endif
   if (ec) {
     std::filesystem::remove(tmp, ec);
     return false;

@@ -41,10 +41,12 @@ endif()
 
 if(MSVC)
   # Every target: CCCL (CUDA 13) refuses cl's traditional preprocessor; CUTLASS/FlashAttention instantiations exceed
-  # the default object section limit. FlashAttention uses M_LOG2E, which <cmath> defines only on request.
+  # the default object section limit. FlashAttention uses M_LOG2E, which <cmath> defines only on request. CUDA 12.x's
+  # dim3 is constexpr (CUTLASS's get_block_shape() needs it) only when __cplusplus says C++11: /Zc:__cplusplus.
   add_compile_definitions(_USE_MATH_DEFINES)
   add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor> $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
-                      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor$<COMMA>/bigobj>)
+                      $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
+                      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor$<COMMA>/bigobj$<COMMA>/Zc:__cplusplus>)
   set(MOSSINFER_WARN /W4 /permissive- /utf-8)
   set(MOSSINFER_CUDA_HOST_WARN -Xcompiler=/W3)  # cl's /Wall (what -Wall means to it) floods the CUDA headers
   if(MOSSINFER_WERROR)

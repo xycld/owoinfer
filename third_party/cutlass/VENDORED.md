@@ -6,3 +6,5 @@
 - Patched: `include/cute/stride.hpp` carries upstream PR #3198 (open as of 2026-10-22: CompactSeq replaces the
   dependent member alias CompactLambda<Major>::seq, which MSVC rejects with C3545). Type-level only: the selected
   sequence, and so the generated code, is unchanged.
+- Patched: `include/cutlass/subbyte_reference.h` passes `__NV_THREAD_SCOPE_SYSTEM` (the default) to `__nv_atomic_load_n`
+  explicitly: nvcc 12.8 on Windows rejects the two-argument form ("too few arguments"). Same scope, same code.

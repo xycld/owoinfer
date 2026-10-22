@@ -406,6 +406,7 @@ TEST(PipelinePng, LargeImageFileRoundTrip) {
 
   std::ifstream in(file, std::ios::binary);
   const std::vector<std::uint8_t> png((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  in.close();  // Windows: remove_all below fails on an open file
   int idat_chunks = 0;
   std::uint32_t max_idat = 0;
   for (std::size_t at = 8; at + 12 <= png.size();) {
