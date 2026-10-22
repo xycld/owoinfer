@@ -1,5 +1,5 @@
-// Small CUDA helpers of the DiT: latent <-> token layout at the model boundary (P:247-248, P:259)
-// and host-to-device writes of tiny per-call parameters.
+// Small CUDA helpers of the DiT: latent <-> token layout at the model boundary (P:247-248, P:259), host-to-device
+// writes of tiny per-call parameters, and the x0 extrapolation of a latent preview.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -16,6 +16,11 @@ void latent_to_tokens(const Tensor& latents, const Tensor& tokens, cudaStream_t 
 
 // x.transpose(1, 2).reshape(C, h, w).float(): tokens bf16 [h*w, C] (contiguous) -> fp32 [C, h, w] (contiguous).
 void tokens_to_latent(const Tensor& tokens, const Tensor& latents, cudaStream_t stream);
+
+// out = x + c * (x - x_prev), fp32 elementwise (contiguous CUDA f32 tensors of one size; out may alias x): the x0
+// estimate of a latent preview, x0 = x_t - sigma_t * (x_t - x_prev) / (sigma_t - sigma_prev), with
+// c = sigma_t / (sigma_prev - sigma_t).
+void extrapolate_latents(const Tensor& x, const Tensor& x_prev, float c, const Tensor& out, cudaStream_t stream);
 
 // Copies `bytes` (<= kMaxParamBytes) host bytes to dst through kernel arguments: no pinned staging,
 // no host synchronization (a pageable cudaMemcpyAsync would wait for the stream), graph-capturable.

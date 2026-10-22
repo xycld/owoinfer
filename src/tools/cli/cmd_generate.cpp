@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -31,16 +32,30 @@ constexpr const char* kUsage =
     "                           [-o <out.png>] [--latent-out <latents.npy>] [--json-report <report.json>]\n"
     "                           [--negative <text>] [--size <W>x<H>] [--width N] [--height N] [--steps N]\n"
     "                           [--cfg X] [--shift X] [--seed N|-1] [--skip-layers \"22\"] [--slg-layers \"\"]\n"
-    "                           [--slg-scale X] [--slg-start X] [--slg-stop X] [--max-seq N] [--sampler euler|ab2]\n"
+    "                           [--slg-scale X] [--slg-start X] [--slg-stop X] [--max-seq N] [--sampler <name>]\n"
+    "                           [--scheduler moss|simple|normal|karras|exponential|beta|sgm_uniform] [--flow-multiplier X]\n"
+    "                           [--noise-layout <layout>] [--noise-source philox|philox_device|brownian_tree]\n"
+    "                           [--eta X] [--s-noise X] [--dataspace <file>] [--no-metadata]\n"
     "                           [--mode min_memory|balanced|max_speed] [--vram-budget GiB] [--vram-reserve MiB]\n"
     "                           [--host-ram-budget GiB] [--cache-dir <dir>] [--then-prompt <text>]... [--direct-io]\n"
-    "                           [--dit-blocks op_by_op|fused|fused_graphs] [--quiet]\n"
+    "                           [--dit-blocks op_by_op|fused|fused_graphs] [--dit <file>] [--te <file>] [--vae <file>]\n"
+    "                           [--tier reference|high|turbo|auto] [--attention auto|exact|q8|q8_fp8|q8_fp16|...]\n"
+    "                           [--preview <preview.png> [--preview-every N]] [--lora <file> [--lora-scale S]]...\n"
+    "                           [--lora-strict] [--quiet]\n"
     "Flags override values read from --params. At least one of -o / --latent-out is required;\n"
     "without -o the VAE decode is skipped. --vram-budget caps the process's GPU memory (CUDA context included).\n"
     "Each --then-prompt generates one more image in the same engine session (same settings, warm models and\n"
     "embedding cache), written to <out>.<n>.png and reported under \"followups\".\n"
     "--dit-blocks (default fused, or the MOSSINFER_DIT_BLOCKS environment variable) picks the DiT block implementation;\n"
-    "all give the same image. fused falls back to op_by_op when its startup self-check fails; fused_graphs adds CUDA graphs.\n";
+    "all give the same image. fused falls back to op_by_op when its startup self-check fails; fused_graphs adds CUDA graphs.\n"
+    "--dit loads the DiT from one safetensors file (INT8 ConvRot or bf16, ComfyUI layout) instead of the bundle's;\n"
+    "--te loads an INT8 ConvRot / W4A8 text encoder file, --vae a FLUX.2 VAE file (e.g. the full decoder); the tokenizer\n"
+    "and configs always come from --model. --preview rewrites a latent preview PNG (no VAE) every N steps.\n"
+    "--tier (default auto): reference = bf16 exact; high = the loaded DiT's GEMMs + 8-bit attention; turbo is\n"
+    "reserved; auto = the fastest certified configuration of the loaded DiT (else reference; an INT8 DiT then runs\n"
+    "with exact attention, uncertified). Certificates: <dit>.mossinfer-cert.json or <cache-dir>/quality_certs/.\n"
+    "--attention overrides the tier's attention kernel: exact (FlashAttention-2) or an 8-bit variant q8_fp8 (= q8),\n"
+    "q8_fp16, q8_fp8_f32acc, q8_fp16_f32acc (lossy).\n";
 
 std::atomic<bool> g_cancel{false};
 // First Ctrl-C: cancel (within a text-encoder layer, DiT block or decode band). A second one terminates (default action restored).
@@ -124,6 +139,9 @@ void print_summary(const pipeline::Result& r) {
                : r.memory.dit_reloaded                                                ? ", DiT reloaded"
                                                                                       : "",
                moss_dit::block_path_name(r.block_path));
+  std::fprintf(stderr, "tier %s (requested %s): DiT %s, %s attention, text encoder %s%s\n",
+               planner::tier_name(r.tier.effective), planner::tier_name(r.tier.requested), r.dit_linears.c_str(),
+               planner::attention_name(r.tier.attention), r.te_precision.c_str(), r.tier.certified ? "" : ", uncertified");
   if (!r.block_path_note.empty()) std::fprintf(stderr, "%s\n", r.block_path_note.c_str());
   const auto& ds = r.dit_stream;
   if (ds.streamed) {
@@ -138,14 +156,15 @@ void print_summary(const pipeline::Result& r) {
 int cmd_generate(const std::vector<std::string>& args) {
   pipeline::Request req;
   pipeline::PipelineOptions options;
-  fs::path params, out_png, out_latent, report;
+  fs::path params, out_png, out_latent, report, preview_png;
+  int preview_every = 1;
   std::vector<std::string> then_prompts;
   bool have_prompt = false, quiet = false;
   // Flags apply after --params is read, in command-line order.
   std::vector<std::pair<std::string, std::string>> flags;
   for (std::size_t i = 0; i < args.size(); ++i) {
     const std::string& a = args[i];
-    if (a == "--direct-io" || a == "--quiet") {
+    if (a == "--direct-io" || a == "--quiet" || a == "--no-metadata" || a == "--lora-strict") {
       flags.emplace_back(a, "");
       continue;
     }
@@ -192,6 +211,20 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--slg-stop") req.slg_stop = to_double(f, v);
       else if (f == "--max-seq") req.max_sequence_length = to_int32(f, v);
       else if (f == "--sampler") req.sampler = pipeline::parse_sampler(v);
+      else if (f == "--scheduler") req.scheduler = pipeline::parse_scheduler(v);
+      else if (f == "--flow-multiplier") req.flow_multiplier = to_double(f, v);
+      else if (f == "--noise-layout") req.noise_layout = pipeline::parse_noise_layout(v);
+      else if (f == "--noise-source") req.noise_source = pipeline::parse_noise_source(v);
+      else if (f == "--eta") req.eta = to_double(f, v);
+      else if (f == "--s-noise") req.s_noise = to_double(f, v);
+      else if (f == "--dataspace") req.dataspace_path = path_from_utf8(v);
+      else if (f == "--no-metadata") req.save_metadata = false;
+      else if (f == "--lora") req.loras.push_back({path_from_utf8(v), 1.0f});
+      else if (f == "--lora-scale") {
+        if (req.loras.empty()) throw std::invalid_argument("--lora-scale must follow a --lora");
+        req.loras.back().strength = static_cast<float>(to_double(f, v));
+      }
+      else if (f == "--lora-strict") options.lora_strict = true;
       else if (f == "--mode") options.mode = planner::parse_mode(v);
       else if (f == "--vram-budget") options.vram_budget = pipeline::vram_option_bytes(to_double(f, v), kGiB, f);
       else if (f == "--vram-reserve") options.vram_reserve = pipeline::vram_option_bytes(to_double(f, v), 1024.0 * 1024.0, f);
@@ -200,6 +233,13 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--then-prompt") then_prompts.push_back(v);
       else if (f == "--direct-io") options.direct_io = true;
       else if (f == "--dit-blocks") options.block_path = moss_dit::parse_block_path(v);
+      else if (f == "--dit") options.dit_file = path_from_utf8(v);
+      else if (f == "--te") options.text_encoder_file = path_from_utf8(v);
+      else if (f == "--vae") options.vae_file = path_from_utf8(v);
+      else if (f == "--preview") preview_png = path_from_utf8(v);
+      else if (f == "--preview-every") preview_every = to_int32(f, v);
+      else if (f == "--tier") options.tier = planner::parse_tier(v);
+      else if (f == "--attention") options.attention = v == "auto" ? std::optional<planner::AttentionMode>() : planner::parse_attention(v);
       else if (f == "--quiet") quiet = true;
       else throw std::invalid_argument("unknown flag " + f);
     }
@@ -229,6 +269,13 @@ int cmd_generate(const std::vector<std::string>& args) {
   control.on_plan = [&](const planner::ExecutionPlan& plan) {
     if (!quiet) std::fprintf(stderr, "%s\n", plan.explanation.c_str());
   };
+  if (!preview_png.empty()) {
+    control.preview_every = preview_every;
+    control.on_preview = [&](const pipeline::PreviewImage& p) {
+      pipeline::write_png_rgb8(preview_png, std::span<const std::uint8_t>(p.rgb, static_cast<std::size_t>(p.width) * p.height * 3),
+                               p.width, p.height);
+    };
+  }
   control.on_step = [&](const pipeline::StepInfo& s) {
     if (!quiet) std::fprintf(stderr, "\rstep %d/%d  %.2f s/step ", s.step, s.num_steps, s.step_seconds);
     return true;
@@ -237,7 +284,24 @@ int cmd_generate(const std::vector<std::string>& args) {
     pipeline::Result r = pipe.generate(q, control);
     if (!quiet) std::fprintf(stderr, "\n");
     if (r.cancelled) return r;
-    if (!png.empty()) pipeline::write_png_rgb8(png, r.rgb, r.width, r.height);
+    // Lossy and uncertified: always said, --quiet or not.
+    if (r.tier.effective != planner::Tier::kReference && !r.tier.certified) {
+      std::fprintf(stderr, "warning: uncertified %s-tier run (%s): %s\n", planner::tier_name(r.tier.effective),
+                   r.dit_linears.c_str(), r.tier.reason.c_str());
+    }
+    if (!png.empty()) {
+      const std::vector<pipeline::PngText> text =
+          q.save_metadata ? pipeline::generation_text_chunks(pipeline::generation_metadata(q, r)) : std::vector<pipeline::PngText>{};
+      pipeline::write_png_rgb8(png, r.rgb, r.width, r.height, text);
+    }
+    for (const std::string& w : r.lora_warnings) std::fprintf(stderr, "warning: LoRA %s\n", w.c_str());
+    for (const auto* t : {&r.cond_token_report, &r.uncond_token_report}) {
+      if (t->truncated) {
+        std::fprintf(stderr, "warning: %s truncated to %zu of %zu tokens (%zu dropped; --max-seq %zu)\n",
+                     t == &r.cond_token_report ? "prompt" : "negative prompt", t->kept_tokens, t->total_tokens,
+                     t->dropped_tokens(), t->max_length);
+      }
+    }
     if (!quiet) print_summary(r);
     return r;
   };

@@ -1,0 +1,43 @@
+{
+ "torch": "2.14.1+cu130",
+ "device": "NVIDIA GeForce RTX 4090 Laptop GPU",
+ "comfy_kitchen": "dba9fac",
+ "block": 5,
+ "timestep": 900.0,
+ "grid": [
+  6,
+  8
+ ],
+ "text": [
+  17,
+  9
+ ],
+ "int8_file": "moss_image_sft_int8_convrot.safetensors",
+ "bf16": "MOSS-Image/sft",
+ "mixed_int8": [
+  "k",
+  "v",
+  "ffn_up_gate"
+ ],
+ "files": {
+  "mod": [
+   18432
+  ],
+  "all_int8_x": [
+   122,
+   3072
+  ],
+  "all_int8_y": [
+   122,
+   3072
+  ],
+  "mixed_x": [
+   65,
+   3072
+  ],
+  "mixed_y": [
+   65,
+   3072
+  ]
+ }
+}

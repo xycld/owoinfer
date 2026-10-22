@@ -20,6 +20,14 @@
 // version and fused-kernels version, cached with the profile) found the fused GEMMs bit-identical to the op-by-op ones
 // here, each in the cuBLASLt configurations it validated (the others run op by op); otherwise op by op, and Result
 // says why.
+// P6: the DiT can come from a single file (PipelineOptions::dit_file: an INT8 ConvRot or bf16 safetensors in the
+// ComfyUI layout) while the tokenizer, configs, text encoder and VAE come from the bundle. A quality tier
+// (PipelineOptions::tier, planner::resolve_tier) decides the lossy toggles from what is loaded: an INT8 DiT runs the
+// High tier's INT8 GEMMs, plus 8-bit attention when the tier asks for it. Streamed INT8 blocks move about half the
+// bytes, and the plan counts the INT8 sizes. Each request takes one fused-route snapshot, sizes its arena from it and
+// runs every step under it. With every P6/P7 option off (the bundle's models, tier reference or an uncertified auto,
+// exact attention, no LoRA, the moss scheduler with euler and the official noise) the output is bit-identical to P5;
+// tier auto picks a lossy configuration only when a certificate covers it.
 #pragma once
 
 #include <algorithm>
@@ -35,7 +43,12 @@
 #include <string_view>
 #include <vector>
 
+#include "models/lora/side_branch.h"
+#include "pipeline/png_writer.h"
+#include "pipeline/quality_cert.h"
 #include "pipeline/sampler.h"
+#include "pipeline/samplers/initial_noise.h"
+#include "tokenizer/prompt_tokens.h"
 #include "planner/planner.h"
 #include "util/json.h"
 
@@ -70,6 +83,23 @@ struct Request {
   double slg_stop = 1.0;
   int max_sequence_length = 4096;
   SamplerKind sampler = SamplerKind::kEuler;
+  // Standard samplers and schedulers (pipeline/samplers): kMoss with euler keeps the official arithmetic bit for bit.
+  SchedulerKind scheduler = SchedulerKind::kMoss;
+  double flow_multiplier = 1.0;                       // FlowSampling::multiplier
+  NoiseLayout noise_layout = NoiseLayout::kOfficial;  // the initial noise's layout (initial_noise)
+  NoiseSource noise_source = NoiseSource::kPhilox;    // stochastic samplers' noise
+  double eta = 1.0;                                   // euler_ancestral, dpmpp_2m_sde
+  double s_noise = 1.0;                               // stochastic samplers' noise multiplier
+  std::filesystem::path dataspace_path;               // the dataspace sampler's parameters (load_dataspace)
+  bool save_metadata = true;  // front ends: write the generation settings into the PNG (png_writer.h)
+  // Runtime LoRAs (models/lora), applied in order with their strengths: low-rank adapters on the block GEMMs run as
+  // side branches (a strength change between requests is instant); the others are merged into the DiT at load (a
+  // strength change re-merges them from the pristine weights kept on the host). Results are uncertified.
+  std::vector<lora::LoraSpec> loras;
+  // img2img (roadmap P7b; reserved): the init image and how much of the schedule to run on it (1 = from noise). Not
+  // wired yet: validate() refuses an init image.
+  std::filesystem::path init_image;
+  double denoise_strength = 1.0;
   bool decode = true;  // false: stop after sampling (final latents only)
 };
 
@@ -113,6 +143,23 @@ struct PipelineOptions {
   // DiT block implementation (all give the same bits). kFused (default) falls back to kOpByOp when the startup
   // self-check fails; kFusedGraphs adds CUDA graphs (opt-in: ~0 measured gain, holds graph memory).
   moss_dit::BlockPath block_path = moss_dit::BlockPath::kFused;
+  // P6/P7a model sources, each used instead of the bundle's component (empty: the bundle's); the tokenizer and configs
+  // always come from the bundle.
+  //   dit_file: a single-file DiT (INT8 ConvRot G = 256, mixed INT8/bf16, or bf16 safetensors: the Comfy-Org /
+  //     community files and `moss-infer quantize` output).
+  //   text_encoder_file: an INT8 ConvRot or W4A8 Qwen3.5 text encoder (qwen35_text::QuantTextModel); its embeddings
+  //     are cached under its own identity and numerics. Held in RAM it is pinned (the plan's host-resident residency).
+  //   vae_file: a single FLUX.2 VAE file (flux2_vae::index_vae_file: e.g. the full decoder), decoded with the
+  //     bundle's latent statistics.
+  std::filesystem::path dit_file;
+  std::filesystem::path text_encoder_file;
+  std::filesystem::path vae_file;
+  bool lora_strict = false;  // lora::LoadOptions::strict: unknown LoRA keys and lossy merges are errors
+  // Quality tier and attention kernel (planner::resolve_tier: what each tier runs and refuses; unset attention: the
+  // tier's choice). Certificates (pipeline/quality_cert.h) are looked up next to the DiT and in
+  // <cache_dir>/quality_certs, once per configuration while the DiT source is loaded.
+  planner::Tier tier = planner::Tier::kAuto;
+  std::optional<planner::AttentionMode> attention;
 };
 
 struct Timings {
@@ -181,6 +228,8 @@ struct Result {
   // decode is skipped).
   bool cancelled = false;
   int cond_tokens = 0, uncond_tokens = 0;
+  // Prompt token counts and truncation (tokenizer/prompt_tokens.h); uncond only under CFG.
+  tok::PromptTokenReport cond_token_report, uncond_token_report;
   int te_cache_hits = 0;    // sequences served by the embedding cache
   bool te_skipped = false;  // every sequence hit: the text encoder did not run
   // The decode actually run: tiled (exact, full-width row bands) and the schedule, or untiled. It can differ from
@@ -193,6 +242,22 @@ struct Result {
   // PipelineOptions::block_path (empty when it does not).
   moss_dit::BlockPath block_path = moss_dit::BlockPath::kFused;
   std::string block_path_note;
+  // P6: the tier that ran (requested and effective tier, DiT precision, attention mode, certificate, reason), the DiT's
+  // source (the bundle's transformer directory or PipelineOptions::dit_file) and its block linears
+  // (moss_dit::describe_linears).
+  planner::TierDecision tier;
+  QualityReport quality;  // the report's "quality" object (pipeline/quality_cert.h)
+  std::string gpu_arch;   // quality_cert's GPU class of the device ("sm_89")
+  std::string dit_source;
+  std::string dit_linears;
+  std::string te_source;     // the bundle's text_encoder directory or PipelineOptions::text_encoder_file
+  std::string te_precision;  // qwen35_text::precision_name: "bf16", "int8", "w4a8"
+  std::string vae_source;    // the bundle's vae directory or PipelineOptions::vae_file
+  // Runtime LoRAs: how each file was read and applied (lora::FileReport), and the losses to show the user (merged
+  // adapters requantized on INT8 block GEMMs).
+  std::vector<lora::FileReport> loras;
+  std::vector<std::string> lora_warnings;
+  std::vector<std::string> lora_notes;  // how files were read (e.g. the metadata alpha applied)
   DitStreamStats dit_stream;
   Timings timings;
   MemoryStats memory;
@@ -202,16 +267,31 @@ struct Result {
 // the DiT is resident; kDecode only when decoding.
 enum class Phase { kTextEncoder, kDitLoad, kDenoise, kDecode };
 
+// A latent preview during sampling (latent_preview: a linear latent -> RGB map, no VAE) of the x0 estimate after a
+// step: x0 = x_t - sigma_t * v, with the step's effective velocity v = (x_t - x_prev) / (sigma_t - sigma_prev).
+struct PreviewImage {
+  int step = 0, num_steps = 0;  // after `step` of `num_steps` finished steps
+  int width = 0, height = 0;    // the image size
+  const std::uint8_t* rgb = nullptr;  // [height, width, 3], valid during the callback only
+};
+
 struct GenerateControl {
   // Once per call, after planning and before the first phase (the launcher shows plan.explanation and the mode).
   std::function<void(const planner::ExecutionPlan&)> on_plan;
   StepCallback on_step;                       // after every sampling step; returning false cancels
+  // After every preview_every-th step (and the last), before on_step. Its buffers count in the denoise phase's plan.
+  std::function<void(const PreviewImage&)> on_preview;
+  int preview_every = 1;
   std::function<bool(Phase)> on_phase;        // before each phase starts; returning false cancels
   // Checked before each phase and after every step, and inside the phases: between text-encoder layers, per DiT
   // weight group while loading, between DiT blocks and per tiled-decode band (each phase then keeps at most one
   // layer / block / band queued on the GPU). The pipeline stays usable after a cancel.
   const std::atomic<bool>* cancel = nullptr;
 };
+
+// The PNG metadata of a generation (png_writer.h generation_text_chunks): settings, the tier that ran, and the models
+// by file name (the bundle, and each separately loaded file); sha256 left empty (not computed here).
+GenerationMetadata generation_metadata(const Request& request, const Result& result);
 
 class Pipeline {
  public:

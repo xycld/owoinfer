@@ -30,6 +30,12 @@
 // gate+residual in the GEMM epilogues, op by op where cuBLASLt's algorithm for the run's size would not match),
 // bit-identical to the op-by-op block at every image size (tested from 128x128 up); with kFusedGraphs it also replays
 // each block from a CUDA graph once a step shape repeats with every block resident (dit_graph.h).
+// P6: a DiT loaded from a single-file checkpoint (weights/quant QuantIndex: Comfy-Org / community INT8 ConvRot files,
+// our converter's output, or a bf16 file) keeps each block linear as stored, INT8 ConvRot G = 256 or bf16. A model with
+// any INT8 linear (or with 8-bit attention set) runs every block on the quantized block path (dit_block_quant.h); the
+// globals and the text refiner stay bf16. Streaming and graphs work alike; INT8 blocks move about half the bytes.
+// The fused route of a forward is its own snapshot unless a request pinned one (set_request_route): a pipeline sizes
+// its arena from one snapshot per request and every step of the request then runs it.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -40,7 +46,9 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -49,11 +57,13 @@
 #include "core/tensor.h"
 #include "kernels/basic/gemm.h"
 #include "models/moss_dit/dit_block_fused.h"
+#include "models/moss_dit/dit_block_quant.h"
 #include "models/moss_dit/dit_graph.h"
 #include "models/moss_dit/dit_weights.h"
 #include "runtime/device_arena.h"
 #include "runtime/stream_set.h"
 #include "weights/model_index.h"
+#include "weights/quant/quant_model.h"
 
 namespace mi::moss_dit {
 
@@ -112,6 +122,23 @@ BlockPath parse_block_path(std::string_view name);
 // conservative, per cached graph times the cache's capacity.
 std::size_t graph_cache_bytes();
 
+// What a forward computes with beyond the block path (P6). Default: the bf16 blocks of P5 (bit-identical to it).
+struct ComputeConfig {
+  bool quantized = false;     // every block on run_block_quant: some block linear is INT8, or 8-bit attention
+  bool bf16_up_gate = true;   // quantized: some block keeps ffn_up_gate bf16 (its `big` layout follows the route)
+  AttentionMode attention = AttentionMode::kExact;
+  std::int64_t lora_rank = 0;  // runtime LoRA side branches' max_rank (0: none): the t buffers of a forward
+  bool operator==(const ComputeConfig&) const = default;
+};
+
+// The precision of the block linears of a DiT index: "bf16" (quant == nullptr: the bundle, or every linear bf16),
+// "int8_convrot256" (all INT8) or "mixed (N int8_convrot256, M bf16)".
+std::string describe_linears(const quant::QuantIndex* quant);
+// Some block linear of `quant` is quantized (false for nullptr).
+bool has_int8_linears(const quant::QuantIndex* quant);
+// The fraction of the block GEMMs' weight elements (their FLOPs) that are INT8 (0 for nullptr): a mixed file's share.
+double int8_gemm_fraction(const quant::QuantIndex* quant);
+
 class MossDit {
  public:
   // Persistent arena bytes the constructor allocates (weights + GEMM workspace), every block resident or with
@@ -120,6 +147,8 @@ class MossDit {
   static std::size_t persistent_bytes(const weights::ModelIndex& index, const Residency& residency);
   // Stack bytes forward() adds to workspace_bytes() for streamed blocks (the device block buffers; 0 if none).
   static std::size_t stream_workspace_bytes(const weights::ModelIndex& index, const Residency& residency);
+  // The config a model loaded from `quant` (nullptr: the bf16 bundle) runs with attention mode `attention`.
+  static ComputeConfig compute_config(const quant::QuantIndex* quant, AttentionMode attention);
 
   // Uploads the transformer groups (globals, text_embedder and the resident blocks) of `index` into the
   // arena's persistent region and waits until they are resident; streamed blocks are validated (and copied
@@ -127,9 +156,27 @@ class MossDit {
   // instead of buffered reads for the load. The arena and index must outlive the model. `cancel` (optional,
   // must outlive the model) is checked before every weight group is read and between the blocks of every
   // forward(); once set, the call waits for its queued copies/kernels and throws Cancelled.
+  // merges (optional, runtime LoRA, models/lora): the stack's adapters that are merged rather than side-branched
+  // (LyCORIS / full deltas, non-block targets) are merged into the weights at load: bf16 in fp32 then rounded, INT8
+  // block GEMMs dequantized, merged and requantized (lossy). A streamed block with merges needs
+  // StreamSource::kHostPinned (its merged pinned copy; std::invalid_argument for kFile). The stack must outlive the
+  // constructor only.
   MossDit(const weights::ModelIndex& index, runtime::DeviceArena& arena, runtime::StreamSet& streams,
-          bool direct_io = false, const std::atomic<bool>* cancel = nullptr, const Residency& residency = {});
+          bool direct_io = false, const std::atomic<bool>* cancel = nullptr, const Residency& residency = {},
+          const lora::LoraStack* merges = nullptr);
+  // P6: from a single-file DiT (quant::to_model_index): every block linear checked against the spec its GEMM runs
+  // (bf16 or int8_convrot256; std::runtime_error naming the linear otherwise). persistent_bytes /
+  // stream_workspace_bytes take quant.index. `quant` must outlive the model.
+  MossDit(const quant::QuantIndex& quant, runtime::DeviceArena& arena, runtime::StreamSet& streams,
+          bool direct_io = false, const std::atomic<bool>* cancel = nullptr, const Residency& residency = {},
+          const lora::LoraStack* merges = nullptr);
   ~MossDit();
+  // Whether `stack` has merged adapters on block `block` (they need the block resident or a pinned host copy).
+  static bool block_has_merges(const lora::LoraStack& stack, int block);
+  // Host bytes of the pristine copies a model loaded with `stack`'s merges keeps (bf16 n*k*2 (+ bias), INT8 n*k + 4n),
+  // and what this model keeps now.
+  static std::size_t pristine_bytes(const lora::LoraStack& stack, const quant::QuantIndex* quant);
+  std::size_t pristine_bytes() const;
   MossDit(const MossDit&) = delete;
   MossDit& operator=(const MossDit&) = delete;
 
@@ -141,6 +188,29 @@ class MossDit {
   const StepGraphStats& graph_stats() const { return graphs_.stats(); }
   // Device memory the cached CUDA graphs hold outside the arena now (graph_cache_bytes()'s per-graph bound each).
   std::size_t graph_bytes() const;
+
+  // Attention kernel of the blocks (default kExact). An 8-bit mode needs attention_supported() (std::runtime_error otherwise)
+  // and a forward stack of workspace_bytes(..., compute_config()).
+  void set_attention(AttentionMode mode);
+  AttentionMode attention() const { return config_.attention; }
+  const ComputeConfig& compute_config() const { return config_; }
+  // The loaded file's quantized index (nullptr: the bf16 bundle).
+  const quant::QuantIndex* quant_index() const { return quant_; }
+
+  // Runtime LoRA side branches (nullptr: none; must outlive their use): while any site is active every block runs on
+  // the quantized block path with the fused LoRA GEMMs, and the forward stack grows by the t buffers
+  // (workspace_bytes(..., compute_config())). Set between forwards. Strength changes (SideBranches::update_strengths)
+  // need no call here: each forward re-derives compute_config() from the sites active then. Throws std::invalid_argument for a QKV side branch on a block whose q/k/v differ in precision.
+  void set_lora(const lora::SideBranches* side_branches);
+  // After a strength change of a LoRA with merged adapters (LoraStack::set_strength on the stack the model was loaded
+  // with): re-merges every merged module from the pristine weights kept at load, into the device weights and the
+  // pinned host copies of streamed blocks. Synchronizes the device; call between forwards.
+  void remerge_lora(const lora::LoraStack& stack);
+  const lora::SideBranches* lora() const { return lora_; }
+
+  // Pins the fused route of every following forward (a request's snapshot, which sized its workspace); nullopt: each
+  // forward takes its own snapshot (the default).
+  void set_request_route(std::optional<FusedRouteSnapshot> route) { request_route_ = std::move(route); }
 
   // Replaces the cancel flag (nullptr: none). While a flag is set, forward() keeps the host at most one block
   // ahead of the GPU, so a cancel lands within about one block.
@@ -175,6 +245,9 @@ class MossDit {
   // at its start, so a poisoning in between makes it need the op-by-op size.
   static std::size_t workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
                                      BlockPath path = BlockPath::kFused);
+  // The same for compute config `config`, under `route` (nullptr: a fresh snapshot) as a pinned request route.
+  static std::size_t workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
+                                     BlockPath path, const ComputeConfig& config, const FusedRouteSnapshot* route);
   // Token offset of each row in the joint sequence, plus the total as the last element.
   static std::vector<std::int64_t> token_offsets(std::int64_t height, std::int64_t width,
                                                  std::span<const std::int64_t> text_lengths);
@@ -201,11 +274,41 @@ class MossDit {
   using Run = BlockRun;
   struct Activations;
 
+  MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quant, runtime::DeviceArena& arena,
+          runtime::StreamSet& streams, bool direct_io, const std::atomic<bool>* cancel, const Residency& residency,
+          const lora::LoraStack* merges);
+  void refresh_config(AttentionMode attention);  // config_ from the loaded linears, `attention` and the LoRA
   void linear(const Tensor& out, const Tensor& x, const Linear& l, cudaStream_t stream);
   void linear(const Tensor& out, const Tensor& x, const Tensor& w, cudaStream_t stream);
   void run_block(const Block& b, const Activations& a, const Run& run, cudaStream_t stream);
 
   runtime::DeviceArena& arena_;
+  const quant::QuantIndex* quant_ = nullptr;
+  ComputeConfig config_;
+  std::optional<FusedRouteSnapshot> request_route_;
+  const lora::SideBranches* lora_ = nullptr;
+  // Runtime-LoRA merges: the pristine weights of the merged modules and where each module's merged weights live.
+  struct MergeTarget {
+    Tensor w, bias, scale;  // bias / scale empty when absent / bf16
+    int group = 0;          // INT8 ConvRot group; 0: bf16
+  };
+  class MergeStaging {
+   public:
+    explicit MergeStaging(const MergeTarget& t);
+    template <typename T>
+    T* w() const { return static_cast<T*>(w_); }
+    std::uint16_t* bias() const { return static_cast<std::uint16_t*>(bias_); }
+    float* scale() const { return static_cast<float*>(scale_); }
+    void store() const;  // device targets: upload the staging copy
+
+   private:
+    const MergeTarget& target;
+    std::vector<std::byte> hw_, hb_, hs_;
+    void *w_ = nullptr, *bias_ = nullptr, *scale_ = nullptr;
+  };
+  void remerge_into(const lora::LoraStack& stack, const std::string& module, const MergeTarget& t, MergeStaging& staging) const;
+  std::unique_ptr<lora::PristineWeights> pristine_;
+  std::vector<std::pair<std::string, MergeTarget>> merge_targets_;
   kernels::Gemm gemm_;
   void* gemm_workspace_ = nullptr;
   LoadStats load_stats_;

@@ -4,7 +4,8 @@
 // text length and skip set (text lengths change the joint attention and the token offsets: they cannot be bucketed or
 // padded), the block range the graph covers (a step split into segments keeps cancel latency at one segment), and
 // every device address the captured work binds that can change between calls (inputs, outputs, the arena stack base),
-// and the fused-block route it was captured under (dit_block_fused.h fused_route_generation).
+// the fused-block route it was captured under (dit_block_fused.h fused_route_generation), and the block variant (bf16 or
+// the quantized block with its attention kernel, P6).
 // Entries live in an LRU (runtime::GraphCache). The cache is indexed by a 64-bit hash and the full key is compared on
 // every hit, so a hash collision runs the work eagerly instead of replaying the wrong graph.
 //
@@ -33,6 +34,7 @@ struct StepGraphKey {
   int block_begin = 0, block_end = kNumBlocks;      // blocks [begin, end) captured
   std::vector<const void*> addresses;               // device addresses the work binds
   std::uint64_t route_generation = 0;               // fused_route_generation() of the captured block route
+  std::uint64_t variant = 0;                        // block implementation: 0 bf16 blocks, else quantized (P6) by attention mode
 
   bool operator==(const StepGraphKey&) const = default;
   std::uint64_t hash() const;

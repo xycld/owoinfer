@@ -48,6 +48,35 @@ mi::pipeline::Result sample_result() {
   r.dit_stream.stall_s = 0.125;
   r.dit_stream.stalls = 4;
   r.dit_stream.steps = {{20.0, 0.75, 0.0625, 2}, {24.0, 1.0, 0.0, 0}};
+  r.tier.requested = mi::planner::Tier::kHigh;
+  r.tier.effective = mi::planner::Tier::kHigh;
+  r.tier.precision = mi::planner::Precision::kInt8;
+  r.tier.attention = mi::planner::AttentionMode::kQ8Fp8;
+  r.tier.reason = "High tier: test";
+  r.gpu_arch = "sm_89";
+  r.quality.config.dit = mi::pipeline::DitPrecision::kInt8ConvRot;
+  r.quality.config.attention = mi::pipeline::AttentionMode::kQ8Fp8;
+  r.quality.config.te = mi::pipeline::TePrecision::kW4A8;
+  r.quality.gpu_arch = "sm_89";
+  r.quality.reason = "High tier: test";
+  r.quality.dit = "/m/dit.safetensors";
+  r.quality.dit_bytes = 123;
+  r.dit_source = "/m/dit.safetensors";
+  r.dit_linears = "int8_convrot256";
+  r.te_source = "/m/te.safetensors";
+  r.te_precision = "w4a8";
+  r.vae_source = "/m/vae";
+  r.cond_token_report.total_tokens = 105;
+  r.cond_token_report.kept_tokens = 100;
+  r.cond_token_report.max_length = 100;
+  r.cond_token_report.truncated = true;
+  mi::lora::FileReport lr;
+  lr.file = "a.safetensors";
+  lr.adapters = 254;
+  lr.side_branch = 252;
+  lr.merged = 2;
+  r.loras = {lr};
+  r.lora_warnings = {"a.safetensors: layers.0.proj.o: requantized"};
   return r;
 }
 
@@ -58,7 +87,7 @@ TEST(PipelineReport, FieldsAreValidJsonWithEveryKey) {
       parse_fields(mi::pipeline::report_fields(sample_request(), sample_result(), "out.png", "lat.npy"));
   for (const char* key : {"request", "seed_used", "steps_scheduled", "steps_run", "cancelled", "cond_tokens", "uncond_tokens",
                           "image", "latents", "mode", "dit_blocks", "plan", "embedding_cache", "decode", "timings_s",
-                          "memory_gib", "host_memory_gib", "hardware", "dit_stream"}) {
+                          "memory_gib", "host_memory_gib", "hardware", "dit_stream", "quality", "models", "tokens", "loras", "lora_warnings", "lora_notes"}) {
     EXPECT_NE(doc.find(key), nullptr) << key;
   }
   EXPECT_EQ(doc.at("image").as_string(), "out.png");
@@ -66,6 +95,28 @@ TEST(PipelineReport, FieldsAreValidJsonWithEveryKey) {
   EXPECT_EQ(doc.at("request").at("slg_layers").as_array().size(), 2u);
   EXPECT_EQ(doc.at("dit_blocks").at("path").as_string(), "op_by_op");
   EXPECT_EQ(doc.at("dit_blocks").at("note").as_string(), "fused self-check failed");
+  // P6: the quality object in the certificates' vocabulary, and the DiT's source.
+  const mi::json::Value& q = doc.at("quality");
+  EXPECT_EQ(q.at("tier").as_string(), "high");
+  EXPECT_EQ(q.at("config").at("dit_precision").as_string(), "int8_convrot");
+  EXPECT_EQ(q.at("config").at("attention").as_string(), "q8_fp8");
+  EXPECT_EQ(q.at("gpu_arch").as_string(), "sm_89");
+  EXPECT_EQ(q.at("reason").as_string(), "High tier: test");
+  EXPECT_TRUE(q.at("certificate").is_null());
+  EXPECT_NE(q.at("numerics").find("elementwise"), nullptr);
+  EXPECT_EQ(q.at("config").at("te_precision").as_string(), "w4a8");
+  EXPECT_EQ(doc.at("models").at("dit").at("source").as_string(), "/m/dit.safetensors");
+  EXPECT_EQ(doc.at("models").at("dit").at("linears").as_string(), "int8_convrot256");
+  EXPECT_EQ(doc.at("models").at("dit").at("tier_requested").as_string(), "high");
+  EXPECT_EQ(doc.at("models").at("dit").at("tier_effective").as_string(), "high");
+  EXPECT_FALSE(doc.at("models").at("dit").at("certified").as_bool());
+  EXPECT_TRUE(doc.at("tokens").at("prompt").at("truncated").as_bool());
+  EXPECT_EQ(doc.at("tokens").at("prompt").at("dropped").as_int(), 5);
+  ASSERT_EQ(doc.at("loras").as_array().size(), 1u);
+  EXPECT_EQ(doc.at("loras").as_array()[0].at("side_branch").as_int(), 252);
+  EXPECT_EQ(doc.at("lora_warnings").as_array().size(), 1u);
+  EXPECT_EQ(doc.at("models").at("text_encoder").at("precision").as_string(), "w4a8");
+  EXPECT_EQ(doc.at("models").at("vae").at("source").as_string(), "/m/vae");
   const mi::json::Value& ds = doc.at("dit_stream");
   EXPECT_TRUE(ds.at("streamed").as_bool());
   EXPECT_EQ(ds.at("resident_blocks").as_int(), 20);

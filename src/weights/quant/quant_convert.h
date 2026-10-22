@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -78,6 +79,19 @@ ConvertStats convert(const std::filesystem::path& input, const std::filesystem::
 // sum in double, coef = f32(strength * alpha / rank). up_row: [rank], down: [rank, k] row-major; acc: k doubles of
 // scratch.
 void lora_merge_row(float* w, std::int64_t k, const float* up_row, const float* down, std::int64_t rank, float coef, double* acc);
-float lora_coef(float strength, std::optional<float> alpha, std::int64_t rank);
+
+// The LoRA alpha rule, shared with the runtime stack (models/lora): each file format's own definition.
+// - A module's `.alpha` tensor wins.
+// - Without one, diffusers / PEFT files declare it in the `lora_adapter_metadata` header (a PEFT LoraConfig as JSON):
+//   its lora_alpha applies (PEFT's scaling = lora_alpha / r). lora_metadata_alpha returns it, or nullopt when the
+//   header has none. Throws QuantError for malformed metadata or a non-empty alpha_pattern (per-module alphas are
+//   refused rather than half-applied).
+// - Without either, alpha / rank = 1.
+// (ComfyUI reads only the alpha tensors and ignores the metadata; for every file surveyed the two agree.)
+std::optional<double> lora_metadata_alpha(const std::map<std::string, std::string>& metadata);
+// alpha / rank in double (1 without alpha), as the Python float of the reference implementations.
+double lora_alpha_scale(std::optional<double> alpha, std::int64_t rank);
+// f32(strength * lora_alpha_scale(alpha, rank)), the product in double; infinity outside the fp32 range.
+float lora_coef(float strength, std::optional<double> alpha, std::int64_t rank);
 
 }  // namespace mi::quant

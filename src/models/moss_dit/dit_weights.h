@@ -13,6 +13,10 @@
 //
 // The copied bytes and their device layout are those of the resident upload (same tensor order, kArenaAlign
 // offsets, 256-byte aligned buffers), so streamed and resident forwards are bit-identical (tested).
+// P6: with a quantized index (weights/quant, a single-file DiT) a block's linears are INT8 ConvRot (I8 weight + F32
+// per-row scale) or bf16, each as the file stores it; every linear is checked against the spec its GEMM implements
+// (quant::view), and a block's bytes, resident or streamed, are its stored bytes (an INT8 block is about half a bf16
+// one).
 #pragma once
 
 #include <cuda_runtime.h>
@@ -33,6 +37,7 @@
 #include "runtime/device_arena.h"
 #include "runtime/pinned_ring.h"
 #include "weights/model_index.h"
+#include "weights/quant/quant_model.h"
 #include "weights/upload.h"
 
 namespace mi::moss_dit {
@@ -64,11 +69,31 @@ struct Residency {
 // resident and copies start during its compute).
 std::bitset<kNumBlocks> resident_mask(int resident_blocks);
 
-// Weight views of one block (P:126-148): norms, fused q/k/v, o, fused up/gate and down projections.
+// An INT8 ConvRot (G = 256) linear as its GEMM consumes it (kernels/quant): weight I8 [N, K] row-major, the rotated
+// and quantized W·H, and its per-row scale F32 [N]. Empty (null data) when the linear is bf16.
+struct Int8Linear {
+  Tensor w;
+  Tensor scale;
+  bool empty() const { return w.data == nullptr; }
+};
+
+// Weight views of one block (P:126-148): norms, fused q/k/v, o, fused up/gate and down projections. Each linear is
+// either bf16 (the Tensor) or INT8 ConvRot (the Int8Linear), never both. q, k and v share one GEMM: fused (qkv /
+// qkv8) when they share a precision; otherwise (a file that kept some of them bf16) qkv_split holds each part.
 struct BlockTensors {
   Tensor norm1, norm2, q_norm, k_norm;
   Tensor qkv;  // proj.q/k/v fused along N: [3 * dim, dim]
   Tensor o, up_gate, down;
+  Int8Linear qkv8, o8, up_gate8, down8;  // qkv8: [3 * dim, dim] with a [3 * dim] scale
+  bool qkv_split = false;
+  Tensor qkv_part[3];                    // qkv_split: bf16 q, k, v (empty where INT8)
+  Int8Linear qkv8_part[3];               // qkv_split: INT8 q, k, v (empty where bf16)
+
+  // Some linear of the block is INT8.
+  bool quantized() const {
+    return !qkv8.empty() || !o8.empty() || !up_gate8.empty() || !down8.empty() || !qkv8_part[0].empty() ||
+           !qkv8_part[1].empty() || !qkv8_part[2].empty();
+  }
 };
 
 // Fault and delay injection (tests): called on reader thread `reader` before each chunk of its share of streamed block
@@ -98,6 +123,13 @@ weights::WeightGroup with_front(const weights::WeightGroup& g, const std::vector
 Tensor take(const weights::TensorMap& m, const std::string& name, std::initializer_list<std::int64_t> shape);
 // Weights uploaded back to back (see with_front) viewed as one tensor concatenated along dim 0 (cols 0: 1-D).
 Tensor fuse(const weights::TensorMap& m, const std::vector<std::string>& names, std::int64_t rows, std::int64_t cols);
+// The upload order of block `block`'s group: q, k, v weights (and with INT8 q/k/v their scales) first, so the fused
+// QKV weight (and scale) is contiguous.
+std::vector<std::string> block_front(int block, const quant::QuantIndex* quant);
+// The views of block `block` out of its uploaded group `m` (any device layout of it: resident or a stream buffer).
+// quant == nullptr: the bundle's bf16 layout. Otherwise every linear goes through quant::view with the spec it is
+// stored as, which must be bf16 or INT8 ConvRot G = 256 (std::runtime_error naming the linear otherwise).
+BlockTensors block_views(int block, const weights::TensorMap& m, const quant::QuantIndex* quant);
 }  // namespace detail
 
 class BlockWeights {
@@ -117,8 +149,13 @@ class BlockWeights {
 
   // Resident blocks go through `upload` in block order; `before_group` runs before every streamed block is
   // validated or copied to pinned host memory (cancel checks). Throws std::invalid_argument on bad options.
+  // quant: the specs of a quantized index (`index` must be quant->index), or nullptr for the bundle's bf16 layout.
+  // host_transform (optional): applied to each streamed block's pinned host copy (kHostPinned) once it is read: the
+  // model's LoRA merges, so the blocks stream merged bytes.
   BlockWeights(const weights::ModelIndex& index, runtime::DeviceArena& arena, const Residency& residency,
-               const Upload& upload, const std::function<void(const weights::WeightGroup&)>& before_group);
+               const Upload& upload, const std::function<void(const weights::WeightGroup&)>& before_group,
+               const quant::QuantIndex* quant = nullptr,
+               const std::function<void(const weights::TensorMap&)>& host_transform = {});
   ~BlockWeights();
   BlockWeights(const BlockWeights&) = delete;
   BlockWeights& operator=(const BlockWeights&) = delete;
@@ -189,6 +226,7 @@ class BlockWeights {
   void collect_stats();
 
   const weights::ModelIndex& index_;
+  const quant::QuantIndex* quant_ = nullptr;
   runtime::DeviceArena& arena_;
   Residency residency_;
   std::bitset<kNumBlocks> mask_;

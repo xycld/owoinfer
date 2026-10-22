@@ -1,7 +1,7 @@
 // Exact tiled decode of the FLUX.2 VAE tail (plan step 23): schedule planner and band executor. See the
 // "Exact tiled decode" notes in flux2_vae.h for why the output is byte-identical to the untiled decode.
 //
-// Terms: the tail is a chain of 17 units (kUnits). A segment runs units [first, last) on full-width row bands; its
+// Terms: the tail is a chain of 17 units (make_units). A segment runs units [first, last) on full-width row bands; its
 // input is a checkpoint tensor kept whole in VRAM, its output the next checkpoint (or RGB). Rows are counted at
 // each tensor's own level (0 = H/8 ... 3 = H). A band owns rows [o0, o1) of the segment output; every GroupNorm
 // inside the segment owns the matching rows of its own input, so the bands partition every layer exactly.
@@ -44,23 +44,26 @@ struct UnitShape {
   int level, in_ch, out_ch;  // an upsampler reads `level` and writes level + 1
 };
 constexpr int kTailUnits = 17;
+using Units = std::array<UnitShape, kTailUnits>;
 
-constexpr std::array<UnitShape, kTailUnits> make_units() {
-  std::array<UnitShape, kTailUnits> u{};
-  int n = 0, ch = kMidCh;
-  u[n++] = {UnitKind::kResnet, 0, kMidCh, kMidCh};  // mid_block.resnets[1]
+constexpr Units make_units(const DecoderConfig& cfg) {
+  Units u{};
+  int n = 0, ch = cfg.mid();
+  u[n++] = {UnitKind::kResnet, 0, ch, ch};  // mid_block.resnets[1]
   for (int b = 0; b < 4; ++b) {
     for (int r = 0; r < kResnetsPerBlock; ++r) {
-      u[n++] = {UnitKind::kResnet, b, ch, kUpOut[b]};
-      ch = kUpOut[b];
+      u[n++] = {UnitKind::kResnet, b, ch, cfg.up_out(b)};
+      ch = cfg.up_out(b);
     }
     if (kUpSample[b]) u[n++] = {UnitKind::kUpsample, b, ch, ch};
   }
   u[n++] = {UnitKind::kOut, 3, ch, 3};
   return u;
 }
-constexpr std::array<UnitShape, kTailUnits> kUnits = make_units();
-static_assert(kUnits[kTailUnits - 1].kind == UnitKind::kOut && kUnits[kTailUnits - 1].in_ch == 96, "unit table");
+static_assert(make_units(DecoderConfig::small())[kTailUnits - 1].kind == UnitKind::kOut &&
+                  make_units(DecoderConfig::small())[kTailUnits - 1].in_ch == 96 &&
+                  make_units(DecoderConfig::full())[kTailUnits - 1].in_ch == 128,
+              "unit table");
 
 constexpr int out_level(const UnitShape& u) { return u.kind == UnitKind::kUpsample ? u.level + 1 : u.level; }
 
@@ -144,15 +147,15 @@ struct SegmentInfo {
   int groupnorms() const { return static_cast<int>(targets.size()) - 1; }
 };
 
-SegmentInfo segment_info(const Geometry& g, int first, int last) {
+SegmentInfo segment_info(const Geometry& g, const Units& units, int first, int last) {
   SegmentInfo si;
   si.first = first;
   si.last = last;
-  si.in_level = kUnits[first].level;
-  si.out_level = out_level(kUnits[last - 1]);
-  si.in_ch = kUnits[first].in_ch;
-  si.out_ch = kUnits[last - 1].kind == UnitKind::kOut ? 0 : kUnits[last - 1].out_ch;
-  for (int u = first; u < last; ++u) append_ops(kUnits[u], si.ops);
+  si.in_level = units[static_cast<std::size_t>(first)].level;
+  si.out_level = out_level(units[static_cast<std::size_t>(last - 1)]);
+  si.in_ch = units[static_cast<std::size_t>(first)].in_ch;
+  si.out_ch = units[static_cast<std::size_t>(last - 1)].kind == UnitKind::kOut ? 0 : units[static_cast<std::size_t>(last - 1)].out_ch;
+  for (int u = first; u < last; ++u) append_ops(units[static_cast<std::size_t>(u)], si.ops);
   const auto per_row = [&](int level, int ch) {  // tile tensor bytes per input-level row
     return static_cast<double>(g.row_bytes(level, ch)) * static_cast<double>(std::int64_t{1} << (level - si.in_level));
   };
@@ -279,16 +282,16 @@ struct Fixed {
   std::size_t gn = 0;        // tail GroupNorm accumulator + statistics slots
   std::size_t rgb = 0;       // RGB8 staging for host output
 };
-Fixed fixed_parts(std::int64_t h, std::int64_t w, const DecodeMode& mode) {
+Fixed fixed_parts(const DecoderConfig& cfg, std::int64_t h, std::int64_t w, const DecodeMode& mode) {
   Fixed f;
-  const Tensor x = act(nullptr, DType::kF32, 2 * h, 2 * w, kMidCh);
+  const Tensor x = act(nullptr, DType::kF32, 2 * h, 2 * w, cfg.mid());
   f.head_x = align_up(x.nbytes());
   f.head_scratch = std::max(2 * f.head_x, align_up(vae::mid_attention_workspace_bytes(x)));
   f.first_ckpt = align_up(x.nbytes() / (mode.bf16_convs ? 2 : 1));
   const bool in_place = !mode.bf16_convs;
   f.head_in = f.head_x + f.head_scratch + (in_place ? 0 : f.first_ckpt);
   f.head_out = (in_place ? 0 : f.head_x) + f.head_scratch;
-  f.aux = align_up(layout(h, w, mode).aux);
+  f.aux = align_up(layout(cfg, h, w, mode).aux);
   f.gn = align_up(vae::group_norm_accum_bytes(1, vae::kGroupNormGroups)) +
          align_up(static_cast<std::size_t>(kStatsSlots) * vae::kGroupNormGroups * 2 * sizeof(float));
   f.rgb = align_up(static_cast<std::size_t>(h * w) * kPixelsPerLatent * kPixelsPerLatent * 3);
@@ -315,16 +318,16 @@ struct Option {
 
 class Planner {
  public:
-  Planner(std::int64_t h, std::int64_t w, const DecodeMode& mode)
+  Planner(const DecoderConfig& cfg, std::int64_t h, std::int64_t w, const DecodeMode& mode)
       : g_{2 * h, 2 * w, mode.bf16_convs ? std::size_t{2} : std::size_t{4}, mode.bf16_convs ? kWorkPerByteBf16 : kWorkPerByteF32},
-        h_(h), w_(w), mode_(mode),
-        fixed_(fixed_parts(h, w, mode)) {
+        h_(h), w_(w), mode_(mode), cfg_(cfg), units_(make_units(cfg)),
+        fixed_(fixed_parts(cfg, h, w, mode)) {
     for (int first = 0; first < kTailUnits; ++first)
       for (int last = first + 1; last <= std::min(kTailUnits, first + kMaxSegmentUnits); ++last)
-        infos_.push_back(segment_info(g_, first, last));
+        infos_.push_back(segment_info(g_, units_, first, last));
     for (int u = 0; u < kTailUnits; ++u) {
       std::vector<Op> ops;
-      append_ops(kUnits[u], ops);
+      append_ops(units_[static_cast<std::size_t>(u)], ops);
       for (const Op& o : ops) {
         const int cl = op_compute_level(o);
         untiled_work_ += op_work(o, g_) * static_cast<double>(g_.rows(cl) * g_.cols(cl));
@@ -379,6 +382,7 @@ class Planner {
     p.height = h_;
     p.width = w_;
     p.bf16 = mode_.bf16_convs;
+    p.config = cfg_;
     p.tile = tile;
     std::size_t block = 0, work = 0;
     double total = 0;
@@ -397,6 +401,7 @@ class Planner {
   std::size_t fixed_bytes() const { return fixed_.aux + fixed_.gn + fixed_.rgb; }
   const Geometry& geometry() const { return g_; }
   const Fixed& fixed() const { return fixed_; }
+  const Units& units() const { return units_; }
   const SegmentInfo& info(int first, int last) const {
     for (const SegmentInfo& si : infos_)
       if (si.first == first && si.last == last) return si;
@@ -407,6 +412,8 @@ class Planner {
   Geometry g_;
   std::int64_t h_, w_;
   DecodeMode mode_;
+  DecoderConfig cfg_;
+  Units units_;
   Fixed fixed_;
   std::vector<SegmentInfo> infos_;
   double untiled_work_ = 0;
@@ -433,9 +440,10 @@ void check_tile(int tile) {
 
 class TiledRunner {
  public:
-  TiledRunner(const Flux2VaeDecoder& d, const Flux2VaeDecoder::Ctx& c, const Geometry& g, char* block,
+  TiledRunner(const Flux2VaeDecoder& d, const Flux2VaeDecoder::Ctx& c, const Geometry& g, const Units& units, char* block,
               std::size_t block_bytes, std::array<char*, 3> bufs, void* accum, float* stats, char* rgb)
-      : d_(d), c_(c), g_(g), block_(block), block_bytes_(block_bytes), bufs_(bufs), accum_(accum), stats_(stats), rgb_(rgb) {}
+      : d_(d), c_(c), g_(g), units_(units), block_(block), block_bytes_(block_bytes), bufs_(bufs), accum_(accum), stats_(stats),
+        rgb_(rgb) {}
 
   // Runs one segment whose input sits at block offset in_off; returns the output's offset.
   std::size_t run_segment(const SegmentInfo& si, std::int64_t band_rows, std::size_t in_off) {
@@ -594,7 +602,7 @@ class TiledRunner {
   }
 
   bool unit(Tile& t, int u) {
-    const UnitShape& us = kUnits[static_cast<std::size_t>(u)];
+    const UnitShape& us = units_[static_cast<std::size_t>(u)];
     switch (us.kind) {
       case UnitKind::kResnet:
         return resnet(t, u == 0 ? d_.mid_resnets_[1] : d_.up_[(u - 1) / 4].resnets[(u - 1) % 4]);
@@ -650,6 +658,7 @@ class TiledRunner {
   const Flux2VaeDecoder& d_;
   const Flux2VaeDecoder::Ctx& c_;
   const Geometry& g_;
+  const Units& units_;
   char* block_;
   std::size_t block_bytes_;
   std::array<char*, 3> bufs_;
@@ -669,7 +678,7 @@ std::string TilePlan::describe() const {
                 static_cast<double>(workspace_bytes) / static_cast<double>(std::size_t{1} << 30), relative_cost);
   std::string s = buf;
   for (const Segment& sg : segments) {
-    const int lout = out_level(kUnits[static_cast<std::size_t>(sg.end_unit - 1)]);
+    const int lout = out_level(make_units(config)[static_cast<std::size_t>(sg.end_unit - 1)]);
     const std::int64_t rows = (2 * height) << lout;
     s += " [" + std::to_string(sg.first_unit) + "," + std::to_string(sg.end_unit) + ")";
     s += sg.band_rows >= rows ? "whole" : "x" + std::to_string((rows + sg.band_rows - 1) / sg.band_rows);
@@ -677,11 +686,11 @@ std::string TilePlan::describe() const {
   return s;
 }
 
-std::optional<TilePlan> Flux2VaeDecoder::plan_tiled(std::int64_t height, std::int64_t width, const DecodeMode& mode,
-                                                    std::size_t budget_bytes, int tile) {
+std::optional<TilePlan> Flux2VaeDecoder::plan_tiled(const DecoderConfig& config, std::int64_t height, std::int64_t width,
+                                                    const DecodeMode& mode, std::size_t budget_bytes, int tile) {
   check_grid(height, width);
   if (tile != 0) check_tile(tile);
-  const Planner p(height, width, mode);
+  const Planner p(config, height, width, mode);
   const std::size_t fixed = p.fixed_bytes();
   const Fixed& f = p.fixed();
   std::optional<TilePlan> best;
@@ -702,10 +711,11 @@ std::optional<TilePlan> Flux2VaeDecoder::plan_tiled(std::int64_t height, std::in
   return best;
 }
 
-TilePlan Flux2VaeDecoder::plan_tiled_min_memory(std::int64_t height, std::int64_t width, const DecodeMode& mode, int tile) {
+TilePlan Flux2VaeDecoder::plan_tiled_min_memory(const DecoderConfig& config, std::int64_t height, std::int64_t width,
+                                                const DecodeMode& mode, int tile) {
   check_grid(height, width);
   check_tile(tile);
-  const Planner p(height, width, mode);
+  const Planner p(config, height, width, mode);
   const std::vector<Option> opts = p.options(tile);
   // For every block cap, the smallest tile-buffer cap that still admits a segmentation (minimax over paths).
   std::size_t best_total = std::numeric_limits<std::size_t>::max(), best_block = 0, best_work = 0;
@@ -726,8 +736,9 @@ TilePlan Flux2VaeDecoder::plan_tiled_min_memory(std::int64_t height, std::int64_
   return p.finish(tile, path);
 }
 
-std::size_t Flux2VaeDecoder::tiled_workspace_bytes(std::int64_t height, std::int64_t width, int tile, const DecodeMode& mode) {
-  return plan_tiled_min_memory(height, width, mode, tile).workspace_bytes;
+std::size_t Flux2VaeDecoder::tiled_workspace_bytes(const DecoderConfig& config, std::int64_t height, std::int64_t width,
+                                                   int tile, const DecodeMode& mode) {
+  return plan_tiled_min_memory(config, height, width, mode, tile).workspace_bytes;
 }
 
 void Flux2VaeDecoder::decode_tiled(const Tensor& latents, const Tensor& rgb, const DecodeMode& mode, const TilePlan& plan,
@@ -736,8 +747,9 @@ void Flux2VaeDecoder::decode_tiled(const Tensor& latents, const Tensor& rgb, con
   if (mode.torch_group_norm)
     fail("decode_tiled needs DecodeMode::torch_group_norm == false (torch's GroupNorm statistics cannot be split into tiles)");
   const std::int64_t h = latents.dim(-2), w = latents.dim(-1);
-  if (plan.height != h || plan.width != w || plan.bf16 != mode.bf16_convs) fail("tile plan was made for another latent grid or mode");
-  const Planner p(h, w, mode);
+  if (plan.height != h || plan.width != w || plan.bf16 != mode.bf16_convs || plan.config != config_)
+    fail("tile plan was made for another latent grid, mode or decoder");
+  const Planner p(config_, h, w, mode);
   const Geometry& g = p.geometry();
   // Re-derive and validate the layout from the plan.
   std::size_t block = 0, work = 0, buf = 0;
@@ -776,7 +788,8 @@ void Flux2VaeDecoder::decode_tiled(const Tensor& latents, const Tensor& rgb, con
   Ctx c{stream, DType::kF32, &mode, aux, f.aux, nullptr, nullptr, 0, strip ? strip_p : nullptr, strip ? kStripScratchBytes : 0, h, w, &hook};
 
   // Head (untiled); its output becomes the first checkpoint at the end of the block (see Fixed).
-  const std::size_t in_bytes = g.row_bytes(0, kMidCh) * static_cast<std::size_t>(g.rows(0));
+  const int mid = config_.mid();
+  const std::size_t in_bytes = g.row_bytes(0, mid) * static_cast<std::size_t>(g.rows(0));
   std::size_t in_off = block - in_bytes;
   char* head_area = regions.head_inside ? block_p : work_p;
   char* x = mode.bf16_convs ? head_area : block_p + in_off;
@@ -784,11 +797,11 @@ void Flux2VaeDecoder::decode_tiled(const Tensor& latents, const Tensor& rgb, con
   run_head(c, latents, x, scratch, scratch + f.head_x, scratch, f.head_scratch);
   c.dt = mode.bf16_convs ? DType::kBF16 : DType::kF32;
   if (c.dt == DType::kBF16)
-    kernels::cast(act(x, DType::kF32, g.rows(0), g.cols(0), kMidCh), act(block_p + in_off, DType::kBF16, g.rows(0), g.cols(0), kMidCh), stream);
+    kernels::cast(act(x, DType::kF32, g.rows(0), g.cols(0), mid), act(block_p + in_off, DType::kBF16, g.rows(0), g.cols(0), mid), stream);
 
   char* rgb_dst = rgb.device == Device::kCUDA ? static_cast<char*>(rgb.data) : rgb_stage;
   const std::size_t accum_bytes = align_up(vae::group_norm_accum_bytes(1, vae::kGroupNormGroups));
-  TiledRunner runner(*this, c, g, block_p, block, {work_p, work_p + buf, work_p + 2 * buf}, gn,
+  TiledRunner runner(*this, c, g, p.units(), block_p, block, {work_p, work_p + buf, work_p + 2 * buf}, gn,
                      reinterpret_cast<float*>(gn + accum_bytes), rgb_dst);
   for (std::size_t i = 0; i < infos.size(); ++i) in_off = runner.run_segment(*infos[i], plan.segments[i].band_rows, in_off);
   if (rgb.device != Device::kCUDA) {
@@ -801,16 +814,16 @@ std::optional<TilePlan> Flux2VaeDecoder::decode_within(const Tensor& latents, co
                                                        std::size_t budget_bytes, cudaStream_t stream) {
   check_decode_args(latents, rgb, mode, has_bf16_);
   const std::int64_t h = latents.dim(-2), w = latents.dim(-1);
-  if (workspace_bytes(h, w, mode) <= budget_bytes) {
+  if (workspace_bytes(config_, h, w, mode) <= budget_bytes) {
     decode(latents, rgb, mode, stream);
     return std::nullopt;
   }
   DecodeMode tiled = mode;
   tiled.torch_group_norm = false;
-  std::optional<TilePlan> plan = plan_tiled(h, w, tiled, budget_bytes);
+  std::optional<TilePlan> plan = plan_tiled(config_, h, w, tiled, budget_bytes);
   if (!plan) {
     throw std::runtime_error("mi::flux2_vae: no decode schedule fits " + std::to_string(budget_bytes) + " bytes (smallest tiled: " +
-                             std::to_string(tiled_workspace_bytes(h, w, 8, tiled)) + ")");
+                             std::to_string(tiled_workspace_bytes(config_, h, w, 8, tiled)) + ")");
   }
   decode_tiled(latents, rgb, tiled, *plan, stream);
   return plan;

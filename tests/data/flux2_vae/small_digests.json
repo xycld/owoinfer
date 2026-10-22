@@ -1,0 +1,53 @@
+{
+ "about": "FNV-1a 64 digests of small-decoder decodes and head-dim-384 attention outputs, keyed by machine (see tests/unit/test_flux2_vae_regress.cpp). Add an entry per machine with MI_FLUX2_VAE_DIGESTS_WRITE.",
+ "entries": [
+  {
+   "key": {
+    "gpu": "NVIDIA GeForce RTX 4090 Laptop GPU",
+    "cc": "8.9",
+    "cudart": 13040,
+    "cublaslt": 130800
+   },
+   "digests": {
+    "attention384 B1 L1000 tf32x3": "061132c80606d5c8",
+    "attention384 B1 L1000 tf32": "331f426e0f3022f6",
+    "attention384 B2 L200 tf32x3": "1147ead03fa68b69",
+    "attention384 B2 L200 tf32": "4791c1c3393276a8",
+    "attention384 B1 L64 tf32x3": "3631d7bf32cf1552",
+    "attention384 B1 L64 tf32": "122914a20cfd426c",
+    "g_short_1024 untiled reference": "3ad7353b8279a47b",
+    "g_short_1024 untiled torch_reference": "bc25684c37c2b7f6",
+    "g_short_1024 untiled fast_attention": "26772ae664d8c562",
+    "g_short_1024 untiled fastest": "5b18b57313dd10b4",
+    "g_short_1024 tiled reference min-mem t16": "3ad7353b8279a47b",
+    "g_short_1024 tiled reference min-mem t40": "3ad7353b8279a47b",
+    "g_short_1024 tiled reference 1.5GiB": "3ad7353b8279a47b",
+    "g_short_1024 tiled fastest min-mem t16": "5b18b57313dd10b4",
+    "g_short_1024 tiled fastest min-mem t40": "5b18b57313dd10b4",
+    "g_short_1024 tiled fastest 1.5GiB": "5b18b57313dd10b4",
+    "g_fridge_1456 untiled reference": "5fc552e29e89f5a3",
+    "g_fridge_1456 untiled torch_reference": "ff9f5efff8bdda5d",
+    "g_fridge_1456 untiled fast_attention": "5e71bce904fd6bd7",
+    "g_fridge_1456 untiled fastest": "7010aca71cb48ec9",
+    "g_fridge_1456 tiled reference min-mem t16": "5fc552e29e89f5a3",
+    "g_fridge_1456 tiled reference min-mem t40": "5fc552e29e89f5a3",
+    "g_fridge_1456 tiled reference 1.5GiB": "5fc552e29e89f5a3",
+    "g_fridge_1456 tiled fastest min-mem t16": "7010aca71cb48ec9",
+    "g_fridge_1456 tiled fastest min-mem t40": "7010aca71cb48ec9",
+    "g_fridge_1456 tiled fastest 1.5GiB": "7010aca71cb48ec9",
+    "asset001_base untiled reference": "b730d48d1a1d0d46",
+    "asset001_base untiled torch_reference": "1900454b410dd31b",
+    "asset001_base untiled fast_attention": "7f458f2f2ed14e53",
+    "asset001_base untiled fastest": "738459bfa80a13f8",
+    "asset001_base tiled reference min-mem t16": "b730d48d1a1d0d46",
+    "asset001_base tiled reference min-mem t40": "b730d48d1a1d0d46",
+    "asset001_base tiled reference 1.5GiB": "b730d48d1a1d0d46",
+    "asset001_base tiled fastest min-mem t16": "738459bfa80a13f8",
+    "asset001_base tiled fastest min-mem t40": "738459bfa80a13f8",
+    "asset001_base tiled fastest 1.5GiB": "738459bfa80a13f8",
+    "ac16_2048 untiled reference": "4e76fea09cb1b190"
+   },
+   "source": "small decoder and attention kernel at commit 4047272 (before the full-decoder generalization), via tests/unit/test_flux2_vae_regress.cpp"
+  }
+ ]
+}

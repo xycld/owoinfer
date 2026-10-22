@@ -1,0 +1,125 @@
+{
+ "format": "mossinfer-quality-certificates",
+ "version": 2,
+ "certificates": [
+  {
+   "tier": "high",
+   "model": {
+    "dit": {
+     "files": [
+      {
+       "name": "tiny.safetensors",
+       "size": 4099,
+       "xxh64": "23ab71dcfdb6681e"
+      }
+     ]
+    },
+    "te": null
+   },
+   "config": {
+    "dit_precision": "int8_convrot",
+    "attention": "q8_fp8",
+    "te_precision": "bf16",
+    "lora": "none"
+   },
+   "numerics": {
+    "attention_q8": 1,
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "int8": 1,
+    "te": 1
+   },
+   "gpu_arch": "sm_89",
+   "prompt_set": {
+    "id": "moss-ac6",
+    "prompts": 23,
+    "sha256": "c0b4b6069d008a51ddac0d91b1399de5e533203f3791ad7f464439905675b876"
+   },
+   "scope": {
+    "max_pixels": 2102784,
+    "samplers": [
+     "euler"
+    ],
+    "steps": [
+     30,
+     50
+    ],
+    "accelerators": "off"
+   },
+   "date": "2026-10-21T12:00:00Z",
+   "gates": [
+    {
+     "name": "determinism.mismatches",
+     "value": 0.0,
+     "op": "<=",
+     "threshold": 0.0,
+     "pass": true
+    },
+    {
+     "name": "same_seed.lpips_mean",
+     "value": 0.0412,
+     "op": "<=",
+     "threshold": 0.12,
+     "pass": true
+    },
+    {
+     "name": "same_seed.lpips_max",
+     "value": 0.131,
+     "op": "<=",
+     "threshold": 0.25,
+     "pass": true
+    },
+    {
+     "name": "same_seed.dino_mean",
+     "value": 0.9731,
+     "op": ">=",
+     "threshold": 0.9,
+     "pass": true
+    },
+    {
+     "name": "same_seed.ocr_delta",
+     "value": -0.0125,
+     "op": ">=",
+     "threshold": -0.05,
+     "pass": true
+    },
+    {
+     "name": "reference.lpips_mean",
+     "value": 0.0655,
+     "op": "<=",
+     "threshold": 0.132,
+     "pass": true
+    },
+    {
+     "name": "reference.lpips_paired_max",
+     "value": 0.0402,
+     "op": "<=",
+     "threshold": 0.08800000000000001,
+     "pass": true
+    },
+    {
+     "name": "reference.dino_mean",
+     "value": 0.9502,
+     "op": ">=",
+     "threshold": 0.8875,
+     "pass": true
+    },
+    {
+     "name": "reference.ocr_delta",
+     "value": 0.003,
+     "op": ">=",
+     "threshold": -0.075,
+     "pass": true
+    }
+   ],
+   "passed": true,
+   "info": {
+    "same_seed.ocr_prompts": 13.0,
+    "reference.ocr_prompts": 13.0,
+    "noise.bf16_vs_official.lpips_mean": 0.0461,
+    "noise.bf16_repeat.lpips_mean": 0.0
+   },
+   "tool": "certify.py 2"
+  }
+ ]
+}

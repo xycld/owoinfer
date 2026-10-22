@@ -10,10 +10,9 @@
 
 namespace mi::flux2_vae::detail {
 
-inline constexpr int kMidCh = 384;
-inline constexpr int kTailMaxCh = 192;  // widest full-resolution tensor: up_blocks[2]'s upsampler (192 ch at H x W)
-// Up blocks in execution order (decoder_block_out_channels reversed): output channels, upsampler.
-inline constexpr int kUpOut[4] = {384, 384, 192, 96};
+// Widest full-resolution tensor: up_blocks[2]'s upsampler (2c channels at H x W; 192 small, 256 full).
+constexpr int tail_max_ch(const DecoderConfig& cfg) { return cfg.up_out(2); }
+// Up blocks in execution order: upsampler present (output channels: DecoderConfig::up_out).
 inline constexpr bool kUpSample[4] = {true, true, true, false};
 inline constexpr int kResnetsPerBlock = 3;  // layers_per_block + 1
 // CUTLASS's conv iterators use 32-bit byte offsets: tensors of 2 GiB or more (the 192-channel full-resolution
@@ -33,7 +32,10 @@ struct Layout {
   std::size_t aux = 0;     // conv / GroupNorm scratch, enough for every decoder shape at this size
   std::size_t strip = 0;   // conv output strip scratch (only for tensors CUTLASS cannot address at once)
 };
-Layout layout(std::int64_t h, std::int64_t w, const DecodeMode& mode);
+Layout layout(const DecoderConfig& cfg, std::int64_t h, std::int64_t w, const DecodeMode& mode);
+
+// Throws std::invalid_argument for an unsupported config.
+void check_config(const DecoderConfig& cfg);
 
 // Validates decode()'s arguments; returns the latent grid {h, w}.
 void check_decode_args(const Tensor& latents, const Tensor& rgb, const DecodeMode& mode, bool has_bf16);

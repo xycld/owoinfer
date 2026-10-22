@@ -15,6 +15,15 @@
 // compute-done event of the layer that last used a buffer before overwriting it. Off (`streaming = false`):
 // the P2 path, which loads a layer synchronously into one buffer and then runs it. Both give bit-identical
 // results.
+//
+// Quantized weights (P6, AC23): the second constructor runs a QuantTextModel (an INT8 ConvRot or W4A8 file, see
+// quant_text_model.h) through the same streaming / host-resident machinery. Every quantized GEMM input is rotated and
+// quantized per token once per site (kernels/quant/quant.h) and shared by the GEMMs reading it: the norm output by
+// q/k/v (attention) or in_proj_qkv/in_proj_z (GDN; in_proj_a/b stay bf16 GEMMs on the bf16 norm output) and by
+// gate/up (MLP), the gated attention output by o_proj, the gated-norm GDN output by out_proj, silu(gate) * up by
+// down_proj. Grouped (W4A8) weights are decoded to INT8 on the GPU right before their GEMM. The INT8 GEMMs run over
+// all packed tokens at once (int32 accumulation is exact and the epilogue is per element, so the bits do not depend
+// on the row count); results stay bit-identical to encoding each prompt alone.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -27,9 +36,11 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "core/tensor.h"
+#include "models/qwen35_text/quant_text_model.h"
 #include "runtime/device_arena.h"
 #include "weights/model_index.h"
 
@@ -46,11 +57,13 @@ inline constexpr int kAttnHeadDim = 256;
 // output bit (the embedding cache keys on it, so stale embeddings become misses).
 inline constexpr std::uint32_t kNumericsVersion = 1;
 
-// What encode()'s output bits depend on besides the weights and the tokens: kNumericsVersion, the precision (bf16
-// weights and activations, the only one so far), the current device's compute capability and the cuBLASLt version
-// (its GEMM algorithm choice). The streaming, weight-source and buffer options never change a bit (tested), so
+// What encode()'s output bits depend on besides the weights and the tokens: kNumericsVersion, the precision (bf16,
+// INT8 ConvRot or W4A8, see Precision), the current device's compute capability and the cuBLASLt version (its GEMM
+// algorithm choice; the quantized encoders still run in_proj_a/b in bf16). The streaming, weight-source and buffer options never change a bit (tested), so
 // they are not part of it.
 std::uint64_t numerics_id();
+// Same for an encoder of the given precision (numerics_id() is numerics_id(Precision::kBF16)).
+std::uint64_t numerics_id(Precision precision);
 
 // Where streamed layer weights come from.
 enum class WeightSource {
@@ -80,6 +93,14 @@ using LayerHook = std::function<void(int layer, const Tensor& hidden, cudaStream
 // once more with layer == kNumLayers after its last copy; an exception thrown here fails that reader.
 using ReaderHook = std::function<void(int reader, int layer)>;
 
+// Test and debugging hooks into an encode's GEMMs (fault and error injection; unset in production). Called on the
+// issuing thread in stream order, so a hook may enqueue work on `stream` (or synchronize it).
+// After linear `module` (e.g. "language_model.layers.17.mlp.down_proj") wrote its output, bf16 [T, n]: may modify it.
+using LinearHook = std::function<void(const std::string& module, const Tensor& out, cudaStream_t stream)>;
+// Quantized encoders, before grouped (W4A8) linear `module` is decoded: its group scales, e4m3 [n, k / group] (`bytes`
+// bytes), in the device weight buffer, which every encode() reloads: may modify them.
+using DecodeHook = std::function<void(const std::string& module, std::uint8_t* s_rel, std::int64_t bytes, cudaStream_t stream)>;
+
 struct EncodeOptions {
   LayerHook layer_hook;
   // Checked before every decoder layer is issued; once set, encode() stops the readers, waits for every queued
@@ -87,6 +108,9 @@ struct EncodeOptions {
   // one layer ahead of the GPU, so a cancel lands within about one layer.
   const std::atomic<bool>* cancel = nullptr;
   ReaderHook reader_hook;  // streaming only
+  // Default-initialized so aggregate initializations of the members above keep compiling warning-free.
+  LinearHook linear_hook = {};
+  DecodeHook decode_hook = {};
 };
 
 // encode() saw EncodeOptions::cancel set. The encoder stays usable.
@@ -123,18 +147,25 @@ class TextEncoder {
                                      const EncoderOptions& options);
   // Same, for the default options.
   static std::size_t workspace_bytes(const weights::ModelIndex& index, std::span<const std::int64_t> lengths);
+  // Same for an encoder of a quantized file (adds the activation-quantization, W4A8 decode and F32-parameter buffers).
+  static std::size_t workspace_bytes(const QuantTextModel& model, std::span<const std::int64_t> lengths,
+                                     const EncoderOptions& options = {});
 
   // Host memory an encoder with `options` holds, exactly: pinned rings (reader_threads x ring_slots x slot;
   // allocated by the constructor) plus, for host-resident sources, the copy of every layer group (allocated by
   // preload_host() or the first encode(); pinned or pageable as the source says). Excludes the mmapped
   // embedding table (file-backed) and transient per-call host buffers.
   static std::size_t host_bytes(const weights::ModelIndex& index, const EncoderOptions& options);
+  static std::size_t host_bytes(const QuantTextModel& model, const EncoderOptions& options);
 
   // `index` must contain the text_encoder groups and outlive the encoder; `arena` serves every device
   // allocation (weight buffer, activations, outputs) from its stack region during encode(). All work is
   // issued on `stream`.
   TextEncoder(const weights::ModelIndex& index, runtime::DeviceArena& arena, cudaStream_t stream,
               EncoderOptions options = {});
+  // An encoder of a quantized file; `model` must outlive the encoder. Same contract otherwise. encode() also throws
+  // mi::quant::QuantError when a streamed W4A8 group scale is NaN or negative.
+  TextEncoder(const QuantTextModel& model, runtime::DeviceArena& arena, cudaStream_t stream, EncoderOptions options = {});
   ~TextEncoder();
   TextEncoder(const TextEncoder&) = delete;
   TextEncoder& operator=(const TextEncoder&) = delete;
@@ -160,6 +191,8 @@ class TextEncoder {
   const EncodeStats& last_stats() const;
   std::size_t weight_buffer_bytes() const;  // one buffer
   std::int64_t vocab_size() const;
+  Precision precision() const;
+  std::uint64_t numerics() const;  // numerics_id(precision())
 
  private:
   struct Impl;

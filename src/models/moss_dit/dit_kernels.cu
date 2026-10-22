@@ -49,6 +49,11 @@ struct Params {
   std::uint32_t words[kMaxParamBytes / 4];
 };
 
+__global__ void extrapolate_kernel(const float* x, const float* x_prev, float c, float* out, std::int64_t n) {
+  const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = x[i] + c * (x[i] - x_prev[i]);
+}
+
 __global__ void write_params_kernel(std::uint32_t* dst, Params p, int n) {
   for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) dst[i] = p.words[i];
 }
@@ -96,6 +101,17 @@ void write_params(void* dst, const void* src, std::size_t bytes, cudaStream_t st
   Params p{};
   std::memcpy(p.words, src, bytes);
   write_params_kernel<<<1, 256, 0, stream>>>(static_cast<std::uint32_t*>(dst), p, static_cast<int>(bytes / 4));
+  MI_CUDA_CHECK_LAUNCH();
+}
+
+void extrapolate_latents(const Tensor& x, const Tensor& x_prev, float c, const Tensor& out, cudaStream_t stream) {
+  const auto f32 = [](const Tensor& t) { return t.device == Device::kCUDA && t.dtype == DType::kF32 && t.is_contiguous(); };
+  check(f32(x) && f32(x_prev) && f32(out) && x_prev.numel() == x.numel() && out.numel() == x.numel(), "extrapolate_latents",
+        "needs contiguous CUDA f32 tensors of equal size");
+  const std::int64_t n = x.numel();
+  if (n == 0) return;
+  extrapolate_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(x.ptr<const float>(), x_prev.ptr<const float>(), c,
+                                                                                out.ptr<float>(), n);
   MI_CUDA_CHECK_LAUNCH();
 }
 

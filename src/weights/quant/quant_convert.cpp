@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "util/checked_math.h"
+#include "util/json.h"
 #include "util/path.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
@@ -228,6 +229,13 @@ LoraFileInfo load_lora(const LoraInput& in, LoraMap& out) {
     if (slot != nullptr) throw weights::FormatError(in.file, t.name, "duplicate LoRA part");
     slot = &t;
   }
+  // The shared alpha rule (lora_metadata_alpha): without an alpha tensor, the diffusers / PEFT metadata alpha.
+  std::optional<double> meta_alpha;
+  try {
+    meta_alpha = lora_metadata_alpha(f.metadata());
+  } catch (const QuantError& e) {
+    throw weights::FormatError(in.file, "", e.what());
+  }
   Xxh64 hash;
   auto read = [&](const weights::TensorInfo& t) {
     std::vector<std::byte> raw(static_cast<std::size_t>(t.nbytes));
@@ -246,7 +254,7 @@ LoraFileInfo load_lora(const LoraInput& in, LoraMap& out) {
     lf.n = p.up->shape[0];
     lf.down = to_floats(read(*p.down), p.down->dtype);
     lf.up = to_floats(read(*p.up), p.up->dtype);
-    std::optional<float> alpha;
+    std::optional<double> alpha = meta_alpha;
     if (p.alpha != nullptr) {
       if (p.alpha->numel() != 1) throw weights::FormatError(in.file, p.alpha->name, "alpha must be a scalar");
       alpha = to_floats(read(*p.alpha), p.alpha->dtype)[0];
@@ -399,11 +407,32 @@ bool glob_match(std::string_view p, std::string_view s) {
   return pi == p.size();
 }
 
-float lora_coef(float strength, std::optional<float> alpha, std::int64_t rank) {
-  // ComfyUI: alpha = alpha_tensor.item() / rank (1.0 without alpha), applied as (strength * alpha) * delta with the
-  // Python double rounded to fp32 by the fp32 tensor multiply.
-  const double a = alpha ? static_cast<double>(*alpha) / static_cast<double>(rank) : 1.0;
-  const double v = static_cast<double>(strength) * a;
+std::optional<double> lora_metadata_alpha(const std::map<std::string, std::string>& metadata) {
+  const auto it = metadata.find("lora_adapter_metadata");
+  if (it == metadata.end()) return std::nullopt;
+  json::Value v;
+  try {
+    v = json::parse(it->second, json::ParseLimits{1 << 16});
+  } catch (const json::ParseError& e) {
+    fail(std::string("malformed lora_adapter_metadata: ") + e.what());
+  }
+  if (!v.is_object()) fail("lora_adapter_metadata is not a JSON object");
+  if (const json::Value* p = v.find("alpha_pattern"); p != nullptr && p->is_object() && !p->as_object().empty()) {
+    fail("lora_adapter_metadata alpha_pattern (per-module alphas) is not supported");
+  }
+  const json::Value* a = v.find("lora_alpha");
+  if (a == nullptr || a->is_null()) return std::nullopt;
+  if (!a->is_number() || !std::isfinite(a->as_double())) fail("lora_adapter_metadata lora_alpha is not a finite number");
+  return a->as_double();
+}
+
+double lora_alpha_scale(std::optional<double> alpha, std::int64_t rank) {
+  return alpha ? *alpha / static_cast<double>(rank) : 1.0;
+}
+
+float lora_coef(float strength, std::optional<double> alpha, std::int64_t rank) {
+  // (strength * alpha / rank) * delta with the Python double rounded to fp32 by the fp32 tensor multiply.
+  const double v = static_cast<double>(strength) * lora_alpha_scale(alpha, rank);
   // Outside the fp32 range (or NaN) the coefficient is reported as infinite; callers reject it.
   return std::fabs(v) <= std::numeric_limits<float>::max() ? static_cast<float>(v) : std::numeric_limits<float>::infinity();
 }

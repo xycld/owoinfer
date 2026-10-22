@@ -31,7 +31,9 @@
 #include "models/moss_dit/moss_dit.h"
 #include "pipeline/hardware_profile.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/report_json.h"
 #include "pipeline/png_writer.h"
+#include "pipeline/quality_cert.h"
 #include "pipeline/rng_torch_compat.h"
 #include "pipeline/sampler.h"
 #include "planner/planner.h"
@@ -309,7 +311,7 @@ TEST(PipelineRequest, ValidatesLikeTheOfficialApp) {
   EXPECT_EQ(mi::pipeline::parse_layer_list("22"), std::vector<int>{22});
   EXPECT_THROW(mi::pipeline::parse_layer_list("22;24"), std::invalid_argument);
   EXPECT_EQ(mi::pipeline::parse_sampler("ab2"), SamplerKind::kAb2);
-  EXPECT_THROW(mi::pipeline::parse_sampler("heun"), std::invalid_argument);
+  EXPECT_THROW(mi::pipeline::parse_sampler("lms"), std::invalid_argument);
 }
 
 TEST(PipelineRequest, VramOptionBytes) {
@@ -482,6 +484,24 @@ std::vector<LoopCase> loop_cases() {
 
 bool have_weights() { return fs::is_regular_file(weights_root() / "base" / "moss.mossidx"); }
 
+const fs::path kInt8Dit = "/workspace/Models/community/comfy-org/moss_image_sft_int8_convrot.safetensors";
+const fs::path kKohyaLora = "/workspace/Models/community/congruency/MOSS-Image-Turbo-MFD/MOSS-Image-SFT-Turbo-MFD-v0.1.comfy.safetensors";
+const fs::path kPeftLora = "/workspace/Models/community/axiomofmind/Moss-image-beauty-lora/pytorch_lora_weights.safetensors";
+bool have_lora_files() {
+  return fs::is_regular_file(weights_root() / "sft" / "moss.mossidx") && fs::is_regular_file(kInt8Dit) &&
+         fs::is_regular_file(kKohyaLora) && fs::is_regular_file(kPeftLora);
+}
+mi::pipeline::Request lora_request() {
+  mi::pipeline::Request req;
+  req.model = weights_root() / "sft";
+  req.prompt = "portrait of a woman in a garden, soft light";
+  req.height = req.width = 256;
+  req.steps = 3;
+  req.decode = false;
+  return req;
+}
+
+
 // DiT + sampler loop on golden text-encoder states (no text-encoder drift) vs the reference loop.
 class PipelineLoop : public ::testing::Test {
  protected:
@@ -612,7 +632,9 @@ TEST(PipelineEndToEnd, FourStepLatentsMatchReference) {
   req.model = weights_root() / "base";
   req.steps = 4;
   req.decode = false;
-  mi::pipeline::Pipeline pipe;
+  mi::pipeline::PipelineOptions ref_options;
+  ref_options.tier = mi::planner::Tier::kReference;  // AC11: the Reference tier, pinned
+  mi::pipeline::Pipeline pipe(ref_options);
   std::vector<int> seen;
   mi::pipeline::GenerateControl control;
   control.on_step = [&](const mi::pipeline::StepInfo& s) {
@@ -1031,7 +1053,8 @@ TEST(PipelineEndToEnd, TiledAndUntiledDecodeGiveTheSameImage) {
   // the planner's other terms); with room, tiling would be a planner regression.
   const std::size_t untiled_need =
       mi::moss_dit::MossDit::persistent_bytes(index) + mi::flux2_vae::Flux2VaeDecoder::persistent_bytes(index) +
-      mi::flux2_vae::Flux2VaeDecoder::workspace_bytes(1024, 1024) + defaults.context_bytes + options.vram_reserve +
+      mi::flux2_vae::Flux2VaeDecoder::workspace_bytes(mi::flux2_vae::decoder_config(index), 1024, 1024) +
+      defaults.context_bytes + options.vram_reserve +
       (std::size_t{1} << 30);
   const bool room_for_untiled = mi::runtime::DeviceArena::free_device_bytes() >= untiled_need;
   mi::pipeline::Result untiled;
@@ -1216,6 +1239,253 @@ TEST(PipelineEndToEnd, StreamedDitMatchesResidentAndCancels) {
 // M1/M2: the DiT block path. The default (fused) and the opt-in fused_graphs report themselves and give op_by_op's
 // latents bit for bit; a failed fused self-check (injected through the cached hardware profile of this GPU) makes the
 // pipeline run op by op and say why, with the same latents.
+// P6: requests the quality tiers refuse fail with std::invalid_argument before any phase runs.
+TEST(PipelineQuality, RefusalsBeforeAnyPhase) {
+  if (!have_weights()) GTEST_SKIP() << "weights not present";
+  mi::pipeline::Request req;
+  req.model = weights_root() / "base";
+  req.prompt = "a cat";
+  req.height = req.width = 256;
+  req.steps = 1;
+  req.decode = false;
+  const auto refused = [&](const mi::pipeline::PipelineOptions& options, const char* what) {
+    mi::pipeline::Pipeline pipe(options);
+    bool phase = false;
+    mi::pipeline::GenerateControl control;
+    control.on_phase = [&](mi::pipeline::Phase) { return phase = true; };
+    EXPECT_THROW(pipe.generate(req, control), std::invalid_argument) << what;
+    EXPECT_FALSE(phase) << what;
+  };
+  mi::pipeline::PipelineOptions o;
+  o.tier = mi::planner::Tier::kHigh;
+  o.attention = mi::planner::AttentionMode::kExact;
+  refused(o, "tier high on a bf16 DiT with exact attention");
+  o = {};
+  o.tier = mi::planner::Tier::kTurbo;
+  refused(o, "tier turbo");
+  o = {};
+  o.tier = mi::planner::Tier::kReference;
+  o.attention = mi::planner::AttentionMode::kQ8Fp8;
+  refused(o, "tier reference with 8-bit attention");
+  o = {};
+  o.text_encoder_file = weights_root() / "base" / "text_encoder";
+  refused(o, "a separate text encoder file");
+  o = {};
+  o.dit_file = weights_root() / "does-not-exist.safetensors";
+  refused(o, "a missing DiT file");
+  const fs::path int8 = "/workspace/Models/community/comfy-org/moss_image_sft_int8_convrot.safetensors";
+  if (fs::is_regular_file(int8)) {
+    o = {};
+    o.dit_file = int8;
+    o.tier = mi::planner::Tier::kReference;
+    refused(o, "tier reference on an INT8 DiT");
+  }
+}
+
+// P6: the Comfy-Org INT8 SFT DiT from its single file, with the SFT bundle's tokenizer, text encoder and VAE. Tier auto
+// (no certificate) runs INT8 GEMMs with exact attention, uncertified; tier high adds 8-bit attention on the loaded DiT
+// (no reload); the report carries the quality object; the default (bf16 bundle, auto) stays the Reference tier.
+TEST(PipelineEndToEnd, Int8DitFileRunsTheHighTier) {
+  const fs::path int8 = "/workspace/Models/community/comfy-org/moss_image_sft_int8_convrot.safetensors";
+  if (!fs::is_regular_file(weights_root() / "sft" / "moss.mossidx") || !fs::is_regular_file(int8)) {
+    GTEST_SKIP() << "SFT bundle or INT8 DiT file not present";
+  }
+  mi::pipeline::Request req;
+  req.model = weights_root() / "sft";
+  req.prompt = "a lighthouse on a cliff at night";
+  req.height = req.width = 256;
+  req.steps = 3;
+  req.decode = false;
+  {
+    mi::pipeline::PipelineOptions ref_options;
+    ref_options.tier = mi::planner::Tier::kReference;  // AC11: the Reference tier, pinned
+    mi::pipeline::Pipeline pipe(ref_options);
+    const mi::pipeline::Result ref = pipe.generate(req);
+    EXPECT_EQ(ref.tier.effective, mi::planner::Tier::kReference);
+    EXPECT_EQ(ref.tier.attention, mi::planner::AttentionMode::kExact);
+    EXPECT_EQ(ref.dit_linears, "bf16");
+    EXPECT_EQ(ref.plan.dit.precision, mi::planner::Precision::kBf16);
+  }
+  mi::pipeline::PipelineOptions options;
+  options.dit_file = int8;
+  mi::pipeline::Pipeline pipe(options);
+  const mi::pipeline::Result a = pipe.generate(req);
+  EXPECT_EQ(a.steps_run, a.steps_scheduled);
+  EXPECT_EQ(a.tier.effective, mi::planner::Tier::kHigh);
+  EXPECT_EQ(a.tier.attention, mi::planner::AttentionMode::kExact);
+  EXPECT_FALSE(a.tier.certified);
+  EXPECT_EQ(a.dit_linears, "int8_convrot256");
+  EXPECT_EQ(a.plan.dit.precision, mi::planner::Precision::kInt8);
+  EXPECT_NE(a.plan.explanation.find("Quality: "), std::string::npos);
+  EXPECT_GT(a.timings.dit_load_s, 0.0);
+  const mi::json::Value doc = mi::json::parse("{" + mi::pipeline::report_fields(req, a, "", "") + "}");
+  EXPECT_EQ(doc.at("quality").at("config").at("dit_precision").as_string(), "int8_convrot");
+  EXPECT_EQ(doc.at("quality").at("config").at("attention").as_string(), "exact");
+  EXPECT_EQ(doc.at("quality").at("tier").as_string(), "high");
+  EXPECT_TRUE(doc.at("quality").at("certificate").is_null());
+  for (const float v : a.latents) ASSERT_TRUE(std::isfinite(v));
+  // Same request again: bit-identical (the loaded DiT is kept).
+  const mi::pipeline::Result again = pipe.generate(req);
+  EXPECT_EQ(again.timings.dit_load_s, 0.0);
+  EXPECT_EQ(bit_mismatches(again.latents, a.latents), 0u);
+}
+
+TEST(PipelineEndToEnd, Int8DitFileHighTierAddsQ8Attention) {
+  const fs::path int8 = "/workspace/Models/community/comfy-org/moss_image_sft_int8_convrot.safetensors";
+  if (!fs::is_regular_file(weights_root() / "sft" / "moss.mossidx") || !fs::is_regular_file(int8)) {
+    GTEST_SKIP() << "SFT bundle or INT8 DiT file not present";
+  }
+  mi::pipeline::Request req;
+  req.model = weights_root() / "sft";
+  req.prompt = "a lighthouse on a cliff at night";
+  req.height = req.width = 256;
+  req.steps = 3;
+  req.decode = false;
+  mi::pipeline::PipelineOptions options;
+  options.dit_file = int8;
+  options.tier = mi::planner::Tier::kHigh;
+  mi::pipeline::Pipeline pipe(options);
+  const mi::pipeline::Result r = pipe.generate(req);
+  EXPECT_EQ(r.tier.effective, mi::planner::Tier::kHigh);
+  EXPECT_EQ(r.tier.attention, mi::planner::AttentionMode::kQ8Fp8);
+  EXPECT_EQ(r.plan.dit.attention, mi::planner::AttentionMode::kQ8Fp8);
+  EXPECT_EQ(r.steps_run, r.steps_scheduled);
+  for (const float v : r.latents) ASSERT_TRUE(std::isfinite(v));
+}
+
+// Runtime LoRAs on the bf16 SFT DiT (two real files, kohya and PEFT): they change the latents, report as uncertified;
+// a strength change applies without reloading the DiT (side branches in place, merged adapters re-merged from the
+// pristine weights), and strength 0 for every file gives the no-LoRA latents bit for bit. A latent preview reports every step.
+TEST(PipelineEndToEnd, RuntimeLorasAndPreview) {
+  const fs::path kohya = kKohyaLora;
+  const fs::path peft = kPeftLora;
+  if (!fs::is_regular_file(weights_root() / "sft" / "moss.mossidx") || !fs::is_regular_file(kohya) || !fs::is_regular_file(peft)) {
+    GTEST_SKIP() << "SFT bundle or LoRA files not present";
+  }
+  mi::pipeline::Request req;
+  req.model = weights_root() / "sft";
+  req.prompt = "portrait of a woman in a garden, soft light";
+  req.height = req.width = 256;
+  req.steps = 3;
+  req.decode = false;
+  mi::pipeline::Pipeline pipe;
+  int previews = 0;
+  mi::pipeline::GenerateControl control;
+  control.on_preview = [&](const mi::pipeline::PreviewImage& p) {
+    ++previews;
+    EXPECT_EQ(p.width, 256);
+    EXPECT_EQ(p.height, 256);
+    EXPECT_NE(p.rgb, nullptr);
+  };
+  const mi::pipeline::Result base = pipe.generate(req, control);
+  EXPECT_EQ(previews, base.steps_run);
+  EXPECT_TRUE(base.loras.empty());
+  req.loras = {{kohya, 0.35f}, {peft, 0.60f}};
+  const mi::pipeline::Result with = pipe.generate(req);
+  ASSERT_EQ(with.loras.size(), 2u);
+  EXPECT_GT(with.loras[0].side_branch + with.loras[1].side_branch, 0);
+  EXPECT_FALSE(with.tier.certified);
+  EXPECT_NE(with.tier.reason.find("LoRA"), std::string::npos);
+  EXPECT_TRUE(with.quality.config.lora);
+  EXPECT_GT(bit_mismatches(with.latents, base.latents), 0u);
+  for (const float v : with.latents) ASSERT_TRUE(std::isfinite(v));
+  req.loras = {{kohya, 0.0f}, {peft, 0.0f}};
+  const mi::pipeline::Result zero = pipe.generate(req);
+  EXPECT_EQ(zero.timings.dit_load_s, 0.0);  // side branches update in place, merges re-merge from the pristine weights
+  EXPECT_EQ(bit_mismatches(zero.latents, base.latents), 0u);
+  req.loras = {{kohya, 0.35f}, {peft, 0.60f}};  // back: the same latents as the first LoRA run
+  const mi::pipeline::Result again = pipe.generate(req);
+  EXPECT_EQ(again.timings.dit_load_s, 0.0);
+  EXPECT_EQ(bit_mismatches(again.latents, with.latents), 0u);
+}
+
+// Auto with a certificate (a fixture for the Comfy-Org INT8 file, config int8 + q8_fp8, in <cache_dir>/quality_certs):
+// found without LoRAs (8-bit attention turned on, the file named); with runtime LoRAs never, in either order, since
+// the search is not cached for LoRA requests.
+TEST(PipelineQuality, AutoUsesACertificateUnlessLorasAreActive) {
+  if (!have_lora_files()) GTEST_SKIP() << "SFT bundle, INT8 DiT or LoRA files not present";
+  using namespace mi::pipeline;
+  mi::testing::TempDir dir("pipe_cert");
+  Certificate c;
+  c.tier = QualityTier::kHigh;
+  c.config = CertConfig{DitPrecision::kInt8ConvRot, AttentionMode::kQ8Fp8, TePrecision::kBf16, false};
+  c.model.dit = identify_component(kInt8Dit, true);
+  c.numerics = engine_numerics(c.config);
+  c.gpu_arch = current_gpu_arch();
+  c.prompt_set = std::string(kCertPromptSetId);
+  c.prompts = kCertPrompts;
+  c.prompt_set_sha256 = std::string(kCertPromptSetSha256Base);
+  c.scope = CertScope{1024 * 1024, {"euler"}, 1, 50, false};
+  c.date = "2026-10-22T00:00:00Z";
+  for (const GateSpec& gs : required_gates(QualityTier::kHigh)) {
+    Gate gt;
+    gt.name = std::string(gs.name);
+    gt.op = gs.op;
+    gt.threshold = gs.limit;
+    gt.value = gs.op == GateOp::kLe ? gs.limit * 0.5 : (gs.limit > 0 ? gs.limit + 0.5 * (1 - gs.limit) : gs.limit * 0.5);
+    gt.pass = true;
+    c.gates.push_back(gt);
+  }
+  c.passed = true;
+  c.info = {{"same_seed.ocr_prompts", 3}, {"reference.ocr_prompts", 3}};
+  ASSERT_EQ(validate_certificate(c), "");
+  fs::create_directories(dir.path() / "cache" / "quality_certs");
+  ASSERT_TRUE(write_certificate_file(dir.path() / "cache" / "quality_certs" / "fixture.json", {c}));
+
+  PipelineOptions options;
+  options.dit_file = kInt8Dit;
+  options.cache_dir = dir.path() / "cache";
+  options.embedding_cache = false;
+  Pipeline pipe(options);
+  Request req = lora_request();
+  req.loras = {{kPeftLora, 0.5f}};
+  for (int round = 0; round < 3; ++round) {
+    const bool lora = round != 1;
+    req.loras.clear();
+    if (lora) req.loras.push_back({kPeftLora, 0.5f});
+    const Result r = pipe.generate(req);
+    EXPECT_EQ(r.tier.effective, mi::planner::Tier::kHigh) << round;
+    EXPECT_EQ(r.tier.certified, !lora) << round << ": " << r.tier.reason;
+    EXPECT_EQ(r.tier.attention, lora ? mi::planner::AttentionMode::kExact : mi::planner::AttentionMode::kQ8Fp8) << round;
+    EXPECT_EQ(r.quality.config.lora, lora) << round;
+    EXPECT_EQ(r.quality.certificate.empty(), lora) << round;
+    if (!lora) {
+      EXPECT_NE(r.tier.reason.find("certified: "), std::string::npos) << r.tier.reason;
+    }
+  }
+}
+
+// Runtime LoRAs on the INT8 DiT: they run (finite, different from no LoRA), the side branches' device memory counts
+// against an explicit VRAM budget (the arena cap shrinks by exactly their bytes), and a failing LoRA load leaves the
+// previous stack in place (the next request with it runs without rebuilding and gives the same latents).
+TEST(PipelineEndToEnd, Int8DitLorasBudgetAndFailedLoad) {
+  if (!have_lora_files()) GTEST_SKIP() << "SFT bundle, INT8 DiT or LoRA files not present";
+  const fs::path not_a_lora = "/workspace/Models/community/comfy-org/flux2-vae_small.safetensors";
+  mi::pipeline::PipelineOptions options;
+  options.dit_file = kInt8Dit;
+  options.vram_budget = std::size_t{8} << 30;
+  mi::pipeline::Pipeline pipe(options);
+  mi::pipeline::Request req = lora_request();
+  const mi::pipeline::Result base = pipe.generate(req);
+  req.loras = {{kKohyaLora, 0.35f}, {kPeftLora, 0.60f}};
+  const mi::pipeline::Result with = pipe.generate(req);
+  for (const float v : with.latents) ASSERT_TRUE(std::isfinite(v));
+  EXPECT_GT(bit_mismatches(with.latents, base.latents), 0u);
+  const mi::lora::LoraStack stack(req.loras, mi::lora::moss_dit_targets());
+  const std::size_t sb = mi::lora::SideBranches::device_bytes(stack);
+  std::printf("[pipeline] INT8 + 2 LoRAs: side branches %.1f MiB; arena cap %.3f -> %.3f GiB\n",
+              static_cast<double>(sb) / (1 << 20), static_cast<double>(base.plan.arena_cap_bytes) / (1 << 30),
+              static_cast<double>(with.plan.arena_cap_bytes) / (1 << 30));
+  EXPECT_EQ(base.plan.arena_cap_bytes - with.plan.arena_cap_bytes, sb);
+  if (!fs::is_regular_file(not_a_lora)) return;
+  req.loras.push_back({not_a_lora, 1.0f});
+  EXPECT_ANY_THROW(pipe.generate(req));
+  req.loras.pop_back();
+  const mi::pipeline::Result again = pipe.generate(req);
+  EXPECT_EQ(again.timings.dit_load_s, 0.0);
+  EXPECT_EQ(bit_mismatches(again.latents, with.latents), 0u);
+}
+
 TEST(PipelineEndToEnd, BlockPathFollowsTheSelfCheck) {
   if (!have_weights()) GTEST_SKIP() << "weights not present";
   using mi::moss_dit::BlockPath;

@@ -1,13 +1,16 @@
-// MOSS-Image sampling: the sigma schedule (MOSSImageScheduler.set_timesteps, P:269-287 + diffusers
-// FlowMatchEulerDiscreteScheduler.set_timesteps), classifier-free guidance with block skipping (P:405-425) and
-// the flow-matching integrators (scheduler.step's Euler, plus a 2nd-order Adams-Bashforth option studied against
-// the reference sampler).
+// MOSS-Image sampling: classifier-free guidance with block skipping (P:405-425) around the sampler driver
+// (pipeline/samplers/sampler_driver.h), on the schedules of pipeline/samplers/schedules.h.
 //
-// Every fp32 operation follows the reference's rounding order, one rounding per torch op:
+// The "moss" schedule with the euler (or ab2) sampler is the official pipeline, rounded as the reference rounds each
+// torch op (velocities, fp32):
 //   CFG     pred = uncond + g * (cond - uncond)                     (P:418)
 //   SLG     pred = pred + s * (cond - skipped), pred = skipped if g == 1  (P:419-424)
 //   Euler   x = x + h * v,  h = sigma[i+1] - sigma[i] in fp32         (scheduler.step)
 //   AB2     x = x + h * ((1 + r) * v - r * v_prev),  r = h / (2 h_prev) in double, scalars cast to fp32
+// Every other (sampler, scheduler) pair runs the k-diffusion formulation on denoised predictions, each row's
+// velocity turned into D = x - v * sigma and combined as
+//   CFG     D = D_uncond + (D_cond - D_uncond) * g
+//   SLG     D = D + (D_cond - D_skipped) * s
 // Latents and predictions stay fp32 throughout, as in the reference.
 #pragma once
 
@@ -22,36 +25,14 @@
 
 #include "core/tensor.h"
 #include "models/moss_dit/moss_dit.h"
+#include "pipeline/samplers/sampler_driver.h"
+#include "pipeline/samplers/schedules.h"
 #include "runtime/device_arena.h"
 
 namespace mi::pipeline {
 
-inline constexpr int kNumTrainTimesteps = 1000;
-
-// torch.linspace(start, end, steps) on the CPU in float32, bit-exact (torch 2.14 linspace_kernel: an fp32 step
-// (end - start) / (steps - 1), the first half as start + step * i and the second half as end - step * (steps - 1 - i),
-// each with a single rounding). steps >= 1.
-std::vector<float> torch_linspace_f32(float start, float end, std::int64_t steps);
-
-// grid(count, shift) of MOSSImageScheduler.set_timesteps: shift * v / (1 + (shift - 1) * v) over
-// v = linspace(1, shift / (1000 + shift - 1), count), each torch op rounded to fp32.
-std::vector<float> moss_sigma_grid(std::int64_t count, double shift);
-
-struct Schedule {
-  std::vector<float> sigmas;     // num_steps() + 1 values, descending, terminal 0 appended
-  std::vector<float> timesteps;  // sigmas * 1000 in fp32 (what the DiT receives)
-  int num_steps() const { return static_cast<int>(timesteps.size()); }
-};
-
-// The pipeline's schedule for `steps` requested steps (>= 1) and `shift` (> 0, finite): the shifted grid snapped to
-// the nearest training sigma (ties to the lower one), consecutive duplicates removed, so num_steps() can be lower
-// than `steps`. Throws std::invalid_argument on invalid arguments.
-Schedule moss_schedule(int steps, double shift);
-
-enum class SamplerKind { kEuler, kAb2 };
-const char* sampler_name(SamplerKind kind);
-// "euler" or "ab2"; throws std::invalid_argument otherwise.
-SamplerKind parse_sampler(std::string_view name);
+// Upper bound on schedule length that denoise_workspace_bytes() budgets the driver's coefficients for.
+inline constexpr int kMaxDenoiseSteps = 10000;
 
 struct Guidance {
   double cfg = 3.0;                // guidance_scale; == 1 disables the negative branch
@@ -75,23 +56,35 @@ struct StepInfo {
 // Called after every step; return false to stop (cancel) before the next one.
 using StepCallback = std::function<bool(const StepInfo&)>;
 
-// Elementwise fp32 kernels of the loop (exposed for tests). All tensors CUDA fp32 with equal numel, contiguous.
-void cfg_combine(const Tensor& cond, const Tensor& uncond, float g, const Tensor& out, cudaStream_t stream);
-void slg_correct(const Tensor& pred, const Tensor& cond, const Tensor& skipped, float scale, const Tensor& out,
-                 cudaStream_t stream);
-void euler_update(const Tensor& x, const Tensor& v, float h, cudaStream_t stream);
-void ab2_update(const Tensor& x, const Tensor& v, const Tensor& v_prev, float h, float a, float b, cudaStream_t stream);
-
-// Stack bytes denoise() allocates itself (velocities, guidance buffers) plus the DiT forward workspace for the
-// largest row set of the run, for a latent grid of height x width and the DiT's block path.
+// The DiT rows of the loop's largest step, in row order: cond, uncond under CFG, the SLG row when SLG is enabled.
+std::vector<std::int64_t> denoise_row_lengths(std::int64_t cond_tokens, std::int64_t uncond_tokens, const Guidance& guidance);
+// Stack bytes denoise() allocates itself, without the DiT forward: velocities, guidance buffers and the sampler
+// driver's state for up to kMaxDenoiseSteps steps. A caller adds MossDit::workspace_bytes for denoise_row_lengths().
+std::size_t denoise_loop_bytes(std::int64_t height, std::int64_t width, std::int64_t cond_tokens,
+                               std::int64_t uncond_tokens, const Guidance& guidance, SamplerKind sampler);
+// Stack bytes denoise() allocates itself (velocities, guidance buffers, the sampler driver's state for up to
+// kMaxDenoiseSteps steps) plus the DiT forward workspace for the largest row set of the run, for a latent grid of
+// height x width and the DiT's block path.
 std::size_t denoise_workspace_bytes(std::int64_t height, std::int64_t width, std::int64_t cond_tokens,
                                     std::int64_t uncond_tokens, const Guidance& guidance, SamplerKind sampler,
                                     moss_dit::BlockPath path = moss_dit::BlockPath::kFused);
 
-// Runs the sampling loop in place on `latents` (CUDA fp32 [128, h, w], the initial noise on entry).
-// cond_text / uncond_text: refined text tokens (MossDit::encode_text output, CUDA bf16 [S, 3072]); uncond_text is
-// ignored when guidance.cfg == 1. All work is on `stream`, scratch on the arena stack (released on return).
-// Returns the number of steps run (< schedule.num_steps() iff the callback cancelled).
+// Runs the sampling loop in place on `latents` (CUDA fp32 [128, h, w], the initial noise scaled to the first sigma
+// on entry (flow_noise_scaling; the pure noise when it is 1), the final latents on return; for the dataspace sampler
+// the final x0 estimate). cond_text / uncond_text: refined text tokens (MossDit::encode_text output, CUDA bf16
+// [S, 3072]); uncond_text is ignored when guidance.cfg == 1. options: noise seed and source for the stochastic
+// samplers, eta / s_noise and the data-space parameters; options.flow is replaced by schedule.flow (the SDE samplers'
+// first-sigma offset uses the schedule's shift), and euler takes the official velocity step iff schedule.scheduler is
+// kMoss. Guidance windows use the step index (i / num_steps), heun's second call included in its step. Each model
+// call's prediction is guide_prediction() of the DiT rows. All work is on `stream`, scratch on the arena stack
+// (released on return). Returns the number of steps run (< schedule.num_steps() iff the callback cancelled).
+// Throws std::invalid_argument.
+int denoise(moss_dit::MossDit& dit, runtime::DeviceArena& arena, const Tensor& cond_text, const Tensor& uncond_text,
+            const Schedule& schedule, const Guidance& guidance, SamplerKind sampler, const SamplerOptions& options,
+            const Tensor& latents, cudaStream_t stream, const StepCallback& on_step = {});
+
+// The deterministic samplers with default options; throws std::invalid_argument for a stochastic or the dataspace
+// sampler (they need a seed or parameters).
 int denoise(moss_dit::MossDit& dit, runtime::DeviceArena& arena, const Tensor& cond_text, const Tensor& uncond_text,
             const Schedule& schedule, const Guidance& guidance, SamplerKind sampler, const Tensor& latents,
             cudaStream_t stream, const StepCallback& on_step = {});

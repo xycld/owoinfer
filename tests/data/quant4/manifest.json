@@ -1,0 +1,84 @@
+{
+ "torch": "2.14.1+cu130",
+ "torch_cuda": "13.0",
+ "device": "NVIDIA GeForce RTX 4090 Laptop GPU",
+ "comfy_kitchen": "dba9fac",
+ "inputs": "splitmix64 hash tensors of test_quant4_kernels.cu (synth_act / synth_vec)",
+ "seeds": {
+  "rot3072": 101,
+  "rot8192": 102,
+  "gemm_x": 103,
+  "gemm_w": 104,
+  "gemm_bias": 105,
+  "gemm_gate": 106,
+  "gemm_residual": 107,
+  "e2e_x": 108,
+  "e2e_w": 109
+ },
+ "gemm": {
+  "m": 67,
+  "n": 264,
+  "k": 512
+ },
+ "files": {
+  "rot3072_q": [
+   40,
+   1536
+  ],
+  "rot3072_s": [
+   40
+  ],
+  "rot8192_q": [
+   9,
+   4096
+  ],
+  "rot8192_s": [
+   9
+  ],
+  "gemm_xq": [
+   67,
+   256
+  ],
+  "gemm_wq": [
+   264,
+   256
+  ],
+  "gemm_xs": [
+   67
+  ],
+  "gemm_ws": [
+   264
+  ],
+  "gemm_y": [
+   67,
+   264
+  ],
+  "gemm_y_bias": [
+   67,
+   264
+  ],
+  "gemm_y_eager_bias": [
+   67,
+   264
+  ],
+  "gemm_res": [
+   67,
+   264
+  ],
+  "gemm_situ": [
+   67,
+   132
+  ],
+  "e2e_wq": [
+   128,
+   1536
+  ],
+  "e2e_ws": [
+   128
+  ],
+  "e2e_y_eager": [
+   53,
+   128
+  ]
+ }
+}

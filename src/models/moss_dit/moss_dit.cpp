@@ -170,6 +170,61 @@ std::size_t graph_cache_bytes() {
   return kPerGraph * kGraphCapacity;
 }
 
+std::string describe_linears(const quant::QuantIndex* quant) {
+  if (quant == nullptr) return "bf16";
+  std::map<std::string, int> counts;
+  for (const auto& [module, spec] : quant->specs) {
+    if (module.rfind("layers.", 0) == 0) ++counts[quant::describe(spec)];
+  }
+  if (counts.size() == 1) return counts.begin()->first;
+  std::string out = "mixed (";
+  for (const auto& [name, n] : counts) out += (out.size() > 7 ? ", " : "") + std::to_string(n) + " " + name;
+  return out + ")";
+}
+
+bool has_int8_linears(const quant::QuantIndex* quant) {
+  if (quant == nullptr) return false;
+  return std::any_of(quant->specs.begin(), quant->specs.end(),
+                     [](const auto& kv) { return kv.first.rfind("layers.", 0) == 0 && kv.second.quantized(); });
+}
+
+double int8_gemm_fraction(const quant::QuantIndex* quant) {
+  if (quant == nullptr) return 0.0;
+  double int8 = 0, all = 0;
+  for (const weights::WeightGroup& g : quant->index.groups) {
+    for (const weights::IndexedTensor& t : g.tensors) {
+      if (t.name.rfind("layers.", 0) != 0 || !t.name.ends_with(".weight") || t.shape.size() != 2) continue;
+      const quant::QuantSpec* spec = quant->find_spec(std::string_view(t.name).substr(0, t.name.size() - 7));
+      if (spec == nullptr) continue;
+      const double elems = static_cast<double>(t.shape[0]) * static_cast<double>(t.shape[1]);
+      all += elems;
+      if (spec->quantized()) int8 += elems;
+    }
+  }
+  return all > 0 ? int8 / all : 0.0;
+}
+
+ComputeConfig MossDit::compute_config(const quant::QuantIndex* quant, AttentionMode attention) {
+  ComputeConfig c;
+  c.attention = attention;
+  c.quantized = has_int8_linears(quant) || attention != AttentionMode::kExact;
+  c.bf16_up_gate = quant == nullptr;
+  if (quant != nullptr) {
+    for (const auto& [module, spec] : quant->specs) {
+      if (module.rfind("layers.", 0) == 0 && module.ends_with(".proj.ffn_up_gate") && !spec.quantized()) c.bf16_up_gate = true;
+    }
+  }
+  return c;
+}
+
+void MossDit::set_attention(AttentionMode mode) {
+  if (!attention_supported(mode)) {
+    throw std::runtime_error(std::string("mi::moss_dit: attention ") + attention_mode_name(mode) +
+                             " is not supported on this device/build");
+  }
+  refresh_config(mode);
+}
+
 std::size_t MossDit::graph_bytes() const { return graphs_.size() * (graph_cache_bytes() / kGraphCapacity); }
 
 void MossDit::set_block_path(BlockPath path) {
@@ -192,8 +247,109 @@ std::size_t MossDit::stream_workspace_bytes(const weights::ModelIndex& index, co
 }
 
 MossDit::MossDit(const weights::ModelIndex& index, runtime::DeviceArena& arena, runtime::StreamSet& streams,
-                 bool direct_io, const std::atomic<bool>* cancel, const Residency& residency)
-    : arena_(arena), cancel_(cancel) {
+                 bool direct_io, const std::atomic<bool>* cancel, const Residency& residency, const lora::LoraStack* merges)
+    : MossDit(index, nullptr, arena, streams, direct_io, cancel, residency, merges) {}
+
+MossDit::MossDit(const quant::QuantIndex& quant, runtime::DeviceArena& arena, runtime::StreamSet& streams, bool direct_io,
+                 const std::atomic<bool>* cancel, const Residency& residency, const lora::LoraStack* merges)
+    : MossDit(quant.index, &quant, arena, streams, direct_io, cancel, residency, merges) {}
+
+bool MossDit::block_has_merges(const lora::LoraStack& stack, int block) {
+  for (const std::string& module : stack.merge_modules()) {
+    const lora::TargetModule* t = stack.model().find(module);
+    if (t != nullptr && t->block == block) return true;
+  }
+  return false;
+}
+
+// A merged module's weights as uploaded (device) or held (pinned host copy of a streamed block), and a host staging
+// copy of them (device targets; host targets are edited in place).
+MossDit::MergeStaging::MergeStaging(const MergeTarget& t) : target(t) {
+  const auto fetch = [&](const Tensor& x, std::vector<std::byte>& host) -> void* {
+    if (x.data == nullptr) return nullptr;
+    if (x.device != Device::kCUDA) return x.data;
+    host.resize(x.nbytes());
+    MI_CUDA_CHECK(cudaMemcpy(host.data(), x.data, x.nbytes(), cudaMemcpyDeviceToHost));
+    return host.data();
+  };
+  w_ = fetch(t.w, hw_);
+  bias_ = fetch(t.bias, hb_);
+  scale_ = fetch(t.scale, hs_);
+}
+
+void MossDit::MergeStaging::store() const {
+  const auto put = [](const Tensor& x, const std::vector<std::byte>& host) {
+    if (x.data != nullptr && x.device == Device::kCUDA) MI_CUDA_CHECK(cudaMemcpy(x.data, host.data(), x.nbytes(), cudaMemcpyHostToDevice));
+  };
+  put(target.w, hw_);
+  put(target.bias, hb_);
+  put(target.scale, hs_);
+}
+
+void MossDit::remerge_into(const lora::LoraStack& stack, const std::string& module, const MergeTarget& t,
+                           MergeStaging& staging) const {
+  if (t.group == 0) {
+    pristine_->remerge_bf16(stack, module, staging.w<std::uint16_t>(), staging.bias());
+  } else {
+    pristine_->remerge_int8(stack, module, staging.w<std::int8_t>(), staging.scale());
+  }
+  staging.store();
+}
+
+void MossDit::remerge_lora(const lora::LoraStack& stack) {
+  if (merge_targets_.empty()) return;
+  MI_CUDA_CHECK(cudaDeviceSynchronize());  // no forward may read the weights while they change
+  for (const auto& [module, t] : merge_targets_) {
+    MergeStaging staging(t);
+    remerge_into(stack, module, t, staging);
+  }
+}
+
+std::size_t MossDit::pristine_bytes(const lora::LoraStack& stack, const quant::QuantIndex* quant) {
+  std::size_t total = 0;
+  for (const std::string& module : stack.merge_modules()) {
+    const lora::TargetModule* t = stack.model().find(module);
+    if (t == nullptr) continue;
+    const auto n = static_cast<std::size_t>(t->n), k = static_cast<std::size_t>(t->k);
+    const quant::QuantSpec* spec = quant != nullptr ? quant->find_spec(module) : nullptr;
+    total += spec != nullptr && spec->quantized() ? n * k + 4 * n : 2 * n * k + (t->has_bias ? 2 * n : 0);
+  }
+  return total;
+}
+
+std::size_t MossDit::pristine_bytes() const { return pristine_ ? pristine_->host_bytes() : 0; }
+
+void MossDit::set_lora(const lora::SideBranches* side_branches) {
+  if (side_branches != nullptr) {
+    for (int b = 0; b < kLayers; ++b) {
+      if (side_branches->site(b, lora::Site::kQkv) == nullptr) continue;
+      if (quant_ != nullptr) {
+        const std::string p = "layers." + std::to_string(b) + ".proj.";
+        const bool q = quant_->find_spec(p + "q")->quantized(), k = quant_->find_spec(p + "k")->quantized(),
+                   v = quant_->find_spec(p + "v")->quantized();
+        if (q != k || k != v) {
+          throw std::invalid_argument("mi::moss_dit: a LoRA on the QKV of block " + std::to_string(b) +
+                                      ", whose q, k and v differ in precision, is not supported");
+        }
+      }
+    }
+  }
+  lora_ = side_branches;
+  refresh_config(config_.attention);
+}
+
+void MossDit::refresh_config(AttentionMode attention) {
+  config_ = compute_config(quant_, attention);
+  if (lora_ != nullptr && lora_->any_active()) {
+    config_.quantized = true;
+    config_.lora_rank = lora_->max_rank();
+  }
+}
+
+MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quant, runtime::DeviceArena& arena,
+                 runtime::StreamSet& streams, bool direct_io, const std::atomic<bool>* cancel, const Residency& residency,
+                 const lora::LoraStack* merges)
+    : arena_(arena), quant_(quant), config_(compute_config(quant, AttentionMode::kExact)), cancel_(cancel) {
   const auto t0 = std::chrono::steady_clock::now();
   gemm_workspace_ = arena.alloc_persistent(kernels::Gemm::kWorkspaceBytes);
   weights::ReaderCache readers(index, direct_io);
@@ -204,11 +360,59 @@ MossDit::MossDit(const weights::ModelIndex& index, runtime::DeviceArena& arena, 
       throw Cancelled();
     }
   };
+  // LoRA merges (lossy for INT8 block GEMMs) into a group's views, on the device (staging copy, merged, uploaded) or
+  // in a pinned host copy (in place). The pristine weights are kept on the host first, so a strength change re-merges
+  // from them (remerge_lora) instead of reloading.
+  const auto merge = [&](const TensorMap& m) {
+    if (merges == nullptr) return;
+    for (const std::string& module : merges->merge_modules()) {
+      const auto w = m.find(module + ".weight");
+      if (w == m.end()) continue;
+      MergeTarget t;
+      t.w = w->second;
+      if (t.w.dtype == DType::kBF16) {
+        const auto b = m.find(module + ".bias");
+        if (b != m.end() && b->second.dtype == DType::kBF16) t.bias = b->second;
+      } else {
+        t.scale = m.at(module + ".weight_scale");
+        const quant::QuantSpec* spec = quant != nullptr ? quant->find_spec(module) : nullptr;
+        if (spec == nullptr || spec->format != quant::QuantFormat::kInt8ConvRot) {
+          throw std::runtime_error("mi::moss_dit: cannot merge a LoRA into '" + module + "' (not an INT8 ConvRot linear)");
+        }
+        t.group = spec->group;
+      }
+      if (!pristine_) pristine_ = std::make_unique<lora::PristineWeights>();
+      MergeStaging staging(t);
+      if (!pristine_->has(module)) {
+        if (t.group == 0) {
+          pristine_->keep_bf16(module, staging.w<std::uint16_t>(), t.w.dim(0), t.w.dim(1), staging.bias());
+        } else {
+          pristine_->keep_int8(module, staging.w<std::int8_t>(), staging.scale(), t.w.dim(0), t.w.dim(1), t.group);
+        }
+      }
+      remerge_into(*merges, module, t, staging);
+      merge_targets_.emplace_back(module, t);
+    }
+  };
   const auto upload = [&](const WeightGroup& g) {
     check_cancel();
     load_stats_.bytes += g.total_bytes;
-    return weights::upload_group(readers, g, arena, ring);
+    TensorMap m = weights::upload_group(readers, g, arena, ring);
+    if (merges != nullptr && !merges->merge_modules().empty()) {
+      ring.synchronize();  // the bytes are on the device before they are read back
+      merge(m);
+    }
+    return m;
   };
+  if (merges != nullptr && residency.streamed() && residency.source == StreamSource::kFile) {
+    const auto mask = resident_mask(residency.resident_blocks);
+    for (int b = 0; b < kLayers; ++b) {
+      if (!mask.test(static_cast<std::size_t>(b)) && block_has_merges(*merges, b)) {
+        throw std::invalid_argument("mi::moss_dit: streamed block " + std::to_string(b) +
+                                    " has merged LoRA adapters: stream from a pinned host copy (StreamSource::kHostPinned)");
+      }
+    }
+  }
 
   const TensorMap glob = upload(*find_group(index, "globals"));
   video_embedder_ = {take(glob, "video_embedder.weight", {kDim, kLatentChannels}), take(glob, "video_embedder.bias", {kDim})};
@@ -251,7 +455,7 @@ MossDit::MossDit(const weights::ModelIndex& index, runtime::DeviceArena& arena, 
   blocks_ = std::make_unique<BlockWeights>(index, arena, residency, upload, [&](const WeightGroup& g) {
     check_cancel();
     if (residency.source == StreamSource::kHostPinned) load_stats_.bytes += g.total_bytes;
-  });
+  }, quant, [&](const TensorMap& host) { merge(host); });
   host_bytes_ = BlockWeights::host_bytes(index, residency);
   ring.synchronize();
   for (cudaEvent_t& e : block_done_) MI_CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
@@ -367,11 +571,27 @@ void MossDit::time_modulation(float timestep, const Tensor& mod, const Tensor& h
 
 std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
                                      BlockPath path) {
-  const std::int64_t total = token_offsets(height, width, text_lengths).back();
-  const FusedRouteSnapshot route = path == BlockPath::kOpByOp ? FusedRouteSnapshot{} : fused_route_snapshot();
+  return workspace_bytes(height, width, text_lengths, path, ComputeConfig{}, nullptr);
+}
+
+std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
+                                     BlockPath path, const ComputeConfig& config, const FusedRouteSnapshot* pinned) {
+  const std::int64_t total = token_offsets(height, width, text_lengths).back(), hw = height * width;
+  const FusedRouteSnapshot route =
+      path == BlockPath::kOpByOp ? FusedRouteSnapshot{} : (pinned != nullptr ? *pinned : fused_route_snapshot());
   StackPlan plan(nullptr);
   Activations(plan, total, total, static_cast<std::int64_t>(text_lengths.size()), true,
-              big_cols(path, height * width, text_lengths, route));
+              config.quantized ? quant_big_cols(hw, text_lengths, config.bf16_up_gate, route)
+                               : big_cols(path, hw, text_lengths, route));
+  if (config.quantized) {
+    plan.tensor(DType::kF32, {total});
+    const std::size_t q8 = q8_attention_workspace_bytes(hw, text_lengths, config.attention);
+    if (q8 > 0) plan.bytes(q8);
+    if (config.lora_rank > 0) {
+      plan.tensor(DType::kBF16, {total, config.lora_rank});
+      plan.bytes(lora::t_workspace_bytes(total, config.lora_rank));
+    }
+  }
   TimeScratch{plan};
   return plan.total();
 }
@@ -427,10 +647,30 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
 
   // One route for the whole forward (its big buffer, graph keys and every block): an install_fused_check meanwhile, e.g.
   // another pipeline's poisoning, applies from the next forward on instead of failing this one's buffer check.
-  const FusedRouteSnapshot route = path_ == BlockPath::kOpByOp ? FusedRouteSnapshot{} : fused_route_snapshot();
+  // The LoRA sites active now (strengths may have changed since set_lora) decide the block path and the t buffers.
+  if (lora_ != nullptr) refresh_config(config_.attention);
+  // A request's pinned route (set_request_route) instead, so every step of the request matches the workspace it sized.
+  const FusedRouteSnapshot route = path_ == BlockPath::kOpByOp ? FusedRouteSnapshot{}
+                                   : request_route_              ? *request_route_
+                                                                 : fused_route_snapshot();
+  const bool quantized = config_.quantized;
   runtime::StackScope scope(arena_);
   StackPlan plan(&arena_);
-  Activations a(plan, total, total, static_cast<std::int64_t>(rows.size()), true, big_cols(path_, hw, lengths, route));
+  Activations a(plan, total, total, static_cast<std::int64_t>(rows.size()), true,
+                quantized ? quant_big_cols(hw, lengths, config_.bf16_up_gate, route) : big_cols(path_, hw, lengths, route));
+  // Quantized blocks: per-token activation scales and the 8-bit attention workspace (workspace_bytes' order).
+  QuantBlockBuffers qa;
+  if (quantized) {
+    qa.scale = plan.tensor(DType::kF32, {total});
+    qa.attn_workspace_bytes = q8_attention_workspace_bytes(hw, lengths, config_.attention);
+    if (qa.attn_workspace_bytes > 0) qa.attn_workspace = plan.bytes(qa.attn_workspace_bytes);
+    if (config_.lora_rank > 0) {
+      qa.lora = lora_;
+      qa.lora_t = plan.tensor(DType::kBF16, {total, config_.lora_rank});
+      qa.lora_workspace_bytes = lora::t_workspace_bytes(total, config_.lora_rank);
+      qa.lora_workspace = plan.bytes(qa.lora_workspace_bytes);
+    }
+  }
   // Streamed blocks: device buffers after the activations; the first copies overlap the setup below.
   BlockWeights::Pass weights(*blocks_, stream, cancel_);
 
@@ -498,15 +738,38 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   // a step shape repeats (a one-off forward stays eager). The cancel throttle and the hook run between blocks, outside
   // the graphs, so cancel latency is unchanged.
   const FusedBlockBuffers fused{a.x, a.y, a.big, a.rope, a.mod, a.lse, a.lse_bytes};
+  qa.f = fused;
   const QkvGemm qkv_gemm{&gemm_, gemm_workspace_, kernels::Gemm::kWorkspaceBytes};
+  const auto run_blocks = [&](int bi, const Block& b, const std::vector<Run>& runs, cudaStream_t s) {
+    for (const Run& run : runs) {
+      if (quantized) {
+        run_block_quant(b, qa, run, qkv_gemm, route, config_.attention, s, bi);
+      } else if (path_ == BlockPath::kOpByOp) {
+        run_block(b, a, run, s);
+      } else {
+        run_block_fused(b, fused, run, qkv_gemm, route, s);
+      }
+    }
+  };
   StepGraphKey key;
   bool use_graphs = false;
-  if (path_ == BlockPath::kFusedGraphs && !blocks_->residency().streamed() && stream != nullptr) {
+  // attention_q8's debug checks synchronize the stream: never inside a capture.
+  const bool capturable = !(config_.attention != AttentionMode::kExact && varlen_debug_checks());
+  if (path_ == BlockPath::kFusedGraphs && !blocks_->residency().streamed() && stream != nullptr && capturable) {
     key.height = height;
     key.width = width;
     key.text_lengths = lengths;
     for (const Row& r : rows) key.skips.push_back(r.skip);
     key.addresses = {a.x.data, a.y.data, a.big.data, a.rope.data, a.mod.data, a.cu_seqlens.data, a.lse, gemm_workspace_};
+    if (quantized) {
+      key.addresses.push_back(qa.scale.data);
+      key.addresses.push_back(qa.attn_workspace);
+      key.addresses.push_back(qa.lora_t.data);
+      key.addresses.push_back(qa.lora_workspace);
+    }
+    // The block variant, and the LoRA side branches' generation (their set of active sites changes the kernels).
+    key.variant = quantized ? 1 + static_cast<std::uint64_t>(config_.attention) : 0;
+    if (qa.lora != nullptr) key.variant |= qa.lora->generation() << 8;
     key.route_generation = route.generation;
     const std::uint64_t h = key.hash();
     use_graphs = h == last_step_hash_;
@@ -524,16 +787,12 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     }
     const Block& b = weights.acquire(bi);
     const std::vector<Run>& runs = block_runs[static_cast<std::size_t>(bi)];
-    if (path_ == BlockPath::kOpByOp) {
-      for (const Run& run : runs) run_block(b, a, run, stream);
-    } else if (!use_graphs) {
-      for (const Run& run : runs) run_block_fused(b, fused, run, qkv_gemm, route, stream);
+    if (!use_graphs) {
+      run_blocks(bi, b, runs, stream);
     } else {
       key.block_begin = bi;
       key.block_end = bi + 1;
-      graphs_.run(key, stream, [&](cudaStream_t s) {
-        for (const Run& run : runs) run_block_fused(b, fused, run, qkv_gemm, route, s);
-      });
+      graphs_.run(key, stream, [&](cudaStream_t s) { run_blocks(bi, b, runs, s); });
     }
     weights.release(bi);
     if (hook) hook(bi, a.x);

@@ -859,7 +859,7 @@ TEST(DitGraphKey, HashAndEqualityCoverEveryField) {
   md::StepGraphKey b = a;
   EXPECT_EQ(a, b);
   EXPECT_EQ(a.hash(), b.hash());
-  std::vector<md::StepGraphKey> variants(8, a);
+  std::vector<md::StepGraphKey> variants(9, a);
   variants[0].height = 65;
   variants[1].width = 63;
   variants[2].text_lengths[0] = 283;
@@ -868,6 +868,7 @@ TEST(DitGraphKey, HashAndEqualityCoverEveryField) {
   variants[5].block_end = 41;
   variants[6].addresses[0] = reinterpret_cast<const void*>(0x2000);
   variants[7].route_generation = 1;
+  variants[8].variant = 2;
   for (const auto& v : variants) {
     EXPECT_FALSE(v == a);
     EXPECT_NE(v.hash(), a.hash());
@@ -1274,6 +1275,100 @@ TEST(FusedSelfCheck, PoisoningDuringAForwardAppliesFromTheNextOne) {
   if (!fs::is_regular_file(bundle_dir() / "moss.mossidx")) GTEST_SKIP() << "weights not present (" << bundle_dir() << ")";
   const ThreadsafeDeathTests style;
   EXPECT_EXIT(std::exit(in_flight_poisoning_failures()), ::testing::ExitedWithCode(0), "in-flight poisoning: ok");
+}
+
+// P6: a request-level route (MossDit::set_request_route, one snapshot per pipeline request). With the route pinned, a
+// poisoning between two forwards of the request (another pipeline's failed self-check between sampling steps) does not
+// change the next forward: it keeps the pinned fused route and the stack its workspace was sized for (it used to size
+// the op-by-op buffer and could fail the step's allocation), and gives the same velocities (== op_by_op). Unpinned, the
+// following forward takes a fresh snapshot: op by op. 512^2 CFG as above, in a child process.
+int request_route_failures() {
+  int failures = 0;
+  const auto expect = [&](bool cond, const std::string& what) {
+    if (!cond) {
+      ++failures;
+      std::fprintf(stderr, "request route: FAILED %s\n", what.c_str());
+    }
+  };
+  const mi::weights::ModelIndex index = mi::weights::load_index(bundle_dir() / "moss.mossidx", bundle_dir());
+  mi::runtime::StreamSet streams;
+  const cudaStream_t stream = streams.compute();
+  install_self_check(stream);
+  constexpr std::int64_t kGrid = 32, kCond = 20, kUncond = 10;
+  const std::int64_t lengths[] = {kCond, kUncond};
+  const md::FusedRouteSnapshot route = md::fused_route_snapshot();
+  const std::size_t work_fused = md::MossDit::workspace_bytes(kGrid, kGrid, lengths, md::BlockPath::kFused, md::ComputeConfig{}, &route);
+  const std::size_t work_op = md::MossDit::workspace_bytes(kGrid, kGrid, lengths, md::BlockPath::kOpByOp);
+  const std::size_t io = mi::runtime::align_up(static_cast<std::size_t>(kCond * kDim * 2)) +
+                         mi::runtime::align_up(static_cast<std::size_t>(kUncond * kDim * 2)) +
+                         3 * mi::runtime::align_up(static_cast<std::size_t>(128 * kGrid * kGrid * 4));
+  md::Residency residency;
+  const std::size_t free = mi::runtime::DeviceArena::free_device_bytes() - (std::size_t{512} << 20);
+  const auto arena_bytes = [&] {
+    return md::MossDit::persistent_bytes(index, residency) + io + work_op + md::MossDit::stream_workspace_bytes(index, residency);
+  };
+  while (residency.resident_blocks > 0 && arena_bytes() > free) --residency.resident_blocks;
+  mi::runtime::DeviceArena arena(arena_bytes());
+  md::MossDit model(index, arena, streams, false, nullptr, residency);
+  const Tensor cond = arena.alloc_persistent_tensor(DType::kBF16, {kCond, kDim});
+  const Tensor uncond = arena.alloc_persistent_tensor(DType::kBF16, {kUncond, kDim});
+  upload(cond, synth_bf16(61, static_cast<std::size_t>(kCond * kDim), 0));
+  upload(uncond, synth_bf16(62, static_cast<std::size_t>(kUncond * kDim), 0));
+  const Tensor latents = arena.alloc_persistent_tensor(DType::kF32, {128, kGrid, kGrid});
+  std::vector<float> lv(static_cast<std::size_t>(latents.numel()));
+  for (std::size_t i = 0; i < lv.size(); ++i) lv[i] = std::sin(0.37f * static_cast<float>(i));
+  MI_CUDA_CHECK(cudaMemcpy(latents.data, lv.data(), lv.size() * 4, cudaMemcpyHostToDevice));
+  const Tensor outs[] = {arena.alloc_persistent_tensor(DType::kF32, {128, kGrid, kGrid}),
+                         arena.alloc_persistent_tensor(DType::kF32, {128, kGrid, kGrid})};
+  md::SkipSet skip22;
+  skip22.set(22);
+  const md::Row rows[] = {{cond, {}}, {uncond, skip22}};
+  const auto velocities = [&] {
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<std::uint32_t> v(static_cast<std::size_t>(2 * latents.numel()));
+    for (std::size_t i = 0; i < 2; ++i) {
+      MI_CUDA_CHECK(cudaMemcpy(v.data() + i * static_cast<std::size_t>(latents.numel()), outs[i].data, outs[i].nbytes(),
+                               cudaMemcpyDeviceToHost));
+    }
+    return v;
+  };
+  model.set_block_path(md::BlockPath::kOpByOp);
+  model.forward(latents, 500.0f, rows, outs, stream);
+  const auto want = velocities();
+  const auto forward_stack = [&](std::string& error) {
+    const std::size_t base = arena.capacity() - arena.available();
+    arena.reset_high_water();
+    try {
+      model.forward(latents, 500.0f, rows, outs, stream);
+    } catch (const std::exception& e) {
+      error = e.what();
+    }
+    return arena.high_water() - base;
+  };
+  model.set_block_path(md::BlockPath::kFused);
+  model.set_request_route(route);
+  std::string error;
+  const std::size_t first = forward_stack(error);
+  expect(error.empty() && velocities() == want, "the first forward of the request == op_by_op: '" + error + "'");
+  md::install_fused_check(md::FusedCheck{false, "injected failure between two steps", {}});
+  const std::size_t second = forward_stack(error);
+  expect(error.empty(), "the next forward of the request runs after the poisoning: '" + error + "'");
+  expect(second == first && first == work_fused, "it keeps the pinned route's stack (" + std::to_string(second) + " vs " +
+                                                     std::to_string(first) + ", query " + std::to_string(work_fused) + ")");
+  if (error.empty()) expect(velocities() == want, "it gives op_by_op's velocities");
+  model.set_request_route(std::nullopt);
+  const std::size_t third = forward_stack(error);
+  expect(error.empty() && third == work_op, "unpinned, the next forward sizes the op-by-op buffer (" + std::to_string(third) +
+                                                " vs " + std::to_string(work_op) + ")");
+  if (error.empty()) expect(velocities() == want, "and gives op_by_op's velocities");
+  if (failures == 0) std::fprintf(stderr, "request route: ok\n");
+  return failures;
+}
+
+TEST(FusedSelfCheck, RequestRouteSurvivesAPoisoningBetweenSteps) {
+  if (!fs::is_regular_file(bundle_dir() / "moss.mossidx")) GTEST_SKIP() << "weights not present (" << bundle_dir() << ")";
+  const ThreadsafeDeathTests style;
+  EXPECT_EXIT(std::exit(request_route_failures()), ::testing::ExitedWithCode(0), "request route: ok");
 }
 
 // Small images, where cuBLASLt's algorithm (and so fused_route) changes with the run length: MossDit::forward with the

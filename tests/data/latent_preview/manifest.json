@@ -1,0 +1,52 @@
+{
+ "latent": "tests/data/flux2_vae/full_crop.latent.npy",
+ "previews": {
+  "crop.preview_48x40.npy": [
+   48,
+   40
+  ],
+  "crop.preview_413x337.npy": [
+   413,
+   337
+  ]
+ },
+ "model": "3x3 neighbourhood, coefficients of src/models/latent_preview/preview_coefficients.h",
+ "fit_script_sha256": "83ac36cfee017b6c0df7e2b201ba369b7ac99cac92237f409eb3933ea9aae1be",
+ "torch": "2.14.1+cu130",
+ "train": [
+  "asset001_base.latent.npy",
+  "asset001_sft.latent.npy",
+  "asset002_base.latent.npy",
+  "asset003_base.latent.npy",
+  "asset004_base.latent.npy",
+  "asset005_base.latent.npy",
+  "asset005_sft.latent.npy",
+  "asset006_base.latent.npy",
+  "asset007_base.latent.npy",
+  "asset008_base.latent.npy",
+  "asset009_base.latent.npy",
+  "asset009_sft.latent.npy",
+  "asset010_base.latent.npy",
+  "asset011_base.latent.npy",
+  "asset012_base.latent.npy",
+  "asset013_base.latent.npy",
+  "asset014_base.latent.npy",
+  "asset015_base.latent.npy",
+  "asset015_sft.latent.npy",
+  "asset016_base.latent.npy",
+  "asset017_base.latent.npy",
+  "asset018_base.latent.npy",
+  "asset019_base.latent.npy",
+  "asset019_sft.latent.npy",
+  "asset020_base.latent.npy"
+ ],
+ "held_out": [
+  "g_fridge_1024",
+  "g_fridge_1456",
+  "g_layout_1024",
+  "g_layout_1456",
+  "g_long4096_1024",
+  "g_short_1024",
+  "g_short_1456"
+ ]
+}

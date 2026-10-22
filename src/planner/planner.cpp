@@ -35,6 +35,15 @@ constexpr double kDecodeReferenceTflops = 40.0;
 // jitter between the copy and compute of neighbouring blocks.
 constexpr double kStreamOverlap = 0.9;
 constexpr double kStreamOverlapTwoBuffers = 0.8;
+// P6 cost model: throughput of the INT8 ConvRot GEMMs (rotation and quantization included) and of the 8-bit attention
+// relative to their bf16 counterparts, from the dev box's 1024^2 CFG step (282 + 10 tokens, every block resident, A/B
+// in one process): bf16 fused 1.38 s, INT8 + exact 0.67 s, INT8 + q8_fp8 0.55 s, INT8 + q8_fp16 0.58 s, with the
+// attention's ~19 % FLOP share of the bf16 step split out. The fp32-accumulating variants are not measured: assumed
+// slower than q8_fp16.
+constexpr double kInt8GemmSpeedup = 2.7;
+constexpr double kQ8Fp8AttentionSpeedup = 1.9;
+constexpr double kQ8Fp16AttentionSpeedup = 1.5;
+constexpr double kQ8F32AccAttentionSpeedup = 1.3;
 
 std::string gib(std::size_t bytes) {
   char buf[32];
@@ -160,8 +169,18 @@ class Planner {
       // Row 1 is the negative prompt; rows 0 and 2 (SLG) the prompt.
       const std::size_t text_row = row == 1 && r_.text_lengths.size() > 1 ? 1 : 0;
       const double l = image_tokens + (r_.text_lengths.empty() ? 0.0 : static_cast<double>(r_.text_lengths[text_row]));
-      // GEMMs: 2 FLOPs per weight per token; attention: QK^T and PV, 2 * L^2 * dim each, per block.
-      flops += static_cast<double>(s_.dit_bytes) * l + 4.0 * l * l * dim * s_.dit_blocks;
+      // GEMMs: 2 FLOPs per weight per token (bf16: 2 bytes per weight); attention: QK^T and PV, 2 * L^2 * dim each,
+      // per block. P6 paths in bf16-equivalent FLOPs: divided by their measured speedup.
+      const double f = std::clamp(s_.dit_int8_fraction, 0.0, 1.0);
+      const double gemm = s_.dit_precision == Precision::kInt8
+                              ? 2.0 * static_cast<double>(s_.dit_params) * l * ((1.0 - f) + f / kInt8GemmSpeedup)
+                              : static_cast<double>(s_.dit_bytes) * l;
+      const double attention = 4.0 * l * l * dim * s_.dit_blocks;
+      const double attention_speedup = in_.attention == AttentionMode::kExact    ? 1.0
+                                       : in_.attention == AttentionMode::kQ8Fp8  ? kQ8Fp8AttentionSpeedup
+                                       : in_.attention == AttentionMode::kQ8Fp16 ? kQ8Fp16AttentionSpeedup
+                                                                                 : kQ8F32AccAttentionSpeedup;
+      flops += gemm + attention / attention_speedup;
     }
     const double compute = flops / (tflops() * 1e12);
     d.compute_s = compute;
@@ -293,8 +312,11 @@ class Planner {
         if (!in_.caps.dit_streaming) continue;
         // P4: no resident blocks (least memory), and as many as fit the arena cap; every buffer count; the pinned
         // host source only where it can pay for its host memory (cold page cache, or max_speed's host budget).
-        std::vector<DitSource> sources{DitSource::kFile};
-        if (in_.caps.dit_host_pinned && (!r_.dit_weights_cached || in_.mode == Mode::kMaxSpeed)) {
+        // Without the file source (runtime LoRA merges on the blocks): the pinned host copy only.
+        std::vector<DitSource> sources;
+        if (in_.caps.dit_file_source) sources.push_back(DitSource::kFile);
+        if (in_.caps.dit_host_pinned &&
+            (!in_.caps.dit_file_source || !r_.dit_weights_cached || in_.mode == Mode::kMaxSpeed)) {
           sources.push_back(DitSource::kHostPinned);
         }
         for (const DitSource src : sources) {
@@ -367,16 +389,21 @@ class Planner {
             static_cast<double>(c.arena)};
   }
 
+  std::string precision_text() const {
+    std::string t = s_.dit_precision == Precision::kInt8 ? "INT8 ConvRot" : "bf16";
+    return is_q8(in_.attention) ? t + " + 8-bit attention (" + attention_name(in_.attention) + ")" : t;
+  }
+
   std::string describe_dit(const DitPlan& d) const {
     switch (d.residency) {
       case DitResidency::kResident:
-        return "resident bf16 (" + gib(s_.dit_bytes) + "), never parked" +
+        return "resident " + precision_text() + " (" + gib(s_.dit_bytes) + "), never parked" +
                (d.graph_bytes > 0 ? ", CUDA graphs up to " + gib(d.graph_bytes) + " outside the arena" : std::string());
       case DitResidency::kParked: {
         std::string when = d.park_for_text_encoder && d.park_for_decode ? "the text encoder and the decode"
                            : d.park_for_text_encoder                    ? "the text encoder"
                                                                         : "the decode";
-        return "parked bf16 (" + gib(s_.dit_bytes) + "): evicted for " + when + " and reloaded for the next denoise";
+        return "parked " + precision_text() + " (" + gib(s_.dit_bytes) + "): evicted for " + when + " and reloaded for the next denoise";
       }
       case DitResidency::kStreamed: {
         char rate[160];
@@ -385,7 +412,7 @@ class Planner {
         const std::string from = d.source == DitSource::kHostPinned ? "a pinned host copy (" + gib(d.stream_bytes) + ")"
                                  : r_.dit_weights_cached            ? std::string("the weight files (page cache)")
                                                                     : std::string("the weight files (cold: disk)");
-        return "streamed bf16: " + std::to_string(d.resident_blocks) + " of " + std::to_string(s_.dit_blocks) +
+        return "streamed " + precision_text() + ": " + std::to_string(d.resident_blocks) + " of " + std::to_string(s_.dit_blocks) +
                " blocks resident, the other " + std::to_string(s_.dit_blocks - d.resident_blocks) + " copied every step from " +
                from + " through " + std::to_string(d.buffers) + " device block buffers (" +
                std::to_string(d.prefetch_blocks) + "-block lookahead), " + gib(d.device_bytes) + " on the device; " + rate;
@@ -479,6 +506,8 @@ class Planner {
     ExecutionPlan p;
     p.mode = in_.mode;
     p.dit = c.dit;
+    p.dit.precision = s_.dit_precision;
+    p.dit.attention = in_.attention;
     p.te = c.te;
     p.vae = c.vae;
     p.cache.enabled = true;
@@ -580,6 +609,39 @@ std::string json_num(double d) {
 
 const char* b2s(bool b) { return b ? "true" : "false"; }
 
+// The text-encoder fields of ModelShapes from the text-encoder groups of `index`.
+void te_shapes(const weights::ModelIndex& index, ModelShapes& s) {
+  for (const weights::WeightGroup* g : index.groups_of(weights::Component::kTextEncoder)) {
+    const std::size_t bytes = static_cast<std::size_t>(g->total_bytes);
+    if (g->name == "embed_tokens") {
+      s.te_embed_bytes = bytes;
+    } else {
+      s.te_stream_bytes += bytes;
+      if (g->name.rfind("layers.", 0) == 0) {
+        ++s.te_layers;
+        s.te_layer_bytes = std::max(s.te_layer_bytes, bytes);
+      }
+    }
+  }
+}
+
+// The DiT fields of ModelShapes from the transformer groups of `index`.
+void dit_shapes(const weights::ModelIndex& index, ModelShapes& s) {
+  for (const weights::WeightGroup* g : index.groups_of(weights::Component::kTransformer)) {
+    const std::size_t bytes = static_cast<std::size_t>(g->total_bytes);
+    s.dit_bytes += bytes;
+    s.dit_params += static_cast<std::size_t>(g->total_params);
+    if (g->name.rfind("block.", 0) == 0) {
+      ++s.dit_blocks;
+      s.dit_block_bytes = std::max(s.dit_block_bytes, bytes);
+      // The width is the length of the block's RMSNorm weights (an INT8 block's 1-D per-row scales are wider).
+      for (const weights::IndexedTensor& t : g->tensors) {
+        if (t.shape.size() == 1 && t.name.ends_with("norm1.weight")) s.dit_dim = std::max(s.dit_dim, static_cast<int>(t.shape[0]));
+      }
+    }
+  }
+}
+
 }  // namespace
 
 const char* mode_name(Mode mode) {
@@ -615,6 +677,143 @@ const char* source_name(DitSource s) {
   return "?";
 }
 
+const char* precision_name(Precision p) { return p == Precision::kInt8 ? "int8" : "bf16"; }
+
+const char* attention_name(AttentionMode a) {
+  switch (a) {
+    case AttentionMode::kExact: return "exact";
+    case AttentionMode::kQ8Fp16: return "q8_fp16";
+    case AttentionMode::kQ8Fp16F32Acc: return "q8_fp16_f32acc";
+    case AttentionMode::kQ8Fp8: return "q8_fp8";
+    case AttentionMode::kQ8Fp8F32Acc: return "q8_fp8_f32acc";
+  }
+  return "?";
+}
+
+bool is_q8(AttentionMode a) { return a != AttentionMode::kExact; }
+
+const char* tier_name(Tier t) {
+  switch (t) {
+    case Tier::kReference: return "reference";
+    case Tier::kHigh: return "high";
+    case Tier::kTurbo: return "turbo";
+    case Tier::kAuto: return "auto";
+  }
+  return "?";
+}
+
+Tier parse_tier(std::string_view name) {
+  for (const Tier t : {Tier::kReference, Tier::kHigh, Tier::kTurbo, Tier::kAuto}) {
+    if (name == tier_name(t)) return t;
+  }
+  throw std::invalid_argument("tier must be reference, high, turbo or auto, got \"" + std::string(name) + "\"");
+}
+
+namespace {
+// Fastest first (fp16 accumulation before fp32; e4m3 P·V before fp16).
+constexpr AttentionMode kQ8Order[] = {AttentionMode::kQ8Fp8, AttentionMode::kQ8Fp16, AttentionMode::kQ8Fp8F32Acc,
+                                      AttentionMode::kQ8Fp16F32Acc};
+}  // namespace
+
+AttentionMode parse_attention(std::string_view name) {
+  if (name == "q8") return AttentionMode::kQ8Fp8;
+  for (const AttentionMode a : {AttentionMode::kExact, AttentionMode::kQ8Fp16, AttentionMode::kQ8Fp16F32Acc,
+                                AttentionMode::kQ8Fp8, AttentionMode::kQ8Fp8F32Acc}) {
+    if (name == attention_name(a)) return a;
+  }
+  throw std::invalid_argument("attention must be exact, q8 (= q8_fp8), q8_fp16, q8_fp16_f32acc, q8_fp8 or "
+                              "q8_fp8_f32acc, got \"" + std::string(name) + "\"");
+}
+
+TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention, Precision precision,
+                          const CertificateLookup& certificate, const AttentionSupported& supported, bool te_quantized) {
+  TierDecision d;
+  d.requested = requested;
+  d.precision = precision;
+  // Lossy weights fix the configuration's precision: an INT8 DiT or a quantized text encoder is never the Reference tier.
+  const bool int8 = precision == Precision::kInt8 || te_quantized;
+  const std::string weights = std::string(precision == Precision::kInt8 ? "INT8 ConvRot GEMMs" : "bf16 GEMMs") +
+                              (te_quantized ? ", quantized text encoder" : "");
+  if (requested == Tier::kTurbo) {
+    throw std::invalid_argument("tier turbo (W4A4) is reserved and not implemented yet; use reference, high or auto");
+  }
+  if (attention && is_q8(*attention) && supported && !supported(*attention)) {
+    throw std::invalid_argument(std::string("attention ") + attention_name(*attention) +
+                                " is not supported on this device/build");
+  }
+  // The lossy configuration (precision, mode): its certificate decides certified / the reason.
+  const auto ask = [&](AttentionMode mode) { return certificate ? certificate(precision, mode) : CertificateAnswer{}; };
+  const auto lossy_with = [&](AttentionMode mode, const std::string& why, const CertificateAnswer& a) {
+    d.effective = Tier::kHigh;
+    d.attention = mode;
+    d.certified = a.found;
+    d.certificate = a.found ? a.file : std::string();
+    d.reason = why + ": " + weights + ", " + attention_name(mode) + " attention; " +
+               (a.found ? "certified: " + a.file : "uncertified" + (a.reason.empty() ? std::string() : " (" + a.reason + ")"));
+    return d;
+  };
+  const auto lossy = [&](AttentionMode mode, const std::string& why) { return lossy_with(mode, why, ask(mode)); };
+  const auto reference = [&](const std::string& why) {
+    d.effective = Tier::kReference;
+    d.attention = AttentionMode::kExact;
+    d.certified = true;
+    d.reason = why;
+    return d;
+  };
+  switch (requested) {
+    case Tier::kReference:
+      if (int8) {
+        throw std::invalid_argument("tier reference runs bf16 weights exactly, but the loaded DiT or text encoder file is "
+                                    "quantized; load the bundle's bf16 models or use tier high or auto");
+      }
+      if (attention && is_q8(*attention)) {
+        throw std::invalid_argument("tier reference uses exact attention; 8-bit attention belongs to tier high");
+      }
+      return reference("Reference tier: bf16 GEMMs, exact attention");
+    case Tier::kHigh: {
+      AttentionMode mode = attention.value_or(AttentionMode::kQ8Fp8);
+      std::string why = "High tier";
+      if (!attention && supported && !supported(mode)) {
+        mode = AttentionMode::kExact;
+        why += " (this device/build has no 8-bit attention kernel)";
+      }
+      if (!int8 && mode == AttentionMode::kExact) {
+        throw std::invalid_argument("tier high needs an INT8 DiT or 8-bit attention, but the loaded DiT is bf16 and "
+                                    "attention exact: that is the Reference tier");
+      }
+      return lossy(mode, why);
+    }
+    case Tier::kAuto:
+    case Tier::kTurbo:
+      break;
+  }
+  if (attention) {
+    if (!int8 && !is_q8(*attention)) return reference("auto: bf16 DiT with exact attention, the Reference tier");
+    return lossy(*attention, "auto with attention " + std::string(attention_name(*attention)));
+  }
+  std::string reasons;
+  std::vector<AttentionMode> candidates;
+  for (const AttentionMode m : kQ8Order) {
+    if (!supported || supported(m)) candidates.push_back(m);
+  }
+  if (int8) candidates.push_back(AttentionMode::kExact);
+  for (const AttentionMode m : candidates) {
+    const CertificateAnswer a = ask(m);
+    if (a.found) return lossy_with(m, "auto: the fastest certified configuration", a);
+    reasons += (reasons.empty() ? "" : "; ") + std::string(attention_name(m)) + ": " +
+               (a.reason.empty() ? std::string("no certificate") : a.reason);
+  }
+  if (!int8) return reference("auto: no lossy configuration of the loaded bf16 DiT is certified (" + reasons +
+                              "), so the Reference tier: bf16 GEMMs, exact attention");
+  // Quantized files cannot run the reference weights: their own GEMMs, without the separate 8-bit attention toggle.
+  d.effective = Tier::kHigh;
+  d.attention = AttentionMode::kExact;
+  d.certified = false;
+  d.reason = "auto: the loaded weights are quantized (they fix the GEMM precision) and no configuration of them is "
+             "certified (" + reasons + "): " + weights + ", exact attention, uncertified";
+  return d;
+}
+
 const char* residency_name(TeResidency r) {
   switch (r) {
     case TeResidency::kStreamed: return "streamed";
@@ -632,32 +831,42 @@ BudgetError::BudgetError(const std::string& message, std::size_t required_arena_
       required_host(required_host_bytes),
       host_limit(host_limit_bytes) {}
 
+ModelShapes shapes_from_index(const weights::ModelIndex& index, const weights::ModelIndex* dit_index, Precision dit_precision,
+                              const weights::ModelIndex* te_index, const weights::ModelIndex* vae_index) {
+  ModelShapes s = shapes_from_index(index);
+  s.dit_precision = dit_precision;
+  if (dit_index != nullptr) {
+    ModelShapes d;
+    dit_shapes(*dit_index, d);
+    if (d.dit_blocks == 0) throw std::invalid_argument("DiT index lacks the DiT blocks");
+    s.dit_blocks = d.dit_blocks;
+    s.dit_block_bytes = d.dit_block_bytes;
+    s.dit_bytes = d.dit_bytes;
+    s.dit_dim = d.dit_dim;
+    s.dit_params = d.dit_params;
+  }
+  if (te_index != nullptr) {
+    ModelShapes t;
+    te_shapes(*te_index, t);
+    if (t.te_layers == 0) throw std::invalid_argument("text-encoder index lacks the decoder layers");
+    s.te_layers = t.te_layers;
+    s.te_layer_bytes = t.te_layer_bytes;
+    s.te_stream_bytes = t.te_stream_bytes;
+    s.te_embed_bytes = t.te_embed_bytes;
+  }
+  if (vae_index != nullptr) {
+    std::size_t bytes = 0;
+    for (const weights::WeightGroup* g : vae_index->groups_of(weights::Component::kVae)) bytes += static_cast<std::size_t>(g->total_bytes);
+    if (bytes == 0) throw std::invalid_argument("VAE index lacks the decoder");
+    s.vae_bytes = bytes;
+  }
+  return s;
+}
+
 ModelShapes shapes_from_index(const weights::ModelIndex& index) {
   ModelShapes s;
-  for (const weights::WeightGroup* g : index.groups_of(weights::Component::kTextEncoder)) {
-    const std::size_t bytes = static_cast<std::size_t>(g->total_bytes);
-    if (g->name == "embed_tokens") {
-      s.te_embed_bytes = bytes;
-    } else {
-      s.te_stream_bytes += bytes;
-      if (g->name.rfind("layers.", 0) == 0) {
-        ++s.te_layers;
-        s.te_layer_bytes = std::max(s.te_layer_bytes, bytes);
-      }
-    }
-  }
-  for (const weights::WeightGroup* g : index.groups_of(weights::Component::kTransformer)) {
-    const std::size_t bytes = static_cast<std::size_t>(g->total_bytes);
-    s.dit_bytes += bytes;
-    if (g->name.rfind("block.", 0) == 0) {
-      ++s.dit_blocks;
-      s.dit_block_bytes = std::max(s.dit_block_bytes, bytes);
-      // The width is the length of the block's widest 1-D tensor (its RMSNorm weights; QK-norms are per head).
-      for (const weights::IndexedTensor& t : g->tensors) {
-        if (t.shape.size() == 1) s.dit_dim = std::max(s.dit_dim, static_cast<int>(t.shape[0]));
-      }
-    }
-  }
+  te_shapes(index, s);
+  dit_shapes(index, s);
   for (const weights::WeightGroup* g : index.groups_of(weights::Component::kVae)) s.vae_bytes += static_cast<std::size_t>(g->total_bytes);
   if (s.te_layers == 0 || s.dit_blocks == 0 || s.vae_bytes == 0) {
     throw std::invalid_argument("model index lacks the text encoder layers, the DiT blocks or the VAE decoder");
@@ -737,7 +946,8 @@ ExecutionPlan prefer_held(const PlanInputs& inputs, ExecutionPlan fresh, const H
 std::string ExecutionPlan::to_json() const {
   std::string o = "{";
   o += "\"mode\": \"" + std::string(mode_name(mode)) + "\"";
-  o += ", \"dit\": {\"residency\": \"" + std::string(residency_name(dit.residency)) + "\", \"precision\": \"bf16\"" +
+  o += ", \"dit\": {\"residency\": \"" + std::string(residency_name(dit.residency)) + "\", \"precision\": \"" + precision_name(dit.precision) +
+       "\", \"attention\": \"" + attention_name(dit.attention) + "\"" +
        ", \"resident_blocks\": " + std::to_string(dit.resident_blocks) + ", \"buffers\": " + std::to_string(dit.buffers) +
        ", \"prefetch_blocks\": " + std::to_string(dit.prefetch_blocks) + ", \"source\": \"" + source_name(dit.source) +
        "\", \"stream_bytes_per_step\": " + std::to_string(dit.stream_bytes) + ", \"transfer_s_per_step\": " +

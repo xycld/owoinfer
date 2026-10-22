@@ -867,6 +867,144 @@ TEST(Planner, ShapesFromIndex) {
   EXPECT_THROW(shapes_from_index(idx), std::invalid_argument);
 }
 
+// P6: an INT8 DiT (the Comfy-Org SFT file's sizes): half the block bytes, so an 8 GiB budget keeps far more blocks
+// resident, and the cost model counts its GEMMs (and 8-bit attention) at their measured speedups.
+ModelShapes int8_shapes() {
+  ModelShapes s = moss_shapes();
+  s.dit_block_bytes = 113'357'312;
+  s.dit_bytes = 5'446'000'000 + (std::size_t{32} << 20);
+  s.dit_params = 8'110'000'000 / 2 * 2;  // the bf16 model's parameter count (int8 bytes + scales differ)
+  s.dit_precision = Precision::kInt8;
+  return s;
+}
+
+TEST(Planner, Int8DitKeepsMoreBlocksResidentAndCostsLess) {
+  Scenario sc;
+  sc.size = 1024;
+  sc.lengths = {282, 10};
+  sc.vram_free_gib = 7.6;
+  sc.streaming = true;
+  const ExecutionPlan bf16 = plan(sc.inputs());
+  PlanInputs in = sc.inputs();
+  in.shapes = int8_shapes();
+  const ExecutionPlan int8 = plan(in);
+  expect_consistent(int8);
+  const int int8_resident = int8.dit.residency == DitResidency::kStreamed ? int8.dit.resident_blocks : 42;
+  const int bf16_resident = bf16.dit.residency == DitResidency::kStreamed ? bf16.dit.resident_blocks : 42;
+  std::printf("[planner] 7.6 GiB free, 1024^2: bf16 %d / int8 %d blocks resident; compute %.2f / %.2f s per step\n",
+              bf16_resident, int8_resident, bf16.dit.compute_s, int8.dit.compute_s);
+  EXPECT_GT(int8_resident, bf16_resident);
+  EXPECT_EQ(int8.dit.precision, Precision::kInt8);
+  EXPECT_LT(int8.dit.compute_s, bf16.dit.compute_s);
+  EXPECT_NE(int8.explanation.find("INT8 ConvRot"), std::string::npos);
+  // A mixed file (half of the GEMM weights INT8) costs between the two.
+  in.shapes.dit_int8_fraction = 0.5;
+  const ExecutionPlan mixed = plan(in);
+  in.shapes.dit_int8_fraction = 0.0;
+  const ExecutionPlan none = plan(in);
+  EXPECT_GT(mixed.dit.compute_s, int8.dit.compute_s);
+  EXPECT_LT(mixed.dit.compute_s, none.dit.compute_s);
+  in.shapes.dit_int8_fraction = 1.0;
+  in.attention = AttentionMode::kQ8Fp8;
+  const ExecutionPlan q8 = plan(in);
+  EXPECT_LT(q8.dit.compute_s, int8.dit.compute_s);
+  EXPECT_EQ(q8.dit.attention, AttentionMode::kQ8Fp8);
+  const mi::json::Value doc = mi::json::parse(q8.to_json());
+  EXPECT_EQ(doc.at("dit").at("precision").as_string(), "int8");
+  EXPECT_EQ(doc.at("dit").at("attention").as_string(), "q8_fp8");
+  // The bf16 bundle's plan is unchanged by the P6 fields (AC11: same residency and estimates as before).
+  const mi::json::Value bdoc = mi::json::parse(bf16.to_json());
+  EXPECT_EQ(bdoc.at("dit").at("precision").as_string(), "bf16");
+  EXPECT_EQ(bdoc.at("dit").at("attention").as_string(), "exact");
+}
+
+TEST(Planner, TierAndAttentionNames) {
+  for (const Tier t : {Tier::kReference, Tier::kHigh, Tier::kTurbo, Tier::kAuto}) EXPECT_EQ(parse_tier(tier_name(t)), t);
+  for (const AttentionMode a : {AttentionMode::kExact, AttentionMode::kQ8Fp16, AttentionMode::kQ8Fp16F32Acc,
+                                AttentionMode::kQ8Fp8, AttentionMode::kQ8Fp8F32Acc}) {
+    EXPECT_EQ(parse_attention(attention_name(a)), a);
+  }
+  EXPECT_EQ(parse_attention("q8"), AttentionMode::kQ8Fp8);
+  EXPECT_THROW(parse_tier("fast"), std::invalid_argument);
+  EXPECT_THROW(parse_attention("fp8"), std::invalid_argument);
+}
+
+TEST(Planner, ResolveTier) {
+  const auto none = [](Precision, AttentionMode) { return CertificateAnswer{false, "", "no certificate file"}; };
+  const auto all = [](AttentionMode) { return true; };
+  const auto no_q8 = [](AttentionMode a) { return a == AttentionMode::kExact; };
+  using O = std::optional<AttentionMode>;
+  // Reference: the default bf16 bundle with tier auto, no lookup needed.
+  int asked = 0;
+  const auto counting = [&](Precision, AttentionMode) {
+    ++asked;
+    return CertificateAnswer{};
+  };
+  TierDecision d = resolve_tier(Tier::kReference, O{}, Precision::kBf16, counting, all);
+  EXPECT_EQ(d.effective, Tier::kReference);
+  EXPECT_EQ(d.attention, AttentionMode::kExact);
+  EXPECT_TRUE(d.certified);
+  EXPECT_EQ(asked, 0);
+  d = resolve_tier(Tier::kAuto, O{}, Precision::kBf16, none, all);
+  EXPECT_EQ(d.effective, Tier::kReference);
+  EXPECT_EQ(d.attention, AttentionMode::kExact);
+  EXPECT_NE(d.reason.find("no certificate file"), std::string::npos) << d.reason;
+  // Refusals.
+  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kInt8, none, all), std::invalid_argument);
+  EXPECT_THROW(resolve_tier(Tier::kReference, O{AttentionMode::kQ8Fp8}, Precision::kBf16, none, all), std::invalid_argument);
+  EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, Precision::kInt8, none, all), std::invalid_argument);
+  EXPECT_THROW(resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kBf16, none, all), std::invalid_argument);
+  EXPECT_THROW(resolve_tier(Tier::kHigh, O{AttentionMode::kQ8Fp8}, Precision::kInt8, none, no_q8), std::invalid_argument);
+  // High: INT8 + q8_fp8 by default, runs uncertified (explicit), exact when forced or without the kernel.
+  d = resolve_tier(Tier::kHigh, O{}, Precision::kInt8, none, all);
+  EXPECT_EQ(d.effective, Tier::kHigh);
+  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
+  EXPECT_FALSE(d.certified);
+  EXPECT_EQ(resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kInt8, none, all).attention, AttentionMode::kExact);
+  EXPECT_EQ(resolve_tier(Tier::kHigh, O{}, Precision::kInt8, none, no_q8).attention, AttentionMode::kExact);
+  EXPECT_EQ(resolve_tier(Tier::kHigh, O{}, Precision::kBf16, none, all).attention, AttentionMode::kQ8Fp8);  // bf16 + q8
+  // Auto on an INT8 DiT: the fastest certified configuration; none certified: exact attention, uncertified.
+  d = resolve_tier(Tier::kAuto, O{}, Precision::kInt8, none, all);
+  EXPECT_EQ(d.effective, Tier::kHigh);
+  EXPECT_EQ(d.attention, AttentionMode::kExact);
+  EXPECT_FALSE(d.certified);
+  const auto exact_only = [](Precision p, AttentionMode a) {
+    return CertificateAnswer{p == Precision::kInt8 && a == AttentionMode::kExact, "/c/x.mossinfer-cert.json", "mismatch"};
+  };
+  d = resolve_tier(Tier::kAuto, O{}, Precision::kInt8, exact_only, all);
+  EXPECT_EQ(d.attention, AttentionMode::kExact);
+  EXPECT_TRUE(d.certified);
+  EXPECT_EQ(d.certificate, "/c/x.mossinfer-cert.json");
+  EXPECT_NE(d.reason.find("certified: /c/x.mossinfer-cert.json"), std::string::npos) << d.reason;
+  std::vector<AttentionMode> order;
+  const auto fp16_only = [&](Precision, AttentionMode a) {
+    order.push_back(a);
+    return CertificateAnswer{a == AttentionMode::kQ8Fp16, "f", ""};
+  };
+  d = resolve_tier(Tier::kAuto, O{}, Precision::kInt8, fp16_only, all);
+  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp16);
+  EXPECT_EQ(order, (std::vector<AttentionMode>{AttentionMode::kQ8Fp8, AttentionMode::kQ8Fp16}));  // fastest first
+  // Auto on a bf16 DiT with a certified 8-bit attention: High (bf16 GEMMs + q8).
+  d = resolve_tier(Tier::kAuto, O{}, Precision::kBf16, fp16_only, all);
+  EXPECT_EQ(d.effective, Tier::kHigh);
+  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp16);
+  // Unsupported variants are never candidates.
+  order.clear();
+  d = resolve_tier(Tier::kAuto, O{}, Precision::kInt8, fp16_only, no_q8);
+  EXPECT_EQ(order, (std::vector<AttentionMode>{AttentionMode::kExact}));
+  // A quantized text encoder is a lossy dimension: never Reference; with a bf16 DiT and exact attention it is High.
+  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kBf16, none, all, true), std::invalid_argument);
+  d = resolve_tier(Tier::kAuto, O{}, Precision::kBf16, none, all, true);
+  EXPECT_EQ(d.effective, Tier::kHigh);
+  EXPECT_EQ(d.attention, AttentionMode::kExact);
+  EXPECT_FALSE(d.certified);
+  EXPECT_EQ(resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kBf16, none, all, true).effective, Tier::kHigh);
+  // Auto with a forced attention runs that configuration.
+  d = resolve_tier(Tier::kAuto, O{AttentionMode::kQ8Fp8F32Acc}, Precision::kInt8, none, all);
+  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8F32Acc);
+  EXPECT_EQ(d.effective, Tier::kHigh);
+}
+
 TEST(PlannerHostMemory, ReportsPrivateMemory) {
   const HostMemory before = process_host_memory();
 #ifdef _WIN32

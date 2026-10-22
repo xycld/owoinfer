@@ -1,0 +1,19 @@
+{
+ "layer": 20,
+ "tokens": 158,
+ "image_tokens": 96,
+ "text_tokens": 62,
+ "loras": [
+  {
+   "file": "congruency/MOSS-Image-Turbo-MFD/MOSS-Image-SFT-Turbo-MFD-v0.1.comfy.safetensors",
+   "strength": 0.35,
+   "format": "kohya"
+  },
+  {
+   "file": "axiomofmind/Moss-image-beauty-lora/pytorch_lora_weights.safetensors",
+   "strength": 0.6,
+   "format": "peft"
+  }
+ ],
+ "reference": "third_party reference _Block in fp32 on fp32-merged weights (W + sum coef * B @ A)"
+}

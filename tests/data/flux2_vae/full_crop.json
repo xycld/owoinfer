@@ -1,0 +1,18 @@
+{
+ "latent": "tests/golden/g_short_1024/final_latent.npy[:, :, 20:44, 16:36] (the reference pipeline's final latent)",
+ "image": "diffusers AutoencoderKLFlux2 (block_out_channels 128/256/512/512) decode, fp32, default TF32 convs",
+ "vae_weights": {
+  "file": "Comfy-Org/MOSS-Image vae/flux2-vae.safetensors",
+  "sha256": "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3"
+ },
+ "latent_stats": {
+  "file": "MOSS-Image base/vae/diffusion_pytorch_model.safetensors",
+  "sha256": "c3bdf94dc67ec69b30ea9fe1fa8340085679cae64d019f7c7e4a9921f1a7f17a"
+ },
+ "generator_sha256": "0ad033d40f3e3715d7449073295fd6dc49563c014bbb4423f2fa3ed3bc66c5b1",
+ "torch": "2.14.1+cu130",
+ "diffusers": "0.41.0",
+ "cuda": "13.0",
+ "cudnn": 92400,
+ "gpu": "NVIDIA GeForce RTX 4090 Laptop GPU"
+}

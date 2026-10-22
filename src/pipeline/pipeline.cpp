@@ -23,11 +23,16 @@
 #include <utility>
 
 #include "core/cuda_check.h"
+#include "mossinfer/mossinfer.h"
 #include "models/flux2_vae/flux2_vae.h"
+#include "models/flux2_vae/vae_file.h"
+#include "models/latent_preview/latent_preview.h"
+#include "models/moss_dit/dit_kernels.h"
 #include "models/moss_dit/moss_dit.h"
 #include "models/qwen35_text/text_encoder.h"
 #include "pipeline/embedding_cache.h"
 #include "pipeline/hardware_profile.h"
+#include "pipeline/quality_cert.h"
 #include "pipeline/rng_torch_compat.h"
 #include "planner/host_memory.h"
 #include "runtime/device_arena.h"
@@ -35,6 +40,7 @@
 #include "tokenizer/qwen_bpe.h"
 #include "util/path.h"
 #include "weights/model_index.h"
+#include "weights/quant/quant_model.h"
 #include "weights/upload.h"
 
 namespace mi::pipeline {
@@ -100,6 +106,112 @@ std::unique_ptr<Bundle> open_bundle(const std::filesystem::path& dir) {
   b->te_hash = text_encoder_hash(b->index);
   return b;
 }
+
+// Where the DiT's weights come from (P6): the bundle's transformer, or a single file (quant::to_model_index; INT8,
+// mixed or bf16). `index` is what MossDit and the planner read: the bundle's index or quant->index.
+struct DitSource {
+  std::filesystem::path path;  // the bundle's transformer directory or the file
+  std::filesystem::path cert_path;  // what certificates identify: the file, or the bundle's transformer directory
+  const weights::ModelIndex* index = nullptr;
+  std::unique_ptr<quant::QuantIndex> quant;  // single file only
+  planner::Precision precision = planner::Precision::kBf16;
+  std::string linears;  // moss_dit::describe_linears
+  // Certificate searches per configuration and request scope, and the identity they computed (hashes are cached in
+  // <cache_dir>/file_hashes.json by quality_cert).
+  std::map<std::string, planner::CertificateAnswer> certificates;
+  std::optional<ModelIdentity> identity;
+};
+
+// The enums share their order (static_asserts): planner / moss_dit / quality-certificate attention modes.
+static_assert(static_cast<int>(planner::AttentionMode::kQ8Fp8F32Acc) == static_cast<int>(moss_dit::AttentionMode::kQ8Fp8F32Acc) &&
+              static_cast<int>(planner::AttentionMode::kQ8Fp16) == static_cast<int>(moss_dit::AttentionMode::kQ8Fp16) &&
+              static_cast<int>(planner::AttentionMode::kQ8Fp8) == static_cast<int>(AttentionMode::kQ8Fp8) &&
+              static_cast<int>(planner::AttentionMode::kQ8Fp16F32Acc) == static_cast<int>(AttentionMode::kQ8Fp16F32Acc) &&
+              static_cast<int>(planner::AttentionMode::kExact) == 0 && static_cast<int>(AttentionMode::kExact) == 0 &&
+              static_cast<int>(moss_dit::AttentionMode::kExact) == 0);
+moss_dit::AttentionMode dit_attention(planner::AttentionMode a) { return static_cast<moss_dit::AttentionMode>(a); }
+
+CertConfig cert_config(planner::Precision precision, planner::AttentionMode mode, qwen35_text::Precision te, bool lora) {
+  CertConfig c;
+  c.lora = lora;  // runtime LoRAs: certificates cover the base model only, so this never matches one
+  c.dit = precision == planner::Precision::kInt8 ? DitPrecision::kInt8ConvRot : DitPrecision::kBf16;
+  c.attention = static_cast<AttentionMode>(mode);
+  c.te = te == qwen35_text::Precision::kInt8   ? TePrecision::kInt8ConvRot
+         : te == qwen35_text::Precision::kW4A8 ? TePrecision::kW4A8
+                                               : TePrecision::kBf16;
+  return c;
+}
+
+// The one place certificates are searched (pipeline/quality_cert.h): the DiT as loaded (its file or the bundle's
+// transformer directory) and the separately loaded text encoder file (empty for the bundle's bf16 encoder), for
+// configuration `cfg` and the request's scope. `identity` receives the models' full identity when it was computed.
+planner::CertificateAnswer search_certificate(const std::filesystem::path& dit, const std::filesystem::path& te,
+                                              const CertConfig& cfg, const std::string& gpu_arch, const GenerationScope& scope,
+                                              const std::filesystem::path& cache_dir, std::optional<ModelIdentity>& identity) {
+  planner::CertificateAnswer a;
+  if (const std::string why = uncertifiable_reason(cfg); !why.empty()) {
+    a.reason = why;
+    return a;
+  }
+  try {
+    std::optional<ModelIdentity> id;
+    const CertificateSearch found =
+        find_certificate(dit, te, CertificateQuery{cfg, gpu_arch, engine_numerics(cfg), scope}, cache_dir, &id);
+    if (id) identity = std::move(id);
+    a.found = found.certificate.has_value();
+    a.file = a.found ? util::path_utf8(found.file) : std::string();
+    a.reason = found.reason;
+  } catch (const std::exception& e) {
+    a.reason = e.what();
+  }
+  return a;
+}
+
+// Bytes of a weight file, or of the *.safetensors files directly inside a directory (as quality_cert identifies them).
+std::uint64_t weight_bytes(const std::filesystem::path& p) {
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(p, ec)) return std::filesystem::file_size(p, ec);
+  std::uint64_t total = 0;
+  for (const auto& e : std::filesystem::directory_iterator(p, ec)) {
+    if (e.is_regular_file(ec) && e.path().extension() == ".safetensors") total += e.file_size(ec);
+  }
+  return total;
+}
+
+std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file) {
+  if (!std::filesystem::is_regular_file(file)) throw std::invalid_argument("DiT file not found: " + util::path_utf8(file));
+  auto d = std::make_unique<DitSource>();
+  d->path = file;
+  d->cert_path = file;
+  d->quant = std::make_unique<quant::QuantIndex>(quant::to_model_index(quant::open_quant_model(file, quant::ModelKind::kDiT)));
+  d->index = &d->quant->index;
+  d->precision = moss_dit::has_int8_linears(d->quant.get()) ? planner::Precision::kInt8 : planner::Precision::kBf16;
+  d->linears = moss_dit::describe_linears(d->quant.get());
+  return d;
+}
+
+// Where the text encoder comes from (P7a): the bundle's bf16 encoder, or a single INT8 / W4A8 file
+// (qwen35_text::QuantTextModel). The tokenizer is always the bundle's. `identity` and `numerics` key the embedding cache:
+// the weights (text_encoder_hash: names, shapes and each file's path, size, mtime and header) and the encoder's numerics
+// (precision and kernel versions), so embeddings of one encoder are never served for another.
+struct TeSource {
+  std::filesystem::path path;  // the bundle's text_encoder directory or the file
+  const weights::ModelIndex* index = nullptr;           // the bundle's (bf16)
+  std::unique_ptr<qwen35_text::QuantTextModel> model;   // file only
+  qwen35_text::Precision precision = qwen35_text::Precision::kBF16;
+  std::uint64_t identity = 0;
+  std::uint64_t numerics = 0;
+};
+
+// Where the VAE decoder comes from (P7a): the bundle's, or a single FLUX.2 VAE file (flux2_vae::index_vae_file, e.g.
+// the full decoder) decoded with the bundle's latent statistics. `index` is used whole, never merged.
+struct VaeSource {
+  std::filesystem::path path;
+  const weights::ModelIndex* index = nullptr;
+  std::unique_ptr<weights::ModelIndex> own;           // file only
+  const weights::ModelIndex* latent_stats = nullptr;  // file only: the bundle's index
+  flux2_vae::DecoderConfig config;
+};
 
 // Transfer rates of this machine (P4b), measured in ~0.2 s: pinned host -> device (best of 4 copies), and the weight
 // files -> pinned host memory with the DiT streamer's 4 readers over one DiT block (the better of two passes after a
@@ -256,6 +368,17 @@ void validate(const Request& r) {
   }
   check_layers(r.uncond_skip_layers, "uncond_skip_layers");
   check_layers(r.slg_layers, "slg_layers");
+  if (!std::isfinite(r.flow_multiplier) || r.flow_multiplier <= 0) throw std::invalid_argument("Flow multiplier must be finite and positive.");
+  if (!std::isfinite(r.eta) || r.eta < 0 || !std::isfinite(r.s_noise) || r.s_noise < 0) {
+    throw std::invalid_argument("eta and s_noise must be finite and nonnegative.");
+  }
+  if (!r.init_image.empty() || r.denoise_strength != 1.0) {
+    throw std::invalid_argument("img2img (an init image, denoise strength < 1) is not supported by this build yet.");
+  }
+  // The pipeline passes SamplerOptions (seed, noise source) to every sampler; the dataspace sampler also needs its file.
+  if (r.sampler == SamplerKind::kDataSpace && r.dataspace_path.empty()) {
+    throw std::invalid_argument("The dataspace sampler needs its parameter file (dataspace_path).");
+  }
 }
 
 std::size_t vram_option_bytes(double amount, double unit_bytes, std::string_view what) {
@@ -341,6 +464,33 @@ Request request_from_parameters(const json::Value& doc) {
   return r;
 }
 
+GenerationMetadata generation_metadata(const Request& q, const Result& r) {
+  GenerationMetadata m;
+  m.engine_version = std::to_string(MI_VERSION_MAJOR) + "." + std::to_string(MI_VERSION_MINOR) + "." + std::to_string(MI_VERSION_PATCH);
+  m.tier = planner::tier_name(r.tier.effective);
+  const auto name = [](const std::string& p) { return util::path_utf8(util::path_from_utf8(p).filename()); };
+  m.models.push_back({"bundle", util::path_utf8(std::filesystem::weakly_canonical(q.model).filename()), ""});
+  if (!r.dit_source.empty()) m.models.push_back({"dit", name(r.dit_source), ""});
+  if (!r.te_source.empty()) m.models.push_back({"text_encoder", name(r.te_source), ""});
+  if (!r.vae_source.empty()) m.models.push_back({"vae", name(r.vae_source), ""});
+  m.prompt = q.prompt;
+  m.negative_prompt = q.negative_prompt;
+  m.sampler = sampler_name(q.sampler);
+  m.scheduler = scheduler_name(q.scheduler);
+  m.steps = q.steps;
+  m.cfg = q.cfg;
+  m.shift = q.shift;
+  m.seed = r.seed;
+  m.width = r.width;
+  m.height = r.height;
+  for (const lora::LoraSpec& l : q.loras) m.loras.push_back({util::path_utf8(l.path.filename()), "", l.strength});
+  m.extra.emplace_back("attention", planner::attention_name(r.tier.attention));
+  m.extra.emplace_back("dit_linears", r.dit_linears);
+  m.extra.emplace_back("noise_layout", noise_layout_name(q.noise_layout));
+  if (sampler_is_stochastic(q.sampler)) m.extra.emplace_back("noise_source", noise_source_name(q.noise_source));
+  return m;
+}
+
 struct Pipeline::Impl {
   PipelineOptions options;
   runtime::StreamSet streams;
@@ -351,13 +501,23 @@ struct Pipeline::Impl {
   std::unique_ptr<runtime::DeviceArena> arena;
   // Long-lived while the arena lives (it holds a reference to it): its pinned rings and streams are set up once.
   std::unique_ptr<qwen35_text::TextEncoder> te;
-  const Bundle* te_bundle = nullptr;
+  const TeSource* te_src = nullptr;
+  std::map<std::string, std::unique_ptr<TeSource>> te_sources;
   std::unique_ptr<moss_dit::MossDit> dit;
-  const Bundle* dit_bundle = nullptr;
+  const DitSource* dit_src = nullptr;
+  // DiT sources by key ("bundle:" / "file:" + canonical path), kept while the pipeline lives (a model references one).
+  std::map<std::string, std::unique_ptr<DitSource>> dit_sources;
+  // Runtime LoRAs: the stack and its device side branches (outside the arena), the files they were read for, and the
+  // merged adapters baked into the loaded DiT (empty: none).
+  std::unique_ptr<lora::LoraStack> lora_stack;
+  std::unique_ptr<lora::SideBranches> lora_sb;
+  std::string lora_files_key;
+  std::string dit_merge_key;
   std::unique_ptr<flux2_vae::Flux2VaeDecoder> vae;
-  const Bundle* vae_bundle = nullptr;
-  // Bundle whose resident DiT was last dropped outside the plan's parking (its next load is a reload).
-  const Bundle* dit_lost = nullptr;
+  const VaeSource* vae_src = nullptr;
+  std::map<std::string, std::unique_ptr<VaeSource>> vae_sources;
+  // DiT source whose resident DiT was last dropped outside the plan's parking (its next load is a reload).
+  const DitSource* dit_lost = nullptr;
   // Transfer rates for the cost model and whether the weight files are page-cached: probed (or read from the cache
   // directory) at the first generate(), refined from every pass (pipeline/hardware_profile.h). Unset with
   // options.hardware.
@@ -365,7 +525,6 @@ struct Pipeline::Impl {
   std::string hw_key;  // hardware_key() of the learner's profile
   // This pipeline's fused-block self-check (from the profile, the process, or run at the first fused generate()).
   std::optional<moss_dit::FusedCheck> fused_check;
-  const std::uint64_t te_numerics = qwen35_text::numerics_id();  // embedding-cache key part
 
   // Per generate() call.
   MemoryStats* mem = nullptr;
@@ -397,6 +556,94 @@ struct Pipeline::Impl {
     return *it->second;
   }
 
+  // The DiT of this call: options.dit_file, else the bundle's transformer.
+  DitSource& dit_source(const Bundle& b, double& load_s) {
+    const bool file = !options.dit_file.empty();
+    const std::filesystem::path path = file ? options.dit_file : b.dir;
+    const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(std::filesystem::weakly_canonical(path));
+    auto it = dit_sources.find(key);
+    if (it == dit_sources.end()) {
+      const auto t0 = Clock::now();
+      std::unique_ptr<DitSource> d;
+      if (file) {
+        d = open_dit_file(path);
+      } else {
+        d = std::make_unique<DitSource>();
+        d->path = b.dir / "transformer";
+        d->cert_path = d->path;
+        d->index = &b.index;
+        d->linears = moss_dit::describe_linears(nullptr);
+      }
+      it = dit_sources.emplace(key, std::move(d)).first;
+      load_s += since(t0);
+    }
+    return *it->second;
+  }
+
+  // The text encoder of this call: options.text_encoder_file, else the bundle's.
+  TeSource& te_source(const Bundle& b, double& load_s) {
+    const bool file = !options.text_encoder_file.empty();
+    const std::filesystem::path path = file ? options.text_encoder_file : b.dir;
+    const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(std::filesystem::weakly_canonical(path));
+    auto it = te_sources.find(key);
+    if (it == te_sources.end()) {
+      const auto t0 = Clock::now();
+      auto t = std::make_unique<TeSource>();
+      if (file) {
+        if (!std::filesystem::is_regular_file(path)) throw std::invalid_argument("text encoder file not found: " + util::path_utf8(path));
+        t->path = path;
+        t->model = std::make_unique<qwen35_text::QuantTextModel>(path);
+        t->precision = t->model->precision();
+        t->identity = text_encoder_hash(t->model->index());
+      } else {
+        t->path = b.dir / "text_encoder";
+        t->index = &b.index;
+        t->identity = b.te_hash;
+      }
+      t->numerics = qwen35_text::numerics_id(t->precision);
+      it = te_sources.emplace(key, std::move(t)).first;
+      load_s += since(t0);
+    }
+    return *it->second;
+  }
+
+  // The VAE decoder of this call: options.vae_file, else the bundle's.
+  VaeSource& vae_source(const Bundle& b, double& load_s) {
+    const bool file = !options.vae_file.empty();
+    const std::filesystem::path path = file ? options.vae_file : b.dir;
+    // A file is decoded with the bundle's latent statistics: one source per (file, bundle).
+    const std::string key = (file ? "file:" + util::path_utf8(std::filesystem::weakly_canonical(path)) + "|bundle:" : "bundle:") +
+                            util::path_utf8(std::filesystem::weakly_canonical(b.dir));
+    auto it = vae_sources.find(key);
+    if (it == vae_sources.end()) {
+      const auto t0 = Clock::now();
+      auto v = std::make_unique<VaeSource>();
+      if (file) {
+        if (!std::filesystem::is_regular_file(path)) throw std::invalid_argument("VAE file not found: " + util::path_utf8(path));
+        v->path = path;
+        v->own = std::make_unique<weights::ModelIndex>(flux2_vae::index_vae_file(path));
+        v->index = v->own.get();
+        v->latent_stats = &b.index;
+      } else {
+        v->path = b.dir / "vae";
+        v->index = &b.index;
+      }
+      v->config = flux2_vae::decoder_config(*v->index);
+      it = vae_sources.emplace(key, std::move(v)).first;
+      load_s += since(t0);
+    }
+    return *it->second;
+  }
+
+  // Data-space sampler parameters by file (read once per pipeline).
+  std::map<std::string, DataSpaceParams> dataspaces;
+  const DataSpaceParams& dataspace(const std::filesystem::path& file) {
+    const std::string key = util::path_utf8(std::filesystem::weakly_canonical(file));
+    auto it = dataspaces.find(key);
+    if (it == dataspaces.end()) it = dataspaces.emplace(key, load_dataspace(util::path_utf8(file))).first;
+    return it->second;
+  }
+
   void sample_memory() {
     const std::size_t f = runtime::DeviceArena::free_device_bytes();
     if (free_at_start > f) mem->device_peak = std::max(mem->device_peak, free_at_start - f);
@@ -404,27 +651,36 @@ struct Pipeline::Impl {
     mem->host_private_peak = std::max(mem->host_private_peak, planner::process_host_memory().private_bytes);
   }
 
-  qwen35_text::EncoderOptions te_options(planner::TeResidency residency, int buffers) const {
+  qwen35_text::EncoderOptions te_options(const TeSource& t, planner::TeResidency residency, int buffers) const {
     qwen35_text::EncoderOptions o;
     o.direct_io = options.direct_io;
     o.weight_buffers = std::max(1, buffers);
-    // Host-resident weights stay pageable: the whole model is never pinned (plan step 24).
-    o.source = residency == planner::TeResidency::kHostResident ? qwen35_text::WeightSource::kHostPageable
-                                                                 : qwen35_text::WeightSource::kFile;
+    // bf16 host-resident weights stay pageable: the whole 15 GB model is never pinned (plan step 24). A quantized
+    // encoder (3.9-6.9 GB) is pinned when held in RAM: its cache-miss target needs the direct DMA.
+    const qwen35_text::WeightSource host =
+        t.model ? qwen35_text::WeightSource::kHostPinned : qwen35_text::WeightSource::kHostPageable;
+    o.source = residency == planner::TeResidency::kHostResident ? host : qwen35_text::WeightSource::kFile;
     return o;
+  }
+  std::size_t te_workspace(const TeSource& t, std::span<const std::int64_t> lengths, const qwen35_text::EncoderOptions& o) const {
+    return t.model ? qwen35_text::TextEncoder::workspace_bytes(*t.model, lengths, o)
+                   : qwen35_text::TextEncoder::workspace_bytes(*t.index, lengths, o);
+  }
+  static std::size_t te_host(const TeSource& t, const qwen35_text::EncoderOptions& o) {
+    return t.model ? qwen35_text::TextEncoder::host_bytes(*t.model, o) : qwen35_text::TextEncoder::host_bytes(*t.index, o);
   }
 
   // Drops every resident model and recreates the arena with `capacity` bytes (all stack phases must have ended).
   // `park`: the plan evicts the DiT here (anything else that drops it makes its next load a reported reload).
   void reset_arena(std::size_t capacity, bool park = false) {
     MI_CUDA_CHECK(cudaStreamSynchronize(streams.compute()));
-    if (dit && !park) dit_lost = dit_bundle;
+    if (dit && !park) dit_lost = dit_src;
     te.reset();
-    te_bundle = nullptr;
+    te_src = nullptr;
     vae.reset();
-    vae_bundle = nullptr;
+    vae_src = nullptr;
     dit.reset();
-    dit_bundle = nullptr;
+    dit_src = nullptr;
     if (arena) {
       sample_memory();
       arena.reset();
@@ -432,6 +688,27 @@ struct Pipeline::Impl {
     arena = std::make_unique<runtime::DeviceArena>(capacity);
     ++mem->arena_creations;
     mem->arena_capacity = std::max(mem->arena_capacity, arena->capacity());
+  }
+
+  // Drops every resident model and the arena itself (all stack phases must have ended): frees the device memory for an
+  // allocation outside it. The next plan creates the arena again; a resident DiT dropped here is reloaded (reported).
+  void release_arena() {
+    MI_CUDA_CHECK(cudaStreamSynchronize(streams.compute()));
+    if (dit) {
+      dit->set_lora(nullptr);
+      dit_lost = dit_src;
+    }
+    te.reset();
+    te_src = nullptr;
+    vae.reset();
+    vae_src = nullptr;
+    dit.reset();
+    dit_src = nullptr;
+    dit_merge_key.clear();
+    if (arena) {
+      sample_memory();
+      arena.reset();
+    }
   }
 
   moss_dit::Residency dit_residency(const planner::DitPlan& d) const {
@@ -451,7 +728,7 @@ struct Pipeline::Impl {
   bool weights_cached() const { return !learner || learner->te_weights_cached(); }
   bool dit_weights_cached() const { return !learner || learner->dit_weights_cached(); }
 
-  planner::HardwareProfile hardware(const Bundle& b) {
+  planner::HardwareProfile hardware(const weights::ModelIndex& dit_index) {
     if (options.hardware) return *options.hardware;
     if (learner) return learner->current();
     hw_key = hardware_key();
@@ -461,7 +738,7 @@ struct Pipeline::Impl {
     if (!stored) {
       StoredProfile p;
       try {
-        p.probe = probe_hardware(b.index, streams.compute());
+        p.probe = probe_hardware(dit_index, streams.compute());
       } catch (const std::exception&) {
         p.probe = planner::HardwareProfile{};  // e.g. no room for the probe's 64 MiB buffers: plan with the defaults
       }
@@ -525,7 +802,9 @@ struct Pipeline::Impl {
     if (!learner || options.hardware) return;
     bool changed = false;
     const std::vector<double>& steps = r.timings.step_s;
-    if (steps.size() >= 3 && r.plan.dit.compute_s > 0) {
+    // Compute rates are learned from the Reference numerics only: the P6 paths' speedups are cost-model constants.
+    const bool reference = r.tier.effective == planner::Tier::kReference;
+    if (reference && steps.size() >= 3 && r.plan.dit.compute_s > 0) {
       std::vector<double> sorted(steps.begin() + 1, steps.end());  // the first step pays warm-up (GEMM plans)
       std::sort(sorted.begin(), sorted.end());
       const double stall = r.dit_stream.streamed ? r.dit_stream.stall_s / static_cast<double>(steps.size()) : 0.0;
@@ -543,48 +822,52 @@ struct Pipeline::Impl {
     if (changed) save_profile(learner->stored());
   }
 
-  void ensure_te(const Bundle& b, const qwen35_text::EncoderOptions& o) {
-    if (te && te_bundle == &b) {
+  void ensure_te(const TeSource& t, const qwen35_text::EncoderOptions& o) {
+    if (te && te_src == &t) {
       const qwen35_text::EncoderOptions& cur = te->options();
       if (cur.weight_buffers == o.weight_buffers && cur.source == o.source && cur.direct_io == o.direct_io) return;
     }
     te.reset();
-    te = std::make_unique<qwen35_text::TextEncoder>(b.index, *arena, streams.compute(), o);
-    te_bundle = &b;
+    te = t.model ? std::make_unique<qwen35_text::TextEncoder>(*t.model, *arena, streams.compute(), o)
+                 : std::make_unique<qwen35_text::TextEncoder>(*t.index, *arena, streams.compute(), o);
+    te_src = &t;
   }
 
   // The plan counts the DiT and every resident model, so a resident DiT is never expected to be dropped here; when
   // it is (the arena found does not match the plan), the reload is reported as MemoryStats::dit_reloaded.
   // `stack_need` excludes the streamed blocks' device buffers (added here from `residency`). A loaded DiT with another
   // residency is replaced: a planned change, not a reload.
-  void ensure_dit(const Bundle& b, const moss_dit::Residency& residency, std::size_t stack_need, const std::atomic<bool>* cancel,
-                  Timings& tm) {
-    stack_need += moss_dit::MossDit::stream_workspace_bytes(b.index, residency);
-    const bool same = dit && dit_bundle == &b && dit->residency() == residency;
+  void ensure_dit(const DitSource& src, const moss_dit::Residency& residency, std::size_t stack_need,
+                  const std::atomic<bool>* cancel, Timings& tm, const lora::LoraStack* merges, const std::string& merge_key) {
+    stack_need += moss_dit::MossDit::stream_workspace_bytes(*src.index, residency);
+    const bool same = dit && dit_src == &src && dit->residency() == residency && dit_merge_key == merge_key;
     if (same && arena->available() >= stack_need) return;
-    const std::size_t persistent = moss_dit::MossDit::persistent_bytes(b.index, residency);
+    const std::size_t persistent = moss_dit::MossDit::persistent_bytes(*src.index, residency);
     if (dit || arena->available() < persistent + stack_need) reset_arena(arena->capacity(), dit && !same);
     if (arena->available() < persistent + stack_need) {
       throw runtime::BudgetError(persistent + stack_need, arena->available());
     }
     const auto t0 = Clock::now();
     try {
-      dit = std::make_unique<moss_dit::MossDit>(b.index, *arena, streams, options.direct_io, cancel, residency);
+      dit = src.quant
+                ? std::make_unique<moss_dit::MossDit>(*src.quant, *arena, streams, options.direct_io, cancel, residency, merges)
+                : std::make_unique<moss_dit::MossDit>(*src.index, *arena, streams, options.direct_io, cancel, residency, merges);
     } catch (...) {
       // A partial load (cancelled or failed) leaves its weights in the persistent region: start over clean.
       reset_arena(arena->capacity());
       throw;
     }
-    dit_bundle = &b;
-    mem->dit_reloaded = mem->dit_reloaded || dit_lost == &b;
+    dit_src = &src;
+    dit_merge_key = merge_key;
+    mem->dit_reloaded = mem->dit_reloaded || dit_lost == &src;
     dit_lost = nullptr;
     tm.dit_load_s = since(t0);
     sample_memory();
   }
 
-  void ensure_vae(const Bundle& b, std::size_t stack_need, bool park_dit, Timings& tm) {
-    if (vae && vae_bundle == &b && arena->available() >= stack_need && !(park_dit && dit)) return;
-    const std::size_t persistent = flux2_vae::Flux2VaeDecoder::persistent_bytes(b.index);
+  void ensure_vae(const VaeSource& v, std::size_t stack_need, bool park_dit, Timings& tm) {
+    if (vae && vae_src == &v && arena->available() >= stack_need && !(park_dit && dit)) return;
+    const std::size_t persistent = flux2_vae::Flux2VaeDecoder::persistent_bytes(*v.index, false, v.latent_stats);
     if (park_dit || vae || arena->available() < persistent + stack_need) {
       // Parking: only where the plan asks for it, or (never expected with the exact workspace queries) as the
       // exact fallback when the decode does not fit; either way it is reported.
@@ -595,8 +878,8 @@ struct Pipeline::Impl {
       throw runtime::BudgetError(persistent + stack_need, arena->available());
     }
     const auto t0 = Clock::now();
-    vae = std::make_unique<flux2_vae::Flux2VaeDecoder>(b.index, *arena, streams, false, options.direct_io);
-    vae_bundle = &b;
+    vae = std::make_unique<flux2_vae::Flux2VaeDecoder>(*v.index, *arena, streams, false, options.direct_io, v.latent_stats);
+    vae_src = &v;
     tm.vae_load_s = since(t0);
     sample_memory();
   }
@@ -606,11 +889,11 @@ struct Pipeline::Impl {
   // it runs: on a full embedding-cache hit the encoder's held memory stays in the baseline.
   std::size_t held_host_bytes(bool te_runs) const {
     std::size_t held = cache ? cache->stats().bytes : 0;
-    if (dit) held += dit->host_bytes();  // a streamed DiT's rings or pinned copy: the planner counts its own
-    if (te_runs && te && te_bundle != nullptr) {
+    if (dit) held += dit->host_bytes() + dit->pristine_bytes();  // rings / pinned copy, LoRA pristine weights: counted by the plan
+    if (te_runs && te && te_src != nullptr) {
       qwen35_text::EncoderOptions file = te->options();
       file.source = qwen35_text::WeightSource::kFile;
-      held += te->host_resident_bytes() + qwen35_text::TextEncoder::host_bytes(te_bundle->index, file);
+      held += te->host_resident_bytes() + te_host(*te_src, file);
     }
     return held;
   }
@@ -648,12 +931,133 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   struct CancelScope {
     Impl& m;
     ~CancelScope() {
-      if (m.dit) m.dit->set_cancel(nullptr);
+      if (m.dit) {
+        m.dit->set_cancel(nullptr);
+        m.dit->set_request_route(std::nullopt);
+      }
       if (m.vae) m.vae->set_cancel(nullptr);
     }
   } cancel_scope{m};
 
   Bundle& b = m.bundle(req.model, tm.index_load_s);
+  DitSource& src = m.dit_source(b, tm.index_load_s);
+  const TeSource& tes = m.te_source(b, tm.index_load_s);
+  const VaeSource& vs = m.vae_source(b, tm.index_load_s);
+  r.te_source = util::path_utf8(tes.path);
+  r.te_precision = qwen35_text::precision_name(tes.precision);
+  r.vae_source = util::path_utf8(vs.path);
+  r.dit_source = util::path_utf8(src.path);
+  r.dit_linears = src.linears;
+  r.gpu_arch = current_gpu_arch();
+  const bool lora_requested = !req.loras.empty();
+  {
+    // Quality tier from what is loaded, before anything heavy (its refusals throw std::invalid_argument here, ahead of
+    // the LoRA files too). Certificates (pipeline/quality_cert.h) are searched for the lossy configurations of this DiT,
+    // once per configuration and scope while the source is loaded; runtime LoRAs are never certified, so with LoRAs
+    // nothing is searched (and nothing LoRA-specific is cached).
+    const std::filesystem::path te_file = tes.model ? tes.path : std::filesystem::path();
+    GenerationScope scope;
+    scope.pixels = std::int64_t{req.width} * req.height;
+    scope.sampler = sampler_name(req.sampler);
+    scope.steps = req.steps;
+    // Sampling settings the certificate scope cannot express yet count as an accelerator outside it (out of scope).
+    scope.accelerators = req.scheduler != SchedulerKind::kMoss || req.flow_multiplier != 1.0 || req.eta != 1.0 ||
+                         req.s_noise != 1.0 || req.noise_source != NoiseSource::kPhilox ||
+                         req.noise_layout != NoiseLayout::kOfficial;
+    const auto lookup = [&](planner::Precision precision, planner::AttentionMode mode) {
+      const CertConfig cfg = cert_config(precision, mode, tes.precision, lora_requested);
+      if (lora_requested) return planner::CertificateAnswer{false, "", uncertifiable_reason(cfg)};
+      const std::string key = std::string(planner::attention_name(mode)) + "|" + util::path_utf8(te_file) + "|" +
+                              qwen35_text::precision_name(tes.precision) + "|" + std::to_string(scope.pixels) + "|" +
+                              scope.sampler + "|" + std::to_string(scope.steps) + (scope.accelerators ? "|acc" : "");
+      auto it = src.certificates.find(key);
+      if (it == src.certificates.end()) {
+        it = src.certificates
+                 .emplace(key, search_certificate(src.cert_path, te_file, cfg, r.gpu_arch, scope, m.options.cache_dir,
+                                                  src.identity))
+                 .first;
+      }
+      return it->second;
+    };
+    const auto supported = [](planner::AttentionMode mode) { return moss_dit::attention_supported(dit_attention(mode)); };
+    r.tier = planner::resolve_tier(m.options.tier, m.options.attention, src.precision, lookup, supported,
+                                   tes.precision != qwen35_text::Precision::kBF16);
+    if (lora_requested) {
+      r.tier.certified = false;
+      r.tier.certificate.clear();
+      r.tier.reason += "; runtime LoRAs active: uncertified (certificates cover the base model only)";
+    }
+    // The report's quality object (quality_report_json): what ran, why, and the models it ran.
+    QualityReport& q = r.quality;
+    q.config = cert_config(r.tier.precision, r.tier.attention, tes.precision, lora_requested);
+    q.gpu_arch = r.gpu_arch;
+    q.reason = r.tier.reason;
+    q.certificate = r.tier.certificate.empty() ? std::filesystem::path() : util::path_from_utf8(r.tier.certificate);
+    q.dit = src.cert_path;
+    q.dit_bytes = weight_bytes(src.cert_path);
+    q.te = te_file;
+    q.te_bytes = te_file.empty() ? 0 : weight_bytes(te_file);
+    if (src.identity) {
+      q.dit_identity = src.identity->dit;
+      q.te_identity = src.identity->te;
+    }
+  }
+  // Runtime LoRAs: the stack is kept while its files (and the DiT source) stay the same; a strength change updates the
+  // side branches in place and re-merges merged adapters from the pristine weights. The loaded DiT carries merged
+  // adapters of the files in `merge_key`. A new stack is built into locals and committed only once it is complete.
+  std::string merge_key;
+  if (!lora_requested) {
+    if (m.dit) m.dit->set_lora(nullptr);
+    m.lora_sb.reset();
+    m.lora_stack.reset();
+    m.lora_files_key.clear();
+  } else {
+    std::string files = util::path_utf8(src.path) + (m.options.lora_strict ? "|strict" : "");
+    for (const lora::LoraSpec& l : req.loras) files += "|" + util::path_utf8(std::filesystem::weakly_canonical(l.path));
+    if (!m.lora_stack || files != m.lora_files_key) {
+      lora::LoadOptions lo;
+      lo.strict = m.options.lora_strict;
+      lo.int8_block_gemms = src.precision == planner::Precision::kInt8;
+      auto stack = std::make_unique<lora::LoraStack>(req.loras, lora::moss_dit_targets(), lo);
+      // The side branches live outside the arena: make room first when a held arena leaves too little free memory
+      // (the arena is recreated at the plan's size below), and retry once if the allocation still fails.
+      const std::size_t sb_bytes = lora::SideBranches::device_bytes(*stack);
+      if (m.dit) m.dit->set_lora(nullptr);
+      m.lora_sb.reset();
+      std::unique_ptr<lora::SideBranches> sb;
+      if (m.arena && runtime::DeviceArena::free_device_bytes() < sb_bytes + m.options.vram_reserve) m.release_arena();
+      try {
+        sb = std::make_unique<lora::SideBranches>(*stack);
+      } catch (const CudaError&) {
+        if (!m.arena) throw;
+        m.release_arena();
+        sb = std::make_unique<lora::SideBranches>(*stack);
+      }
+      m.lora_stack = std::move(stack);
+      m.lora_sb = std::move(sb);
+      m.lora_files_key = files;
+    } else {
+      bool changed = false;
+      for (int i = 0; i < m.lora_stack->files(); ++i) {
+        const float strength = req.loras[static_cast<std::size_t>(i)].strength;
+        if (m.lora_stack->strength(i) != strength) {
+          m.lora_stack->set_strength(i, strength);
+          changed = true;
+        }
+      }
+      if (changed) {
+        m.lora_sb->update_strengths(*m.lora_stack);  // between forwards: nothing reads them now
+        // Merged adapters: re-merged from the pristine weights kept at load, in place (no reload).
+        if (m.dit && m.dit_merge_key == files && !m.lora_stack->merge_modules().empty()) m.dit->remerge_lora(*m.lora_stack);
+      }
+    }
+    if (!m.lora_stack->merge_modules().empty()) merge_key = files;
+    r.loras = m.lora_stack->reports();
+    for (const lora::FileReport& f : r.loras) {
+      for (const std::string& w : f.warnings) r.lora_warnings.push_back(f.file + ": " + w);
+      for (const std::string& n : f.notes) r.lora_notes.push_back(f.file + ": " + n);
+    }
+  }
   if (req.seed >= 0) {
     r.seed = static_cast<std::uint64_t>(req.seed);
   } else {
@@ -667,7 +1071,26 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   g.slg_scale = req.slg_scale;
   g.slg_start = req.slg_start;
   g.slg_stop = req.slg_stop;
-  const Schedule schedule = moss_schedule(req.steps, req.shift);
+  // Schedule (pipeline/samplers): the official one for kMoss, the scheduler's otherwise; the dataspace sampler's from its
+  // step codes.
+  const FlowSampling flow{req.shift, req.flow_multiplier};
+  const DataSpaceParams* dataspace = nullptr;
+  Schedule schedule;
+  if (req.sampler == SamplerKind::kDataSpace) {
+    dataspace = &m.dataspace(req.dataspace_path);
+    schedule.sigmas = dataspace_sigmas(*dataspace, req.steps);
+    schedule.timesteps.assign(dataspace->step_codes.begin(), dataspace->step_codes.begin() + req.steps);
+    schedule.scheduler = SchedulerKind::kSimple;  // not kMoss: the data-space arithmetic
+    schedule.flow = flow;
+  } else {
+    schedule = make_schedule(req.scheduler, req.steps, flow);
+  }
+  SamplerOptions sampler_options;
+  sampler_options.noise = req.noise_source;
+  sampler_options.eta = req.eta;
+  sampler_options.s_noise = req.s_noise;
+  sampler_options.flow = flow;
+  sampler_options.dataspace = dataspace;
   r.height = req.height;
   r.width = req.width;
   r.steps_requested = req.steps;
@@ -676,9 +1099,11 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   // Tokenize (P:321-327). The negative prompt is encoded only with CFG (P:388-394).
   auto t0 = Clock::now();
   std::vector<std::vector<std::int32_t>> seqs;
-  seqs.push_back(tok::encode_moss_prompt(b.tokenizer, req.prompt, static_cast<std::size_t>(req.max_sequence_length)));
+  seqs.push_back(tok::encode_moss_prompt_report(b.tokenizer, req.prompt, static_cast<std::size_t>(req.max_sequence_length),
+                                                r.cond_token_report));
   if (g.do_cfg()) {
-    seqs.push_back(tok::encode_moss_prompt(b.tokenizer, req.negative_prompt, static_cast<std::size_t>(req.max_sequence_length)));
+    seqs.push_back(tok::encode_moss_prompt_report(b.tokenizer, req.negative_prompt,
+                                                  static_cast<std::size_t>(req.max_sequence_length), r.uncond_token_report));
   }
   tm.tokenize_s = since(t0);
   const std::int64_t sc = static_cast<std::int64_t>(seqs[0].size());
@@ -692,7 +1117,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   std::vector<std::shared_ptr<const Embedding>> embeds(seqs.size());
   std::vector<std::size_t> missing;
   for (std::size_t i = 0; i < seqs.size(); ++i) {
-    keys[i] = EmbeddingKey{b.te_hash, m.te_numerics, req.max_sequence_length, seqs[i]};
+    keys[i] = EmbeddingKey{tes.identity, tes.numerics, req.max_sequence_length, seqs[i]};
     if (m.cache) embeds[i] = m.cache->find(keys[i]);
     if (embeds[i]) {
       ++r.te_cache_hits;
@@ -705,8 +1130,18 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   for (const std::size_t i : missing) te_lengths.push_back(static_cast<std::int64_t>(seqs[i].size()));
 
   // Machine profile and block path (the first call probes and self-checks; both are cached).
-  r.hardware = m.hardware(b);
+  r.hardware = m.hardware(*src.index);
   const moss_dit::BlockPath block_path = m.block_path(r.block_path_note);
+  // One fused route for the whole request: it sizes the denoise workspace and every step runs under it, so a poisoning
+  // meanwhile (another pipeline's failed self-check) applies from the next request on instead of failing a step.
+  const moss_dit::FusedRouteSnapshot route =
+      block_path == moss_dit::BlockPath::kOpByOp ? moss_dit::FusedRouteSnapshot{} : moss_dit::fused_route_snapshot();
+  const moss_dit::AttentionMode attention = dit_attention(r.tier.attention);
+  moss_dit::ComputeConfig dit_config = moss_dit::MossDit::compute_config(src.quant.get(), attention);
+  if (m.lora_sb && m.lora_sb->any_active()) {
+    dit_config.quantized = true;  // the side branches run on the quantized block path (its fused LoRA GEMMs)
+    dit_config.lora_rank = m.lora_sb->max_rank();
+  }
 
   // Exact stack need of the phases this request runs, and the plan.
   const std::int64_t h = req.height / 16, w = req.width / 16;
@@ -715,23 +1150,34 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   const std::size_t refined_bytes = bf16_rows(sc, moss_dit::kDim) + (g.do_cfg() ? bf16_rows(su, moss_dit::kDim) : 0);
   const std::size_t refine_need = bf16_rows(sc, moss_dit::kTextDim) + (g.do_cfg() ? bf16_rows(su, moss_dit::kTextDim) : 0) +
                                   moss_dit::MossDit::encode_text_workspace_bytes(std::max(sc, su));
+  // The sampling loop's own buffers plus the forward for the loop's largest row set (cond, uncond under CFG, SLG) under
+  // this request's route and config.
+  const std::vector<std::int64_t> row_lengths = denoise_row_lengths(sc, su, g);
+  const std::size_t loop_buffers = denoise_loop_bytes(h, w, sc, su, g, req.sampler);
+  const std::size_t forward_bytes = moss_dit::MossDit::workspace_bytes(h, w, row_lengths, block_path, dit_config, &route);
+  // A latent preview: the previous latents, the x0 estimate, the preview's scratch and its RGB image.
+  const std::size_t image_bytes = static_cast<std::size_t>(req.height) * static_cast<std::size_t>(req.width) * 3;
+  const std::size_t preview_bytes =
+      control.on_preview ? 2 * latent_bytes + align_up(latent_preview::workspace_bytes(h, w)) + align_up(image_bytes) : 0;
   const std::size_t denoise_need =
-      refined_bytes + std::max(refine_need, latent_bytes + denoise_workspace_bytes(h, w, sc, su, g, req.sampler, block_path));
+      refined_bytes + std::max(refine_need, latent_bytes + preview_bytes + loop_buffers + forward_bytes);
   // Exact GroupNorm statistics: the untiled decode and every tiled one the plan may pick from the free VRAM give the
   // same bytes, so the image does not depend on the memory budget.
   constexpr flux2_vae::DecodeMode decode_mode = flux2_vae::DecodeMode::reference();
   static_assert(!decode_mode.torch_group_norm, "torch's GroupNorm cannot be tiled");
 
   planner::PlanInputs in;
-  in.shapes = planner::shapes_from_index(b.index);
-  in.shapes.dit_bytes = moss_dit::MossDit::persistent_bytes(b.index);
-  in.shapes.dit_block_bytes = align_up(moss_dit::BlockWeights::block_device_bytes(b.index));  // the buffers' size
-  in.shapes.vae_bytes = flux2_vae::Flux2VaeDecoder::persistent_bytes(b.index);
+  in.shapes = planner::shapes_from_index(b.index, src.quant ? src.index : nullptr, src.precision,
+                                         tes.model ? &tes.model->index() : nullptr, vs.own.get());
+  in.shapes.dit_bytes = moss_dit::MossDit::persistent_bytes(*src.index);
+  if (src.quant) in.shapes.dit_int8_fraction = moss_dit::int8_gemm_fraction(src.quant.get());
+  in.shapes.dit_block_bytes = align_up(moss_dit::BlockWeights::block_device_bytes(*src.index));  // the buffers' size
+  in.shapes.vae_bytes = flux2_vae::Flux2VaeDecoder::persistent_bytes(*vs.index, false, vs.latent_stats);
   in.request.height = req.height;
   in.request.width = req.width;
   in.request.text_lengths = {sc};
   if (g.do_cfg()) in.request.text_lengths.push_back(su);
-  in.request.steps = schedule.num_steps();
+  in.request.steps = schedule.num_steps() * model_calls_per_step(req.sampler);  // DiT evaluations (heun: 2 per step)
   in.request.rows_per_step = 1 + (g.do_cfg() ? 1 : 0) + (g.slg_scale > 0 && g.slg_layers.any() ? 1 : 0);
   in.request.te_lengths = te_lengths;
   in.request.decode = req.decode;
@@ -740,17 +1186,17 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   in.request.dit_weights_cached = m.dit_weights_cached();
   in.request.vae_resident = m.vae != nullptr;
   in.workspaces.text_encoder = [&](planner::TeResidency residency, int buffers) {
-    return qwen35_text::TextEncoder::workspace_bytes(b.index, te_lengths, m.te_options(residency, buffers));
+    return m.te_workspace(tes, te_lengths, m.te_options(tes, residency, buffers));
   };
   in.workspaces.denoise = denoise_need;
   if (req.decode) {
-    in.workspaces.decode = latent_bytes + flux2_vae::Flux2VaeDecoder::workspace_bytes(h, w, decode_mode);
+    in.workspaces.decode = latent_bytes + flux2_vae::Flux2VaeDecoder::workspace_bytes(vs.config, h, w, decode_mode);
     in.workspaces.decode_tiled = [&](std::size_t budget) -> std::optional<planner::TiledDecode> {
       std::optional<flux2_vae::TilePlan> tp;
       if (budget == 0) {
-        tp = flux2_vae::Flux2VaeDecoder::plan_tiled_min_memory(h, w, decode_mode, 8);
+        tp = flux2_vae::Flux2VaeDecoder::plan_tiled_min_memory(vs.config, h, w, decode_mode, 8);
       } else if (budget > latent_bytes) {
-        tp = flux2_vae::Flux2VaeDecoder::plan_tiled(h, w, decode_mode, budget - latent_bytes);
+        tp = flux2_vae::Flux2VaeDecoder::plan_tiled(vs.config, h, w, decode_mode, budget - latent_bytes);
       }
       if (!tp) return std::nullopt;
       return planner::TiledDecode{latent_bytes + tp->workspace_bytes, tp->relative_cost, tp->tile};
@@ -759,9 +1205,12 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   std::size_t embed_bytes = 0;
   for (const auto& s : seqs) embed_bytes += s.size() * qwen35_text::kHidden * 2;
   in.workspaces.host_buffers = embed_bytes + 2 * latent_bytes +
-                               (req.decode ? static_cast<std::size_t>(req.height) * static_cast<std::size_t>(req.width) * 3 : 0);
+                               (req.decode ? image_bytes : 0) + (control.on_preview ? image_bytes : 0);
+  // The pristine copies of LoRA-merged modules the DiT keeps on the host (held_host_bytes takes a loaded DiT's out of
+  // the baseline, so they count once).
+  if (!merge_key.empty()) in.workspaces.host_buffers += moss_dit::MossDit::pristine_bytes(*m.lora_stack, src.quant.get());
   in.caps.te_max_buffers = 2;
-  in.caps.te_ring_bytes = qwen35_text::TextEncoder::host_bytes(b.index, m.te_options(planner::TeResidency::kStreamed, 2));
+  in.caps.te_ring_bytes = Impl::te_host(tes, m.te_options(tes, planner::TeResidency::kStreamed, 2));
   in.caps.te_host_resident = true;
   in.caps.dit_parking = true;
   in.caps.dit_streaming = true;
@@ -769,19 +1218,27 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   {
     moss_dit::Residency file;
     file.resident_blocks = 0;
-    in.caps.dit_ring_bytes = moss_dit::BlockWeights::host_bytes(b.index, file);
+    in.caps.dit_ring_bytes = moss_dit::BlockWeights::host_bytes(*src.index, file);
   }
   in.caps.dit_host_pinned = true;
+  if (m.lora_stack) {
+    for (int bi = 0; bi < moss_dit::kLayers; ++bi) {
+      if (moss_dit::MossDit::block_has_merges(*m.lora_stack, bi)) in.caps.dit_file_source = false;
+    }
+  }
   in.caps.dit_graph_bytes = block_path == moss_dit::BlockPath::kFusedGraphs ? moss_dit::graph_cache_bytes() : 0;
   in.hardware = r.hardware;
   in.budgets.vram_free = runtime::DeviceArena::free_device_bytes() + (m.arena ? m.arena->capacity() : 0);
   in.budgets.vram_reserve = m.options.vram_reserve;
   in.budgets.vram_budget = m.options.vram_budget;
+  // The LoRA side branches hold device memory outside the arena, as the context does: it counts against the budget.
+  if (m.lora_sb) in.budgets.context_bytes += m.lora_sb->device_bytes();
   in.budgets.host_available = planner::host_available_bytes();
   const std::size_t held_host = m.held_host_bytes(!missing.empty());
   in.budgets.host_private_now = r.memory.host_private_start > held_host ? r.memory.host_private_start - held_host : 0;
   in.budgets.host_budget = m.options.host_ram_budget;
   in.mode = m.options.mode;
+  in.attention = r.tier.attention;
   in.cache_disk_spill = m.cache && m.cache->disk_enabled();
   // Throws planner::BudgetError before any heavy work. A resident VAE decoder the request does not need is counted;
   // when that alone makes the request infeasible, plan without it and recreate the arena (dropping it) below.
@@ -797,7 +1254,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   // A loaded DiT stays (in its held arena, with its residency) unless the request's own plan saves more than reloading
   // it costs: no reload churn when request sizes alternate or the free device memory moves a little.
   bool kept = false;
-  if (m.arena && m.dit && m.dit_bundle == &b && !drop_resident) {
+  if (m.arena && m.dit && m.dit_src == &src && m.dit_merge_key == merge_key && !drop_resident) {
     const moss_dit::Residency& loaded = m.dit->residency();
     planner::HeldDit held;
     held.arena_bytes = m.arena->capacity();
@@ -810,6 +1267,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     }
     r.plan = planner::prefer_held(in, std::move(r.plan), held, &kept);
   }
+  r.plan.explanation += "\nQuality: " + r.tier.reason + "; DiT " + r.dit_linears + " from " + r.dit_source + ".";
   const planner::ExecutionPlan& plan = r.plan;
   if (m.cache) m.cache->set_max_bytes(plan.cache.host_bytes);
   tm.plan_s = since(t0);
@@ -834,7 +1292,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     std::vector<std::vector<std::int32_t>> todo;
     for (const std::size_t i : missing) todo.push_back(seqs[i]);
     t0 = Clock::now();
-    m.ensure_te(b, m.te_options(plan.te.residency, plan.te.buffers));
+    m.ensure_te(tes, m.te_options(tes, plan.te.residency, plan.te.buffers));
     qwen35_text::EncodeOptions eo;
     eo.cancel = control.cancel;
     std::vector<std::vector<std::uint16_t>> out;
@@ -868,7 +1326,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   if (!keep_going(Phase::kDitLoad)) return finish();
   const moss_dit::Residency residency = m.dit_residency(plan.dit);
   try {
-    m.ensure_dit(b, residency, denoise_need, control.cancel, tm);
+    m.ensure_dit(src, residency, denoise_need, control.cancel, tm, merge_key.empty() ? nullptr : m.lora_stack.get(), merge_key);
   } catch (const moss_dit::Cancelled&) {
     r.cancelled = true;
     return finish();
@@ -880,6 +1338,9 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     m.learner->observe_dit_load(static_cast<double>(ls.bytes) / ls.seconds / 1e9);
   }
   if (m.dit->block_path() != block_path) m.dit->set_block_path(block_path);
+  if (m.dit->attention() != attention) m.dit->set_attention(attention);
+  m.dit->set_lora(m.lora_sb.get());
+  m.dit->set_request_route(route);
   r.block_path = block_path;
   if (block_path == moss_dit::BlockPath::kFusedGraphs && residency.streamed()) {
     r.block_path = moss_dit::BlockPath::kFused;  // streamed blocks wait on host-driven copies: never captured
@@ -907,9 +1368,23 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
 
     // P:400-402: fp32 CPU noise [1, 128, h, w].
     const Tensor latents = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, h, w});
+    Tensor prev, x0, preview_rgb;
+    void* preview_ws = nullptr;
+    const std::size_t preview_ws_bytes = latent_preview::workspace_bytes(h, w);
+    std::vector<std::uint8_t> preview_host;
+    if (control.on_preview) {
+      prev = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, h, w});
+      x0 = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, h, w});
+      preview_ws = m.arena->alloc_stack(preview_ws_bytes);
+      preview_rgb = m.arena->alloc_tensor(DType::kU8, {req.height, req.width, 3});
+      preview_host.resize(image_bytes);
+    }
     {
-      const std::vector<float> noise = rng::torch_cpu_randn(r.seed, latents.numel());
+      const std::vector<float> noise = initial_noise(req.noise_layout, r.seed, moss_dit::kLatentChannels, h, w);
       MI_CUDA_CHECK(cudaMemcpyAsync(latents.data, noise.data(), latents.nbytes(), cudaMemcpyHostToDevice, stream));
+      // x = sigma_0 * noise (identity for the official schedule's sigma_0 = 1).
+      flow_noise_scaling(latents, Tensor{}, schedule.sigmas.front(), stream);
+      if (control.on_preview) MI_CUDA_CHECK(cudaMemcpyAsync(prev.data, latents.data, latents.nbytes(), cudaMemcpyDeviceToDevice, stream));
       MI_CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
@@ -940,13 +1415,29 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
         ds.stalls = total.stalls;
       }
       tm.step_s.push_back(info.step_seconds);
+      if (control.on_preview) {
+        // x0 estimate from this step's effective velocity (the last step's latents are their own x0: sigma = 0).
+        const int every = std::max(1, control.preview_every);
+        if (info.step % every == 0 || info.step == info.num_steps) {
+          const double s_now = schedule.sigmas[static_cast<std::size_t>(info.step)];
+          const double s_prev = schedule.sigmas[static_cast<std::size_t>(info.step) - 1];
+          const float c = s_prev != s_now ? static_cast<float>(s_now / (s_prev - s_now)) : 0.0f;
+          moss_dit::extrapolate_latents(latents, prev, c, x0, stream);
+          latent_preview::preview(x0, preview_rgb, preview_ws, preview_ws_bytes, stream);
+          MI_CUDA_CHECK(cudaMemcpyAsync(preview_host.data(), preview_rgb.data, image_bytes, cudaMemcpyDeviceToHost, stream));
+          MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+          control.on_preview(PreviewImage{info.step, info.num_steps, req.width, req.height, preview_host.data()});
+        }
+        MI_CUDA_CHECK(cudaMemcpyAsync(prev.data, latents.data, latents.nbytes(), cudaMemcpyDeviceToDevice, stream));
+      }
       if (control.on_step && !control.on_step(info)) r.cancelled = true;
       if (cancel_requested()) r.cancelled = true;
       return !r.cancelled;
     };
     t0 = Clock::now();
     try {
-      r.steps_run = denoise(*m.dit, *m.arena, ref_c, ref_u, schedule, g, req.sampler, latents, stream, on_step);
+      sampler_options.seed = r.seed;
+      r.steps_run = denoise(*m.dit, *m.arena, ref_c, ref_u, schedule, g, req.sampler, sampler_options, latents, stream, on_step);
     } catch (const moss_dit::Cancelled&) {
       // Inside a step's forward, before its update: the latents are those after the last finished step.
       r.cancelled = true;
@@ -963,7 +1454,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   // 4. VAE decode (P:428-438) to RGB8: untiled when it fits the arena next to the resident models, else tiled, with the
   // same bytes either way (decode_mode). Not after a cancel, even one seen at the last step.
   if (req.decode && !r.cancelled && keep_going(Phase::kDecode)) {
-    m.ensure_vae(b, plan.vae.stack_bytes, plan.dit.park_for_decode, tm);
+    m.ensure_vae(vs, plan.vae.stack_bytes, plan.dit.park_for_decode, tm);
     runtime::StackScope phase(*m.arena);
     const Tensor latents = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, h, w});
     MI_CUDA_CHECK(cudaMemcpyAsync(latents.data, r.latents.data(), latents.nbytes(), cudaMemcpyHostToDevice, stream));

@@ -1,11 +1,15 @@
-// fp32 single-head attention for the VAE mid-block (head dim 384) and the surrounding mid_attention block.
+// fp32 single-head attention for the VAE mid-block (head dim D = 384: the small FLUX.2 decoder; D = 512: the full
+// decoder and the encoder) and the surrounding mid_attention block. API: kernels/vae/attention.h.
 //
 // Flash-style kernel: a CTA owns 64 query rows and walks the keys in blocks of 64 with an online softmax, so
-// the L x L score matrix never exists. head_dim 384 in fp32 is too wide to keep Q (or a 64 x 384 K/V tile)
+// the L x L score matrix never exists. A head dim of 384-512 in fp32 is too wide to keep Q (or a 64 x D K/V tile)
 // resident next to the pipeline buffers, so every operand streams through one 3-buffer cp.async ring:
-// per key block, 8 "S stages" (Q and K columns [48i, 48i+48)) build S = Q K^T, then 4 "V stages" (16 keys x
-// 384) accumulate O += P V. 8 warps: for S, warp w computes rows 16(w%4).. x keys 32(w/4)..; for O, warp w
-// owns rows 32(w%2).. x columns 96(w/2).. (96 fp32 accumulators per thread). Row max/alpha/P meet in smem.
+// per key block, D / kDk "S stages" (Q and K columns [kDk i, kDk (i+1))) build S = Q K^T, then 64 / kVKeys "V stages"
+// (kVKeys keys x D) accumulate O += P V. 8 warps: for S, warp w computes rows 16(w%4).. x keys 32(w/4)..; for O,
+// warp w owns rows 32(w%2).. x columns (D/4)(w/2).. (D/4 fp32 accumulators per thread). Row max/alpha/P meet in smem.
+// Tiling per head dim (Traits<D>): D = 384 takes 48 d-columns per S stage and 16 keys per V stage (the original
+// kernel's tiling, kept bit for bit); D = 512 takes 32 and 8, so three ring buffers plus P fit sm_89's opt-in shared
+// memory (74.5 KB). The finer stages only change how the fp32-accurate partial sums are folded.
 // Math: TF32 m16n8k8 mma.sync; kTf32x3 splits each operand into big + small TF32 parts and accumulates
 // small*big + big*small + big*big (the 3xTF32 scheme behind CUTLASS OpMultiplyAddFastF32, which the
 // reference SDPA uses for fp32). Tensor-core accumulation truncates, so S and O are accumulated per stage in
@@ -18,28 +22,47 @@
 #include <string>
 
 #include "core/cuda_check.h"
-#include "kernels/vae/vae_kernels.h"
+#include "kernels/vae/attention.h"
 
 namespace mi::vae {
 namespace {
 
-constexpr int kD = 384;
 constexpr int kBr = 64, kBc = 64, kWarps = 8, kThreads = kWarps * 32;
-constexpr int kDk = 48;                        // d columns per S stage
-constexpr int kSStages = kD / kDk;             // 8
-constexpr int kVKeys = 16;                     // keys per V stage
-constexpr int kVStages = kBc / kVKeys;         // 4
-constexpr int kStagesPerBlock = kSStages + kVStages;
-constexpr int kQkStride = kDk + 4;             // 52 = 20 mod 32 banks: A/B fragment loads conflict-free
-constexpr int kVStride = kD + 8;               // 392 = 8 mod 32: B fragment (k = t, n = g) loads conflict-free
-constexpr int kPStride = kBc + 4;              // 68 = 4 mod 32
-constexpr int kBufFloats = 2 * kBr * kQkStride;  // 6656 >= kVKeys * kVStride (6272)
+constexpr int kPStride = kBc + 4;  // 68 = 4 mod 32
 constexpr int kBufs = 3;
-constexpr int kSmemFloats = kBufs * kBufFloats + kBr * kPStride + 2 * kBr /*redmax*/ + 2 * kBr /*m*/ + kBr /*alpha*/ +
-                            2 * kBr /*lsum*/;
-constexpr int kSmemBytes = kSmemFloats * 4;
-static_assert(kVKeys * kVStride <= kBufFloats, "V stage must fit a ring buffer");
-static_assert(kSmemBytes <= 101376, "exceeds sm_89 opt-in shared memory");
+
+template <int D>
+struct Traits;
+template <>
+struct Traits<384> {
+  static constexpr int kDk = 48, kVKeys = 16;  // the shared kernel's tiling
+};
+template <>
+struct Traits<512> {
+  static constexpr int kDk = 32, kVKeys = 8;
+};
+
+template <int D>
+struct Cfg {
+  static constexpr int kD = D;
+  static constexpr int kDk = Traits<D>::kDk;        // d columns per S stage
+  static constexpr int kSStages = kD / kDk;
+  static constexpr int kVKeys = Traits<D>::kVKeys;  // keys per V stage
+  static constexpr int kVStages = kBc / kVKeys;
+  static constexpr int kStagesPerBlock = kSStages + kVStages;
+  static constexpr int kQkStride = kDk + 4;  // 52 / 36: g * stride + t hits 32 distinct banks (A/B fragment loads)
+  static constexpr int kVStride = kD + 8;    // 392 / 520 = 8 mod 32: B fragment (k = t, n = g) loads conflict-free
+  static constexpr int kBufFloats =
+      2 * kBr * kQkStride > kVKeys * kVStride ? 2 * kBr * kQkStride : kVKeys * kVStride;
+  static constexpr int kSmemFloats = kBufs * kBufFloats + kBr * kPStride + 2 * kBr /*redmax*/ + 2 * kBr /*m*/ +
+                                     kBr /*alpha*/ + 2 * kBr /*lsum*/;
+  static constexpr int kSmemBytes = kSmemFloats * 4;
+  static constexpr int kOCols = kD / 4;    // O columns per warp
+  static constexpr int kONj = kOCols / 8;  // m16n8 tiles per warp row block
+  static_assert(kD % kDk == 0 && kDk % 8 == 0 && kBc % kVKeys == 0 && kVKeys % 8 == 0, "tiling");
+  static_assert(kSmemBytes <= 101376, "exceeds sm_89 opt-in shared memory");
+};
+static_assert(Cfg<384>::kBufFloats == 6656 && Cfg<384>::kSmemBytes == 99072, "384 must keep the shared kernel's layout");
 
 __device__ __forceinline__ std::uint32_t to_tf32(float x) {
   std::uint32_t r;
@@ -84,16 +107,19 @@ struct AttnArgs {
   const float* v;
   float* o;
   std::int64_t q_batch, k_batch, v_batch, o_batch;  // element strides between batches
-  std::int64_t q_ld, k_ld, v_ld;                    // row strides (o is contiguous, ld 384)
+  std::int64_t q_ld, k_ld, v_ld;                    // row strides (o is contiguous, ld D)
   int len;
   float scale_log2;  // scale * log2(e)
 };
 
+template <class C>
 __device__ __forceinline__ void load_stage(const AttnArgs& a, float* buf, int stage, int q0, const float* qb,
                                            const float* kb_, const float* vb) {
+  constexpr int kD = C::kD, kDk = C::kDk, kSStages = C::kSStages, kVKeys = C::kVKeys, kQkStride = C::kQkStride,
+                kVStride = C::kVStride, kStagesPerBlock = C::kStagesPerBlock;
   const int kb = stage / kStagesPerBlock, i = stage % kStagesPerBlock;
   if (i < kSStages) {
-    // Q rows q0.., K rows kb*64.., columns [48i, 48i+48): 2 x 64 rows x 12 vectors.
+    // Q rows q0.., K rows kb*64.., columns [kDk i, kDk (i+1)): 2 x 64 rows x kDk/4 vectors.
     for (int vidx = threadIdx.x; vidx < 2 * kBr * (kDk / 4); vidx += kThreads) {
       const int which = vidx / (kBr * (kDk / 4));
       const int r = (vidx / (kDk / 4)) % kBr, c4 = vidx % (kDk / 4);
@@ -116,8 +142,11 @@ __device__ __forceinline__ void load_stage(const AttnArgs& a, float* buf, int st
   }
 }
 
-template <bool kSplit>
+template <class C, bool kSplit>
 __global__ void __launch_bounds__(kThreads, 1) attention_kernel(AttnArgs a) {
+  constexpr int kD = C::kD, kDk = C::kDk, kSStages = C::kSStages, kVKeys = C::kVKeys, kQkStride = C::kQkStride,
+                kVStride = C::kVStride, kStagesPerBlock = C::kStagesPerBlock, kBufFloats = C::kBufFloats,
+                kONj = C::kONj;
   extern __shared__ float smem[];
   float* bufs = smem;
   float* p_sm = bufs + kBufs * kBufFloats;
@@ -137,15 +166,15 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(AttnArgs a) {
   // S roles
   const int s_row = 16 * (warp % 4), s_col = 32 * (warp / 4), s_half = warp / 4;
   // O roles
-  const int o_row = 32 * (warp % 2), o_col = 96 * (warp / 2);
+  const int o_row = 32 * (warp % 2), o_col = C::kOCols * (warp / 2);
 
   for (int i = threadIdx.x; i < kBr; i += kThreads) m_sm[i] = -INFINITY;
 
-  float o_acc[2][12][4];
+  float o_acc[2][kONj][4];
 #pragma unroll
   for (int mi = 0; mi < 2; ++mi)
 #pragma unroll
-    for (int nj = 0; nj < 12; ++nj)
+    for (int nj = 0; nj < kONj; ++nj)
 #pragma unroll
       for (int e = 0; e < 4; ++e) o_acc[mi][nj][e] = 0.0f;
   float s_acc[4][4];
@@ -154,15 +183,15 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(AttnArgs a) {
   const int num_kb = (a.len + kBc - 1) / kBc;
   const int total = num_kb * kStagesPerBlock;
 
-  load_stage(a, bufs, 0, q0, qb, kbp, vb);
+  load_stage<C>(a, bufs, 0, q0, qb, kbp, vb);
   cp_async_commit();
-  if (total > 1) load_stage(a, bufs + kBufFloats, 1, q0, qb, kbp, vb);
+  if (total > 1) load_stage<C>(a, bufs + kBufFloats, 1, q0, qb, kbp, vb);
   cp_async_commit();
 
   for (int stage = 0; stage < total; ++stage) {
     cp_async_wait<1>();
     __syncthreads();  // stage landed for all threads; buffer (stage + 2) % 3 is no longer read
-    if (stage + 2 < total) load_stage(a, bufs + ((stage + 2) % kBufs) * kBufFloats, stage + 2, q0, qb, kbp, vb);
+    if (stage + 2 < total) load_stage<C>(a, bufs + ((stage + 2) % kBufs) * kBufFloats, stage + 2, q0, qb, kbp, vb);
     cp_async_commit();
 
     const float* buf = bufs + (stage % kBufs) * kBufFloats;
@@ -259,7 +288,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(AttnArgs a) {
           for (int h = 0; h < 2; ++h) {
             const float alpha = alpha_sm[o_row + 16 * mi + g + 8 * h];
 #pragma unroll
-            for (int nj = 0; nj < 12; ++nj) {
+            for (int nj = 0; nj < kONj; ++nj) {
               o_acc[mi][nj][2 * h] *= alpha;
               o_acc[mi][nj][2 * h + 1] *= alpha;
             }
@@ -281,7 +310,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(AttnArgs a) {
           split<kSplit>(pa[8 * kPStride + 4], ab[kk][mi][3], as[kk][mi][3]);
         }
 #pragma unroll
-      for (int nj = 0; nj < 12; ++nj) {
+      for (int nj = 0; nj < kONj; ++nj) {
         std::uint32_t bb[kVKeys / 8][2], bs[kVKeys / 8][2];
 #pragma unroll
         for (int kk = 0; kk < kVKeys / 8; ++kk) {
@@ -325,7 +354,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_kernel(AttnArgs a) {
       const float inv = 1.0f / (lsum[row] + lsum[kBr + row]);
       float* orow = ob + static_cast<std::int64_t>(q) * kD + o_col + 2 * t;
 #pragma unroll
-      for (int nj = 0; nj < 12; ++nj)
+      for (int nj = 0; nj < kONj; ++nj)
         *reinterpret_cast<float2*>(orow + 8 * nj) = make_float2(o_acc[mi][nj][2 * h] * inv, o_acc[mi][nj][2 * h + 1] * inv);
     }
 }
@@ -394,21 +423,54 @@ constexpr std::size_t kLtWorkspace = std::size_t{8} << 20;
 constexpr std::size_t kAlign = 256;
 std::size_t align_up(std::size_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 
+template <int D>
+void launch(const AttnArgs& a, dim3 grid, AttnPrecision precision, cudaStream_t stream) {
+  constexpr int smem = Cfg<D>::kSmemBytes;
+  if (precision == AttnPrecision::kTf32x3) {
+    MI_CUDA_CHECK(cudaFuncSetAttribute(attention_kernel<Cfg<D>, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    attention_kernel<Cfg<D>, true><<<grid, kThreads, smem, stream>>>(a);
+  } else {
+    MI_CUDA_CHECK(cudaFuncSetAttribute(attention_kernel<Cfg<D>, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    attention_kernel<Cfg<D>, false><<<grid, kThreads, smem, stream>>>(a);
+  }
+  MI_CUDA_CHECK_LAUNCH();
+}
+
+struct MidLayout {
+  std::size_t xn, qkv, gn, lt, total;
+};
+
+MidLayout mid_layout(const Tensor& x) {
+  const std::size_t tokens = static_cast<std::size_t>(x.dim(0) * x.dim(1) * x.dim(2));
+  const std::size_t d = static_cast<std::size_t>(x.dim(3));
+  MidLayout l{};
+  l.xn = 0;
+  l.qkv = align_up(tokens * d * sizeof(float));
+  l.gn = l.qkv + align_up(tokens * 3 * d * sizeof(float));
+  l.lt = l.gn + align_up(group_norm_workspace_bytes(x, kGroupNormGroups));
+  l.total = l.lt + kLtWorkspace;
+  return l;
+}
+
 }  // namespace
+
+bool attention_head_dim_supported(std::int64_t d) { return d == 384 || d == 512; }
 
 void attention_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& o, float scale,
                     AttnPrecision precision, cudaStream_t stream) {
+  const std::int64_t d = q.rank == 3 ? q.dim(2) : 0;
+  require(attention_head_dim_supported(d), "attention_fp32: head dim must be 384 or 512, got " + q.describe());
   for (const Tensor* t : {&q, &k, &v, &o}) {
-    require(t->rank == 3 && t->dtype == DType::kF32 && t->device == Device::kCUDA && t->dim(2) == kD && t->stride[2] == 1,
-            "attention_fp32: q/k/v/o must be f32 CUDA [B, L, 384] with unit inner stride, got " + t->describe());
+    require(t->rank == 3 && t->dtype == DType::kF32 && t->device == Device::kCUDA && t->dim(2) == d && t->stride[2] == 1,
+            "attention_fp32: q/k/v/o must be f32 CUDA [B, L, D] with unit inner stride, got " + t->describe());
     require(t->dim(0) == q.dim(0) && t->dim(1) == q.dim(1), "attention_fp32: q/k/v/o shapes differ");
     require(aligned16(t->data) && t->stride[1] % 4 == 0 && (t->dim(0) == 1 || t->stride[0] % 4 == 0),
             "attention_fp32: base pointers and strides must be 16-byte aligned");
   }
-  require(o.stride[1] == kD, "attention_fp32: o rows must be contiguous");
+  require(o.stride[1] == d, "attention_fp32: o rows must be contiguous");
   for (const Tensor* t : {&q, &k, &v}) {
     const auto* lo = static_cast<const char*>(t->data);
-    const auto* hi = lo + (t->dim(0) - 1) * t->stride[0] * 4 + (t->dim(1) - 1) * t->stride[1] * 4 + kD * 4;
+    const auto* hi = lo + (t->dim(0) - 1) * t->stride[0] * 4 + (t->dim(1) - 1) * t->stride[1] * 4 + d * 4;
     const auto* olo = static_cast<const char*>(o.data);
     require(hi <= olo || olo + o.nbytes() <= lo, "attention_fp32: o must not overlap q/k/v");
   }
@@ -418,45 +480,24 @@ void attention_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
   AttnArgs a{q.ptr<float>(), k.ptr<float>(), v.ptr<float>(), o.ptr<float>(), q.stride[0], k.stride[0], v.stride[0],
              o.stride[0], q.stride[1], k.stride[1], v.stride[1], len, scale * 1.4426950408889634f};
   const dim3 grid(static_cast<unsigned>((len + kBr - 1) / kBr), static_cast<unsigned>(q.dim(0)));
-  if (precision == AttnPrecision::kTf32x3) {
-    MI_CUDA_CHECK(cudaFuncSetAttribute(attention_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-    attention_kernel<true><<<grid, kThreads, kSmemBytes, stream>>>(a);
-  } else {
-    MI_CUDA_CHECK(cudaFuncSetAttribute(attention_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-    attention_kernel<false><<<grid, kThreads, kSmemBytes, stream>>>(a);
-  }
-  MI_CUDA_CHECK_LAUNCH();
+  if (d == 512)
+    launch<512>(a, grid, precision, stream);
+  else
+    launch<384>(a, grid, precision, stream);
 }
-
-namespace {
-
-struct MidLayout {
-  std::size_t xn, qkv, gn, lt, total;
-};
-
-MidLayout mid_layout(const Tensor& x) {
-  const std::size_t tokens = static_cast<std::size_t>(x.dim(0) * x.dim(1) * x.dim(2));
-  MidLayout l{};
-  l.xn = 0;
-  l.qkv = align_up(tokens * kD * sizeof(float));
-  l.gn = l.qkv + align_up(tokens * 3 * kD * sizeof(float));
-  l.lt = l.gn + align_up(group_norm_workspace_bytes(x, kGroupNormGroups));
-  l.total = l.lt + kLtWorkspace;
-  return l;
-}
-
-}  // namespace
 
 std::size_t mid_attention_workspace_bytes(const Tensor& x) {
-  require(x.rank == 4 && x.dim(3) == kD, "mid_attention: x must be [B,H,W,384]");
+  require(x.rank == 4 && attention_head_dim_supported(x.dim(3)), "mid_attention: x must be [B,H,W,384] or [B,H,W,512]");
   return mid_layout(x).total;
 }
 
 void mid_attention(cublasLtHandle_t lt, const Tensor& x, const MidAttentionWeights& w, const Tensor* residual,
                    const Tensor& y, void* workspace, std::size_t workspace_bytes, AttnPrecision precision,
                    bool fast_linears, cudaStream_t stream) {
-  require(x.rank == 4 && x.dim(3) == kD && x.dtype == DType::kF32 && x.device == Device::kCUDA && x.is_contiguous(),
-          "mid_attention: x must be contiguous f32 CUDA [B,H,W,384], got " + x.describe());
+  require(x.rank == 4 && attention_head_dim_supported(x.dim(3)) && x.dtype == DType::kF32 && x.device == Device::kCUDA &&
+              x.is_contiguous(),
+          "mid_attention: x must be contiguous f32 CUDA [B,H,W,384] or [B,H,W,512], got " + x.describe());
+  const std::int64_t dim = x.dim(3);
   require(y.dtype == DType::kF32 && y.numel() == x.numel() && y.is_contiguous() && y.device == Device::kCUDA,
           "mid_attention: y must match x");
   if (residual)
@@ -464,9 +505,9 @@ void mid_attention(cublasLtHandle_t lt, const Tensor& x, const MidAttentionWeigh
             "mid_attention: residual must match x");
   const Tensor* mats[] = {&w.wq, &w.wk, &w.wv, &w.wo};
   for (const Tensor* m : mats)
-    require(m->dtype == DType::kF32 && m->numel() == kD * kD && m->is_contiguous(), "mid_attention: weights must be f32 [384,384]");
+    require(m->dtype == DType::kF32 && m->numel() == dim * dim && m->is_contiguous(), "mid_attention: weights must be f32 [D, D]");
   const Tensor* vecs[] = {&w.bq, &w.bk, &w.bv, &w.bo, &w.gn_gamma, &w.gn_beta};
-  for (const Tensor* m : vecs) require(m->dtype == DType::kF32 && m->numel() == kD, "mid_attention: biases/affine must be f32 [384]");
+  for (const Tensor* m : vecs) require(m->dtype == DType::kF32 && m->numel() == dim, "mid_attention: biases/affine must be f32 [D]");
   const MidLayout l = mid_layout(x);
   require(workspace_bytes >= l.total && aligned16(workspace), "mid_attention: workspace too small or not 16-byte aligned");
 
@@ -474,35 +515,36 @@ void mid_attention(cublasLtHandle_t lt, const Tensor& x, const MidAttentionWeigh
   char* ws = static_cast<char*>(workspace);
   auto* xn = reinterpret_cast<float*>(ws + l.xn);
   auto* qkv = reinterpret_cast<float*>(ws + l.qkv);
-  Tensor xn_t = Tensor::view(xn, DType::kF32, Device::kCUDA, {x.dim(0), x.dim(1), x.dim(2), kD});
+  Tensor xn_t = Tensor::view(xn, DType::kF32, Device::kCUDA, {x.dim(0), x.dim(1), x.dim(2), dim});
 
   group_norm(x, kGroupNormGroups, kResnetEps, w.gn_gamma, w.gn_beta, /*silu=*/false, xn_t, ws + l.gn, l.lt - l.gn, stream);
   const Tensor* proj_w[] = {&w.wq, &w.wk, &w.wv};
   const Tensor* proj_b[] = {&w.bq, &w.bk, &w.bv};
   for (int p = 0; p < 3; ++p)
-    linear(lt, xn, kD, proj_w[p]->ptr<float>(), proj_b[p]->ptr<float>(), nullptr, 0, qkv + p * kD, 3 * kD, tokens, kD, kD,
+    linear(lt, xn, dim, proj_w[p]->ptr<float>(), proj_b[p]->ptr<float>(), nullptr, 0, qkv + p * dim, 3 * dim, tokens, dim, dim,
            fast_linears, ws + l.lt, kLtWorkspace, stream);
 
   auto qkv_view = [&](int p) {
-    Tensor t = Tensor::view(qkv + p * kD, DType::kF32, Device::kCUDA, {batch, len, kD});
-    t.stride[1] = 3 * kD;
-    t.stride[0] = len * 3 * kD;
+    Tensor t = Tensor::view(qkv + p * dim, DType::kF32, Device::kCUDA, {batch, len, dim});
+    t.stride[1] = 3 * dim;
+    t.stride[0] = len * 3 * dim;
     return t;
   };
-  Tensor o = Tensor::view(xn, DType::kF32, Device::kCUDA, {batch, len, kD});  // GN output is dead after the projections
-  // Known theoretical 1-ulp risk: SDPA's default scale is 1/sqrt(E) formed in double and rounded to fp32; this
-  // fp32 expression is not guaranteed to round to the same float for every E (for E = 512 both give 0x3d3504f3).
-  attention_fp32(qkv_view(0), qkv_view(1), qkv_view(2), o, 1.0f / std::sqrt(static_cast<float>(kD)), precision, stream);
+  Tensor o = Tensor::view(xn, DType::kF32, Device::kCUDA, {batch, len, dim});  // GN output is dead after the projections
+  // SDPA's default scale is 1/sqrt(E) formed in double and rounded to fp32. This fp32 expression gives the same float
+  // for E = 512 (0x3d3504f3) but 1 ulp less for E = 384 (0x3d5105eb vs 0x3d5105ec); kept, the small decoder's outputs
+  // are pinned to it (the attention is fp32-accurate, not bit-identical to SDPA, either way).
+  attention_fp32(qkv_view(0), qkv_view(1), qkv_view(2), o, 1.0f / std::sqrt(static_cast<float>(dim)), precision, stream);
   if (!residual) {
-    linear(lt, xn, kD, w.wo.ptr<float>(), w.bo.ptr<float>(), nullptr, 0, y.ptr<float>(), kD, tokens, kD, kD, fast_linears,
+    linear(lt, xn, dim, w.wo.ptr<float>(), w.bo.ptr<float>(), nullptr, 0, y.ptr<float>(), dim, tokens, dim, dim, fast_linears,
            ws + l.lt, kLtWorkspace, stream);
     return;
   }
   // Reference order: round(to_out(o) + bias), then + residual. cuBLASLt's epilogue would add C before the bias,
   // so the GEMM writes into the (now free) QKV scratch and residual_add rounds the sum; y may alias the residual.
-  linear(lt, xn, kD, w.wo.ptr<float>(), w.bo.ptr<float>(), nullptr, 0, qkv, kD, tokens, kD, kD, fast_linears, ws + l.lt,
+  linear(lt, xn, dim, w.wo.ptr<float>(), w.bo.ptr<float>(), nullptr, 0, qkv, dim, tokens, dim, dim, fast_linears, ws + l.lt,
          kLtWorkspace, stream);
-  residual_add(Tensor::view(qkv, DType::kF32, Device::kCUDA, {x.dim(0), x.dim(1), x.dim(2), kD}), *residual, y, stream);
+  residual_add(Tensor::view(qkv, DType::kF32, Device::kCUDA, {x.dim(0), x.dim(1), x.dim(2), dim}), *residual, y, stream);
 }
 
 }  // namespace mi::vae

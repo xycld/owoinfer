@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -22,9 +23,12 @@
 #include "kernels/basic/norm.h"
 #include "kernels/basic/rope.h"
 #include "kernels/gdn/gdn.h"
+#include "kernels/quant/quant.h"
+#include "kernels/quant/w4a8_decode.h"
 #include "runtime/pinned_ring.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
+#include "weights/quant/quant_codec.h"
 #include "weights/upload.h"
 
 namespace mi::qwen35_text {
@@ -94,7 +98,41 @@ struct Layer {
   std::string prefix;  // tensor name prefix, e.g. "language_model.layers.3."
 };
 
-Layer validate_layer(const weights::ModelIndex& index, int i) {
+// Tensor `name` of group g, with its dtype and shape.
+void check_group_tensor(const weights::WeightGroup& g, const std::string& name, std::initializer_list<weights::DType> dtypes,
+                        const std::vector<std::int64_t>& shape) {
+  const weights::IndexedTensor& t = find_tensor(g, name);
+  if (std::find(dtypes.begin(), dtypes.end(), t.dtype) == dtypes.end() || t.shape != shape) {
+    std::string want;
+    for (auto d : shape) want += (want.empty() ? "" : ", ") + std::to_string(d);
+    fail("tensor " + name + " must be " + weights::dtype_name(*dtypes.begin()) + " [" + want + "]");
+  }
+}
+
+// Checks the tensors a quantized layer's linear `module` (of the bf16 shape [n, k]) contributes; returns their count.
+std::size_t check_quant_linear(const weights::WeightGroup& g, const std::string& module, const LinearInfo& info,
+                               const std::vector<std::int64_t>& shape) {
+  using weights::DType;
+  if (shape != std::vector<std::int64_t>{info.n, info.k}) fail("linear " + module + " has an unexpected shape");
+  switch (info.kind) {
+    case LinearInfo::Kind::kBF16:
+      check_group_tensor(g, module + ".weight", {DType::kBF16}, shape);
+      return 1;
+    case LinearInfo::Kind::kInt8:
+      check_group_tensor(g, module + ".weight", {DType::kI8}, shape);
+      check_group_tensor(g, module + ".weight_scale", {DType::kF32}, {info.n});
+      return 2;
+    case LinearInfo::Kind::kGrouped:
+      check_group_tensor(g, module + ".weight", {DType::kI8, DType::kU8}, {info.n, info.k * info.bits / 8});
+      check_group_tensor(g, module + ".weight_s_rel", {DType::kF8E4M3, DType::kU8}, {info.n, info.k / info.group});
+      check_group_tensor(g, module + ".weight_s_channel", {DType::kF32}, {info.n});
+      if (info.codebook) check_group_tensor(g, module + ".weight_codebook", {DType::kF32}, {16});
+      return info.codebook ? 4 : 3;
+  }
+  return 0;
+}
+
+Layer validate_layer(const weights::ModelIndex& index, int i, const QuantTextModel* qm = nullptr) {
   Layer l;
   l.group = index.find_group(Component::kTextEncoder, "layers." + std::to_string(i));
   if (l.group == nullptr) fail("bundle index has no text_encoder group layers." + std::to_string(i));
@@ -112,10 +150,29 @@ Layer validate_layer(const weights::ModelIndex& index, int i) {
   }
   if (l.prefix.empty()) fail("layers." + std::to_string(i) + " has no input_layernorm.weight");
   const auto& mixer = l.full_attention ? kFullAttnSpecs : kLinearAttnSpecs;
+  std::size_t expected = 0, converted = 0;
   for (const auto* specs : {&kCommonSpecs, &mixer}) {
-    for (const auto& s : *specs) check_tensor(find_tensor(*l.group, l.prefix + s.name), s.shape);
+    for (const auto& s : *specs) {
+      const std::string name = l.prefix + s.name;
+      const std::string module = name.size() > 7 ? name.substr(0, name.size() - 7) : std::string();
+      const LinearInfo* info = qm != nullptr && name.ends_with(".weight") ? qm->find_linear(module) : nullptr;
+      if (info != nullptr) {
+        expected += check_quant_linear(*l.group, module, *info, s.shape);
+      } else if (qm != nullptr && qm->bf16_tensors().count(name) != 0) {
+        if (qm->bf16_shape(name) != s.shape) fail("tensor " + name + " has an unexpected shape");
+        ++converted;
+      } else {
+        check_tensor(find_tensor(*l.group, name), s.shape);
+        ++expected;
+      }
+    }
   }
-  const std::size_t expected = kCommonSpecs.size() + mixer.size();
+  if (qm != nullptr) {
+    // Every F32 tensor of the layer the model converted must be one the layer reads.
+    std::size_t f32 = 0;
+    for (const auto& [name, v] : qm->bf16_tensors()) f32 += name.starts_with(l.prefix);
+    if (f32 != converted) fail("layers." + std::to_string(i) + " has unexpected F32 tensors");
+  }
   if (l.group->tensors.size() != expected) {
     fail("layers." + std::to_string(i) + " has " + std::to_string(l.group->tensors.size()) + " tensors, expected " +
          std::to_string(expected));
@@ -244,11 +301,37 @@ float elapsed_ms(cudaEvent_t a, cudaEvent_t b) {
 // driver). cudaErrorNotReady is the expected answer; real errors surface at the next checked call.
 void flush(cudaStream_t s) { static_cast<void>(cudaStreamQuery(s)); }
 
+// Bytes of the device buffer holding a quantized model's bf16-rounded F32 parameters, each at an arena alignment.
+std::size_t aux_bytes(const QuantTextModel* qm) {
+  std::size_t total = 0;
+  if (qm != nullptr) {
+    for (const auto& [name, v] : qm->bf16_tensors()) total += runtime::align_up(v.size() * sizeof(std::uint16_t));
+  }
+  return total;
+}
+
+bool quantized(const QuantTextModel* qm) { return qm != nullptr && qm->precision() != Precision::kBF16; }
+
+// encode()'s quantized-model scratch over t tokens, in its allocation order: the F32 parameters, the per-token INT8
+// activations (widest input: down_proj's 12288) and their scales, the W4A8 decode buffer and its flag.
+std::size_t quant_scratch_bytes(const QuantTextModel* qm, std::int64_t t) {
+  using runtime::align_up;
+  std::size_t total = aux_bytes(qm);
+  if (quantized(qm)) total += align_up(static_cast<std::size_t>(t * kIntermediate)) + align_up(static_cast<std::size_t>(t) * sizeof(float));
+  if (qm != nullptr && qm->max_grouped_elems() > 0) {
+    total += align_up(static_cast<std::size_t>(qm->max_grouped_elems())) + align_up(sizeof(unsigned));
+  }
+  return total;
+}
+
+std::size_t workspace_bytes_impl(const weights::ModelIndex& index, const QuantTextModel* qm,
+                                 std::span<const std::int64_t> lengths, const EncoderOptions& options);
+
 }  // namespace
 
 struct TextEncoder::Impl {
-  Impl(const weights::ModelIndex& idx, runtime::DeviceArena& a, cudaStream_t s, EncoderOptions o)
-      : index(idx), arena(a), stream(s), opts(o), readers(idx, o.direct_io) {}
+  Impl(const weights::ModelIndex& idx, runtime::DeviceArena& a, cudaStream_t s, EncoderOptions o, const QuantTextModel* q)
+      : index(idx), arena(a), stream(s), opts(o), readers(idx, o.direct_io), qm(q) {}
   ~Impl();
 
   // Streaming: one per reader thread.
@@ -281,6 +364,18 @@ struct TextEncoder::Impl {
   std::size_t weight_bytes = 0;
   EncodeStats stats;
   void* gemm_ws = nullptr;  // valid during encode()
+  // Quantized models (null for the bf16 bundle).
+  const QuantTextModel* qm = nullptr;
+  std::vector<weights::TensorMap> aux;  // per layer: the bf16-rounded F32 parameters, valid during encode()
+  // Valid during encode() of a quantized model: the per-token INT8 activations of the current site (xq_src is the bf16
+  // tensor they were made from, xq_k its width), the W4A8 decode buffer and the invalid-group-scale flag.
+  std::int8_t* xq = nullptr;
+  float* xs = nullptr;
+  const void* xq_src = nullptr;
+  std::int64_t xq_k = 0;
+  std::int8_t* decode_buf = nullptr;
+  unsigned* invalid = nullptr;
+  const EncodeOptions* hooks = nullptr;  // the running encode()'s options (linear / decode hooks)
 
   // Row-count-dependent ops run per sequence, so every row is computed exactly as in the reference's
   // single-prompt forward (and as when the sequence is encoded alone): cuBLASLt picks its algorithm (tiles,
@@ -289,6 +384,56 @@ struct TextEncoder::Impl {
     b.for_each_sequence([&](std::int64_t s, std::int64_t e) {
       gemm.linear(out.slice0(s, e), x.slice0(s, e), w, nullptr, gemm_ws, kernels::Gemm::kWorkspaceBytes, stream);
     });
+  }
+
+  // Rotates and quantizes x (bf16 [T, K]) per token for the quantized linears that read it next (no-op for bf16).
+  void quantize_input(const Batch& b, const Tensor& x) {
+    if (!quantized(qm)) return;
+    kernels::quant::rotate_quantize(x.ptr<__nv_bfloat16>(), x.stride[0], xq, x.dim(1), xs, b.tokens,
+                                    static_cast<int>(x.dim(1)), stream);
+    xq_src = x.data;
+    xq_k = x.dim(1);
+  }
+
+  // out = x . W^T for the linear `module` as stored: bf16 per sequence, or INT8 over all tokens from the activations
+  // quantize_input(x) made (grouped weights decoded first).
+  void lin(const Batch& b, const Tensor& out, const Tensor& x, const weights::TensorMap& w, const std::string& module) {
+    const LinearInfo* info = qm != nullptr ? qm->find_linear(module) : nullptr;
+    if (info == nullptr || info->kind == LinearInfo::Kind::kBF16) {
+      linear(b, out, x, w.at(module + ".weight"));
+      if (hooks != nullptr && hooks->linear_hook) hooks->linear_hook(module, out, stream);
+      return;
+    }
+    if (xq_src != x.data || xq_k != x.dim(1)) fail("internal: " + module + " input was not quantized");
+    kernels::quant::Int8Operands op;
+    op.x_q = xq;
+    op.ldx = xq_k;
+    op.x_scale = xs;
+    op.m = b.tokens;
+    op.n = info->n;
+    op.k = info->k;
+    if (info->kind == LinearInfo::Kind::kInt8) {
+      op.w = w.at(module + ".weight").ptr<std::int8_t>();
+      op.w_scale = w.at(module + ".weight_scale").ptr<float>();
+    } else {
+      kernels::quant::GroupedCodes c;
+      c.packed = static_cast<const std::uint8_t*>(w.at(module + ".weight").data);
+      auto* s_rel = static_cast<std::uint8_t*>(w.at(module + ".weight_s_rel").data);
+      c.s_rel = s_rel;
+      c.codebook = info->codebook ? w.at(module + ".weight_codebook").ptr<float>() : nullptr;
+      c.n = info->n;
+      c.k = info->k;
+      c.bits = info->bits;
+      c.group = info->group;
+      if (hooks != nullptr && hooks->decode_hook) {
+        hooks->decode_hook(module, s_rel, c.n * (c.k / c.group), stream);
+      }
+      kernels::quant::decode_grouped_int8(c, decode_buf, invalid, stream);
+      op.w = decode_buf;
+      op.w_scale = w.at(module + ".weight_s_channel").ptr<float>();
+    }
+    kernels::quant::int8_gemm(op, nullptr, out.ptr<__nv_bfloat16>(), out.stride[0], stream);
+    if (hooks != nullptr && hooks->linear_hook) hooks->linear_hook(module, out, stream);
   }
 
   void norm(const Batch& b, const Tensor& x, const Tensor& w, const Tensor& out) {
@@ -306,10 +451,34 @@ struct TextEncoder::Impl {
   void gather_embeddings(const std::vector<std::vector<std::int32_t>>& seqs, const Tensor& x) {
     constexpr std::size_t kRowBytes = kHidden * sizeof(std::uint16_t);
     std::vector<std::byte> host(static_cast<std::size_t>(x.nbytes()));
-    std::size_t row = 0;
-    for (const auto& s : seqs) {
-      for (std::int32_t id : s) {
-        std::memcpy(host.data() + row++ * kRowBytes, embed_rows + static_cast<std::size_t>(id) * kRowBytes, kRowBytes);
+    if (qm != nullptr) {
+      // Quantized table: each distinct id decoded once (reads of a few KB each, spread over threads).
+      std::vector<std::int64_t> ids;
+      for (const auto& s : seqs) ids.insert(ids.end(), s.begin(), s.end());
+      std::vector<std::int64_t> uniq = ids;
+      std::sort(uniq.begin(), uniq.end());
+      uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+      std::vector<std::uint16_t> rows(uniq.size() * kHidden);
+      constexpr std::int64_t kRowsPerTask = 64;
+      const auto tasks = static_cast<std::int64_t>((uniq.size() + kRowsPerTask - 1) / kRowsPerTask);
+      quant::parallel_for(tasks, std::min(opts.reader_threads * 2, 16), [&](std::int64_t tb, std::int64_t te) {
+        for (std::int64_t t = tb; t < te; ++t) {
+          const auto r0 = static_cast<std::size_t>(t * kRowsPerTask);
+          const std::size_t nr = std::min<std::size_t>(kRowsPerTask, uniq.size() - r0);
+          quant::gather_embedding_rows_bf16(qm->model(), qm->embed_tokens(), std::span(uniq.data() + r0, nr),
+                                            rows.data() + r0 * kHidden);
+        }
+      });
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        const auto u = static_cast<std::size_t>(std::lower_bound(uniq.begin(), uniq.end(), ids[i]) - uniq.begin());
+        std::memcpy(host.data() + i * kRowBytes, rows.data() + u * kHidden, kRowBytes);
+      }
+    } else {
+      std::size_t row = 0;
+      for (const auto& s : seqs) {
+        for (std::int32_t id : s) {
+          std::memcpy(host.data() + row++ * kRowBytes, embed_rows + static_cast<std::size_t>(id) * kRowBytes, kRowBytes);
+        }
       }
     }
     MI_CUDA_CHECK(cudaMemcpyAsync(x.data, host.data(), host.size(), cudaMemcpyHostToDevice, stream));
@@ -324,9 +493,10 @@ struct TextEncoder::Impl {
     Tensor qg = arena.alloc_tensor(DType::kBF16, {t, kQgDim});
     Tensor k = arena.alloc_tensor(DType::kBF16, {t, kKvDim});
     Tensor v = arena.alloc_tensor(DType::kBF16, {t, kKvDim});
-    linear(b, qg, h, w.at(p + "self_attn.q_proj.weight"));
-    linear(b, k, h, w.at(p + "self_attn.k_proj.weight"));
-    linear(b, v, h, w.at(p + "self_attn.v_proj.weight"));
+    quantize_input(b, h);
+    lin(b, qg, h, w, p + "self_attn.q_proj");
+    lin(b, k, h, w, p + "self_attn.k_proj");
+    lin(b, v, h, w, p + "self_attn.v_proj");
     // q_proj output viewed per head as [q | gate].
     Tensor q_raw = strided(qg.data, DType::kBF16, {t, kNumHeads, kAttnHeadDim}, {kQgDim, 2 * kAttnHeadDim, 1});
     Tensor gate = strided(qg.ptr<std::uint16_t>() + kAttnHeadDim, DType::kBF16, {t, kNumHeads, kAttnHeadDim},
@@ -349,7 +519,9 @@ struct TextEncoder::Impl {
     attention::flash_fwd(q, k3, v3, attn, b.cu_dev, b.cu_dev, b.max_len, /*causal=*/true, kAttnScale, ws, ws_bytes,
                          stream);
     kernels::sigmoid_mul(attn, gate, attn, stream);
-    linear(b, y, attn.reshaped({t, kNumHeads * kAttnHeadDim}), w.at(p + "self_attn.o_proj.weight"));
+    const Tensor attn2 = attn.reshaped({t, kNumHeads * kAttnHeadDim});
+    quantize_input(b, attn2);
+    lin(b, y, attn2, w, p + "self_attn.o_proj");
   }
 
   // Qwen3_5GatedDeltaNet (Q:490-650) without cache: writes out_proj's output to y.
@@ -361,10 +533,11 @@ struct TextEncoder::Impl {
     Tensor z = arena.alloc_tensor(DType::kBF16, {t, gdn::kValueDim});
     Tensor bb = arena.alloc_tensor(DType::kBF16, {t, gdn::kNumVHeads});
     Tensor aa = arena.alloc_tensor(DType::kBF16, {t, gdn::kNumVHeads});
-    linear(b, qkv, h, w.at(p + "linear_attn.in_proj_qkv.weight"));
-    linear(b, z, h, w.at(p + "linear_attn.in_proj_z.weight"));
-    linear(b, bb, h, w.at(p + "linear_attn.in_proj_b.weight"));
-    linear(b, aa, h, w.at(p + "linear_attn.in_proj_a.weight"));
+    quantize_input(b, h);
+    lin(b, qkv, h, w, p + "linear_attn.in_proj_qkv");
+    lin(b, z, h, w, p + "linear_attn.in_proj_z");
+    lin(b, bb, h, w, p + "linear_attn.in_proj_b");
+    lin(b, aa, h, w, p + "linear_attn.in_proj_a");
     Tensor conv = arena.alloc_tensor(DType::kBF16, {t, gdn::kConvDim});
     gdn::causal_conv1d_silu(qkv, w.at(p + "linear_attn.conv1d.weight").reshaped({gdn::kConvDim, gdn::kConvKernel}),
                             b.cu_dev, conv, stream);
@@ -381,7 +554,9 @@ struct TextEncoder::Impl {
     b.for_each_sequence([&](std::int64_t s, std::int64_t e) {
       kernels::rms_norm_gated_qwen(core.slice0(s, e), z3.slice0(s, e), norm_w, core.slice0(s, e), stream);
     });
-    linear(b, y, core.reshaped({t, gdn::kValueDim}), w.at(p + "linear_attn.out_proj.weight"));
+    const Tensor core2 = core.reshaped({t, gdn::kValueDim});
+    quantize_input(b, core2);
+    lin(b, y, core2, w, p + "linear_attn.out_proj");
   }
 
   // Qwen3_5DecoderLayer.forward (Q:871-900) on the residual stream x in place; h and y are [T, 4096] scratch.
@@ -395,19 +570,27 @@ struct TextEncoder::Impl {
       gated_delta_net(l, w, b, h, y);
     }
     kernels::residual_add(x, y, x, stream);
+    xq_src = nullptr;  // h is about to hold the next site's input
     norm(b, x, w.at(p + "post_attention_layernorm.weight"), h);
     {
       runtime::StackScope scope(arena);
       Tensor gate = arena.alloc_tensor(DType::kBF16, {b.tokens, kIntermediate});
       Tensor up = arena.alloc_tensor(DType::kBF16, {b.tokens, kIntermediate});
-      linear(b, gate, h, w.at(p + "mlp.gate_proj.weight"));
-      linear(b, up, h, w.at(p + "mlp.up_proj.weight"));
+      quantize_input(b, h);
+      lin(b, gate, h, w, p + "mlp.gate_proj");
+      lin(b, up, h, w, p + "mlp.up_proj");
       kernels::silu_mul(gate, up, gate, stream);
-      linear(b, y, gate, w.at(p + "mlp.down_proj.weight"));
+      quantize_input(b, gate);
+      lin(b, y, gate, w, p + "mlp.down_proj");
     }
     kernels::residual_add(x, y, x, stream);
+    xq_src = nullptr;
   }
 
+  void init_layers();
+  void alloc_quant_scratch(std::int64_t tokens);
+  void release_quant_scratch();
+  void check_decode();
   void create_streaming_resources();
   void load_host();
   std::vector<LayerPlan> plan_layers(const std::vector<void*>& bufs) const;
@@ -490,6 +673,7 @@ std::vector<LayerPlan> TextEncoder::Impl::plan_layers(const std::vector<void*>& 
     LayerPlan& p = plans[static_cast<std::size_t>(i)];
     const weights::WeightGroup& g = *layers[static_cast<std::size_t>(i)].group;
     p.w = weights::plan_group_upload(g, bufs[static_cast<std::size_t>(i) % bufs.size()], weight_bytes, pieces);
+    if (!aux.empty()) p.w.insert(aux[static_cast<std::size_t>(i)].begin(), aux[static_cast<std::size_t>(i)].end());
     for (const weights::UploadPiece& piece : pieces) {
       const std::byte* host = nullptr;
       if (!host_layers.empty()) {
@@ -558,7 +742,8 @@ void TextEncoder::Impl::run_layers_sync(const Batch& b, void* weight_buf, const 
     if (cancel_requested(options)) throw Cancelled();
     const Layer& l = layers[static_cast<std::size_t>(i)];
     auto t0 = Clock::now();
-    const weights::TensorMap w = load(*l.group, weight_buf, weight_bytes);
+    weights::TensorMap w = load(*l.group, weight_buf, weight_bytes);
+    if (!aux.empty()) w.insert(aux[static_cast<std::size_t>(i)].begin(), aux[static_cast<std::size_t>(i)].end());
     stats.weight_load_s += seconds_since(t0);
     stats.layer_bytes[static_cast<std::size_t>(i)] = l.group->total_bytes;
     t0 = Clock::now();
@@ -645,32 +830,30 @@ void TextEncoder::Impl::run_layers_streaming(const std::vector<std::vector<std::
   }
 }
 
-std::uint64_t numerics_id() {
-  constexpr std::uint32_t kPrecisionBf16 = 1;
+std::uint64_t numerics_id() { return numerics_id(Precision::kBF16); }
+
+std::uint64_t numerics_id(Precision precision) {
+  // bf16 keeps the code it had before quantized encoders existed, so cached bf16 embeddings stay valid.
+  const std::uint64_t code = precision == Precision::kBF16 ? 1 : precision == Precision::kInt8 ? 2 : 3;
   int device = 0, major = 0, minor = 0;
   MI_CUDA_CHECK(cudaGetDevice(&device));
   MI_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
   MI_CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
-  const std::uint64_t fields[] = {kNumericsVersion, kPrecisionBf16, static_cast<std::uint64_t>(major * 10 + minor),
-                                  static_cast<std::uint64_t>(cublasLtGetVersion())};
-  return xxh64(fields, sizeof(fields));
+  // Quantized precisions also depend on the INT8 kernels (rotate+quantize, GEMM epilogue) and, for W4A8, the decoder;
+  // bf16 hashes exactly the fields it always did.
+  const std::uint64_t int8_version = precision == Precision::kBF16 ? 0 : kernels::quant::kInt8NumericsVersion;
+  const std::uint64_t decode_version = precision == Precision::kW4A8 ? kernels::quant::kGroupedDecodeVersion : 0;
+  const std::uint64_t fields[] = {kNumericsVersion, code, static_cast<std::uint64_t>(major * 10 + minor),
+                                  static_cast<std::uint64_t>(cublasLtGetVersion()), int8_version, decode_version};
+  return xxh64(fields, precision == Precision::kBF16 ? 4 * sizeof(std::uint64_t) : sizeof(fields));
 }
 
 TextEncoder::TextEncoder(const weights::ModelIndex& index, runtime::DeviceArena& arena, cudaStream_t stream,
                          EncoderOptions options)
-    : impl_(std::make_unique<Impl>(index, arena, stream, options)) {
+    : impl_(std::make_unique<Impl>(index, arena, stream, options, nullptr)) {
   check_options(options);
+  impl_->init_layers();
   Impl& m = *impl_;
-  for (int i = 0; i < kNumLayers; ++i) {
-    m.layers.push_back(validate_layer(index, i));
-    m.weight_bytes = std::max(m.weight_bytes, weights::group_device_bytes(*m.layers.back().group));
-  }
-  if (index.find_group(Component::kTextEncoder, "layers." + std::to_string(kNumLayers)) != nullptr) {
-    fail("bundle has more than " + std::to_string(kNumLayers) + " text encoder layers");
-  }
-  check_tensor(single_tensor(index, "final_norm"), {kHidden});
-  m.final_norm = index.find_group(Component::kTextEncoder, "final_norm");
-
   const weights::IndexedTensor& embed = single_tensor(index, "embed_tokens");
   if (embed.dtype != weights::DType::kBF16 || embed.shape.size() != 2 || embed.shape[1] != kHidden || embed.shape[0] < 1) {
     fail("tensor " + embed.name + " must be BF16 [vocab, 4096]");
@@ -685,6 +868,82 @@ TextEncoder::TextEncoder(const weights::ModelIndex& index, runtime::DeviceArena&
   if (options.streaming) m.create_streaming_resources();
 }
 
+TextEncoder::TextEncoder(const QuantTextModel& model, runtime::DeviceArena& arena, cudaStream_t stream,
+                         EncoderOptions options)
+    : impl_(std::make_unique<Impl>(model.index(), arena, stream, options, &model)) {
+  check_options(options);
+  impl_->init_layers();
+  const quant::QuantLinear& embed = model.embed_tokens();
+  if (embed.k != kHidden) fail("embed_tokens must have 4096 columns, got " + std::to_string(embed.k));
+  impl_->vocab = embed.n;
+  if (options.streaming) impl_->create_streaming_resources();
+}
+
+// Allocation order and sizes as quant_scratch_bytes().
+void TextEncoder::Impl::alloc_quant_scratch(std::int64_t tokens) {
+  if (qm == nullptr) return;
+  aux.assign(kNumLayers, {});
+  if (!qm->bf16_tensors().empty()) {
+    auto* dst = static_cast<std::byte*>(arena.alloc_stack(aux_bytes(qm)));
+    const std::string prefix = "language_model.layers.";
+    for (const auto& [name, v] : qm->bf16_tensors()) {
+      const std::size_t bytes = v.size() * sizeof(std::uint16_t);
+      MI_CUDA_CHECK(cudaMemcpyAsync(dst, v.data(), bytes, cudaMemcpyHostToDevice, stream));
+      // "language_model.layers.<N>.<...>", as QuantTextModel routed it.
+      int layer = -1;
+      const char* digits = name.data() + prefix.size();
+      const auto r = std::from_chars(digits, name.data() + name.size(), layer);
+      if (!name.starts_with(prefix) || r.ec != std::errc() || r.ptr == digits || *r.ptr != '.' || layer < 0 ||
+          layer >= kNumLayers) {
+        fail("tensor " + name + " belongs to no layer");
+      }
+      const std::vector<std::int64_t>& shape = qm->bf16_shape(name);
+      aux[static_cast<std::size_t>(layer)].emplace(name, Tensor::view(dst, DType::kBF16, Device::kCUDA, shape.data(),
+                                                                       static_cast<int>(shape.size())));
+      dst += runtime::align_up(bytes);
+    }
+  }
+  if (quantized(qm)) {
+    xq = static_cast<std::int8_t*>(arena.alloc_stack(static_cast<std::size_t>(tokens * kIntermediate)));
+    xs = static_cast<float*>(arena.alloc_stack(static_cast<std::size_t>(tokens) * sizeof(float)));
+  }
+  if (qm->max_grouped_elems() > 0) {
+    decode_buf = static_cast<std::int8_t*>(arena.alloc_stack(static_cast<std::size_t>(qm->max_grouped_elems())));
+    invalid = static_cast<unsigned*>(arena.alloc_stack(sizeof(unsigned)));
+    MI_CUDA_CHECK(cudaMemsetAsync(invalid, 0, sizeof(unsigned), stream));
+  }
+}
+
+void TextEncoder::Impl::release_quant_scratch() {
+  aux.clear();
+  xq = nullptr;
+  xs = nullptr;
+  xq_src = nullptr;
+  xq_k = 0;
+  decode_buf = nullptr;
+  invalid = nullptr;
+}
+
+// After the stream is synchronized: a NaN or negative W4A8 group scale decoded to zeros somewhere.
+void TextEncoder::Impl::check_decode() {
+  if (invalid == nullptr) return;
+  unsigned flag = 0;
+  MI_CUDA_CHECK(cudaMemcpy(&flag, invalid, sizeof(flag), cudaMemcpyDeviceToHost));
+  if (flag != 0) throw quant::QuantError("qwen35_text: a W4A8 group scale of the file is NaN or negative");
+}
+
+void TextEncoder::Impl::init_layers() {
+  for (int i = 0; i < kNumLayers; ++i) {
+    layers.push_back(validate_layer(index, i, qm));
+    weight_bytes = std::max(weight_bytes, weights::group_device_bytes(*layers.back().group));
+  }
+  if (index.find_group(Component::kTextEncoder, "layers." + std::to_string(kNumLayers)) != nullptr) {
+    fail("bundle has more than " + std::to_string(kNumLayers) + " text encoder layers");
+  }
+  check_tensor(single_tensor(index, "final_norm"), {kHidden});
+  final_norm = index.find_group(Component::kTextEncoder, "final_norm");
+}
+
 TextEncoder::~TextEncoder() = default;
 
 // Mirrors encode(): outputs, the fixed scratch, then the largest of one layer's token-mixer and MLP scratch.
@@ -696,6 +955,18 @@ std::size_t TextEncoder::workspace_bytes(const weights::ModelIndex& index, std::
 
 std::size_t TextEncoder::workspace_bytes(const weights::ModelIndex& index, std::span<const std::int64_t> lengths,
                                          const EncoderOptions& options) {
+  return workspace_bytes_impl(index, nullptr, lengths, options);
+}
+
+std::size_t TextEncoder::workspace_bytes(const QuantTextModel& model, std::span<const std::int64_t> lengths,
+                                         const EncoderOptions& options) {
+  return workspace_bytes_impl(model.index(), &model, lengths, options);
+}
+
+namespace {
+
+std::size_t workspace_bytes_impl(const weights::ModelIndex& index, const QuantTextModel* qm,
+                                 std::span<const std::int64_t> lengths, const EncoderOptions& options) {
   using runtime::align_up;
   check_options(options);
   std::int64_t t = 0, max_len = 0;
@@ -705,7 +976,7 @@ std::size_t TextEncoder::workspace_bytes(const weights::ModelIndex& index, std::
   }
   std::size_t weight_bytes = 0;
   for (int i = 0; i < kNumLayers; ++i) {
-    weight_bytes = std::max(weight_bytes, weights::group_device_bytes(*validate_layer(index, i).group));
+    weight_bytes = std::max(weight_bytes, weights::group_device_bytes(*validate_layer(index, i, qm).group));
   }
   single_tensor(index, "final_norm");
   const std::size_t norm_bytes = weights::group_device_bytes(*index.find_group(Component::kTextEncoder, "final_norm"));
@@ -715,7 +986,8 @@ std::size_t TextEncoder::workspace_bytes(const weights::ModelIndex& index, std::
                             align_up(kernels::Gemm::kWorkspaceBytes) + align_up(norm_bytes) +
                             align_up((lengths.size() + 1) * sizeof(std::int32_t)) +
                             align_up(static_cast<std::size_t>(max_len * kernels::kQwenRopeDim) * 2) +
-                            3 * rows(kHidden, 2);  // x, h, y
+                            3 * rows(kHidden, 2) +  // x, h, y
+                            quant_scratch_bytes(qm, t);
   const std::size_t attn = rows(kQgDim, 2) + 2 * rows(kKvDim, 2) + 2 * rows(kNumHeads * kAttnHeadDim, 2) +
                            align_up(attention::flash_fwd_workspace_bytes(t, kNumHeads));
   const std::size_t delta_net = 2 * rows(gdn::kConvDim, 2) + rows(gdn::kValueDim, 2) + 3 * rows(gdn::kNumVHeads, 2) +
@@ -725,7 +997,7 @@ std::size_t TextEncoder::workspace_bytes(const weights::ModelIndex& index, std::
   return fixed + std::max({attn, delta_net, mlp});
 }
 
-std::size_t TextEncoder::host_bytes(const weights::ModelIndex& index, const EncoderOptions& options) {
+std::size_t host_bytes_impl(const weights::ModelIndex& index, const QuantTextModel* qm, const EncoderOptions& options) {
   check_options(options);
   std::size_t total = 0;
   if (uses_rings(options)) {
@@ -733,9 +1005,19 @@ std::size_t TextEncoder::host_bytes(const weights::ModelIndex& index, const Enco
              ring_slot_bytes(options);
   }
   if (host_resident(options)) {
-    for (int i = 0; i < kNumLayers; ++i) total += weights::host_group_bytes(*validate_layer(index, i).group);
+    for (int i = 0; i < kNumLayers; ++i) total += weights::host_group_bytes(*validate_layer(index, i, qm).group);
   }
   return total;
+}
+
+}  // namespace
+
+std::size_t TextEncoder::host_bytes(const weights::ModelIndex& index, const EncoderOptions& options) {
+  return host_bytes_impl(index, nullptr, options);
+}
+
+std::size_t TextEncoder::host_bytes(const QuantTextModel& model, const EncoderOptions& options) {
+  return host_bytes_impl(model.index(), &model, options);
 }
 
 void TextEncoder::preload_host() {
@@ -754,6 +1036,8 @@ const EncoderOptions& TextEncoder::options() const { return impl_->opts; }
 const EncodeStats& TextEncoder::last_stats() const { return impl_->stats; }
 std::size_t TextEncoder::weight_buffer_bytes() const { return impl_->weight_bytes; }
 std::int64_t TextEncoder::vocab_size() const { return impl_->vocab; }
+Precision TextEncoder::precision() const { return impl_->qm != nullptr ? impl_->qm->precision() : Precision::kBF16; }
+std::uint64_t TextEncoder::numerics() const { return numerics_id(precision()); }
 
 std::vector<Tensor> TextEncoder::encode(const std::vector<std::vector<std::int32_t>>& sequences,
                                         const EncodeOptions& options) {
@@ -788,6 +1072,7 @@ std::vector<Tensor> TextEncoder::encode(const std::vector<std::vector<std::int32
   // Outputs first, so they survive the scratch rollback below. On failure nothing stays allocated.
   const std::size_t mark = m.arena.mark();
   Tensor out = m.arena.alloc_tensor(DType::kBF16, {b.tokens, kHidden});
+  m.hooks = &options;
   try {
     runtime::StackScope scratch(m.arena);
     std::vector<void*> weight_bufs;
@@ -806,6 +1091,7 @@ std::vector<Tensor> TextEncoder::encode(const std::vector<std::vector<std::int32
     Tensor x = m.arena.alloc_tensor(DType::kBF16, {b.tokens, kHidden});  // residual stream
     Tensor h = m.arena.alloc_tensor(DType::kBF16, {b.tokens, kHidden});
     Tensor y = m.arena.alloc_tensor(DType::kBF16, {b.tokens, kHidden});
+    m.alloc_quant_scratch(b.tokens);
 
     // The final norm (16 KiB) is loaded up front in both modes.
     auto t0 = Clock::now();
@@ -847,8 +1133,13 @@ std::vector<Tensor> TextEncoder::encode(const std::vector<std::vector<std::int32
       m.stats.compute_s += seconds_since(t0);
     }
     for (const std::uint64_t v : m.stats.layer_bytes) m.stats.weight_bytes += v;
+    m.check_decode();
+    m.release_quant_scratch();
     m.gemm_ws = nullptr;
+    m.hooks = nullptr;
   } catch (...) {
+    m.hooks = nullptr;
+    m.release_quant_scratch();
     m.gemm_ws = nullptr;
     m.arena.rollback(mark);
     throw;

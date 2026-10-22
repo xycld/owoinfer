@@ -59,7 +59,15 @@ enum class DitSource {
   kFile,        // the weight files through small pinned rings: page cache (file-backed, not private) or disk
   kHostPinned,  // a pinned host copy of the streamed blocks (host private memory: their full size)
 };
-enum class Precision { kBf16 };  // P6 adds fp8 / int8 storage and compute paths
+// Precision of the DiT's block linears, from the loaded file (P6): bf16 (the bundle, or a bf16 single file) or INT8
+// ConvRot (a file with any INT8 linear; mixed files that keep some linears bf16 count as int8).
+enum class Precision { kBf16, kInt8 };
+// Attention kernel of the DiT blocks (moss_dit::AttentionMode, one per attention_q8 variant): exact FA2, or 8-bit
+// (SageAttention-style, lossy).
+enum class AttentionMode { kExact, kQ8Fp16, kQ8Fp16F32Acc, kQ8Fp8, kQ8Fp8F32Acc };
+// Quality tiers (plan §P6): kReference = bf16 weights, exact math; kHigh = INT8 ConvRot GEMMs and/or 8-bit attention;
+// kTurbo = W4A4 (reserved: not implemented yet); kAuto = the fastest certified configuration of the loaded model.
+enum class Tier { kReference, kHigh, kTurbo, kAuto };
 enum class TeResidency {
   kStreamed,      // decoder layers stream from the weight files through `buffers` device layer buffers
   kHostResident,  // decoder layers held in host private memory and streamed to the device from there
@@ -70,6 +78,49 @@ enum class VaeDecodeKind { kUntiled, kTiled };
 const char* residency_name(DitResidency r);
 const char* residency_name(TeResidency r);
 const char* source_name(DitSource s);
+const char* precision_name(Precision p);        // "bf16", "int8"
+// "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc" (the quality certificates' tokens).
+const char* attention_name(AttentionMode a);
+const char* tier_name(Tier t);                  // "reference", "high", "turbo", "auto"
+// "reference" / "high" / "turbo" / "auto"; throws std::invalid_argument otherwise.
+Tier parse_tier(std::string_view name);
+// An attention_name(), or "q8" (= q8_fp8); throws std::invalid_argument otherwise.
+AttentionMode parse_attention(std::string_view name);
+bool is_q8(AttentionMode a);  // an 8-bit mode
+
+// The quality tier a request runs (P4b/P6), decided before planning from what is loaded. The weights fix the GEMM
+// precision (an INT8 DiT runs INT8 GEMMs; its weights are not the reference); the tier decides the attention kernel:
+//   reference  bf16 DiT and text encoder, exact attention. Refused for quantized weights and with an 8-bit attention.
+//   high       the lossy configuration of the loaded DiT: its precision, 8-bit attention (q8_fp8 unless `attention`
+//              says otherwise; exact when the device lacks the 8-bit kernel and the DiT is INT8). Runs certified or
+//              not (an explicit choice). Refused for a bf16 DiT with exact attention (that is the Reference tier).
+//   turbo      reserved: refused.
+//   auto       with `attention` given: that configuration. Otherwise each lossy configuration of the loaded DiT,
+//              fastest first (8-bit attention q8_fp8, q8_fp16, q8_fp8_f32acc, q8_fp16_f32acc, then exact for an INT8
+//              DiT), that this device runs: the first with a certificate. None: Reference for a bf16 DiT; an INT8 DiT
+//              runs INT8 GEMMs with exact attention, reported uncertified.
+// `certificate` is asked for lossy configurations only (Reference needs none).
+struct CertificateAnswer {
+  bool found = false;
+  std::string file;    // where the certificate is
+  std::string reason;  // why none was found
+};
+using CertificateLookup = std::function<CertificateAnswer(Precision dit, AttentionMode attention)>;
+using AttentionSupported = std::function<bool(AttentionMode attention)>;
+struct TierDecision {
+  Tier requested = Tier::kAuto;
+  Tier effective = Tier::kReference;
+  Precision precision = Precision::kBf16;
+  AttentionMode attention = AttentionMode::kExact;
+  bool certified = false;   // a certificate covers what runs (Reference: true, needs none)
+  std::string certificate;  // its file (empty for Reference and uncertified runs)
+  std::string reason;       // what was chosen and why, for the launcher and the report
+};
+// Throws std::invalid_argument (naming the conflict) for a refused combination.
+// te_quantized: the text encoder is an INT8 / W4A8 file, a lossy dimension as an INT8 DiT is (reference refused; the
+// exact-attention configuration is a High-tier one).
+TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention, Precision dit_precision,
+                          const CertificateLookup& certificate, const AttentionSupported& supported, bool te_quantized = false);
 
 // Machine throughput the cost model uses. Defaults are conservative for a desktop PC; the pipeline replaces the
 // transfer rates with measured ones (pipeline.h: a probe at first use, cached on disk with the embedding cache, then
@@ -97,6 +148,10 @@ struct ModelShapes {
   std::size_t dit_block_bytes = 0;  // largest block: the streaming unit
   std::size_t dit_bytes = 0;        // everything resident
   int dit_dim = 0;                  // model width (cost model: attention FLOPs)
+  // P6: precision of the block linears and the parameter count (cost model: an INT8 DiT's bytes are no FLOP count).
+  Precision dit_precision = Precision::kBf16;
+  std::size_t dit_params = 0;
+  double dit_int8_fraction = 1.0;  // kInt8: the INT8 share of the block GEMM FLOPs (< 1 for a mixed file)
   // VAE decoder; the pipeline replaces it with Flux2VaeDecoder::persistent_bytes().
   std::size_t vae_bytes = 0;
 };
@@ -104,6 +159,10 @@ struct ModelShapes {
 // Group totals of `index` (its text_encoder, transformer and vae groups). Throws std::invalid_argument when a
 // component the engine needs is missing.
 ModelShapes shapes_from_index(const weights::ModelIndex& index);
+// The same with components loaded from their own files (P6/P7a): the DiT's fields from `dit_index` (with
+// `dit_precision`), the text encoder's from `te_index`, the VAE's from `vae_index`; nullptr: the bundle's.
+ModelShapes shapes_from_index(const weights::ModelIndex& index, const weights::ModelIndex* dit_index, Precision dit_precision,
+                              const weights::ModelIndex* te_index = nullptr, const weights::ModelIndex* vae_index = nullptr);
 
 // One generation as far as memory and time are concerned.
 struct RequestShape {
@@ -169,6 +228,9 @@ struct Capabilities {
   std::size_t dit_graph_bytes = 0;
   std::size_t dit_ring_bytes = 0;  // P4 pinned host staging of the file source (its readers' rings)
   bool dit_host_pinned = false;    // P4 a pinned host copy of the streamed blocks as the source
+  // Streamed blocks may come from the weight files (false: only from a pinned host copy, e.g. blocks that carry merged
+  // runtime-LoRA weights, which the files do not hold).
+  bool dit_file_source = true;
 };
 
 struct Budgets {
@@ -186,7 +248,8 @@ struct Budgets {
 
 struct DitPlan {
   DitResidency residency = DitResidency::kResident;
-  Precision precision = Precision::kBf16;
+  Precision precision = Precision::kBf16;          // ModelShapes::dit_precision
+  AttentionMode attention = AttentionMode::kExact;  // PlanInputs::attention
   int resident_blocks = 0;  // kStreamed: blocks kept resident (the others stream); otherwise every block
   int buffers = 0;          // kStreamed: device block buffers (>= 2; min(buffers, streamed blocks) are allocated)
   int prefetch_blocks = 0;  // kStreamed: lookahead on the copy streams (buffers - 1)
@@ -282,6 +345,7 @@ struct PlanInputs {
   Budgets budgets;
   HardwareProfile hardware;
   Mode mode = Mode::kBalanced;
+  AttentionMode attention = AttentionMode::kExact;  // the DiT's attention kernel (cost model)
   bool cache_disk_spill = false;
   // Only plans with this DiT residency (residency, and when streamed: resident blocks, buffers, source): the pipeline
   // asks whether its loaded DiT can serve the request before dropping it.

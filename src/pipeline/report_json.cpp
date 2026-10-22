@@ -10,6 +10,7 @@
 
 #include "models/moss_dit/moss_dit.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/quality_cert.h"
 #include "pipeline/sampler.h"
 #include "planner/planner.h"
 #include "util/path.h"
@@ -102,10 +103,25 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
     << ", \"steps\": " << q.steps << ", \"cfg\": " << num(q.cfg) << ", \"shift\": " << num(q.shift) << ", \"seed\": " << q.seed
     << ", \"uncond_skip_layers\": " << json_layers(q.uncond_skip_layers) << ", \"slg_layers\": " << json_layers(q.slg_layers)
     << ", \"slg_scale\": " << num(q.slg_scale) << ", \"slg_start\": " << num(q.slg_start) << ", \"slg_stop\": " << num(q.slg_stop)
-    << ", \"max_sequence_length\": " << q.max_sequence_length << ", \"sampler\": \"" << sampler_name(q.sampler) << "\"},\n";
+    << ", \"max_sequence_length\": " << q.max_sequence_length << ", \"sampler\": \"" << sampler_name(q.sampler)
+    << "\", \"scheduler\": \"" << scheduler_name(q.scheduler) << "\", \"flow_multiplier\": " << num(q.flow_multiplier)
+    << ", \"noise_layout\": \"" << noise_layout_name(q.noise_layout) << "\", \"noise_source\": \""
+    << noise_source_name(q.noise_source) << "\", \"eta\": " << num(q.eta) << ", \"s_noise\": " << num(q.s_noise)
+    << ", \"dataspace\": " << json_escape(util::path_utf8(q.dataspace_path)) << "},\n";
   o << " \"seed_used\": " << r.seed << ", \"steps_scheduled\": " << r.steps_scheduled << ", \"steps_run\": " << r.steps_run
     << ", \"cancelled\": " << tf(r.cancelled) << ", \"cond_tokens\": " << r.cond_tokens
     << ", \"uncond_tokens\": " << r.uncond_tokens << ",\n";
+  // Prompt token counts (tokenizer/prompt_tokens.h): what the text encoder kept and whether a prompt was truncated.
+  const auto tokens = [&](const tok::PromptTokenReport& tr) {
+    std::ostringstream ts;
+    ts.imbue(std::locale::classic());
+    ts << "{\"total\": " << tr.total_tokens << ", \"kept\": " << tr.kept_tokens << ", \"template\": " << tr.template_tokens
+      << ", \"prompt\": " << tr.prompt_tokens() << ", \"dropped\": " << tr.dropped_tokens() << ", \"max_length\": "
+      << tr.max_length << ", \"truncated\": " << tf(tr.truncated) << "}";
+    return ts.str();
+  };
+  o << " \"tokens\": {\"prompt\": " << tokens(r.cond_token_report) << ", \"negative_prompt\": " << tokens(r.uncond_token_report)
+    << "},\n";
   o << " \"image\": ";
   parts.head = o.str();
   o.str("");
@@ -113,6 +129,32 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
   o << " \"mode\": \"" << planner::mode_name(r.plan.mode) << "\",\n";
   o << " \"dit_blocks\": {\"path\": \"" << moss_dit::block_path_name(r.block_path) << "\", \"note\": "
     << json_escape(r.block_path_note) << "},\n";
+  // P6: the quality object in the certificates' vocabulary (pipeline/quality_cert.h: tier, config, engine numerics, GPU
+  // class, reason, certificate, models), filled by generate(), and where each model came from.
+  const planner::TierDecision& td = r.tier;
+  o << " \"quality\": " << quality_report_json(r.quality) << ",\n";
+  o << " \"models\": {\"dit\": {\"source\": " << json_escape(r.dit_source) << ", \"linears\": " << json_escape(r.dit_linears)
+    << ", \"tier_requested\": \"" << planner::tier_name(td.requested) << "\", \"tier_effective\": \""
+    << planner::tier_name(td.effective) << "\", \"certified\": " << tf(td.certified)
+    << "}, \"text_encoder\": {\"source\": " << json_escape(r.te_source) << ", \"precision\": "
+    << json_escape(r.te_precision.empty() ? "bf16" : r.te_precision) << "}, \"vae\": {\"source\": " << json_escape(r.vae_source)
+    << "}},\n";
+  // Runtime LoRAs: how each file was read and applied, and the lossy merges.
+  const auto strings = [&](const std::vector<std::string>& v) {
+    std::string out = "[";
+    for (std::size_t i = 0; i < v.size(); ++i) out += (i ? ", " : "") + json_escape(v[i]);
+    return out + "]";
+  };
+  o << " \"loras\": [";
+  for (std::size_t i = 0; i < r.loras.size(); ++i) {
+    const lora::FileReport& f = r.loras[i];
+    const float strength = i < q.loras.size() ? q.loras[i].strength : 0.0f;
+    o << (i ? ", " : "") << "{\"file\": " << json_escape(f.file) << ", \"strength\": " << num(strength)
+      << ", \"adapters\": " << f.adapters << ", \"side_branch\": " << f.side_branch << ", \"merged\": " << f.merged
+      << ", \"unknown\": " << strings(f.unknown) << ", \"warnings\": " << strings(f.warnings) << ", \"notes\": "
+      << strings(f.notes) << "}";
+  }
+  o << "], \"lora_warnings\": " << strings(r.lora_warnings) << ", \"lora_notes\": " << strings(r.lora_notes) << ",\n";
   o << " \"plan\": " << r.plan.to_json() << ",\n";
   o << " \"embedding_cache\": {\"hits\": " << r.te_cache_hits << ", \"te_skipped\": " << tf(r.te_skipped) << "},\n";
   // What ran (it may differ from plan.vae: the decode takes the fastest schedule the arena it finds leaves room for).

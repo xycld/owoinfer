@@ -35,21 +35,28 @@ std::vector<std::string> fused_qkv(int block) {
   return {p + "proj.q.weight", p + "proj.k.weight", p + "proj.v.weight"};
 }
 
-// The tensors make_views() reads, with their shapes: checked up front for blocks that are only streamed.
-void validate_block(const WeightGroup& g, int block) {
-  const std::string p = prefix(block);
-  const std::pair<const char*, std::vector<std::int64_t>> specs[] = {
-      {"norm1.weight", {kDim}},          {"norm2.weight", {kDim}},          {"q_norm.weight", {kHeadDim}},
-      {"k_norm.weight", {kHeadDim}},     {"proj.q.weight", {kDim, kDim}},   {"proj.k.weight", {kDim, kDim}},
-      {"proj.v.weight", {kDim, kDim}},   {"proj.o.weight", {kDim, kDim}},   {"proj.ffn_up_gate.weight", {kUpGateDim, kDim}},
-      {"proj.ffn_down.weight", {kDim, kFfnDim}}};
-  for (const auto& [name, shape] : specs) {
-    const auto it = std::find_if(g.tensors.begin(), g.tensors.end(), [&](const auto& t) { return t.name == p + name; });
-    if (it == g.tensors.end()) throw std::runtime_error("mi::moss_dit: weight '" + p + name + "' missing");
-    if (it->dtype != weights::DType::kBF16 || it->shape != shape) {
-      throw std::runtime_error("mi::moss_dit: weight '" + p + name + "' has an unexpected type/shape");
+constexpr const char* kQkvParts[3] = {"proj.q", "proj.k", "proj.v"};
+
+// The spec of block linear `module` in a quantized index: bf16 or INT8 ConvRot G = 256, the two the block runs.
+const quant::QuantSpec& linear_spec(const quant::QuantIndex& q, const std::string& module) {
+  const quant::QuantSpec* s = q.find_spec(module);
+  if (s == nullptr) throw std::runtime_error("mi::moss_dit: linear '" + module + "' missing from the DiT file");
+  if (*s != quant::QuantSpec::bf16() && *s != quant::QuantSpec::int8_convrot(256)) {
+    throw std::runtime_error("mi::moss_dit: linear '" + module + "' is stored as " + quant::describe(*s) +
+                             "; the DiT runs bf16 and int8_convrot256 linears");
+  }
+  return *s;
+}
+
+// Views of tensors uploaded back to back: one [rows * parts, cols] (cols 0: [rows * parts]) view of the first.
+Tensor concat_rows(const std::vector<Tensor>& parts, DType dt, std::int64_t rows, std::int64_t cols, const std::string& what) {
+  for (std::size_t i = 1; i < parts.size(); ++i) {
+    if (static_cast<const char*>(parts[i].data) != static_cast<const char*>(parts[i - 1].data) + parts[i - 1].nbytes()) {
+      throw std::runtime_error("mi::moss_dit: weights to fuse are not contiguous: " + what);
     }
   }
+  const auto n = static_cast<std::int64_t>(parts.size()) * rows;
+  return cols > 0 ? Tensor::view(parts[0].data, dt, Device::kCUDA, {n, cols}) : Tensor::view(parts[0].data, dt, Device::kCUDA, {n});
 }
 
 void check_residency(const Residency& r) {
@@ -147,6 +154,79 @@ Tensor fuse(const TensorMap& m, const std::vector<std::string>& names, std::int6
   const auto n = static_cast<std::int64_t>(parts.size()) * rows;
   return cols > 0 ? Tensor::view(parts[0].data, DType::kBF16, Device::kCUDA, {n, cols})
                   : Tensor::view(parts[0].data, DType::kBF16, Device::kCUDA, {n});
+}
+
+std::vector<std::string> block_front(int block, const quant::QuantIndex* quant) {
+  std::vector<std::string> front = fused_qkv(block);
+  if (quant == nullptr) return front;
+  const std::string p = prefix(block);
+  bool int8 = true;
+  for (const char* part : kQkvParts) int8 = int8 && linear_spec(*quant, p + part).quantized();
+  if (int8) {
+    for (const char* part : kQkvParts) front.push_back(p + part + ".weight_scale");
+  }
+  return front;
+}
+
+BlockTensors block_views(int block, const TensorMap& m, const quant::QuantIndex* quant) {
+  const std::string p = prefix(block);
+  BlockTensors b;
+  b.norm1 = take(m, p + "norm1.weight", {kDim});
+  b.norm2 = take(m, p + "norm2.weight", {kDim});
+  b.q_norm = take(m, p + "q_norm.weight", {kHeadDim});
+  b.k_norm = take(m, p + "k_norm.weight", {kHeadDim});
+  if (quant == nullptr) {
+    b.qkv = fuse(m, fused_qkv(block), kDim, kDim);
+    b.o = take(m, p + "proj.o.weight", {kDim, kDim});
+    b.up_gate = take(m, p + "proj.ffn_up_gate.weight", {kUpGateDim, kDim});
+    b.down = take(m, p + "proj.ffn_down.weight", {kDim, kFfnDim});
+    return b;
+  }
+  // Every linear through quant::view with the spec the GEMM implements (dtype, shape, scale, alignment checks).
+  const auto checked = [&](const std::string& module, const quant::QuantSpec& spec, std::int64_t n, std::int64_t k) {
+    const quant::QuantWeights v = quant::view(*quant, m, module, spec);
+    if (v.n != n || v.k != k || v.device != Device::kCUDA) {
+      throw std::runtime_error("mi::moss_dit: linear '" + module + "' has an unexpected shape");
+    }
+    if (v.bias != nullptr) throw std::runtime_error("mi::moss_dit: linear '" + module + "' has a bias the DiT does not use");
+    return v;
+  };
+  const auto int8 = [&](const std::string& module, std::int64_t n, std::int64_t k) {
+    const quant::QuantWeights v = checked(module, quant::QuantSpec::int8_convrot(256), n, k);
+    return Int8Linear{Tensor::view(const_cast<void*>(v.weight), DType::kI8, Device::kCUDA, {n, k}),
+                      Tensor::view(const_cast<float*>(v.scale), DType::kF32, Device::kCUDA, {n})};
+  };
+  const auto linear = [&](const char* name, std::int64_t n, std::int64_t k, Tensor& bf16, Int8Linear& q8) {
+    const std::string module = p + name;
+    if (linear_spec(*quant, module).quantized()) {
+      q8 = int8(module, n, k);
+    } else {
+      checked(module, quant::QuantSpec::bf16(), n, k);
+      bf16 = take(m, module + ".weight", {n, k});
+    }
+  };
+  int quantized_parts = 0;
+  for (const char* part : kQkvParts) quantized_parts += linear_spec(*quant, p + part).quantized() ? 1 : 0;
+  if (quantized_parts == 0) {
+    for (const char* part : kQkvParts) checked(p + part, quant::QuantSpec::bf16(), kDim, kDim);
+    b.qkv = fuse(m, fused_qkv(block), kDim, kDim);
+  } else if (quantized_parts == 3) {
+    std::vector<Tensor> w, s;
+    for (const char* part : kQkvParts) {
+      const Int8Linear l = int8(p + part, kDim, kDim);
+      w.push_back(l.w);
+      s.push_back(l.scale);
+    }
+    b.qkv8 = {concat_rows(w, DType::kI8, kDim, kDim, p + "proj.q/k/v"),
+              concat_rows(s, DType::kF32, kDim, 0, p + "proj.q/k/v scales")};
+  } else {
+    b.qkv_split = true;
+    for (int i = 0; i < 3; ++i) linear(kQkvParts[i], kDim, kDim, b.qkv_part[i], b.qkv8_part[i]);
+  }
+  linear("proj.o", kDim, kDim, b.o, b.o8);
+  linear("proj.ffn_up_gate", kUpGateDim, kDim, b.up_gate, b.up_gate8);
+  linear("proj.ffn_down", kDim, kFfnDim, b.down, b.down8);
+  return b;
 }
 
 }  // namespace detail
@@ -262,9 +342,13 @@ std::size_t BlockWeights::host_bytes(const weights::ModelIndex& index, const Res
 }
 
 BlockWeights::BlockWeights(const weights::ModelIndex& index, runtime::DeviceArena& arena, const Residency& residency,
-                           const Upload& upload, const std::function<void(const WeightGroup&)>& before_group)
-    : index_(index), arena_(arena), residency_(residency) {
+                           const Upload& upload, const std::function<void(const WeightGroup&)>& before_group,
+                           const quant::QuantIndex* quant, const std::function<void(const TensorMap&)>& host_transform)
+    : index_(index), quant_(quant), arena_(arena), residency_(residency) {
   check_residency(residency);
+  if (quant != nullptr && &quant->index != &index) {
+    throw std::invalid_argument("mi::moss_dit: a quantized DiT's block weights must come from its own index");
+  }
   mask_ = resident_mask(residency.resident_blocks);
   nbuf_ = buffer_count(residency);
   block_bytes_ = runtime::align_up(block_device_bytes(index));
@@ -273,17 +357,24 @@ BlockWeights::BlockWeights(const weights::ModelIndex& index, runtime::DeviceAren
   try {
     if (residency.streamed()) readers_ = std::make_unique<weights::ReaderCache>(index, residency.direct_io);
     for (int i = 0; i < kNumBlocks; ++i) {
-      ordered_.push_back(detail::with_front(block_group(index, i), fused_qkv(i)));
+      ordered_.push_back(detail::with_front(block_group(index, i), detail::block_front(i, quant)));
       if (resident(i)) {
         resident_[static_cast<std::size_t>(i)] = make_views(i, upload(ordered_.back()));
         continue;
       }
       if (before_group) before_group(ordered_.back());
-      validate_block(ordered_.back(), i);
+      {
+        // The views a pass will make, on the device layout at a placeholder address (never dereferenced): checks
+        // every tensor a streamed block needs up front.
+        std::vector<weights::UploadPiece> pieces;
+        detail::block_views(i, weights::plan_group_upload(ordered_.back(), reinterpret_cast<void*>(std::uintptr_t{1} << 30),
+                                                          block_bytes_, pieces), quant);
+      }
       seq_of_[static_cast<std::size_t>(i)] = static_cast<int>(streamed_.size());
       streamed_.push_back(i);
       if (residency.source == StreamSource::kHostPinned) {
         host_.push_back(weights::load_group_to_host(*readers_, ordered_.back(), weights::HostMemory::kPinned));
+        if (host_transform) host_transform(host_.back().tensors);
       }
     }
     if (residency.streamed()) create_streaming_resources();
@@ -354,19 +445,7 @@ std::size_t BlockWeights::host_resident_bytes() const {
   return total;
 }
 
-BlockTensors BlockWeights::make_views(int block, const TensorMap& m) const {
-  const std::string p = prefix(block);
-  BlockTensors b;
-  b.norm1 = detail::take(m, p + "norm1.weight", {kDim});
-  b.norm2 = detail::take(m, p + "norm2.weight", {kDim});
-  b.q_norm = detail::take(m, p + "q_norm.weight", {kHeadDim});
-  b.k_norm = detail::take(m, p + "k_norm.weight", {kHeadDim});
-  b.qkv = detail::fuse(m, fused_qkv(block), kDim, kDim);
-  b.o = detail::take(m, p + "proj.o.weight", {kDim, kDim});
-  b.up_gate = detail::take(m, p + "proj.ffn_up_gate.weight", {kUpGateDim, kDim});
-  b.down = detail::take(m, p + "proj.ffn_down.weight", {kDim, kFfnDim});
-  return b;
-}
+BlockTensors BlockWeights::make_views(int block, const TensorMap& m) const { return detail::block_views(block, m, quant_); }
 
 void BlockWeights::reader_loop(std::size_t r, const std::vector<std::vector<Chunk>>& chunks, Sync& sync) {
   Reader& me = *rd_[r];

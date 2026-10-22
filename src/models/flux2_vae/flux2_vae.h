@@ -1,6 +1,12 @@
 // FLUX.2 VAE decoder (AutoencoderKLFlux2 decode path as the MOSS pipeline calls it, P:430-438 +
 // VaeImageProcessor.postprocess): DiT latents [128, h, w] fp32 -> RGB8 [16h, 16w, 3]. The op sequence and
-// its reference precision are documented in kernels/vae/vae_kernels.h.
+// its reference precision are documented in kernels/vae/vae_kernels.h (for the small decoder's widths).
+//
+// Widths (DecoderConfig): the MOSS bundle ships the small decoder (decoder_block_out_channels 96/192/384/384); the
+// full FLUX.2 decoder (128/256/512/512, e.g. a single-file flux2-vae.safetensors, see vae_file.h) shares the latent
+// space. Both have the same structure with every width scaled by 4/3, so the buffer schedules below hold for both;
+// only the mid attention's head dim differs (384 / 512, both kernels/vae/attention.h). The config comes from the
+// weights' shapes (decoder_config()); the static memory queries take it as their first argument.
 //
 // Structure (so the exact tiled path of plan step 23 can reuse it):
 //   head: BN de-norm + unpack, post_quant_conv, conv_in, mid resnet 0, mid attention. All at latent
@@ -20,9 +26,9 @@
 // attention to single-pass TF32 / TF32 linears, and the tail's convs and GroupNorms to bf16 activations and
 // weights; the head stays fp32 in every mode (~3% of the work, and the attention kernel is fp32-only).
 //
-// Memory: weights (fp32, KRSC conv layout, ~112 MB; + ~56 MB with bf16 copies) in the arena's persistent
-// region; activations on its stack region for the duration of one decode() (sized by workspace_bytes).
-// Two regions of 192 * 16h * 16w activation elements each are ping-ponged, so the peak is the two largest
+// Memory: weights (fp32, KRSC conv layout; small ~112 MB + ~56 MB with bf16 copies, full ~199 MB + ~97 MB) in the
+// arena's persistent region; activations on its stack region for the duration of one decode() (sized by
+// workspace_bytes). Two regions of 2c * 16h * 16w activation elements each (c = 96 small, 128 full) are ping-ponged, so the peak is the two largest
 // live tensors (up_blocks[2]'s upsampler and up_blocks[3]'s first resnet at full resolution), plus a 128 MiB
 // strip scratch when a tensor reaches 2 GiB (CUTLASS's addressing limit; those convs run in row strips with
 // a one-row halo, bit-identical). Stack memory is released when decode() returns, with kernels possibly still
@@ -78,6 +84,23 @@ inline constexpr int kPixelsPerLatent = 16;  // image pixels per DiT latent pixe
 // to one pixel per lower level (2 + 4 + 8 px). The head's receptive field is the whole image (attention).
 inline constexpr int kTailReceptiveRadius = 114;
 
+// decoder_block_out_channels = {c, 2c, 4c, 4c}. Supported: c = 96 (small) and c = 128 (full).
+struct DecoderConfig {
+  int base_channels = 96;
+
+  static constexpr DecoderConfig small() { return {96}; }
+  static constexpr DecoderConfig full() { return {128}; }
+  constexpr int mid() const { return 4 * base_channels; }  // conv_in / mid block / attention head dim
+  // Output channels of up_blocks[b] in execution order (decoder_block_out_channels reversed): 4c, 4c, 2c, c.
+  constexpr int up_out(int b) const { return base_channels * (b < 2 ? 4 : b == 2 ? 2 : 1); }
+  constexpr bool operator==(const DecoderConfig&) const = default;
+  const char* name() const { return base_channels == 96 ? "small" : base_channels == 128 ? "full" : "unsupported"; }
+};
+
+// The VAE "decoder" group's widths, from decoder.conv_in.weight's shape. Throws std::runtime_error when the group is
+// missing or its width is not a supported config.
+DecoderConfig decoder_config(const weights::ModelIndex& index);
+
 struct DecodeMode {
   bool bf16_convs = false;  // tail convs/GroupNorms on bf16 activations (decoder loaded with bf16 weights)
   vae::AttnPrecision attention = vae::AttnPrecision::kTf32x3;
@@ -116,6 +139,7 @@ struct TilePlan {
   };
   std::int64_t height = 0, width = 0;  // latent grid the plan is for
   bool bf16 = false;                   // DecodeMode::bf16_convs the plan is for
+  DecoderConfig config;                // decoder widths the plan is for
   int tile = 0;                        // band height in image pixels (a multiple of 8)
   std::vector<Segment> segments;
   std::size_t workspace_bytes = 0;  // stack bytes decode_tiled allocates
@@ -133,24 +157,36 @@ struct Cancelled : std::runtime_error {
 
 class Flux2VaeDecoder {
  public:
-  // Persistent arena bytes the constructor allocates.
-  static std::size_t persistent_bytes(const weights::ModelIndex& index, bool bf16_weights = false);
+  // Persistent arena bytes the constructor allocates (same arguments).
+  static std::size_t persistent_bytes(const weights::ModelIndex& index, bool bf16_weights = false,
+                                      const weights::ModelIndex* latent_stats = nullptr);
 
-  // Uploads the VAE "decoder" group into the arena's persistent region, rewrites the conv weights to the
-  // KRSC layout in place (plus bf16 KRSC copies when bf16_weights, needed by DecodeMode::bf16_convs) and
-  // waits until everything is resident. Uses a small stack scratch while loading. The arena and the
-  // streams must outlive the decoder.
+  // Uploads the VAE "decoder" group of `index` (any supported widths, see decoder_config()) into the arena's persistent
+  // region, rewrites the conv weights to the KRSC layout in place (plus bf16 KRSC copies when bf16_weights, needed by
+  // DecodeMode::bf16_convs) and waits until everything is resident. Uses a small stack scratch while loading. The arena
+  // and the streams must outlive the decoder; the indexes need not.
+  //
+  // latent_stats: the index whose VAE "decoder" group supplies bn.running_mean / bn.running_var, the latent
+  // de-normalization the DiT latents were made for. Pass the MOSS bundle's index whenever `index` comes from a single
+  // VAE file (vae_file.h): the official pipeline de-normalizes with the bundle's statistics (bf16-rounded values stored
+  // as F32), while the community files carry the unrounded fp32 originals. The two indexes stay separate (the weights
+  // are read through `index`, the statistics through `latent_stats`), so their tensors can never mix. nullptr: `index`'s
+  // own statistics, i.e. the bundle decode, or a single file with no bundle at hand (a fallback, not a current use
+  // case: the result then differs slightly from the official pipeline's). Throws std::runtime_error for a missing,
+  // misshapen or unexpected tensor, or a tensor outside its index's files.
   Flux2VaeDecoder(const weights::ModelIndex& index, runtime::DeviceArena& arena, runtime::StreamSet& streams,
-                  bool bf16_weights = false, bool direct_io = false);
+                  bool bf16_weights = false, bool direct_io = false, const weights::ModelIndex* latent_stats = nullptr);
   ~Flux2VaeDecoder();
   Flux2VaeDecoder(const Flux2VaeDecoder&) = delete;
   Flux2VaeDecoder& operator=(const Flux2VaeDecoder&) = delete;
 
   const LoadStats& load_stats() const { return load_stats_; }
   bool has_bf16_weights() const { return has_bf16_; }
+  const DecoderConfig& config() const { return config_; }
 
   // Stack bytes decode() allocates for a latent grid of height x width (image = 16x that).
-  static std::size_t workspace_bytes(std::int64_t height, std::int64_t width, const DecodeMode& mode = {});
+  static std::size_t workspace_bytes(const DecoderConfig& config, std::int64_t height, std::int64_t width,
+                                     const DecodeMode& mode = {});
 
   // latents: contiguous CUDA fp32 [128, h, w] or [1, 128, h, w] (the pipeline's final latents).
   // rgb: contiguous u8 [16h, 16w, 3] or [1, 16h, 16w, 3], CUDA (asynchronous on `stream`) or CPU (returns
@@ -161,20 +197,22 @@ class Flux2VaeDecoder {
   // ---- Exact tiled decode ----
   // Fastest schedule (least estimated recomputation) whose workspace fits budget_bytes; tile = 0 searches the band
   // height, otherwise it is fixed (image pixels, a multiple of 8). nullopt when nothing fits. Mode: as decode_tiled.
-  static std::optional<TilePlan> plan_tiled(std::int64_t height, std::int64_t width, const DecodeMode& mode,
-                                            std::size_t budget_bytes, int tile = 0);
+  static std::optional<TilePlan> plan_tiled(const DecoderConfig& config, std::int64_t height, std::int64_t width,
+                                            const DecodeMode& mode, std::size_t budget_bytes, int tile = 0);
   // The schedule with the smallest workspace for this band height, and among those the fastest.
-  static TilePlan plan_tiled_min_memory(std::int64_t height, std::int64_t width, const DecodeMode& mode, int tile);
+  static TilePlan plan_tiled_min_memory(const DecoderConfig& config, std::int64_t height, std::int64_t width,
+                                        const DecodeMode& mode, int tile);
   // plan_tiled_min_memory(...).workspace_bytes.
-  static std::size_t tiled_workspace_bytes(std::int64_t height, std::int64_t width, int tile, const DecodeMode& mode);
+  static std::size_t tiled_workspace_bytes(const DecoderConfig& config, std::int64_t height, std::int64_t width, int tile,
+                                           const DecodeMode& mode);
 
   // Byte-identical to decode() in the same mode. Requires mode.torch_group_norm == false (every mode but
-  // torch_reference()) and a plan made for this latent grid and mode. The hook sees the head stages only. Allocates
+  // torch_reference()) and a plan made for this latent grid, mode and config(). The hook sees the head stages only. Allocates
   // plan.workspace_bytes of stack.
   void decode_tiled(const Tensor& latents, const Tensor& rgb, const DecodeMode& mode, const TilePlan& plan,
                     cudaStream_t stream, const StageHook& hook = {});
 
-  // Untiled when workspace_bytes() fits budget_bytes; otherwise the fastest tiled plan within it, byte-identical to the
+  // Untiled when workspace_bytes(config(), ...) fits budget_bytes; otherwise the fastest tiled plan within it, byte-identical to the
   // untiled decode. A torch_group_norm mode tiles with exact GroupNorm statistics instead (max 1/255 from its untiled
   // decode). Returns the plan used (nullopt: untiled).
   // Throws std::runtime_error when even the smallest tiled plan does not fit.
@@ -189,10 +227,6 @@ class Flux2VaeDecoder {
  private:
   friend class TiledRunner;
 
-// A tiled decode saw the cancel flag (Flux2VaeDecoder::set_cancel). The decoder stays usable.
-struct Cancelled : std::runtime_error {
-  Cancelled() : std::runtime_error("flux2_vae: decode cancelled") {}
-};
   struct Conv {
     Tensor w;       // fp32 [K, R, S, C]
     Tensor w_bf16;  // bf16 [K, R, S, C] (bf16_weights only)
@@ -216,11 +250,13 @@ struct Cancelled : std::runtime_error {
   void conv(const Ctx& c, const Tensor& x, const Conv& cv, const Tensor* residual, const Tensor& y) const;
   void norm(const Ctx& c, const Tensor& x, const Norm& n, bool silu, const Tensor& y) const;
   char* resnet(const Ctx& c, const Resnet& r, char* x, char* a, char* b, std::int64_t h, std::int64_t w) const;
+  void mid_attention(const Ctx& c, const Tensor& x, char* attn_ws, std::size_t attn_bytes) const;
   void run_head(const Ctx& c, const Tensor& latents, char* x, char* a, char* b, char* attn_ws, std::size_t attn_bytes) const;
   // Writes RGB8 into rgb when it is on the device, else into a stack staging buffer; returns the written tensor.
   Tensor run_tail(const Ctx& c, const Tensor& rgb) const;
 
   runtime::DeviceArena& arena_;
+  DecoderConfig config_;
   cublasLtHandle_t lt_ = nullptr;
   LoadStats load_stats_;
   bool has_bf16_ = false;
