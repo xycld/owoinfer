@@ -10,6 +10,10 @@
 #include <string>
 #include <vector>
 
+#if !defined(__FLT16_MAX__)  // no _Float16 (MSVC): CUDA's host float -> half, also round-to-nearest-even
+#include <cuda_fp16.h>
+#endif
+
 #include "weights/quant/quant_codec.h"
 #include "weights/safetensors.h"
 
@@ -44,7 +48,11 @@ inline void write_st(const std::filesystem::path& path, const std::vector<StTens
           break;
         }
         case weights::DType::kF16: {
+#if defined(__FLT16_MAX__)
           const _Float16 f = static_cast<_Float16>(v);
+#else
+          const __half f = __float2half_rn(v);
+#endif
           std::uint16_t h;
           std::memcpy(&h, &f, 2);
           data.push_back(static_cast<std::uint8_t>(h & 0xFF));

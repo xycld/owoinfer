@@ -233,8 +233,8 @@ struct Int8Kernel {
 // Visitor nodes of one tile configuration.
 template <class Tile>
 struct Nodes {
-  template <class... Ts>
-  using EVT = cutlass::epilogue::threadblock::Sm80EVT<Ts...>;
+  template <class Op, class... Ts>  // Op named: MSVC cannot expand a pack into Sm80EVT's non-pack NodeOp
+  using EVT = cutlass::epilogue::threadblock::Sm80EVT<Op, Ts...>;
   using ThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<typename Tile::Threadblock,
                                                                            typename Tile::Warp, bf16, kAlignC, 1>;
   using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
