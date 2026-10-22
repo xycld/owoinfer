@@ -1,7 +1,7 @@
-# moss-server (tools/server, docs/server-protocol.md) and the C API example (examples/c). Both are clients of the
-# public C API only: they link the shared libmossinfer when cmake/modules/packaging.cmake defines it (target
-# `mossinfer`), else the static core. Like the CLI they need every module, so they are built in full (unfiltered)
-# builds only. Nothing here exists with MOSSINFER_BUILD_API=OFF.
+# moss-server (tools/server, docs/server-protocol.md), the C API example (examples/c) and the C ABI tests. All are
+# clients of the public C API only: they link the shared libmossinfer when cmake/modules/packaging.cmake defines it
+# (target `mossinfer`), else the static core. Like the CLI they need every module, so they are built in full
+# (unfiltered) builds only, except the header-only layout test. Nothing here exists with MOSSINFER_BUILD_API=OFF.
 if(NOT MOSSINFER_BUILD_API)
   return()
 endif()
@@ -62,6 +62,23 @@ if(NOT MOSSINFER_ONLY AND EXISTS ${CMAKE_SOURCE_DIR}/tools/server/main.cpp)
              -DBUNDLE=${MOSSINFER_TEST_WEIGHTS}/base -DOUT=${CMAKE_BINARY_DIR}/c_example_minimal.png
              -P ${CMAKE_SOURCE_DIR}/tests/c/run_c_example.cmake)
     set_tests_properties(c_example_minimal PROPERTIES LABELS gpu SKIP_REGULAR_EXPRESSION "MOSSINFER_TEST_SKIPPED")
+
+    # A program built against the 0.1 header (hand-written 0.1 struct layouts) against this library. No GPU needed.
+    add_executable(mossinfer_abi_compat_c ${CMAKE_SOURCE_DIR}/tests/c/test_abi_compat.c)
+    set_target_properties(mossinfer_abi_compat_c PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    target_compile_options(mossinfer_abi_compat_c PRIVATE ${_mi_c_warn})
+    if(TARGET mossinfer)
+      target_link_libraries(mossinfer_abi_compat_c PRIVATE mossinfer)
+    else()
+      target_link_libraries(mossinfer_abi_compat_c PRIVATE mossinfer_core)
+      set_target_properties(mossinfer_abi_compat_c PROPERTIES LINKER_LANGUAGE CXX)
+    endif()
+    add_test(NAME c_abi_compat COMMAND mossinfer_abi_compat_c)
+    set_tests_properties(c_abi_compat PROPERTIES LABELS cpu)
+    # The same, plus a generation from the 0.1.0 structs (a PNG without metadata). Skipped without weights or a GPU.
+    add_test(NAME c_abi_compat_gpu COMMAND mossinfer_abi_compat_c ${MOSSINFER_TEST_WEIGHTS}/base
+             ${CMAKE_BINARY_DIR}/c_abi_compat_gpu.png)
+    set_tests_properties(c_abi_compat_gpu PROPERTIES LABELS gpu SKIP_REGULAR_EXPRESSION "MOSSINFER_TEST_SKIPPED")
   endif()
 endif()
 unset(_mi_c_warn)

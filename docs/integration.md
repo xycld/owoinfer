@@ -8,7 +8,7 @@ The reference documents are:
 
 This page does not repeat them. It explains how the pieces fit together, and which choices the launcher has to make.
 
-Version 0.1.0 (ABI 1, server protocol 1). This is a pre-release: see [Versioning](#versioning).
+Version 0.2.0 (ABI 1, server protocol 1). This is a pre-release: see [Versioning](#versioning).
 
 ## Support status
 
@@ -19,7 +19,15 @@ Version 0.1.0 (ABI 1, server protocol 1). This is a pre-release: see [Versioning
 | Platform | Linux x86-64 with the `cu13` build (CUDA 13) |
 | GPUs | NVIDIA compute capability 8.x and 12.x: RTX 30xx, RTX 40xx, RTX 50xx, A100/A10/A40, L4/L40, RTX PRO Blackwell |
 | Models | the official MOSS-Image Base and SFT Hugging Face folders (bf16), read in place |
-| Generation | text-to-image with the official app's parameters: prompt, negative prompt, size, steps, CFG, shift, seed, skip layers, skip-layer guidance, Euler and AB2 samplers |
+| Component model files | a single-file DiT, text encoder or VAE next to the bundle folder: ComfyUI and community files, INT8 ConvRot DiT and text encoder, W4A8 text encoder (`dit_file`, `text_encoder_file`, `vae_file`) |
+| Generation | text-to-image with the official app's parameters: prompt, negative prompt, size, steps, CFG, shift, seed, skip layers, skip-layer guidance |
+| Quality tier | `auto` (default: the fastest configuration with a quality certificate, else exact), `reference` (bf16, exact), `high` (the loaded weights plus 8-bit attention); the tier that ran is reported |
+| Attention mode | exact (FlashAttention-2) or one of four 8-bit modes, as an override of the tier's choice |
+| LoRAs | a list of files with strengths per generation, applied at run time; per-file reports and warnings |
+| Samplers and schedulers | 9 samplers (Euler, AB2, Euler ancestral, Heun, DPM++ 2M, DPM++ 2M SDE, ER-SDE, RES multistep, data-space), 7 schedulers, noise layout and source, eta, s_noise, flow multiplier |
+| Preview | a latent preview image during sampling, every N steps (library: a callback with RGB8; server: a PNG rewritten in place and a `preview` event) |
+| PNG metadata | the generation settings embedded in the PNG (`generation` record, schema `mossinfer.generation/1`, plus `parameters`), the prompts optional |
+| Prompt token report | token counts per prompt and a truncation warning |
 | Memory modes | `min_memory`, `balanced`, `max_speed`, plus explicit VRAM and RAM budgets. The engine plans against the VRAM that is actually free and streams the model when it doesn't fit. |
 | Integration surfaces | the C library (`libmossinfer`) and the sidecar process (`moss-server`), with the same features |
 | Run-time control | progress, cancel from any thread, one generation at a time per engine, device probe and build recommendation |
@@ -27,24 +35,16 @@ Version 0.1.0 (ABI 1, server protocol 1). This is a pre-release: see [Versioning
 
 ### Planned: integrate now, enabled later
 
-These are designed and partly built. Some already have their place in the API, so the launcher can wire them up today behind a capability check (see [Preparing for planned features](#preparing-for-planned-features)).
+These are designed and partly built. The launcher can prepare for them now (see [Preparing for planned features](#preparing-for-planned-features)).
 
 | Feature | State | How the launcher prepares |
 |---|---|---|
 | Windows x64 (MSVC) builds, both flavours | code written, never compiled; first build comes with CI | ship the same integration code; budget time for fixes on the first Windows build |
 | `cu12` builds (Linux and Windows) | written, never compiled | include the flavour choice (see [Picking the build](#picking-the-build-cu12-or-cu13)) |
 | Release archives | the CI workflows exist but have not run yet | build from source until then (see [Getting the binaries](#getting-the-binaries)) |
-| Image preview during sampling | in the API now (`preview_callback`, `MI_CAP_PREVIEW`); never called yet | implement the callback; show previews only when the capability is set |
-| ComfyUI and quantized model files (e.g. INT8 ConvRot) | in the API now (`MI_MODEL_FORMAT_COMFYUI`, `MI_CAP_COMFYUI_MODELS`); returns `MI_ERR_NOT_SUPPORTED` (server: `not_supported`) | offer these files only when the capability is set |
-| Quality tier: exact bf16, INT8 "High", "Auto" per GPU (Auto uses only tiers that pass a quality check) | in development; not in the API yet | plan a tier setting with "Auto" as the default |
-| Separate DiT, text-encoder and VAE files | in development; not in the API yet | plan per-component file pickers next to the model folder |
-| Attention mode: exact or 8-bit | in development; not in the API yet | plan an advanced setting |
-| LoRAs (files and strengths, applied at run time) | in development; not in the API yet | plan a LoRA list per generation |
-| More samplers and schedulers | in development; not in the API yet | keep the sampler setting open to new values |
-| Generation settings embedded in the PNG (prompt optional) | in development; not in the API yet | plan an "embed settings" option |
-| Prompt token count and truncation warning | in development; not in the API yet | plan a warning next to the prompt box |
-
-Provisional parameter names for these are under [Preparing for planned features](#preparing-for-planned-features).
+| Image-to-image | planned; not in the API yet | plan an init image and a denoise strength per generation |
+| High-resolution fix | planned; not in the API yet | plan a second-pass (upscale) setting |
+| Inpainting | planned; not in the API yet | plan a mask input next to the init image |
 
 ### Not supported
 
@@ -56,8 +56,8 @@ Provisional parameter names for these are under [Preparing for planned features]
 | 32-bit systems | not supported |
 | One generation split across several GPUs | not supported. One engine per GPU is the intended pattern (not yet tested on multi-GPU machines). |
 | Several generations at once on one engine | not supported: queue them in the launcher |
-| Image-to-image, high-resolution fix, inpainting | not supported; on the long-term roadmap |
-| INT4 "Turbo" tier | not supported; under evaluation |
+| A ComfyUI checkpoint or models folder as the model path | not supported: the model path is a bundle folder; ComfyUI files load as component files |
+| INT4 "Turbo" tier | not supported; under evaluation (`turbo` is refused) |
 | Server output other than PNG | not supported |
 
 ## Choosing the integration surface
@@ -118,7 +118,7 @@ cmake --preset linux-cuda13
 cmake --build --preset linux-cuda13 -j8
 CUDA_VISIBLE_DEVICES="" ctest --preset linux-cuda13 -L '^cpu$'
 cmake --install build-linux-cuda13                # -> build-linux-cuda13/install
-(cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-0.1.0-linux-cu13-x86_64.{tar.gz,zip}
+(cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-0.2.0-linux-cu13-x86_64.{tar.gz,zip}
 ```
 
 - **glibc:** the archive needs the glibc of the machine that built it, or a newer one. Build on the oldest distribution you want to support. CI uses Ubuntu 22.04, which gives glibc 2.35. A build from a rolling distribution such as Arch will not start on Ubuntu LTS.
@@ -154,7 +154,8 @@ hf download OpenMOSS-Team/MOSS-Image-SFT  --local-dir MOSS-Image/sft  --exclude 
 - **The model path is the folder** that contains `text_encoder/`, `tokenizer/`, `transformer/` and `vae/`, e.g. `MOSS-Image/base`.
 - **The folder can be read-only.** The engine writes nothing into it. An optional `moss.mossidx` index, made with `moss-infer index <folder>`, makes the first load slightly faster. Without one, the engine builds the index in memory.
 - **To save disk with both models,** hard-link SFT's `text_encoder/*.safetensors` and `vae/*.safetensors` to Base's. They are byte-identical.
-- **ComfyUI and quantized files** are planned (see [Support status](#support-status)). Until `MI_CAP_COMFYUI_MODELS` is set, `MI_MODEL_FORMAT_COMFYUI`, or a file path with `MI_MODEL_FORMAT_AUTO`, returns `MI_ERR_NOT_SUPPORTED`, and the server answers `not_supported`.
+- **ComfyUI and quantized files** load as component files next to the bundle folder: `dit_file` (INT8 ConvRot, mixed INT8/bf16 or bf16 DiT), `text_encoder_file` (INT8 ConvRot or W4A8) and `vae_file`. The tokenizer and configs still come from the folder. A file as the model path itself (`MI_MODEL_FORMAT_COMFYUI`, or a file with `MI_MODEL_FORMAT_AUTO`) returns `MI_ERR_NOT_SUPPORTED`, and the server answers `not_supported`, while `MI_CAP_COMFYUI_MODELS` is unset.
+- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. A quality certificate (`<dit>.mossinfer-cert.json`, or in `<cache_dir>/quality_certs/`) lets `auto` pick a lossy configuration; the report's `quality` object says which one ran and whether it was certified.
 
 ## Picking the build: cu12 or cu13
 
@@ -189,12 +190,12 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 **Messages.**
 - One JSON object per line, UTF-8.
 - Every request has an `id` and gets exactly one response with that `id`.
-- Events (`plan`, `progress`, `done`, `log`) carry the `id` of the request they belong to, and can arrive between responses. Read stdout on a dedicated thread, and dispatch by `id` and `event`.
+- Events (`plan`, `progress`, `preview`, `done`, `log`) carry the `id` of the request they belong to, and can arrive between responses. Read stdout on a dedicated thread, and dispatch by `id` and `event`.
 
 **Lifecycle.**
 1. `hello`: check `protocol_version == 1` and `abi_version`, and pick the flavour (see above).
 2. `load` `{"model": "<folder>", "mode": "balanced", "cache_dir": "<launcher cache dir>/mossinfer"}`. This returns quickly. The weights load during `generate`: the DiT in the first `dit_load` phase, and the text encoder streams in `text_encoder` whenever the prompt is not in the embedding cache.
-3. `generate` `{"prompt": ..., "output": "<path>.png", ...}`. The answer is immediate: `{"accepted": true}`. Then come `plan` once, `progress` at each phase start and after each step, and finally `done` with `status` `ok`, `cancelled` or `error`.
+3. `generate` `{"prompt": ..., "output": "<path>.png", ...}`. The answer is immediate: `{"accepted": true}`. Then come `plan` once, `progress` at each phase start and after each step, `preview` before a step's `progress` when `preview_output` is set, and finally `done` with `status` `ok`, `cancelled` or `error`. Show `done.warnings` (LoRA losses, a truncated prompt) next to the image.
 4. `cancel` `{"id": <the generate request's id>}` from the UI's stop button. The id must match exactly, JSON type included (`"g1"` is not `1`). The generation stops within one block or layer, and `done` arrives with `"status": "cancelled"`.
 5. `unload` frees the VRAM while the launcher stays open. `load` with different settings replaces the engine: the old one is released first, so if the new `load` fails, no engine is loaded.
 6. `shutdown` on exit. The server cancels any running generation, answers, and exits with status 0. Kill it if it hasn't exited after a few seconds.
@@ -216,7 +217,8 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 - **`invalid_argument`** (from `load`): the model path does not exist, or a setting is out of range.
 - **`model`:** the folder is not a MOSS-Image model folder, or its files are damaged.
 - **`io`:** a file could not be read, or the PNG could not be written.
-- **`not_supported`:** a planned feature that this build does not enable yet.
+- **`not_supported`:** a feature that this build does not enable, e.g. a ComfyUI file as the model path.
+- **`invalid_argument` in `done`:** a tier combination the engine refuses, e.g. `reference` with an INT8 `dit_file`. The message names the conflict.
 
 **Paths.** The server trusts its input: it reads and writes exactly the paths it is given. The launcher must choose `output` and `cache_dir` itself, or validate them, and must not forward raw paths from untrusted sources (see "Security" in [server-protocol.md](server-protocol.md)).
 
@@ -225,7 +227,7 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 With CMake:
 
 ```cmake
-find_package(MossInfer 0.1 REQUIRED CONFIG)   # CMAKE_PREFIX_PATH=<unpacked package>
+find_package(MossInfer 0.2 REQUIRED CONFIG)   # CMAKE_PREFIX_PATH=<unpacked package>
 target_link_libraries(launcher PRIVATE MossInfer::mossinfer)
 ```
 
@@ -255,50 +257,59 @@ Bindings in other languages can follow the frozen struct layouts in [c-api.md](c
 | Cache folder | `cache_dir` | **Always set it** to a folder the launcher owns. It holds the prompt-embedding cache and a small hardware profile, which spare later runs a short measurement and a self-check. |
 | GPU | `device_index` / `device` | From `hello`'s device list. Supported devices only. |
 | Model | `model_path` / `model` | The Base or SFT folder. |
+| Model files | `dit_file`, `text_encoder_file`, `vae_file` | Optional file pickers next to the model folder, empty by default (the folder's own components). Offer them when `MI_CAP_MODEL_FILES` / `model_files` is set. |
+| Quality tier | `tier`: `auto` / `reference` / `high` | Default **Auto**. Show the tier that ran (`mi_result_tier()`, or the report's `quality` and `models`), and mark uncertified lossy runs. Leave `turbo` out: this build refuses it. |
+| Attention | `attention`: `default` / `exact` / `q8_fp8` / ... | An advanced setting, default `default` (the tier's choice). |
+| LoRA strictness | `lora_strict` | Off. Turn it on only for workflows where a partly applied LoRA must fail instead of warn. |
 
 **Per-image settings** (`generate` / `mi_gen_params`) mirror the official app's `parameters.json`, and so do the defaults:
 - 1024×1024, 50 steps, CFG 3.0, shift 5.0;
 - seed 42 (`-1` = random; the seed used is in the report);
 - the negative branch skips DiT block 22;
-- Euler sampler.
+- Euler sampler, `moss` scheduler.
 
-Width and height must be multiples of 16, at most 4096 per side, and at most 4.2 megapixels in total. `mi_gen_params_validate()` checks a request without a GPU, which suits live form validation.
+Width and height must be multiples of 16, at most 4096 per side, and at most 4.2 megapixels in total. `mi_gen_params_validate()` checks a request without a GPU, which suits live form validation; the server checks a `generate` before it looks at its own state, so it can validate the same way.
 
-Leave `block_path`, `direct_io` and the skip-layer guidance fields (`slg_*`) at their defaults unless you have a reason to change them. `block_path` changes speed only, never the image.
+| Launcher setting | Engine field (`mi_gen_params` / server `generate`) | Recommendation |
+|---|---|---|
+| LoRA list | `loras` (`{path, strength}` each, at most 64) | A list per generation with a strength slider each. Show `done.warnings` (`mi_result_message()`) after the run. |
+| Sampler and scheduler | `sampler`, `scheduler` | Default Euler + `moss` (the official result). List all names; group the stochastic samplers' `eta` and `s_noise`, and `noise_source`, as advanced options. The `dataspace` sampler needs its parameters file (`dataspace`). |
+| Embed settings | `save_metadata` | On by default (`mi_gen_params_init(p, sizeof *p)`; a program built against the 0.1.0 header gets no metadata). |
+| Include prompts | `include_prompts` | On by default. Offer it as a privacy option for images that will be shared. |
+| Preview | `preview_callback` + `preview_interval` / `preview_output` + `preview_every` | On. Every step is fine for small images; use about 5 for large ones, because each preview is a full-size device-to-host copy plus (server) a PNG write, on the generating thread while the GPU waits. The preview is coarse (no VAE). On Windows, do not keep the server's preview file open: the server renames each new preview over it, a held file makes that fail, and the server then logs a warning and goes on. |
+
+Leave `block_path`, `direct_io`, `noise_layout`, `flow_multiplier` and the skip-layer guidance fields (`slg_*`) at their defaults unless you have a reason to change them. `block_path` changes speed only, never the image.
+
+**Prompt length.** The text encoder keeps at most `max_sequence_length` tokens of the formatted prompt (4096 by default). `mi_result_prompt_tokens()`, the report's `tokens` and `done.warnings` say when a prompt was cut. Show the warning next to the prompt box.
 
 **Reproducibility.** The same model, seed, settings and engine version give the same image on the same GPU and flavour, whatever the VRAM budget and memory mode.
 
 ## Preparing for planned features
 
-Features that already have their place in the API are announced by a capability bit. Check `mi_capabilities()`, or `capabilities` in the server's `hello`, at startup, and enable the matching UI only when the bit is set:
+Features are announced by a capability bit. Check `mi_capabilities()`, or `capabilities` in the server's `hello`, at startup, and enable the matching UI only when the bit is set. The same launcher then works with older and newer builds.
 
-| Capability | C API | `hello` | Enables |
-|---|---|---|---|
-| Preview | `MI_CAP_PREVIEW` | `"preview"` | `preview_callback` delivers RGB8 previews every `preview_interval` steps |
-| ComfyUI and quantized models | `MI_CAP_COMFYUI_MODELS` | `"comfyui_models"` | `MI_MODEL_FORMAT_COMFYUI` and single-file model paths |
+| Capability | C API | `hello` | This build | Enables |
+|---|---|---|---|---|
+| Preview | `MI_CAP_PREVIEW` (0x1) | `"preview"` | set | `preview_callback` / `preview_output` |
+| ComfyUI file as the model path | `MI_CAP_COMFYUI_MODELS` (0x2) | `"comfyui_models"` | unset | `MI_MODEL_FORMAT_COMFYUI` and a file as `model_path` |
+| Component model files | `MI_CAP_MODEL_FILES` (0x4) | `"model_files"` | set | `dit_file`, `text_encoder_file`, `vae_file` |
+| LoRAs | `MI_CAP_LORA` (0x8) | `"lora"` | set | `loras`, `lora_strict` |
+| Tiers and attention | `MI_CAP_TIERS` (0x10) | `"tiers"` | set | `tier`, `attention` |
+| Samplers and schedulers | `MI_CAP_SAMPLERS` (0x20) | `"samplers"` | set | the samplers after AB2, `scheduler`, the noise options |
 
-The other planned features will arrive as **new trailing struct fields and new enum values** in the C API, and as **new optional parameters** for the server. Leaving them unset keeps today's behaviour. These are the provisional names, which may still change:
-
-| Feature | Parameters | Reported in the result |
-|---|---|---|
-| Quality tier | `tier` | the tier chosen, and a quality object (a run with LoRAs is reported as uncertified) |
-| Separate model files | `dit_file`, `text_encoder_file`, `vae_file` | model sources, text-encoder precision |
-| Attention mode | `attention` | |
-| LoRAs | a list of `{path, strength}`, `lora_strict` | per-LoRA reports, warnings, notes |
-| Samplers and schedulers | `scheduler`, `flow_multiplier`, `eta`, `s_noise`, `noise_layout`, `noise_source`, `dataspace` | |
-| Settings embedded in the PNG | `save_metadata` (written as a `generation` record, schema `mossinfer.generation/1`, plus `parameters`) | |
-| Preview (server) | a `preview` event, `preview_every` | |
-| Prompt length check | | token count, and whether the prompt was truncated |
-
-Build the settings UI so that these slot in without a redesign. Integration code written now needs no rework for them, only a rebuild against the new header.
+The planned features (image-to-image, high-resolution fix, inpainting) will arrive the same way: **new trailing struct fields, new enum values and new capability bits** in the C API, and **new optional parameters** for the server. Leaving them unset keeps today's behaviour. A program built against an older header keeps working with a newer library, because the library accepts every older struct size (see [Versioning](#versioning)). Build the settings UI so that an init image, a denoise strength and a mask can slot in without a redesign.
 
 ## Reports and diagnostics
 
 Every result carries a JSON report: `mi_result_report_json()`, or `done.report` from the server. It holds:
 - the request and the seed used;
+- the tier that ran, the quality object (certificate, configuration) and the model sources;
+- the prompt token counts, and the LoRA reports, warnings and notes;
 - the execution plan: what was resident, and the memory per phase;
 - timings per phase, and VRAM and RAM peaks;
 - model streaming statistics and the hardware profile.
+
+The library also has accessors for the parts a launcher shows: `mi_result_tier()`, `mi_result_text()`, `mi_result_prompt_tokens()`, `mi_result_lora()` and `mi_result_message()` (see [c-api.md](c-api.md#results)).
 
 Attach it to bug reports, together with the server's stderr log and `hello`'s `probe`.
 
@@ -307,14 +318,15 @@ Attach it to bug reports, together with the server's stderr log and `hello`'s `p
 ## Versioning
 
 - **Version numbers.**
-  - `mi_version()` returns the release version (`0.1.0`).
+  - `mi_version()` returns the release version (`0.2.0`).
   - `mi_abi_version()` and `MI_ABI_VERSION` give the binary interface version (1).
   - The server's `hello` reports its `protocol_version` (1).
 - **Additive changes keep ABI 1:** new functions, new fields at the end of structs, new enum values, new optional server parameters and events.
-  - The policy is that a newer library will accept structs from programs built against an older header: their `struct_size` is smaller, and the missing fields take their defaults.
-  - 0.1.0 is the first release, so no older size exists yet. Today the library accepts exactly its own sizes, and returns `MI_ERR_ABI_MISMATCH` for any other.
+  - A newer library accepts structs from programs built against an older header: their `struct_size` is smaller, the library reads only those bytes, and the missing fields take their defaults. It writes only `struct_size` bytes of output structs.
+  - This is implemented: 0.2.0 accepts the 0.1.0 sizes of `mi_engine_params` (80 bytes) and `mi_gen_params` (168 bytes) as well as its own (120 and 240). Any other size returns `MI_ERR_ABI_MISMATCH`. A 0.1.0 program keeps the 0.1.0 behaviour: its PNGs carry no metadata. See [c-api.md](c-api.md#struct-sizes).
 - **Incompatible changes raise `MI_ABI_VERSION`.** On Linux the shared library's SONAME follows the ABI (`libmossinfer.so.1`).
-- **Before 1.0, pin the launcher to an exact engine release,** and rebuild it against each new header. A minor release may still raise the ABI. The CMake package accepts only the same `MAJOR.MINOR`.
+- **Before 1.0, pin the launcher to an exact engine release,** and rebuild it against each new header. A minor release may still raise the ABI.
+  - **Run time and build time differ.** At run time, the 0.2 library accepts programs built against the 0.1 header (same ABI, older struct sizes). At build time, the CMake package (`SameMinorVersion`) satisfies only the matching `MAJOR.MINOR`: `find_package(MossInfer 0.1)` does not find 0.2.0. Update the requested version when you move to a new header.
 - **Server clients:** unknown parameters are rejected with `invalid_params`, so a typo never goes unnoticed. Send only parameters that the server's version documents. Ignore unknown fields in responses and events, because new ones will appear.
 
 ## Licensing and redistribution

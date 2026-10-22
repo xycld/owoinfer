@@ -26,6 +26,14 @@ int main(void) {
   check("sizeof(mi_sampler)", sizeof(mi_sampler), 4);
   check("sizeof(mi_phase)", sizeof(mi_phase), 4);
   check("sizeof(mi_block_path)", sizeof(mi_block_path), 4);
+  check("sizeof(mi_tier)", sizeof(mi_tier), 4);
+  check("sizeof(mi_attention)", sizeof(mi_attention), 4);
+  check("sizeof(mi_precision)", sizeof(mi_precision), 4);
+  check("sizeof(mi_scheduler)", sizeof(mi_scheduler), 4);
+  check("sizeof(mi_noise_layout)", sizeof(mi_noise_layout), 4);
+  check("sizeof(mi_noise_source)", sizeof(mi_noise_source), 4);
+  check("sizeof(mi_result_text_kind)", sizeof(mi_result_text_kind), 4);
+  check("sizeof(mi_message_kind)", sizeof(mi_message_kind), 4);
 
   SIZE(mi_device_info, 592);
   FIELD(mi_device_info, struct_size, 0);
@@ -53,7 +61,7 @@ int main(void) {
   FIELD(mi_probe_info, message, 60);
   FIELD(mi_probe_info, _reserved0, 572);
 
-  SIZE(mi_engine_params, 80);
+  SIZE(mi_engine_params, 120);
   FIELD(mi_engine_params, struct_size, 0);
   FIELD(mi_engine_params, model_path, 8);
   FIELD(mi_engine_params, model_format, 16);
@@ -67,7 +75,14 @@ int main(void) {
   FIELD(mi_engine_params, embedding_cache, 64);
   FIELD(mi_engine_params, direct_io, 68);
   FIELD(mi_engine_params, block_path, 72);
-  FIELD(mi_engine_params, _reserved1, 76);
+  FIELD(mi_engine_params, _reserved1, 76); /* the 0.1 layout ends here (80 bytes) */
+  FIELD(mi_engine_params, dit_file, 80);
+  FIELD(mi_engine_params, text_encoder_file, 88);
+  FIELD(mi_engine_params, vae_file, 96);
+  FIELD(mi_engine_params, tier, 104);
+  FIELD(mi_engine_params, attention, 108);
+  FIELD(mi_engine_params, lora_strict, 112);
+  FIELD(mi_engine_params, _reserved2, 116);
 
   SIZE(mi_progress, 40);
   FIELD(mi_progress, struct_size, 0);
@@ -78,7 +93,7 @@ int main(void) {
   FIELD(mi_progress, step_seconds, 24);
   FIELD(mi_progress, elapsed_seconds, 32);
 
-  SIZE(mi_gen_params, 168);
+  SIZE(mi_gen_params, 240);
   FIELD(mi_gen_params, struct_size, 0);
   FIELD(mi_gen_params, prompt, 8);
   FIELD(mi_gen_params, negative_prompt, 16);
@@ -103,7 +118,23 @@ int main(void) {
   FIELD(mi_gen_params, preview_callback, 144);
   FIELD(mi_gen_params, preview_interval, 152);
   FIELD(mi_gen_params, _reserved1, 156);
-  FIELD(mi_gen_params, user_data, 160);
+  FIELD(mi_gen_params, user_data, 160); /* the 0.1 layout ends here (168 bytes) */
+  FIELD(mi_gen_params, scheduler, 168);
+  FIELD(mi_gen_params, noise_layout, 172);
+  FIELD(mi_gen_params, noise_source, 176);
+  FIELD(mi_gen_params, save_metadata, 180);
+  FIELD(mi_gen_params, flow_multiplier, 184);
+  FIELD(mi_gen_params, eta, 192);
+  FIELD(mi_gen_params, s_noise, 200);
+  FIELD(mi_gen_params, dataspace_path, 208);
+  FIELD(mi_gen_params, loras, 216);
+  FIELD(mi_gen_params, loras_count, 224);
+  FIELD(mi_gen_params, include_prompts, 232);
+  FIELD(mi_gen_params, _reserved2, 236);
+
+  SIZE(mi_lora, 16); /* array element without struct_size: frozen */
+  FIELD(mi_lora, path, 0);
+  FIELD(mi_lora, strength, 8);
 
   SIZE(mi_timings, 104);
   FIELD(mi_timings, struct_size, 0);
@@ -141,6 +172,33 @@ int main(void) {
   FIELD(mi_dit_stream_stats, h2d_gbps, 48);
   FIELD(mi_dit_stream_stats, hidden_fraction, 56);
   FIELD(mi_dit_stream_stats, source, 64);
+
+  SIZE(mi_tier_info, 32);
+  FIELD(mi_tier_info, struct_size, 0);
+  FIELD(mi_tier_info, requested, 8);
+  FIELD(mi_tier_info, effective, 12);
+  FIELD(mi_tier_info, attention, 16);
+  FIELD(mi_tier_info, certified, 20);
+  FIELD(mi_tier_info, dit_precision, 24);
+  FIELD(mi_tier_info, text_encoder_precision, 28);
+
+  SIZE(mi_prompt_tokens, 32);
+  FIELD(mi_prompt_tokens, struct_size, 0);
+  FIELD(mi_prompt_tokens, total_tokens, 8);
+  FIELD(mi_prompt_tokens, kept_tokens, 12);
+  FIELD(mi_prompt_tokens, prompt_tokens, 16);
+  FIELD(mi_prompt_tokens, dropped_tokens, 20);
+  FIELD(mi_prompt_tokens, max_length, 24);
+  FIELD(mi_prompt_tokens, truncated, 28);
+
+  SIZE(mi_lora_report, 32);
+  FIELD(mi_lora_report, struct_size, 0);
+  FIELD(mi_lora_report, adapters, 8);
+  FIELD(mi_lora_report, side_branch, 12);
+  FIELD(mi_lora_report, merged, 16);
+  FIELD(mi_lora_report, unknown_keys, 20);
+  FIELD(mi_lora_report, warnings, 24);
+  FIELD(mi_lora_report, notes, 28);
 
   printf("%s: C struct layouts %s the frozen ABI %d table\n", failures ? "FAIL" : "ok",
          failures ? "differ from" : "match", MI_ABI_VERSION);

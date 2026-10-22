@@ -8,10 +8,16 @@
 #include <iterator>
 #include <limits>
 #include <locale>
+#include <stdexcept>
 #include <string>
 
 #include "../../tools/server/json_out.h"
+#include "../../tools/server/names.h"
 #include "pipeline/report_json.h"
+#include "pipeline/samplers/initial_noise.h"
+#include "pipeline/samplers/sampler_driver.h"
+#include "pipeline/samplers/schedules.h"
+#include "planner/planner.h"
 
 namespace {
 
@@ -78,6 +84,62 @@ TEST(ServerJson, NumbersMatchThePipelineAndIgnoreTheLocale) {
   EXPECT_EQ(server[10], "null");
   EXPECT_EQ(server[11], "null");
   EXPECT_EQ(server[12], "null");
+}
+
+// tools/server/names.h: every protocol name is the pipeline's own spelling, and maps to the C value of the pipeline
+// value (the C enums keep the pipeline's order; mi_tier starts with AUTO, mi_attention with DEFAULT = unset). Each C
+// value appears once.
+TEST(ServerJson, EnumNamesAreThePipelines) {
+  namespace p = mi::pipeline;
+  int i = 0;
+  for (const auto& n : mi::server::kSamplerNames) {
+    EXPECT_EQ(static_cast<int>(n.value), i++);
+    EXPECT_EQ(static_cast<int>(p::parse_sampler(n.name)), static_cast<int>(n.value)) << n.name;
+    EXPECT_EQ(p::sampler_name(p::parse_sampler(n.name)), n.name);
+  }
+  EXPECT_EQ(i, 9);
+  i = 0;
+  for (const auto& n : mi::server::kSchedulerNames) {
+    EXPECT_EQ(static_cast<int>(n.value), i++);
+    EXPECT_EQ(static_cast<int>(p::parse_scheduler(n.name)), static_cast<int>(n.value)) << n.name;
+    EXPECT_EQ(p::scheduler_name(p::parse_scheduler(n.name)), n.name);
+  }
+  EXPECT_EQ(i, 7);
+  i = 0;
+  for (const auto& n : mi::server::kNoiseLayoutNames) {
+    EXPECT_EQ(static_cast<int>(n.value), i++);
+    EXPECT_EQ(static_cast<int>(p::parse_noise_layout(n.name)), static_cast<int>(n.value)) << n.name;
+    EXPECT_EQ(p::noise_layout_name(p::parse_noise_layout(n.name)), n.name);
+  }
+  EXPECT_EQ(i, 2);
+  i = 0;
+  for (const auto& n : mi::server::kNoiseSourceNames) {
+    EXPECT_EQ(static_cast<int>(n.value), i++);
+    EXPECT_EQ(static_cast<int>(p::parse_noise_source(n.name)), static_cast<int>(n.value)) << n.name;
+    EXPECT_EQ(p::noise_source_name(p::parse_noise_source(n.name)), n.name);
+  }
+  EXPECT_EQ(i, 3);
+  const mi::planner::Tier tiers[] = {mi::planner::Tier::kAuto, mi::planner::Tier::kReference, mi::planner::Tier::kHigh,
+                                     mi::planner::Tier::kTurbo};
+  i = 0;
+  for (const auto& n : mi::server::kTierNames) {
+    EXPECT_EQ(static_cast<int>(n.value), i);
+    EXPECT_EQ(mi::planner::parse_tier(n.name), tiers[i]) << n.name;
+    EXPECT_EQ(mi::planner::tier_name(tiers[i++]), n.name);
+  }
+  EXPECT_EQ(i, 4);
+  i = 0;
+  for (const auto& n : mi::server::kAttentionNames) {
+    EXPECT_EQ(static_cast<int>(n.value), i++);
+    if (n.value == MI_ATTENTION_DEFAULT) {
+      EXPECT_EQ(n.name, "default");
+      EXPECT_THROW(mi::planner::parse_attention(n.name), std::invalid_argument);
+      continue;
+    }
+    EXPECT_EQ(static_cast<int>(mi::planner::parse_attention(n.name)) + 1, static_cast<int>(n.value)) << n.name;
+    EXPECT_EQ(mi::planner::attention_name(mi::planner::parse_attention(n.name)), n.name);
+  }
+  EXPECT_EQ(i, 6);
 }
 
 // The report of a done event: a NULL from mi_result_report_json() becomes JSON null instead of a crash.

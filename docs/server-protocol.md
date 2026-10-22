@@ -8,7 +8,7 @@
 ```
 moss-server                     # speak the protocol on stdin/stdout
 moss-server --parent-pid <pid>  # the same, and exit when process <pid> (the launcher) exits
-moss-server --version           # "moss-server 0.1.0 (protocol 1, ABI 1)"
+moss-server --version           # "moss-server 0.2.0 (protocol 1, ABI 1)"
 ```
 
 ### `--parent-pid`
@@ -26,8 +26,8 @@ If `<pid>` is not running at startup, the server exits with status 1. A malforme
 
 The server trusts its launcher completely: whoever writes to its stdin has the server's file-system rights. The protocol is a local pipe between a launcher and the child it spawned, not an interface for untrusted input.
 - **No network surface.** The server opens no socket and listens on no port. Its only input is stdin.
-- **Paths are used as given.** `generate`'s `output` is written wherever it points, and an existing file there is overwritten (atomically: a temporary file renamed over it). `load`'s `model` and `cache_dir` are read, and the cache directory is written to. The server does not confine any path to a directory, resolve symlinks, or check ownership.
-- **The launcher validates paths.** A launcher that takes `output`, `model` or `cache_dir` from a user, a web page, a workflow file or another program must check them first. For example, it can confine outputs to its own output directory, reject `..` components and symlinks it did not create, and refuse to overwrite files it does not own.
+- **Paths are used as given.** `generate`'s `output` and `preview_output` are written wherever they point, and an existing file there is overwritten (atomically: a temporary file renamed over it). `load`'s `model`, `dit_file`, `text_encoder_file`, `vae_file` and `cache_dir`, and `generate`'s `loras` paths and `dataspace`, are read, and the cache directory is written to. The server does not confine any path to a directory, resolve symlinks, or check ownership.
+- **The launcher validates paths.** A launcher that takes any of these paths from a user, a web page, a workflow file or another program must check them first. For example, it can confine outputs to its own output directory, reject `..` components and symlinks it did not create, and refuse to overwrite files it does not own.
 - **Run it as the user.** Run the server with the launcher's own (unprivileged) rights, never elevated.
 
 ## Framing
@@ -49,11 +49,11 @@ The server trusts its launcher completely: whoever writes to its stdin has the s
 |---|---|
 | request | `{"id": <string, integer or null>, "method": "<name>", "params": {...}}`. `params` is optional; no other members are allowed. |
 | response | `{"id": <same id>, "result": {...}}` or `{"id": <same id>, "error": {"code": "<code>", "message": "<text>"}}` |
-| event | `{"event": "progress" \| "plan" \| "done" \| "log", "id": <id of the generate request>, ...}` |
+| event | `{"event": "progress" \| "plan" \| "preview" \| "done" \| "log", "id": <id of the generate request>, ...}` |
 
 Every request gets exactly one response. Responses to different requests can interleave with events, so a client should match responses by `id`. A request whose `id` could not be read (malformed JSON, for example) is answered with `"id": null`.
 
-Unknown members in `params` are rejected (`invalid_params`), so a typo cannot be silently ignored.
+Unknown members in `params` are rejected (`invalid_params`), so a typo cannot be silently ignored. So is a member given twice, in `params` and in a `loras` entry, because one of its values would be lost.
 
 ### Error codes
 
@@ -64,8 +64,8 @@ Unknown members in `params` are rejected (`invalid_params`), so a typo cannot be
 | `method_not_found` | unknown `method` |
 | `invalid_params` | wrong parameter type or value, unknown parameter, a string containing NUL (`\u0000`: the C API's strings are NUL-terminated), or a generation request the engine rejects (the message uses the official app's wording) |
 | `unsupported_protocol` | `hello` asked for another protocol version |
-| `no_engine` | `generate` before `load` |
-| `busy` | `generate`, `load` or `unload` while a generation runs |
+| `no_engine` | a valid `generate` before `load` |
+| `busy` | a valid `generate`, or `load` or `unload`, while a generation runs |
 | `invalid_argument`, `abi_mismatch`, `not_supported`, `out_of_memory`, `model`, `io`, `cuda`, `internal` | the engine's `mi_status` (`MI_ERR_<CODE>`), with `mi_last_error_message()` as the message |
 
 ## Methods
@@ -79,8 +79,8 @@ Params (all optional):
 
 ```
 >> {"id": 1, "method": "hello", "params": {"client": "launcher", "protocol_version": 1}}
-<< {"id": 1, "result": {"protocol_version": 1, "server": "moss-server", "version": "0.1.0", "abi_version": 1,
-    "capabilities": {"preview": false, "comfyui_models": false},
+<< {"id": 1, "result": {"protocol_version": 1, "server": "moss-server", "version": "0.2.0", "abi_version": 1,
+    "capabilities": {"preview": true, "comfyui_models": false, "model_files": true, "lora": true, "tiers": true, "samplers": true},
     "probe": {"driver_cuda_version": 13040, "runtime_cuda_version": 13040, "driver_compatible": true,
               "device_count": 1, "supported_device_count": 1, "build_flavour": "cu13", "recommended_flavour": "cu13",
               "message": "recommended flavour cu13 (the driver supports CUDA 13.4)"}}}
@@ -92,6 +92,17 @@ With `"devices": true`, `probe.devices` is a list of objects with these fields:
 - `supported`, `unsupported_reason`
 
 `hello` works without a GPU or driver; the reason is then in `message`.
+
+`capabilities` mirrors the C API's `mi_capabilities()` bits. A launcher enables a feature's UI only when its capability is true.
+
+| Capability | C bit | This build | Covers |
+|---|---|---|---|
+| `preview` | `MI_CAP_PREVIEW` | true | `generate`'s `preview_output` / `preview_every`, the `preview` event |
+| `comfyui_models` | `MI_CAP_COMFYUI_MODELS` | false | a ComfyUI file or folder as `load`'s `model` |
+| `model_files` | `MI_CAP_MODEL_FILES` | true | `load`'s `dit_file`, `text_encoder_file`, `vae_file` (ComfyUI / community INT8 ConvRot and W4A8 files included) |
+| `lora` | `MI_CAP_LORA` | true | `generate`'s `loras`, `load`'s `lora_strict` |
+| `tiers` | `MI_CAP_TIERS` | true | `load`'s `tier` and `attention` |
+| `samplers` | `MI_CAP_SAMPLERS` | true | the samplers after `ab2`, `scheduler`, `noise_layout`, `noise_source`, `flow_multiplier`, `eta`, `s_noise`, `dataspace` |
 
 ### `load`
 
@@ -109,6 +120,14 @@ Creates the engine. A loaded engine is released first, because two engines would
 | `embedding_cache` | bool | true | |
 | `direct_io` | bool | false | |
 | `block_path` | string | `"default"` (fused) | DiT block implementation: `"default"`, `"op_by_op"`, `"fused"`, `"fused_graphs"`. All give the same image; the path that ran is the report's `dit_blocks.path`. |
+| `dit_file` | string | `""` (the bundle's `transformer/`) | single-file DiT: INT8 ConvRot, mixed INT8/bf16 or bf16, ComfyUI layout |
+| `text_encoder_file` | string | `""` (the bundle's `text_encoder/`) | INT8 ConvRot or W4A8 text encoder |
+| `vae_file` | string | `""` (the bundle's `vae/`) | single FLUX.2 VAE file |
+| `tier` | string | `"auto"` | `"auto"`, `"reference"`, `"high"`, `"turbo"` (refused at generate time by this build) |
+| `attention` | string | `"default"` (the tier's choice) | `"default"`, `"exact"`, `"q8_fp16"`, `"q8_fp16_f32acc"`, `"q8_fp8"`, `"q8_fp8_f32acc"` |
+| `lora_strict` | bool | false | unknown LoRA keys and lossy merges fail the generation (`model`) instead of being reported |
+
+`tier` and `attention` take exactly the pipeline's spellings (`tier_name()`, `attention_name()`), plus `"default"` for an unset attention. The CLI's alias `q8` (= `q8_fp8`) is not accepted. The tokenizer and configs always come from `model`, which stays a bundle directory. A component file that does not exist fails `load` with `invalid_argument`, naming the parameter; a malformed one fails the first `generate` with `model`. The tiers are described in [c-api.md](c-api.md#tier-and-attention): a combination the tier refuses (e.g. `"reference"` with an INT8 `dit_file`) is accepted by `generate` and then ends in `done` with `"status": "error"` and the code `invalid_argument`. After a run, the report's `quality` and `models` objects say what ran.
 
 ```
 >> {"id": 2, "method": "load", "params": {"model": "/models/MOSS-Image/base", "mode": "balanced"}}
@@ -138,9 +157,25 @@ The params are those of `parameters.json`, plus `output`:
 | `slg_layers` | same | `[]` |
 | `slg_scale`, `slg_start`, `slg_stop` | number | 0, 0, 1 |
 | `max_sequence_length` | integer | 4096 |
-| `sampler` | `"euler"` or `"ab2"` | `"euler"` |
+| `sampler` | string | `"euler"`. One of `"euler"`, `"ab2"`, `"euler_ancestral"`, `"heun"`, `"dpmpp_2m"`, `"dpmpp_2m_sde"`, `"er_sde"`, `"res_multistep"`, `"dataspace"`. |
+| `scheduler` | string | `"moss"`. One of `"moss"`, `"simple"`, `"normal"`, `"karras"`, `"exponential"`, `"beta"`, `"sgm_uniform"`. `"moss"` with `"euler"` is the official pipeline, bit for bit. |
+| `flow_multiplier` | number | 1.0; finite and > 0. `"moss"` ignores it. |
+| `noise_layout` | string | `"official"`, or `"batch_stream"` |
+| `noise_source` | string | `"philox"`, or `"philox_device"`, `"brownian_tree"`: the stochastic samplers' noise |
+| `eta` | number | 1.0 (`euler_ancestral`, `dpmpp_2m_sde`); finite and ≥ 0 |
+| `s_noise` | number | 1.0 (the stochastic samplers); finite and ≥ 0 |
+| `dataspace` | string | none. The `dataspace` sampler's parameters file: required by it, and then it must exist. |
+| `loras` | array | `[]`. Objects `{"path": string, "strength": number}`, applied in order, at most 64. `path` is required and must name an existing file; `strength` defaults to 1 and must be finite. Other members, and a member given twice, are rejected. |
+| `save_metadata` | bool | true: the PNG carries the generation settings (`generation` and `parameters` text chunks, [c-api.md](c-api.md#png-metadata)) |
+| `include_prompts` | bool | true: the metadata includes the prompt and negative prompt |
+| `preview_output` | string | none. A PNG path that the server rewrites with a latent preview during sampling (see the `preview` event). |
+| `preview_every` | integer ≥ 1 | 1: steps between previews (the last step always gets one). Only valid together with `preview_output`. Use about 5 for large images (see the `preview` event). |
 
-The request is validated before it is accepted, so an invalid request gets an `invalid_params` error and no events:
+`save_metadata` and `include_prompts` default to true for every client. The server has not been released before 0.2.0, so no client depends on the C API's 0.1.0 behaviour (no metadata), which only a program built against the 0.1.0 header keeps ([c-api.md](c-api.md#struct-sizes)).
+
+The names are the pipeline's own spellings (`sampler_name()`, `scheduler_name()`, `noise_layout_name()`, `noise_source_name()`). The server maps them to the C API's enum values through its own table (`tools/server/names.h`), which a `cpu` test checks against the pipeline.
+
+The request is validated before it is accepted, so an invalid request gets an `invalid_params` error and no events. Validation comes before the server's state: an invalid request gets `invalid_params` even without an engine or while a generation runs. It includes the existence of the LoRA and dataspace files.
 
 ```
 >> {"id": "bad", "method": "generate", "params": {"prompt": "x", "width": 1000, "output": "x.png"}}
@@ -159,7 +194,14 @@ A complete run. Lines are shortened; a real `plan` and `report` are longer:
 << {"event": "progress", "id": "g1", "phase": "denoise", "step": 1, "total_steps": 2, "step_seconds": 0.12715, "elapsed_seconds": 8.42648}
 << {"event": "progress", "id": "g1", "phase": "denoise", "step": 2, "total_steps": 2, "step_seconds": 0.116925, "elapsed_seconds": 8.54342}
 << {"event": "progress", "id": "g1", "phase": "decode", "step": 0, "total_steps": 2, "step_seconds": 0, "elapsed_seconds": 8.54358}
-<< {"event": "done", "id": "g1", "status": "ok", "image": "/tmp/apple.png", "report": {"request": {...}, "seed_used": 7, "steps_run": 2, "cancelled": false, "image": "/tmp/apple.png", ...}}
+<< {"event": "done", "id": "g1", "status": "ok", "image": "/tmp/apple.png", "report": {"request": {...}, "seed_used": 7, "steps_run": 2, "cancelled": false, "image": "/tmp/apple.png", ...}, "warnings": []}
+```
+
+With a preview (`"preview_output": "/tmp/preview.png"`), each denoise step that gets one sends a `preview` right before its `progress`:
+
+```
+<< {"event": "preview", "id": "g1", "step": 1, "total_steps": 2, "image": "/tmp/preview.png", "width": 256, "height": 256}
+<< {"event": "progress", "id": "g1", "phase": "denoise", "step": 1, "total_steps": 2, "step_seconds": 0.13021, "elapsed_seconds": 8.43117}
 ```
 
 ### Events of a generation
@@ -168,12 +210,19 @@ A complete run. Lines are shortened; a real `plan` and `report` are longer:
 |---|---|
 | `plan` | `explanation` (several lines of text), `plan` (object: residencies, arena, per-phase peaks, time estimate). Sent once, before the first phase. |
 | `progress` | `phase` (`text_encoder`, `dit_load`, `denoise`, `decode`, in that order), `step`, `total_steps`, `step_seconds`, `elapsed_seconds` |
-| `done` | `status`, plus fields that depend on it (below) |
-| `log` | `level` (`info`), `message`; `id` when it belongs to a request |
+| `preview` | `step`, `total_steps`, `image` (the `preview_output` path), `width`, `height`. Only with `preview_output`. |
+| `done` | `status`, `warnings`, plus fields that depend on `status` (below) |
+| `log` | `level` (`info`, `warning`), `message`; `id` when it belongs to a request |
 
 `progress` is sent at each phase start (`step` 0) and after every sampling step.
 - `text_encoder` is entered even on a full embedding-cache hit, and `dit_load` even when the DiT is resident.
 - `total_steps` counts the scheduled steps, which can be fewer than the requested `steps`.
+
+`preview` is sent after every `preview_every`-th sampling step and after the last one, before that step's `progress`.
+- The server first rewrites the `preview_output` PNG through `mi_write_png()` (atomically: a reader never sees a partial file), then sends the event. Read the file when the event arrives; the next preview replaces it.
+- The image has the requested size (`width` × `height`). It is a linear latent → RGB map of the current x0 estimate, without the VAE: coarse, not the final image.
+- Each preview costs a full-size device-to-host copy and a PNG write (about 3 bytes per pixel, uncompressed), both on the generating thread while the GPU waits. For large images, a `preview_every` of about 5 keeps that cost small.
+- A preview that cannot be written is skipped with a `log` event of level `warning`; the generation goes on. On Windows this happens when a reader holds the preview file open while the server renames the new one over it: open the file, read it and close it again, or copy it, rather than keeping it open.
 
 The fields of `done` depend on `status`:
 
@@ -183,12 +232,19 @@ The fields of `done` depend on `status`:
 | `"cancelled"` | `steps_run`, `report` (no image is written) |
 | `"error"` | `error: {code, message}`, plus `report` when only the PNG write failed |
 
+`warnings` is always present: an array of strings for the launcher to show, empty when there is nothing to say.
+- One entry per LoRA warning, `"LoRA <module>: <reason>"` (e.g. an adapter requantized on INT8 GEMMs).
+- `"prompt truncated to K of N tokens (D dropped; max_sequence_length M)"`, and the same for the `"negative prompt"`, when the text encoder cut the end of a prompt.
+
 `report` is the same document as `moss-infer generate --json-report`, or `null` in the rare case that the library could not render it (`mi_result_report_json()` returned NULL, e.g. out of host memory):
 - `request`, `seed_used`, `steps_scheduled`, `steps_run`, `cancelled`, `cond_tokens`, `uncond_tokens`
 - `image`, `latents` (always `""` here), `mode`, `plan`, `embedding_cache`, `decode`
 - `dit_blocks` (`path` that ran, `note` saying why it differs from the requested one, or `""`)
 - `timings_s`, `memory_gib`, `host_memory_gib`, `hardware`
 - `dit_stream`: DiT block streaming (`streamed`, `resident_blocks`, `buffers`, `source`, `bytes`, `copy_s`, `stall_s`, `stalls`, `h2d_gbps`, `hidden`, and per-step `steps`)
+- `tokens`: per prompt, `total`, `kept`, `template`, `prompt`, `dropped`, `max_length`, `truncated`
+- `quality` (tier, configuration, certificate, GPU class) and `models` (DiT, text encoder and VAE sources, DiT linears, requested and effective tier, certified, text-encoder precision)
+- `loras` (per file: adapters, side branch, merged, unknown keys, strength), `lora_warnings`, `lora_notes`
 
 The server is idle again by the time `done` is written, so the next `generate` can follow it immediately.
 
@@ -201,7 +257,7 @@ The generation stops within one text-encoder layer, DiT block or decode band, an
 ```
 >> {"id": 4, "method": "cancel", "params": {"id": "g2"}}
 << {"id": 4, "result": {"cancelling": true, "generating_id": "g2"}}
-<< {"event": "done", "id": "g2", "status": "cancelled", "steps_run": 2, "report": {...}}
+<< {"event": "done", "id": "g2", "status": "cancelled", "steps_run": 2, "report": {...}, "warnings": []}
 ```
 
 When nothing runs, the answer is `{"cancelling": false}`. When another generation runs, the answer also carries its `"generating_id"`.
@@ -242,17 +298,19 @@ send({"id": 3, "method": "shutdown"})
 
 ## Tests
 
-`tests/server/test_protocol.py` uses the standard library only. The server's JSON output helpers (`tools/server/json_out.h`; the server links only the C API, so it cannot use the pipeline's report renderer) are checked by the `cpu` gtest suite `ServerJson.*` (`tests/unit/test_server_json.cpp`): strings and numbers are written exactly as `pipeline::json_escape` / `json_number` write them, numbers ignore the C and C++ locales, and a NULL report becomes `null`.
+`tests/server/test_protocol.py` uses the standard library only. The server's JSON output helpers (`tools/server/json_out.h`; the server links only the C API, so it cannot use the pipeline's report renderer) are checked by the `cpu` gtest suite `ServerJson.*` (`tests/unit/test_server_json.cpp`): strings and numbers are written exactly as `pipeline::json_escape` / `json_number` write them, numbers ignore the C and C++ locales, and a NULL report becomes `null`. `ServerJson.EnumNamesAreThePipelines` checks the name tables of `tools/server/names.h` against the pipeline's names and the C enum values.
 
 | ctest name | Label | What it runs |
 |---|---|---|
 | `server_protocol` | `cpu` | No GPU or weights needed (details below) |
-| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown |
+| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params` |
 
 `server_protocol` covers:
-- `hello`, `status`, and idle `cancel` / `unload`
+- `hello` (the capabilities included), `status`, and idle `cancel` / `unload`
 - malformed input of every kind, unknown methods and params (an unknown or non-string `block_path` included), and NUL in strings
 - `load` errors mapped from engine statuses
+- the P6 `load` params: bad `tier` / `attention` names (`"q8"` and `"auto"` included) and types, every valid name, missing component files
+- the P6 `generate` params, checked without an engine: bad enum names and types, bad numbers, the `dataspace` sampler without or with a missing file (the message names `dataspace`), repeated members in `params` and in a `loras` entry, bad `loras` shapes (not an array, a string element, no or empty `path`, unknown members, a bad `strength`, a missing file), `preview_every` without `preview_output`, and every valid name
 - `shutdown`, end of input, and `--version` / usage errors
 - stdout set up with stderr sent to a file, to `DEVNULL`, merged into stdout, or closed. On Linux, `/proc` shows exactly one fd on the protocol pipe, at 3 or higher, close-on-exec.
 - stdin closed
