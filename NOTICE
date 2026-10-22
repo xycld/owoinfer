@@ -3,7 +3,10 @@ Copyright 2026 The MossInfer Authors
 
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-This product bundles third-party components under their own licenses; see
-third_party/*/LICENSE* and VENDORED.md files (CUTLASS and FlashAttention-2: BSD-3-Clause;
-stb: public domain/MIT) and, in binary packages, the NVIDIA CUDA EULA for redistributed
-CUDA libraries (cuBLASLt, and the CUDA runtime when not statically linked).
+This product bundles, or is derived in part from, third-party components under their own licenses:
+CUTLASS and FlashAttention-2 (BSD-3-Clause), SageAttention and comfy-kitchen (Apache-2.0), stb
+(public domain/MIT, tests only), xxHash (BSD-2-Clause, reimplemented from the specification) and
+Unicode data of Hugging Face tokenizers (Apache-2.0, Unicode License v3). THIRD_PARTY_NOTICES.md
+lists each with its copyright, upstream and license file, and reproduces the comfy-kitchen NOTICE.
+Binary packages also redistribute NVIDIA CUDA libraries (cuBLASLt, and the CUDA runtime when it is
+not statically linked) under the NVIDIA CUDA EULA.

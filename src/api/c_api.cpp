@@ -338,11 +338,7 @@ mi_status mi_probe_device(int32_t index, mi_device_info* info) {
     require(info, "info");
     check_size(info->struct_size, sizeof(mi_device_info), "mi_device_info");
     // The index first: a bad one must not cost a free-memory query (a driver context) on every device.
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess) {
-      cudaGetLastError();  // no driver or device: count 0, like mi_probe()
-      count = 0;
-    }
+    const int count = mi::backend::device_count();  // the same devices mi_probe() lists, old drivers included
     if (index < 0 || index >= count) {
       throw std::invalid_argument("device index " + std::to_string(index) + " out of range (" + std::to_string(count) +
                                   " CUDA devices).");

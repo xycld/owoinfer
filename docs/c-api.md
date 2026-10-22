@@ -84,7 +84,7 @@ cmake --build <build> --target mossinfer_example_c
 2. Selects the device.
 3. Creates the pipeline.
 
-The weights load on the first `mi_generate()`. The DiT stays resident across generations when the plan allows it, so the first call pays the load (about 7 s warm on the dev box) and later ones do not.
+The weights load on the first `mi_generate()`. The DiT stays resident across generations when the plan allows it, so the first call pays the load (about 7 s from a warm page cache on an RTX 4090 Laptop) and later ones do not.
 
 | `mi_engine_params` field | Default | Meaning |
 |---|---|---|
@@ -143,13 +143,13 @@ Strings returned by accessors are owned by the result. They stay valid until `mi
 - this library's flavour and the flavour the machine should install (`"cu13"`, `"cu12"` or `""`)
 - a summary message
 
-It works on machines without a driver or GPU and creates no CUDA context.
+It works on machines without a driver or GPU and creates no CUDA context. When the driver is older than this build's CUDA version (a `cu13` build on a CUDA 12 driver), the CUDA runtime cannot list devices; the probe then lists them through the driver API. Each device the build could otherwise run is marked unsupported with the driver as the reason, and `"cu12"` is recommended when such a device exists.
 
-`mi_probe_device(i)` adds the name, PCI bus id, compute capability, total and free memory, and whether this build supports the device (and why not). It is implemented by `src/backend/probe.h`. An `i` outside [0, device count) fails with `MI_ERR_INVALID_ARGUMENT` before any device is queried, and only device `i` has its free memory measured (`ProbeOptions::free_memory_device`). It also leaves no CUDA context behind:
+`mi_probe_device(i)` adds the name, PCI bus id, compute capability, total and free memory, and whether this build supports the device (and why not). It is implemented by `src/backend/probe.h`. An `i` outside [0, device count) fails with `MI_ERR_INVALID_ARGUMENT` before any free-memory query, and only device `i` has its free memory measured (`ProbeOptions::free_memory_device`). It also leaves no CUDA context behind:
 - **Free memory comes from NVML** (`libnvidia-ml.so.1` / `nvml.dll`, loaded at run time; `nvmlDeviceGetMemoryInfo` by PCI bus id). NVML needs no context.
 - **Fallback without NVML:** the driver API (`libcuda.so.1` / `nvcuda.dll`). It retains the device's primary context, calls `cuMemGetInfo` and releases the context again. The last release destroys it. If an engine already holds that context, the probe shares it and creates nothing.
 - **Never** through the CUDA runtime (whose context would stay for the life of the process), and never `cudaDeviceReset`.
-- `mi::backend::DeviceInfo::free_memory_source` records which method answered (`"nvml"` or `"driver"`). On the dev box it is NVML.
+- `mi::backend::DeviceInfo::free_memory_source` records which method answered (`"nvml"` or `"driver"`). With a standard NVIDIA driver install it is NVML.
 
 ## Frozen layout (ABI 1)
 
@@ -190,7 +190,7 @@ On ELF platforms `MOSSINFER_API` is always `visibility("default")`. The shared l
 | `src/api/pipeline_adapter.{h,cpp}` | the only code that touches `pipeline::Pipeline`: converts the C structs into `Request` / `PipelineOptions`, and flattens `pipeline::Result` into C-API types and the JSON report |
 | `src/pipeline/report_json.{h,cpp}` | the report renderer shared with `moss-infer generate --json-report`, so both documents are the same field for field |
 
-When the `Pipeline` fields change (P4), the adapter is the whole rebase.
+When the `Pipeline` fields change, the adapter is the only code to update.
 
 ## Tests
 
@@ -201,10 +201,10 @@ Label `cpu` (`tests/unit/test_c_api.cpp`):
 
 Label `gpu`:
 - **`GpuCApiProbe.*`**: after `mi_probe_device()`, the process holds no CUDA context. This is checked through the driver's primary-context state and NVML's process list.
-- **`GpuCApi.*`** covers the device probe, and a 256², 2-step generation with callbacks, a concurrent call rejected as busy, the block path accessors and `mi_result_dit_stream()` (nothing streamed in balanced mode on the dev box), and PNG and report checks. It also covers cancel from another thread with no carry-over, and the caller's current context restored by create, generate and free.
+- **`GpuCApi.*`** covers the device probe, and a 256², 2-step generation with callbacks, a concurrent call rejected as busy, the block path accessors and `mi_result_dit_stream()` (nothing streamed in balanced mode on a 16 GiB card), and PNG and report checks. It also covers cancel from another thread with no carry-over, and the caller's current context restored by create, generate and free.
 
-Run the GPU tests on the dev box under the GPU lock:
+Run the GPU tests on a machine with a supported GPU:
 
 ```
-GTEST_FILTER='GpuCApi.*' flock /workspace/Projects/MossInfer/.gpu.lock <build>/mossinfer_tests
+GTEST_FILTER='GpuCApi.*' <build>/mossinfer_tests
 ```

@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
+#include <vector>
 
 namespace mi::backend {
 
@@ -13,6 +15,23 @@ struct MemoryInfo {
   std::uint64_t free_bytes = 0;
   std::uint64_t total_bytes = 0;
 };
+
+// One device as the driver API reports it, in CUDA ordinal order.
+struct DriverDevice {
+  std::string name;
+  int cc_major = 0;
+  int cc_minor = 0;
+  int multiprocessors = 0;
+  bool integrated = false;
+  std::uint64_t total_bytes = 0;
+  std::string pci_bus_id;  // "0000:01:00.0"; empty if unavailable
+};
+
+// Every device the driver sees (driver API: cuDeviceGetCount and attribute queries, no context). The probe uses it
+// when the CUDA runtime cannot enumerate devices because the driver is older than this build's CUDA version. Empty when
+// libcuda is absent or a call fails, and on drivers before R450 (CUDA 11), which lack the context entry points this
+// file requires; the probe then reports no device, which is still the right verdict there.
+std::optional<std::vector<DriverDevice>> driver_devices();
 
 // NVML's view of the device with this PCI bus id ("0000:01:00.0"). Creates no CUDA context. Empty when NVML
 // (libnvidia-ml.so.1 / nvml.dll) is absent or fails.

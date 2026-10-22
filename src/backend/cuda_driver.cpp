@@ -58,6 +58,12 @@ struct Driver {
   decltype(&cuCtxGetCurrent) get_current = nullptr;
   decltype(&cuCtxSetCurrent) set_current = nullptr;
   decltype(&cuMemGetInfo_v2) mem_get_info = nullptr;
+  // Device enumeration (driver_devices()); optional, not part of `ok`.
+  decltype(&cuDeviceGetCount) device_count = nullptr;
+  decltype(&cuDeviceGetName) device_name = nullptr;
+  decltype(&cuDeviceGetAttribute) device_attribute = nullptr;
+  decltype(&cuDeviceTotalMem_v2) device_total_mem = nullptr;
+  decltype(&cuDeviceGetPCIBusId) device_pci_bus_id = nullptr;
   bool ok = false;
 };
 
@@ -79,6 +85,11 @@ const Driver& driver() {
     r.get_current = lib.symbol<decltype(r.get_current)>("cuCtxGetCurrent");
     r.set_current = lib.symbol<decltype(r.set_current)>("cuCtxSetCurrent");
     r.mem_get_info = lib.symbol<decltype(r.mem_get_info)>("cuMemGetInfo_v2");
+    r.device_count = lib.symbol<decltype(r.device_count)>("cuDeviceGetCount");
+    r.device_name = lib.symbol<decltype(r.device_name)>("cuDeviceGetName");
+    r.device_attribute = lib.symbol<decltype(r.device_attribute)>("cuDeviceGetAttribute");
+    r.device_total_mem = lib.symbol<decltype(r.device_total_mem)>("cuDeviceTotalMem_v2");
+    r.device_pci_bus_id = lib.symbol<decltype(r.device_pci_bus_id)>("cuDeviceGetPCIBusId");
     // cuInit creates no context; it fails without a driver or with no visible device (CUDA_VISIBLE_DEVICES="").
     r.ok = init != nullptr && r.device_get != nullptr && r.primary_retain != nullptr && r.primary_release != nullptr &&
            r.primary_state != nullptr && r.push != nullptr && r.pop != nullptr && r.get_current != nullptr &&
@@ -157,6 +168,39 @@ std::optional<MemoryInfo> driver_memory_info(int device_ordinal) {
   }
   // The last release destroys the primary context (and frees its memory); an engine's own reference keeps it.
   d.primary_release(dev);
+  return out;
+}
+
+std::optional<std::vector<DriverDevice>> driver_devices() {
+  const Driver& d = driver();
+  if (!d.ok || d.device_count == nullptr || d.device_name == nullptr || d.device_attribute == nullptr ||
+      d.device_total_mem == nullptr || d.device_pci_bus_id == nullptr) {
+    return std::nullopt;
+  }
+  int count = 0;
+  if (d.device_count(&count) != CUDA_SUCCESS) return std::nullopt;
+  std::vector<DriverDevice> out;
+  for (int i = 0; i < count; ++i) {
+    CUdevice dev = 0;
+    char name[256] = {};
+    DriverDevice r;
+    std::size_t total = 0;
+    int integrated = 0;
+    if (d.device_get(&dev, i) != CUDA_SUCCESS || d.device_name(name, static_cast<int>(sizeof(name)), dev) != CUDA_SUCCESS ||
+        d.device_attribute(&r.cc_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) != CUDA_SUCCESS ||
+        d.device_attribute(&r.cc_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) != CUDA_SUCCESS ||
+        d.device_attribute(&r.multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev) != CUDA_SUCCESS ||
+        d.device_attribute(&integrated, CU_DEVICE_ATTRIBUTE_INTEGRATED, dev) != CUDA_SUCCESS ||
+        d.device_total_mem(&total, dev) != CUDA_SUCCESS) {
+      return std::nullopt;
+    }
+    r.name = name;
+    r.integrated = integrated != 0;
+    r.total_bytes = total;
+    char bus_id[32] = {};
+    if (d.device_pci_bus_id(bus_id, static_cast<int>(sizeof(bus_id)), dev) == CUDA_SUCCESS) r.pci_bus_id = bus_id;
+    out.push_back(std::move(r));
+  }
   return out;
 }
 

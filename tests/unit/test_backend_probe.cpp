@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -167,6 +168,44 @@ TEST(BackendProbe, Recommendation) {
   EXPECT_NE(ampere.reason.find("no kernel image for sm_86"), std::string::npos) << ampere.reason;
 }
 
+// A cu13 build on a CUDA 12 driver: the runtime lists no device, so probe() takes them from the driver API. They are
+// unsupported by this build, and the recommendation still names cu12, the flavour the driver runs.
+TEST(BackendProbe, OldDriverStillRecommendsItsFlavour) {
+  auto old_driver = [](std::vector<mi::backend::DriverDevice> devices) {
+    ProbeResult r;
+    r.driver_version = 12080;
+    r.build_cuda_version = 13040;
+    r.build_flavour = Flavour::kCuda13;
+    mi::backend::add_driver_api_devices(r, devices, kRelease);
+    mi::backend::recommend(r, kRelease);
+    return r;
+  };
+  mi::backend::DriverDevice ada;
+  ada.name = "synthetic sm_89";
+  ada.cc_major = 8;
+  ada.cc_minor = 9;
+  ada.total_bytes = std::uint64_t{8} << 30;
+  ada.pci_bus_id = "0000:01:00.0";
+  mi::backend::DriverDevice turing = ada;
+  turing.cc_major = 7;
+  turing.cc_minor = 5;
+
+  const ProbeResult r = old_driver({turing, ada});
+  ASSERT_EQ(r.devices.size(), 2u);
+  EXPECT_EQ(r.devices[0].index, 0);
+  EXPECT_EQ(r.devices[1].index, 1);
+  EXPECT_EQ(r.devices[1].name, "synthetic sm_89");
+  EXPECT_EQ(r.devices[1].total_bytes, ada.total_bytes);
+  EXPECT_EQ(r.devices[1].pci_bus_id, ada.pci_bus_id);
+  EXPECT_EQ(r.supported_devices, 0);
+  EXPECT_FALSE(r.devices[1].supported);
+  EXPECT_NE(r.devices[1].reason.find("580"), std::string::npos) << r.devices[1].reason;  // the cu13 driver minimum
+  EXPECT_EQ(r.recommended, Flavour::kCuda12);
+  EXPECT_NE(r.reason.find("recommended flavour cu12"), std::string::npos) << r.reason;
+
+  EXPECT_EQ(old_driver({turing}).recommended, Flavour::kNone);  // still needs a device the flavours can run on
+}
+
 TEST(BackendProbe, BuildIdentity) {
   EXPECT_NE(mi::backend::flavour_of_cuda_version(CUDART_VERSION), Flavour::kNone);
   // The architecture list comes from CMake and parses (or is one of the "unknown" spellings).
@@ -227,6 +266,31 @@ TEST(GpuBackendProbe, EnumeratesDevices) {
   ASSERT_EQ(cudaGetDevice(&current), cudaSuccess);
   EXPECT_EQ(current, 0);
   EXPECT_EQ(cudaGetLastError(), cudaSuccess);
+}
+
+// The driver-API enumeration (the old-driver fallback) sees the same devices as the runtime, and creates no context.
+TEST(GpuBackendProbe, DriverApiListsTheSameDevices) {
+  // Only meaningful in a context-free process (see FreeMemoryLeavesNoContext).
+  if (!mi::testing::cuda_context_report().empty()) GTEST_SKIP() << "the process already holds a CUDA context";
+  mi::backend::ProbeOptions options;
+  options.query_free_memory = false;
+  const ProbeResult r = mi::backend::probe(options);
+  const auto devs = mi::backend::driver_devices();
+  ASSERT_TRUE(devs.has_value());
+  ASSERT_EQ(devs->size(), r.devices.size());
+  EXPECT_EQ(mi::backend::device_count(), static_cast<int>(r.devices.size()));
+  for (std::size_t i = 0; i < devs->size(); ++i) {
+    const mi::backend::DriverDevice& a = (*devs)[i];
+    const DeviceInfo& b = r.devices[i];
+    EXPECT_EQ(a.name, b.name);
+    EXPECT_EQ(a.cc_major, b.cc_major);
+    EXPECT_EQ(a.cc_minor, b.cc_minor);
+    EXPECT_EQ(a.multiprocessors, b.multiprocessors);
+    EXPECT_EQ(a.integrated, b.integrated);
+    EXPECT_EQ(a.total_bytes, b.total_bytes);
+    EXPECT_EQ(a.pci_bus_id, b.pci_bus_id);
+  }
+  EXPECT_EQ(mi::testing::cuda_context_report(), "");
 }
 
 // Measuring free memory leaves no CUDA context behind, with NVML and with the driver-API fallback; the calling
