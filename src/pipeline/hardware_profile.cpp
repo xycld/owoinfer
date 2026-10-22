@@ -17,9 +17,6 @@
 
 #ifdef _WIN32
 #include <process.h>
-
-#include <chrono>
-#include <thread>
 #else
 #include <unistd.h>
 #endif
@@ -27,6 +24,7 @@
 #include "core/cuda_check.h"
 #include "kernels/fused/fused_gemm.h"
 #include "util/json.h"
+#include "util/rename_replace.h"
 
 namespace mi::pipeline {
 namespace {
@@ -202,14 +200,7 @@ bool write_profile(const std::filesystem::path& path, const std::string& key, co
       return false;
     }
   }
-  std::filesystem::rename(tmp, path, ec);
-#ifdef _WIN32
-  // Windows refuses to replace a file that a reader or a concurrent writer has open at that moment: retry briefly.
-  for (int i = 0; ec && i < 200; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    std::filesystem::rename(tmp, path, ec);
-  }
-#endif
+  util::rename_replace(tmp, path, ec);
   if (ec) {
     std::filesystem::remove(tmp, ec);
     return false;

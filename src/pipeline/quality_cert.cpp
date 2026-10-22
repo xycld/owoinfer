@@ -36,6 +36,7 @@
 #include "models/qwen35_text/text_encoder.h"
 #include "util/json.h"
 #include "util/path.h"
+#include "util/rename_replace.h"
 #include "util/xxh64.h"
 
 // GCC's -Wdangling-reference heuristic flags every `const T& x = f(dom, where + "...")`: the DOM accessors below
@@ -488,7 +489,7 @@ bool write_atomic(const fs::path& path, const std::string& text) {
     return false;
   }
 #endif
-  fs::rename(tmp, path, ec);
+  util::rename_replace(tmp, path, ec);
   if (ec) {
     fs::remove(tmp, ec);
     return false;

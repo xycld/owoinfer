@@ -12,6 +12,7 @@
 #include <thread>
 #include <utility>
 
+#include "util/rename_replace.h"
 #include "util/xxh64.h"
 #include "weights/safetensors.h"
 
@@ -369,7 +370,7 @@ void EmbeddingCache::write_disk(const EmbeddingKey& key, const Embedding& value)
     ok = static_cast<bool>(out);
   }
   std::error_code ec;
-  if (ok) fs::rename(tmp, path, ec);
+  if (ok) util::rename_replace(tmp, path, ec);
   if (!ok || ec) {
     fs::remove(tmp, ec);
     std::lock_guard<std::mutex> lock(mu_);
