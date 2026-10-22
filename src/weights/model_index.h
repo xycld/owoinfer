@@ -103,6 +103,21 @@ struct ModelIndex {
   std::filesystem::path file_path(std::uint32_t id) const { return bundle_dir / util::path_from_utf8(files.at(id).path); }
 };
 
+// Where a tensor of a component goes: into a group, or into a named exclusion. Exactly one of the two is set.
+struct TensorRoute {
+  std::string group;       // e.g. "block.3", "layers.0", "embed_tokens"
+  std::string exclude;     // exclusion prefix, e.g. "visual."
+  std::string layer_kind;  // text_encoder layers: attention kind implied by this tensor's name
+};
+
+// The routing build_index applies to the official names (text encoder: optionally `model.`-prefixed). Throws
+// IndexError for a name no group or exclusion covers.
+TensorRoute classify_tensor(Component c, const std::string& name);
+
+// Parses "<digits>." at the front of `rest` into n and advances past it. Digits are canonical (no sign, no leading
+// zero) so two spellings cannot name the same layer.
+bool take_layer_index(std::string_view& rest, int& n);
+
 struct BuildOptions {
   bool checksum = false;  // read every group's bytes and record XXH64 (full I/O on the group files)
 };

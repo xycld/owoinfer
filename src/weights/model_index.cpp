@@ -134,30 +134,13 @@ std::vector<IndexedTensor> load_component_tensors(ModelIndex& index, Component c
 
 // ---- Classification ---------------------------------------------------------------------------
 
-// Where a tensor goes: into a group, or into a named exclusion. Exactly one of the two is set.
-struct Route {
-  std::string group;
-  std::string exclude;
-  std::string layer_kind;  // text_encoder layers: attention kind implied by this tensor's name
-};
+using Route = TensorRoute;
 
 [[noreturn]] void unclassified(Component c, const std::string& name) {
   throw IndexError(std::string("unclassified ") + component_name(c) + " tensor '" + name + "'");
 }
 
 bool starts_with(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
-
-// Parses "<digits>." at the front of `rest`; returns the layer number and the remainder. Digits are
-// canonical (no sign, no leading zero) so two spellings cannot name the same layer.
-bool take_index(std::string_view& rest, int& n) {
-  auto dot = rest.find('.');
-  if (dot == std::string_view::npos || dot == 0) return false;
-  if (rest[0] < '0' || rest[0] > '9' || (rest[0] == '0' && dot > 1)) return false;
-  auto r = std::from_chars(rest.data(), rest.data() + dot, n);
-  if (r.ec != std::errc() || r.ptr != rest.data() + dot) return false;
-  rest.remove_prefix(dot + 1);
-  return true;
-}
 
 // Qwen3_5Model checkpoints name tensors `language_model.*` / `visual.*`; wrapped variants carry a
 // leading `model.`.
@@ -175,7 +158,7 @@ Route classify_text_encoder(const std::string& full) {
   if (starts_with(name, "layers.")) {
     name.remove_prefix(7);
     int n = 0;
-    if (!take_index(name, n)) unclassified(Component::kTextEncoder, full);
+    if (!take_layer_index(name, n)) unclassified(Component::kTextEncoder, full);
     r.group = "layers." + std::to_string(n);
     if (starts_with(name, "linear_attn.")) r.layer_kind = "linear_attention";
     else if (starts_with(name, "self_attn.")) r.layer_kind = "full_attention";
@@ -190,7 +173,7 @@ Route classify_transformer(const std::string& full) {
   if (starts_with(name, "layers.")) {
     name.remove_prefix(7);
     int n = 0;
-    if (!take_index(name, n)) unclassified(Component::kTransformer, full);
+    if (!take_layer_index(name, n)) unclassified(Component::kTransformer, full);
     r.group = "block." + std::to_string(n);
     return r;
   }
@@ -414,6 +397,25 @@ const char* component_name(Component c) {
     case Component::kVae: return "vae";
   }
   return "?";
+}
+
+bool take_layer_index(std::string_view& rest, int& n) {
+  auto dot = rest.find('.');
+  if (dot == std::string_view::npos || dot == 0) return false;
+  if (rest[0] < '0' || rest[0] > '9' || (rest[0] == '0' && dot > 1)) return false;
+  auto r = std::from_chars(rest.data(), rest.data() + dot, n);
+  if (r.ec != std::errc() || r.ptr != rest.data() + dot) return false;
+  rest.remove_prefix(dot + 1);
+  return true;
+}
+
+TensorRoute classify_tensor(Component c, const std::string& name) {
+  switch (c) {
+    case Component::kTextEncoder: return classify_text_encoder(name);
+    case Component::kTransformer: return classify_transformer(name);
+    case Component::kVae: return classify_vae(name);
+  }
+  unclassified(c, name);
 }
 
 std::int64_t IndexedTensor::numel() const {

@@ -94,13 +94,14 @@ target_include_directories(mossinfer_core SYSTEM PRIVATE
 target_link_libraries(mossinfer_core PUBLIC CUDA::cudart CUDA::cublasLt)
 set_target_properties(mossinfer_core PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_SEPARABLE_COMPILATION OFF)
 
-# torch_cpu_randn is bit-exact only if the compiler neither contracts mul+add into FMAs nor applies
-# fast-math. Source options come after CMAKE_CXX_FLAGS on the command line, so these win.
+# torch_cpu_randn, the INT8 ConvRot quantizer and the LoRA merge are bit-exact only if the compiler neither contracts
+# mul+add into FMAs nor applies fast-math. Source options come after CMAKE_CXX_FLAGS on the command line, so these win.
+set(MOSSINFER_STRICT_FP_SOURCES ${CMAKE_SOURCE_DIR}/src/pipeline/rng_torch_compat.cpp
+    ${CMAKE_SOURCE_DIR}/src/weights/quant/quant_codec.cpp ${CMAKE_SOURCE_DIR}/src/weights/quant/quant_convert.cpp)
 if(MSVC)
-  set_source_files_properties(${CMAKE_SOURCE_DIR}/src/pipeline/rng_torch_compat.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+  set_source_files_properties(${MOSSINFER_STRICT_FP_SOURCES} PROPERTIES COMPILE_OPTIONS "/fp:precise")
 else()
-  set_source_files_properties(${CMAKE_SOURCE_DIR}/src/pipeline/rng_torch_compat.cpp
-                              PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math")
+  set_source_files_properties(${MOSSINFER_STRICT_FP_SOURCES} PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math")
 endif()
 
 if(MOSSINFER_ASAN AND NOT MSVC)

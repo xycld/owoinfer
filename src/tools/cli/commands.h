@@ -13,5 +13,6 @@ using CommandFn = int (*)(const std::vector<std::string>& args);
 int cmd_index(const std::vector<std::string>& args);
 int cmd_inspect(const std::vector<std::string>& args);
 int cmd_generate(const std::vector<std::string>& args);
+int cmd_quantize(const std::vector<std::string>& args);
 
 }  // namespace mi::cli

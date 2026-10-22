@@ -1,0 +1,24 @@
+{
+ "heads": 2,
+ "head_dim": 128,
+ "upstream_commit": "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5",
+ "torch": "2.14.1+cu130",
+ "oracle_lengths": [
+  1,
+  37,
+  64,
+  150
+ ],
+ "upstream_shape": [
+  2,
+  160,
+  2,
+  128
+ ],
+ "upstream_cos_vs_exact": {
+  "int8_fp16": 0.9999240636825562,
+  "int8_fp16_f32acc": 0.9999220371246338,
+  "int8_fp8_upstream": 0.9993640184402466,
+  "int8_fp8_f32acc": 0.9993420839309692
+ }
+}
