@@ -41,7 +41,8 @@ endif()
 
 if(MSVC)
   # Every target: CCCL (CUDA 13) refuses cl's traditional preprocessor; CUTLASS/FlashAttention instantiations exceed
-  # the default object section limit.
+  # the default object section limit. FlashAttention uses M_LOG2E, which <cmath> defines only on request.
+  add_compile_definitions(_USE_MATH_DEFINES)
   add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor> $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
                       $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor$<COMMA>/bigobj>)
   set(MOSSINFER_WARN /W4 /permissive- /utf-8)

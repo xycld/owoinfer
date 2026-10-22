@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "util/checked_math.h"
+#include "util/file_time.h"
 #include "util/json.h"
 #include "util/path.h"
 #include "weights/file_reader.h"
@@ -44,11 +45,6 @@ std::string shape_str(const std::vector<std::int64_t>& s) {
   std::string out = "[";
   for (std::size_t i = 0; i < s.size(); ++i) out += (i ? ", " : "") + std::to_string(s[i]);
   return out + "]";
-}
-
-std::int64_t mtime_ns(const fs::path& p) {
-  auto sys = std::chrono::clock_cast<std::chrono::system_clock>(fs::last_write_time(p));
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(sys.time_since_epoch()).count();
 }
 
 // ---- Names -------------------------------------------------------------------------------------------------
@@ -421,7 +417,7 @@ QuantModel open_quant_model_impl(const fs::path& path, std::optional<ModelKind> 
   for (const fs::path& p : paths) {
     weights::SafetensorsFile file(p);
     const auto id = static_cast<std::uint32_t>(model.files.size());
-    model.files.push_back({util::path_utf8(p.lexically_relative(model.base_dir)), file.file_size(), mtime_ns(p)});
+    model.files.push_back({util::path_utf8(p.lexically_relative(model.base_dir)), file.file_size(), util::file_mtime_ns(p)});
     if (id == 0) model.metadata = file.metadata();
     auto md = file.metadata().find("_quantization_metadata");
     if (md != file.metadata().end()) {
