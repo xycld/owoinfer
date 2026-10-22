@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks an installed MossInfer tree or a CPack archive (CI and local; docs/packaging.md).
+"""Checks an installed MossInfer tree or a CPack archive (CI and local).
 
   AC1   no torch / c10 / python among the dependencies of any shipped binary (readelf+ldd / dumpbin /dependents)
   ABI   the shared library exports only mi_* symbols (nm -D / dumpbin /exports)

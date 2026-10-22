@@ -23,8 +23,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, windows-2022]
-        # Bump the 13.x entry to 13.4 once Jimver/cuda-toolkit lists it: the gate toolchain is 13.4
-        # (docs/model-notes.md section 9). bitexact_cu13 tests are GPU tests and do not run on hosted runners.
+        # Bump the 13.x entry to 13.4 once Jimver/cuda-toolkit lists it: the gate toolchain is 13.4.
+        # bitexact_cu13 tests are GPU tests and do not run on hosted runners.
         cuda: ["12.8.1", "13.3.1"]
         include:
           - os: ubuntu-22.04
@@ -101,7 +101,7 @@ jobs:
 
       - name: CPU tests
         # The cu12 test presets exclude the bitexact_cu13 label themselves. With every device hidden, a GPU test
-        # mislabelled cpu fails here; on GPU machines tests/unit/test_cpu_guard.cpp catches it (docs/building.md).
+        # mislabelled cpu fails here; on GPU machines tests/unit/test_cpu_guard.cpp catches it.
         run: |
           export CUDA_VISIBLE_DEVICES=""
           ctest --preset "$preset" -L '^cpu$' --parallel 4

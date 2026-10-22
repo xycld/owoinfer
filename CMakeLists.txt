@@ -54,7 +54,7 @@ endif()
 file(GLOB_RECURSE MOSSINFER_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_SOURCE_DIR}/src/*.cpp ${CMAKE_SOURCE_DIR}/src/*.cu)
 list(FILTER MOSSINFER_SOURCES EXCLUDE REGEX ".*/src/tools/.*")
-# P7a: OFF leaves out the C API (src/api), libmossinfer and moss-server (docs/building.md).
+# P7a: OFF leaves out the C API (src/api), libmossinfer and moss-server.
 option(MOSSINFER_BUILD_API "Build the C API (src/api), libmossinfer and moss-server" ON)
 if(NOT MOSSINFER_BUILD_API)
   list(FILTER MOSSINFER_SOURCES EXCLUDE REGEX ".*/src/api/.*")

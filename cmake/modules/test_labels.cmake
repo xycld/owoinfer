@@ -1,9 +1,9 @@
-# ctest labels for the gtest cases (P7a I-4, docs/building.md "Tests"):
+# ctest labels for the gtest cases (P7a):
 #   gpu            needs a CUDA device (run under the GPU lock on the dev box)
 #   golden         needs the large tests/golden/**/*.npy files, which are not in the repository (on gpu tests too)
 #   cpu            everything else: no device, no out-of-repository data. CI runs `ctest -L cpu`
 #   bitexact_cu13  (in addition) compares bit for bit against torch built with CUDA 13.4 libdevice
-#                  (docs/model-notes.md section 9); the cu12 flavour excludes these and is validated by the
+#                  (the gate toolchain); the cu12 flavour excludes these and is validated by the
 #                  noise-floor gates (AC5, AC6) instead. PipelineSchedule.* is not among them: the sigma schedule
 #                  is host code (fp32 mul/div/fma, -ffp-contract=off or /fp:strict, no libm) compared against
 #                  torch's CPU arithmetic, so it is exact under any CUDA toolkit. RngTorchCompat.* stays: it is golden

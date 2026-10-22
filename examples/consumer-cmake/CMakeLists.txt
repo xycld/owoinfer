@@ -1,4 +1,4 @@
-# Out-of-tree consumer of an installed MossInfer package (docs/packaging.md). Needs no CUDA toolkit:
+# Out-of-tree consumer of an installed MossInfer package (API: docs/c-api.md). Needs no CUDA toolkit:
 #   cmake -S examples/consumer-cmake -B build-consumer -DCMAKE_PREFIX_PATH=<mossinfer install or unzipped package>
 #   cmake --build build-consumer && build-consumer/mossinfer_consumer
 cmake_minimum_required(VERSION 3.21)

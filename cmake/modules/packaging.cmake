@@ -1,4 +1,4 @@
-# Packaging (P7a I-3, docs/packaging.md): the shared C-API library, install rules, the CMake package
+# Packaging (P7a; the consumer side is docs/c-api.md): the shared C-API library, install rules, the CMake package
 # (find_package(MossInfer) -> MossInfer::mossinfer) and CPack archives. With every option at its default this file
 # changes nothing about how mossinfer_core, moss-infer and the tests are compiled (install rules only).
 #

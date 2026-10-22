@@ -1,6 +1,6 @@
 // Backend probe: which CUDA devices exist, whether this build can run on them, and which release flavour
-// (cu12 / cu13) a launcher should install for the machine's driver. Phase I of backend pluggability
-// (.omc/plans/p7a-infra.md); exposed to C callers as mi_probe().
+// (cu12 / cu13) a launcher should install for the machine's driver. Phase I of backend pluggability;
+// exposed to C callers as mi_probe().
 //
 // The probe never throws on a missing GPU or driver: it returns an empty device list and a reason.
 // Free memory comes from NVML or a short-lived driver-API context (backend/cuda_driver.h), both loaded at run time;

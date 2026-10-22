@@ -1,5 +1,5 @@
 # Push / PR: every release flavour builds, passes the CPU tests and the package checks (AC1, AC17, exports,
-# find_package consumer). GPU, golden and bit-exact tests need the dev box (docs/building.md).
+# find_package consumer). GPU, golden and bit-exact tests need the dev box.
 name: ci
 
 on:

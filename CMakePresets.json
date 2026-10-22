@@ -100,7 +100,7 @@
       "name": "linux-cuda12",
       "inherits": "test-base",
       "configurePreset": "linux-cuda12",
-      "description": "bitexact_cu13 tests compare against CUDA 13.4 libdevice and are excluded (docs/model-notes.md section 9).",
+      "description": "bitexact_cu13 tests compare against CUDA 13.4 libdevice and are excluded.",
       "filter": { "exclude": { "label": "bitexact_cu13" } }
     },
     { "name": "windows-msvc-cuda13", "inherits": "test-base", "configurePreset": "windows-msvc-cuda13" },
@@ -108,7 +108,7 @@
       "name": "windows-msvc-cuda12",
       "inherits": "test-base",
       "configurePreset": "windows-msvc-cuda12",
-      "description": "bitexact_cu13 tests compare against CUDA 13.4 libdevice and are excluded (docs/model-notes.md section 9).",
+      "description": "bitexact_cu13 tests compare against CUDA 13.4 libdevice and are excluded.",
       "filter": { "exclude": { "label": "bitexact_cu13" } }
     }
   ],
