@@ -40,6 +40,10 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
 endif()
 
 if(MSVC)
+  # Every target: CCCL (CUDA 13) refuses cl's traditional preprocessor; CUTLASS/FlashAttention instantiations exceed
+  # the default object section limit.
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor> $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
+                      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor$<COMMA>/bigobj>)
   set(MOSSINFER_WARN /W4 /permissive- /utf-8)
   set(MOSSINFER_CUDA_HOST_WARN -Xcompiler=/W3)  # cl's /Wall (what -Wall means to it) floods the CUDA headers
   if(MOSSINFER_WERROR)
