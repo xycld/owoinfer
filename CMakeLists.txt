@@ -7,7 +7,9 @@ project(MossInfer VERSION ${MOSSINFER_VERSION} LANGUAGES C CXX)
 # compiler check with CMake's default, the compiler's own (sm_75 for CUDA 13), so it never builds sm_120 with a CUDA
 # < 12.8 that cannot; (3) only if nothing chose targets, the list below replaces that default (FORCE, cached so a
 # re-configure keeps it). Below find_package(CUDAToolkit), sm_120 is dropped from the targets when the compiler is
-# < 12.8, whoever chose them.
+# < 12.8, whoever chose them. No sm_86 image: sm_80 SASS runs on sm_86/87 (same major), and no kernel here has an
+# sm_86-specific path (the only __CUDA_ARCH__ >= 860 branch in the vendored code, CUTLASS's SIMT fp32 thread MMA, is not
+# instantiated). sm_89 stays for its e4m3 MMA (attention_q8).
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
   set(_mi_default_cuda_archs ON)
 endif()
@@ -18,7 +20,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 if(_mi_default_cuda_archs)
-  set(CMAKE_CUDA_ARCHITECTURES 80 86 89 120 CACHE STRING "CUDA architectures" FORCE)
+  set(CMAKE_CUDA_ARCHITECTURES 80 89 120 CACHE STRING "CUDA architectures" FORCE)
   unset(_mi_default_cuda_archs)
 endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -39,7 +41,23 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
   unset(_mi_archs)
 endif()
 
+# Device code in the fatbinary is compressed, every entry including SASS (-Xfatbin=-compress-all, which any driver
+# reads). CUDA 13 also uses --compress-mode=size (smaller, slower to decompress), which needs a driver >= 580, the
+# CUDA 13 floor anyway. CUDA 12 keeps the default mode: size/balance would raise the cu12 flavour's driver floor from
+# 525.60.13 to 550.54.14.
+add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all>)
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=size>)
+endif()
+
 if(MSVC)
+  # Every target: CCCL (CUDA 13) refuses cl's traditional preprocessor; CUTLASS/FlashAttention instantiations exceed
+  # the default object section limit. FlashAttention uses M_LOG2E, which <cmath> defines only on request. CUDA 12.x's
+  # dim3 is constexpr (CUTLASS's get_block_shape() needs it) only when __cplusplus says C++11: /Zc:__cplusplus.
+  add_compile_definitions(_USE_MATH_DEFINES)
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor> $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
+                      $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
+                      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor$<COMMA>/bigobj$<COMMA>/Zc:__cplusplus>)
   set(MOSSINFER_WARN /W4 /permissive- /utf-8)
   set(MOSSINFER_CUDA_HOST_WARN -Xcompiler=/W3)  # cl's /Wall (what -Wall means to it) floods the CUDA headers
   if(MOSSINFER_WERROR)
@@ -149,5 +167,7 @@ if(MOSSINFER_TESTS)
   target_compile_definitions(mossinfer_tests PRIVATE
     MOSSINFER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   include(GoogleTest)
-  gtest_discover_tests(mossinfer_tests DISCOVERY_MODE PRE_TEST)
+  # The 5 s default discovery timeout is too short on Windows runners, where the first start of the large test
+  # executable can be slow (seen once in CI: "Process terminated due to timeout").
+  gtest_discover_tests(mossinfer_tests DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120)
 endif()

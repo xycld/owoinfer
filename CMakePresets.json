@@ -14,10 +14,10 @@
       "name": "release-base",
       "hidden": true,
       "inherits": "base",
-      "description": "Release flavour: SASS for sm_80/86/89/120 plus compute_120 PTX for newer GPUs, shared C-API library, static cudart. Warnings are not errors here: release toolchains (MSVC, GCC 12, CUDA 12.8) differ from the dev box's.",
+      "description": "Release flavour: SASS for sm_80 (also runs on sm_86/87), sm_89 and sm_120 plus compute_120 PTX for newer GPUs, shared C-API library, static cudart. Warnings are not errors here: release toolchains (MSVC, GCC 12, CUDA 12.8) differ from the dev box's.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_CUDA_ARCHITECTURES": "80-real;86-real;89-real;120",
+        "CMAKE_CUDA_ARCHITECTURES": "80-real;89-real;120",
         "MOSSINFER_SHARED": "ON",
         "MOSSINFER_STATIC_CUDART": "ON",
         "MOSSINFER_BUNDLE_CUDA_LIBS": "ON",

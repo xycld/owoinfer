@@ -742,7 +742,9 @@ TEST(QualityCert, HashCache) {
   EXPECT_EQ(identify_component(f, true, cache).files[0].xxh64, ha);
   ASSERT_TRUE(fs::is_regular_file(cache / "file_hashes.json"));
   const std::string cache_text = read_text(cache / "file_hashes.json");
-  EXPECT_NE(cache_text.find(mi::util::path_utf8(fs::canonical(f))), std::string::npos) << cache_text;
+  std::string json_path = mi::util::path_utf8(fs::canonical(f));  // as the JSON text spells it (Windows: "\\")
+  for (std::size_t i = 0; (i = json_path.find('\\', i)) != std::string::npos; i += 2) json_path.insert(i, 1, '\\');
+  EXPECT_NE(cache_text.find(json_path), std::string::npos) << cache_text;
 
   // Same size, content changed, modification time restored: the key is unchanged, so the cached hash is served
   // (proof the cache is used; the documented limit of a metadata-keyed cache).

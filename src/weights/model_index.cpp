@@ -14,6 +14,7 @@
 #include <unordered_map>
 
 #include "util/checked_math.h"
+#include "util/file_time.h"
 #include "util/json.h"
 #include "util/path.h"
 #include "util/xxh64.h"
@@ -65,11 +66,6 @@ json::Value parse_json_file(const fs::path& path, std::uintmax_t max_bytes, std:
   }
 }
 
-std::int64_t mtime_ns(const fs::path& p) {
-  auto sys = std::chrono::clock_cast<std::chrono::system_clock>(fs::last_write_time(p));
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(sys.time_since_epoch()).count();
-}
-
 // ---- Reading a component's safetensors files --------------------------------------------------
 
 // Opens every safetensors file of a component dir (following the shard index when present),
@@ -115,7 +111,7 @@ std::vector<IndexedTensor> load_component_tensors(ModelIndex& index, Component c
     const fs::path path = dir / path_from_utf8(shard);
     SafetensorsFile file(path);
     auto id = static_cast<std::uint32_t>(index.files.size());
-    index.files.push_back({std::string(component_name(comp)) + "/" + shard, file.file_size(), mtime_ns(path)});
+    index.files.push_back({std::string(component_name(comp)) + "/" + shard, file.file_size(), util::file_mtime_ns(path)});
     for (const TensorInfo& t : file.tensors()) {
       if (!weight_map.empty()) {
         auto it = weight_map.find(t.name);
@@ -540,7 +536,7 @@ ModelIndex load_index(const fs::path& path, const fs::path& bundle_dir) {
       const fs::path p = index.bundle_dir / path_from_utf8(file.path);
       std::error_code ec;
       if (!fs::is_regular_file(p, ec)) throw StaleIndexError(where + ": file " + file.path + " no longer exists; rebuild with `moss-infer index`");
-      if (fs::file_size(p) != file.size || mtime_ns(p) != file.mtime_ns) {
+      if (fs::file_size(p) != file.size || util::file_mtime_ns(p) != file.mtime_ns) {
         throw StaleIndexError(where + ": " + file.path + " changed since the index was built; rebuild with `moss-infer index`");
       }
       index.files.push_back(std::move(file));

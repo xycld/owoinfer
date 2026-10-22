@@ -20,7 +20,7 @@ using mi::backend::Flavour;
 using mi::backend::ProbeResult;
 
 // The release presets' list (CMakePresets.json).
-const std::vector<CudaArch> kRelease = mi::backend::parse_cuda_architectures("80-real;86-real;89-real;120");
+const std::vector<CudaArch> kRelease = mi::backend::parse_cuda_architectures("80-real;89-real;120");
 
 DeviceInfo device(int major, int minor) {
   DeviceInfo d;
@@ -60,15 +60,15 @@ TEST(BackendProbe, FlavourForDriver) {
 }
 
 TEST(BackendProbe, ParsesCmakeArchitectureLists) {
-  ASSERT_EQ(kRelease.size(), 4u);
+  ASSERT_EQ(kRelease.size(), 3u);
   EXPECT_EQ(kRelease[0].major, 8);
   EXPECT_EQ(kRelease[0].minor, 0);
   EXPECT_TRUE(kRelease[0].sass);
   EXPECT_FALSE(kRelease[0].ptx);
-  EXPECT_EQ(kRelease[3].major, 12);
-  EXPECT_EQ(kRelease[3].minor, 0);
-  EXPECT_TRUE(kRelease[3].sass);
-  EXPECT_TRUE(kRelease[3].ptx);
+  EXPECT_EQ(kRelease[2].major, 12);
+  EXPECT_EQ(kRelease[2].minor, 0);
+  EXPECT_TRUE(kRelease[2].sass);
+  EXPECT_TRUE(kRelease[2].ptx);
 
   const auto commas = mi::backend::parse_cuda_architectures("89,120-virtual");
   ASSERT_EQ(commas.size(), 2u);
@@ -91,7 +91,8 @@ TEST(BackendProbe, ParsesCmakeArchitectureLists) {
 TEST(BackendProbe, KernelImageCompatibility) {
   // SASS runs on the same major with an equal or higher minor.
   EXPECT_TRUE(mi::backend::compatible_image(kRelease, 8, 0, false));
-  EXPECT_TRUE(mi::backend::compatible_image(kRelease, 8, 7, false));  // Jetson Orin: sm_86 SASS
+  EXPECT_TRUE(mi::backend::compatible_image(kRelease, 8, 6, false));  // RTX 30xx: sm_80 SASS
+  EXPECT_TRUE(mi::backend::compatible_image(kRelease, 8, 7, false));  // Jetson Orin: sm_80 SASS
   EXPECT_TRUE(mi::backend::compatible_image(kRelease, 12, 1, false));
   // sm_90 / sm_100 have neither SASS nor older PTX; compute_120 PTX cannot be JIT-compiled down.
   EXPECT_FALSE(mi::backend::compatible_image(kRelease, 9, 0, true));

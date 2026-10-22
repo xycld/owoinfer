@@ -22,7 +22,17 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -248,9 +258,14 @@ std::pair<double, double> cos_rel(const std::vector<float>& ref, const std::vect
 class ClockSampler {
  public:
   ClockSampler() {
+#ifdef _WIN32
+    lib_ = LoadLibraryExA("nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto sym = [&](const char* n) { return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(lib_), n)); };
+#else
     lib_ = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (lib_ == nullptr) return;
     const auto sym = [&](const char* n) { return dlsym(lib_, n); };
+#endif
+    if (lib_ == nullptr) return;
     init_ = reinterpret_cast<int (*)()>(sym("nvmlInit_v2"));
     shutdown_ = reinterpret_cast<int (*)()>(sym("nvmlShutdown"));
     by_bus_ = reinterpret_cast<int (*)(const char*, void**)>(sym("nvmlDeviceGetHandleByPciBusId_v2"));
@@ -280,7 +295,11 @@ class ClockSampler {
     stop_.store(true);
     if (thread_.joinable()) thread_.join();
     if (ok_) shutdown_();
+#ifdef _WIN32
+    if (lib_ != nullptr) FreeLibrary(static_cast<HMODULE>(lib_));
+#else
     if (lib_ != nullptr) dlclose(lib_);
+#endif
   }
   ClockSampler(const ClockSampler&) = delete;
   ClockSampler& operator=(const ClockSampler&) = delete;

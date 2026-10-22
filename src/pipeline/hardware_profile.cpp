@@ -24,6 +24,7 @@
 #include "core/cuda_check.h"
 #include "kernels/fused/fused_gemm.h"
 #include "util/json.h"
+#include "util/rename_replace.h"
 
 namespace mi::pipeline {
 namespace {
@@ -188,7 +189,8 @@ bool write_profile(const std::filesystem::path& path, const std::string& key, co
   // Unique per process and call: concurrent writers never share a temporary file; the rename replaces atomically.
   char suffix[64];
   std::snprintf(suffix, sizeof(suffix), ".tmp.%d.%08x", process_id(), static_cast<unsigned>(std::random_device{}()));
-  const std::filesystem::path tmp = path.string() + suffix;
+  std::filesystem::path tmp = path;  // not path.string(): the ANSI code page on Windows
+  tmp += suffix;
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     out << doc;
@@ -198,7 +200,7 @@ bool write_profile(const std::filesystem::path& path, const std::string& key, co
       return false;
     }
   }
-  std::filesystem::rename(tmp, path, ec);
+  util::rename_replace(tmp, path, ec);
   if (ec) {
     std::filesystem::remove(tmp, ec);
     return false;

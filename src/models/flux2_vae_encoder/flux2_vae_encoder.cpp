@@ -15,6 +15,7 @@
 #include "core/cuda_check.h"
 #include "kernels/vae/attention.h"
 #include "pipeline/rng_torch_compat.h"
+#include "util/path.h"
 #include "weights/file_reader.h"
 #include "weights/model_index.h"
 #include "weights/safetensors.h"
@@ -520,12 +521,12 @@ class Loader {
       if (t.name.size() < key.size() || t.name.compare(t.name.size() - key.size(), key.size(), key) != 0) continue;
       const std::string prefix = t.name.substr(0, t.name.size() - key.size());
       if (!prefix.empty() && prefix.back() != '.') continue;  // e.g. "xencoder.conv_in.weight" is another tensor
-      if (found_) throw std::runtime_error("mi::flux2_vae_encoder: several encoders in " + path.string() + " ('" + prefix_ +
+      if (found_) throw std::runtime_error("mi::flux2_vae_encoder: several encoders in " + util::path_utf8(path) + " ('" + prefix_ +
                                            "', '" + prefix + "')");
       prefix_ = prefix;
       found_ = true;
     }
-    if (!found_) throw std::runtime_error("mi::flux2_vae_encoder: no encoder.conv_in.weight in " + path.string());
+    if (!found_) throw std::runtime_error("mi::flux2_vae_encoder: no encoder.conv_in.weight in " + util::path_utf8(path));
     original_ = file_.find(prefix_ + "encoder.down.0.block.0.conv1.weight") != nullptr;
     if (arena_ != nullptr) {
       reader_ = std::make_unique<weights::FileReader>(path, direct_io);
@@ -542,7 +543,7 @@ class Loader {
     for (const auto& t : file_.tensors()) {
       if (!starts_with(t.name, prefix_ + "encoder.") && !starts_with(t.name, prefix_ + "quant_conv.")) continue;
       if (consumed_.count(t.name) == 0)
-        throw std::runtime_error("mi::flux2_vae_encoder: unexpected tensor '" + t.name + "' in " + file_.path().string());
+        throw std::runtime_error("mi::flux2_vae_encoder: unexpected tensor '" + t.name + "' in " + util::path_utf8(file_.path()));
     }
   }
 
@@ -585,7 +586,7 @@ class Loader {
   const weights::TensorInfo& info(const std::string& dname, std::initializer_list<std::int64_t> shape) {
     const std::string name = prefix_ + (original_ ? original_name(dname) : dname);
     const weights::TensorInfo* t = file_.find(name);
-    if (t == nullptr) throw std::runtime_error("mi::flux2_vae_encoder: tensor '" + name + "' missing from " + file_.path().string());
+    if (t == nullptr) throw std::runtime_error("mi::flux2_vae_encoder: tensor '" + name + "' missing from " + util::path_utf8(file_.path()));
     consumed_.insert(name);
     std::int64_t numel = 1;
     for (std::int64_t d : shape) numel *= d;

@@ -12,6 +12,7 @@
 #include <thread>
 #include <utility>
 
+#include "util/rename_replace.h"
 #include "util/xxh64.h"
 #include "weights/safetensors.h"
 
@@ -280,7 +281,9 @@ std::shared_ptr<const Embedding> EmbeddingCache::read_disk(const EmbeddingKey& k
     std::lock_guard<std::mutex> lock(mu_);
     ++(stats_.*field);
   };
+  std::ifstream in;
   const auto reject = [&] {
+    in.close();  // Windows cannot delete a file that is still open
     std::error_code rm;
     fs::remove(path, rm);
     count(&EmbeddingCacheStats::disk_rejects);
@@ -292,7 +295,7 @@ std::shared_ptr<const Embedding> EmbeddingCache::read_disk(const EmbeddingKey& k
     return nullptr;
   }
   if (size < kHeaderBytes || size > kMaxFileBytes) return reject();
-  std::ifstream in(path, std::ios::binary);
+  in.open(path, std::ios::binary);
   unsigned char header[kHeaderBytes];
   if (!in.read(reinterpret_cast<char*>(header), kHeaderBytes)) {
     count(&EmbeddingCacheStats::disk_errors);
@@ -367,7 +370,7 @@ void EmbeddingCache::write_disk(const EmbeddingKey& key, const Embedding& value)
     ok = static_cast<bool>(out);
   }
   std::error_code ec;
-  if (ok) fs::rename(tmp, path, ec);
+  if (ok) util::rename_replace(tmp, path, ec);
   if (!ok || ec) {
     fs::remove(tmp, ec);
     std::lock_guard<std::mutex> lock(mu_);

@@ -91,8 +91,8 @@ struct SituGluNode : cutlass::epilogue::threadblock::VisitorImpl2x<> {
 
 template <class Threadblock, class Warp>
 struct Trees {
-  template <class... Ts>
-  using EVT = cutlass::epilogue::threadblock::Sm80EVT<Ts...>;
+  template <class Op, class... Ts>  // Op named: MSVC cannot expand a pack into Sm80EVT's non-pack NodeOp
+  using EVT = cutlass::epilogue::threadblock::Sm80EVT<Op, Ts...>;
   using ThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<Threadblock, Warp, bf16, 8, 1>;
   using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
   using StrideD = cute::Stride<std::int64_t, cute::_1, std::int64_t>;

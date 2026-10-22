@@ -36,6 +36,7 @@
 #include "models/qwen35_text/text_encoder.h"
 #include "util/json.h"
 #include "util/path.h"
+#include "util/rename_replace.h"
 #include "util/xxh64.h"
 
 // GCC's -Wdangling-reference heuristic flags every `const T& x = f(dom, where + "...")`: the DOM accessors below
@@ -488,7 +489,7 @@ bool write_atomic(const fs::path& path, const std::string& text) {
     return false;
   }
 #endif
-  fs::rename(tmp, path, ec);
+  util::rename_replace(tmp, path, ec);
   if (ec) {
     fs::remove(tmp, ec);
     return false;
@@ -528,9 +529,9 @@ FileKey file_key(const fs::path& path) {
   k.dev = info.dwVolumeSerialNumber;
   k.ino = (std::uint64_t{info.nFileIndexHigh} << 32) | info.nFileIndexLow;
   k.size = (std::uint64_t{info.nFileSizeHigh} << 32) | info.nFileSizeLow;
-  // FILETIME: 100 ns ticks.
+  // FILETIME: 100 ns ticks since 1601, which overflow int64 as nanoseconds; rebased to the Unix epoch like POSIX.
   const std::uint64_t ticks = (std::uint64_t{info.ftLastWriteTime.dwHighDateTime} << 32) | info.ftLastWriteTime.dwLowDateTime;
-  k.mtime_ns = static_cast<std::int64_t>(ticks) * 100;
+  k.mtime_ns = (static_cast<std::int64_t>(ticks) - 116444736000000000) * 100;
 #else
   struct stat st {};
   if (::stat(canon.c_str(), &st) != 0) fail("cannot stat " + k.path);
