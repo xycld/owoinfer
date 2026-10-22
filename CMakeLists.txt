@@ -156,5 +156,7 @@ if(MOSSINFER_TESTS)
   target_compile_definitions(mossinfer_tests PRIVATE
     MOSSINFER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   include(GoogleTest)
-  gtest_discover_tests(mossinfer_tests DISCOVERY_MODE PRE_TEST)
+  # The 5 s default discovery timeout is too short on Windows runners, where the first start of the large test
+  # executable can be slow (seen once in CI: "Process terminated due to timeout").
+  gtest_discover_tests(mossinfer_tests DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120)
 endif()
