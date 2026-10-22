@@ -142,7 +142,7 @@ typedef struct mi_probe_info {
  * with device_count == 0 and the reason in `message`. Creates no CUDA context. */
 MOSSINFER_API mi_status mi_probe(mi_probe_info* info);
 /* Fills `info` (struct_size set by the caller) for device `index` in [0, device_count); any other index fails with
- * MI_ERR_INVALID_ARGUMENT before a device is queried. Only device `index` has its free memory measured: from NVML
+ * MI_ERR_INVALID_ARGUMENT before any free-memory query. Only device `index` has its free memory measured: from NVML
  * when the driver ships it, else from a temporary CUDA context (driver API) that is released before returning. The
  * call leaves no CUDA context behind and does not change the calling thread's current context. */
 MOSSINFER_API mi_status mi_probe_device(int32_t index, mi_device_info* info);

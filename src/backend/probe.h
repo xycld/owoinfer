@@ -12,6 +12,8 @@
 #include <string_view>
 #include <vector>
 
+#include "backend/cuda_driver.h"
+
 namespace mi::backend {
 
 // Minimum compute capability of every kernel in the engine (bf16 tensor cores, cp.async).
@@ -108,8 +110,18 @@ struct ProbeOptions {
   int free_memory_device = -1;
 };
 
+// Appends driver-API devices to `result` and evaluates them against result.driver_version and build_cuda_version.
+// probe() uses it when the runtime cannot enumerate devices on an old driver (cudaErrorInsufficientDriver): the devices
+// are then unsupported by this build, and recommend() can still name the flavour the driver runs. Pure: used by tests.
+void add_driver_api_devices(ProbeResult& result, const std::vector<DriverDevice>& devices,
+                            const std::vector<CudaArch>& archs = build_architectures());
+
 // Enumerates devices and evaluates them. Never throws for a missing driver or device.
 ProbeResult probe(const ProbeOptions& options = {});
+
+// CUDA devices visible to the process: the runtime's count, or the driver API's when the driver is too old for this
+// build's runtime; 0 without a driver or device. Creates no context.
+int device_count();
 
 // Multi-line human-readable report of a probe result (for `moss-infer` diagnostics and logs).
 std::string format_report(const ProbeResult& result);

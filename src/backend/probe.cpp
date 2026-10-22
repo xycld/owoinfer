@@ -201,6 +201,33 @@ void recommend(ProbeResult& r, const std::vector<CudaArch>& archs) {
          cuda_version_string(r.driver_version) + ")");
 }
 
+void add_driver_api_devices(ProbeResult& r, const std::vector<DriverDevice>& devices, const std::vector<CudaArch>& archs) {
+  for (const DriverDevice& src : devices) {
+    DeviceInfo d;
+    d.index = static_cast<int>(r.devices.size());
+    d.name = src.name;
+    d.cc_major = src.cc_major;
+    d.cc_minor = src.cc_minor;
+    d.multiprocessors = src.multiprocessors;
+    d.integrated = src.integrated;
+    d.total_bytes = src.total_bytes;
+    d.pci_bus_id = src.pci_bus_id;
+    evaluate_device(d, r.driver_version, r.build_cuda_version, archs);
+    r.supported_devices += d.supported ? 1 : 0;
+    r.devices.push_back(std::move(d));
+  }
+}
+
+int device_count() {
+  int count = 0;
+  if (const cudaError_t err = cudaGetDeviceCount(&count); err != cudaSuccess) {
+    cudaGetLastError();
+    const auto devs = err == cudaErrorInsufficientDriver ? driver_devices() : std::nullopt;
+    return devs ? static_cast<int>(devs->size()) : 0;
+  }
+  return count;
+}
+
 ProbeResult probe(const ProbeOptions& options) {
   ProbeResult r;
   r.build_cuda_version = CUDART_VERSION;
@@ -217,6 +244,16 @@ ProbeResult probe(const ProbeOptions& options) {
   if (const cudaError_t err = cudaGetDeviceCount(&count); err != cudaSuccess) {
     cudaGetLastError();
     r.reason = std::string("no usable CUDA device: ") + cudaGetErrorName(err) + " (" + cudaGetErrorString(err) + ")";
+    // A driver older than this build's CUDA: the runtime lists nothing, but the driver API still does, so the
+    // recommendation can name the flavour this driver runs (cu12 under a cu13 build).
+    if (err == cudaErrorInsufficientDriver) {
+      if (const auto devs = driver_devices(); devs && !devs->empty()) {
+        r.reason = std::string("this ") + flavour_name(r.build_flavour) +
+                   " build cannot use the installed driver (cudaErrorInsufficientDriver); the devices are listed through the "
+                   "driver API";
+        add_driver_api_devices(r, *devs);
+      }
+    }
     recommend(r);
     return r;
   }
