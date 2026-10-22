@@ -9,11 +9,14 @@
 //         except the GroupNorms, whose statistics are per image. The whole tail reaches kTailReceptiveRadius
 //         output pixels per side; the tiled path (below) only needs the halo of the segment it runs.
 //
-// Precision: DecodeMode::reference() follows the reference: fp32 activations, TF32 convs with cuDNN's rounding
-// (bit-identical), torch-identical GroupNorms (torch_group_norm.h), fp32-accurate kTf32x3 attention and strict
-// fp32 attention linears. Everything before the attention is bit-identical to torch; the attention is not, and
-// later TF32 convs amplify its last-bit differences, so ~99.1-99.3% of the output bytes match the reference PNGs
-// and the rest differ by 1 (torch itself, swapping only its SDPA backend, gets 99.5%). Faster modes switch the
+// Precision: DecodeMode::reference() (the pipeline's) follows the reference: fp32 activations, TF32 convs with
+// cuDNN's rounding (bit-identical), fp32-accurate kTf32x3 attention and strict fp32 attention linears, with the
+// GroupNorms' exact fixed-point statistics (vae::group_norm), which tiled decodes need. DecodeMode::torch_reference()
+// swaps in torch-identical GroupNorms (torch_group_norm.h): then everything before the attention is bit-identical to
+// torch. The attention is not, and later TF32 convs amplify its last-bit differences, so in either mode ~99.1-99.3% of
+// the output bytes match the reference PNGs and the rest differ by 1 (torch itself, swapping only its SDPA backend, gets
+// 99.5%). The two GroupNorms move 0.5-0.7% of the bytes by 1 against each other, but neither is closer to torch:
+// against a diffusers decode of the same 2048^2 latents, 0.74% of the bytes differ with either. Faster modes switch the
 // attention to single-pass TF32 / TF32 linears, and the tail's convs and GroupNorms to bf16 activations and
 // weights; the head stays fp32 in every mode (~3% of the work, and the attention kernel is fp32-only).
 //
@@ -32,8 +35,9 @@
 //     values as the whole tensor (zero padding is real only at the image border, garbage rows are discarded).
 //   - vae::group_norm's statistics are exact integer sums (vae_kernels.h): a layer's statistics accumulated band by
 //     band equal the whole-tensor statistics bit for bit. torch_group_norm's per-thread Welford chains run over the
-//     whole tensor channel by channel and cannot be split, so tiled modes need torch_group_norm == false (in the
-//     reference precision that moves ~1% of the bytes by 1 against the torch-identical untiled decode).
+//     whole tensor channel by channel and cannot be split, so tiled decodes need torch_group_norm == false. Every
+//     mode but the parity mode torch_reference() uses exact statistics, so the pipeline's decode gives the same bytes
+//     whether the planner runs it untiled or tiled.
 // A GroupNorm needs its whole input before any band can be normalized, so the tail is cut into segments between
 // checkpoint tensors kept whole in VRAM, and each segment runs one statistics pass per GroupNorm it contains
 // (recomputing the segment's prefix band by band, keeping only the statistics), then an output pass that writes
@@ -78,12 +82,16 @@ struct DecodeMode {
   bool bf16_convs = false;  // tail convs/GroupNorms on bf16 activations (decoder loaded with bf16 weights)
   vae::AttnPrecision attention = vae::AttnPrecision::kTf32x3;
   bool fast_linears = false;  // attention linears in TF32 instead of strict fp32
-  // fp32 GroupNorms bit-identical to torch (torch_group_norm.h) instead of the fp64-statistics kernel, which
-  // is more accurate but moves ~1% of the output bytes by 1.
-  bool torch_group_norm = true;
+  // fp32 GroupNorms bit-identical to torch (torch_group_norm.h) instead of vae::group_norm's exact fixed-point
+  // statistics. Parity tests only: torch's statistics cannot be split into bands, so decode_tiled refuses it and a
+  // torch-GroupNorm decode differs from the tiled one (0.5-0.7% of the bytes by 1).
+  bool torch_group_norm = false;
 
+  // The pipeline's precision: untiled and tiled decodes give the same bytes.
   static constexpr DecodeMode reference() { return {}; }
-  static constexpr DecodeMode fast_attention() { return {false, vae::AttnPrecision::kTf32, true, true}; }
+  // reference() with torch's GroupNorm: bit-identical to torch up to the mid attention (VAE parity tests).
+  static constexpr DecodeMode torch_reference() { return {false, vae::AttnPrecision::kTf32x3, false, true}; }
+  static constexpr DecodeMode fast_attention() { return {false, vae::AttnPrecision::kTf32, true, false}; }
   static constexpr DecodeMode fastest() { return {true, vae::AttnPrecision::kTf32, true, false}; }
 };
 
@@ -160,13 +168,15 @@ class Flux2VaeDecoder {
   // plan_tiled_min_memory(...).workspace_bytes.
   static std::size_t tiled_workspace_bytes(std::int64_t height, std::int64_t width, int tile, const DecodeMode& mode);
 
-  // Byte-identical to decode() in the same mode. Requires mode.torch_group_norm == false and a plan made for this
-  // latent grid and mode. The hook sees the head stages only. Allocates plan.workspace_bytes of stack.
+  // Byte-identical to decode() in the same mode. Requires mode.torch_group_norm == false (every mode but
+  // torch_reference()) and a plan made for this latent grid and mode. The hook sees the head stages only. Allocates
+  // plan.workspace_bytes of stack.
   void decode_tiled(const Tensor& latents, const Tensor& rgb, const DecodeMode& mode, const TilePlan& plan,
                     cudaStream_t stream, const StageHook& hook = {});
 
-  // Untiled when workspace_bytes() fits budget_bytes; otherwise the fastest tiled plan within it, with
-  // torch_group_norm switched off (max 1/255 from the untiled decode). Returns the plan used (nullopt: untiled).
+  // Untiled when workspace_bytes() fits budget_bytes; otherwise the fastest tiled plan within it, byte-identical to the
+  // untiled decode. A torch_group_norm mode tiles with exact GroupNorm statistics instead (max 1/255 from its untiled
+  // decode). Returns the plan used (nullopt: untiled).
   // Throws std::runtime_error when even the smallest tiled plan does not fit.
   std::optional<TilePlan> decode_within(const Tensor& latents, const Tensor& rgb, const DecodeMode& mode,
                                         std::size_t budget_bytes, cudaStream_t stream);

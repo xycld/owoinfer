@@ -4,6 +4,8 @@
 // host vs device output, the workspace query vs the arena's high-water mark, and decode timing per mode.
 // Exact tiled decode: byte-identical to the untiled decode in the same mode for every latent size, band height and
 // budget tried (tiny bands near the halo limit, bands not dividing the image), with its memory high-water and time.
+// The reference-image tests run the pipeline's precision (DecodeMode::reference(), exact GroupNorm) and the
+// torch-GroupNorm parity mode (torch_reference()).
 #include <gtest/gtest.h>
 
 #include <cuda_runtime.h>
@@ -50,11 +52,12 @@ constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 // 8-bit agreement with the reference PNGs, set from the reference's own reproducibility (measured with the dev
 // venv on this GPU): swapping only torch's SDPA backend (mem-efficient -> math) in this decode leaves 99.46-99.49%
 // of the bytes identical (max diff 1) on g_short/g_fridge_1024, and torch's standalone decode reproduces the
-// asset/2048^2 PNGs (decoded inside the full pipeline) to only 99.54% / 99.34%. Everything up to the mid-block
-// attention is bit-identical here; the attention (kernels/vae kTf32x3) is fp32-accurate but not bit-identical to
-// torch's kernel, and the TF32 operand rounding of every later conv amplifies those last-bit differences
-// (4e-7 relative after the attention, 2e-3 at up_blocks.3). Bounds: at most 3x torch's own backend-swap
-// fraction of differing bytes, and never more than 1 step.
+// asset/2048^2 PNGs (decoded inside the full pipeline) to only 99.54% / 99.34%. In torch_reference() everything up
+// to the mid-block attention is bit-identical here; the attention (kernels/vae kTf32x3) is fp32-accurate but not
+// bit-identical to torch's kernel, and the TF32 operand rounding of every later conv amplifies those last-bit
+// differences (4e-7 relative after the attention, 2e-3 at up_blocks.3). reference()'s exact GroupNorm statistics
+// differ from torch's in the last bits as well. Bounds (both modes): at most 3x torch's own backend-swap fraction of
+// differing bytes, and never more than 1 step.
 constexpr double kMinIdentical = 0.984;
 constexpr int kMaxAbsDiff = 1;
 constexpr double kMaxMeanAbsDiff = 0.015;
@@ -133,7 +136,7 @@ Diff compare(const std::vector<std::uint8_t>& ref, const std::vector<std::uint8_
 const char* mode_name(const DecodeMode& m) {
   if (m.bf16_convs) return "fastest (bf16 convs, tf32 attn+linears)";
   if (m.attention == mi::vae::AttnPrecision::kTf32) return "fast attention (tf32 attn+linears)";
-  return "reference (tf32 convs, tf32x3 attn)";
+  return m.torch_group_norm ? "torch reference (tf32x3 attn, torch GN)" : "reference (tf32 convs, tf32x3 attn)";
 }
 
 // tools/reference/gen_flux2_vae_vectors.py synth(): float32 ops only, reproduced exactly.
@@ -193,9 +196,10 @@ class Flux2VaeTest : public ::testing::Test {
     if (!fs::is_regular_file(bundle_dir() / "moss.mossidx")) return;
     index_ = std::make_unique<mi::weights::ModelIndex>(mi::weights::load_index(bundle_dir() / "moss.mossidx", bundle_dir()));
     streams_ = std::make_unique<mi::runtime::StreamSet>();
-    // Largest decode here: 2048^2 (128x128 latent grid) in the reference mode.
+    // Largest decode here: 2048^2 (128x128 latent grid) in the fp32 modes.
     const std::size_t bytes = Flux2VaeDecoder::persistent_bytes(*index_, true) +
-                              Flux2VaeDecoder::workspace_bytes(128, 128, DecodeMode::reference());
+                              std::max(Flux2VaeDecoder::workspace_bytes(128, 128, DecodeMode::reference()),
+                                       Flux2VaeDecoder::workspace_bytes(128, 128, DecodeMode::torch_reference()));
     std::printf("[flux2_vae] arena %.3f GiB (free %.3f GiB)\n", static_cast<double>(bytes) / kGiB,
                 static_cast<double>(mi::runtime::DeviceArena::free_device_bytes()) / kGiB);
     arena_ = std::make_unique<mi::runtime::DeviceArena>(bytes);
@@ -256,10 +260,12 @@ TEST_F(Flux2VaeTest, GoldenFinalLatentsMatchReferenceImages) {
   const auto ids = golden_cases();
   ASSERT_EQ(ids.size(), 7u);
   for (const auto& id : ids) {
-    const Diff d = check_against_png(id, golden_dir() / id / "final_latent.npy", golden_dir() / id / "image.png");
-    EXPECT_GE(d.identical, kMinIdentical) << id;
-    EXPECT_LE(d.max_abs, kMaxAbsDiff) << id;
-    EXPECT_LE(d.mean_abs, kMaxMeanAbsDiff) << id;
+    for (const DecodeMode& mode : {DecodeMode::reference(), DecodeMode::torch_reference()}) {
+      const Diff d = check_against_png(id, golden_dir() / id / "final_latent.npy", golden_dir() / id / "image.png", mode);
+      EXPECT_GE(d.identical, kMinIdentical) << id << " " << mode_name(mode);
+      EXPECT_LE(d.max_abs, kMaxAbsDiff) << id << " " << mode_name(mode);
+      EXPECT_LE(d.mean_abs, kMaxMeanAbsDiff) << id << " " << mode_name(mode);
+    }
   }
 }
 
@@ -267,19 +273,23 @@ TEST_F(Flux2VaeTest, Bench2048MatchesReferenceImage) {
   if (!fs::is_regular_file(bench_latent_2048())) GTEST_SKIP() << "reference bench output absent: " << bench_latent_2048();
   fs::path png = bench_latent_2048();
   png.replace_filename("ac16_2048.png");
-  const Diff d = check_against_png("ac16_2048", bench_latent_2048(), png);
-  EXPECT_GE(d.identical, kMinIdentical);
-  EXPECT_LE(d.max_abs, kMaxAbsDiff);
-  EXPECT_LE(d.mean_abs, kMaxMeanAbsDiff);
+  for (const DecodeMode& mode : {DecodeMode::reference(), DecodeMode::torch_reference()}) {
+    const Diff d = check_against_png("ac16_2048", bench_latent_2048(), png, mode);
+    EXPECT_GE(d.identical, kMinIdentical) << mode_name(mode);
+    EXPECT_LE(d.max_abs, kMaxAbsDiff) << mode_name(mode);
+    EXPECT_LE(d.mean_abs, kMaxMeanAbsDiff) << mode_name(mode);
+  }
 }
 
 TEST_F(Flux2VaeTest, NonSquareAssetMatchesReferenceImage) {
   fs::path png = asset_latent();
   png.replace_filename("asset001_base.png");
-  const Diff d = check_against_png("asset001_base", asset_latent(), png);
-  EXPECT_GE(d.identical, kMinIdentical);
-  EXPECT_LE(d.max_abs, kMaxAbsDiff);
-  EXPECT_LE(d.mean_abs, kMaxMeanAbsDiff);
+  for (const DecodeMode& mode : {DecodeMode::reference(), DecodeMode::torch_reference()}) {
+    const Diff d = check_against_png("asset001_base", asset_latent(), png, mode);
+    EXPECT_GE(d.identical, kMinIdentical) << mode_name(mode);
+    EXPECT_LE(d.max_abs, kMaxAbsDiff) << mode_name(mode);
+    EXPECT_LE(d.mean_abs, kMaxMeanAbsDiff) << mode_name(mode);
+  }
 }
 
 // Faster modes trade exactness for speed: report how far they move the 8-bit image.
@@ -322,7 +332,7 @@ TEST_F(Flux2VaeTest, WorkspaceQueryCoversPeakAndIsReported) {
     }
   }
   // The stack high-water of a real decode equals the query (all allocations happen up front).
-  for (const DecodeMode& mode : {DecodeMode::reference(), DecodeMode::fastest()}) {
+  for (const DecodeMode& mode : {DecodeMode::reference(), DecodeMode::torch_reference(), DecodeMode::fastest()}) {
     const auto latent = load_latent(asset_latent());
     DevTensor rgb(mi::DType::kU8, {latent->t.dim(1) * 16, latent->t.dim(2) * 16, 3});
     arena_->reset_high_water();
@@ -355,7 +365,8 @@ TEST_F(Flux2VaeTest, DecodeTiming) {
     }
     const auto latent = load_latent(c.latent);
     DevTensor rgb(mi::DType::kU8, {latent->t.dim(1) * 16, latent->t.dim(2) * 16, 3});
-    for (const DecodeMode& mode : {DecodeMode::reference(), DecodeMode::fast_attention(), DecodeMode::fastest()}) {
+    for (const DecodeMode& mode : {DecodeMode::reference(), DecodeMode::torch_reference(), DecodeMode::fast_attention(),
+                                   DecodeMode::fastest()}) {
       model_->decode(latent->t, rgb.t, mode, stream());  // warm-up (cuBLASLt heuristics, kernel attributes)
       constexpr int kIters = 3;
       MI_CUDA_CHECK(cudaEventRecord(a, stream()));
@@ -367,8 +378,11 @@ TEST_F(Flux2VaeTest, DecodeTiming) {
       const double s = ms / 1e3 / kIters;
       std::printf("[flux2_vae] decode %-9s %-40s %7.3f s  (torch %.2f-%.2f s: %.1f-%.1fx)\n", c.name, mode_name(mode), s,
                   c.ref_min_s, c.ref_max_s, c.ref_min_s / s, c.ref_max_s / s);
-      RecordProperty(std::string(c.name) + "." + (mode.bf16_convs ? "fastest" : mode.attention == mi::vae::AttnPrecision::kTf32 ? "fast_attn" : "reference") + ".s",
-                     std::to_string(s));
+      const char* key = mode.bf16_convs                                   ? "fastest"
+                        : mode.attention == mi::vae::AttnPrecision::kTf32 ? "fast_attn"
+                        : mode.torch_group_norm                           ? "torch_reference"
+                                                                          : "reference";
+      RecordProperty(std::string(c.name) + "." + key + ".s", std::to_string(s));
       if (mi::testing::kAssertTimings) {
         EXPECT_LT(s, c.ref_max_s) << c.name << " " << mode_name(mode);
       }
@@ -379,13 +393,6 @@ TEST_F(Flux2VaeTest, DecodeTiming) {
 }
 
 // ---- Exact tiled decode -------------------------------------------------------------------------------------
-
-// The reference precision with exact (tileable) GroupNorm statistics: what tiled decodes are byte-identical to.
-constexpr DecodeMode exact_reference() {
-  DecodeMode m = DecodeMode::reference();
-  m.torch_group_norm = false;
-  return m;
-}
 
 double max_abs_diff(const std::vector<std::uint8_t>& a, const std::vector<std::uint8_t>& b) {
   int mx = 0;
@@ -399,7 +406,7 @@ TEST(Flux2VaeTiledPlan, BudgetsAndQueries) {
     std::int64_t h, w;
   };
   const Size sizes[] = {{"1024x1024", 64, 64}, {"1456x1456", 91, 91}, {"2048x2048", 128, 128}, {"1184x1776", 74, 111}};
-  for (const DecodeMode& mode : {exact_reference(), DecodeMode::fastest()}) {
+  for (const DecodeMode& mode : {DecodeMode::reference(), DecodeMode::fastest()}) {
     for (const Size& s : sizes) {
       std::printf("[flux2_vae] tiled %-9s %-40s untiled %.3f GiB\n", s.name, mode_name(mode),
                   static_cast<double>(Flux2VaeDecoder::workspace_bytes(s.h, s.w, mode)) / kGiB);
@@ -421,9 +428,9 @@ TEST(Flux2VaeTiledPlan, BudgetsAndQueries) {
     }
   }
   // Plan step 23 targets (reference precision): 1456^2 within 1.0 GiB, 2048^2 within 1.5 GiB.
-  EXPECT_TRUE(Flux2VaeDecoder::plan_tiled(91, 91, exact_reference(), std::size_t{1} << 30).has_value());
-  EXPECT_TRUE(Flux2VaeDecoder::plan_tiled(128, 128, exact_reference(), std::size_t{3} << 29).has_value());
-  EXPECT_THROW(Flux2VaeDecoder::plan_tiled_min_memory(64, 64, exact_reference(), 12), std::invalid_argument);
+  EXPECT_TRUE(Flux2VaeDecoder::plan_tiled(91, 91, DecodeMode::reference(), std::size_t{1} << 30).has_value());
+  EXPECT_TRUE(Flux2VaeDecoder::plan_tiled(128, 128, DecodeMode::reference(), std::size_t{3} << 29).has_value());
+  EXPECT_THROW(Flux2VaeDecoder::plan_tiled_min_memory(64, 64, DecodeMode::reference(), 12), std::invalid_argument);
 }
 
 class Flux2VaeTiledTest : public Flux2VaeTest {
@@ -463,8 +470,9 @@ class Flux2VaeTiledTest : public Flux2VaeTest {
     return r;
   }
 
-  // Untiled decodes (exact and torch GroupNorm) as the baseline, then every plan: byte-identical to the exact
-  // untiled decode, within 1/255 of the torch-GroupNorm one, stack high-water equal to the plan's workspace.
+  // Untiled decodes (exact and torch GroupNorm) as the baseline, then every plan: byte-identical to the untiled decode
+  // in `mode` (reference(): the pipeline's decode is the same tiled and untiled), within 1/255 of the torch-GroupNorm
+  // one, stack high-water equal to the plan's workspace.
   void check_plans(const std::string& label, const fs::path& latent_path, const DecodeMode& mode,
                    const std::vector<mi::flux2_vae::TilePlan>& plans, const fs::path& png = {}) {
     const auto latent = load_latent(latent_path);
@@ -521,27 +529,30 @@ class Flux2VaeTiledTest : public Flux2VaeTest {
 TEST_F(Flux2VaeTiledTest, ByteIdentical1024) {
   // Tiles: 8 px (one latent row per band at H/8, far below the halo), 40 (does not divide 1024), the whole image
   // (every segment one band: the executor without halos), and two budgets.
-  check_plans("g_short_1024", golden_dir() / "g_short_1024" / "final_latent.npy", exact_reference(),
-              plans(64, 64, exact_reference(), {8, 40, 1024}, {0.5, 0.75}), golden_dir() / "g_short_1024" / "image.png");
+  check_plans("g_short_1024", golden_dir() / "g_short_1024" / "final_latent.npy", DecodeMode::reference(),
+              plans(64, 64, DecodeMode::reference(), {8, 40, 1024}, {0.5, 0.75}),
+              golden_dir() / "g_short_1024" / "image.png");
 }
 
 TEST_F(Flux2VaeTiledTest, ByteIdentical1456) {
-  check_plans("g_fridge_1456", golden_dir() / "g_fridge_1456" / "final_latent.npy", exact_reference(),
-              plans(91, 91, exact_reference(), {16, 72}, {1.0, 1.5}), golden_dir() / "g_fridge_1456" / "image.png");
+  check_plans("g_fridge_1456", golden_dir() / "g_fridge_1456" / "final_latent.npy", DecodeMode::reference(),
+              plans(91, 91, DecodeMode::reference(), {16, 72}, {1.0, 1.5}), golden_dir() / "g_fridge_1456" / "image.png");
 }
 
 TEST_F(Flux2VaeTiledTest, ByteIdenticalNonSquareAsset) {
   const auto a = mi::npy::load(asset_latent());
   fs::path png = asset_latent();
   png.replace_filename("asset001_base.png");
-  check_plans("asset001_base", asset_latent(), exact_reference(), plans(a.shape[2], a.shape[3], exact_reference(), {24, 168}, {1.0}), png);
+  check_plans("asset001_base", asset_latent(), DecodeMode::reference(),
+              plans(a.shape[2], a.shape[3], DecodeMode::reference(), {24, 168}, {1.0}), png);
 }
 
 TEST_F(Flux2VaeTiledTest, ByteIdentical2048) {
   if (!fs::is_regular_file(bench_latent_2048())) GTEST_SKIP() << "reference bench output absent: " << bench_latent_2048();
   fs::path png = bench_latent_2048();
   png.replace_filename("ac16_2048.png");
-  check_plans("ac16_2048", bench_latent_2048(), exact_reference(), plans(128, 128, exact_reference(), {136}, {1.5, 2.0, 2.5}), png);
+  check_plans("ac16_2048", bench_latent_2048(), DecodeMode::reference(),
+              plans(128, 128, DecodeMode::reference(), {136}, {1.5, 2.0, 2.5}), png);
 }
 
 TEST_F(Flux2VaeTiledTest, ByteIdenticalBf16Mode) {
@@ -555,7 +566,7 @@ TEST_F(Flux2VaeTiledTest, ByteIdenticalBf16Mode) {
 TEST_F(Flux2VaeTiledTest, CancelBetweenBands) {
   const auto latent = load_latent(golden_dir() / "g_short_1024" / "final_latent.npy");
   const std::int64_t h = latent->t.dim(1), w = latent->t.dim(2);
-  const DecodeMode mode = exact_reference();
+  const DecodeMode mode = DecodeMode::reference();
   const auto plan = Flux2VaeDecoder::plan_tiled_min_memory(h, w, mode, 8);  // the most bands
   DevTensor rgb(mi::DType::kU8, {h * 16, w * 16, 3});
   std::vector<std::uint8_t> want(static_cast<std::size_t>(rgb.t.nbytes())), got(want.size());
@@ -604,28 +615,39 @@ TEST_F(Flux2VaeTiledTest, CancelBetweenBands) {
   model_->set_cancel(nullptr);
 }
 
+// decode_within in the pipeline's mode gives the same bytes untiled and tiled; the torch-GroupNorm parity mode tiles
+// with exact statistics (its own decode_tiled refuses it).
 TEST_F(Flux2VaeTiledTest, DecodeWithinBudget) {
   const auto latent = load_latent(golden_dir() / "g_fridge_1456" / "final_latent.npy");
   const std::int64_t h = latent->t.dim(1), w = latent->t.dim(2);
   DevTensor rgb(mi::DType::kU8, {h * 16, w * 16, 3});
   std::vector<std::uint8_t> got(static_cast<std::size_t>(rgb.t.nbytes())), want(got.size());
   const Tensor host_want = Tensor::view(want.data(), mi::DType::kU8, mi::Device::kCPU, {h * 16, w * 16, 3});
-  // Fits: untiled, torch GroupNorm kept.
+  const Tensor host_got = Tensor::view(got.data(), mi::DType::kU8, mi::Device::kCPU, {h * 16, w * 16, 3});
+  model_->decode(latent->t, host_want, DecodeMode::reference(), stream());
+  // Fits: untiled (device output path).
   EXPECT_FALSE(model_->decode_within(latent->t, rgb.t, DecodeMode::reference(),
                                      Flux2VaeDecoder::workspace_bytes(h, w, DecodeMode::reference()), stream()));
   MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
   rgb.buf.download(got.data(), got.size());
-  model_->decode(latent->t, host_want, DecodeMode::reference(), stream());
   EXPECT_EQ(got, want);
-  // 1 GiB: tiled with exact GroupNorm statistics, equal to the untiled exact decode (host output path).
-  const Tensor host_got = Tensor::view(got.data(), mi::DType::kU8, mi::Device::kCPU, {h * 16, w * 16, 3});
+  // 1 GiB: tiled, byte-identical to the untiled decode (host output path).
   const auto plan = model_->decode_within(latent->t, host_got, DecodeMode::reference(), std::size_t{1} << 30, stream());
   ASSERT_TRUE(plan.has_value());
   EXPECT_LE(plan->workspace_bytes, std::size_t{1} << 30);
-  model_->decode(latent->t, host_want, exact_reference(), stream());
   EXPECT_EQ(got, want);
-  EXPECT_THROW(model_->decode_within(latent->t, host_got, DecodeMode::reference(), std::size_t{64} << 20, stream()), std::runtime_error);
-  EXPECT_THROW(model_->decode_tiled(latent->t, host_got, DecodeMode::reference(), *plan, stream()), std::invalid_argument);
+  // torch_reference(): untiled when it fits, tiled with exact statistics (= reference()) when it does not.
+  std::fill(got.begin(), got.end(), std::uint8_t{0});
+  EXPECT_TRUE(model_->decode_within(latent->t, host_got, DecodeMode::torch_reference(), std::size_t{1} << 30, stream()));
+  EXPECT_EQ(got, want);
+  EXPECT_FALSE(model_->decode_within(latent->t, host_got, DecodeMode::torch_reference(),
+                                     Flux2VaeDecoder::workspace_bytes(h, w, DecodeMode::torch_reference()), stream()));
+  model_->decode(latent->t, host_want, DecodeMode::torch_reference(), stream());
+  EXPECT_EQ(got, want);
+  EXPECT_THROW(model_->decode_within(latent->t, host_got, DecodeMode::reference(), std::size_t{64} << 20, stream()),
+               std::runtime_error);
+  EXPECT_THROW(model_->decode_tiled(latent->t, host_got, DecodeMode::torch_reference(), *plan, stream()),
+               std::invalid_argument);
 }
 
 }  // namespace

@@ -20,7 +20,7 @@ void gated_residual(const Problem& p, const Tensor& residual, const Tensor& x, c
 }  // namespace detail
 
 void gemm_gated_residual(const Tensor& residual, const Tensor& x, const Tensor& w, const Tensor& gate,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, GemmTile tile) {
   constexpr const char* op = "gemm_gated_residual";
   const detail::Problem p = detail::check_problem(op, residual, x, w, w.dim(0));
   kernels::detail::check_vector(op, "gate", gate, p.n);
@@ -28,8 +28,8 @@ void gemm_gated_residual(const Tensor& residual, const Tensor& x, const Tensor& 
     throw std::invalid_argument(std::string("mi::kernels::fused::") + op + ": gate must be 16-byte aligned");
   }
   if (p.m == 0) return;
-  detail::with_tile(detail::tile_for(p), [&](auto tile) {
-    detail::gated_residual<decltype(tile)>(p, residual, x, w, gate, stream);
+  detail::with_tile(tile == GemmTile::kAuto ? detail::tile_for(p) : tile, [&](auto cfg) {
+    detail::gated_residual<decltype(cfg)>(p, residual, x, w, gate, stream);
   });
 }
 

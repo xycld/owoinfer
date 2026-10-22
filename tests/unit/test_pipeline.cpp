@@ -1006,6 +1006,42 @@ TEST(PipelineEndToEnd, CancelsWithinPhases) {
             });
 }
 
+// The image does not depend on the VRAM budget: one seed decoded untiled (default budget) and tiled (an arena cap that
+// leaves no room for the untiled decode next to the resident DiT, as in CancelsWithinPhases) gives the same RGB bytes.
+TEST(PipelineEndToEnd, TiledAndUntiledDecodeGiveTheSameImage) {
+  if (!have_weights()) GTEST_SKIP() << "weights not present";
+  const fs::path bundle = weights_root() / "base";
+  const mi::weights::ModelIndex index = mi::weights::load_index(bundle / "moss.mossidx", bundle);
+  mi::pipeline::Request req;
+  req.model = bundle;
+  req.prompt = "a lighthouse on a rocky coast at dusk, oil painting";
+  req.negative_prompt = "blurry";
+  req.steps = 2;
+  mi::pipeline::PipelineOptions options;
+  options.embedding_cache = false;
+  mi::pipeline::Result untiled;
+  {
+    mi::pipeline::Pipeline pipe(options);
+    untiled = pipe.generate(req);
+  }
+  const std::size_t cap = mi::moss_dit::MossDit::persistent_bytes(index) + mi::flux2_vae::Flux2VaeDecoder::persistent_bytes(index) +
+                          (std::size_t{1280} << 20);
+  const mi::planner::Budgets defaults;
+  options.vram_budget = cap + defaults.context_bytes + options.vram_reserve;
+  mi::pipeline::Pipeline pipe(options);
+  const mi::pipeline::Result tiled = pipe.generate(req);
+  std::printf("[pipeline decode] untiled %.2f s (%s); tiled %.2f s (%s)\n", untiled.timings.decode_s,
+              untiled.decode_schedule.c_str(), tiled.timings.decode_s, tiled.decode_schedule.c_str());
+  ASSERT_FALSE(untiled.decode_tiled) << untiled.plan.explanation;
+  ASSERT_TRUE(tiled.decode_tiled) << tiled.plan.explanation;
+  EXPECT_EQ(bit_mismatches(tiled.latents, untiled.latents), 0u);
+  ASSERT_EQ(untiled.rgb.size(), static_cast<std::size_t>(1024 * 1024 * 3));
+  ASSERT_EQ(tiled.rgb.size(), untiled.rgb.size());
+  std::size_t differ = 0;
+  for (std::size_t i = 0; i < untiled.rgb.size(); ++i) differ += tiled.rgb[i] != untiled.rgb[i];
+  EXPECT_EQ(differ, 0u) << "of " << untiled.rgb.size() << " bytes";
+}
+
 // Free device memory grows between two requests (another application exits): the plan for the second would like a
 // larger arena (the whole DiT resident), which means dropping and reloading the loaded, partly streamed DiT. The
 // pipeline plans inside the held arena instead when that costs less than the reload: no new arena, no reload, the

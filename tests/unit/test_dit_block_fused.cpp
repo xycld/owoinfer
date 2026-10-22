@@ -10,6 +10,7 @@
 // and 1456^2 + 4096 tokens (synthetic activations).
 #include <gtest/gtest.h>
 
+#include <cublasLt.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -28,6 +29,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -855,7 +857,7 @@ TEST(DitGraphKey, HashAndEqualityCoverEveryField) {
   md::StepGraphKey b = a;
   EXPECT_EQ(a, b);
   EXPECT_EQ(a.hash(), b.hash());
-  std::vector<md::StepGraphKey> variants(7, a);
+  std::vector<md::StepGraphKey> variants(8, a);
   variants[0].height = 65;
   variants[1].width = 63;
   variants[2].text_lengths[0] = 283;
@@ -863,6 +865,7 @@ TEST(DitGraphKey, HashAndEqualityCoverEveryField) {
   variants[4].block_begin = 1;
   variants[5].block_end = 41;
   variants[6].addresses[0] = reinterpret_cast<const void*>(0x2000);
+  variants[7].route_generation = 1;
   for (const auto& v : variants) {
     EXPECT_FALSE(v == a);
     EXPECT_NE(v.hash(), a.hash());
@@ -899,30 +902,62 @@ TEST(DitGraph, CapturesReplaysAndEvicts) {
   MI_CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-// M1 startup self-check: finds and checks at least one fused configuration on this GPU (cheaply), routes only the
-// configurations it validated, and reports a mismatch injected into one fused result.
+// The GPU and library the routing facts asserted below were measured on: sm_89 with cuBLASLt 13.
+bool measured_platform() {
+  int device = 0;
+  MI_CUDA_CHECK(cudaGetDevice(&device));
+  cudaDeviceProp prop{};
+  MI_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+  return prop.major == 8 && prop.minor == 9 && cublasLtGetVersion() / 10000 == 13;
+}
+
+// Run lengths of a CFG step whose rows are `hw` latent tokens plus each text length: every non-empty set of the rows
+// (a block that a row skips runs the others), as fused_big_cols sizes for.
+std::vector<std::int64_t> run_lengths(std::int64_t hw, std::span<const std::int64_t> text_lengths) {
+  std::vector<std::int64_t> out;
+  for (std::uint32_t mask = 1; mask < (std::uint32_t{1} << text_lengths.size()); ++mask) {
+    std::int64_t m = 0;
+    for (std::size_t r = 0; r < text_lengths.size(); ++r) {
+      if (mask & (std::uint32_t{1} << r)) m += hw + text_lengths[r];
+    }
+    out.push_back(m);
+  }
+  return out;
+}
+
+// M1 startup self-check: finds and checks at least one fused configuration on this GPU (cheaply), under every CUTLASS
+// tile, routes only the configurations it validated, covers the production run lengths, and reports a mismatch
+// injected into one fused result.
 TEST(FusedSelfCheck, PassesAndReportsAnInjectedMismatch) {
   cudaStream_t stream = nullptr;
   MI_CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-  const std::size_t free_before = mi::runtime::DeviceArena::free_device_bytes();
-  std::size_t peak = 0;
   const auto t0 = std::chrono::steady_clock::now();
-  const md::FusedCheck ok = md::check_fused_gemms(stream, [&](const char*, std::int64_t, const Tensor&) {
-    const std::size_t free_now = mi::runtime::DeviceArena::free_device_bytes();
-    peak = std::max(peak, free_before > free_now ? free_before - free_now : 0);
-  });
+  const md::FusedCheck ok = md::check_fused_gemms(stream);
   const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  std::printf("[fused self-check] %s: %s (%.2f s, ~%.0f MiB device memory)\n", ok.ok ? "ok" : "FAILED", ok.detail.c_str(),
-              s, static_cast<double>(peak) / (1 << 20));
+  // Device memory the check allocates: per op, its operands at the largest row count it checked, plus the GEMM
+  // workspace (ffn_up_gate: x, w, the [rows, 2F] op-by-op output, ref and got; the others: x, w, gate, the op-by-op
+  // output, ref and got).
+  std::size_t operand_bytes = 0;
+  for (const auto& [op, k, n] : {std::tuple{"o_proj", kDim, kDim}, std::tuple{"ffn_up_gate", kDim, kUpGate},
+                                  std::tuple{"ffn_down", std::int64_t{md::kFfnDim}, kDim}}) {
+    std::int64_t m = 0;
+    for (const md::FusedConfig& f : ok.validated) m = f.op == op ? std::max(m, f.rows) : m;
+    if (m == 0) continue;
+    const std::int64_t elems = std::string(op) == "ffn_up_gate" ? m * k + n * k + 2 * m * n : m * k + n * k + n + 3 * m * n;
+    operand_bytes = std::max(operand_bytes, static_cast<std::size_t>(elems) * 2);
+  }
+  const std::size_t check_bytes = operand_bytes + mi::kernels::Gemm::kWorkspaceBytes;
+  std::printf("[fused self-check] %s: %s (%.2f s, %.0f MiB device memory)\n", ok.ok ? "ok" : "FAILED", ok.detail.c_str(), s,
+              static_cast<double>(check_bytes) / (1 << 20));
   for (const md::FusedConfig& f : ok.validated) {
     std::printf("[fused self-check]   %-11s @ %5lld rows: %s\n", f.op.c_str(), static_cast<long long>(f.rows),
                 f.config.describe().c_str());
   }
   ASSERT_TRUE(ok.ok) << ok.detail;
   ASSERT_FALSE(ok.validated.empty());  // a pass checked something
-  EXPECT_LE(s, 3.0);
-  EXPECT_LE(static_cast<double>(peak), 0.3 * kGiB);
+  EXPECT_LE(s, 30.0);                  // a hang guard: ~1 s on an idle 4090 Laptop GPU, slower under load or ASan
+  EXPECT_LE(check_bytes, std::size_t{1} << 28);
   // Each validated configuration routes fused at its row count with the validated set, and op by op without it (a
   // configuration the check did not validate never runs fused).
   for (std::size_t i = 0; i < ok.validated.size(); ++i) {
@@ -934,6 +969,38 @@ TEST(FusedSelfCheck, PassesAndReportsAnInjectedMismatch) {
     EXPECT_FALSE(pick(md::fused_route(f.rows, others))) << f.op << " @ " << f.rows;
     const md::FusedRoute none = md::fused_route(f.rows, std::span<const md::FusedConfig>());
     EXPECT_FALSE(none.o || none.up_gate || none.down);
+  }
+  // The configurations cuBLASLt runs at the run lengths of the measured gates (1024^2 with 282 + 10 tokens, 1456^2 with
+  // 4096 + 16) are validated ones, so those steps run every pair fused.
+  struct Gate {
+    const char* name;
+    std::int64_t grid;
+    std::vector<std::int64_t> lengths;
+  };
+  const Gate gates[] = {{"1024^2 282+10", 64, {282, 10}}, {"1456^2 4096+16", 91, {4096, 16}}};
+  mi::kernels::Gemm probe;
+  const auto view = [](std::int64_t rows, std::int64_t cols) {  // never dereferenced: algo_config reads the layout
+    return Tensor::view(reinterpret_cast<void*>(std::uintptr_t{1} << 20), DType::kBF16, mi::Device::kCUDA, {rows, cols});
+  };
+  for (const Gate& g : gates) {
+    for (const std::int64_t m : run_lengths(g.grid * g.grid, g.lengths)) {
+      const md::FusedRoute r = md::fused_route(m, ok.validated);
+      for (const auto& [op, k, n, fused] :
+           {std::tuple{"o_proj", kDim, kDim, r.o}, std::tuple{"ffn_up_gate", kDim, kUpGate, r.up_gate},
+            std::tuple{"ffn_down", std::int64_t{md::kFfnDim}, kDim, r.down}}) {
+        mi::kernels::Gemm::AlgoConfig c =
+            probe.algo_config(view(m, n), view(m, k), view(n, k), nullptr, mi::kernels::Gemm::kWorkspaceBytes);
+        c.workspace_bytes = 0;
+        const bool validated = std::any_of(ok.validated.begin(), ok.validated.end(),
+                                           [&](const md::FusedConfig& f) { return f.op == op && f.config == c; });
+        std::printf("[fused self-check] %-14s %5lld rows %-11s %s: %s\n", g.name, static_cast<long long>(m), op,
+                    c.describe().c_str(), validated ? "validated" : "NOT validated");
+        EXPECT_EQ(fused, validated && mi::kernels::fused::matches_cublaslt(c)) << g.name << " " << op << " @ " << m;
+        if (measured_platform()) {
+          EXPECT_TRUE(validated) << g.name << " " << op << " @ " << m;
+        }
+      }
+    }
   }
   int calls = 0;
   std::string where;
@@ -949,7 +1016,79 @@ TEST(FusedSelfCheck, PassesAndReportsAnInjectedMismatch) {
   EXPECT_FALSE(bad.ok);
   EXPECT_TRUE(bad.validated.empty());
   EXPECT_NE(bad.detail.find(where + ": 1 of"), std::string::npos) << bad.detail;
+  EXPECT_NE(bad.detail.find("CUTLASS tile 128x256"), std::string::npos) << bad.detail;  // the second tile run
   MI_CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+// A failed self-check poisons the device: configurations another check installed (before or after) never run fused
+// again, workspaces are sized for the op-by-op ffn_up_gate, a fused block over a buffer sized for the old route refuses
+// to run, and the graph key changes. In a child process: the poisoning is process-wide and permanent.
+int poisoned_route_failures() {
+  int failures = 0;
+  const auto expect = [&](bool cond, const std::string& what) {
+    if (!cond) {
+      ++failures;
+      std::fprintf(stderr, "poisoned route: FAILED %s\n", what.c_str());
+    }
+  };
+  cudaStream_t stream = nullptr;
+  MI_CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  const md::FusedCheck ok = md::check_fused_gemms(stream);
+  expect(ok.ok, "self-check: " + ok.detail);
+  md::install_fused_check(ok);
+  const std::int64_t lengths[] = {282, 10};
+  const std::uint64_t gen_ok = md::fused_route_generation();
+  expect(gen_ok > 0, "installing configurations changes the generation");
+  bool any_fused = false;
+  for (const md::FusedConfig& f : ok.validated) {
+    const md::FusedRoute r = md::fused_route(f.rows);
+    any_fused = any_fused || r.o || r.up_gate || r.down;
+  }
+  expect(any_fused, "the installed check runs something fused");
+  if (measured_platform()) expect(md::fused_big_cols(64 * 64, lengths) == md::kFusedBigCols, "1024^2 fused big buffer");
+
+  md::install_fused_check(md::FusedCheck{false, "injected failure", {}});
+  const std::uint64_t gen_poisoned = md::fused_route_generation();
+  expect(gen_poisoned != gen_ok, "poisoning changes the generation");
+  md::install_fused_check(ok);  // another pipeline's passed check afterwards
+  md::install_fused_check(md::FusedCheck{false, "again", {}});
+  expect(md::fused_route_generation() == gen_poisoned, "nothing else changes the generation");
+  for (const md::FusedConfig& f : ok.validated) {
+    const md::FusedRoute r = md::fused_route(f.rows);
+    expect(!(r.o || r.up_gate || r.down), f.op + " @ " + std::to_string(f.rows) + " runs op by op");
+    const md::FusedRoute t = md::fused_route(f.rows, ok.validated);  // the explicit-set overload ignores poisoning
+    expect(t.o || t.up_gate || t.down, "explicit set @ " + std::to_string(f.rows));
+  }
+  expect(md::fused_big_cols(64 * 64, lengths) == md::kOpByOpBigCols, "op-by-op big buffer after poisoning");
+  expect(md::MossDit::workspace_bytes(64, 64, lengths, md::BlockPath::kFused) ==
+             md::MossDit::workspace_bytes(64, 64, lengths, md::BlockPath::kOpByOp),
+         "fused workspace = op-by-op workspace after poisoning");
+  // A block over a big buffer sized for the fused route (kFusedBigCols per token) is refused before any launch.
+  constexpr int kRows = 16;
+  mi::DeviceBuffer x(kRows * kDim * 2), y(kRows * kDim * 2), big(kRows * md::kFusedBigCols * 2), mod(6 * kDim * 2);
+  const md::FusedBlockBuffers a{Tensor::view(x.get(), DType::kBF16, mi::Device::kCUDA, {kRows, kDim}),
+                                Tensor::view(y.get(), DType::kBF16, mi::Device::kCUDA, {kRows, kDim}),
+                                Tensor::view(big.get(), DType::kBF16, mi::Device::kCUDA, {kRows, md::kFusedBigCols}),
+                                Tensor{},
+                                Tensor::view(mod.get(), DType::kBF16, mi::Device::kCUDA, {6 * kDim})};
+  mi::kernels::Gemm gemm;
+  const md::QkvGemm qkv{&gemm, nullptr, 0};
+  std::string error;
+  try {
+    md::run_block_fused(md::BlockTensors{}, a, md::BlockRun{0, kRows, Tensor{}, kRows}, qkv, stream);
+  } catch (const std::invalid_argument& e) {
+    error = e.what();
+  }
+  expect(error.find(std::to_string(md::kOpByOpBigCols) + " per token") != std::string::npos,
+         "run_block_fused refuses the small buffer: '" + error + "'");
+  MI_CUDA_CHECK(cudaStreamDestroy(stream));
+  if (failures == 0) std::fprintf(stderr, "poisoned route: ok\n");
+  return failures;
+}
+
+TEST(FusedSelfCheck, FailedCheckPoisonsTheDevice) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");  // re-executes the binary: a fresh CUDA context and route state
+  EXPECT_EXIT(std::exit(poisoned_route_failures()), ::testing::ExitedWithCode(0), "poisoned route: ok");
 }
 
 // Small images, where cuBLASLt's algorithm (and so fused_route) changes with the run length: MossDit::forward with the
@@ -989,9 +1128,7 @@ TEST(DitSmallImages, ForwardFusedMatchesOpByOpBitForBit) {
     std::printf("[dit small] fused_route(%lld rows): o %s, up_gate %s, down %s\n", static_cast<long long>(m),
                 r.o ? "fused" : "op by op", r.up_gate ? "fused" : "op by op", r.down ? "fused" : "op by op");
   }
-  cudaDeviceProp prop{};
-  MI_CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-  if (prop.major == 8 && prop.minor == 9) {
+  if (measured_platform()) {
     EXPECT_FALSE(md::fused_route(84).down) << "sm_89: cuBLASLt splits K for ffn_down at 84 rows";
   }
   // Whether a forward over `rows` ran some pairs fused and others op by op (in one run, or across its runs).
@@ -1077,7 +1214,11 @@ TEST(DitSmallImages, ForwardFusedMatchesOpByOpBitForBit) {
               "%zu graph captures, ~%.0f KiB device memory per captured block graph\n",
               checks, residency.resident_blocks, graph_captures, graph_bytes_per_capture / 1024.0);
   std::printf("[dit small] %zu of the checked forwards mixed fused and op-by-op pairs\n", mixed_forwards);
-  EXPECT_GT(mixed_forwards, 0u);  // the fallback ran inside fused forwards that matched op_by_op
+  if (measured_platform()) {
+    EXPECT_GT(mixed_forwards, 0u);  // the fallback ran inside fused forwards that matched op_by_op
+  } else {
+    std::printf("[dit small] not sm_89 + cuBLASLt 13: whether some forward mixes fused and op-by-op pairs is not asserted\n");
+  }
   if (graph_bytes_per_capture >= 0) {
     EXPECT_LE(graph_bytes_per_capture * md::kGraphCapacity, static_cast<double>(md::graph_cache_bytes()));
   }

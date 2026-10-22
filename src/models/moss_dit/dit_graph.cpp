@@ -26,6 +26,7 @@ std::uint64_t StepGraphKey::hash() const {
   f.mix(static_cast<std::uint64_t>(block_end));
   f.mix(addresses.size());
   for (const void* p : addresses) f.mix(reinterpret_cast<std::uintptr_t>(p));
+  f.mix(route_generation);
   return f.h;
 }
 static_assert(kNumBlocks <= 64, "StepGraphKey::hash packs a skip set into 64 bits");

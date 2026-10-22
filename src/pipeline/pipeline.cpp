@@ -717,7 +717,10 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
                                   moss_dit::MossDit::encode_text_workspace_bytes(std::max(sc, su));
   const std::size_t denoise_need =
       refined_bytes + std::max(refine_need, latent_bytes + denoise_workspace_bytes(h, w, sc, su, g, req.sampler, block_path));
-  const flux2_vae::DecodeMode decode_mode = flux2_vae::DecodeMode::reference();
+  // Exact GroupNorm statistics: the untiled decode and every tiled one the plan may pick from the free VRAM give the
+  // same bytes, so the image does not depend on the memory budget.
+  constexpr flux2_vae::DecodeMode decode_mode = flux2_vae::DecodeMode::reference();
+  static_assert(!decode_mode.torch_group_norm, "torch's GroupNorm cannot be tiled");
 
   planner::PlanInputs in;
   in.shapes = planner::shapes_from_index(b.index);
@@ -743,13 +746,11 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   if (req.decode) {
     in.workspaces.decode = latent_bytes + flux2_vae::Flux2VaeDecoder::workspace_bytes(h, w, decode_mode);
     in.workspaces.decode_tiled = [&](std::size_t budget) -> std::optional<planner::TiledDecode> {
-      flux2_vae::DecodeMode tiled = decode_mode;
-      tiled.torch_group_norm = false;  // what decode_within runs tiled
       std::optional<flux2_vae::TilePlan> tp;
       if (budget == 0) {
-        tp = flux2_vae::Flux2VaeDecoder::plan_tiled_min_memory(h, w, tiled, 8);
+        tp = flux2_vae::Flux2VaeDecoder::plan_tiled_min_memory(h, w, decode_mode, 8);
       } else if (budget > latent_bytes) {
-        tp = flux2_vae::Flux2VaeDecoder::plan_tiled(h, w, tiled, budget - latent_bytes);
+        tp = flux2_vae::Flux2VaeDecoder::plan_tiled(h, w, decode_mode, budget - latent_bytes);
       }
       if (!tp) return std::nullopt;
       return planner::TiledDecode{latent_bytes + tp->workspace_bytes, tp->relative_cost, tp->tile};
@@ -959,8 +960,8 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     MI_CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
-  // 4. VAE decode (P:428-438) to RGB8: untiled when it fits the arena next to the resident models, else exact tiled.
-  // Not after a cancel, even one seen at the last step.
+  // 4. VAE decode (P:428-438) to RGB8: untiled when it fits the arena next to the resident models, else tiled, with the
+  // same bytes either way (decode_mode). Not after a cancel, even one seen at the last step.
   if (req.decode && !r.cancelled && keep_going(Phase::kDecode)) {
     m.ensure_vae(b, plan.vae.stack_bytes, plan.dit.park_for_decode, tm);
     runtime::StackScope phase(*m.arena);

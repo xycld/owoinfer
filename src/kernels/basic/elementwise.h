@@ -7,9 +7,15 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 #include "core/tensor.h"
 
 namespace mi::kernels {
+
+// Numerics version of these ops: bump it whenever one of them changes an output bit. kernels::fused folds it into
+// kFusedKernelsVersion (its epilogues must match situ_glu and gated_residual), so cached fused self-checks run again.
+inline constexpr std::uint32_t kElementwiseNumericsVersion = 1;
 
 // MOSS _situ (P:66-67): (4*tanh(g/4)*sigmoid(g)) * (25*tanh(h/25)), op by op in bf16.
 // Fused form reads the ffn_up_gate output [..., 2F] chunked as [hidden | gate] (P:147); out is [..., F].

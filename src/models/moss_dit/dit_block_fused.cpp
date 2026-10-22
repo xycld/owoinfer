@@ -71,13 +71,16 @@ OpConfigs query_configs(kernels::Gemm& gemm, std::int64_t rows) {
   return c;
 }
 
-// Per device: the cuBLASLt handle fused_route() asks, its answers per row count, and the installed configurations.
-// Leaked on purpose: cuBLASLt handles must not be destroyed during static destruction, after the CUDA runtime.
+// Per device: the cuBLASLt handle fused_route() asks, its answers per row count, the installed configurations, whether
+// a failed check poisoned the device, and how often the installed route changed. Leaked on purpose: cuBLASLt handles
+// must not be destroyed during static destruction, after the CUDA runtime.
 struct RouteState {
   std::mutex mu;
   std::map<int, std::unique_ptr<kernels::Gemm>> gemms;
   std::map<std::pair<int, std::int64_t>, OpConfigs> configs;
   std::map<int, std::vector<FusedConfig>> validated;
+  std::set<int> poisoned;
+  std::map<int, std::uint64_t> generation;
 };
 RouteState& route_state() {
   static auto* state = new RouteState();
@@ -114,7 +117,8 @@ FusedRoute fused_route(std::int64_t rows) {
   RouteState& st = route_state();
   std::lock_guard<std::mutex> lock(st.mu);
   const auto v = st.validated.find(device);
-  return route_locked(st, device, rows, v == st.validated.end() ? std::span<const FusedConfig>() : v->second);
+  if (v == st.validated.end() || st.poisoned.contains(device)) return {false, false, false};
+  return route_locked(st, device, rows, v->second);
 }
 
 FusedRoute fused_route(std::int64_t rows, std::span<const FusedConfig> validated) {
@@ -127,17 +131,32 @@ FusedRoute fused_route(std::int64_t rows, std::span<const FusedConfig> validated
 }
 
 void install_fused_check(const FusedCheck& check) {
-  if (!check.ok) return;
   int device = 0;
   MI_CUDA_CHECK(cudaGetDevice(&device));
   RouteState& st = route_state();
   std::lock_guard<std::mutex> lock(st.mu);
+  if (!check.ok) {
+    if (st.poisoned.insert(device).second) ++st.generation[device];
+    return;
+  }
   std::vector<FusedConfig>& installed = st.validated[device];
   for (const FusedConfig& c : check.validated) {
     const bool known = std::any_of(installed.begin(), installed.end(),
                                    [&](const FusedConfig& v) { return v.op == c.op && v.config == c.config; });
-    if (!known) installed.push_back(c);
+    if (!known) {
+      installed.push_back(c);
+      ++st.generation[device];
+    }
   }
+}
+
+std::uint64_t fused_route_generation() {
+  int device = 0;
+  MI_CUDA_CHECK(cudaGetDevice(&device));
+  RouteState& st = route_state();
+  std::lock_guard<std::mutex> lock(st.mu);
+  const auto it = st.generation.find(device);
+  return it == st.generation.end() ? 0 : it->second;
 }
 
 std::int64_t fused_big_cols(std::int64_t hw, std::span<const std::int64_t> text_lengths) {
@@ -236,14 +255,16 @@ struct DevMatrix {
     buf = DeviceBuffer(t.nbytes());
     t.data = buf.get();
   }
-  // Filled from `pool` starting at element `offset` (wrapping), so operands differ without generating each one.
-  void fill(const std::vector<std::uint16_t>& pool, std::size_t offset) {
-    std::vector<std::uint16_t> h(static_cast<std::size_t>(t.numel()));
+  // The first `rows` rows filled from `pool` starting at element `offset` (wrapping), so operands differ without
+  // generating each one.
+  void fill(const std::vector<std::uint16_t>& pool, std::size_t offset, std::int64_t rows) {
+    std::vector<std::uint16_t> h(static_cast<std::size_t>(rows * t.dim(1)));
     for (std::size_t i = 0; i < h.size(); ++i) h[i] = pool[(offset + i * 7) % pool.size()];
     buf.upload(h.data(), h.size() * sizeof(std::uint16_t));
   }
-  std::vector<std::uint16_t> download() const {
-    std::vector<std::uint16_t> h(static_cast<std::size_t>(t.numel()));
+  void fill(const std::vector<std::uint16_t>& pool, std::size_t offset) { fill(pool, offset, t.dim(0)); }
+  std::vector<std::uint16_t> download(std::int64_t rows) const {
+    std::vector<std::uint16_t> h(static_cast<std::size_t>(rows * t.dim(1)));
     buf.download(h.data(), h.size() * sizeof(std::uint16_t));
     return h;
   }
@@ -267,6 +288,14 @@ constexpr std::size_t kCheckBytes = std::size_t{224} << 20;  // + the 32 MiB GEM
 std::size_t check_bytes(int op, std::int64_t rows) {
   const auto m = static_cast<std::size_t>(rows), k = static_cast<std::size_t>(kOpK[op]), n = static_cast<std::size_t>(kOpN[op]);
   return 2 * (op == 1 ? m * k + n * k + m * n + m * n : m * k + n * k + n + 3 * m * n);
+}
+
+// Every CUTLASS tile a fused launch can run: kAuto picks by row count and SM count (128x128 below two waves, else
+// 128x256, or 256x128 for ffn_up_gate's N), and set_gemm_tile_override can force any of them.
+using kernels::fused::GemmTile;
+constexpr GemmTile kCheckTiles[] = {GemmTile::k128x128, GemmTile::k128x256, GemmTile::k256x128};
+const char* tile_name(GemmTile t) {
+  return t == GemmTile::k128x128 ? "128x128" : t == GemmTile::k128x256 ? "128x256" : "256x128";
 }
 
 }  // namespace
@@ -296,19 +325,34 @@ FusedCheck check_fused_gemms(cudaStream_t stream, const FusedCheckHook& hook) {
   std::vector<FusedConfig> checked;
   std::string mismatch;
   std::size_t unchecked = 0;
-  const auto compare = [&](const FusedConfig& f, const std::vector<std::uint16_t>& want, const DevMatrix& got) {
-    MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (hook) hook(f.op.c_str(), f.rows, got.t);
-    MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-    const std::vector<std::uint16_t> g = got.download();
-    std::size_t diff = 0;
-    for (std::size_t i = 0; i < g.size(); ++i) diff += g[i] != want[i];
-    if (diff == 0) {
-      checked.push_back(f);
-    } else if (mismatch.empty()) {
-      mismatch = f.op + " at " + std::to_string(f.rows) + " rows: " + std::to_string(diff) + " of " +
-                 std::to_string(g.size()) + " outputs differ from cuBLASLt + the unfused op (" + f.config.describe() + ")";
+  // The fused op under every tile, each on inputs reset by `prepare`; returns the first f.rows rows of each result.
+  const auto run_tiles = [&](const FusedConfig& f, const DevMatrix& got, auto&& prepare, auto&& fused) {
+    std::vector<std::vector<std::uint16_t>> out;
+    for (const GemmTile tile : kCheckTiles) {
+      prepare();
+      fused(tile);
+      MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (hook) hook(f.op.c_str(), f.rows, got.t.slice0(0, f.rows));
+      MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+      out.push_back(got.download(f.rows));
     }
+    return out;
+  };
+  const auto compare = [&](const FusedConfig& f, const std::vector<std::uint16_t>& want,
+                           const std::vector<std::vector<std::uint16_t>>& got) {
+    bool same = true;
+    for (std::size_t t = 0; t < got.size(); ++t) {
+      std::size_t diff = 0;
+      for (std::size_t i = 0; i < want.size(); ++i) diff += got[t][i] != want[i];
+      if (diff == 0) continue;
+      same = false;
+      if (mismatch.empty()) {
+        mismatch = f.op + " at " + std::to_string(f.rows) + " rows: " + std::to_string(diff) + " of " +
+                   std::to_string(want.size()) + " outputs differ from cuBLASLt + the unfused op (" + f.config.describe() +
+                   ", CUTLASS tile " + tile_name(kCheckTiles[t]) + ")";
+      }
+    }
+    if (same) checked.push_back(f);
   };
   // The op-by-op linear, after making sure cuBLASLt runs it with the configuration under test (the probe's layout is
   // the check's: contiguous rows from 256-byte aligned allocations).
@@ -341,13 +385,14 @@ FusedCheck check_fused_gemms(cudaStream_t stream, const FusedCheckHook& hook) {
       w.fill(pool, 6);
       for (const FusedConfig* f : todo) {
         const std::int64_t m = f->rows;
-        MI_CUDA_CHECK(cudaMemsetAsync(ref.t.data, 0, ref.t.nbytes(), stream));
-        MI_CUDA_CHECK(cudaMemsetAsync(got.t.data, 0, got.t.nbytes(), stream));
-        linear(*f, up_gate.t.slice0(0, m), x.t.slice0(0, m), w.t);
-        kernels::situ_glu(up_gate.t.slice0(0, m), ref.t.slice0(0, m), stream);
-        kernels::fused::gemm_situ_glu(got.t.slice0(0, m), x.t.slice0(0, m), w.t, stream);
+        const Tensor xm = x.t.slice0(0, m), um = up_gate.t.slice0(0, m), gm = got.t.slice0(0, m);
+        const auto fused = run_tiles(
+            *f, got, [&] { MI_CUDA_CHECK(cudaMemsetAsync(gm.data, 0, gm.nbytes(), stream)); },
+            [&](GemmTile tile) { kernels::fused::gemm_situ_glu(gm, xm, w.t, stream, tile); });
+        linear(*f, um, xm, w.t);
+        kernels::situ_glu(um, ref.t.slice0(0, m), stream);
         MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-        compare(*f, ref.download(), got);
+        compare(*f, ref.download(m), fused);
       }
       continue;
     }
@@ -359,14 +404,16 @@ FusedCheck check_fused_gemms(cudaStream_t stream, const FusedCheckHook& hook) {
     const Tensor g = Tensor::view(gate.t.data, DType::kBF16, Device::kCUDA, {n});
     for (const FusedConfig* f : todo) {
       const std::int64_t m = f->rows;
-      ref.fill(pool, 4);  // the residual, updated in place
-      const Tensor xm = x.t.slice0(0, m), ym = y.t.slice0(0, m), rm = ref.t.slice0(0, m);
-      MI_CUDA_CHECK(cudaMemcpyAsync(got.t.data, ref.t.data, ref.t.nbytes(), cudaMemcpyDeviceToDevice, stream));
+      const Tensor xm = x.t.slice0(0, m), ym = y.t.slice0(0, m), rm = ref.t.slice0(0, m), gm = got.t.slice0(0, m);
+      ref.fill(pool, 4, m);  // the residual: each fused run starts from a copy, the op-by-op one updates it in place
+      const auto fused = run_tiles(
+          *f, got,
+          [&] { MI_CUDA_CHECK(cudaMemcpyAsync(gm.data, rm.data, gm.nbytes(), cudaMemcpyDeviceToDevice, stream)); },
+          [&](GemmTile tile) { kernels::fused::gemm_gated_residual(gm, xm, w.t, g, stream, tile); });
       linear(*f, ym, xm, w.t);
       kernels::gated_residual(rm, ym, g, rm, stream);
-      kernels::fused::gemm_gated_residual(got.t.slice0(0, m), xm, w.t, g, stream);
       MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-      compare(*f, ref.download(), got);
+      compare(*f, ref.download(m), fused);
     }
   }
   const std::string skipped =

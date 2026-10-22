@@ -501,6 +501,7 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     key.text_lengths = lengths;
     for (const Row& r : rows) key.skips.push_back(r.skip);
     key.addresses = {a.x.data, a.y.data, a.big.data, a.rope.data, a.mod.data, a.cu_seqlens.data, a.lse, gemm_workspace_};
+    key.route_generation = fused_route_generation();
     const std::uint64_t h = key.hash();
     use_graphs = h == last_step_hash_;
     last_step_hash_ = h;

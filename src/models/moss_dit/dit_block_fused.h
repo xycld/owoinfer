@@ -54,29 +54,32 @@ struct FusedConfig {
 // op-by-op linear cuBLASLt runs with a configuration (Gemm::AlgoConfig: algorithm, tile, stages, inner shape, swizzle,
 // split-K, reduction, custom option, cluster) that the self-check installed for this device validated for that op, and
 // that kernels::fused::matches_cublaslt accepts. Every other pair runs op by op, and all of them do on a device without
-// an installed check. Asks cuBLASLt with MossDit's operand layout (contiguous rows, 256-byte aligned,
-// Gemm::kWorkspaceBytes); cached per device and row count, thread-safe.
+// an installed check or poisoned by a failed one (install_fused_check). Asks cuBLASLt with MossDit's operand layout
+// (contiguous rows, 256-byte aligned, Gemm::kWorkspaceBytes); cached per device and row count, thread-safe.
 struct FusedRoute {
   bool o = true;        // o-proj + gated residual
   bool up_gate = true;  // ffn_up_gate + SiTU-GLU
   bool down = true;     // ffn_down + gated residual
 };
 FusedRoute fused_route(std::int64_t rows);
-// The same with `validated` in place of the installed configurations (tests).
+// The same with `validated` in place of the installed configurations and regardless of poisoning (tests).
 FusedRoute fused_route(std::int64_t rows, std::span<const FusedConfig> validated);
 
 // Big-buffer elements per token of a fused forward over rows of `hw + text_lengths[r]` tokens: kOpByOpBigCols when
 // some set of these rows (a run of the rows that execute a block) gets ffn_up_gate op by op, else kFusedBigCols.
+// It follows the installed route: after a poisoning it is kOpByOpBigCols, and a forward planned before with
+// kFusedBigCols fails run_block_fused's buffer check (std::invalid_argument) instead of overrunning the buffer.
 std::int64_t fused_big_cols(std::int64_t hw, std::span<const std::int64_t> text_lengths);
 
 // Startup self-check (once per GPU, library version and kernels::fused::kFusedKernelsVersion, see
 // pipeline/hardware_profile.h). Asks cuBLASLt (no launches) for each op's configuration at every realistic run length
 // (1..61506 rows: every count up to 1536, then sampled), collects the distinct ones matches_cublaslt accepts, and runs
-// each once on synthetic inputs, fused and op by op, at the smallest row count that gets it (a configuration whose
-// operands would exceed ~0.25 GiB stays unvalidated: op by op). ok iff at least one configuration was checked and every
-// checked one is bit-identical; then `validated` lists them. detail says what was checked, what differed, or that
-// nothing would run fused. Throws CudaError when it cannot allocate its operands. `hook` (tests) may alter each fused
-// result before it is compared.
+// each on synthetic inputs at the smallest row count that gets it, op by op once and fused under every CUTLASS tile
+// (kernels::fused::GemmTile: the tile a launch picks depends on its row count, so production row counts run tiles the
+// smallest one does not). A configuration whose operands would exceed ~0.25 GiB stays unvalidated: op by op. ok iff at
+// least one configuration was checked and every checked one is bit-identical under every tile; then `validated` lists
+// them. detail says what was checked, what differed, or that nothing would run fused. Throws CudaError when it cannot
+// allocate its operands. `hook` (tests) may alter each fused result (its f.rows rows) before it is compared.
 struct FusedCheck {
   bool ok = false;
   std::string detail;
@@ -86,9 +89,13 @@ using FusedCheckHook = std::function<void(const char* op, std::int64_t rows, con
 FusedCheck check_fused_gemms(cudaStream_t stream, const FusedCheckHook& hook = {});
 
 // Lets fused_route() run the configurations of a passed check (check.ok) fused on the current device, added to any
-// installed before (a set only grows: workspaces sized for an earlier route stay large enough). A failed check
-// installs nothing.
+// installed before (a set only grows: workspaces sized for an earlier route stay large enough). A failed check poisons
+// the device instead: fused_route() runs every pair op by op there from then on, whatever any pipeline installed
+// before or after, since the fused kernels just disagreed with cuBLASLt on it.
 void install_fused_check(const FusedCheck& check);
+// Changes whenever install_fused_check changes the current device's route (new configurations, a poisoning). CUDA
+// graphs of fused blocks key on it, so a graph captured under an older route is never replayed.
+std::uint64_t fused_route_generation();
 
 // Activations of one forward (views; rows = the joint tokens of every row of the step).
 struct FusedBlockBuffers {

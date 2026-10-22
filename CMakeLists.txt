@@ -1,11 +1,13 @@
 cmake_minimum_required(VERSION 3.28)
-# Default GPU targets unless -DCMAKE_CUDA_ARCHITECTURES or CUDAARCHS chose them. Decided before project(), which sets
-# CMAKE_CUDA_ARCHITECTURES to the compiler's default (sm_75 for CUDA 13); applied after it, once the CUDA version is
-# known (project()'s compiler check must not build for sm_120 with CUDA < 12.8). Cached, so a re-configure keeps it.
+project(MossInfer LANGUAGES C CXX)
+# Default GPU targets unless -DCMAKE_CUDA_ARCHITECTURES, CUDAARCHS or the toolchain file chose them. Decided after the
+# C/C++ project() (which reads the toolchain file) and before enabling CUDA, which sets CMAKE_CUDA_ARCHITECTURES to the
+# compiler's default (sm_75 for CUDA 13); applied after that, once the CUDA version is known (the compiler check must
+# not build for sm_120 with CUDA < 12.8). FORCE then only replaces that default. Cached, so a re-configure keeps it.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
   set(_mi_default_cuda_archs ON)
 endif()
-project(MossInfer LANGUAGES C CXX CUDA)
+enable_language(CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
