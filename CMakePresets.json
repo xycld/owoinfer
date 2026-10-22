@@ -1,0 +1,121 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "installDir": "${sourceDir}/build-${presetName}/install",
+      "cacheVariables": { "CMAKE_EXPORT_COMPILE_COMMANDS": "ON" }
+    },
+    {
+      "name": "release-base",
+      "hidden": true,
+      "inherits": "base",
+      "description": "Release flavour: SASS for sm_80/86/89/120 plus compute_120 PTX for newer GPUs, shared C-API library, static cudart. Warnings are not errors here: release toolchains (MSVC, GCC 12, CUDA 12.8) differ from the dev box's.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "80-real;86-real;89-real;120",
+        "MOSSINFER_SHARED": "ON",
+        "MOSSINFER_STATIC_CUDART": "ON",
+        "MOSSINFER_BUNDLE_CUDA_LIBS": "ON",
+        "MOSSINFER_TESTS": "ON",
+        "MOSSINFER_WERROR": "OFF"
+      }
+    },
+    {
+      "name": "linux",
+      "hidden": true,
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": { "MOSSINFER_STATIC_LIBSTDCXX": "ON" }
+    },
+    {
+      "name": "windows",
+      "hidden": true,
+      "description": "MSVC (Visual Studio 2022 or newer) + Ninja: run from a VS x64 developer prompt (CI: ilammy/msvc-dev-cmd).",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "architecture": { "value": "x64", "strategy": "external" },
+      "toolset": { "value": "host=x64", "strategy": "external" },
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl",
+        "MOSSINFER_FETCH_GTEST": "ON"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Dev box (sm_89, tests, shared library)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CUDA_ARCHITECTURES": "89",
+        "MOSSINFER_SHARED": "ON",
+        "MOSSINFER_TESTS": "ON"
+      }
+    },
+    {
+      "name": "linux-cuda13",
+      "displayName": "Linux release, CUDA 13.x (driver >= 580)",
+      "inherits": [ "release-base", "linux" ],
+      "cacheVariables": { "MOSSINFER_EXPECT_CUDA_MAJOR": "13" }
+    },
+    {
+      "name": "linux-cuda12",
+      "displayName": "Linux release, CUDA 12.8+ (driver >= 525)",
+      "inherits": [ "release-base", "linux" ],
+      "cacheVariables": { "MOSSINFER_EXPECT_CUDA_MAJOR": "12" }
+    },
+    {
+      "name": "windows-msvc-cuda13",
+      "displayName": "Windows release, MSVC + CUDA 13.x (driver >= 580)",
+      "inherits": [ "release-base", "windows" ],
+      "cacheVariables": { "MOSSINFER_EXPECT_CUDA_MAJOR": "13" }
+    },
+    {
+      "name": "windows-msvc-cuda12",
+      "displayName": "Windows release, MSVC + CUDA 12.8+ (driver >= 527)",
+      "inherits": [ "release-base", "windows" ],
+      "cacheVariables": { "MOSSINFER_EXPECT_CUDA_MAJOR": "12" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "linux-cuda13", "configurePreset": "linux-cuda13" },
+    { "name": "linux-cuda12", "configurePreset": "linux-cuda12" },
+    { "name": "windows-msvc-cuda13", "configurePreset": "windows-msvc-cuda13" },
+    { "name": "windows-msvc-cuda12", "configurePreset": "windows-msvc-cuda12" }
+  ],
+  "testPresets": [
+    {
+      "name": "test-base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    { "name": "dev", "inherits": "test-base", "configurePreset": "dev" },
+    { "name": "linux-cuda13", "inherits": "test-base", "configurePreset": "linux-cuda13" },
+    {
+      "name": "linux-cuda12",
+      "inherits": "test-base",
+      "configurePreset": "linux-cuda12",
+      "description": "bitexact_cu13 tests compare against CUDA 13.4 libdevice and are excluded.",
+      "filter": { "exclude": { "label": "bitexact_cu13" } }
+    },
+    { "name": "windows-msvc-cuda13", "inherits": "test-base", "configurePreset": "windows-msvc-cuda13" },
+    {
+      "name": "windows-msvc-cuda12",
+      "inherits": "test-base",
+      "configurePreset": "windows-msvc-cuda12",
+      "description": "bitexact_cu13 tests compare against CUDA 13.4 libdevice and are excluded.",
+      "filter": { "exclude": { "label": "bitexact_cu13" } }
+    }
+  ],
+  "packagePresets": [
+    { "name": "linux-cuda13", "configurePreset": "linux-cuda13" },
+    { "name": "linux-cuda12", "configurePreset": "linux-cuda12" },
+    { "name": "windows-msvc-cuda13", "configurePreset": "windows-msvc-cuda13" },
+    { "name": "windows-msvc-cuda12", "configurePreset": "windows-msvc-cuda12" }
+  ]
+}

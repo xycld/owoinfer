@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
-project(MossInfer LANGUAGES C CXX)
+# Version from include/mossinfer/mossinfer.h (cmake/version.cmake); packaging in cmake/modules/packaging.cmake.
+include(cmake/version.cmake)
+project(MossInfer VERSION ${MOSSINFER_VERSION} LANGUAGES C CXX)
 # Default GPU targets, in three steps: (1) here, after project(C CXX) has read any toolchain file, note whether
 # -DCMAKE_CUDA_ARCHITECTURES, CUDAARCHS or the toolchain chose targets; (2) enable_language(CUDA) then runs its
 # compiler check with CMake's default, the compiler's own (sm_75 for CUDA 13), so it never builds sm_120 with a CUDA
@@ -56,6 +58,11 @@ endif()
 file(GLOB_RECURSE MOSSINFER_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_SOURCE_DIR}/src/*.cpp ${CMAKE_SOURCE_DIR}/src/*.cu)
 list(FILTER MOSSINFER_SOURCES EXCLUDE REGEX ".*/src/tools/.*")
+# P7a: OFF leaves out the C API (src/api), libmossinfer and moss-server.
+option(MOSSINFER_BUILD_API "Build the C API (src/api), libmossinfer and moss-server" ON)
+if(NOT MOSSINFER_BUILD_API)
+  list(FILTER MOSSINFER_SOURCES EXCLUDE REGEX ".*/src/api/.*")
+endif()
 
 # Parallel development: MOSSINFER_ONLY="core;util;kernels/gdn" builds only sources under those src/
 # prefixes, and MOSSINFER_TESTS_ONLY="test_gdn;test_json" only tests/unit files with those name
@@ -130,6 +137,9 @@ if(MOSSINFER_TESTS)
   find_package(GTest 1.12 REQUIRED)  # GTEST_FLAG_GET / GTEST_FLAG_SET
   file(GLOB MOSSINFER_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/unit/*.cpp ${CMAKE_SOURCE_DIR}/tests/unit/*.cu)
   mossinfer_filter(MOSSINFER_TEST_SOURCES "${MOSSINFER_TEST_SOURCES}" ${CMAKE_SOURCE_DIR}/tests/unit "${MOSSINFER_TESTS_ONLY}")
+  if(NOT MOSSINFER_BUILD_API)
+    list(FILTER MOSSINFER_TEST_SOURCES EXCLUDE REGEX ".*/tests/unit/test_c_api\\.cpp$")
+  endif()
   add_executable(mossinfer_tests ${MOSSINFER_TEST_SOURCES})
   target_link_libraries(mossinfer_tests PRIVATE mossinfer_core GTest::gtest_main)
   target_compile_options(mossinfer_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${MOSSINFER_WARN}>

@@ -1,0 +1,10 @@
+# find_package(MossInfer) -> imported target MossInfer::mossinfer (shared library + include/mossinfer/mossinfer.h).
+# The CUDA libraries it needs are private dependencies, installed next to it; consumers need no CUDA toolkit.
+# MossInfer_RUNTIME_DIR: the package's bin/ directory. On Windows every DLL there (mossinfer.dll, cuBLASLt, the MSVC
+# runtime) must sit next to the consumer's executable or on PATH; examples/consumer-cmake copies them.
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/MossInferTargets.cmake")
+set(MossInfer_CUDA_MAJOR @CUDAToolkit_VERSION_MAJOR@)
+set_and_check(MossInfer_RUNTIME_DIR "@PACKAGE_CMAKE_INSTALL_BINDIR@")
+check_required_components(MossInfer)

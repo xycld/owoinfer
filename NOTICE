@@ -1,0 +1,9 @@
+MossInfer
+Copyright 2026 The MossInfer Authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles third-party components under their own licenses; see
+third_party/*/LICENSE* and VENDORED.md files (CUTLASS and FlashAttention-2: BSD-3-Clause;
+stb: public domain/MIT) and, in binary packages, the NVIDIA CUDA EULA for redistributed
+CUDA libraries (cuBLASLt, and the CUDA runtime when not statically linked).

@@ -1,0 +1,22 @@
+# Push / PR: every release flavour builds, passes the CPU tests and the package checks (AC1, AC17, exports,
+# find_package consumer). GPU, golden and bit-exact tests need the dev box.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      retention-days: 7

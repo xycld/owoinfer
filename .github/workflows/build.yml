@@ -1,0 +1,138 @@
+# Reusable build of the four release flavours (Linux/Windows x CUDA 12/13), called by ci.yml and release.yml.
+# Per flavour: configure + build with the CMakePresets.json release preset, CPU-only tests (hosted runners have no
+# GPU), install, AC1 (no torch/python) + exports + AC17 (size) checks, the find_package consumer, CPack archives.
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      retention-days:
+        description: Days to keep the uploaded packages
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+
+jobs:
+  flavour:
+    name: ${{ matrix.platform }}-${{ matrix.flavour }} (CUDA ${{ matrix.cuda }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+        # Bump the 13.x entry to 13.4 once Jimver/cuda-toolkit lists it: the gate toolchain is 13.4.
+        # bitexact_cu13 tests are GPU tests and do not run on hosted runners.
+        cuda: ["12.8.1", "13.3.1"]
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+          - os: windows-2022
+            platform: windows-msvc
+          - cuda: "12.8.1"
+            flavour: cuda12
+          - cuda: "13.3.1"
+            flavour: cuda13
+    env:
+      preset: ${{ matrix.platform }}-${{ matrix.flavour }}
+      SCCACHE_GHA_ENABLED: "true"
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      CMAKE_CUDA_COMPILER_LAUNCHER: sccache
+      # Hosted runners: 4 cores, 16 GB RAM; the FlashAttention / CUTLASS translation units need ~4 GB each.
+      CMAKE_BUILD_PARALLEL_LEVEL: "3"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Host compiler (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-12
+          {
+            echo "CC=gcc-12"
+            echo "CXX=g++-12"
+            echo "CUDAHOSTCXX=g++-12"
+          } >> "$GITHUB_ENV"
+
+      - uses: lukka/get-cmake@fffaaafeea488556c2c12dad60690008bc1caacb # v4.4.2
+
+      # Newest tag on 2026-10-21 (git ls-remote --tags); it and master still run on node20, no Node 24 release yet.
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+
+      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        id: cuda
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: local
+          linux-local-args: '["--toolkit"]'
+          use-github-cache: false
+          log-file-suffix: ${{ matrix.os }}-${{ matrix.cuda }}.txt
+
+      - name: CUDA DLL directory (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # CUDA 13 keeps its DLLs in bin/x64; tests and the consumer load cuBLASLt from PATH.
+          cuda_path="$(cygpath -u "$CUDA_PATH")"
+          if [ -d "$cuda_path/bin/x64" ]; then cygpath -w "$cuda_path/bin/x64" >> "$GITHUB_PATH"; fi
+          nvcc --version
+
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Configure
+        run: cmake --preset "$preset" -DMOSSINFER_FETCH_GTEST=ON
+
+      - name: Build
+        run: cmake --build --preset "$preset"
+
+      - name: CPU tests
+        # The cu12 test presets exclude the bitexact_cu13 label themselves. With every device hidden, a GPU test
+        # mislabelled cpu fails here; on GPU machines tests/unit/test_cpu_guard.cpp catches it.
+        run: |
+          export CUDA_VISIBLE_DEVICES=""
+          ctest --preset "$preset" -L '^cpu$' --parallel 4
+
+      - name: Install
+        run: cmake --install "build-$preset" --prefix "build-$preset/install"
+
+      - name: AC1 / exports / AC17 / find_package consumer
+        run: |
+          python .github/scripts/check_package.py --prefix "build-$preset/install" \
+            --consumer examples/consumer-cmake --consumer-build "build-$preset/consumer" --run-consumer
+
+      - name: Package
+        working-directory: build-${{ env.preset }}
+        run: cpack --config CPackConfig.cmake
+
+      - name: AC17 size of the archive
+        run: |
+          for archive in build-"$preset"/mossinfer-*.zip build-"$preset"/mossinfer-*.tar.gz; do
+            [ -f "$archive" ] || continue
+            python .github/scripts/check_package.py --archive "$archive"
+          done
+          sccache --show-stats
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mossinfer-${{ matrix.platform }}-${{ matrix.flavour }}
+          path: |
+            build-${{ env.preset }}/mossinfer-*.zip
+            build-${{ env.preset }}/mossinfer-*.tar.gz
+            build-${{ env.preset }}/mossinfer-*.sha256
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+          compression-level: 0
