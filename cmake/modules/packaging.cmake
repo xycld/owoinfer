@@ -127,7 +127,7 @@ endif()
 
 # Licences of everything compiled into the shipped binaries. stb is test-only and not shipped. The project's
 # Apache-2.0 LICENSE and NOTICE go to the archive root (where users look) and to the doc directory.
-foreach(_mi_file IN ITEMS LICENSE NOTICE)
+foreach(_mi_file IN ITEMS LICENSE NOTICE THIRD_PARTY_NOTICES.md)
   if(EXISTS ${CMAKE_SOURCE_DIR}/${_mi_file})
     install(FILES ${CMAKE_SOURCE_DIR}/${_mi_file} DESTINATION .)
     install(FILES ${CMAKE_SOURCE_DIR}/${_mi_file} DESTINATION ${MOSSINFER_INSTALL_DOCDIR})
@@ -140,6 +140,8 @@ install(FILES ${CMAKE_SOURCE_DIR}/third_party/cutlass/LICENSE.txt ${CMAKE_SOURCE
 install(FILES ${CMAKE_SOURCE_DIR}/third_party/flash-attention/LICENSE ${CMAKE_SOURCE_DIR}/third_party/flash-attention/AUTHORS
               ${CMAKE_SOURCE_DIR}/third_party/flash-attention/VENDORED.md
         DESTINATION ${MOSSINFER_INSTALL_DOCDIR}/third_party/flash-attention)
+install(FILES ${CMAKE_SOURCE_DIR}/third_party/sageattention/LICENSE ${CMAKE_SOURCE_DIR}/third_party/sageattention/VENDORED.md
+        DESTINATION ${MOSSINFER_INSTALL_DOCDIR}/third_party/sageattention)
 unset(_mi_file)
 
 # Executables are defined after the fragments (moss-infer in CMakeLists.txt, moss-server in server.cmake), so their

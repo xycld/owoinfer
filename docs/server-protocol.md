@@ -260,5 +260,5 @@ send({"id": 3, "method": "shutdown"})
 
 ```
 MOSS_SERVER=<build>/moss-server python3 tests/server/test_protocol.py
-MOSSINFER_GPU_TESTS=1 MOSS_SERVER=<build>/moss-server flock /workspace/Projects/MossInfer/.gpu.lock python3 tests/server/test_protocol.py
+MOSSINFER_GPU_TESTS=1 MOSS_SERVER=<build>/moss-server MOSS_WEIGHTS=<models>/MOSS-Image python3 tests/server/test_protocol.py
 ```

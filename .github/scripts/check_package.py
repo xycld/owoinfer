@@ -4,7 +4,7 @@
   AC1   no torch / c10 / python among the dependencies of any shipped binary (readelf+ldd / dumpbin /dependents)
   ABI   the shared library exports only mi_* symbols (nm -D / dumpbin /exports)
   AC17  engine library <= 150 MB, whole redistributable (uncompressed, CUDA libraries included) <= 800 MB
-  LIC   the project's LICENSE and NOTICE (Apache-2.0) at the root and in share/doc/mossinfer/
+  LIC   the project's LICENSE, NOTICE and THIRD_PARTY_NOTICES.md at the root and in share/doc/mossinfer/
   CRT   Windows: the MSVC runtime (vcruntime140, msvcp140 and every other one the binaries import) ships in bin/
   find_package: optionally builds and runs examples/consumer-cmake against the tree, with the CUDA toolkit removed
         from PATH / LD_LIBRARY_PATH so that only the package's own libraries can satisfy it
@@ -180,12 +180,19 @@ def main():
         if size > ENGINE_LIMIT:
             failures.append(f"AC17: engine library {size / MB:.1f} MB > {ENGINE_LIMIT / MB:.0f} MB")
 
-    for name in ("LICENSE", "NOTICE"):
+    for name in ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"):
         for rel in (name, os.path.join("share", "doc", "mossinfer", name)):
             present = os.path.isfile(os.path.join(prefix, rel))
             print(f"LIC {rel}: {'ok' if present else 'MISSING'}")
             if not present:
                 failures.append(f"LIC: {rel} missing (Apache-2.0 requires it in every distribution)")
+    third_party = os.path.join("share", "doc", "mossinfer", "third_party")
+    for rel in ("cutlass/LICENSE.txt", "flash-attention/LICENSE", "sageattention/LICENSE", "cuda/EULA.txt"):
+        rel = os.path.join(third_party, *rel.split("/"))
+        present = os.path.isfile(os.path.join(prefix, rel))
+        print(f"LIC {rel}: {'ok' if present else 'MISSING'}")
+        if not present:
+            failures.append(f"LIC: {rel} missing (a bundled component's licence must ship with it)")
 
     if IS_WINDOWS:
         bin_dir = os.path.join(prefix, "bin")
