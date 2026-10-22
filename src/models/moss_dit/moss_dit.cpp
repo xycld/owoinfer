@@ -182,15 +182,24 @@ std::string describe_linears(const quant::QuantIndex* quant) {
   return out + ")";
 }
 
-bool has_int8_linears(const quant::QuantIndex* quant) {
+bool has_quantized_linears(const quant::QuantIndex* quant) {
   if (quant == nullptr) return false;
   return std::any_of(quant->specs.begin(), quant->specs.end(),
                      [](const auto& kv) { return kv.first.rfind("layers.", 0) == 0 && kv.second.quantized(); });
 }
 
-double int8_gemm_fraction(const quant::QuantIndex* quant) {
+bool has_int4_linears(const quant::QuantIndex* quant) {
+  if (quant == nullptr) return false;
+  return std::any_of(quant->specs.begin(), quant->specs.end(), [](const auto& kv) {
+    return kv.first.rfind("layers.", 0) == 0 && kv.second.format == quant::QuantFormat::kInt4ConvRot;
+  });
+}
+
+namespace {
+// The share of the block GEMMs' weight elements whose spec has format `f`.
+double gemm_fraction(const quant::QuantIndex* quant, quant::QuantFormat f) {
   if (quant == nullptr) return 0.0;
-  double int8 = 0, all = 0;
+  double part = 0, all = 0;
   for (const weights::WeightGroup& g : quant->index.groups) {
     for (const weights::IndexedTensor& t : g.tensors) {
       if (t.name.rfind("layers.", 0) != 0 || !t.name.ends_with(".weight") || t.shape.size() != 2) continue;
@@ -198,16 +207,74 @@ double int8_gemm_fraction(const quant::QuantIndex* quant) {
       if (spec == nullptr) continue;
       const double elems = static_cast<double>(t.shape[0]) * static_cast<double>(t.shape[1]);
       all += elems;
-      if (spec->quantized()) int8 += elems;
+      if (spec->format == f) part += elems;
     }
   }
-  return all > 0 ? int8 / all : 0.0;
+  return all > 0 ? part / all : 0.0;
+}
+}  // namespace
+
+double int8_gemm_fraction(const quant::QuantIndex* quant) { return gemm_fraction(quant, quant::QuantFormat::kInt8ConvRot); }
+double int4_gemm_fraction(const quant::QuantIndex* quant) { return gemm_fraction(quant, quant::QuantFormat::kInt4ConvRot); }
+
+namespace {
+// The merge refusal for INT4 linears (load time and check_lora_merges).
+std::string int4_merge_message(const std::string& module) {
+  return "mi::moss_dit: cannot merge a LoRA into '" + module +
+         "' (merges need a bf16 or INT8 ConvRot linear; INT4 linears take side-branch adapters only)";
+}
+bool is_int4(const quant::QuantIndex* quant, const std::string& module) {
+  const quant::QuantSpec* spec = quant != nullptr ? quant->find_spec(module) : nullptr;
+  return spec != nullptr && spec->format == quant::QuantFormat::kInt4ConvRot;
+}
+}  // namespace
+
+void check_lora_merges(const lora::LoraStack& stack, const quant::QuantIndex* quant) {
+  for (const lora::Adapter& a : stack.adapters()) {
+    if (!a.side_branch && is_int4(quant, a.module)) throw std::invalid_argument(int4_merge_message(a.module));
+  }
+}
+
+double int4_side_branch_fraction(const quant::QuantIndex* quant, const lora::SideBranches& sb) {
+  if (quant == nullptr) return 0.0;
+  constexpr double kD = kDim, kF = kFfnDim;
+  const struct {
+    lora::Site site;
+    const char* parts[3];
+    double elems;  // per part
+  } sites[] = {{lora::Site::kQkv, {"q", "k", "v"}, kD * kD},
+               {lora::Site::kO, {"o", nullptr, nullptr}, kD * kD},
+               {lora::Site::kUpGate, {"ffn_up_gate", nullptr, nullptr}, 2 * kF * kD},
+               {lora::Site::kDown, {"ffn_down", nullptr, nullptr}, kD * kF}};
+  double int4 = 0;
+  for (int b = 0; b < kLayers; ++b) {
+    for (const auto& s : sites) {
+      if (sb.site(b, s.site) == nullptr) continue;
+      for (const char* part : s.parts) {
+        if (part != nullptr && is_int4(quant, "layers." + std::to_string(b) + ".proj." + part)) int4 += s.elems;
+      }
+    }
+  }
+  return int4 / (kLayers * (4 * kD * kD + 3 * kF * kD));
+}
+
+std::vector<std::string> shadowed_by_time_embedding(const lora::LoraStack& stack) {
+  std::vector<std::string> out;
+  for (const lora::Adapter& a : stack.adapters()) {
+    if (a.module.rfind("time_embedding.", 0) == 0) {
+      out.push_back(a.module + ": overridden by the replacement step embedder (time_embedding_file), not applied");
+    } else if ((a.module == "shared_block_modulation" || a.module == "video_head_modulation") && a.bias_diff) {
+      out.push_back(a.module + ": its bias delta is overridden by the replacement step embedder's bias, not applied");
+    }
+  }
+  return out;
 }
 
 ComputeConfig MossDit::compute_config(const quant::QuantIndex* quant, AttentionMode attention) {
   ComputeConfig c;
   c.attention = attention;
-  c.quantized = has_int8_linears(quant) || attention != AttentionMode::kExact;
+  c.quantized = has_quantized_linears(quant) || attention != AttentionMode::kExact;
+  c.int4 = has_int4_linears(quant);
   c.bf16_up_gate = quant == nullptr;
   if (quant != nullptr) {
     for (const auto& [module, spec] : quant->specs) {
@@ -325,8 +392,8 @@ void MossDit::set_lora(const lora::SideBranches* side_branches) {
       if (side_branches->site(b, lora::Site::kQkv) == nullptr) continue;
       if (quant_ != nullptr) {
         const std::string p = "layers." + std::to_string(b) + ".proj.";
-        const bool q = quant_->find_spec(p + "q")->quantized(), k = quant_->find_spec(p + "k")->quantized(),
-                   v = quant_->find_spec(p + "v")->quantized();
+        const quant::QuantSpec &q = *quant_->find_spec(p + "q"), &k = *quant_->find_spec(p + "k"),
+                               &v = *quant_->find_spec(p + "v");
         if (q != k || k != v) {
           throw std::invalid_argument("mi::moss_dit: a LoRA on the QKV of block " + std::to_string(b) +
                                       ", whose q, k and v differ in precision, is not supported");
@@ -377,7 +444,7 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
         t.scale = m.at(module + ".weight_scale");
         const quant::QuantSpec* spec = quant != nullptr ? quant->find_spec(module) : nullptr;
         if (spec == nullptr || spec->format != quant::QuantFormat::kInt8ConvRot) {
-          throw std::runtime_error("mi::moss_dit: cannot merge a LoRA into '" + module + "' (not an INT8 ConvRot linear)");
+          throw std::runtime_error(int4_merge_message(module));
         }
         t.group = spec->group;
       }
@@ -543,10 +610,61 @@ struct TimeScratch {
 };
 }  // namespace
 
+void MossDit::set_time_embedding(const TimeEmbeddingFp32* te) {
+  te_cache_.clear();
+  if (te == nullptr) {
+    te_.reset();
+    te_buf_ = DeviceBuffer();
+    return;
+  }
+  const auto sized = [](const std::vector<float>& v, std::size_t n) { return v.size() == n; };
+  if (!sized(te->w0, std::size_t{kDim} * kFreqDim) || !sized(te->b0, kDim) || !sized(te->w2, std::size_t{kDim} * kDim) ||
+      !sized(te->b2, kDim) || !(te->mod_bias.empty() || sized(te->mod_bias, 6 * kDim)) ||
+      !(te->head_bias.empty() || sized(te->head_bias, 2 * kDim))) {
+    fail("set_time_embedding: replacement tensors have unexpected sizes");
+  }
+  // The biases the device linears add: the replacement's, or the model's own widened.
+  std::vector<float> biases(8 * kDim);
+  const auto own = [&](const Tensor& b, std::size_t at) {
+    std::vector<std::uint16_t> h(static_cast<std::size_t>(b.numel()));
+    MI_CUDA_CHECK(cudaMemcpy(h.data(), b.data, h.size() * 2, cudaMemcpyDeviceToHost));
+    for (std::size_t i = 0; i < h.size(); ++i) {
+      const std::uint32_t u = static_cast<std::uint32_t>(h[i]) << 16;
+      std::memcpy(&biases[at + i], &u, 4);
+    }
+  };
+  if (te->mod_bias.empty()) own(block_modulation_.bias, 0);
+  else std::copy(te->mod_bias.begin(), te->mod_bias.end(), biases.begin());
+  if (te->head_bias.empty()) own(head_modulation_.bias, 6 * kDim);
+  else std::copy(te->head_bias.begin(), te->head_bias.end(), biases.begin() + 6 * kDim);
+  DeviceBuffer buf((9 * kDim) * sizeof(float));
+  buf.upload(biases.data(), biases.size() * sizeof(float), kDim * sizeof(float));
+  te_ = std::make_unique<TimeEmbeddingFp32>(*te);
+  te_buf_ = std::move(buf);
+}
+
 void MossDit::time_modulation(float timestep, const Tensor& mod, const Tensor& head, cudaStream_t stream) {
   check_device(mod, DType::kBF16, "mod");
   check_device(head, DType::kBF16, "head");
   if (mod.numel() != 6 * kDim || head.numel() != 2 * kDim) fail("mod/head must hold 6*3072 / 2*3072 values");
+  if (te_) {
+    std::uint32_t key = 0;
+    std::memcpy(&key, &timestep, 4);
+    auto it = te_cache_.find(key);
+    if (it == te_cache_.end()) {
+      if (te_cache_.size() >= 256) te_cache_.clear();
+      it = te_cache_.emplace(key, time_vector_fp32(*te_, timestep)).first;
+    }
+    float* const dev = static_cast<float*>(te_buf_.get());
+    const std::vector<float>& time = it->second;
+    constexpr std::size_t kChunk = kMaxParamBytes / sizeof(float);
+    for (std::size_t i = 0; i < time.size(); i += kChunk) {
+      write_params(dev + i, time.data() + i, std::min(kChunk, time.size() - i) * sizeof(float), stream);
+    }
+    linear_fp32_row(block_modulation_.w, dev, dev + kDim, mod, stream);
+    linear_fp32_row(head_modulation_.w, dev, dev + 7 * kDim, head, stream);
+    return;
+  }
   runtime::StackScope scope(arena_);
   StackPlan plan(&arena_);
   TimeScratch t(plan);
@@ -590,6 +708,7 @@ std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, st
     if (config.lora_rank > 0) {
       plan.tensor(DType::kBF16, {total, config.lora_rank});
       plan.bytes(lora::t_workspace_bytes(total, config.lora_rank));
+      if (config.int4) plan.bytes(kInt4UnpackBytes);
     }
   }
   TimeScratch{plan};
@@ -669,6 +788,10 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
       qa.lora_t = plan.tensor(DType::kBF16, {total, config_.lora_rank});
       qa.lora_workspace_bytes = lora::t_workspace_bytes(total, config_.lora_rank);
       qa.lora_workspace = plan.bytes(qa.lora_workspace_bytes);
+      if (config_.int4) {
+        qa.int4_unpack_bytes = kInt4UnpackBytes;
+        qa.int4_unpack = plan.bytes(kInt4UnpackBytes);
+      }
     }
   }
   // Streamed blocks: device buffers after the activations; the first copies overlap the setup below.
@@ -766,6 +889,7 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
       key.addresses.push_back(qa.attn_workspace);
       key.addresses.push_back(qa.lora_t.data);
       key.addresses.push_back(qa.lora_workspace);
+      key.addresses.push_back(qa.int4_unpack);
     }
     // The block variant, and the LoRA side branches' generation (their set of active sites changes the kernels).
     key.variant = quantized ? 1 + static_cast<std::uint64_t>(config_.attention) : 0;

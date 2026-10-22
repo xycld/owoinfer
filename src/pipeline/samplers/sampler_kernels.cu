@@ -1,8 +1,8 @@
 // Sampler driver kernels. Each torch op of the reference rounds once, so every op here is an explicitly rounded
 // intrinsic (nvcc would otherwise contract mul + add into FMAs). Scalar coefficients follow the reference's 0-dim
-// CUDA tensor ops: CUDA math library logf/expf/powf (as torch's kernels call them, no fast-math), torch's expm1, IEEE
-// division and sqrt; a tensor divided by a Python number is a multiplication by its fp32 reciprocal in torch, a
-// tensor divided by a tensor a true division.
+// CUDA tensor ops: CUDA math library logf/expf/powf (as torch's kernels call them, no fast-math), a correctly rounded
+// expm1, IEEE division and sqrt; a tensor divided by a Python number is a multiplication by its fp32 reciprocal in
+// torch, a tensor divided by a tensor a true division.
 #include "pipeline/samplers/sampler_kernels.h"
 
 #include <cmath>
@@ -28,40 +28,13 @@ __device__ __forceinline__ float sub(float a, float b) { return __fsub_rn(a, b);
 __device__ __forceinline__ float mul(float a, float b) { return __fmul_rn(a, b); }
 __device__ __forceinline__ float div(float a, float b) { return __fdiv_rn(a, b); }
 
-// expm1 as torch's CUDA kernels compute it: pinned to the CUDA 13.0 math library's expm1f (transcribed from the SASS
-// of torch 2.14.1+cu130's expm1 kernel). Later CUDA releases changed expm1f (CUDA 13.4 differs on ~1 % of inputs by
-// 1 ulp), so a torch built with another CUDA may differ again; the tests check the vectors' torch build. The power of two is formed exactly (the hardware's ex2 is exact for integers; the
-// paths where it is not are overridden by the final selects).
-__device__ float torch_expm1f(float x) {
-  const float t = rintf(__fmul_rn(x, 1.4426950216293334961f));
-  float j = !(fabsf(x) < 0.40999999642372131348f) ? t : 0.0f;
-  const bool j_is_128 = j == 128.0f;
-  float f = __fmaf_rn(-j, 0.693145751953125f, x);
-  f = __fmaf_rn(-j, 1.428606765330187045e-06f, f);
-  float u = __fmaf_rn(f, __int_as_float(0x3ab5ebe6), 0.0083824126049876213074f);
-  if (j_is_128) j = __fadd_rn(j, -1.0f);
-  u = __fmaf_rn(f, u, 0.041667830199003219604f);
-  const bool normal = !(j < -126.0f);
-  u = __fmaf_rn(f, u, 0.16666397452354431152f);
-  u = __fmaf_rn(f, u, 0.49999994039535522461f);
-  float s;
-  if (normal && j <= 127.0f) {
-    s = __int_as_float((static_cast<int>(j) + 127) << 23);
-  } else if (normal) {
-    s = INFINITY;  // j > 127: overflow, selected to +inf below
-  } else {
-    s = 0.0f;      // j < -126: the result is selected to -1 below
-  }
-  u = __fmul_rn(f, u);
-  u = __fmaf_rn(f, u, f);
-  float r = __fadd_rn(s, -1.0f);
-  r = __fmaf_rn(u, s, r);
-  if (j_is_128) r = __fadd_rn(r, r);
-  if (j > 128.0f) r = INFINITY;
-  if (j < -25.0f) r = -1.0f;
-  if (x == 0.0f) r = __fadd_rn(x, x);
-  return r;
-}
+// expm1(x) correctly rounded to fp32 (round to nearest even), for every fp32 input: the CUDA math library's
+// double-precision expm1 (max error 1 ulp of double) rounded once to fp32. An exhaustive sweep (CUDA 13.4) found the
+// double result within 64 double ulps of an fp32 rounding boundary for only 179 fp32 inputs, each of which matches a
+// 300-bit evaluation, so the result is the same with any CUDA release whose double expm1 stays within 64 ulps
+// (it is documented within 1). torch's CUDA expm1 (CUDA 13.0 libm in torch 2.14.1+cu130) is not
+// correctly rounded on 26,510,788 of the 2^32 inputs (all by 1 ulp), so this differs from torch there.
+__device__ float expm1f_rn(float x) { return static_cast<float>(expm1(static_cast<double>(x))); }
 
 // -log(sigma) (dpmpp_2m, res_multistep t_fn) and the flow half-log-SNR -logit(sigma) = -log(sigma / (1 - sigma)).
 __device__ float t_fn(float s) { return -logf(s); }
@@ -128,7 +101,7 @@ __global__ void coef_kernel(CoefKind kind, const float* sig, int steps, float et
         const float t = t_fn(s), tn = t_fn(sn);
         const float h = sub(tn, t);
         o[kDpmC1] = div(expf(-tn), expf(-t));  // sigma_fn(t_next) / sigma_fn(t)
-        o[kDpmC2] = torch_expm1f(-h);
+        o[kDpmC2] = expm1f_rn(-h);
         o[kDpmA] = 0.0f;
         o[kDpmQ] = 0.0f;
         if (i > 0) {
@@ -149,7 +122,7 @@ __global__ void coef_kernel(CoefKind kind, const float* sig, int steps, float et
         const float h = sub(lt, ls);
         const float h_eta = mul(h, eta1);
         const float alpha_t = mul(sn, expf(lt));
-        const float em = -torch_expm1f(-h_eta);
+        const float em = -expm1f_rn(-h_eta);
         o[kSdeC1] = mul(div(sn, s), expf(mul(-h, eta)));
         o[kSdeC2] = mul(alpha_t, em);
         o[kSdeC3] = 0.0f;
@@ -158,7 +131,7 @@ __global__ void coef_kernel(CoefKind kind, const float* sig, int steps, float et
           const float r = div(h_last, h);
           o[kSdeC3] = mul(mul(mul(0.5f, alpha_t), em), div(1.0f, r));
         }
-        o[kSdeNoise] = sqrtf(-torch_expm1f(mul(mul(-2.0f, h), eta)));
+        o[kSdeNoise] = sqrtf(-expm1f_rn(mul(mul(-2.0f, h), eta)));
         break;
       }
       case CoefKind::kEr: {
@@ -197,7 +170,10 @@ __global__ void coef_kernel(CoefKind kind, const float* sig, int steps, float et
         break;
       }
       case CoefKind::kRes: {
-        // res_multistep with eta 0: sigma_down = sigma_next, old_sigma_down = sigma
+        // res_multistep with eta 0: sigma_down = sigma_next, old_sigma_down = sigma. The RES two-step exponential
+        // integrator (Zhang et al., arXiv 2308.02157) in t = -log(sigma), h = t_next - t, with the previous node at
+        // c2 = (t_prev - t) / h: x_next = e^-h x + h (b1 D + b2 D_prev), where the order conditions b1 + b2 = phi1 and
+        // c2 b2 = phi2 use phi1 = (1 - e^-h) / h and phi2 = (1 - phi1) / h.
         float* o = c + i * kResCount;
         for (int k = 0; k < kResCount; ++k) o[k] = 0.0f;
         o[kResS] = s;
@@ -206,7 +182,7 @@ __global__ void coef_kernel(CoefKind kind, const float* sig, int steps, float et
           const float t = t_fn(s), t_old = t_fn(s), t_next = t_fn(sn), t_prev = t_fn(sig[i - 1]);
           const float h = sub(t_next, t);
           const float c2 = div(sub(t_prev, t_old), h);
-          const float phi1 = div(torch_expm1f(-h), -h);
+          const float phi1 = div(expm1f_rn(-h), -h);
           const float phi2 = div(sub(phi1, 1.0f), -h);
           o[kResB1] = nan0(sub(phi1, div(phi2, c2)));
           o[kResB2] = nan0(div(phi2, c2));
@@ -220,7 +196,7 @@ __global__ void coef_kernel(CoefKind kind, const float* sig, int steps, float et
 }
 
 __global__ void expm1_kernel(const float* x, float* y, std::int64_t n) {
-  MI_GRID_LOOP(i, n) { y[i] = torch_expm1f(x[i]); }
+  MI_GRID_LOOP(i, n) { y[i] = expm1f_rn(x[i]); }
 }
 
 __global__ void euler_kernel(float* x, const float* den, float s, float dt, std::int64_t n) {
@@ -377,7 +353,7 @@ void compute_coefficients(CoefKind kind, const float* sigmas, int steps, float e
     }                                                                 \
   } while (0)
 
-void torch_expm1(const float* x, float* y, std::int64_t n, cudaStream_t stream) { MI_LAUNCH(expm1_kernel, n, x, y); }
+void expm1_rn(const float* x, float* y, std::int64_t n, cudaStream_t stream) { MI_LAUNCH(expm1_kernel, n, x, y); }
 
 void euler(float* x, const float* den, float s, float dt, std::int64_t n, cudaStream_t stream) {
   MI_LAUNCH(euler_kernel, n, x, den, s, dt);

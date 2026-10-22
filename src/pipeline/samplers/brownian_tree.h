@@ -1,3 +1,7 @@
+// Adapted from torchsde BrownianInterval (Apache-2.0, Copyright 2020 Google LLC); modified: ported to C++ for the
+// BrownianTree configuration only (halfway tree, no Levy area, fixed tol 1e-6 / pool 24 / 45-entry cache), with fp32
+// host arithmetic and torch-compatible CPU randn. The seed derivation reimplements NumPy's SeedSequence
+// (BSD-3-Clause, Copyright (c) 2005-2026 NumPy Developers).
 // Brownian-tree noise for SDE samplers, bit-exact with the k-diffusion family's BrownianTreeNoiseSampler on the CPU
 // (torchsde 0.2.6 BrownianTree: a BrownianInterval with halfway_tree, tol 1e-6, pool_size 24), so DPM++ SDE samplers
 // reproduce that reference's noise for a given seed.

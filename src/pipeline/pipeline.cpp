@@ -26,6 +26,7 @@
 #include "mossinfer/mossinfer.h"
 #include "models/flux2_vae/flux2_vae.h"
 #include "models/flux2_vae/vae_file.h"
+#include "models/flux2_vae_encoder/flux2_vae_encoder.h"
 #include "models/latent_preview/latent_preview.h"
 #include "models/moss_dit/dit_kernels.h"
 #include "models/moss_dit/moss_dit.h"
@@ -33,6 +34,7 @@
 #include "pipeline/embedding_cache.h"
 #include "pipeline/hardware_profile.h"
 #include "pipeline/quality_cert.h"
+#include "pipeline/report_json.h"
 #include "pipeline/rng_torch_compat.h"
 #include "planner/host_memory.h"
 #include "runtime/device_arena.h"
@@ -41,6 +43,7 @@
 #include "util/path.h"
 #include "weights/model_index.h"
 #include "weights/quant/quant_model.h"
+#include "weights/safetensors.h"
 #include "weights/upload.h"
 
 namespace mi::pipeline {
@@ -134,7 +137,9 @@ moss_dit::AttentionMode dit_attention(planner::AttentionMode a) { return static_
 CertConfig cert_config(planner::Precision precision, planner::AttentionMode mode, qwen35_text::Precision te, bool lora) {
   CertConfig c;
   c.lora = lora;  // runtime LoRAs: certificates cover the base model only, so this never matches one
-  c.dit = precision == planner::Precision::kInt8 ? DitPrecision::kInt8ConvRot : DitPrecision::kBf16;
+  c.dit = precision == planner::Precision::kInt8   ? DitPrecision::kInt8ConvRot
+          : precision == planner::Precision::kInt4 ? DitPrecision::kW4A4
+                                                   : DitPrecision::kBf16;
   c.attention = static_cast<AttentionMode>(mode);
   c.te = te == qwen35_text::Precision::kInt8   ? TePrecision::kInt8ConvRot
          : te == qwen35_text::Precision::kW4A8 ? TePrecision::kW4A8
@@ -183,9 +188,13 @@ std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file) {
   auto d = std::make_unique<DitSource>();
   d->path = file;
   d->cert_path = file;
-  d->quant = std::make_unique<quant::QuantIndex>(quant::to_model_index(quant::open_quant_model(file, quant::ModelKind::kDiT)));
+  // INT4 ConvRot (convrot_w4a4) linears stay packed for the INT4 GEMMs (the Turbo tier).
+  d->quant = std::make_unique<quant::QuantIndex>(
+      quant::to_model_index(quant::open_quant_model(file, quant::ModelKind::kDiT), {.native_int4 = true}));
   d->index = &d->quant->index;
-  d->precision = moss_dit::has_int8_linears(d->quant.get()) ? planner::Precision::kInt8 : planner::Precision::kBf16;
+  d->precision = moss_dit::has_int4_linears(d->quant.get())   ? planner::Precision::kInt4
+                 : moss_dit::has_quantized_linears(d->quant.get()) ? planner::Precision::kInt8
+                                                              : planner::Precision::kBf16;
   d->linears = moss_dit::describe_linears(d->quant.get());
   return d;
 }
@@ -211,6 +220,15 @@ struct VaeSource {
   std::unique_ptr<weights::ModelIndex> own;           // file only
   const weights::ModelIndex* latent_stats = nullptr;  // file only: the bundle's index
   flux2_vae::DecoderConfig config;
+};
+
+// Where the VAE encoder comes from (P7b img2img): PipelineOptions::vae_file when that file holds an encoder (its latent
+// statistics: the bundle's, as for the decoder), else the bundle's VAE file. `persistent` is
+// Flux2VaeEncoder::persistent_bytes (the file validated).
+struct EncoderSource {
+  std::filesystem::path file;
+  const weights::ModelIndex* latent_stats = nullptr;
+  std::size_t persistent = 0;
 };
 
 // Transfer rates of this machine (P4b), measured in ~0.2 s: pinned host -> device (best of 4 copies), and the weight
@@ -372,8 +390,55 @@ void validate(const Request& r) {
   if (!std::isfinite(r.eta) || r.eta < 0 || !std::isfinite(r.s_noise) || r.s_noise < 0) {
     throw std::invalid_argument("eta and s_noise must be finite and nonnegative.");
   }
-  if (!r.init_image.empty() || r.denoise_strength != 1.0) {
-    throw std::invalid_argument("img2img (an init image, denoise strength < 1) is not supported by this build yet.");
+  // img2img, inpainting and the hires fix.
+  const auto check_image = [](const Image& im, int channels, const char* what) {
+    if (im.width <= 0 || im.height <= 0 || im.width > kMaxInputSide || im.height > kMaxInputSide ||
+        std::int64_t{im.width} * im.height > kMaxInputPixels) {
+      throw std::invalid_argument(std::string(what) + " must be 1 to " + std::to_string(kMaxInputSide) + " pixels on a side and at most " +
+                                  std::to_string(kMaxInputPixels / 1000000) + " megapixels.");
+    }
+    if (im.channels != channels) {
+      throw std::invalid_argument(std::string(what) + (channels == 3 ? " must be an RGB image (3 channels)." : " must be a grayscale image (1 channel)."));
+    }
+    if (im.pixels.size() != static_cast<std::size_t>(im.width) * static_cast<std::size_t>(im.height) * static_cast<std::size_t>(channels)) {
+      throw std::invalid_argument(std::string(what) + ": the pixel buffer size does not match width x height x channels.");
+    }
+  };
+  if (!std::isfinite(r.denoise_strength) || r.denoise_strength < 0 || r.denoise_strength > 1) {
+    throw std::invalid_argument("Denoise strength must be between 0 and 1.");
+  }
+  if (r.init_image == nullptr) {
+    if (r.denoise_strength != 1.0) throw std::invalid_argument("A denoise strength below 1 needs an init image.");
+    if (r.mask != nullptr) throw std::invalid_argument("An inpainting mask needs an init image.");
+  } else {
+    check_image(*r.init_image, 3, "The init image");
+  }
+  if (r.mask != nullptr) {
+    check_image(*r.mask, 1, "The inpainting mask");
+    if (r.mask->width != r.init_image->width || r.mask->height != r.init_image->height) {
+      throw std::invalid_argument("The inpainting mask must have the init image's size (" + std::to_string(r.init_image->width) +
+                                  "x" + std::to_string(r.init_image->height) + "), not " + std::to_string(r.mask->width) +
+                                  "x" + std::to_string(r.mask->height) + ".");
+    }
+  }
+  if (r.hires.enabled()) {
+    const Request::Hires& hf = r.hires;
+    if (hf.height <= 0 || hf.width <= 0 || hf.height % 16 != 0 || hf.width % 16 != 0) {
+      throw std::invalid_argument("Hires fix: height and width must be positive multiples of 16.");
+    }
+    if (hf.height > kMaxSide || hf.width > kMaxSide || std::int64_t{hf.height} * hf.width > kMaxPixels) {
+      throw std::invalid_argument("Hires fix: the size must be at most " + std::to_string(kMaxSide) +
+                                  " on a side and 4.2 megapixels.");
+    }
+    if (!std::isfinite(hf.strength) || hf.strength < 0 || hf.strength > 1) {
+      throw std::invalid_argument("Hires fix: the denoise strength must be between 0 and 1.");
+    }
+    if (hf.steps < 0 || hf.steps > kMaxSteps) {
+      throw std::invalid_argument("Hires fix: steps must be 0 (the request's) to " + std::to_string(kMaxSteps) + ".");
+    }
+  }
+  if (r.sampler == SamplerKind::kDataSpace && (r.init_image != nullptr || r.hires.enabled())) {
+    throw std::invalid_argument("The dataspace sampler cannot start from an image (img2img, inpainting, hires fix).");
   }
   // The pipeline passes SamplerOptions (seed, noise source) to every sampler; the dataspace sampler also needs its file.
   if (r.sampler == SamplerKind::kDataSpace && r.dataspace_path.empty()) {
@@ -461,6 +526,14 @@ Request request_from_parameters(const json::Value& doc) {
   number("slg_scale", r.slg_scale);
   number("slg_start", r.slg_start);
   number("slg_stop", r.slg_stop);
+  // img2img / hires fix scalars (engine keys; the images themselves are front-end inputs, e.g. the CLI's paths).
+  number("denoise_strength", r.denoise_strength);
+  if (const json::Value* v = p.find("resize"); v != nullptr && !v->is_null()) {
+    if (!v->is_string()) throw std::invalid_argument("resize must be a string.");
+    r.resize = parse_resize_mode(v->as_string());
+  }
+  number("hires_strength", r.hires.strength);
+  integer("hires_steps", r.hires.steps);
   return r;
 }
 
@@ -486,8 +559,35 @@ GenerationMetadata generation_metadata(const Request& q, const Result& r) {
   for (const lora::LoraSpec& l : q.loras) m.loras.push_back({util::path_utf8(l.path.filename()), "", l.strength});
   m.extra.emplace_back("attention", planner::attention_name(r.tier.attention));
   m.extra.emplace_back("dit_linears", r.dit_linears);
+  if (!r.time_embedding.empty()) m.extra.emplace_back("time_embedding", name(r.time_embedding));
   m.extra.emplace_back("noise_layout", noise_layout_name(q.noise_layout));
   if (sampler_is_stochastic(q.sampler)) m.extra.emplace_back("noise_source", noise_source_name(q.noise_source));
+  // img2img / inpainting / hires fix: the settings that shaped the image (file names only, no directories).
+  const auto num = [](double d) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.6g", d);
+    return std::string(buf);
+  };
+  const auto image_label = [](const Image& im) {
+    return (im.name.empty() ? std::string() : util::path_utf8(util::path_from_utf8(im.name).filename()) + " ") +
+           std::to_string(im.width) + "x" + std::to_string(im.height);
+  };
+  const bool image_used = q.init_image != nullptr && r.image_mode != "txt2img";
+  if (image_used) {
+    m.extra.emplace_back("mode", r.image_mode);
+    m.extra.emplace_back("init_image", image_label(*q.init_image));
+    m.extra.emplace_back("denoise_strength", num(q.denoise_strength));
+    m.extra.emplace_back("resize", resize_mode_name(q.resize));
+    if (q.mask != nullptr) m.extra.emplace_back("mask", image_label(*q.mask));
+  }
+  if (q.hires.enabled()) {
+    m.extra.emplace_back("hires", std::to_string(q.hires.width) + "x" + std::to_string(q.hires.height));
+    m.extra.emplace_back("hires_base", std::to_string(q.width) + "x" + std::to_string(q.height));
+    m.extra.emplace_back("hires_strength", num(q.hires.strength));
+    m.extra.emplace_back("hires_steps", std::to_string(q.hires.steps > 0 ? q.hires.steps : q.steps));
+    m.extra.emplace_back("hires_upscaler", "lanczos");
+    if (!image_used) m.extra.emplace_back("resize", resize_mode_name(q.resize));
+  }
   return m;
 }
 
@@ -516,6 +616,10 @@ struct Pipeline::Impl {
   std::unique_ptr<flux2_vae::Flux2VaeDecoder> vae;
   const VaeSource* vae_src = nullptr;
   std::map<std::string, std::unique_ptr<VaeSource>> vae_sources;
+  // img2img's VAE encoder: persistent in the arena next to the decoder once loaded (dropped with the arena).
+  std::unique_ptr<flux2_vae_encoder::Flux2VaeEncoder> encoder;
+  const EncoderSource* encoder_src = nullptr;
+  std::map<std::string, std::unique_ptr<EncoderSource>> encoder_sources;
   // DiT source whose resident DiT was last dropped outside the plan's parking (its next load is a reload).
   const DitSource* dit_lost = nullptr;
   // Transfer rates for the cost model and whether the weight files are page-cached: probed (or read from the cache
@@ -536,10 +640,14 @@ struct Pipeline::Impl {
       co.disk_dir = options.cache_dir;
       cache = std::make_unique<EmbeddingCache>(co);
     }
+    if (!options.time_embedding_file.empty()) {
+      time_embedding = std::make_unique<moss_dit::TimeEmbeddingFp32>(moss_dit::load_time_embedding(options.time_embedding_file));
+    }
   }
 
   ~Impl() {
     te.reset();
+    encoder.reset();
     vae.reset();
     dit.reset();
     arena.reset();
@@ -635,6 +743,43 @@ struct Pipeline::Impl {
     return *it->second;
   }
 
+  // The VAE encoder of this call (EncoderSource).
+  EncoderSource& encoder_source(const Bundle& b, double& load_s) {
+    const std::string key = (options.vae_file.empty() ? std::string() : "file:" + util::path_utf8(std::filesystem::weakly_canonical(options.vae_file)) + "|") +
+                            "bundle:" + util::path_utf8(std::filesystem::weakly_canonical(b.dir));
+    auto it = encoder_sources.find(key);
+    if (it == encoder_sources.end()) {
+      const auto t0 = Clock::now();
+      auto e = std::make_unique<EncoderSource>();
+      // A VAE file with an encoder (a tensor under "encoder." or "<prefix>.encoder.") is used whole, its errors
+      // reported; a decoder-only file (e.g. the small decoder) encodes with the bundle's VAE.
+      bool has_encoder = false;
+      if (!options.vae_file.empty()) {
+        const weights::SafetensorsFile header(options.vae_file);
+        for (const weights::TensorInfo& t : header.tensors()) {
+          if (t.name.rfind("encoder.", 0) == 0 || t.name.find(".encoder.") != std::string::npos) has_encoder = true;
+        }
+      }
+      if (has_encoder) {
+        e->persistent = flux2_vae_encoder::Flux2VaeEncoder::persistent_bytes(options.vae_file, &b.index);
+        e->file = options.vae_file;
+        e->latent_stats = &b.index;
+      } else {
+        e->file = b.dir / "vae" / "diffusion_pytorch_model.safetensors";
+        if (!std::filesystem::is_regular_file(e->file)) {
+          throw std::invalid_argument("img2img needs the VAE encoder, but the bundle has no " + util::path_utf8(e->file));
+        }
+        e->persistent = flux2_vae_encoder::Flux2VaeEncoder::persistent_bytes(e->file);
+      }
+      it = encoder_sources.emplace(key, std::move(e)).first;
+      load_s += since(t0);
+    }
+    return *it->second;
+  }
+
+  // PipelineOptions::time_embedding_file, read at construction.
+  std::unique_ptr<moss_dit::TimeEmbeddingFp32> time_embedding;
+
   // Data-space sampler parameters by file (read once per pipeline).
   std::map<std::string, DataSpaceParams> dataspaces;
   const DataSpaceParams& dataspace(const std::filesystem::path& file) {
@@ -677,6 +822,8 @@ struct Pipeline::Impl {
     if (dit && !park) dit_lost = dit_src;
     te.reset();
     te_src = nullptr;
+    encoder.reset();
+    encoder_src = nullptr;
     vae.reset();
     vae_src = nullptr;
     dit.reset();
@@ -700,6 +847,8 @@ struct Pipeline::Impl {
     }
     te.reset();
     te_src = nullptr;
+    encoder.reset();
+    encoder_src = nullptr;
     vae.reset();
     vae_src = nullptr;
     dit.reset();
@@ -852,6 +1001,7 @@ struct Pipeline::Impl {
       dit = src.quant
                 ? std::make_unique<moss_dit::MossDit>(*src.quant, *arena, streams, options.direct_io, cancel, residency, merges)
                 : std::make_unique<moss_dit::MossDit>(*src.index, *arena, streams, options.direct_io, cancel, residency, merges);
+      if (time_embedding) dit->set_time_embedding(time_embedding.get());
     } catch (...) {
       // A partial load (cancelled or failed) leaves its weights in the persistent region: start over clean.
       reset_arena(arena->capacity());
@@ -859,9 +1009,10 @@ struct Pipeline::Impl {
     }
     dit_src = &src;
     dit_merge_key = merge_key;
+    ++mem->dit_loads;
     mem->dit_reloaded = mem->dit_reloaded || dit_lost == &src;
     dit_lost = nullptr;
-    tm.dit_load_s = since(t0);
+    tm.dit_load_s += since(t0);
     sample_memory();
   }
 
@@ -880,7 +1031,25 @@ struct Pipeline::Impl {
     const auto t0 = Clock::now();
     vae = std::make_unique<flux2_vae::Flux2VaeDecoder>(*v.index, *arena, streams, false, options.direct_io, v.latent_stats);
     vae_src = &v;
-    tm.vae_load_s = since(t0);
+    tm.vae_load_s += since(t0);
+    sample_memory();
+  }
+
+  // The VAE encoder, persistent next to the other resident models. The plan counts it (with the decoder) in every
+  // phase, so it is expected to fit; when it does not, the arena is recreated (a resident DiT is then reloaded).
+  void ensure_encoder(const EncoderSource& e, std::size_t stack_need, Timings& tm) {
+    if (encoder && encoder_src == &e && arena->available() >= stack_need) return;
+    if (encoder || arena->available() < e.persistent + stack_need) reset_arena(arena->capacity());
+    if (arena->available() < e.persistent + stack_need) throw runtime::BudgetError(e.persistent + stack_need, arena->available());
+    const auto t0 = Clock::now();
+    try {
+      encoder = std::make_unique<flux2_vae_encoder::Flux2VaeEncoder>(e.file, *arena, streams, options.direct_io, e.latent_stats);
+    } catch (...) {
+      reset_arena(arena->capacity());  // a partial upload stays in the persistent region
+      throw;
+    }
+    encoder_src = &e;
+    tm.vae_encoder_load_s += since(t0);
     sample_memory();
   }
 
@@ -898,6 +1067,19 @@ struct Pipeline::Impl {
     return held;
   }
 };
+
+std::int64_t schedule_steps(const Request& req) {
+  const FlowSampling flow{req.shift, req.flow_multiplier};
+  // The dataspace schedule has one step per requested step (generate() checks them against the file's step codes).
+  const int steps1 = req.sampler == SamplerKind::kDataSpace ? req.steps : make_schedule(req.scheduler, req.steps, flow).num_steps();
+  const int start1 = (req.init_image == nullptr) ? 0 : strength_start_step(steps1, req.denoise_strength);
+  std::int64_t total = steps1 - start1;
+  if (req.hires.enabled()) {
+    const int steps2 = make_schedule(req.scheduler, req.hires.steps > 0 ? req.hires.steps : req.steps, flow).num_steps();
+    total += steps2 - strength_start_step(steps2, req.hires.strength);
+  }
+  return total;
+}
 
 Pipeline::Pipeline(PipelineOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {}
 Pipeline::~Pipeline() = default;
@@ -948,6 +1130,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   r.vae_source = util::path_utf8(vs.path);
   r.dit_source = util::path_utf8(src.path);
   r.dit_linears = src.linears;
+  if (m.time_embedding) r.time_embedding = util::path_utf8(m.options.time_embedding_file);
   r.gpu_arch = current_gpu_arch();
   const bool lora_requested = !req.loras.empty();
   {
@@ -960,10 +1143,11 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     scope.pixels = std::int64_t{req.width} * req.height;
     scope.sampler = sampler_name(req.sampler);
     scope.steps = req.steps;
-    // Sampling settings the certificate scope cannot express yet count as an accelerator outside it (out of scope).
+    // Sampling settings the certificate scope cannot express yet (and runs starting from an image: img2img,
+    // inpainting, the hires fix) count as an accelerator outside it (out of scope).
     scope.accelerators = req.scheduler != SchedulerKind::kMoss || req.flow_multiplier != 1.0 || req.eta != 1.0 ||
                          req.s_noise != 1.0 || req.noise_source != NoiseSource::kPhilox ||
-                         req.noise_layout != NoiseLayout::kOfficial;
+                         req.noise_layout != NoiseLayout::kOfficial || req.init_image != nullptr || req.hires.enabled();
     const auto lookup = [&](planner::Precision precision, planner::AttentionMode mode) {
       const CertConfig cfg = cert_config(precision, mode, tes.precision, lora_requested);
       if (lora_requested) return planner::CertificateAnswer{false, "", uncertifiable_reason(cfg)};
@@ -1017,8 +1201,9 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     if (!m.lora_stack || files != m.lora_files_key) {
       lora::LoadOptions lo;
       lo.strict = m.options.lora_strict;
-      lo.int8_block_gemms = src.precision == planner::Precision::kInt8;
+      lo.int8_block_gemms = src.precision != planner::Precision::kBf16;
       auto stack = std::make_unique<lora::LoraStack>(req.loras, lora::moss_dit_targets(), lo);
+      moss_dit::check_lora_merges(*stack, src.quant.get());  // before anything is released or loaded
       // The side branches live outside the arena: make room first when a held arena leaves too little free memory
       // (the arena is recreated at the plan's size below), and retry once if the allocation still fails.
       const std::size_t sb_bytes = lora::SideBranches::device_bytes(*stack);
@@ -1057,6 +1242,9 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       for (const std::string& w : f.warnings) r.lora_warnings.push_back(f.file + ": " + w);
       for (const std::string& n : f.notes) r.lora_notes.push_back(f.file + ": " + n);
     }
+    if (m.time_embedding) {
+      for (const std::string& w : moss_dit::shadowed_by_time_embedding(*m.lora_stack)) r.lora_warnings.push_back(w);
+    }
   }
   if (req.seed >= 0) {
     r.seed = static_cast<std::uint64_t>(req.seed);
@@ -1091,10 +1279,50 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   sampler_options.s_noise = req.s_noise;
   sampler_options.flow = flow;
   sampler_options.dataspace = dataspace;
-  r.height = req.height;
-  r.width = req.width;
+  // img2img / inpainting / hires fix (P7b): the request's pass at its size, from noise or from the init image, and the
+  // hires fix's second pass at its target size from the upscaled first image. Each pass runs the tail of its schedule
+  // that its denoise strength leaves (diffusers get_timesteps); strength 1 without a mask needs no encode at all.
+  const bool hires = req.hires.enabled();
+  const bool inpaint = req.mask != nullptr;
+  const bool img2img = req.init_image != nullptr && (req.denoise_strength < 1.0 || inpaint);
+  const auto crop_schedule = [](Schedule s, int start) {
+    s.sigmas.erase(s.sigmas.begin(), s.sigmas.begin() + start);
+    s.timesteps.erase(s.timesteps.begin(), s.timesteps.begin() + start);
+    return s;
+  };
+  const int H1 = req.height, W1 = req.width;
+  const int H2 = hires ? req.hires.height : H1, W2 = hires ? req.hires.width : W1;
+  r.image_mode = inpaint ? "inpaint" : img2img ? "img2img" : "txt2img";
+  if (req.init_image != nullptr && !img2img) {
+    r.image_note = "denoise strength 1 without a mask samples from pure noise: the init image was not used";
+  }
+  const int start1 = (req.init_image == nullptr) ? 0 : strength_start_step(schedule.num_steps(), req.denoise_strength);
+  const Schedule sched1 = crop_schedule(schedule, start1);
+  r.first_pass.width = W1;
+  r.first_pass.height = H1;
+  r.first_pass.schedule_steps = schedule.num_steps();
+  r.first_pass.start_step = start1;
+  r.first_pass.strength = (req.init_image == nullptr) ? 1.0 : req.denoise_strength;
+  Schedule sched2;
+  if (hires) {
+    const Schedule full = make_schedule(req.scheduler, req.hires.steps > 0 ? req.hires.steps : req.steps, flow);
+    const int start2 = strength_start_step(full.num_steps(), req.hires.strength);
+    sched2 = crop_schedule(full, start2);
+    r.hires.width = W2;
+    r.hires.height = H2;
+    r.hires.schedule_steps = full.num_steps();
+    r.hires.start_step = start2;
+    r.hires.strength = req.hires.strength;
+  }
+  const bool need_dit = sched1.num_steps() > 0 || (hires && sched2.num_steps() > 0);
+  const bool need_encoder = img2img || hires;
+  const EncoderSource* enc_src = need_encoder ? &m.encoder_source(b, tm.index_load_s) : nullptr;
+  if (enc_src != nullptr) r.vae_encoder_source = util::path_utf8(enc_src->file);
+  r.height = H1;
+  r.width = W1;
   r.steps_requested = req.steps;
-  r.steps_scheduled = schedule.num_steps();
+  const int total_steps = static_cast<int>(schedule_steps(req));
+  r.steps_scheduled = total_steps;
 
   // Tokenize (P:321-327). The negative prompt is encoded only with CFG (P:388-394).
   auto t0 = Clock::now();
@@ -1111,17 +1339,18 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   r.cond_tokens = static_cast<int>(sc);
   r.uncond_tokens = static_cast<int>(su);
 
-  // Embedding cache: sequences it serves skip the text encoder.
+  // Embedding cache: sequences it serves skip the text encoder. Without a sampling step (denoise strength 0) nothing
+  // needs the embeddings: the text encoder does not run.
   t0 = Clock::now();
   std::vector<EmbeddingKey> keys(seqs.size());
   std::vector<std::shared_ptr<const Embedding>> embeds(seqs.size());
   std::vector<std::size_t> missing;
   for (std::size_t i = 0; i < seqs.size(); ++i) {
     keys[i] = EmbeddingKey{tes.identity, tes.numerics, req.max_sequence_length, seqs[i]};
-    if (m.cache) embeds[i] = m.cache->find(keys[i]);
+    if (m.cache && need_dit) embeds[i] = m.cache->find(keys[i]);
     if (embeds[i]) {
       ++r.te_cache_hits;
-    } else {
+    } else if (need_dit) {
       missing.push_back(i);
     }
   }
@@ -1144,23 +1373,48 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   }
 
   // Exact stack need of the phases this request runs, and the plan.
-  const std::int64_t h = req.height / 16, w = req.width / 16;
-  const std::size_t latent_bytes = align_up(static_cast<std::size_t>(moss_dit::kLatentChannels * h * w) * sizeof(float));
+  const auto latent_bytes_of = [](int H, int W) {
+    return align_up(static_cast<std::size_t>(moss_dit::kLatentChannels) * static_cast<std::size_t>(H / 16) *
+                    static_cast<std::size_t>(W / 16) * sizeof(float));
+  };
+  const auto image_bytes_of = [](int H, int W) { return static_cast<std::size_t>(H) * static_cast<std::size_t>(W) * 3; };
   const auto bf16_rows = [](std::int64_t s, std::int64_t c) { return align_up(static_cast<std::size_t>(s * c) * 2); };
   const std::size_t refined_bytes = bf16_rows(sc, moss_dit::kDim) + (g.do_cfg() ? bf16_rows(su, moss_dit::kDim) : 0);
   const std::size_t refine_need = bf16_rows(sc, moss_dit::kTextDim) + (g.do_cfg() ? bf16_rows(su, moss_dit::kTextDim) : 0) +
                                   moss_dit::MossDit::encode_text_workspace_bytes(std::max(sc, su));
-  // The sampling loop's own buffers plus the forward for the loop's largest row set (cond, uncond under CFG, SLG) under
-  // this request's route and config.
   const std::vector<std::int64_t> row_lengths = denoise_row_lengths(sc, su, g);
-  const std::size_t loop_buffers = denoise_loop_bytes(h, w, sc, su, g, req.sampler);
-  const std::size_t forward_bytes = moss_dit::MossDit::workspace_bytes(h, w, row_lengths, block_path, dit_config, &route);
-  // A latent preview: the previous latents, the x0 estimate, the preview's scratch and its RGB image.
-  const std::size_t image_bytes = static_cast<std::size_t>(req.height) * static_cast<std::size_t>(req.width) * 3;
-  const std::size_t preview_bytes =
-      control.on_preview ? 2 * latent_bytes + align_up(latent_preview::workspace_bytes(h, w)) + align_up(image_bytes) : 0;
-  const std::size_t denoise_need =
-      refined_bytes + std::max(refine_need, latent_bytes + preview_bytes + loop_buffers + forward_bytes);
+  // The denoise phase of one pass at H x W: the refined text, then the larger of the refiner and (latents, a latent
+  // preview's buffers, the sampling loop's own buffers and the forward for the loop's largest row set under this
+  // request's route and config). A pass starting from an image also uploads z0 next to the latents before sampling.
+  const auto denoise_need_of = [&](int H, int W, bool from_image) {
+    const std::int64_t lh = H / 16, lw = W / 16;
+    const std::size_t lat = latent_bytes_of(H, W);
+    const std::size_t loop_buffers = denoise_loop_bytes(lh, lw, sc, su, g, req.sampler);
+    const std::size_t forward_bytes = moss_dit::MossDit::workspace_bytes(lh, lw, row_lengths, block_path, dit_config, &route);
+    // A latent preview: the previous latents, the x0 estimate, the preview's scratch and its RGB image.
+    const std::size_t preview_bytes =
+        control.on_preview ? 2 * lat + align_up(latent_preview::workspace_bytes(lh, lw)) + align_up(image_bytes_of(H, W)) : 0;
+    return refined_bytes + std::max(refine_need, lat + preview_bytes + std::max(loop_buffers + forward_bytes, from_image ? lat : 0));
+  };
+  std::size_t denoise_need = 0;
+  if (sched1.num_steps() > 0) denoise_need = denoise_need_of(H1, W1, img2img);
+  if (hires && sched2.num_steps() > 0) denoise_need = std::max(denoise_need, denoise_need_of(H2, W2, true));
+  // VAE encodes (latents + the smallest exact tiling; at run time the encode takes the fastest tiling the arena leaves):
+  // the init image at the request size, the upscaled first image (and, inpainting, the init image) at the hires size.
+  std::size_t encode_need = 0;
+  const auto encode_need_of = [&](int H, int W) {
+    return latent_bytes_of(H, W) + flux2_vae_encoder::Flux2VaeEncoder::plan_min_memory(H, W).workspace_bytes;
+  };
+  if (img2img) encode_need = encode_need_of(H1, W1);
+  if (hires) encode_need = std::max(encode_need, encode_need_of(H2, W2));
+  // The decodes that run: the hires fix's first pass (for the upscale) and the final one; the plan sizes the larger.
+  int dec_h = 0, dec_w = 0;
+  const auto consider_decode = [&](int H, int W) {
+    if (std::int64_t{H} * W > std::int64_t{dec_h} * dec_w) dec_h = H, dec_w = W;
+  };
+  if (hires) consider_decode(H1, W1);
+  if (req.decode) consider_decode(H2, W2);
+  const bool need_decoder = dec_h > 0;
   // Exact GroupNorm statistics: the untiled decode and every tiled one the plan may pick from the free VRAM give the
   // same bytes, so the image does not depend on the memory budget.
   constexpr flux2_vae::DecodeMode decode_mode = flux2_vae::DecodeMode::reference();
@@ -1171,49 +1425,82 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
                                          tes.model ? &tes.model->index() : nullptr, vs.own.get());
   in.shapes.dit_bytes = moss_dit::MossDit::persistent_bytes(*src.index);
   if (src.quant) in.shapes.dit_int8_fraction = moss_dit::int8_gemm_fraction(src.quant.get());
+  if (src.quant) in.shapes.dit_int4_fraction = moss_dit::int4_gemm_fraction(src.quant.get());
+  if (src.quant && m.lora_sb) {
+    // INT4 sites with an active LoRA side branch run the INT8 LoRA GEMMs: costed at INT8 speed.
+    const double f = moss_dit::int4_side_branch_fraction(src.quant.get(), *m.lora_sb);
+    in.shapes.dit_int4_fraction -= f;
+    in.shapes.dit_int8_fraction = moss_dit::int8_gemm_fraction(src.quant.get()) + f;
+  }
   in.shapes.dit_block_bytes = align_up(moss_dit::BlockWeights::block_device_bytes(*src.index));  // the buffers' size
-  in.shapes.vae_bytes = flux2_vae::Flux2VaeDecoder::persistent_bytes(*vs.index, false, vs.latent_stats);
-  in.request.height = req.height;
-  in.request.width = req.width;
+  // The VAE side of the persistent region: the decoder and the encoder this request uses, plus those an earlier
+  // request left resident (counted in every phase; when that alone makes the request infeasible, plan without them and
+  // recreate the arena, dropping them, below).
+  const std::size_t dec_bytes = flux2_vae::Flux2VaeDecoder::persistent_bytes(*vs.index, false, vs.latent_stats);
+  const std::size_t needed_vae = (need_decoder ? dec_bytes : 0) + (enc_src != nullptr ? enc_src->persistent : 0);
+  const std::size_t held_vae = (!need_decoder && m.vae ? dec_bytes : 0) +
+                               (enc_src == nullptr && m.encoder && m.encoder_src != nullptr ? m.encoder_src->persistent : 0);
+  in.shapes.vae_bytes = needed_vae + held_vae > 0 ? needed_vae + held_vae : dec_bytes;
+  in.request.height = H2;
+  in.request.width = W2;
   in.request.text_lengths = {sc};
   if (g.do_cfg()) in.request.text_lengths.push_back(su);
-  in.request.steps = schedule.num_steps() * model_calls_per_step(req.sampler);  // DiT evaluations (heun: 2 per step)
+  {
+    // DiT evaluations (heun: 2 per step); the first pass of a hires fix counted at the target's cost by area.
+    const double area = static_cast<double>(H1) * W1 / (static_cast<double>(H2) * W2);
+    const int steps = (hires ? sched2.num_steps() : 0) + static_cast<int>(std::ceil(sched1.num_steps() * area));
+    in.request.steps = steps * model_calls_per_step(req.sampler);
+  }
   in.request.rows_per_step = 1 + (g.do_cfg() ? 1 : 0) + (g.slg_scale > 0 && g.slg_layers.any() ? 1 : 0);
   in.request.te_lengths = te_lengths;
-  in.request.decode = req.decode;
+  in.request.decode = need_decoder;
   in.request.te_cached = missing.empty();
   in.request.weights_cached = m.weights_cached();
   in.request.dit_weights_cached = m.dit_weights_cached();
-  in.request.vae_resident = m.vae != nullptr;
+  in.request.vae_resident = needed_vae + held_vae > 0;
   in.workspaces.text_encoder = [&](planner::TeResidency residency, int buffers) {
     return m.te_workspace(tes, te_lengths, m.te_options(tes, residency, buffers));
   };
-  in.workspaces.denoise = denoise_need;
-  if (req.decode) {
-    in.workspaces.decode = latent_bytes + flux2_vae::Flux2VaeDecoder::workspace_bytes(vs.config, h, w, decode_mode);
-    in.workspaces.decode_tiled = [&](std::size_t budget) -> std::optional<planner::TiledDecode> {
+  // The hires fix decodes its first pass next to the resident DiT (exact tiling, never parking it), so the DiT is loaded
+  // once per request: the smallest tiled decode of the first pass counts in the denoise phase, where the DiT is resident.
+  const std::size_t first_decode_need =
+      hires ? latent_bytes_of(H1, W1) +
+                  flux2_vae::Flux2VaeDecoder::plan_tiled_min_memory(vs.config, H1 / 16, W1 / 16, decode_mode, 8).workspace_bytes
+            : 0;
+  in.workspaces.denoise = std::max({denoise_need, encode_need, first_decode_need});
+  if (need_decoder) {
+    const std::int64_t dh = dec_h / 16, dw = dec_w / 16;
+    const std::size_t dec_latent = latent_bytes_of(dec_h, dec_w);
+    in.workspaces.decode = dec_latent + flux2_vae::Flux2VaeDecoder::workspace_bytes(vs.config, dh, dw, decode_mode);
+    in.workspaces.decode_tiled = [&, dh, dw, dec_latent](std::size_t budget) -> std::optional<planner::TiledDecode> {
       std::optional<flux2_vae::TilePlan> tp;
       if (budget == 0) {
-        tp = flux2_vae::Flux2VaeDecoder::plan_tiled_min_memory(vs.config, h, w, decode_mode, 8);
-      } else if (budget > latent_bytes) {
-        tp = flux2_vae::Flux2VaeDecoder::plan_tiled(vs.config, h, w, decode_mode, budget - latent_bytes);
+        tp = flux2_vae::Flux2VaeDecoder::plan_tiled_min_memory(vs.config, dh, dw, decode_mode, 8);
+      } else if (budget > dec_latent) {
+        tp = flux2_vae::Flux2VaeDecoder::plan_tiled(vs.config, dh, dw, decode_mode, budget - dec_latent);
       }
       if (!tp) return std::nullopt;
-      return planner::TiledDecode{latent_bytes + tp->workspace_bytes, tp->relative_cost, tp->tile};
+      return planner::TiledDecode{dec_latent + tp->workspace_bytes, tp->relative_cost, tp->tile};
     };
   }
   std::size_t embed_bytes = 0;
   for (const auto& s : seqs) embed_bytes += s.size() * qwen35_text::kHidden * 2;
-  in.workspaces.host_buffers = embed_bytes + 2 * latent_bytes +
-                               (req.decode ? image_bytes : 0) + (control.on_preview ? image_bytes : 0);
+  {
+    // Host buffers of the generation: embeddings, noise and latents, the final and preview images, and the image
+    // work of img2img / inpainting / hires (resized images, z0, the upscaled first image).
+    const std::size_t lat = std::max(latent_bytes_of(H1, W1), latent_bytes_of(H2, W2));
+    const std::size_t img = std::max(image_bytes_of(H1, W1), image_bytes_of(H2, W2));
+    in.workspaces.host_buffers = embed_bytes + 2 * lat + (req.decode ? img : 0) + (control.on_preview ? img : 0);
+    if (req.init_image != nullptr || hires) in.workspaces.host_buffers += 4 * lat + 3 * img;
+  }
   // The pristine copies of LoRA-merged modules the DiT keeps on the host (held_host_bytes takes a loaded DiT's out of
   // the baseline, so they count once).
   if (!merge_key.empty()) in.workspaces.host_buffers += moss_dit::MossDit::pristine_bytes(*m.lora_stack, src.quant.get());
   in.caps.te_max_buffers = 2;
   in.caps.te_ring_bytes = Impl::te_host(tes, m.te_options(tes, planner::TeResidency::kStreamed, 2));
   in.caps.te_host_resident = true;
-  in.caps.dit_parking = true;
-  in.caps.dit_streaming = true;
+  in.caps.dit_parking = need_dit;
+  in.caps.dit_streaming = need_dit;
   in.caps.dit_max_buffers = 3;
   {
     moss_dit::Residency file;
@@ -1240,21 +1527,29 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   in.mode = m.options.mode;
   in.attention = r.tier.attention;
   in.cache_disk_spill = m.cache && m.cache->disk_enabled();
-  // Throws planner::BudgetError before any heavy work. A resident VAE decoder the request does not need is counted;
-  // when that alone makes the request infeasible, plan without it and recreate the arena (dropping it) below.
+  if (!need_dit) {
+    // No sampling step (denoise strength 0): the DiT is neither loaded nor planned (the planner wants a DiT shape: one
+    // byte, resident).
+    in.shapes.dit_bytes = 1;
+    in.shapes.dit_block_bytes = 0;
+    in.caps.dit_graph_bytes = 0;
+    in.caps.dit_ring_bytes = 0;
+  }
+  // Throws planner::BudgetError before any heavy work.
   bool drop_resident = false;
   try {
     r.plan = planner::plan(in);
   } catch (const planner::BudgetError&) {
-    if (!in.request.vae_resident || req.decode) throw;
-    in.request.vae_resident = false;
+    if (held_vae == 0) throw;
+    in.shapes.vae_bytes = needed_vae > 0 ? needed_vae : dec_bytes;
+    in.request.vae_resident = needed_vae > 0;
     r.plan = planner::plan(in);
     drop_resident = true;
   }
   // A loaded DiT stays (in its held arena, with its residency) unless the request's own plan saves more than reloading
   // it costs: no reload churn when request sizes alternate or the free device memory moves a little.
   bool kept = false;
-  if (m.arena && m.dit && m.dit_src == &src && m.dit_merge_key == merge_key && !drop_resident) {
+  if (need_dit && m.arena && m.dit && m.dit_src == &src && m.dit_merge_key == merge_key && !drop_resident) {
     const moss_dit::Residency& loaded = m.dit->residency();
     planner::HeldDit held;
     held.arena_bytes = m.arena->capacity();
@@ -1268,6 +1563,26 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     r.plan = planner::prefer_held(in, std::move(r.plan), held, &kept);
   }
   r.plan.explanation += "\nQuality: " + r.tier.reason + "; DiT " + r.dit_linears + " from " + r.dit_source + ".";
+  if (m.time_embedding) {
+    r.plan.explanation += "\nDiT step embedder replaced (fp32) from " + util::path_utf8(m.options.time_embedding_file) + ".";
+  }
+  if (!need_dit) r.plan.explanation += "\nNo sampling step (denoise strength 0): the DiT is neither planned nor loaded.";
+  if (req.init_image != nullptr || hires) {
+    std::string what = r.image_mode;
+    if (!r.image_note.empty()) what += " (" + r.image_note + ")";
+    if (img2img) {
+      what += " from a " + std::to_string(req.init_image->width) + "x" + std::to_string(req.init_image->height) + " image (" +
+              resize_mode_name(req.resize) + ", strength " + json_number(req.denoise_strength) + ": " +
+              std::to_string(sched1.num_steps()) + " of " + std::to_string(schedule.num_steps()) + " steps)";
+    }
+    if (hires) {
+      what += "; hires fix " + std::to_string(W1) + "x" + std::to_string(H1) + " -> " + std::to_string(W2) + "x" +
+              std::to_string(H2) + " (strength " + json_number(req.hires.strength) + ": " + std::to_string(sched2.num_steps()) +
+              " of " + std::to_string(r.hires.schedule_steps) + " steps), the first pass decoded next to the DiT (tiled as "
+              "needed: the DiT is loaded once)";
+    }
+    r.plan.explanation += "\nImage: " + what + "; VAE encoder from " + r.vae_encoder_source + ".";
+  }
   const planner::ExecutionPlan& plan = r.plan;
   if (m.cache) m.cache->set_max_bytes(plan.cache.host_bytes);
   tm.plan_s = since(t0);
@@ -1275,7 +1590,8 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
 
   // The plan's arena. A larger existing one is kept (its resident models with it) unless the request needs less than
   // arena_shrink_below of it and the plan does not keep the loaded DiT.
-  const bool shrink = m.arena && !kept &&
+  // Without a sampling step a held DiT is kept too (the arena is not shrunk under it).
+  const bool shrink = m.arena && !kept && need_dit &&
                       static_cast<double>(plan.arena_bytes) < m.options.arena_shrink_below * static_cast<double>(m.arena->capacity());
   if (!m.arena || m.arena->capacity() < plan.arena_bytes || drop_resident || shrink) m.reset_arena(plan.arena_bytes);
   m.arena->reset_high_water();
@@ -1285,7 +1601,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   // 1. Text encoder for the sequences the cache did not serve; its device memory is released when it returns.
   if (!keep_going(Phase::kTextEncoder)) return finish();
   if (!missing.empty()) {
-    if (plan.dit.park_for_text_encoder && (m.dit || m.vae)) {
+    if (plan.dit.park_for_text_encoder && (m.dit || m.vae || m.encoder)) {
       r.memory.dit_parked_for_text_encoder = m.dit != nullptr;
       m.reset_arena(m.arena->capacity(), true);
     }
@@ -1322,40 +1638,103 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     }
   }
 
-  // 2. DiT, resident across calls.
-  if (!keep_going(Phase::kDitLoad)) return finish();
-  const moss_dit::Residency residency = m.dit_residency(plan.dit);
-  try {
-    m.ensure_dit(src, residency, denoise_need, control.cancel, tm, merge_key.empty() ? nullptr : m.lora_stack.get(), merge_key);
-  } catch (const moss_dit::Cancelled&) {
-    r.cancelled = true;
-    return finish();
-  }
-  m.dit->set_cancel(control.cancel);
-  // A DiT read from the weight files: page-cached or cold (the loader's one reader; O_DIRECT reads say nothing).
-  const moss_dit::LoadStats& ls = m.dit->load_stats();
-  if (tm.dit_load_s > 0 && m.learner && !m.options.direct_io && ls.seconds > 0 && ls.bytes >= (std::uint64_t{1} << 30)) {
-    m.learner->observe_dit_load(static_cast<double>(ls.bytes) / ls.seconds / 1e9);
-  }
-  if (m.dit->block_path() != block_path) m.dit->set_block_path(block_path);
-  if (m.dit->attention() != attention) m.dit->set_attention(attention);
-  m.dit->set_lora(m.lora_sb.get());
-  m.dit->set_request_route(route);
-  r.block_path = block_path;
-  if (block_path == moss_dit::BlockPath::kFusedGraphs && residency.streamed()) {
-    r.block_path = moss_dit::BlockPath::kFused;  // streamed blocks wait on host-driven copies: never captured
-    if (r.block_path_note.empty()) r.block_path_note = "CUDA graphs need every DiT block resident: blocks ran fused, eagerly";
-  }
+  // Host latents of an RGB image at its own size: the VAE encoder's posterior mean, on the arena stack with what the
+  // resident models leave (encode_within: exact tiling when the untiled encode does not fit, same bytes).
+  const auto encode_image = [&](const Image& im, PassReport& pass) {
+    m.ensure_encoder(*enc_src, encode_need_of(im.height, im.width), tm);
+    const auto te0 = Clock::now();
+    runtime::StackScope scope(*m.arena);
+    const Tensor lat = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, im.height / 16, im.width / 16});
+    const Tensor rgb = Tensor::view(const_cast<std::uint8_t*>(im.pixels.data()), DType::kU8, Device::kCPU, {im.height, im.width, 3});
+    const flux2_vae_encoder::TilePlan used =
+        m.encoder->encode_within(rgb, lat, flux2_vae_encoder::EncodeOptions{}, m.arena->available(), stream);
+    std::vector<float> z(static_cast<std::size_t>(lat.numel()));
+    MI_CUDA_CHECK(cudaMemcpyAsync(z.data(), lat.data, lat.nbytes(), cudaMemcpyDeviceToHost, stream));
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+    pass.encoded = true;
+    pass.encode_schedule += (pass.encode_schedule.empty() ? "" : "; ") + (used.tiled() ? used.describe() : std::string("untiled"));
+    tm.encode_s += since(te0);
+    m.sample_memory();
+    return z;
+  };
+  // An image brought to H x W by the request's resize mode (host, PIL-exact Lanczos).
+  const auto sized = [&](const Image& im, int H, int W) {
+    const auto ti = Clock::now();
+    Image out = resize_to(im, W, H, req.resize);
+    tm.image_ops_s += since(ti);
+    return out;
+  };
+  const auto sized_mask = [&](int H, int W) {
+    const auto ti = Clock::now();
+    std::vector<float> out = latent_mask(resize_to(*req.mask, W, H, req.resize), H / 16, W / 16);
+    tm.image_ops_s += since(ti);
+    return out;
+  };
 
-  // 3. Text refiner once per row, then the sampling loop.
-  if (!keep_going(Phase::kDenoise)) return finish();
-  {
+  // 2. img2img: the init image at the request size, encoded before the DiT load (when the DiT is not resident yet, the
+  // encode has the room to itself); then the DiT, resident across calls.
+  if (!keep_going(Phase::kDitLoad)) return finish();
+  std::vector<float> z0_1, mask_1;
+  if (img2img) {
+    const Image init = sized(*req.init_image, H1, W1);
+    z0_1 = encode_image(init, r.first_pass);
+    if (inpaint) mask_1 = sized_mask(H1, W1);
+    if (cancel_requested()) {
+      r.cancelled = true;
+      return finish();
+    }
+  }
+  const moss_dit::Residency residency = m.dit_residency(plan.dit);
+  // Loads the DiT when it is not resident (first use, or parked / dropped since) and sets this request's options.
+  const auto prepare_dit = [&]() {
+    const double loaded_before = tm.dit_load_s;
+    try {
+      m.ensure_dit(src, residency, denoise_need, control.cancel, tm, merge_key.empty() ? nullptr : m.lora_stack.get(), merge_key);
+    } catch (const moss_dit::Cancelled&) {
+      r.cancelled = true;
+      return false;
+    }
+    m.dit->set_cancel(control.cancel);
+    // A DiT read from the weight files: page-cached or cold (the loader's one reader; O_DIRECT reads say nothing).
+    const moss_dit::LoadStats& ls = m.dit->load_stats();
+    if (tm.dit_load_s > loaded_before && m.learner && !m.options.direct_io && ls.seconds > 0 && ls.bytes >= (std::uint64_t{1} << 30)) {
+      m.learner->observe_dit_load(static_cast<double>(ls.bytes) / ls.seconds / 1e9);
+    }
+    if (m.dit->block_path() != block_path) m.dit->set_block_path(block_path);
+    if (m.dit->attention() != attention) m.dit->set_attention(attention);
+    m.dit->set_lora(m.lora_sb.get());
+    m.dit->set_request_route(route);
+    r.block_path = block_path;
+    if (block_path == moss_dit::BlockPath::kFusedGraphs && residency.streamed()) {
+      r.block_path = moss_dit::BlockPath::kFused;  // streamed blocks wait on host-driven copies: never captured
+      if (r.block_path_note.empty()) r.block_path_note = "CUDA graphs need every DiT block resident: blocks ran fused, eagerly";
+    }
+    return true;
+  };
+  if (need_dit && !prepare_dit()) return finish();
+
+  // 3. Sampling passes: the text refiner once per row, then the sampling loop at H x W over `sched`, from the seeded
+  // noise (z0 null) or from z0 at the schedule's first sigma; with a mask, the inpainting blend against blend_z0 after
+  // every step. Leaves the pass's latents in r.latents (the partial ones when cancelled); returns false when cancelled.
+  int steps_done = 0;  // finished steps of the earlier passes (progress counts on across passes)
+  const auto run_pass = [&](int H, int W, const Schedule& sched, const std::vector<float>* z0, const std::vector<float>* blend_z0,
+                            const std::vector<float>* lmask, PassReport& pass) {
+    const std::int64_t h = H / 16, w = W / 16;
+    pass.ran = true;
+    r.height = H;
+    r.width = W;
+    if (sched.num_steps() == 0) {
+      // Denoise strength 0: sigma = 0 at the start, x = z0 (the VAE round trip of the image).
+      r.latents = *z0;
+      return true;
+    }
+    const std::vector<float> noise = initial_noise(req.noise_layout, r.seed, moss_dit::kLatentChannels, h, w);
     runtime::StackScope phase(*m.arena);
     const Tensor ref_c = m.arena->alloc_tensor(DType::kBF16, {sc, moss_dit::kDim});
     const Tensor ref_u = g.do_cfg() ? m.arena->alloc_tensor(DType::kBF16, {su, moss_dit::kDim}) : Tensor{};
     {
       runtime::StackScope refine(*m.arena);
-      t0 = Clock::now();
+      const auto tr = Clock::now();
       for (std::size_t i = 0; i < embeds.size(); ++i) {
         const std::int64_t s = static_cast<std::int64_t>(seqs[i].size());
         const Tensor te = m.arena->alloc_tensor(DType::kBF16, {s, moss_dit::kTextDim});
@@ -1363,11 +1742,12 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
         m.dit->encode_text(te, i == 0 ? ref_c : ref_u, stream);
       }
       MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-      tm.refine_s = since(t0);
+      tm.refine_s += since(tr);
     }
 
     // P:400-402: fp32 CPU noise [1, 128, h, w].
     const Tensor latents = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, h, w});
+    const std::size_t image_bytes = image_bytes_of(H, W);
     Tensor prev, x0, preview_rgb;
     void* preview_ws = nullptr;
     const std::size_t preview_ws_bytes = latent_preview::workspace_bytes(h, w);
@@ -1376,30 +1756,51 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       prev = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, h, w});
       x0 = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, h, w});
       preview_ws = m.arena->alloc_stack(preview_ws_bytes);
-      preview_rgb = m.arena->alloc_tensor(DType::kU8, {req.height, req.width, 3});
+      preview_rgb = m.arena->alloc_tensor(DType::kU8, {H, W, 3});
       preview_host.resize(image_bytes);
     }
-    {
-      const std::vector<float> noise = initial_noise(req.noise_layout, r.seed, moss_dit::kLatentChannels, h, w);
-      MI_CUDA_CHECK(cudaMemcpyAsync(latents.data, noise.data(), latents.nbytes(), cudaMemcpyHostToDevice, stream));
+    MI_CUDA_CHECK(cudaMemcpyAsync(latents.data, noise.data(), latents.nbytes(), cudaMemcpyHostToDevice, stream));
+    if (z0 == nullptr) {
       // x = sigma_0 * noise (identity for the official schedule's sigma_0 = 1).
-      flow_noise_scaling(latents, Tensor{}, schedule.sigmas.front(), stream);
-      if (control.on_preview) MI_CUDA_CHECK(cudaMemcpyAsync(prev.data, latents.data, latents.nbytes(), cudaMemcpyDeviceToDevice, stream));
+      flow_noise_scaling(latents, Tensor{}, sched.sigmas.front(), stream);
+    } else {
+      // img2img (scheduler.scale_noise): x = sigma_t * noise + (1 - sigma_t) * z0.
+      runtime::StackScope upload(*m.arena);
+      const Tensor z = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, h, w});
+      MI_CUDA_CHECK(cudaMemcpyAsync(z.data, z0->data(), z.nbytes(), cudaMemcpyHostToDevice, stream));
+      flow_noise_scaling(latents, z, sched.sigmas.front(), stream);
       MI_CUDA_CHECK(cudaStreamSynchronize(stream));
     }
+    if (control.on_preview) MI_CUDA_CHECK(cudaMemcpyAsync(prev.data, latents.data, latents.nbytes(), cudaMemcpyDeviceToDevice, stream));
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Streaming diagnostics per step: the provider's running totals (read after the step's synchronization).
+    // Streaming diagnostics per step: the provider's running totals (read after the step's synchronization), added to
+    // the earlier passes' totals.
     DitStreamStats& ds = r.dit_stream;
-    ds.streamed = residency.streamed();
-    if (ds.streamed) {
+    const DitStreamStats before = ds;
+    ds.streamed = ds.streamed || residency.streamed();
+    if (residency.streamed()) {
       ds.resident_blocks = residency.resident_blocks;
       ds.buffers = residency.buffers;
       ds.source = moss_dit::stream_source_name(residency.source);
       m.dit->reset_stream_stats();
     }
     moss_dit::StreamStats seen;
+    std::vector<float> blend_host(lmask != nullptr ? noise.size() : 0);
+    int finished = 0;
     const StepCallback on_step = [&](const StepInfo& info) {
-      if (ds.streamed) {
+      finished = info.step;
+      if (lmask != nullptr) {
+        // Inpainting: the kept region back on the init image's trajectory at the next step's sigma (0 after the last).
+        const auto tb = Clock::now();
+        MI_CUDA_CHECK(cudaMemcpyAsync(blend_host.data(), latents.data, latents.nbytes(), cudaMemcpyDeviceToHost, stream));
+        MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+        inpaint_blend(blend_host, *blend_z0, noise, *lmask, sched.sigmas[static_cast<std::size_t>(info.step)]);
+        MI_CUDA_CHECK(cudaMemcpyAsync(latents.data, blend_host.data(), latents.nbytes(), cudaMemcpyHostToDevice, stream));
+        MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+        tm.image_ops_s += since(tb);
+      }
+      if (residency.streamed()) {
         const moss_dit::StreamStats& total = m.dit->total_stream_stats();
         DitStreamStats::Step st;
         const double copy_s = total.copy_s - seen.copy_s;
@@ -1409,72 +1810,127 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
         st.stalls = total.stalls - seen.stalls;
         ds.steps.push_back(st);
         seen = total;
-        ds.bytes = total.bytes;
-        ds.copy_s = total.copy_s;
-        ds.stall_s = total.stall_s;
-        ds.stalls = total.stalls;
+        ds.bytes = before.bytes + total.bytes;
+        ds.copy_s = before.copy_s + total.copy_s;
+        ds.stall_s = before.stall_s + total.stall_s;
+        ds.stalls = before.stalls + total.stalls;
       }
       tm.step_s.push_back(info.step_seconds);
+      const StepInfo overall{steps_done + info.step, total_steps, info.step_seconds};
       if (control.on_preview) {
         // x0 estimate from this step's effective velocity (the last step's latents are their own x0: sigma = 0).
         const int every = std::max(1, control.preview_every);
-        if (info.step % every == 0 || info.step == info.num_steps) {
-          const double s_now = schedule.sigmas[static_cast<std::size_t>(info.step)];
-          const double s_prev = schedule.sigmas[static_cast<std::size_t>(info.step) - 1];
+        if (overall.step % every == 0 || overall.step == overall.num_steps) {
+          const double s_now = sched.sigmas[static_cast<std::size_t>(info.step)];
+          const double s_prev = sched.sigmas[static_cast<std::size_t>(info.step) - 1];
           const float c = s_prev != s_now ? static_cast<float>(s_now / (s_prev - s_now)) : 0.0f;
           moss_dit::extrapolate_latents(latents, prev, c, x0, stream);
           latent_preview::preview(x0, preview_rgb, preview_ws, preview_ws_bytes, stream);
           MI_CUDA_CHECK(cudaMemcpyAsync(preview_host.data(), preview_rgb.data, image_bytes, cudaMemcpyDeviceToHost, stream));
           MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-          control.on_preview(PreviewImage{info.step, info.num_steps, req.width, req.height, preview_host.data()});
+          control.on_preview(PreviewImage{overall.step, overall.num_steps, W, H, preview_host.data()});
         }
         MI_CUDA_CHECK(cudaMemcpyAsync(prev.data, latents.data, latents.nbytes(), cudaMemcpyDeviceToDevice, stream));
       }
-      if (control.on_step && !control.on_step(info)) r.cancelled = true;
+      if (control.on_step && !control.on_step(overall)) r.cancelled = true;
       if (cancel_requested()) r.cancelled = true;
       return !r.cancelled;
     };
-    t0 = Clock::now();
+    const auto ts = Clock::now();
+    int run = 0;
     try {
       sampler_options.seed = r.seed;
-      r.steps_run = denoise(*m.dit, *m.arena, ref_c, ref_u, schedule, g, req.sampler, sampler_options, latents, stream, on_step);
+      run = denoise(*m.dit, *m.arena, ref_c, ref_u, sched, g, req.sampler, sampler_options, latents, stream, on_step);
     } catch (const moss_dit::Cancelled&) {
       // Inside a step's forward, before its update: the latents are those after the last finished step.
       r.cancelled = true;
-      r.steps_run = static_cast<int>(tm.step_s.size());
+      run = finished;
     }
-    tm.denoise_s = since(t0);
-    if (!r.cancelled) m.learn_from_denoise(r);
+    tm.denoise_s += since(ts);
+    pass.steps_run = run;
+    steps_done += run;
+    r.steps_run = steps_done;
     m.sample_memory();
     r.latents.resize(static_cast<std::size_t>(latents.numel()));
     MI_CUDA_CHECK(cudaMemcpyAsync(r.latents.data(), latents.data, latents.nbytes(), cudaMemcpyDeviceToHost, stream));
     MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-  }
+    return !r.cancelled;
+  };
 
-  // 4. VAE decode (P:428-438) to RGB8: untiled when it fits the arena next to the resident models, else tiled, with the
-  // same bytes either way (decode_mode). Not after a cancel, even one seen at the last step.
-  if (req.decode && !r.cancelled && keep_going(Phase::kDecode)) {
-    m.ensure_vae(vs, plan.vae.stack_bytes, plan.dit.park_for_decode, tm);
+  // 4. VAE decode (P:428-438) of host latents to RGB8: untiled when it fits the arena next to the resident models, else
+  // tiled, with the same bytes either way (decode_mode). Returns false when cancelled (`out` is then cleared).
+  // `first`: the hires fix's first pass, decoded next to the DiT without parking it (the plan counted its smallest
+  // tiling in the denoise phase); its schedule goes to first_pass.decode_schedule. Otherwise the final decode, as planned.
+  const auto decode_latents = [&](const std::vector<float>& lat, int H, int W, std::vector<std::uint8_t>& out, bool first) {
+    if (first) {
+      m.ensure_vae(vs, first_decode_need, false, tm);
+    } else {
+      m.ensure_vae(vs, plan.vae.stack_bytes, plan.dit.park_for_decode, tm);
+    }
     runtime::StackScope phase(*m.arena);
-    const Tensor latents = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, h, w});
-    MI_CUDA_CHECK(cudaMemcpyAsync(latents.data, r.latents.data(), latents.nbytes(), cudaMemcpyHostToDevice, stream));
-    r.rgb.resize(static_cast<std::size_t>(req.height) * static_cast<std::size_t>(req.width) * 3);
-    const Tensor rgb = Tensor::view(r.rgb.data(), DType::kU8, Device::kCPU, {req.height, req.width, 3});
-    t0 = Clock::now();
+    const Tensor latents = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, H / 16, W / 16});
+    MI_CUDA_CHECK(cudaMemcpyAsync(latents.data, lat.data(), latents.nbytes(), cudaMemcpyHostToDevice, stream));
+    out.resize(image_bytes_of(H, W));
+    const Tensor rgb = Tensor::view(out.data(), DType::kU8, Device::kCPU, {H, W, 3});
+    const auto td = Clock::now();
     m.vae->set_cancel(control.cancel);
     try {
       const std::optional<flux2_vae::TilePlan> used =
           m.vae->decode_within(latents, rgb, decode_mode, m.arena->available(), stream);
       MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-      r.decode_tiled = used.has_value();
-      r.decode_schedule = used ? used->describe() : "untiled";
+      if (first) {
+        r.first_pass.decode_schedule = used ? used->describe() : "untiled";
+      } else {
+        r.decode_tiled = used.has_value();
+        r.decode_schedule = used ? used->describe() : "untiled";
+      }
     } catch (const flux2_vae::Cancelled&) {
       r.cancelled = true;
-      r.rgb.clear();
+      out.clear();
     }
-    tm.decode_s = since(t0);
+    tm.decode_s += since(td);
     m.sample_memory();
+    return !r.cancelled;
+  };
+
+  if (!keep_going(Phase::kDenoise)) return finish();
+  if (!run_pass(H1, W1, sched1, img2img ? &z0_1 : nullptr, inpaint ? &z0_1 : nullptr, inpaint ? &mask_1 : nullptr, r.first_pass)) {
+    return finish();
   }
+  // Compute and streaming rates from a single pass at one size (a hires fix's passes mix sizes).
+  if (!hires && sched1.num_steps() > 0) m.learn_from_denoise(r);
+
+  // 5. Hires fix: decode the first pass, upscale it in pixel space, encode it at the target size, and refine it there.
+  if (hires) {
+    if (!keep_going(Phase::kDecode)) return finish();
+    Image first;
+    first.width = W1;
+    first.height = H1;
+    first.channels = 3;
+    if (!decode_latents(r.latents, H1, W1, first.pixels, true)) return finish();
+    if (!keep_going(Phase::kDenoise)) return finish();
+    std::vector<float> z0_2, blend_2, mask_2;
+    {
+      const auto ti = Clock::now();
+      const Image up = resize_to(first, W2, H2, req.resize);
+      first.pixels = {};
+      tm.image_ops_s += since(ti);
+      z0_2 = encode_image(up, r.hires);
+    }
+    if (inpaint) {
+      blend_2 = encode_image(sized(*req.init_image, H2, W2), r.hires);
+      mask_2 = sized_mask(H2, W2);
+    }
+    if (cancel_requested()) {
+      r.cancelled = true;
+      return finish();
+    }
+    if (sched2.num_steps() > 0 && !prepare_dit()) return finish();
+    if (!run_pass(H2, W2, sched2, &z0_2, inpaint ? &blend_2 : nullptr, inpaint ? &mask_2 : nullptr, r.hires)) return finish();
+  }
+
+  // 6. The final decode. Not after a cancel, even one seen at the last step.
+  if (req.decode && !r.cancelled && keep_going(Phase::kDecode)) decode_latents(r.latents, r.height, r.width, r.rgb, false);
   return finish();
 }
 

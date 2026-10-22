@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -72,7 +73,7 @@ std::vector<float> read_floats(std::ifstream& in, const weights::TensorInfo& t) 
   std::vector<T> raw(static_cast<std::size_t>(t.numel()));
   in.seekg(static_cast<std::streamoff>(t.offset));
   in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size() * sizeof(T)));
-  if (!in) throw std::runtime_error("load_dataspace: cannot read tensor " + t.name);
+  if (!in) throw DataspaceError("load_dataspace: cannot read tensor " + t.name);
   return std::vector<float>(raw.begin(), raw.end());
 }
 
@@ -128,16 +129,22 @@ NoiseSource parse_noise_source(std::string_view name) {
 }
 
 DataSpaceParams load_dataspace(const std::string& path) {
-  const weights::SafetensorsFile file{util::path_from_utf8(path)};
+  std::optional<weights::SafetensorsFile> opened;
+  try {
+    opened.emplace(util::path_from_utf8(path));
+  } catch (const weights::FormatError& e) {
+    throw DataspaceError(e.what());
+  }
+  const weights::SafetensorsFile& file = *opened;
   const weights::TensorInfo* q = file.find("latent_mix.Q");
   const weights::TensorInfo* codes = file.find("step_codes");
-  if (q == nullptr || codes == nullptr) throw std::runtime_error(path + ": expected tensors latent_mix.Q and step_codes");
+  if (q == nullptr || codes == nullptr) throw DataspaceError(path + ": expected tensors latent_mix.Q and step_codes");
   if (q->dtype != weights::DType::kF32 || q->shape.size() != 2 || q->shape[0] != q->shape[1] || q->shape[0] < 1 ||
       q->shape[0] > 4096) {
-    throw std::runtime_error(path + ": latent_mix.Q must be F32 [C, C]");
+    throw DataspaceError(path + ": latent_mix.Q must be F32 [C, C]");
   }
   if (codes->shape.size() != 1 || codes->shape[0] < 1 || codes->shape[0] > 1000) {
-    throw std::runtime_error(path + ": step_codes must be a vector of 1..1000 values");
+    throw DataspaceError(path + ": step_codes must be a vector of 1..1000 values");
   }
   std::ifstream in(file.path(), std::ios::binary);
   DataSpaceParams p;
@@ -147,13 +154,13 @@ DataSpaceParams load_dataspace(const std::string& path) {
     case weights::DType::kF32: p.step_codes = read_floats<float>(in, *codes); break;
     case weights::DType::kF64: p.step_codes = read_floats<double>(in, *codes); break;
     case weights::DType::kI64: p.step_codes = read_floats<std::int64_t>(in, *codes); break;
-    default: throw std::runtime_error(path + ": step_codes must be F32, F64 or I64");
+    default: throw DataspaceError(path + ": step_codes must be F32, F64 or I64");
   }
   for (const float c : p.step_codes) {
-    if (!std::isfinite(c) || c < 0 || c > 1000) throw std::runtime_error(path + ": step codes must lie in [0, 1000]");
+    if (!std::isfinite(c) || c < 0 || c > 1000) throw DataspaceError(path + ": step codes must lie in [0, 1000]");
   }
   for (const float v : p.q) {
-    if (!std::isfinite(v)) throw std::runtime_error(path + ": latent_mix.Q is not finite");
+    if (!std::isfinite(v)) throw DataspaceError(path + ": latent_mix.Q is not finite");
   }
   return p;
 }

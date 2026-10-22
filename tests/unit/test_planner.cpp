@@ -918,6 +918,93 @@ TEST(Planner, Int8DitKeepsMoreBlocksResidentAndCostsLess) {
   EXPECT_EQ(bdoc.at("dit").at("attention").as_string(), "exact");
 }
 
+// P6c: an INT4 DiT (toxicdog's convrot_w4a4 SFT file's sizes): a quarter of the bf16 block bytes, INT4 GEMMs at their
+// measured speedup; a mixed INT4/INT8/bf16 file costs by fraction.
+TEST(Planner, Int4DitStreamsLessAndCostsLeast) {
+  Scenario sc;
+  sc.size = 1024;
+  sc.lengths = {282, 10};
+  sc.vram_free_gib = 4.0;
+  sc.streaming = true;
+  PlanInputs in = sc.inputs();
+  in.shapes = int8_shapes();
+  const ExecutionPlan int8 = plan(in);
+  in.shapes.dit_block_bytes = 56'709'120;
+  in.shapes.dit_bytes = 3'035'000'000 + (std::size_t{32} << 20);
+  in.shapes.dit_precision = Precision::kInt4;
+  const ExecutionPlan int4 = plan(in);
+  expect_consistent(int4);
+  const int int4_resident = int4.dit.residency == DitResidency::kStreamed ? int4.dit.resident_blocks : 42;
+  const int int8_resident = int8.dit.residency == DitResidency::kStreamed ? int8.dit.resident_blocks : 42;
+  std::printf("[planner] 4 GiB free, 1024^2: int8 %d / int4 %d blocks resident; compute %.2f / %.2f s per step\n",
+              int8_resident, int4_resident, int8.dit.compute_s, int4.dit.compute_s);
+  EXPECT_GT(int4_resident, int8_resident);
+  EXPECT_EQ(int4.dit.precision, Precision::kInt4);
+  EXPECT_LT(int4.dit.compute_s, int8.dit.compute_s);
+  EXPECT_NE(int4.explanation.find("INT4 ConvRot"), std::string::npos);
+  EXPECT_EQ(mi::json::parse(int4.to_json()).at("dit").at("precision").as_string(), "int4");
+  // Mixed: half INT4, half INT8 costs between all-INT4 and all-INT8; a quarter of it bf16 instead costs more.
+  in.shapes.dit_int4_fraction = 0.5;
+  in.shapes.dit_int8_fraction = 0.5;
+  const ExecutionPlan mixed = plan(in);
+  EXPECT_GT(mixed.dit.compute_s, int4.dit.compute_s);
+  EXPECT_LT(mixed.dit.compute_s, int8.dit.compute_s);
+  in.shapes.dit_int8_fraction = 0.25;
+  EXPECT_GT(plan(in).dit.compute_s, mixed.dit.compute_s);
+  // The INT8 share is capped at what the INT4 share leaves (the defaults, 1.0 and 1.0, mean all INT4).
+  in.shapes.dit_int4_fraction = 1.0;
+  in.shapes.dit_int8_fraction = 1.0;
+  EXPECT_DOUBLE_EQ(plan(in).dit.compute_s, int4.dit.compute_s);
+  EXPECT_STREQ(precision_name(Precision::kInt4), "int4");
+}
+
+TEST(Planner, TurboTier) {
+  const auto none = [](Precision, AttentionMode) { return CertificateAnswer{false, "", "not certifiable"}; };
+  const auto all = [](AttentionMode) { return true; };
+  const auto no_q8 = [](AttentionMode a) { return a == AttentionMode::kExact; };
+  using O = std::optional<AttentionMode>;
+  // Explicit turbo on an INT4 DiT: INT4 GEMMs + q8_fp8 attention, uncertified, said so.
+  TierDecision d = resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, none, all);
+  EXPECT_EQ(d.effective, Tier::kTurbo);
+  EXPECT_EQ(d.precision, Precision::kInt4);
+  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
+  EXPECT_FALSE(d.certified);
+  EXPECT_NE(d.reason.find("INT4 ConvRot GEMMs"), std::string::npos) << d.reason;
+  EXPECT_NE(d.reason.find("uncertified (not certifiable)"), std::string::npos) << d.reason;
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, none, no_q8).attention, AttentionMode::kExact);
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{AttentionMode::kExact}, Precision::kInt4, none, all).attention, AttentionMode::kExact);
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, none, all, true).effective, Tier::kTurbo);  // + quantized TE
+  // Turbo needs an INT4 DiT; an INT4 DiT is never Reference or High.
+  for (const Precision p : {Precision::kBf16, Precision::kInt8}) {
+    EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, p, none, all), std::invalid_argument);
+  }
+  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kInt4, none, all), std::invalid_argument);
+  EXPECT_THROW(resolve_tier(Tier::kHigh, O{}, Precision::kInt4, none, all), std::invalid_argument);
+  // Auto never runs an uncertified Turbo configuration: refused, naming the way out.
+  try {
+    resolve_tier(Tier::kAuto, O{}, Precision::kInt4, none, all);
+    ADD_FAILURE() << "auto ran an uncertified INT4 DiT";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string(e.what()).find("tier turbo"), std::string::npos) << e.what();
+  }
+  EXPECT_THROW(resolve_tier(Tier::kAuto, O{AttentionMode::kExact}, Precision::kInt4, none, all), std::invalid_argument);
+  // With a certificate auto picks the fastest certified Turbo configuration.
+  std::vector<AttentionMode> order;
+  const auto fp16_only = [&](Precision p, AttentionMode a) {
+    order.push_back(a);
+    return CertificateAnswer{p == Precision::kInt4 && a == AttentionMode::kQ8Fp16, "/c/t.mossinfer-cert.json", ""};
+  };
+  d = resolve_tier(Tier::kAuto, O{}, Precision::kInt4, fp16_only, all);
+  EXPECT_EQ(d.effective, Tier::kTurbo);
+  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp16);
+  EXPECT_TRUE(d.certified);
+  EXPECT_EQ(d.certificate, "/c/t.mossinfer-cert.json");
+  EXPECT_EQ(order, (std::vector<AttentionMode>{AttentionMode::kQ8Fp8, AttentionMode::kQ8Fp16}));
+  d = resolve_tier(Tier::kAuto, O{AttentionMode::kQ8Fp16}, Precision::kInt4, fp16_only, all);
+  EXPECT_EQ(d.effective, Tier::kTurbo);
+  EXPECT_TRUE(d.certified);
+}
+
 TEST(Planner, TierAndAttentionNames) {
   for (const Tier t : {Tier::kReference, Tier::kHigh, Tier::kTurbo, Tier::kAuto}) EXPECT_EQ(parse_tier(tier_name(t)), t);
   for (const AttentionMode a : {AttentionMode::kExact, AttentionMode::kQ8Fp16, AttentionMode::kQ8Fp16F32Acc,

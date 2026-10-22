@@ -15,14 +15,18 @@
 #include "kernels/fused/qk_norm_rope.h"
 #include "kernels/lora/lora_gemm.h"
 #include "kernels/quant/quant.h"
+#include "kernels/quant4/quant4.h"
+#include "models/moss_dit/dit_kernels.h"
 
 namespace mi::moss_dit {
 namespace {
 
 namespace kq = kernels::quant;
+namespace kq4 = kernels::quant4;
 
 constexpr std::int64_t kD = 3072, kH = 24, kHd = 128, kF = 8192;
 static_assert(kFusedBigCols * 2 >= kF * 2 + kF, "the INT8 ffn_down input must fit next to the fused ffn output");
+static_assert(kInt4UnpackBytes >= 2 * kF * kD && kInt4UnpackBytes >= kD * kF, "every INT4 block weight fits unpacked");
 // SDPA's default scale 1/sqrt(head_dim), computed in double and rounded once as torch does (as moss_dit.cpp).
 const float kScale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHd)));
 attention_q8::Variant variant_of(AttentionMode m) {
@@ -78,8 +82,22 @@ kq::Int8Operands operands(const std::int8_t* xq, std::int64_t ldx, const float* 
   return op;
 }
 
+kq4::Int4Operands operands4(const std::uint8_t* xq, std::int64_t ldx, const float* scale, const Int4Linear& w,
+                            std::int64_t m) {
+  kq4::Int4Operands op;
+  op.x_q = xq;
+  op.ldx = ldx;
+  op.x_scale = scale;
+  op.w = static_cast<const std::uint8_t*>(w.w.data);
+  op.w_scale = static_cast<const float*>(w.scale.data);
+  op.m = m;
+  op.n = w.w.dim(0);
+  op.k = w.k();
+  return op;
+}
+
 bool bf16_up_gate_runs_op_by_op(const BlockTensors& w, const FusedRoute& route, bool lora) {
-  return w.up_gate8.empty() && !route.up_gate && !lora;
+  return w.up_gate8.empty() && w.up_gate4.empty() && !route.up_gate && !lora;
 }
 
 }  // namespace
@@ -154,6 +172,12 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
        qa.lora_t.dim(1) < qa.lora->max_rank() || qa.lora_workspace_bytes < lora::t_workspace_bytes(l, qa.lora->max_rank()))) {
     throw std::invalid_argument("mi::moss_dit::run_block_quant: LoRA buffers do not match the side branches");
   }
+  const bool unpack = (s_qkv != nullptr && !w.qkv4.empty()) || (s_o != nullptr && !w.o4.empty()) ||
+                      (s_up != nullptr && !w.up_gate4.empty()) || (s_down != nullptr && !w.down4.empty());
+  if (unpack && (qa.int4_unpack == nullptr || qa.int4_unpack_bytes < kInt4UnpackBytes)) {
+    throw std::invalid_argument("mi::moss_dit::run_block_quant: an INT4 linear with a LoRA side branch needs the "
+                                "int4_unpack buffer (kInt4UnpackBytes)");
+  }
   // t of a site for its bf16 input `in` (rows of this run): the LoRA GEMM's operand.
   const auto prepare = [&](const lora::SiteBranch& sb, const Tensor& in) {
     Tensor t = Tensor::view(qa.lora_t.data, DType::kBF16, Device::kCUDA, {m, sb.rank});
@@ -185,16 +209,46 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   const Tensor qkv = rows_of(a.big, 0, l, 3 * kD, run.t0, run.t1);
   const Tensor attn = rows_of(a.big, l * 3 * kD, l, kD, run.t0, run.t1);
   float* scale = static_cast<float*>(qa.scale.data) + run.t0;
-  // INT8 [L, kD] GEMM inputs: the qkv input in the attention output's columns (free until attention runs), the o-proj
-  // and ffn_up_gate inputs in y (free while their GEMMs run: the INT8 path never stores the bf16 norm output).
+  // Quantized [L, kD] GEMM inputs (INT8, or packed INT4 in the first half): the qkv input in the attention output's
+  // columns (free until attention runs), the o-proj and ffn_up_gate inputs in y (free while their GEMMs run: the
+  // quantized paths never store the bf16 norm output). An INT4 linear with a LoRA side branch runs the INT8 LoRA GEMM
+  // on its values unpacked to INT8 (the same int32 dot products, so the base result is the INT4 GEMM's): the packed
+  // input then sits right after its unpacked INT8 copy (each region holds 2 kD bytes per token, the pair needs 1.5 kD).
   std::int8_t* const xq_qkv = static_cast<std::int8_t*>(attn.data);
   std::int8_t* const xq_y = static_cast<std::int8_t*>(a.y.data) + run.t0 * kD;
   const auto linear = [&](const Tensor& out, const Tensor& in, const Tensor& weight) {
     qkv_gemm.gemm->linear(out, in, weight, nullptr, qkv_gemm.workspace, qkv_gemm.workspace_bytes, stream);
   };
+  const auto u8 = [](std::int8_t* p) { return reinterpret_cast<std::uint8_t*>(p); };
+  // INT8 operands of an INT4 linear for the LoRA GEMMs: its packed input `xq4` (row stride k / 2) unpacked to `xq8`
+  // (row stride k) and its weight unpacked into the int4_unpack buffer.
+  const auto unpacked = [&](const std::int8_t* xq4, std::int8_t* xq8, const Int4Linear& lin) {
+    const std::int64_t k = lin.k(), n = lin.w.dim(0);
+    unpack_int4(xq4, k / 2, xq8, k, m, k, stream);
+    unpack_int4(lin.w.data, k / 2, qa.int4_unpack, k, n, k, stream);
+    kq::Int8Operands op;
+    op.x_q = xq8;
+    op.ldx = k;
+    op.x_scale = scale;
+    op.w = static_cast<const std::int8_t*>(qa.int4_unpack);
+    op.w_scale = static_cast<const float*>(lin.scale.data);
+    op.m = m;
+    op.n = n;
+    op.k = k;
+    return op;
+  };
 
   // QKV projection (P:139-140 up to the linear).
-  if (!w.qkv8.empty() && s_qkv != nullptr) {
+  if (!w.qkv4.empty() && s_qkv != nullptr) {
+    kernels::rms_norm_modulate_moss(x, w.norm1, vec(a.mod, 1), vec(a.mod, 0), y, stream);
+    kq4::convrot_quantize_int4(bf(y), kD, u8(xq_qkv + m * kD), kD / 2, scale, m, static_cast<int>(kD), stream);
+    const kq::Int8Operands op = unpacked(xq_qkv + m * kD, xq_qkv, w.qkv4);
+    kl::int8_gemm_lora(op, nullptr, prepare(*s_qkv, y), bf_mut(qkv), 3 * kD, stream);
+  } else if (!w.qkv4.empty()) {
+    kq4::rms_norm_modulate_convrot_quantize_int4(bf(x), kD, bf(w.norm1), bf(vec(a.mod, 1)), bf(vec(a.mod, 0)), u8(xq_qkv),
+                                                 kD / 2, scale, m, static_cast<int>(kD), stream);
+    kq4::int4_gemm(operands4(u8(xq_qkv), kD / 2, scale, w.qkv4, m), nullptr, bf_mut(qkv), 3 * kD, stream);
+  } else if (!w.qkv8.empty() && s_qkv != nullptr) {
     kernels::rms_norm_modulate_moss(x, w.norm1, vec(a.mod, 1), vec(a.mod, 0), y, stream);
     kq::rotate_quantize(bf(y), kD, xq_qkv, kD, scale, m, static_cast<int>(kD), stream);
     kl::int8_gemm_lora(operands(xq_qkv, kD, scale, w.qkv8, m), nullptr, prepare(*s_qkv, y), bf_mut(qkv), 3 * kD, stream);
@@ -209,18 +263,37 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     } else if (!w.qkv_split) {
       linear(qkv, y, w.qkv);
     } else {
-      // q, k and v of different precisions: one shared quantized input for the INT8 parts, the bf16 norm output for
-      // the others, each GEMM into its columns of qkv.
-      bool any_int8 = false;
-      for (const Int8Linear& p : w.qkv8_part) any_int8 = any_int8 || !p.empty();
-      if (any_int8) kq::rotate_quantize(bf(y), kD, xq_qkv, kD, scale, m, static_cast<int>(kD), stream);
-      for (int i = 0; i < 3; ++i) {
+      // q, k and v of different precisions, each GEMM into its columns of qkv: the bf16 parts from the norm output,
+      // the INT8 parts from one shared INT8 input, then the INT4 parts from one shared INT4 input (it overwrites the
+      // INT8 input and scales once their GEMMs are queued: one stream).
+      const auto part = [&](int i) {
         Tensor out = Tensor::view(static_cast<std::uint16_t*>(qkv.data) + i * kD, DType::kBF16, Device::kCUDA, {m, kD});
         out.stride[0] = 3 * kD;
-        if (!w.qkv8_part[i].empty()) {
-          kq::int8_gemm(operands(xq_qkv, kD, scale, w.qkv8_part[i], m), nullptr, bf_mut(out), 3 * kD, stream);
-        } else {
-          linear(out, y, w.qkv_part[i]);
+        return out;
+      };
+      bool any_int8 = false, any_int4 = false;
+      for (int i = 0; i < 3; ++i) {
+        any_int8 = any_int8 || !w.qkv8_part[i].empty();
+        any_int4 = any_int4 || !w.qkv4_part[i].empty();
+      }
+      for (int i = 0; i < 3; ++i) {
+        if (w.qkv8_part[i].empty() && w.qkv4_part[i].empty()) linear(part(i), y, w.qkv_part[i]);
+      }
+      if (any_int8) {
+        kq::rotate_quantize(bf(y), kD, xq_qkv, kD, scale, m, static_cast<int>(kD), stream);
+        for (int i = 0; i < 3; ++i) {
+          if (!w.qkv8_part[i].empty()) {
+            kq::int8_gemm(operands(xq_qkv, kD, scale, w.qkv8_part[i], m), nullptr, bf_mut(part(i)), 3 * kD, stream);
+          }
+        }
+      }
+      if (any_int4) {
+        kq4::convrot_quantize_int4(bf(y), kD, u8(xq_qkv), kD / 2, scale, m, static_cast<int>(kD), stream);
+        for (int i = 0; i < 3; ++i) {
+          if (!w.qkv4_part[i].empty()) {
+            kq4::int4_gemm(operands4(u8(xq_qkv), kD / 2, scale, w.qkv4_part[i], m), nullptr, bf_mut(part(i)), 3 * kD,
+                           stream);
+          }
         }
       }
     }
@@ -236,7 +309,18 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   }
 
   // x += o(attn) * gate_a (P:142).
-  if (!w.o8.empty()) {
+  if (!w.o4.empty()) {
+    kl::LoraSlices lo;
+    if (s_o != nullptr) lo = prepare(*s_o, attn);  // t from the bf16 input, before it is rotated
+    std::int8_t* const xq4 = s_o != nullptr ? xq_y + m * kD : xq_y;
+    kq4::convrot_quantize_int4(bf(attn), kD, u8(xq4), kD / 2, scale, m, static_cast<int>(kD), stream);
+    if (s_o != nullptr) {
+      kl::int8_gemm_gated_residual_lora(unpacked(xq4, xq_y, w.o4), nullptr, bf(vec(a.mod, 2)), lo, bf_mut(x), kD, stream);
+    } else {
+      kq4::int4_gemm_gated_residual(operands4(u8(xq4), kD / 2, scale, w.o4, m), nullptr, bf(vec(a.mod, 2)), bf_mut(x), kD,
+                                    stream);
+    }
+  } else if (!w.o8.empty()) {
     kl::LoraSlices lo;
     if (s_o != nullptr) lo = prepare(*s_o, attn);  // t from the bf16 input, before it is rotated
     kq::rotate_quantize(bf(attn), kD, xq_y, kD, scale, m, static_cast<int>(kD), stream);
@@ -257,7 +341,19 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
 
   // ffn = situ_glu(up_gate(rms_norm_modulate(x))) (P:143-147).
   Tensor ffn;
-  if (!w.up_gate8.empty() && s_up != nullptr) {
+  if (!w.up_gate4.empty() && s_up != nullptr) {
+    // As the INT8 LoRA case: the bf16 norm output stays in y, the quantized input goes to the attention output's columns.
+    ffn = rows_of(a.big, 0, l, kF, run.t0, run.t1);
+    kernels::rms_norm_modulate_moss(x, w.norm2, vec(a.mod, 4), vec(a.mod, 3), y, stream);
+    kq4::convrot_quantize_int4(bf(y), kD, u8(xq_qkv + m * kD), kD / 2, scale, m, static_cast<int>(kD), stream);
+    const kq::Int8Operands op = unpacked(xq_qkv + m * kD, xq_qkv, w.up_gate4);
+    kl::int8_gemm_situ_glu_lora(op, prepare(*s_up, y), bf_mut(ffn), kF, stream);
+  } else if (!w.up_gate4.empty()) {
+    ffn = rows_of(a.big, 0, l, kF, run.t0, run.t1);
+    kq4::rms_norm_modulate_convrot_quantize_int4(bf(x), kD, bf(w.norm2), bf(vec(a.mod, 4)), bf(vec(a.mod, 3)), u8(xq_y),
+                                                 kD / 2, scale, m, static_cast<int>(kD), stream);
+    kq4::int4_gemm_situ_glu(operands4(u8(xq_y), kD / 2, scale, w.up_gate4, m), bf_mut(ffn), kF, stream);
+  } else if (!w.up_gate8.empty() && s_up != nullptr) {
     // The bf16 norm output stays in y: the quantized input goes to the attention output's columns (free now, and
     // after the [L, kF] ffn this GEMM writes).
     ffn = rows_of(a.big, 0, l, kF, run.t0, run.t1);
@@ -286,11 +382,23 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   }
 
   // x += down(ffn) * gate_f (P:148).
-  if (!w.down8.empty()) {
-    // [L, kF] int8 where the FFN leaves `big` free: after the fused [L, kF] ffn, or over the op-by-op up_gate output.
-    std::int8_t* const base =
-        up_gate_op_by_op ? static_cast<std::int8_t*>(a.big.data) : static_cast<std::int8_t*>(a.big.data) + l * kF * 2;
-    std::int8_t* const xq = base + run.t0 * kF;
+  // [L, kF] int8 (or packed int4) where the FFN leaves `big` free: after the fused [L, kF] ffn, or over the op-by-op
+  // up_gate output. With an INT4 linear's LoRA the packed input goes to y instead (free here), the INT8 copy to `big`.
+  std::int8_t* const base =
+      up_gate_op_by_op ? static_cast<std::int8_t*>(a.big.data) : static_cast<std::int8_t*>(a.big.data) + l * kF * 2;
+  std::int8_t* const xq = base + run.t0 * kF;
+  if (!w.down4.empty()) {
+    kl::LoraSlices ld;
+    if (s_down != nullptr) ld = prepare(*s_down, ffn);
+    std::int8_t* const xq4 = s_down != nullptr ? static_cast<std::int8_t*>(a.y.data) + run.t0 * (kF / 2) : xq;
+    kq4::convrot_quantize_int4(bf(ffn), kF, u8(xq4), kF / 2, scale, m, static_cast<int>(kF), stream);
+    if (s_down != nullptr) {
+      kl::int8_gemm_gated_residual_lora(unpacked(xq4, xq, w.down4), nullptr, bf(vec(a.mod, 5)), ld, bf_mut(x), kD, stream);
+    } else {
+      kq4::int4_gemm_gated_residual(operands4(u8(xq4), kF / 2, scale, w.down4, m), nullptr, bf(vec(a.mod, 5)), bf_mut(x),
+                                    kD, stream);
+    }
+  } else if (!w.down8.empty()) {
     kl::LoraSlices ld;
     if (s_down != nullptr) ld = prepare(*s_down, ffn);
     kq::rotate_quantize(bf(ffn), kF, xq, kF, scale, m, static_cast<int>(kF), stream);

@@ -278,7 +278,7 @@ TEST_F(DitInt8Block, ViewsOfTheComfyOrgFile) {
   EXPECT_EQ(int8_.down8.w.dim(1), md::kFfnDim);
   EXPECT_EQ(int8_.qkv.data, nullptr);
   EXPECT_EQ(md::describe_linears(quant_.get()), "int8_convrot256");
-  EXPECT_TRUE(md::has_int8_linears(quant_.get()));
+  EXPECT_TRUE(md::has_quantized_linears(quant_.get()));
   // An INT8 block is about half a bf16 one (weights + per-row scales).
   const double ratio = static_cast<double>(md::BlockWeights::block_device_bytes(quant_->index)) /
                        static_cast<double>(md::BlockWeights::block_device_bytes(*bundle_));

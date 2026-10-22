@@ -9,13 +9,29 @@ the upstream licence file; its `VENDORED.md` lists what was kept and what was ch
 | FlashAttention-2 (forward kernel headers) | BSD-3-Clause | Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file (Tri Dao) | https://github.com/Dao-AILab/flash-attention, v2.8.3 (`060c9188beec3a8b62b33a3bfa6d5d2d44975fab`) | `third_party/flash-attention/` (`LICENSE`, `AUTHORS`), launched from `src/kernels/attention/` |
 | SageAttention (CUDA headers) | Apache-2.0 | Copyright 2024 Jintao Zhang, Haofeng Huang (file headers: Copyright (c) 2024 by SageAttention team). Embedded, also Apache-2.0: FlashInfer team 2023, adapted from flashinfer v0.1.5 (`cp_async.cuh`, `math.cuh`, `mma.cuh`, `permuted_smem.cuh`); vLLM team 2023 and NVIDIA 2020–2023 from FasterTransformer (`reduction_utils.cuh`) | https://github.com/thu-ml/SageAttention (`d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5`) | `third_party/sageattention/` (`LICENSE`, identical to upstream's). `attn_utils.cuh`, `qk_int_sv_f8_cuda_sm89.cuh` and `qk_int_sv_f16_cuda_sm80.cuh` are modified and each carries a "MossInfer modifications" notice. Launchers in `src/kernels/attention_q8/`; `q8_preprocess.cu` there derives from upstream `csrc/fused/fused.cu`. Upstream has no NOTICE file |
 | comfy-kitchen | Apache-2.0 | Copyright (c) 2025 Comfy Org | https://github.com/Comfy-Org/comfy-kitchen (`dba9fac464e93143146f9bafa4f9cb0a9a116bc5`) | `src/kernels/quant/int8_gemm_impl.cuh` is adapted from `comfy_kitchen/backends/cuda/ops/cutlass_gemm_int8.cu` (modified; the file says how). `src/kernels/quant/` and `src/weights/quant/` reproduce its INT8 ConvRot math (rotation order, quantization, dequantization). `src/kernels/quant4/int4_gemm_impl.cuh` adapts `FusedInt4Gemm` from `comfy_kitchen/backends/cuda/ops/convrot_w4a4.cu`, and `src/kernels/quant4/` with `src/weights/quant/convrot_w4a4.*` reproduce its W4A4 ConvRot quantization math |
-| MOSS-Image reference pipeline; diffusers `FlowMatchEulerDiscreteScheduler` | Apache-2.0 | Copyright OpenMOSS-Team (MOSS-Image); Copyright The HuggingFace Team (diffusers) | https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base, https://github.com/huggingface/diffusers | `src/pipeline/sampler.*`, `src/pipeline/samplers/` and the guidance code reimplement their sampling schedule and classifier-free-guidance operation order. No code is copied |
-| stb_image | MIT or public domain (Unlicense), at your choice | Copyright (c) 2017 Sean Barrett | https://github.com/nothings/stb (`013ac3beddff3dbffafd5177e7972067cd2b5083`) | `third_party/stb/` (`LICENSE`). Used by the tests only, not linked into the engine |
+| MOSS-Image reference pipeline; diffusers `FlowMatchEulerDiscreteScheduler` | Apache-2.0 | Copyright OpenMOSS-Team (MOSS-Image); Copyright The HuggingFace Team (diffusers) | https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base, https://github.com/huggingface/diffusers | `src/pipeline/sampler.*` and `src/pipeline/samplers/schedules.cpp` (the `moss` schedule, the velocity Euler step and classifier-free guidance on velocities) reimplement their sampling schedule and operation order. No code is copied |
+| k-diffusion | MIT | Copyright (c) 2022 Katherine Crowson | https://github.com/crowsonkb/k-diffusion | `src/pipeline/samplers/` reimplements its samplers (euler, heun, dpmpp_2m, dpmpp_2m_sde) and the karras and exponential schedules, matching their operation order. No code is copied |
+| ER-SDE-Solver | MIT | Copyright (c) 2023 Qinpeng Cui | https://github.com/QinpengCui/ER-SDE-Solver | `src/pipeline/samplers/sampler_kernels.cu` (`er_sde`) implements its method (arXiv 2309.06169; noise scaler, quadrature); no code is copied |
+| torchsde (`BrownianInterval`) | Apache-2.0 | Copyright 2020 Google LLC | https://github.com/google-research/torchsde | `src/pipeline/samplers/brownian_tree.*` is adapted from its Brownian interval (modified; the file header says how) |
+| NumPy (`SeedSequence`) | BSD-3-Clause | Copyright (c) 2005-2026, NumPy Developers | https://github.com/numpy/numpy | `src/pipeline/samplers/brownian_tree.cpp` reproduces its SeedSequence entropy-mixing constants and algorithm |
+| PyTorch (Philox `randn`, `linspace`, reduction order) | BSD-3-Clause | Copyright (c) 2016- Facebook, Inc. and contributors | https://github.com/pytorch/pytorch | `src/pipeline/samplers/torch_cuda_randn.*`, `src/pipeline/rng_torch_compat.*` and helpers in `sampler_kernels.cu` reproduce its random-number and arithmetic order |
+| LyCORIS | Apache-2.0 | Copyright (c) KohakuBlueleaf and contributors | https://github.com/KohakuBlueleaf/LyCORIS | `src/models/lora/` follows its LoHa/LoKr weight definitions and scaling |
+| stb_image | MIT or public domain (Unlicense), at your choice | Copyright (c) 2017 Sean Barrett | https://github.com/nothings/stb (`013ac3beddff3dbffafd5177e7972067cd2b5083`) | `third_party/stb/` (`LICENSE`). Linked into the engine for PNG/JPEG decoding of init images and masks (`src/pipeline/pipeline_image.cpp`), and used by the tests |
 | xxHash (XXH64 algorithm and constants) | BSD-2-Clause | Copyright (c) Yann Collet | https://github.com/Cyan4973/xxHash (specification) | `src/util/xxh64.h` is an independent implementation from the specification |
 | Unicode tables of HF `tokenizers` 0.23.3 | Apache-2.0 (tokenizers); Unicode License v3 (Unicode Character Database) | Copyright (c) Hugging Face, Inc.; Copyright (c) Unicode, Inc. | https://github.com/huggingface/tokenizers | `src/tokenizer/unicode_tables.inc` (generated data, measured from the library by `tools/gen/gen_unicode_tables.py`) |
 
 `third_party/reference/` is a local, untracked checkout of reference code (the official MOSS-Image pipeline and
 ComfyUI nodes) used to generate test vectors. It is not part of the repository or of any distribution.
+
+## Reference implementations used as test oracles (not included)
+
+The standard samplers and schedulers in `src/pipeline/samplers/` were checked bit for bit against the outputs of
+ComfyUI (https://github.com/comfyanonymous/ComfyUI, GPL-3.0), used as a test oracle on a local, untracked checkout.
+No ComfyUI code is included in MossInfer. The test vectors under `tests/data/samplers/` are program outputs. Where
+our code reproduces a numeric operation order, that order is a functional requirement for bit-exact results, and the
+underlying methods are published (Karras et al. 2022; Lu et al. 2022, DPM-Solver++; Cui et al. 2023, ER-SDE-Solver;
+Zhang et al. 2023, arXiv 2308.02157). The same applies to the official MOSS-Image pipeline and diffusers, used as
+references for exactness.
 
 ## comfy-kitchen NOTICE
 
@@ -36,7 +52,7 @@ FlashAttention-2 and SageAttention are vendored directly; see the table above.
 ## Licence texts
 
 - BSD-3-Clause: `third_party/cutlass/LICENSE.txt`, `third_party/flash-attention/LICENSE`.
-- Apache-2.0: `third_party/sageattention/LICENSE`. comfy-kitchen and HF `tokenizers` use the same licence text,
+- Apache-2.0: `third_party/sageattention/LICENSE`. comfy-kitchen, torchsde, LyCORIS and HF `tokenizers` use the same licence text,
   https://www.apache.org/licenses/LICENSE-2.0.
 - MIT / Unlicense: `third_party/stb/LICENSE`.
 - BSD-2-Clause (xxHash) and Unicode License v3: reproduced below, since they have no file in this repository.

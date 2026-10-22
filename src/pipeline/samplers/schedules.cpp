@@ -28,46 +28,55 @@ void check(const FlowSampling& fs) {
 // Python float scalars enter torch's fp32 tensor ops cast to fp32.
 float f32(double d) { return static_cast<float>(d); }
 
-// Regularized incomplete beta I_x(a, b) by its continued fraction (modified Lentz), valid and fast for
-// x < (a + 1) / (a + b + 2); long double keeps the bisection below well inside double resolution.
-long double ibeta_cf(long double x, long double a, long double b) {
+// Regularized incomplete beta function I_x(a, b), written from the continued fraction of DLMF 8.17.22
+// (https://dlmf.nist.gov/8.17.E22):
+//   I_x(a, b) = x^a (1 - x)^b / (a B(a, b)) * 1 / (1 + d_1 / (1 + d_2 / (1 + ...))),
+//   d_2m = m (b - m) x / ((a + 2m - 1)(a + 2m)),  d_2m+1 = -(a + m)(a + b + m) x / ((a + 2m)(a + 2m + 1)),
+// which converges fast for x < (a + 1) / (a + b + 2); above that the symmetry I_x(a, b) = 1 - I_(1-x)(b, a)
+// (DLMF 8.17.4) is used. The fraction is evaluated with the modified Lentz algorithm (W. J. Lentz, Appl. Opt. 15
+// (1976) 668; I. J. Thompson and A. R. Barnett, J. Comput. Phys. 64 (1986) 490). long double keeps the bisection in
+// beta_quantile() well inside double resolution.
+
+// d_j of DLMF 8.17.22, j >= 1.
+long double dlmf_beta_numerator(int j, long double x, long double a, long double b) {
+  const long double m = j / 2;
+  if (j % 2 == 0) return m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m));
+  return -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1));
+}
+
+// 1 + d_1 / (1 + d_2 / (1 + ...)) by modified Lentz: f_j = f_(j-1) C_j D_j with C_j = 1 + d_j / C_(j-1) and
+// D_j = 1 / (1 + d_j D_(j-1)), from f_0 = C_0 = 1 and D_0 = 0; a vanishing C_j or 1 / D_j is replaced by a tiny value.
+long double beta_fraction_lentz(long double x, long double a, long double b) {
   const long double tiny = std::numeric_limits<long double>::min();
   const long double tol = 4 * std::numeric_limits<long double>::epsilon();
-  const long double qab = a + b, qap = a + 1, qam = a - 1;
-  long double c = 1, d = 1 - qab * x / qap;
-  if (std::fabs(d) < tiny) d = tiny;
-  d = 1 / d;
-  long double h = d;
-  for (int m = 1; m <= 100000; ++m) {
-    const long double m2 = 2.0L * m;
-    long double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
-    d = 1 + aa * d;
-    if (std::fabs(d) < tiny) d = tiny;
-    c = 1 + aa / c;
+  long double f = 1, c = 1, d = 0;
+  for (int j = 1; j <= 200000; ++j) {
+    const long double dj = dlmf_beta_numerator(j, x, a, b);
+    long double den = 1 + dj * d;
+    if (std::fabs(den) < tiny) den = tiny;
+    d = 1 / den;
+    c = 1 + dj / c;
     if (std::fabs(c) < tiny) c = tiny;
-    d = 1 / d;
-    h *= d * c;
-    aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
-    d = 1 + aa * d;
-    if (std::fabs(d) < tiny) d = tiny;
-    c = 1 + aa / c;
-    if (std::fabs(c) < tiny) c = tiny;
-    d = 1 / d;
-    const long double del = d * c;
-    h *= del;
-    if (std::fabs(del - 1) < tol) break;
+    const long double ratio = c * d;
+    f *= ratio;
+    if (std::fabs(ratio - 1) < tol) break;
   }
-  return h;
+  return f;
+}
+
+// I_x(a, b) by the fraction, for x in (0, 1) below the switch point.
+long double incbeta_below_switch(long double x, long double a, long double b) {
+  const long double log_beta = std::lgamma(a) + std::lgamma(b) - std::lgamma(a + b);
+  const long double prefactor = std::exp(a * std::log(x) + b * std::log1p(-x) - log_beta);  // x^a (1-x)^b / B(a, b)
+  return prefactor / (a * beta_fraction_lentz(x, a, b));
 }
 
 // I_x(a, b) for x in [0, 1].
-long double ibeta(long double x, long double a, long double b) {
+long double regularized_incomplete_beta(long double x, long double a, long double b) {
   if (x <= 0) return 0;
   if (x >= 1) return 1;
-  const long double lbeta = std::lgamma(a) + std::lgamma(b) - std::lgamma(a + b);
-  const long double front = std::exp(a * std::log(x) + b * std::log1p(-x) - lbeta);
-  if (x < (a + 1) / (a + b + 2)) return front * ibeta_cf(x, a, b) / a;
-  return 1 - front * ibeta_cf(1 - x, b, a) / b;
+  if (x < (a + 1) / (a + b + 2)) return incbeta_below_switch(x, a, b);
+  return 1 - incbeta_below_switch(1 - x, b, a);
 }
 
 std::vector<float> with_denoise(SchedulerKind kind, int steps, const FlowSampling& fs, double denoise) {
@@ -200,13 +209,13 @@ double beta_quantile(double p, double a, double b) {
   if (!(p >= 0.0 && p <= 1.0) || !(a > 0) || !(b > 0)) throw std::invalid_argument("beta_quantile: bad arguments");
   if (p == 0.0) return 0.0;
   if (p == 1.0) return 1.0;
-  // I_x is increasing in x: bisect to the resolution of long double.
+  // I_x(a, b) increases with x: bisect [0, 1] until the bracket no longer splits in long double.
+  const long double target = p;
   long double lo = 0, hi = 1;
-  for (int i = 0; i < 200 && lo < hi; ++i) {
+  for (int iter = 0; iter < 200; ++iter) {
     const long double mid = (lo + hi) / 2;
-    if (mid <= lo || mid >= hi) break;
-    if (ibeta(mid, a, b) < static_cast<long double>(p)) lo = mid;
-    else hi = mid;
+    if (!(lo < mid && mid < hi)) break;
+    (regularized_incomplete_beta(mid, a, b) < target ? lo : hi) = mid;
   }
   return static_cast<double>((lo + hi) / 2);
 }

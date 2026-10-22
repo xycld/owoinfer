@@ -10,6 +10,7 @@
 // `_quantization_metadata` header key ({"layers": {module: config}}), as ComfyUI reads them. Supported formats:
 //   int8_tensorwise (+ convrot / convrot_groupsize)  -> kInt8ConvRot(G) or kInt8Plain, raw bytes
 //   asym_w4a8_int8 (Lloyd-Max codebook or uniform), w6a8_int8, convrot_w4a4  -> decoded exactly to kInt8ConvRot
+//   convrot_w4a4 (INT4 activations), with IndexOptions::native_int4            -> kInt4ConvRot, raw packed bytes
 // A fused DiT `layers.N.proj.qkv` ([3 * dim, dim] = cat([q, k, v], 0)) is split into proj.q / proj.k / proj.v by
 // row slices of every per-row tensor; the slices are plain byte ranges of the file.
 //
@@ -57,21 +58,24 @@ struct QuantError : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
-enum class QuantFormat : std::uint8_t { kBF16, kInt8ConvRot, kInt8Plain };
+// kInt4ConvRot: the convrot_w4a4 weights kept packed (signed nibbles [N, K/2], even column in the low nibble, f32
+// per-row scale) for the INT4 GEMMs (kernels/quant4); only to_model_index(model, {.native_int4 = true}) gives it.
+enum class QuantFormat : std::uint8_t { kBF16, kInt8ConvRot, kInt8Plain, kInt4ConvRot };
 const char* format_name(QuantFormat f);
 
 // How one GEMM's weight is quantized.
 struct QuantSpec {
   QuantFormat format = QuantFormat::kBF16;
-  int group = 0;  // kInt8ConvRot: Hadamard size along K (power of 4); 0 otherwise
+  int group = 0;  // kInt8ConvRot / kInt4ConvRot: Hadamard size along K (power of 4); 0 otherwise
 
   static QuantSpec bf16() { return {}; }
   static QuantSpec int8_convrot(int g) { return {QuantFormat::kInt8ConvRot, g}; }
   static QuantSpec int8_plain() { return {QuantFormat::kInt8Plain, 0}; }
+  static QuantSpec int4_convrot(int g) { return {QuantFormat::kInt4ConvRot, g}; }
   bool quantized() const { return format != QuantFormat::kBF16; }
   bool operator==(const QuantSpec&) const = default;
 };
-std::string describe(const QuantSpec& s);  // "bf16", "int8_convrot256", "int8_plain"
+std::string describe(const QuantSpec& s);  // "bf16", "int8_convrot256", "int8_plain", "int4_convrot256"
 
 // How the stored bytes become the spec's weight (+ scale).
 enum class Encoding : std::uint8_t {
@@ -99,9 +103,10 @@ struct QuantLinear {
   std::optional<weights::IndexedTensor> s_channel;  // kW4A8 / kW6A8: F32 [N]
   std::optional<weights::IndexedTensor> codebook;   // kW4A8: F32 [16]; absent = uniform codes (code - 8)
   std::optional<weights::IndexedTensor> bias;       // [N], any float dtype as stored
-  int quant_group = 0;          // kW4A8 / kW6A8 group size along K
+  int quant_group = 0;          // kW4A8 / kW6A8 group size along K; kW4A4: the config's quant_group_size (0: absent)
   bool fused_slice = false;     // rows of a fused proj.qkv
   bool full_precision_mm = false;  // config asked ComfyUI to run this layer in full precision (informational)
+  bool int8_activations = false;   // kW4A4 with linear_dtype "int8": INT8 activations (W4A8 compute), never native INT4
   std::string source_module;    // module name in the file (e.g. "layers.3.proj.qkv")
 
   bool needs_decode() const { return encoding != Encoding::kRaw; }
@@ -138,7 +143,7 @@ bool is_gemm_module(ModelKind kind, std::string_view module);
 struct QuantWeights {
   QuantSpec spec;
   std::int64_t n = 0, k = 0;
-  const void* weight = nullptr;  // bf16 or int8, [n, k] row-major
+  const void* weight = nullptr;  // bf16 or int8 [n, k] row-major; kInt4ConvRot: packed int4 [n, k/2] bytes
   const float* scale = nullptr;  // [n] per-row scale; null for bf16
   const void* bias = nullptr;    // [n] in bias_dtype, or null
   DType bias_dtype = DType::kBF16;
@@ -156,11 +161,19 @@ struct QuantIndex {
   const QuantSpec* find_spec(std::string_view module) const;
 };
 
+// native_int4: convrot_w4a4 linears (INT4 activations, quant_group_size absent or 64: the only value comfy-kitchen
+// runs) are listed as stored, kInt4ConvRot with their packed `<module>.weight` (I8 [N, K/2]) and `.weight_scale`,
+// instead of needing decoding.
+struct IndexOptions {
+  bool native_int4 = false;
+};
+
 // Reads each quantized linear's scales (a few MB in all) to validate them. Throws QuantError if a linear needs
 // decoding (convert it first), a stored scale is invalid or a tensor has no group.
-QuantIndex to_model_index(const QuantModel& model);
+QuantIndex to_model_index(const QuantModel& model, const IndexOptions& options = {});
 
-// The linear `module` out of a group uploaded from `index`: `<module>.weight` (+ `.weight_scale`, `.bias`).
+// The linear `module` out of a group uploaded from `index`: `<module>.weight` (+ `.weight_scale`, `.bias`); for
+// kInt4ConvRot the weight is the packed I8 [N, K/2] tensor and the view's k is 2 * K/2.
 // `expected` is the spec the caller's GEMM implements; it must equal the file's (index.specs), so a bf16 GEMM can
 // never consume INT8 bytes or a ConvRot256 kernel a ConvRot64 weight. Checks dtypes, shapes, contiguity, devices
 // and element alignment (host groups keep each tensor's file offset modulo 4096; files written by the safetensors

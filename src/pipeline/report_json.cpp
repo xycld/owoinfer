@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <locale>
+#include <memory>
 #include <sstream>
 #include <system_error>
 
@@ -107,7 +108,25 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
     << "\", \"scheduler\": \"" << scheduler_name(q.scheduler) << "\", \"flow_multiplier\": " << num(q.flow_multiplier)
     << ", \"noise_layout\": \"" << noise_layout_name(q.noise_layout) << "\", \"noise_source\": \""
     << noise_source_name(q.noise_source) << "\", \"eta\": " << num(q.eta) << ", \"s_noise\": " << num(q.s_noise)
-    << ", \"dataspace\": " << json_escape(util::path_utf8(q.dataspace_path)) << "},\n";
+    << ", \"dataspace\": " << json_escape(util::path_utf8(q.dataspace_path));
+  // img2img / inpainting / hires fix (P7b): the images by name and size (their pixels are not reported).
+  const auto image = [&](const std::shared_ptr<const Image>& p) {
+    if (p == nullptr) return std::string("null");
+    const Image& im = *p;
+    std::ostringstream is;
+    is.imbue(std::locale::classic());
+    is << "{\"name\": " << json_escape(im.name) << ", \"width\": " << im.width << ", \"height\": " << im.height << "}";
+    return is.str();
+  };
+  o << ", \"init_image\": " << image(q.init_image) << ", \"denoise_strength\": " << num(q.denoise_strength)
+    << ", \"mask\": " << image(q.mask) << ", \"resize\": \"" << resize_mode_name(q.resize) << "\", \"hires\": ";
+  if (q.hires.enabled()) {
+    o << "{\"width\": " << q.hires.width << ", \"height\": " << q.hires.height << ", \"strength\": " << num(q.hires.strength)
+      << ", \"steps\": " << q.hires.steps << "}";
+  } else {
+    o << "null";
+  }
+  o << "},\n";
   o << " \"seed_used\": " << r.seed << ", \"steps_scheduled\": " << r.steps_scheduled << ", \"steps_run\": " << r.steps_run
     << ", \"cancelled\": " << tf(r.cancelled) << ", \"cond_tokens\": " << r.cond_tokens
     << ", \"uncond_tokens\": " << r.uncond_tokens << ",\n";
@@ -127,6 +146,20 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
   o.str("");
   o << ", \"latents\": " << json_escape(latent_path) << ",\n";
   o << " \"mode\": \"" << planner::mode_name(r.plan.mode) << "\",\n";
+  // What the image passes ran: the strengths' start steps, the steps run and the encodes.
+  const auto pass = [&](const PassReport& p) {
+    std::ostringstream ps;
+    ps.imbue(std::locale::classic());
+    ps << "{\"ran\": " << tf(p.ran) << ", \"width\": " << p.width << ", \"height\": " << p.height
+       << ", \"schedule_steps\": " << p.schedule_steps << ", \"start_step\": " << p.start_step << ", \"steps_run\": "
+       << p.steps_run << ", \"strength\": " << num(p.strength) << ", \"encoded\": " << tf(p.encoded)
+       << ", \"encode_schedule\": " << json_escape(p.encode_schedule) << ", \"decode_schedule\": " << json_escape(p.decode_schedule)
+       << "}";
+    return ps.str();
+  };
+  o << " \"img2img\": {\"mode\": " << json_escape(r.image_mode) << ", \"note\": " << json_escape(r.image_note) << ", \"vae_encoder\": " << json_escape(r.vae_encoder_source)
+    << ", \"upscaler\": " << (q.hires.enabled() ? "\"lanczos\"" : "null") << ", \"first_pass\": " << pass(r.first_pass)
+    << ", \"hires\": " << (q.hires.enabled() ? pass(r.hires) : std::string("null")) << "},\n";
   o << " \"dit_blocks\": {\"path\": \"" << moss_dit::block_path_name(r.block_path) << "\", \"note\": "
     << json_escape(r.block_path_note) << "},\n";
   // P6: the quality object in the certificates' vocabulary (pipeline/quality_cert.h: tier, config, engine numerics, GPU
@@ -135,7 +168,8 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
   o << " \"quality\": " << quality_report_json(r.quality) << ",\n";
   o << " \"models\": {\"dit\": {\"source\": " << json_escape(r.dit_source) << ", \"linears\": " << json_escape(r.dit_linears)
     << ", \"tier_requested\": \"" << planner::tier_name(td.requested) << "\", \"tier_effective\": \""
-    << planner::tier_name(td.effective) << "\", \"certified\": " << tf(td.certified)
+    << planner::tier_name(td.effective) << "\", \"certified\": " << tf(td.certified) << ", \"time_embedding\": "
+    << (r.time_embedding.empty() ? std::string("null") : json_escape(r.time_embedding))
     << "}, \"text_encoder\": {\"source\": " << json_escape(r.te_source) << ", \"precision\": "
     << json_escape(r.te_precision.empty() ? "bf16" : r.te_precision) << "}, \"vae\": {\"source\": " << json_escape(r.vae_source)
     << "}},\n";
@@ -161,20 +195,21 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
   o << " \"decode\": {\"ran\": " << tf(!r.rgb.empty()) << ", \"tiled\": " << tf(r.decode_tiled) << ", \"schedule\": "
     << json_escape(r.decode_schedule) << ", \"planned_tiled\": " << tf(r.plan.vae.run && r.plan.vae.kind == planner::VaeDecodeKind::kTiled)
     << ", \"planned_tile\": " << r.plan.vae.tile << "},\n";
-  const double load = t.index_load_s + t.dit_load_s + t.vae_load_s;
+  const double load = t.index_load_s + t.dit_load_s + t.vae_load_s + t.vae_encoder_load_s;
   const double encode = t.tokenize_s + t.text_encode_s + t.refine_s;
   o << " \"timings_s\": {\"total\": " << num(t.total_s) << ", \"load\": " << num(load) << ", \"encode\": " << num(encode)
     << ", \"denoise\": " << num(t.denoise_s) << ", \"decode\": " << num(t.decode_s) << ", \"index_load\": " << num(t.index_load_s)
     << ", \"tokenize\": " << num(t.tokenize_s) << ", \"plan\": " << num(t.plan_s) << ", \"text_encode\": " << num(t.text_encode_s)
     << ", \"te_weight_load\": " << num(t.te_weight_load_s) << ", \"te_weight_wait\": " << num(t.te_weight_wait_s)
     << ", \"te_compute\": " << num(t.te_compute_s) << ", \"dit_load\": " << num(t.dit_load_s) << ", \"refine\": " << num(t.refine_s)
-    << ", \"vae_load\": " << num(t.vae_load_s) << ", \"steps\": [";
+    << ", \"vae_load\": " << num(t.vae_load_s) << ", \"vae_encoder_load\": " << num(t.vae_encoder_load_s)
+    << ", \"vae_encode\": " << num(t.encode_s) << ", \"image_ops\": " << num(t.image_ops_s) << ", \"steps\": [";
   for (std::size_t i = 0; i < t.step_s.size(); ++i) o << (i ? ", " : "") << num(t.step_s[i]);
   o << "]},\n";
   o << " \"memory_gib\": {\"arena_capacity\": " << g(m.arena_capacity) << ", \"arena_high_water\": " << g(m.arena_high_water)
     << ", \"device_peak\": " << g(m.device_peak) << ", \"free_at_start\": " << g(m.free_at_start)
     << ", \"arena_creations\": " << m.arena_creations << ", \"dit_parked_for_text_encoder\": " << tf(m.dit_parked_for_text_encoder)
-    << ", \"dit_parked_for_decode\": " << tf(m.dit_parked_for_decode) << ", \"dit_reloaded\": " << tf(m.dit_reloaded) << "},\n";
+    << ", \"dit_parked_for_decode\": " << tf(m.dit_parked_for_decode) << ", \"dit_reloaded\": " << tf(m.dit_reloaded) << ", \"dit_loads\": " << m.dit_loads << "},\n";
   o << " \"host_memory_gib\": {\"start\": " << g(m.host_private_start) << ", \"private_peak\": " << g(m.host_private_peak) << "},\n";
   const auto& hw = r.hardware;
   o << " \"hardware\": {\"measured\": " << tf(hw.measured) << ", \"h2d_gbps\": " << num(hw.h2d_gbps) << ", \"host_gbps\": "

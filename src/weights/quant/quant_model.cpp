@@ -31,6 +31,8 @@ constexpr std::uint64_t kMaxConfigBytes = 4096;
 constexpr std::size_t kMaxConfigValues = 256;
 constexpr std::size_t kMaxQuantMetadataValues = 1'000'000;
 constexpr std::int64_t kMaxGroupSize = 4096;
+// The only convrot_w4a4 quant_group_size comfy-kitchen @dba9fac accepts (_INT4_GROUP_SIZE).
+constexpr int kW4A4QuantGroup = 64;
 
 [[noreturn]] void fail(const std::string& msg) { throw QuantError("mi::quant: " + msg); }
 
@@ -236,6 +238,8 @@ class Builder {
       l.encoding = Encoding::kW4A4;
       if (c.quant_group_size != 0 && l.k % c.quant_group_size != 0) fail("'" + m + "': quant_group_size does not divide K");
       if (!c.linear_dtype.empty() && c.linear_dtype != "int4" && c.linear_dtype != "int8") fail("'" + m + "': unknown linear_dtype '" + c.linear_dtype + "'");
+      l.int8_activations = c.linear_dtype == "int8";
+      l.quant_group = static_cast<int>(c.quant_group_size);
       l.scale = take(m + ".weight_scale");
       if (!per_row(*l.scale, l.n)) fail("'" + m + "': convrot_w4a4 weight_scale must be F32 [N]");
     } else if (c.format == "asym_w4a8_int8" || c.format == "w6a8_int8") {
@@ -341,12 +345,14 @@ const char* format_name(QuantFormat f) {
     case QuantFormat::kBF16: return "bf16";
     case QuantFormat::kInt8ConvRot: return "int8_convrot";
     case QuantFormat::kInt8Plain: return "int8_plain";
+    case QuantFormat::kInt4ConvRot: return "int4_convrot";
   }
   return "?";
 }
 
 std::string describe(const QuantSpec& s) {
-  return s.format == QuantFormat::kInt8ConvRot ? "int8_convrot" + std::to_string(s.group) : format_name(s.format);
+  if (s.format == QuantFormat::kInt8ConvRot || s.format == QuantFormat::kInt4ConvRot) return format_name(s.format) + std::to_string(s.group);
+  return format_name(s.format);
 }
 
 const char* encoding_name(Encoding e) {
@@ -584,11 +590,14 @@ QuantWeights view(const QuantIndex& index, const weights::TensorMap& m, std::str
   QuantWeights v;
   v.spec = *spec;
   v.n = wt.dim(0);
-  v.k = wt.dim(1);
+  v.k = spec->format == QuantFormat::kInt4ConvRot ? 2 * wt.dim(1) : wt.dim(1);  // packed: two values per byte
   v.weight = wt.data;
   v.device = wt.device;
   if (reinterpret_cast<std::uintptr_t>(v.weight) % mi::dtype_size(wt.dtype) != 0) fail("weight '" + mod + "' is not aligned in memory");
-  if (spec->format == QuantFormat::kInt8ConvRot && (!valid_convrot_group(spec->group) || v.k % spec->group != 0)) fail("'" + mod + "': bad ConvRot group");
+  if ((spec->format == QuantFormat::kInt8ConvRot || spec->format == QuantFormat::kInt4ConvRot) &&
+      (!valid_convrot_group(spec->group) || v.k % spec->group != 0)) {
+    fail("'" + mod + "': bad ConvRot group");
+  }
   if (spec->quantized()) {
     auto s = m.find(mod + ".weight_scale");
     if (s == m.end()) fail("scale '" + mod + ".weight_scale' missing");
@@ -611,7 +620,7 @@ QuantWeights view(const QuantIndex& index, const weights::TensorMap& m, std::str
   return v;
 }
 
-QuantIndex to_model_index(const QuantModel& model) {
+QuantIndex to_model_index(const QuantModel& model, const IndexOptions& options) {
   QuantIndex qi;
   weights::ModelIndex& index = qi.index;
   index.bundle_dir = model.base_dir;
@@ -637,12 +646,18 @@ QuantIndex to_model_index(const QuantModel& model) {
     g.tensors.push_back(std::move(t));
   };
   for (const QuantLinear& l : model.linears) {
-    if (l.needs_decode()) fail("linear '" + l.name + "' is stored as " + encoding_name(l.encoding) + " and needs decoding; convert the file with `moss-infer quantize` first");
-    qi.specs.emplace(l.name, l.spec);
+    // Native INT4: the packed nibbles and per-row scales as stored (the same bytes decode_rows reads).
+    // comfy-kitchen (every backend) runs convrot_w4a4 only with quant_group_size 64 (its default when absent), a
+    // layout requirement on K that does not enter the per-row math; other values keep the decode path.
+    const bool int4 = options.native_int4 && l.encoding == Encoding::kW4A4 && !l.int8_activations &&
+                      (l.quant_group == 0 || l.quant_group == kW4A4QuantGroup) && l.k % kW4A4QuantGroup == 0;
+    if (l.needs_decode() && !int4) fail("linear '" + l.name + "' is stored as " + encoding_name(l.encoding) + " and needs decoding; convert the file with `moss-infer quantize` first");
+    const QuantSpec spec = int4 ? QuantSpec::int4_convrot(l.spec.group) : l.spec;
+    qi.specs.emplace(l.name, spec);
     IndexedTensor w = l.weight;
     w.name = l.name + ".weight";
     put(std::move(w));
-    if (l.spec.quantized()) {
+    if (spec.quantized()) {
       IndexedTensor s = *l.scale;
       const std::vector<std::byte> bytes = read_tensor(model, s);
       std::vector<float> v(static_cast<std::size_t>(l.n));

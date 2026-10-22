@@ -34,6 +34,9 @@
 // our converter's output, or a bf16 file) keeps each block linear as stored, INT8 ConvRot G = 256 or bf16. A model with
 // any INT8 linear (or with 8-bit attention set) runs every block on the quantized block path (dit_block_quant.h); the
 // globals and the text refiner stay bf16. Streaming and graphs work alike; INT8 blocks move about half the bytes.
+// P6c (Turbo tier): an INT4 ConvRot file (convrot_w4a4, quant::IndexOptions::native_int4) keeps its linears packed and
+// runs them on the INT4 GEMMs, any mix of INT4, INT8 and bf16 linears per block; INT4 blocks move about a quarter of
+// the bf16 bytes.
 // The fused route of a forward is its own snapshot unless a request pinned one (set_request_route): a pipeline sizes
 // its arena from one snapshot per request and every step of the request then runs it.
 #pragma once
@@ -45,6 +48,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -60,6 +64,7 @@
 #include "models/moss_dit/dit_block_quant.h"
 #include "models/moss_dit/dit_graph.h"
 #include "models/moss_dit/dit_weights.h"
+#include "models/moss_dit/distill.h"
 #include "runtime/device_arena.h"
 #include "runtime/stream_set.h"
 #include "weights/model_index.h"
@@ -128,16 +133,32 @@ struct ComputeConfig {
   bool bf16_up_gate = true;   // quantized: some block keeps ffn_up_gate bf16 (its `big` layout follows the route)
   AttentionMode attention = AttentionMode::kExact;
   std::int64_t lora_rank = 0;  // runtime LoRA side branches' max_rank (0: none): the t buffers of a forward
+  bool int4 = false;           // some block linear is INT4 (with LoRA side branches: the int4_unpack buffer)
   bool operator==(const ComputeConfig&) const = default;
 };
 
 // The precision of the block linears of a DiT index: "bf16" (quant == nullptr: the bundle, or every linear bf16),
-// "int8_convrot256" (all INT8) or "mixed (N int8_convrot256, M bf16)".
+// "int8_convrot256" (all INT8), "int4_convrot256" (all INT4) or "mixed (N int4_convrot256, M bf16)".
 std::string describe_linears(const quant::QuantIndex* quant);
-// Some block linear of `quant` is quantized (false for nullptr).
-bool has_int8_linears(const quant::QuantIndex* quant);
-// The fraction of the block GEMMs' weight elements (their FLOPs) that are INT8 (0 for nullptr): a mixed file's share.
+// Some block linear of `quant` is quantized, INT8 or INT4 (false for nullptr).
+bool has_quantized_linears(const quant::QuantIndex* quant);
+// Some block linear of `quant` is INT4 (false for nullptr).
+bool has_int4_linears(const quant::QuantIndex* quant);
+// The fraction of the block GEMMs' weight elements (their FLOPs) that are INT8 / INT4 (0 for nullptr): a mixed file's
+// share.
 double int8_gemm_fraction(const quant::QuantIndex* quant);
+double int4_gemm_fraction(const quant::QuantIndex* quant);
+// Runtime LoRA on a quantized DiT:
+//   check_lora_merges: std::invalid_argument when an adapter of `stack` that is merged at load (not a side branch:
+//     LoHa / LoKr / full deltas) targets a block linear stored INT4 in `quant` (merges need bf16 or INT8 ConvRot). For
+//     callers to refuse a stack before they load anything; the model's constructor refuses it too.
+//   int4_side_branch_fraction: the share of the block GEMMs' weight elements that are INT4 and carry an active side
+//     branch of `sb` (those sites run the INT8 LoRA GEMMs, dit_block_quant.h: costed at INT8 speed).
+//   shadowed_by_time_embedding: one message per adapter of `stack` that set_time_embedding's replacement overrides
+//     (time_embedding.* deltas, and bias deltas of shared_block_modulation / video_head_modulation).
+void check_lora_merges(const lora::LoraStack& stack, const quant::QuantIndex* quant);
+double int4_side_branch_fraction(const quant::QuantIndex* quant, const lora::SideBranches& sb);
+std::vector<std::string> shadowed_by_time_embedding(const lora::LoraStack& stack);
 
 class MossDit {
  public:
@@ -165,7 +186,7 @@ class MossDit {
           bool direct_io = false, const std::atomic<bool>* cancel = nullptr, const Residency& residency = {},
           const lora::LoraStack* merges = nullptr);
   // P6: from a single-file DiT (quant::to_model_index): every block linear checked against the spec its GEMM runs
-  // (bf16 or int8_convrot256; std::runtime_error naming the linear otherwise). persistent_bytes /
+  // (bf16, int8_convrot256 or int4_convrot256; std::runtime_error naming the linear otherwise). persistent_bytes /
   // stream_workspace_bytes take quant.index. `quant` must outlive the model.
   MossDit(const quant::QuantIndex& quant, runtime::DeviceArena& arena, runtime::StreamSet& streams,
           bool direct_io = false, const std::atomic<bool>* cancel = nullptr, const Residency& residency = {},
@@ -238,6 +259,15 @@ class MossDit {
   // (shift_a, scale_a, gate_a, shift_f, scale_f, gate_f), head CUDA bf16 [2*kDim] (shift, scale).
   // forward() calls it; public for parity tests.
   void time_modulation(float timestep, const Tensor& mod, const Tensor& head, cudaStream_t stream);
+
+  // Distilled checkpoints (P6 step 41, distill.h): replaces the step embedder and the two modulation biases by `te`
+  // (nullptr: the loaded weights again, bit-identical to before). With a replacement, time_modulation computes in fp32
+  // as the published files require: the embedder on the host (time_vector_fp32, cached per timestep), the two
+  // modulation linears on the device (the model's bf16 weights widened, fp32 accumulation, the replacement biases),
+  // and rounds mod / head to bf16 once. Holds a small device buffer (~110 KB) outside the arena. Call between
+  // forwards; `te` is copied.
+  void set_time_embedding(const TimeEmbeddingFp32* te);
+  bool has_time_embedding() const { return te_ != nullptr; }
 
   // Stack bytes forward() needs for a latent grid of height x width (= image size / 16) and the rows'
   // text lengths, in row order, with block path `path`; also enough for any subset of these rows. The fused paths
@@ -316,6 +346,11 @@ class MossDit {
   cudaEvent_t block_done_[2] = {nullptr, nullptr};  // blocks k - 2 and k - 1 of a forward (cancel throttle)
 
   Linear video_embedder_, time_in_, time_out_, block_modulation_, head_modulation_, text_proj_;
+  // set_time_embedding: the replacement, its device arrays [time fp32 kDim | mod bias 6 kDim | head bias 2 kDim] and the
+  // host embedder's outputs per timestep (bit pattern).
+  std::unique_ptr<TimeEmbeddingFp32> te_;
+  DeviceBuffer te_buf_;
+  std::map<std::uint32_t, std::vector<float>> te_cache_;
   Tensor final_norm_, final_linear_;
   TextBlock text_blocks_[2];
   std::unique_ptr<BlockWeights> blocks_;

@@ -1,15 +1,22 @@
-// One MOSS DiT block (_Block.forward, P:136-148) on the High-tier compute path (P6 step 36): each linear as the
-// loaded file stores it, INT8 ConvRot (G = 256) or bf16, plus a choice of attention kernel.
+// One MOSS DiT block (_Block.forward, P:136-148) on the quantized compute path (P6 steps 36 and 40): each linear as
+// the loaded file stores it, INT8 ConvRot (G = 256, High tier), INT4 ConvRot (G = 256, Turbo tier) or bf16, plus a
+// choice of attention kernel.
 //   INT8 linear: its input is rotated and quantized per token where it is produced, then an INT8 x INT8 -> INT32
 //   GEMM with the dequantization and the following elementwise op in its epilogue (kernels/quant):
 //     qkv:      rms_norm_modulate_rotate_quantize(x, norm1, scale_a, shift_a) -> int8_gemm
 //     o:        rotate_quantize(attn)                                       -> int8_gemm_gated_residual (gate_a)
 //     up_gate:  rms_norm_modulate_rotate_quantize(x, norm2, scale_f, shift_f) -> int8_gemm_situ_glu
 //     down:     rotate_quantize(ffn)                                        -> int8_gemm_gated_residual (gate_f)
+//   INT4 linear: the same sites and epilogues with kernels/quant4 (rotate + per-token INT4 quantize, then the
+//   INT4 x INT4 -> INT32 GEMM): rms_norm_modulate_convrot_quantize_int4 -> int4_gemm / int4_gemm_situ_glu,
+//   convrot_quantize_int4 -> int4_gemm_gated_residual. Numerics: comfy-kitchen's convrot_w4a4_linear (eager
+//   activation quantization, CUDA epilogue order; see kernels/quant4/quant4.h).
 //   bf16 linear: exactly what run_block_fused does for it (cuBLASLt QKV; o / up_gate / down fused or op by op as the
 //   route says), so a file that keeps some linears bf16 runs them as the Reference tier does.
 //   QK-norm + RoPE: the fused kernel (kernels/fused/qk_norm_rope.h), as the bf16 block.
 //   Runtime LoRA (P6 step 42): an active side-branch site adds Δ = Σ s_i B_i (A_i x) inside its GEMM (kernels/lora).
+//   An INT4 site runs the INT8 LoRA GEMM on its operands unpacked to INT8 (unpack_int4): the int32 dot products and
+//   the epilogue are the INT4 GEMM's, so the base result is bit for bit the plain INT4 one (at INT8 GEMM speed).
 //   Attention: exact (attention::flash_fwd) or 8-bit (attention_q8, any of its variants; SageAttention2++ by default).
 // The INT8 path's numerics are those of comfy-kitchen's int8_linear with ConvRot (see kernels/quant/quant.h): the
 // rotation in the CUDA kernel's fp32 order, the bf16-rounded rotated row, per-token absmax/127 scales, round half to
@@ -61,19 +68,25 @@ struct QuantBlockBuffers {
   Tensor lora_t;
   void* lora_workspace = nullptr;
   std::size_t lora_workspace_bytes = 0;
+  // An INT4 linear with an active LoRA site: its weight unpacked to INT8, kInt4UnpackBytes, 16-byte aligned.
+  void* int4_unpack = nullptr;
+  std::size_t int4_unpack_bytes = 0;
 };
+
+// Bytes of the largest block weight unpacked to INT8 (ffn_up_gate, [2 * 8192, 3072]).
+inline constexpr std::size_t kInt4UnpackBytes = std::size_t{2} * 8192 * 3072;
 
 // Big-buffer elements per token for the quantized block over rows of `hw + text_lengths[r]` tokens: kFusedBigCols,
 // unless some block runs ffn_up_gate bf16 (`bf16_up_gate`) and the route gives a run of these rows the op-by-op
-// [up_gate | ffn] layout (then fused_big_cols' kOpByOpBigCols). The INT8 ffn_down input ([L, kFfnDim] int8) lives in
-// the part of `big` the FFN does not use.
+// [up_gate | ffn] layout (then fused_big_cols' kOpByOpBigCols). The INT8 ffn_down input ([L, kFfnDim] int8; INT4:
+// packed [L, kFfnDim / 2]) lives in the part of `big` the FFN does not use.
 std::int64_t quant_big_cols(std::int64_t hw, std::span<const std::int64_t> text_lengths, bool bf16_up_gate,
                             const FusedRouteSnapshot& route);
 
 // attention_q8 workspace bytes enough for any run of any subset of these rows (0 for kExact).
 std::size_t q8_attention_workspace_bytes(std::int64_t hw, std::span<const std::int64_t> text_lengths, AttentionMode mode);
 
-// The block on run `run` of `a` with weights `w` (any mix of bf16 and INT8 linears, dit_weights.h), bf16 pairs routed
+// The block on run `run` of `a` with weights `w` (any mix of bf16, INT8 and INT4 linears, dit_weights.h), bf16 pairs routed
 // by `route` as run_block_fused does. Operands 256-byte aligned (arena allocations, kArenaAlign weights). Buffers that
 // do not match (big smaller than quant_big_cols per token, no scale buffer, a q8 workspace too small for the run) are a
 // programming error: std::invalid_argument before any launch.
@@ -81,6 +94,7 @@ std::size_t q8_attention_workspace_bytes(std::int64_t hw, std::span<const std::i
 // kernels/lora (bf16 or INT8 base, whatever the route says), its t computed from the site's bf16 input; for an INT8
 // qkv / ffn_up_gate site that input (the norm output) is materialized and rotated separately, bit-identical to the
 // fused norm + rotate kernel. A block whose q/k/v differ in precision takes no qkv side branch (std::invalid_argument).
+// An active site on an INT4 linear needs the int4_unpack buffer (std::invalid_argument otherwise).
 void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& a, const BlockRun& run, const QkvGemm& qkv_gemm,
                      const FusedRouteSnapshot& route, AttentionMode attention, cudaStream_t stream, int block = 0);
 

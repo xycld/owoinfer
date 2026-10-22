@@ -28,6 +28,10 @@
 // runs every step under it. With every P6/P7 option off (the bundle's models, tier reference or an uncertified auto,
 // exact attention, no LoRA, the moss scheduler with euler and the official noise) the output is bit-identical to P5;
 // tier auto picks a lossy configuration only when a certificate covers it.
+// P7b: img2img, inpainting and the hires fix (Request::init_image, mask, hires; pipeline_image.h for the host side):
+// the VAE encoder (flux2_vae_encoder) sits next to the decoder in the arena's persistent region and the plan counts it
+// in every phase; each encode runs on the stack with the room the resident models leave (exact tiling as needed), the
+// init image's before the DiT is loaded. A hires fix plans for its target size and reuses the loaded models.
 #pragma once
 
 #include <algorithm>
@@ -44,6 +48,7 @@
 #include <vector>
 
 #include "models/lora/side_branch.h"
+#include "pipeline/pipeline_image.h"
 #include "pipeline/png_writer.h"
 #include "pipeline/quality_cert.h"
 #include "pipeline/sampler.h"
@@ -96,19 +101,59 @@ struct Request {
   // side branches (a strength change between requests is instant); the others are merged into the DiT at load (a
   // strength change re-merges them from the pristine weights kept on the host). Results are uncertified.
   std::vector<lora::LoraSpec> loras;
-  // img2img (roadmap P7b; reserved): the init image and how much of the schedule to run on it (1 = from noise). Not
-  // wired yet: validate() refuses an init image.
-  std::filesystem::path init_image;
-  double denoise_strength = 1.0;
+  // img2img (roadmap P7b, diffusers' img2img / inpainting convention). init_image (null: none): RGB (3 channels), any
+  // size up to kMaxInputSide per side and kMaxInputPixels, shared (a request copy does not copy the pixels); it is
+  // brought to height x width by `resize` (pipeline_image.h; crop by default) and VAE-encoded (the posterior mean) to
+  // z0. Of the N scheduled steps (after the scheduler's snapping), the first t = int(max(N - min(N * s, N), 0)) are
+  // skipped for denoise_strength s (strength_start_step), and sampling starts from
+  //   x = sigma[t] * noise + (1 - sigma[t]) * z0
+  // with `noise` the request's seeded initial noise (the same as txt2img). s = 1 without a mask is txt2img, bit for
+  // bit (the init image is not used: Result::image_mode says "txt2img" and image_note why); s = 0 runs no step: the
+  // result is the VAE round trip decode(encode(image)), and neither the text encoder nor the DiT runs (nor is it
+  // planned). Not with the dataspace sampler.
+  // Guidance windows (uncond_skip_layers, slg_start / slg_stop) keep the official pipeline's step-index convention:
+  // they are measured over the steps a pass actually runs (step i of the strength-cropped schedule over its length),
+  // not over the full schedule.
+  std::shared_ptr<const Image> init_image;
+  double denoise_strength = 1.0;  // [0, 1]
+  // Inpainting ("latent blend" with the base model: MOSS-Image has no inpainting checkpoint; null: none): 1 channel, the
+  // init image's size, resized like it; >= 128 regenerate, < 128 keep (binarized at 0.5 as diffusers does), then
+  // bilinearly interpolated to the latent grid (latent_mask). After every step, at the next step's sigma s',
+  //   x = (1 - m) * (s' * noise + (1 - s') * z0) + m * x
+  // so the kept region ends exactly at z0 (its VAE round trip). Needs init_image; works at any strength. The mask
+  // interpolation is diffusers' FLUX.2 Klein inpainting pipeline's (F.interpolate(mode="bilinear") of the binarized
+  // mask, pipeline_flux2_klein_inpaint.py prepare_mask_latents).
+  std::shared_ptr<const Image> mask;
+  ResizeMode resize = ResizeMode::kCrop;
+  // Hires fix: a second pass at width x height (multiples of 16, within the image size bounds; 0 x 0 = off). The
+  // first pass (txt2img or img2img at the request size) is decoded, Lanczos-upscaled to the target with `resize`
+  // (pixel space: decode -> resize -> encode), encoded, and refined as an img2img pass with `strength` over
+  // `steps` scheduled steps (0: the request's steps). Same seed, prompt, sampler and scheduler; the models stay
+  // loaded: the first pass is decoded next to the resident DiT (exact tiling as needed, never parking it; the plan
+  // counts that decode's smallest tiling in the denoise phase), so the DiT is loaded at most once per request. With a
+  // mask the second pass blends against the init image brought to the target size.
+  struct Hires {
+    int width = 0, height = 0;
+    double strength = 0.45;  // [0, 1]; typically 0.3-0.6
+    int steps = 0;
+    bool enabled() const { return width > 0 || height > 0; }
+  } hires;
   bool decode = true;  // false: stop after sampling (final latents only)
 };
 
 // Throws std::invalid_argument with the official app's wording where it has one.
 void validate(const Request& request);
 
+// The total number of denoise steps the request runs: the first pass's schedule (the dataspace sampler's step count,
+// else the scheduler's) minus the steps its denoise strength skips when it starts from an init image, plus the hires
+// fix's second pass likewise. Does not validate; generate()'s steps_scheduled.
+std::int64_t schedule_steps(const Request& request);
+
 // Reads a parameters.json document: either the asset file ({"schema_version", "parameters": {...}}, versions 1 and 2
 // as gradio_app.parse_parameters reads them) or a bare parameters object. Skip-layer lists may be "22,24" strings
-// or integer arrays; a null seed means -1. `model` is left empty. Throws std::invalid_argument.
+// or integer arrays; a null seed means -1. `model` is left empty. Engine keys beyond the app's: denoise_strength,
+// resize, hires_strength, hires_steps (the init image, mask and hires size are a front end's: e.g. the CLI reads
+// "init_image" / "mask" paths and "hires"). Throws std::invalid_argument.
 Request request_from_parameters(const json::Value& doc);
 
 // GenerationConfig.layers (gradio_app.py:119-129): "22, 24" -> {22, 24}, blank -> {}. Throws std::invalid_argument
@@ -154,6 +199,10 @@ struct PipelineOptions {
   std::filesystem::path dit_file;
   std::filesystem::path text_encoder_file;
   std::filesystem::path vae_file;
+  // P6 step 41: a step-embedder replacement (moss_dit::load_time_embedding, e.g. a distill bundle's
+  // time_embedding.safetensors) applied to whichever DiT is loaded, computed in fp32 (MossDit::set_time_embedding).
+  // Read when the pipeline is constructed (moss_dit::DistillError for a bad file).
+  std::filesystem::path time_embedding_file;
   bool lora_strict = false;  // lora::LoadOptions::strict: unknown LoRA keys and lossy merges are errors
   // Quality tier and attention kernel (planner::resolve_tier: what each tier runs and refuses; unset attention: the
   // tier's choice). Certificates (pipeline/quality_cert.h) are looked up next to the DiT and in
@@ -174,9 +223,14 @@ struct Timings {
   double refine_s = 0;    // text refiner, all rows
   double denoise_s = 0;
   double vae_load_s = 0;
-  double decode_s = 0;
+  double decode_s = 0;     // every decode (the hires fix decodes twice)
+  // img2img / inpainting / hires fix: VAE encoder load, every encode, and the host-side image work (resizes,
+  // the hires upscale, mask preparation, per-step inpainting blends).
+  double vae_encoder_load_s = 0;
+  double encode_s = 0;
+  double image_ops_s = 0;
   double total_s = 0;
-  std::vector<double> step_s;
+  std::vector<double> step_s;  // every sampling step, both passes of a hires fix
 };
 
 struct MemoryStats {
@@ -190,6 +244,7 @@ struct MemoryStats {
   // A resident DiT was dropped outside the plan's parking (arena growth or shrink, a phase that did not fit) and
   // loaded again in this call.
   bool dit_reloaded = false;
+  int dit_loads = 0;  // DiT loads in the call (0 when it was resident or not needed; at most 1 unless the plan parks)
   std::size_t host_private_start = 0;  // process private host memory when the call started
   std::size_t host_private_peak = 0;   // its peak, sampled at phase boundaries
 };
@@ -214,7 +269,23 @@ struct DitStreamStats {
   std::vector<Step> steps;  // per finished step
 };
 
+// One sampling pass of an image request (the request's pass, and the hires fix's second pass).
+struct PassReport {
+  bool ran = false;     // the pass was reached (not cancelled before it)
+  int width = 0, height = 0;
+  int schedule_steps = 0;  // N: the full schedule's steps after snapping
+  int start_step = 0;      // steps skipped by the denoise strength (strength_start_step); 0 for txt2img
+  int steps_run = 0;
+  double strength = 1.0;
+  bool encoded = false;           // an image was VAE-encoded for this pass (img2img start or inpainting blend)
+  std::string encode_schedule;    // the encode(s) run: "untiled" or the tile plan (flux2_vae_encoder::TilePlan)
+  // The hires fix's first pass only: its decode for the upscale ("untiled" or the tile plan; next to the DiT, which is
+  // never parked for it). The final decode is Result::decode_schedule.
+  std::string decode_schedule;
+};
+
 struct Result {
+  // The final image size: the hires fix's target when it ran, else the request's. Latents always match it.
   int height = 0, width = 0;
   std::vector<std::uint8_t> rgb;  // [height, width, 3]; empty if !decode or cancelled
   // Final latents [128, height/16, width/16]; the partial result if cancelled during sampling (the latents after the
@@ -222,8 +293,16 @@ struct Result {
   std::vector<float> latents;
   std::uint64_t seed = 0;         // the seed actually used
   int steps_requested = 0;
-  int steps_scheduled = 0;  // after the schedule's snapping
+  // Steps the request samples, both passes (after the schedule's snapping and the denoise strengths), and those run.
+  int steps_scheduled = 0;
   int steps_run = 0;
+  // img2img / inpainting / hires fix: what ran ("txt2img", "img2img" or "inpaint"), each pass, and the VAE encoder
+  // (its file; empty when nothing was encoded).
+  std::string image_mode = "txt2img";
+  std::string image_note;  // e.g. why an init image was not used (strength 1 without a mask)
+  PassReport first_pass;
+  PassReport hires;
+  std::string vae_encoder_source;
   // Set whenever a cancel request was seen, even after the last step (then steps_run == steps_scheduled and the
   // decode is skipped).
   bool cancelled = false;
@@ -250,6 +329,7 @@ struct Result {
   std::string gpu_arch;   // quality_cert's GPU class of the device ("sm_89")
   std::string dit_source;
   std::string dit_linears;
+  std::string time_embedding;  // PipelineOptions::time_embedding_file when a replacement step embedder ran (else empty)
   std::string te_source;     // the bundle's text_encoder directory or PipelineOptions::text_encoder_file
   std::string te_precision;  // qwen35_text::precision_name: "bf16", "int8", "w4a8"
   std::string vae_source;    // the bundle's vae directory or PipelineOptions::vae_file
@@ -264,7 +344,9 @@ struct Result {
 };
 
 // Phases of generate(), in order. kTextEncoder is entered even on a full embedding-cache hit and kDitLoad even when
-// the DiT is resident; kDecode only when decoding.
+// the DiT is resident; kDecode only when decoding. img2img encodes the init image in kDitLoad (before the DiT load);
+// the hires fix enters kDecode (the first pass, decoded for the upscale), then kDenoise (encode and second pass) and
+// kDecode again.
 enum class Phase { kTextEncoder, kDitLoad, kDenoise, kDecode };
 
 // A latent preview during sampling (latent_preview: a linear latent -> RGB map, no VAE) of the x0 estimate after a
@@ -278,7 +360,9 @@ struct PreviewImage {
 struct GenerateControl {
   // Once per call, after planning and before the first phase (the launcher shows plan.explanation and the mode).
   std::function<void(const planner::ExecutionPlan&)> on_plan;
-  StepCallback on_step;                       // after every sampling step; returning false cancels
+  // After every sampling step; returning false cancels. With the hires fix the steps count on across both passes
+  // (step and num_steps cover both), as do the previews'.
+  StepCallback on_step;
   // After every preview_every-th step (and the last), before on_step. Its buffers count in the denoise phase's plan.
   std::function<void(const PreviewImage&)> on_preview;
   int preview_every = 1;

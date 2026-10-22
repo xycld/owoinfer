@@ -37,13 +37,14 @@ std::vector<std::string> fused_qkv(int block) {
 
 constexpr const char* kQkvParts[3] = {"proj.q", "proj.k", "proj.v"};
 
-// The spec of block linear `module` in a quantized index: bf16 or INT8 ConvRot G = 256, the two the block runs.
-const quant::QuantSpec& linear_spec(const quant::QuantIndex& q, const std::string& module) {
+// The spec of block linear `module` in a quantized index: bf16, INT8 ConvRot G = 256 or INT4 ConvRot G = 256, the
+// three the block runs.
+quant::QuantSpec linear_spec(const quant::QuantIndex& q, const std::string& module) {
   const quant::QuantSpec* s = q.find_spec(module);
   if (s == nullptr) throw std::runtime_error("mi::moss_dit: linear '" + module + "' missing from the DiT file");
-  if (*s != quant::QuantSpec::bf16() && *s != quant::QuantSpec::int8_convrot(256)) {
+  if (*s != quant::QuantSpec::bf16() && *s != quant::QuantSpec::int8_convrot(256) && *s != quant::QuantSpec::int4_convrot(256)) {
     throw std::runtime_error("mi::moss_dit: linear '" + module + "' is stored as " + quant::describe(*s) +
-                             "; the DiT runs bf16 and int8_convrot256 linears");
+                             "; the DiT runs bf16, int8_convrot256 and int4_convrot256 linears");
   }
   return *s;
 }
@@ -160,9 +161,10 @@ std::vector<std::string> block_front(int block, const quant::QuantIndex* quant) 
   std::vector<std::string> front = fused_qkv(block);
   if (quant == nullptr) return front;
   const std::string p = prefix(block);
-  bool int8 = true;
-  for (const char* part : kQkvParts) int8 = int8 && linear_spec(*quant, p + part).quantized();
-  if (int8) {
+  const quant::QuantSpec q = linear_spec(*quant, p + kQkvParts[0]);
+  bool fused = q.quantized();
+  for (const char* part : kQkvParts) fused = fused && linear_spec(*quant, p + part) == q;
+  if (fused) {
     for (const char* part : kQkvParts) front.push_back(p + part + ".weight_scale");
   }
   return front;
@@ -196,36 +198,61 @@ BlockTensors block_views(int block, const TensorMap& m, const quant::QuantIndex*
     return Int8Linear{Tensor::view(const_cast<void*>(v.weight), DType::kI8, Device::kCUDA, {n, k}),
                       Tensor::view(const_cast<float*>(v.scale), DType::kF32, Device::kCUDA, {n})};
   };
-  const auto linear = [&](const char* name, std::int64_t n, std::int64_t k, Tensor& bf16, Int8Linear& q8) {
+  const auto int4 = [&](const std::string& module, std::int64_t n, std::int64_t k) {
+    const quant::QuantWeights v = checked(module, quant::QuantSpec::int4_convrot(256), n, k);
+    return Int4Linear{Tensor::view(const_cast<void*>(v.weight), DType::kI8, Device::kCUDA, {n, k / 2}),
+                      Tensor::view(const_cast<float*>(v.scale), DType::kF32, Device::kCUDA, {n})};
+  };
+  const auto linear = [&](const char* name, std::int64_t n, std::int64_t k, Tensor& bf16, Int8Linear& q8, Int4Linear& q4) {
     const std::string module = p + name;
-    if (linear_spec(*quant, module).quantized()) {
+    const quant::QuantSpec spec = linear_spec(*quant, module);
+    if (spec.format == quant::QuantFormat::kInt4ConvRot) {
+      q4 = int4(module, n, k);
+    } else if (spec.quantized()) {
       q8 = int8(module, n, k);
     } else {
       checked(module, quant::QuantSpec::bf16(), n, k);
       bf16 = take(m, module + ".weight", {n, k});
     }
   };
-  int quantized_parts = 0;
-  for (const char* part : kQkvParts) quantized_parts += linear_spec(*quant, p + part).quantized() ? 1 : 0;
-  if (quantized_parts == 0) {
+  const quant::QuantSpec q_spec = linear_spec(*quant, p + kQkvParts[0]);
+  bool same = true;
+  for (const char* part : kQkvParts) same = same && linear_spec(*quant, p + part) == q_spec;
+  if (same && !q_spec.quantized()) {
     for (const char* part : kQkvParts) checked(p + part, quant::QuantSpec::bf16(), kDim, kDim);
     b.qkv = fuse(m, fused_qkv(block), kDim, kDim);
-  } else if (quantized_parts == 3) {
+  } else if (same) {
+    // One spec for q, k and v: their weights and scales were uploaded back to back (block_front), one fused GEMM.
+    const bool four = q_spec.format == quant::QuantFormat::kInt4ConvRot;
     std::vector<Tensor> w, s;
     for (const char* part : kQkvParts) {
-      const Int8Linear l = int8(p + part, kDim, kDim);
-      w.push_back(l.w);
-      s.push_back(l.scale);
+      Tensor lw, ls;
+      if (four) {
+        const Int4Linear l = int4(p + part, kDim, kDim);
+        lw = l.w;
+        ls = l.scale;
+      } else {
+        const Int8Linear l = int8(p + part, kDim, kDim);
+        lw = l.w;
+        ls = l.scale;
+      }
+      w.push_back(lw);
+      s.push_back(ls);
     }
-    b.qkv8 = {concat_rows(w, DType::kI8, kDim, kDim, p + "proj.q/k/v"),
-              concat_rows(s, DType::kF32, kDim, 0, p + "proj.q/k/v scales")};
+    const Tensor fw = concat_rows(w, DType::kI8, kDim, four ? kDim / 2 : kDim, p + "proj.q/k/v");
+    const Tensor fs = concat_rows(s, DType::kF32, kDim, 0, p + "proj.q/k/v scales");
+    if (four) {
+      b.qkv4 = {fw, fs};
+    } else {
+      b.qkv8 = {fw, fs};
+    }
   } else {
     b.qkv_split = true;
-    for (int i = 0; i < 3; ++i) linear(kQkvParts[i], kDim, kDim, b.qkv_part[i], b.qkv8_part[i]);
+    for (int i = 0; i < 3; ++i) linear(kQkvParts[i], kDim, kDim, b.qkv_part[i], b.qkv8_part[i], b.qkv4_part[i]);
   }
-  linear("proj.o", kDim, kDim, b.o, b.o8);
-  linear("proj.ffn_up_gate", kUpGateDim, kDim, b.up_gate, b.up_gate8);
-  linear("proj.ffn_down", kDim, kFfnDim, b.down, b.down8);
+  linear("proj.o", kDim, kDim, b.o, b.o8, b.o4);
+  linear("proj.ffn_up_gate", kUpGateDim, kDim, b.up_gate, b.up_gate8, b.up_gate4);
+  linear("proj.ffn_down", kDim, kFfnDim, b.down, b.down8, b.down4);
   return b;
 }
 

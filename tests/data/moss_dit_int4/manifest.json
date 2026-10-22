@@ -1,0 +1,57 @@
+{
+ "torch": "2.14.1+cu130",
+ "device": "NVIDIA GeForce RTX 4090 Laptop GPU",
+ "comfy_kitchen": "dba9fac",
+ "block": 5,
+ "timestep": 900.0,
+ "grid": [
+  6,
+  8
+ ],
+ "text": [
+  17,
+  9
+ ],
+ "int4_file": "moss_image_sft_int4_convrot.safetensors",
+ "int8_file": "moss_image_sft_int8_convrot.safetensors",
+ "bf16": "MOSS-Image/sft",
+ "mixed": {
+  "q": "int4",
+  "k": "int8",
+  "v": "bf16",
+  "o": "bf16",
+  "ffn_up_gate": "int4",
+  "ffn_down": "int8"
+ },
+ "lora": {
+  "file": "lora_block5.safetensors",
+  "rank": 8,
+  "alpha": 4.0,
+  "strength": 1.0
+ },
+ "files": {
+  "mod": [
+   18432
+  ],
+  "all_int4_x": [
+   122,
+   3072
+  ],
+  "all_int4_y": [
+   122,
+   3072
+  ],
+  "lora_y": [
+   122,
+   3072
+  ],
+  "mixed_x": [
+   65,
+   3072
+  ],
+  "mixed_y": [
+   65,
+   3072
+  ]
+ }
+}

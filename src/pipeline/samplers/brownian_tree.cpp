@@ -1,3 +1,7 @@
+// Adapted from torchsde BrownianInterval (Apache-2.0, Copyright 2020 Google LLC); modified: ported to C++ for the
+// BrownianTree configuration only (halfway tree, no Levy area, fixed tol 1e-6 / pool 24 / 45-entry cache), with fp32
+// host arithmetic and torch-compatible CPU randn. The seed derivation reimplements NumPy's SeedSequence
+// (BSD-3-Clause, Copyright (c) 2005-2026 NumPy Developers).
 #include "pipeline/samplers/brownian_tree.h"
 
 #include <cmath>
@@ -21,7 +25,8 @@
 namespace mi::pipeline {
 namespace {
 
-// numpy/random/bit_generator.pyx constants.
+// NumPy SeedSequence constants (numpy/random/bit_generator.pyx; BSD-3-Clause, Copyright (c) 2005-2026 NumPy
+// Developers).
 constexpr std::uint32_t kInitA = 0x43b0d7e5, kMultA = 0x931e8875, kInitB = 0x8b51f9dd, kMultB = 0x58f38ded;
 constexpr std::uint32_t kMixMultL = 0xca01f9dd, kMixMultR = 0x4973f715;
 constexpr int kXShift = 16;

@@ -24,8 +24,8 @@ enum class CoefKind { kEuler, kAncestral, kHeun, kDpm2m, kSde, kEr, kRes };
 void compute_coefficients(CoefKind kind, const float* sigmas, int steps, float eta, float eta_plus_one, float* coef,
                           cudaStream_t stream);
 
-// y = expm1(x) exactly as torch's CUDA expm1 (exposed for tests).
-void torch_expm1(const float* x, float* y, std::int64_t n, cudaStream_t stream);
+// y = expm1(x) correctly rounded to fp32 (exposed for tests).
+void expm1_rn(const float* x, float* y, std::int64_t n, cudaStream_t stream);
 
 void euler(float* x, const float* den, float s, float dt, std::int64_t n, cudaStream_t stream);
 void velocity_euler(float* x, const float* v, float h, std::int64_t n, cudaStream_t stream);

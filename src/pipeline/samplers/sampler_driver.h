@@ -6,7 +6,9 @@
 //
 // Algorithms (x: latents, s = sigma_i, n = sigma_{i+1}, D: denoised, all arithmetic fp32 with the reference's
 // rounding order; scalar coefficients are evaluated on the GPU with the CUDA math library, as torch does for its
-// 0-dim tensors):
+// 0-dim tensors, except expm1, which is correctly rounded where torch's is 1 ulp off on some inputs, so dpmpp_2m,
+// dpmpp_2m_sde and res_multistep match the reference within 4.5e-7 of the latents' largest magnitude instead of
+// bit for bit):
 //   euler            d = (x - D) / s,  x += d * (n - s)                              (Karras et al. 2022, Alg. 2)
 //   euler (velocity) x += (n - s) * v      the official MOSS-Image pipeline's step (constructor's official_euler)
 //   ab2              2nd-order Adams-Bashforth on v (Euler first): x += h ((1 + r) v - r v_prev), r = h / (2 h_prev)
@@ -44,6 +46,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -93,8 +97,13 @@ struct DataSpaceParams {
   std::vector<float> q;           // row-major [out, in]
   std::vector<float> step_codes;  // timesteps, e.g. 1000, 968, ...
 };
+// A malformed or invalid dataspace file (load_dataspace).
+class DataspaceError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
 // Reads `latent_mix.Q` (F32 [C, C]) and `step_codes` (F32/F64/I64 [N]) from a dataspace.safetensors file.
-// Throws std::runtime_error.
+// Throws DataspaceError for a malformed or invalid file (std::runtime_error: unreadable).
 DataSpaceParams load_dataspace(const std::string& path);
 // Sigmas for the first `steps` codes: code / 1000, then 0. Throws std::invalid_argument if steps is out of range.
 std::vector<float> dataspace_sigmas(const DataSpaceParams& params, int steps);

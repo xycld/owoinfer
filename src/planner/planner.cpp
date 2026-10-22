@@ -41,6 +41,10 @@ constexpr double kStreamOverlapTwoBuffers = 0.8;
 // attention's ~19 % FLOP share of the bf16 step split out. The fp32-accumulating variants are not measured: assumed
 // slower than q8_fp16.
 constexpr double kInt8GemmSpeedup = 2.7;
+// INT4 ConvRot GEMMs (P6c), the same measurement on the community INT4 file (every linear INT4, 2026-10-22, one
+// process): bf16 1.38 s, INT8 + exact 0.71 s, INT4 + exact 0.55 s, INT4 + q8_fp8 0.40 s; with the same attention split,
+// the INT4 GEMMs run 3.8x (exact) to 4.3x (q8) the bf16 ones, about 1.55x the INT8 ones.
+constexpr double kInt4GemmSpeedup = 4.0;
 constexpr double kQ8Fp8AttentionSpeedup = 1.9;
 constexpr double kQ8Fp16AttentionSpeedup = 1.5;
 constexpr double kQ8F32AccAttentionSpeedup = 1.3;
@@ -171,9 +175,11 @@ class Planner {
       const double l = image_tokens + (r_.text_lengths.empty() ? 0.0 : static_cast<double>(r_.text_lengths[text_row]));
       // GEMMs: 2 FLOPs per weight per token (bf16: 2 bytes per weight); attention: QK^T and PV, 2 * L^2 * dim each,
       // per block. P6 paths in bf16-equivalent FLOPs: divided by their measured speedup.
-      const double f = std::clamp(s_.dit_int8_fraction, 0.0, 1.0);
-      const double gemm = s_.dit_precision == Precision::kInt8
-                              ? 2.0 * static_cast<double>(s_.dit_params) * l * ((1.0 - f) + f / kInt8GemmSpeedup)
+      const double f4 = s_.dit_precision == Precision::kInt4 ? std::clamp(s_.dit_int4_fraction, 0.0, 1.0) : 0.0;
+      const double f8 = std::clamp(s_.dit_int8_fraction, 0.0, 1.0 - f4);
+      const double gemm = s_.dit_precision != Precision::kBf16
+                              ? 2.0 * static_cast<double>(s_.dit_params) * l *
+                                    ((1.0 - f8 - f4) + f8 / kInt8GemmSpeedup + f4 / kInt4GemmSpeedup)
                               : static_cast<double>(s_.dit_bytes) * l;
       const double attention = 4.0 * l * l * dim * s_.dit_blocks;
       const double attention_speedup = in_.attention == AttentionMode::kExact    ? 1.0
@@ -390,7 +396,9 @@ class Planner {
   }
 
   std::string precision_text() const {
-    std::string t = s_.dit_precision == Precision::kInt8 ? "INT8 ConvRot" : "bf16";
+    std::string t = s_.dit_precision == Precision::kInt4   ? "INT4 ConvRot"
+                    : s_.dit_precision == Precision::kInt8 ? "INT8 ConvRot"
+                                                           : "bf16";
     return is_q8(in_.attention) ? t + " + 8-bit attention (" + attention_name(in_.attention) + ")" : t;
   }
 
@@ -677,7 +685,14 @@ const char* source_name(DitSource s) {
   return "?";
 }
 
-const char* precision_name(Precision p) { return p == Precision::kInt8 ? "int8" : "bf16"; }
+const char* precision_name(Precision p) {
+  switch (p) {
+    case Precision::kBf16: return "bf16";
+    case Precision::kInt8: return "int8";
+    case Precision::kInt4: return "int4";
+  }
+  return "?";
+}
 
 const char* attention_name(AttentionMode a) {
   switch (a) {
@@ -730,12 +745,18 @@ TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention
   TierDecision d;
   d.requested = requested;
   d.precision = precision;
-  // Lossy weights fix the configuration's precision: an INT8 DiT or a quantized text encoder is never the Reference tier.
-  const bool int8 = precision == Precision::kInt8 || te_quantized;
-  const std::string weights = std::string(precision == Precision::kInt8 ? "INT8 ConvRot GEMMs" : "bf16 GEMMs") +
+  // Lossy weights fix the configuration's precision: a quantized DiT or text encoder is never the Reference tier, and
+  // an INT4 DiT is always the Turbo tier.
+  const bool int4 = precision == Precision::kInt4;
+  const bool int8 = precision != Precision::kBf16 || te_quantized;
+  const std::string weights = std::string(int4 ? "INT4 ConvRot GEMMs" : precision == Precision::kInt8 ? "INT8 ConvRot GEMMs" : "bf16 GEMMs") +
                               (te_quantized ? ", quantized text encoder" : "");
-  if (requested == Tier::kTurbo) {
-    throw std::invalid_argument("tier turbo (W4A4) is reserved and not implemented yet; use reference, high or auto");
+  if (requested == Tier::kTurbo && !int4) {
+    throw std::invalid_argument(std::string("tier turbo runs an INT4 ConvRot DiT (a convrot_w4a4 file loaded as the DiT), "
+                                            "but the loaded DiT is ") + precision_name(precision) + "; use reference, high or auto");
+  }
+  if (requested == Tier::kHigh && int4) {
+    throw std::invalid_argument("the loaded DiT is INT4 ConvRot, which runs the Turbo tier; use tier turbo");
   }
   if (attention && is_q8(*attention) && supported && !supported(*attention)) {
     throw std::invalid_argument(std::string("attention ") + attention_name(*attention) +
@@ -744,7 +765,7 @@ TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention
   // The lossy configuration (precision, mode): its certificate decides certified / the reason.
   const auto ask = [&](AttentionMode mode) { return certificate ? certificate(precision, mode) : CertificateAnswer{}; };
   const auto lossy_with = [&](AttentionMode mode, const std::string& why, const CertificateAnswer& a) {
-    d.effective = Tier::kHigh;
+    d.effective = int4 ? Tier::kTurbo : Tier::kHigh;
     d.attention = mode;
     d.certified = a.found;
     d.certificate = a.found ? a.file : std::string();
@@ -783,11 +804,29 @@ TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention
       }
       return lossy(mode, why);
     }
+    case Tier::kTurbo: {
+      AttentionMode mode = attention.value_or(AttentionMode::kQ8Fp8);
+      std::string why = "Turbo tier";
+      if (!attention && supported && !supported(mode)) {
+        mode = AttentionMode::kExact;
+        why += " (this device/build has no 8-bit attention kernel)";
+      }
+      return lossy(mode, why);
+    }
     case Tier::kAuto:
-    case Tier::kTurbo:
       break;
   }
+  // Auto never runs an uncertified Turbo configuration.
+  const auto turbo_refused = [&](const std::string& reasons) {
+    return std::invalid_argument("the loaded DiT is INT4 ConvRot (the Turbo tier) and no certificate covers it (" + reasons +
+                                 "): auto only selects a certified Turbo configuration; choose tier turbo to run it uncertified");
+  };
   if (attention) {
+    if (int4) {
+      const CertificateAnswer a = ask(*attention);
+      if (!a.found) throw turbo_refused(std::string(attention_name(*attention)) + ": " + (a.reason.empty() ? "no certificate" : a.reason));
+      return lossy_with(*attention, "auto with attention " + std::string(attention_name(*attention)), a);
+    }
     if (!int8 && !is_q8(*attention)) return reference("auto: bf16 DiT with exact attention, the Reference tier");
     return lossy(*attention, "auto with attention " + std::string(attention_name(*attention)));
   }
@@ -797,14 +836,20 @@ TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention
     if (!supported || supported(m)) candidates.push_back(m);
   }
   if (int8) candidates.push_back(AttentionMode::kExact);
+  std::string first_reason;
+  bool one_reason = true;
   for (const AttentionMode m : candidates) {
     const CertificateAnswer a = ask(m);
     if (a.found) return lossy_with(m, "auto: the fastest certified configuration", a);
-    reasons += (reasons.empty() ? "" : "; ") + std::string(attention_name(m)) + ": " +
-               (a.reason.empty() ? std::string("no certificate") : a.reason);
+    const std::string why = a.reason.empty() ? std::string("no certificate") : a.reason;
+    if (reasons.empty()) first_reason = why;
+    one_reason = one_reason && why == first_reason;
+    reasons += (reasons.empty() ? "" : "; ") + std::string(attention_name(m)) + ": " + why;
   }
+  if (int4 && one_reason && !first_reason.empty()) reasons = "every attention mode: " + first_reason;
   if (!int8) return reference("auto: no lossy configuration of the loaded bf16 DiT is certified (" + reasons +
                               "), so the Reference tier: bf16 GEMMs, exact attention");
+  if (int4) throw turbo_refused(reasons);
   // Quantized files cannot run the reference weights: their own GEMMs, without the separate 8-bit attention toggle.
   d.effective = Tier::kHigh;
   d.attention = AttentionMode::kExact;

@@ -1,5 +1,7 @@
 // `moss-infer generate`: prompt or parameters.json -> PNG (and optionally the final latents and a JSON report).
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <csignal>
 #include <cstdlib>
 #include <cstdint>
@@ -7,13 +9,18 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <locale>
+#include <memory>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "models/moss_dit/distill.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/samplers/sampler_driver.h"
 #include "pipeline/png_writer.h"
 #include "pipeline/report_json.h"
 #include "planner/planner.h"
@@ -41,21 +48,39 @@ constexpr const char* kUsage =
     "                           [--dit-blocks op_by_op|fused|fused_graphs] [--dit <file>] [--te <file>] [--vae <file>]\n"
     "                           [--tier reference|high|turbo|auto] [--attention auto|exact|q8|q8_fp8|q8_fp16|...]\n"
     "                           [--preview <preview.png> [--preview-every N]] [--lora <file> [--lora-scale S]]...\n"
-    "                           [--lora-strict] [--quiet]\n"
+    "                           [--lora-strict] [--distill <dir>] [--time-embedding <file>] [--quiet]\n"
+    "                           [--init-image <png|jpg> [--strength X] [--mask <png|jpg>] [--resize crop|fit|stretch]]\n"
+    "                           [--hires <W>x<H>|<scale> [--hires-strength X] [--hires-steps N]]\n"
     "Flags override values read from --params. At least one of -o / --latent-out is required;\n"
     "without -o the VAE decode is skipped. --vram-budget caps the process's GPU memory (CUDA context included).\n"
     "Each --then-prompt generates one more image in the same engine session (same settings, warm models and\n"
     "embedding cache), written to <out>.<n>.png and reported under \"followups\".\n"
     "--dit-blocks (default fused, or the MOSSINFER_DIT_BLOCKS environment variable) picks the DiT block implementation;\n"
     "all give the same image. fused falls back to op_by_op when its startup self-check fails; fused_graphs adds CUDA graphs.\n"
-    "--dit loads the DiT from one safetensors file (INT8 ConvRot or bf16, ComfyUI layout) instead of the bundle's;\n"
+    "--dit loads the DiT from one safetensors file (INT8 ConvRot, INT4 ConvRot or bf16, ComfyUI layout) instead of the\n"
+    "bundle's;\n"
     "--te loads an INT8 ConvRot / W4A8 text encoder file, --vae a FLUX.2 VAE file (e.g. the full decoder); the tokenizer\n"
     "and configs always come from --model. --preview rewrites a latent preview PNG (no VAE) every N steps.\n"
-    "--tier (default auto): reference = bf16 exact; high = the loaded DiT's GEMMs + 8-bit attention; turbo is\n"
-    "reserved; auto = the fastest certified configuration of the loaded DiT (else reference; an INT8 DiT then runs\n"
-    "with exact attention, uncertified). Certificates: <dit>.mossinfer-cert.json or <cache-dir>/quality_certs/.\n"
+    "--tier (default auto): reference = bf16 exact; high = the loaded DiT's GEMMs + 8-bit attention; turbo = an INT4\n"
+    "ConvRot DiT (--dit) + 8-bit attention; auto = the fastest certified configuration of the loaded DiT (else\n"
+    "reference; an INT8 DiT then runs with exact attention, uncertified; an uncertified INT4 DiT needs --tier turbo).\n"
+    "Certificates: <dit>.mossinfer-cert.json or <cache-dir>/quality_certs/.\n"
     "--attention overrides the tier's attention kernel: exact (FlashAttention-2) or an 8-bit variant q8_fp8 (= q8),\n"
-    "q8_fp16, q8_fp8_f32acc, q8_fp16_f32acc (lossy).\n";
+    "q8_fp16, q8_fp8_f32acc, q8_fp16_f32acc (lossy).\n"
+    "--init-image (PNG or JPEG, EXIF orientation applied) runs img2img: the image is brought to the output size with\n"
+    "--resize (default crop: cover and center-crop; fit: fit inside, edge-filled bands; stretch) and the last\n"
+    "--strength (default 0.75) of the schedule is sampled from it; strength 1 is txt2img, 0 returns the VAE round trip.\n"
+    "Without a size (--size/--width/--height, or height/width in --params) the output size follows the init image\n"
+    "(rounded down to multiples of 16, within 4.2 megapixels).\n"
+    "--mask (white = regenerate, black = keep; the init image's size) inpaints by latent blending with the base model.\n"
+    "--hires generates at the base size, then upscales (Lanczos, pixel space) to <W>x<H> or <scale> x the base size\n"
+    "(rounded to multiples of 16) and refines with --hires-strength (default 0.45) over --hires-steps (default --steps).\n"
+    "--params may also carry \"init_image\" and \"mask\" (paths, relative to the parameters file), \"denoise_strength\",\n"
+    "\"resize\", \"hires\" (\"<W>x<H>\" or a scale), \"hires_strength\" and \"hires_steps\"; flags override them.\n"
+    "--distill <dir> applies a distill bundle (lodestones' data-space DMD repos): its time_embedding.safetensors (as\n"
+    "--time-embedding), lora.safetensors (as --lora, strength 1; a following --lora-scale sets it) and\n"
+    "dataspace.safetensors (--sampler dataspace --dataspace <file>), with --cfg 1 and --steps = the file's step codes\n"
+    "unless given. --time-embedding replaces the DiT's step embedder and modulation biases, computed in fp32.\n";
 
 std::atomic<bool> g_cancel{false};
 // First Ctrl-C: cancel (within a text-encoder layer, DiT block or decode band). A second one terminates (default action restored).
@@ -125,6 +150,42 @@ fs::path followup_path(const fs::path& out, std::size_t n) {
   return p;
 }
 
+constexpr double kDefaultStrength = 0.75;
+
+// A JSON number as --hires accepts it ("2", "1.5").
+std::string json_number_text(const json::Value& v) {
+  if (v.is_int()) return std::to_string(v.as_int());
+  std::ostringstream os;
+  os.imbue(std::locale::classic());
+  os << v.as_double();
+  return os.str();
+}
+
+// The output size for an init image without --size: its own, scaled down to fit kMaxPixels and kMaxSide, rounded down
+// to multiples of 16 (at least 16).
+void fit_size_to(const pipeline::Image& im, int& width, int& height) {
+  double scale = 1.0;
+  const double pixels = static_cast<double>(im.width) * im.height;
+  if (pixels > static_cast<double>(pipeline::kMaxPixels)) scale = std::sqrt(static_cast<double>(pipeline::kMaxPixels) / pixels);
+  scale = std::min(scale, static_cast<double>(pipeline::kMaxSide) / std::max(im.width, im.height));
+  width = std::max(16, static_cast<int>(std::floor(im.width * scale / 16)) * 16);
+  height = std::max(16, static_cast<int>(std::floor(im.height * scale / 16)) * 16);
+}
+
+// --hires <W>x<H> (the target size) or <scale> (times the base size, rounded to multiples of 16).
+void parse_hires(const std::string& v, pipeline::Request& req) {
+  const std::size_t x = v.find('x');
+  if (x != std::string::npos) {
+    req.hires.width = to_int32("--hires", v.substr(0, x));
+    req.hires.height = to_int32("--hires", v.substr(x + 1));
+    return;
+  }
+  const double scale = to_double("--hires", v);
+  if (!std::isfinite(scale) || scale <= 0) throw std::invalid_argument("--hires: the scale must be positive");
+  req.hires.width = std::max(16, static_cast<int>(std::lround(req.width * scale / 16)) * 16);
+  req.hires.height = std::max(16, static_cast<int>(std::lround(req.height * scale / 16)) * 16);
+}
+
 void print_summary(const pipeline::Result& r) {
   const auto& t = r.timings;
   std::fprintf(stderr,
@@ -143,6 +204,16 @@ void print_summary(const pipeline::Result& r) {
                planner::tier_name(r.tier.effective), planner::tier_name(r.tier.requested), r.dit_linears.c_str(),
                planner::attention_name(r.tier.attention), r.te_precision.c_str(), r.tier.certified ? "" : ", uncertified");
   if (!r.block_path_note.empty()) std::fprintf(stderr, "%s\n", r.block_path_note.c_str());
+  if (r.first_pass.encoded || r.hires.ran) {
+    std::fprintf(stderr, "%s: %d of %d steps from step %d", r.image_mode.c_str(), r.first_pass.steps_run,
+                 r.first_pass.schedule_steps - r.first_pass.start_step, r.first_pass.start_step);
+    if (r.hires.ran) {
+      std::fprintf(stderr, "; hires %dx%d: %d of %d steps from step %d", r.hires.width, r.hires.height, r.hires.steps_run,
+                   r.hires.schedule_steps - r.hires.start_step, r.hires.start_step);
+    }
+    std::fprintf(stderr, "; VAE encode %.2f s (load %.2f s), image ops %.2f s\n", r.timings.encode_s, r.timings.vae_encoder_load_s,
+                 r.timings.image_ops_s);
+  }
   const auto& ds = r.dit_stream;
   if (ds.streamed) {
     std::fprintf(stderr, "DiT streamed: %d of 42 blocks resident, %d buffers from %s; %.1f GB/s, %.1f%% of the copy hidden, "
@@ -159,7 +230,14 @@ int cmd_generate(const std::vector<std::string>& args) {
   fs::path params, out_png, out_latent, report, preview_png;
   int preview_every = 1;
   std::vector<std::string> then_prompts;
-  bool have_prompt = false, quiet = false;
+  bool have_prompt = false, quiet = false, size_given = false;
+  fs::path init_image, mask;
+  std::optional<double> strength;
+  std::string hires;
+  bool distill = false, distill_dataspace = false;
+  json::Value pdoc;
+  const json::Value* pobj = nullptr;  // the parameters object of --params
+  int distill_steps = 0;
   // Flags apply after --params is read, in command-line order.
   std::vector<std::pair<std::string, std::string>> flags;
   for (std::size_t i = 0; i < args.size(); ++i) {
@@ -177,7 +255,13 @@ int cmd_generate(const std::vector<std::string>& args) {
   for (const auto& [f, v] : flags) {
     if (f == "--params") params = path_from_utf8(v);
   }
-  if (!params.empty()) req = pipeline::request_from_parameters(json::parse(read_file(params)));
+  if (!params.empty()) {
+    pdoc = json::parse(read_file(params));
+    req = pipeline::request_from_parameters(pdoc);
+    pobj = pdoc.find("parameters") != nullptr ? pdoc.find("parameters") : &pdoc;
+  }
+  // A key the parameters file sets: front-end defaults never override it.
+  const auto in_params = [&](const char* key) { return pobj != nullptr && pobj->find(key) != nullptr; };
   constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
   try {
     // The environment variable overrides the default block path (A/B runs); --dit-blocks overrides both.
@@ -193,13 +277,14 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--json-report") report = path_from_utf8(v);
       else if (f == "--negative") req.negative_prompt = v;
       else if (f == "--size") {
+        size_given = true;
         const std::size_t x = v.find('x');
         if (x == std::string::npos) throw std::invalid_argument("--size: expected <W>x<H>");
         req.width = to_int32(f, v.substr(0, x));
         req.height = to_int32(f, v.substr(x + 1));
       }
-      else if (f == "--width") req.width = to_int32(f, v);
-      else if (f == "--height") req.height = to_int32(f, v);
+      else if (f == "--width") req.width = to_int32(f, v), size_given = true;
+      else if (f == "--height") req.height = to_int32(f, v), size_given = true;
       else if (f == "--steps") req.steps = to_int32(f, v);
       else if (f == "--cfg") req.cfg = to_double(f, v);
       else if (f == "--shift") req.shift = to_double(f, v);
@@ -225,6 +310,26 @@ int cmd_generate(const std::vector<std::string>& args) {
         req.loras.back().strength = static_cast<float>(to_double(f, v));
       }
       else if (f == "--lora-strict") options.lora_strict = true;
+      else if (f == "--time-embedding") options.time_embedding_file = path_from_utf8(v);
+      else if (f == "--distill") {
+        moss_dit::DistillBundle b;
+        try {
+          b = moss_dit::open_distill_bundle(path_from_utf8(v));
+          if (!b.dataspace.empty()) {
+            distill_steps = static_cast<int>(pipeline::load_dataspace(util::path_utf8(b.dataspace)).step_codes.size());
+          }
+        } catch (const std::runtime_error& e) {
+          throw std::invalid_argument(std::string("--distill: ") + e.what());
+        }
+        distill = true;
+        if (!b.time_embedding.empty()) options.time_embedding_file = b.time_embedding;
+        if (!b.lora.empty()) req.loras.push_back({b.lora, 1.0f});
+        if (!b.dataspace.empty()) {
+          req.sampler = pipeline::SamplerKind::kDataSpace;
+          distill_dataspace = true;
+          req.dataspace_path = b.dataspace;
+        }
+      }
       else if (f == "--mode") options.mode = planner::parse_mode(v);
       else if (f == "--vram-budget") options.vram_budget = pipeline::vram_option_bytes(to_double(f, v), kGiB, f);
       else if (f == "--vram-reserve") options.vram_reserve = pipeline::vram_option_bytes(to_double(f, v), 1024.0 * 1024.0, f);
@@ -240,6 +345,13 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--preview-every") preview_every = to_int32(f, v);
       else if (f == "--tier") options.tier = planner::parse_tier(v);
       else if (f == "--attention") options.attention = v == "auto" ? std::optional<planner::AttentionMode>() : planner::parse_attention(v);
+      else if (f == "--init-image") init_image = path_from_utf8(v);
+      else if (f == "--strength") strength = to_double(f, v);
+      else if (f == "--mask") mask = path_from_utf8(v);
+      else if (f == "--resize") req.resize = pipeline::parse_resize_mode(v);
+      else if (f == "--hires") hires = v;
+      else if (f == "--hires-strength") req.hires.strength = to_double(f, v);
+      else if (f == "--hires-steps") req.hires.steps = to_int32(f, v);
       else if (f == "--quiet") quiet = true;
       else throw std::invalid_argument("unknown flag " + f);
     }
@@ -250,9 +362,62 @@ int cmd_generate(const std::vector<std::string>& args) {
     std::cerr << "moss-infer generate: numeric flag out of range\n" << kUsage;
     return 2;
   }
+  if (distill) {
+    // The bundle's defaults where the command line does not set them: no CFG, the trained number of steps.
+    const auto given = [&](const char* flag) {
+      return std::any_of(flags.begin(), flags.end(), [&](const auto& fv) { return fv.first == flag; });
+    };
+    if (!given("--cfg") && !in_params("cfg")) req.cfg = 1.0;
+    if (!given("--steps") && !in_params("steps") && distill_steps > 0) req.steps = distill_steps;
+  }
   if ((params.empty() && !have_prompt) || req.model.empty() || (out_png.empty() && out_latent.empty())) {
     std::cerr << kUsage;
     return 2;
+  }
+  try {
+    // Image inputs from --params (paths relative to the parameters file), unless a flag gave them.
+    const auto param_string = [&](const char* key) -> std::string {
+      const json::Value* v = pobj != nullptr ? pobj->find(key) : nullptr;
+      if (v == nullptr || v->is_null()) return {};
+      if (v->is_number()) return json_number_text(*v);
+      if (!v->is_string()) throw std::invalid_argument(std::string("--params: ") + key + " must be a string");
+      return v->as_string();
+    };
+    const auto param_path = [&](const char* key) {
+      const std::string v = param_string(key);
+      if (v.empty()) return fs::path();
+      const fs::path p = path_from_utf8(v);
+      return p.is_absolute() ? p : params.parent_path() / p;
+    };
+    if (init_image.empty()) init_image = param_path("init_image");
+    if (mask.empty()) mask = param_path("mask");
+    if (hires.empty()) hires = param_string("hires");
+    if (distill_dataspace && req.sampler == pipeline::SamplerKind::kDataSpace && (!init_image.empty() || !hires.empty())) {
+      throw std::invalid_argument("--distill selected the bundle's dataspace sampler, which cannot start from an image "
+                                  "(--init-image, --hires); pass --sampler after --distill to use another sampler");
+    }
+    if (!init_image.empty()) {
+      req.init_image = std::make_shared<const pipeline::Image>(pipeline::load_image(init_image, 3));
+      if (strength) req.denoise_strength = *strength;
+      else if (!in_params("denoise_strength")) req.denoise_strength = kDefaultStrength;
+      if (!size_given && !in_params("height") && !in_params("width")) fit_size_to(*req.init_image, req.width, req.height);
+    } else if (strength) {
+      throw std::invalid_argument("--strength needs --init-image");
+    }
+    if (!mask.empty()) {
+      if (init_image.empty()) throw std::invalid_argument("--mask needs --init-image");
+      req.mask = std::make_shared<const pipeline::Image>(pipeline::load_image(mask, 1));
+    }
+    if (!hires.empty()) parse_hires(hires, req);
+  } catch (const std::invalid_argument& e) {
+    std::cerr << "moss-infer generate: " << e.what() << "\n" << kUsage;
+    return 2;
+  } catch (const std::out_of_range&) {
+    std::cerr << "moss-infer generate: --hires out of range\n" << kUsage;
+    return 2;
+  } catch (const std::runtime_error& e) {
+    std::cerr << "moss-infer generate: " << e.what() << "\n";
+    return 1;
   }
   req.decode = !out_png.empty();
   pipeline::validate(req);
@@ -295,6 +460,7 @@ int cmd_generate(const std::vector<std::string>& args) {
       pipeline::write_png_rgb8(png, r.rgb, r.width, r.height, text);
     }
     for (const std::string& w : r.lora_warnings) std::fprintf(stderr, "warning: LoRA %s\n", w.c_str());
+    if (!r.image_note.empty()) std::fprintf(stderr, "note: %s\n", r.image_note.c_str());
     for (const auto* t : {&r.cond_token_report, &r.uncond_token_report}) {
       if (t->truncated) {
         std::fprintf(stderr, "warning: %s truncated to %zu of %zu tokens (%zu dropped; --max-seq %zu)\n",

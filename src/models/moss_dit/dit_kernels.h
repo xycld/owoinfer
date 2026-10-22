@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 
 #include "core/tensor.h"
 
@@ -21,6 +22,16 @@ void tokens_to_latent(const Tensor& tokens, const Tensor& latents, cudaStream_t 
 // estimate of a latent preview, x0 = x_t - sigma_t * (x_t - x_prev) / (sigma_t - sigma_prev), with
 // c = sigma_t / (sigma_prev - sigma_t).
 void extrapolate_latents(const Tensor& x, const Tensor& x_prev, float c, const Tensor& out, cudaStream_t stream);
+
+// Packed signed int4 (two values per byte, even column in the low nibble: the kernels/quant4 layout) -> int8 values:
+// in [rows, cols / 2] bytes (row stride ld_in bytes) -> out [rows, cols] (row stride ld_out). cols even. The INT4
+// linears' path to the INT8 LoRA GEMMs: the int32 dot products, and so the GEMM results, are the INT4 GEMM's.
+void unpack_int4(const void* in, std::int64_t ld_in, void* out, std::int64_t ld_out, std::int64_t rows, std::int64_t cols,
+                 cudaStream_t stream);
+
+// out[r] = bf16(sum_c w[r, c] * x[c] + bias[r]) in fp32 (w bf16 [n, k] contiguous, widened; x, bias f32 device
+// arrays; out bf16 [n]): an fp32 nn.Linear on one row, rounded once. k % 8 == 0, w 16-byte aligned.
+void linear_fp32_row(const Tensor& w, const float* x, const float* bias, const Tensor& out, cudaStream_t stream);
 
 // Copies `bytes` (<= kMaxParamBytes) host bytes to dst through kernel arguments: no pinned staging,
 // no host synchronization (a pageable cudaMemcpyAsync would wait for the stream), graph-capturable.

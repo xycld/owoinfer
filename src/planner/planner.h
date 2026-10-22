@@ -59,14 +59,16 @@ enum class DitSource {
   kFile,        // the weight files through small pinned rings: page cache (file-backed, not private) or disk
   kHostPinned,  // a pinned host copy of the streamed blocks (host private memory: their full size)
 };
-// Precision of the DiT's block linears, from the loaded file (P6): bf16 (the bundle, or a bf16 single file) or INT8
-// ConvRot (a file with any INT8 linear; mixed files that keep some linears bf16 count as int8).
-enum class Precision { kBf16, kInt8 };
+// Precision of the DiT's block linears, from the loaded file (P6): bf16 (the bundle, or a bf16 single file), INT8
+// ConvRot (a file with any INT8 linear; mixed files that keep some linears bf16 count as int8) or INT4 ConvRot (a file
+// with any INT4 linear, the Turbo tier; its INT8 / bf16 linears are costed by fraction).
+enum class Precision { kBf16, kInt8, kInt4 };
 // Attention kernel of the DiT blocks (moss_dit::AttentionMode, one per attention_q8 variant): exact FA2, or 8-bit
 // (SageAttention-style, lossy).
 enum class AttentionMode { kExact, kQ8Fp16, kQ8Fp16F32Acc, kQ8Fp8, kQ8Fp8F32Acc };
 // Quality tiers (plan §P6): kReference = bf16 weights, exact math; kHigh = INT8 ConvRot GEMMs and/or 8-bit attention;
-// kTurbo = W4A4 (reserved: not implemented yet); kAuto = the fastest certified configuration of the loaded model.
+// kTurbo = INT4 ConvRot GEMMs (an INT4 DiT file) and 8-bit attention; kAuto = the fastest certified configuration of
+// the loaded model.
 enum class Tier { kReference, kHigh, kTurbo, kAuto };
 enum class TeResidency {
   kStreamed,      // decoder layers stream from the weight files through `buffers` device layer buffers
@@ -78,7 +80,7 @@ enum class VaeDecodeKind { kUntiled, kTiled };
 const char* residency_name(DitResidency r);
 const char* residency_name(TeResidency r);
 const char* source_name(DitSource s);
-const char* precision_name(Precision p);        // "bf16", "int8"
+const char* precision_name(Precision p);        // "bf16", "int8", "int4"
 // "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc" (the quality certificates' tokens).
 const char* attention_name(AttentionMode a);
 const char* tier_name(Tier t);                  // "reference", "high", "turbo", "auto"
@@ -91,14 +93,17 @@ bool is_q8(AttentionMode a);  // an 8-bit mode
 // The quality tier a request runs (P4b/P6), decided before planning from what is loaded. The weights fix the GEMM
 // precision (an INT8 DiT runs INT8 GEMMs; its weights are not the reference); the tier decides the attention kernel:
 //   reference  bf16 DiT and text encoder, exact attention. Refused for quantized weights and with an 8-bit attention.
-//   high       the lossy configuration of the loaded DiT: its precision, 8-bit attention (q8_fp8 unless `attention`
-//              says otherwise; exact when the device lacks the 8-bit kernel and the DiT is INT8). Runs certified or
-//              not (an explicit choice). Refused for a bf16 DiT with exact attention (that is the Reference tier).
-//   turbo      reserved: refused.
+//   high       the lossy configuration of the loaded bf16 or INT8 DiT: its precision, 8-bit attention (q8_fp8 unless
+//              `attention` says otherwise; exact when the device lacks the 8-bit kernel and the DiT is INT8). Runs
+//              certified or not (an explicit choice). Refused for a bf16 DiT with exact attention (that is the
+//              Reference tier) and for an INT4 DiT (that is the Turbo tier).
+//   turbo      an INT4 DiT (refused for any other): INT4 GEMMs, 8-bit attention as for high. Runs certified or not
+//              (an explicit choice, reported uncertified without a certificate).
 //   auto       with `attention` given: that configuration. Otherwise each lossy configuration of the loaded DiT,
-//              fastest first (8-bit attention q8_fp8, q8_fp16, q8_fp8_f32acc, q8_fp16_f32acc, then exact for an INT8
-//              DiT), that this device runs: the first with a certificate. None: Reference for a bf16 DiT; an INT8 DiT
-//              runs INT8 GEMMs with exact attention, reported uncertified.
+//              fastest first (8-bit attention q8_fp8, q8_fp16, q8_fp8_f32acc, q8_fp16_f32acc, then exact for a
+//              quantized DiT), that this device runs: the first with a certificate. None: Reference for a bf16 DiT; an
+//              INT8 DiT runs INT8 GEMMs with exact attention, reported uncertified. Auto never runs an uncertified
+//              Turbo configuration: an INT4 DiT without a certificate is refused (choose tier turbo explicitly).
 // `certificate` is asked for lossy configurations only (Reference needs none).
 struct CertificateAnswer {
   bool found = false;
@@ -152,6 +157,8 @@ struct ModelShapes {
   Precision dit_precision = Precision::kBf16;
   std::size_t dit_params = 0;
   double dit_int8_fraction = 1.0;  // kInt8: the INT8 share of the block GEMM FLOPs (< 1 for a mixed file)
+  // kInt4: the INT4 share (the INT8 share is then dit_int8_fraction, capped at the rest; the remainder is bf16).
+  double dit_int4_fraction = 1.0;
   // VAE decoder; the pipeline replaces it with Flux2VaeDecoder::persistent_bytes().
   std::size_t vae_bytes = 0;
 };

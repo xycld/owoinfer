@@ -149,29 +149,43 @@ TEST(SamplerCudaRandn, MatchesTorchCudaGenerator) {
 }
 
 TEST(SamplerCudaMath, VectorsComeFromThePinnedTorch) {
-  // torch_expm1f is pinned to CUDA 13.0's libm and torch_sum200 to torch >= 2.14's reduction order: the vectors must
-  // come from that build (regenerate and re-check both when the reference torch changes).
+  // torch_sum200 follows torch >= 2.14's reduction order, and the expm1 comparison below counts the differences from
+  // that build's CUDA expm1: the vectors must come from it (regenerate and re-check when the reference torch changes).
   EXPECT_EQ(manifest().at("torch").as_string(), "2.14.1+cu130");
 }
 
-TEST(SamplerCudaMath, Expm1MatchesTorch) {
+TEST(SamplerCudaMath, Expm1CorrectlyRounded) {
   if (!have_gpu()) GTEST_SKIP() << "no CUDA device";
   const std::vector<float> x = floats_from_bits(manifest().at("expm1").at("x"));
-  const std::vector<float> want = floats_from_bits(manifest().at("expm1").at("y"));
+  const std::vector<float> torch_y = floats_from_bits(manifest().at("expm1").at("y"));
   DeviceBuffer dx(x), dy(static_cast<std::int64_t>(x.size()));
-  sampler_kernels::torch_expm1(dx.p, dy.p, dx.n, nullptr);
+  sampler_kernels::expm1_rn(dx.p, dy.p, dx.n, nullptr);
   const std::vector<float> got = dy.download();
-  std::size_t bad = 0, nans = 0;
+  // Host reference: glibc's double expm1 rounded once to fp32 (none of these inputs is a hard case for that rounding).
+  // torch's CUDA expm1 is within 1 ulp of it everywhere, and differs on 234 of these 4028 inputs.
+  std::size_t bad = 0, nans = 0, off_torch = 0;
+  std::int64_t max_ulp_torch = 0;
+  const auto ordered = [](float f) {
+    const auto i = static_cast<std::int64_t>(static_cast<std::int32_t>(bits(f)));
+    return i < 0 ? -(i & 0x7fffffff) : i;
+  };
   for (std::size_t i = 0; i < got.size(); ++i) {
-    if (std::isnan(want[i])) {
+    const float want = static_cast<float>(std::expm1(static_cast<double>(x[i])));
+    if (std::isnan(want)) {
       bad += !std::isnan(got[i]);
-      ++nans;
-    } else {
-      bad += bits(got[i]) != bits(want[i]);
+      nans += std::isnan(torch_y[i]);
+      continue;
     }
+    bad += bits(got[i]) != bits(want);
+    off_torch += bits(got[i]) != bits(torch_y[i]);
+    max_ulp_torch = std::max(max_ulp_torch, std::abs(ordered(got[i]) - ordered(torch_y[i])));
   }
   EXPECT_EQ(bad, 0u) << "of " << got.size();
   EXPECT_GE(nans, 1u);
+  EXPECT_EQ(off_torch, 234u);
+  EXPECT_LE(max_ulp_torch, 1);
+  std::printf("[samplers] expm1: %zu/%zu correctly rounded, %zu differ from torch by %lld ulp\n", got.size() - bad,
+              got.size(), off_torch, static_cast<long long>(max_ulp_torch));
 }
 
 // The synthetic model of the generator: call k returns the CFG-combined denoised prediction of two velocity
@@ -199,10 +213,17 @@ struct SyntheticModel {
   }
 };
 
+// Samplers whose step coefficients use expm1 (the others reproduce the reference bit for bit).
+bool uses_expm1(SamplerKind kind) {
+  return kind == SamplerKind::kDpmpp2m || kind == SamplerKind::kDpmpp2mSde || kind == SamplerKind::kResMultistep;
+}
+constexpr double kExpm1TrajectoryTol = 1e-6;  // measured: at most 4.5e-7 (about 4 ulps of the largest element)
+
 TEST(SamplerDriver, TrajectoriesMatchReference) {
   if (!have_gpu()) GTEST_SKIP() << "no CUDA device";
   const bool same_grid = same_grid_as_reference();
   std::map<std::string, int> exact, total;
+  std::map<std::string, double> worst_rel;
   int skipped = 0;
   for (const auto& e : manifest().at("trajectories").as_array()) {
     const std::string name = e.at("sampler").as_string();
@@ -255,16 +276,29 @@ TEST(SamplerDriver, TrajectoriesMatchReference) {
     }
     ASSERT_EQ(idx.size(), want.size()) << what;
     std::size_t bad = 0;
-    double max_abs = 0;
+    double max_abs = 0, max_ref = 0;
     for (std::size_t k = 0; k < idx.size(); ++k) {
       bad += bits(got[idx[k]]) != bits(want[k]);
       max_abs = std::max(max_abs, std::fabs(static_cast<double>(got[idx[k]]) - want[k]));
+      max_ref = std::max(max_ref, std::fabs(static_cast<double>(want[k])));
     }
-    EXPECT_EQ(bad, 0u) << what << ": max |diff| " << max_abs;
+    if (uses_expm1(kind)) {
+      // The driver's expm1 is correctly rounded; torch's CUDA expm1 is 1 ulp off on 26.5M of the 2^32 fp32 inputs
+      // (~0.6 %), and on 234 of the 4028 test vectors (~5.8 %). A coefficient that differs by 1 ulp moves the
+      // trajectory by a few fp32 ulps of its largest element.
+      EXPECT_LE(max_abs, kExpm1TrajectoryTol * max_ref) << what << ": " << bad << " elements differ";
+      worst_rel[name] = std::max(worst_rel[name], max_abs / max_ref);
+    } else {
+      EXPECT_EQ(bad, 0u) << what << ": max |diff| " << max_abs;
+    }
     ++total[name];
     exact[name] += bad == 0;
   }
-  for (const auto& [name, t] : total) std::printf("[samplers] %-16s %2d/%2d trajectories bit-exact\n", name.c_str(), exact[name], t);
+  for (const auto& [name, t] : total) {
+    std::printf("[samplers] %-16s %2d/%2d trajectories bit-exact", name.c_str(), exact[name], t);
+    if (worst_rel.count(name) != 0) std::printf(", max |diff| / max |ref| %.3g", worst_rel[name]);
+    std::printf("\n");
+  }
   if (skipped > 0) std::printf("[samplers] %d large stochastic cases skipped: this GPU's SM count differs from the reference GPU\n", skipped);
 }
 
@@ -431,6 +465,29 @@ TEST(SamplerDriver, LoadDataspaceFiles) {
     EXPECT_THROW(dataspace_sigmas(d, static_cast<int>(d.step_codes.size()) + 1), std::invalid_argument);
   }
   if (found == 0) GTEST_SKIP() << "no dataspace.safetensors under /workspace/Models/community";
+}
+
+TEST(SamplerDriver, MalformedDataspaceRaisesDataspaceError) {
+  const fs::path dir = fs::temp_directory_path() / "mossinfer_dataspace_test";
+  fs::create_directories(dir);
+  const auto write = [&](const char* name, const std::string& bytes) {
+    const fs::path p = dir / name;
+    std::ofstream(p, std::ios::binary) << bytes;
+    return p.string();
+  };
+  // Not a safetensors file at all.
+  EXPECT_THROW(load_dataspace(write("garbage.safetensors", "this is not a safetensors file")), DataspaceError);
+  // A valid, empty safetensors file: the expected tensors are missing.
+  const std::string header = "{}";
+  std::string empty(8, '\0');
+  empty[0] = static_cast<char>(header.size());
+  try {
+    load_dataspace(write("empty.safetensors", empty + header));
+    ADD_FAILURE() << "expected DataspaceError";
+  } catch (const DataspaceError& e) {
+    EXPECT_NE(std::string(e.what()).find("expected tensors latent_mix.Q and step_codes"), std::string::npos) << e.what();
+  }
+  fs::remove_all(dir);
 }
 
 TEST(SamplerDriver, CancelViaAfterStep) {
