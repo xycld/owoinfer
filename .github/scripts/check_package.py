@@ -13,7 +13,8 @@
         --undefined-only / dumpbin /dependents, /imports). The full package bundles it (with the CUDA EULA); the
         --system-cuda variant ships no CUDA library at all and needs no EULA
   CERT  the quality certificates in share/mossinfer/quality_certs/ (the engine's install-tree search; the directory
-        may be absent): listed; any file there that is not a *.mossinfer-cert.json, or does not parse as JSON, fails
+        may be absent): listed; any entry there that is not a regular *.mossinfer-cert.json file (a symbolic link
+        included), or does not parse as JSON, fails
   find_package: optionally builds and runs examples/consumer-cmake against the tree, with the CUDA toolkit removed
         from PATH / LD_LIBRARY_PATH so that only the package's own libraries can satisfy it
 
@@ -309,6 +310,10 @@ def main():
         for name in sorted(os.listdir(cert_dir)):
             rel = os.path.join(cert_rel, name)
             path = os.path.join(cert_dir, name)
+            if os.path.islink(path):
+                print(f"CERT {rel}: a symbolic link")
+                failures.append(f"CERT: {rel} is a symbolic link (a package carries regular files only)")
+                continue
             if not name.endswith(CERT_SUFFIX) or not os.path.isfile(path):
                 print(f"CERT {rel}: not a {CERT_SUFFIX} file")
                 failures.append(f"CERT: {rel} is not a {CERT_SUFFIX} file (only certificates belong there)")
