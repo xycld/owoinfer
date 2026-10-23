@@ -241,6 +241,7 @@
     "te_precision": "bf16"
    },
    "numerics": {
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "te": 1
@@ -253,6 +254,7 @@
     "te_precision": "int8_convrot"
    },
    "numerics": {
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -266,6 +268,7 @@
     "te_precision": "w4a8"
    },
    "numerics": {
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -281,6 +284,7 @@
    },
    "numerics": {
     "attention_q8": 1,
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "te": 1
@@ -294,6 +298,7 @@
    },
    "numerics": {
     "attention_q8": 1,
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -308,6 +313,7 @@
    },
    "numerics": {
     "attention_q8": 1,
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -322,6 +328,7 @@
     "te_precision": "bf16"
    },
    "numerics": {
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -335,6 +342,7 @@
     "te_precision": "int8_convrot"
    },
    "numerics": {
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -348,6 +356,7 @@
     "te_precision": "w4a8"
    },
    "numerics": {
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -363,6 +372,7 @@
    },
    "numerics": {
     "attention_q8": 1,
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -377,6 +387,7 @@
    },
    "numerics": {
     "attention_q8": 1,
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -391,6 +402,7 @@
    },
    "numerics": {
     "attention_q8": 1,
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -405,6 +417,7 @@
     "te_precision": "bf16"
    },
    "numerics": {
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "te": 1,
@@ -418,6 +431,7 @@
     "te_precision": "int8_convrot"
    },
    "numerics": {
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -432,6 +446,7 @@
     "te_precision": "w4a8"
    },
    "numerics": {
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -448,6 +463,7 @@
    },
    "numerics": {
     "attention_q8": 1,
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "te": 1,
@@ -462,6 +478,7 @@
    },
    "numerics": {
     "attention_q8": 1,
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,
@@ -477,6 +494,7 @@
    },
    "numerics": {
     "attention_q8": 1,
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,

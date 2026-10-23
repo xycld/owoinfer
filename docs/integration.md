@@ -34,6 +34,7 @@ Version 0.2.0 (ABI 1, server protocol 1). This is a pre-release: see [Versioning
 | Memory modes | `min_memory`, `balanced`, `max_speed`, plus explicit VRAM and RAM budgets. The engine plans against the VRAM that is actually free and streams the model when it doesn't fit. |
 | Integration surfaces | the C library (`libmossinfer`) and the sidecar process (`moss-server`), with the same features |
 | Run-time control | progress, cancel from any thread, one generation at a time per engine, device probe and build recommendation |
+| System CUDA reuse | a compatible cuBLASLt from the user's CUDA install, used by the `-system-cuda` package or on request (`MOSSINFER_CUDA_LIBS=system`); the probe reports which copy runs (Linux; see [CUDA libraries](#cuda-libraries)) |
 | Output | PNG file (both surfaces), or RGB8 in memory (library), plus a JSON report per image |
 
 ### Planned: integrate now, enabled later
@@ -45,6 +46,7 @@ These are designed and partly built. The launcher can prepare for them now (see 
 | Windows x64 (MSVC) builds, both flavours | code written, never compiled; first build comes with CI | ship the same integration code; budget time for fixes on the first Windows build |
 | `cu12` builds (Linux and Windows) | written, never compiled | include the flavour choice (see [Picking the build](#picking-the-build-cu12-or-cu13)) |
 | Release archives | the CI workflows exist but have not run yet | build from source until then (see [Getting the binaries](#getting-the-binaries)) |
+| System CUDA reuse on Windows | the search paths are written (`CUDA_PATH`, `CUDA_PATH_V<major>_*`), not yet verified on Windows | the same logic as on Linux: read `probe.cublaslt` |
 
 ### Not supported
 
@@ -105,11 +107,11 @@ On top of that, the weights are read through the operating system's page cache. 
 |---|---|
 | MOSS-Image Base folder | 26 GB |
 | MOSS-Image SFT folder | 26 GB, or about 10 GB extra when its text encoder and VAE files are hard links to Base's (they are byte-identical) |
-| Engine package | several hundred MB, most of it NVIDIA cuBLASLt |
+| Engine package | several hundred MB, most of it NVIDIA cuBLASLt; the `-system-cuda` archive leaves cuBLASLt out |
 
 ## Getting the binaries
 
-**From a release (planned).** CI builds one archive per OS and flavour, named `mossinfer-<version>-<os>-cu<12|13>-<arch>.zip`; Linux also gets `.tar.gz`. A GitHub release attaches the archives with one `SHA256SUMS` file. See [Package contents](#package-contents).
+**From a release (planned).** CI builds two archives per OS and flavour: `mossinfer-<version>-<os>-cu<12|13>-<arch>.zip` (the full package) and `mossinfer-<version>-<os>-cu<12|13>-<arch>-system-cuda.zip` (the same without cuBLASLt); Linux also gets `.tar.gz` of both. A GitHub release attaches the archives with one `SHA256SUMS` file. See [Package contents](#package-contents).
 
 **From source, Linux, until then:**
 
@@ -119,6 +121,7 @@ cmake --preset linux-cuda13
 cmake --build --preset linux-cuda13 -j8
 CUDA_VISIBLE_DEVICES="" ctest --preset linux-cuda13 -L '^cpu$'
 cmake --install build-linux-cuda13                # -> build-linux-cuda13/install
+cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-cuda13/install-system-cuda
 (cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-0.2.0-linux-cu13-x86_64.{tar.gz,zip}
 ```
 
@@ -132,16 +135,64 @@ cmake --install build-linux-cuda13                # -> build-linux-cuda13/instal
 | `bin/moss-server` (`moss-server.exe`) | the sidecar |
 | `bin/moss-infer` | command-line tool for debugging and for converting models. The launcher doesn't need it, and it carries its own copy of the engine. |
 | `lib/libmossinfer.so.1` (Windows: `bin/mossinfer.dll` + `lib/mossinfer.lib`) | the engine and the C API. It exports only `mi_*` functions. |
-| `lib/libcublasLt.so.*` (Windows: `bin/cublasLt64_*.dll`) | NVIDIA cuBLASLt, redistributed under the CUDA EULA |
+| `lib/libcublasLt.so.<major>` (Windows: `bin/cublasLt64_<major>.dll`) | NVIDIA cuBLASLt, redistributed under the CUDA EULA; full package only |
 | Windows: `bin/vcruntime140*.dll`, `bin/msvcp140.dll` | the MSVC runtime, so users need no Visual C++ Redistributable |
 | `include/mossinfer/mossinfer.h` | the C API header |
 | `share/cmake/MossInfer/` | the CMake package: `find_package(MossInfer)` |
 | `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`, `share/doc/mossinfer/` | licences (see [Licensing](#licensing-and-redistribution)) |
 
+**Two variants per flavour.**
+- **Full** (`mossinfer-…-cu13-x86_64.zip`): bundles cuBLASLt and the CUDA EULA. It runs on any machine with a suitable driver, and uses its own cuBLASLt by default (`auto`, see [CUDA libraries](#cuda-libraries)): results are reproducible across machines, and the quality certificates of the release (the certified tiers) apply.
+- **System CUDA** (`mossinfer-…-cu13-x86_64-system-cuda.zip`): the same files without cuBLASLt and the EULA, several hundred MB smaller. It runs only where a compatible cuBLASLt is installed. It is made from the release presets, which link the CUDA runtime statically; a tree installed the same way from a build with a shared cudart (the dev preset) also needs a system cudart.
+- **Users with a CUDA toolkit** can use its cuBLASLt instead in two ways: download the smaller `-system-cuda` archive, or keep the full one and set `MOSSINFER_CUDA_LIBS=system`. A system copy of another cuBLASLt version can change result bits, and certificates measured with the bundled copy do not apply to it (see Reproducibility below).
+- **Which to offer:** the launcher decides from the probe. Run the probe of any installed copy with `MOSSINFER_CUDA_LIBS=system` (`hello`'s `probe.cublaslt`, or `mi_probe()`): when `source` is `"system"`, the machine has a compatible copy and the `-system-cuda` archive works there; otherwise offer the full one. A launcher that installs once for many machines ships the full archive.
+
 **Ship the tree as it is.**
-- `moss-server` and `libmossinfer` find their libraries relative to themselves: RUNPATH `$ORIGIN/../lib` for the executables and `$ORIGIN` for the library. On Windows, all DLLs sit in `bin/`.
-- The package needs no CUDA toolkit and no environment variables.
+- `moss-server` finds `libmossinfer` relative to itself (RUNPATH `$ORIGIN/../lib`). On Windows, all DLLs sit in `bin/`.
+- `libmossinfer` has no load-time dependency on cuBLASLt: it loads cuBLASLt at run time (a system copy, or the bundled one next to it by absolute path).
+- The full package needs no CUDA toolkit and no environment variables.
 - The CUDA runtime is linked statically on every OS, and libstdc++ is linked statically on Linux.
+
+### CUDA libraries
+
+cuBLASLt is the only CUDA library the engine loads besides the driver. The engine loads it at run time, once per process: at the first `mi_probe()` or `mi_engine_create()` (server: `hello` or `load`).
+
+**Requirements for a system copy:**
+- the same CUDA major version as the flavour (`cu13`: cuBLASLt 13.x, `cu12`: 12.x);
+- a cuBLASLt version not older than the one the build was compiled against;
+- findable in one of the locations below.
+
+A copy that fails a check is skipped, and the next location is tried.
+
+**Search order.** `MOSSINFER_CUDA_LIBS` selects the candidates. The default `auto` tries the bundled copy, then the system locations: a full package uses its own copy, and a `-system-cuda` package, which has none, a compatible system copy. `system` tries only the system locations, also in a full package; `bundled` only the bundled copy.
+
+| | Linux | Windows |
+|---|---|---|
+| System | `libcublasLt.so.<major>` through the dynamic loader (`LD_LIBRARY_PATH`, the `ld.so` cache), then by absolute path: `lib64/` and `targets/<arch>-linux/lib/` under `$CUDA_PATH`, `$CUDA_HOME`, `/usr/local/cuda-<major>` and `/usr/local/cuda`, then `/opt/cuda/lib64`, `/usr/lib/<arch>-linux-gnu`, `/usr/lib64` and `/usr/lib` (distribution packages). Relative `CUDA_PATH` / `CUDA_HOME` values are ignored. | `bin\x64\cublasLt64_<major>.dll` and `bin\cublasLt64_<major>.dll` under `%CUDA_PATH%`, then under every `%CUDA_PATH_V<major>_<minor>%` (newest first). Never the bare DLL name: the application directory would come first. |
+| Bundled | next to `libmossinfer` (`lib/`); for an executable that links the engine statically (`moss-infer`), also `../lib` | next to `mossinfer.dll` (`bin/`) |
+
+A system search that ends at the bundled file does not count as a system copy. The soname search uses the RUNPATH of the module that asks, so it reaches the bundled file first when that module's RUNPATH points at the package's `lib/`: `libmossinfer` and `moss-infer` in a build with a shared cudart (the dev preset; release builds link cudart statically and give them no such RUNPATH), or a directory on `LD_LIBRARY_PATH`. The loader then rejects that file and goes on with the absolute paths, which is why the distribution directories are listed there too.
+
+**Environment variables:**
+
+| Variable | Values | Effect |
+|---|---|---|
+| `MOSSINFER_CUDA_LIBS` | `auto` (default), `system`, `bundled` | which candidates are tried (`auto`: bundled, then system); another value is an error |
+| `MOSSINFER_CUBLASLT` | an absolute file path | only this file is tried (reported as `"env"`); it must pass the same checks. A relative path is refused. |
+
+Both variables choose code that the process loads and runs. Treat them like `LD_LIBRARY_PATH`: set them only from trusted configuration, never from user-supplied or downloaded data.
+
+**What the launcher sees.**
+- `mi_probe_info.cublaslt_source`, `cublaslt_version`, `cublaslt_path` and `cublaslt_error`, or `probe.cublaslt` in `hello`, report the copy in use.
+- Without a usable copy, the probe still answers, with the reason in `cublaslt_error`: every candidate it tried, and why each was rejected.
+- `mi_engine_create()` then fails with `MI_ERR_CUDA` and the same message (server: `load` fails with error code `cuda`).
+
+**Reproducibility.**
+- A different cuBLASLt version can change the bits of a result.
+- The engine reruns its fused-kernel self-check for each cuBLASLt version, so the correctness check always covers the copy in use.
+- Quality certificates are bound to the cuBLASLt version they were measured with. A run with another version (a system copy) finds no usable certificate, so tier `auto` runs Reference, and the report's reason names the certificate, the cuBLASLt version it was measured with and the one loaded.
+- Each report records the copy (`quality.cublaslt`).
+- The default (`auto` in a full package) and `MOSSINFER_CUDA_LIBS=bundled` run the release's own library, so results can be compared across machines.
 
 ## Model files
 
@@ -239,7 +290,7 @@ Without CMake:
 - Link `libmossinfer.so` (Windows: `mossinfer.lib`).
 - Define `MOSSINFER_SHARED`. On Windows this selects `dllimport`.
 - No CUDA headers or toolkit are needed.
-- At run time, `libmossinfer` must find its cuBLASLt, so keep the package's `lib/` (Windows: `bin/`) together.
+- At run time, `libmossinfer` loads cuBLASLt from a compatible CUDA install or from its own directory (see [CUDA libraries](#cuda-libraries)), so keep the package's `lib/` (Windows: `bin/`) together.
 
 The minimal C program is [`examples/c/minimal.c`](../examples/c/minimal.c), and [c-api.md](c-api.md) has a quick start. The rules that matter for integration:
 - **Check the ABI at startup.** Refuse to run when `mi_abi_version() != MI_ABI_VERSION`. On Windows this is the only protection against a mismatched DLL.
@@ -306,6 +357,7 @@ Features are announced by a capability bit. Check `mi_capabilities()`, or `capab
 | Image input | `MI_CAP_IMAGE_INPUT` (0x40) | `"image_input"` | set | img2img and inpainting |
 | Hires fix | `MI_CAP_HIRES` (0x80) | `"hires"` | set | the hires fix |
 | Distill bundles | `MI_CAP_DISTILL` (0x100) | `"distill"` | set | `distill_dir` / `distill`, `time_embedding_file` |
+| System CUDA reuse | `MI_CAP_SYSTEM_CUDA` (0x200) | `"system_cuda"` | set | `mi_probe_info.cublaslt_*` / `probe.cublaslt`; `MOSSINFER_CUDA_LIBS`, `MOSSINFER_CUBLASLT` |
 
 Future features will arrive the same way: **new trailing struct fields, new enum values and new capability bits** in the C API, and **new optional parameters** for the server. Leaving them unset keeps today's behaviour. A program built against an older header keeps working with a newer library, because the library accepts every older struct size (see [Versioning](#versioning)).
 
@@ -313,7 +365,7 @@ Future features will arrive the same way: **new trailing struct fields, new enum
 
 Every result carries a JSON report: `mi_result_report_json()`, or `done.report` from the server. It holds:
 - the request and the seed used;
-- the tier that ran, the quality object (certificate, configuration) and the model sources;
+- the tier that ran, the quality object (certificate, configuration, engine numerics, the cuBLASLt copy in use) and the model sources;
 - the prompt token counts, and the LoRA reports, warnings and notes;
 - the execution plan: what was resident, and the memory per phase;
 - timings per phase, and VRAM and RAM peaks;
@@ -343,6 +395,6 @@ Attach it to bug reports, together with the server's stderr log and `hello`'s `p
 
 - **MossInfer** is Apache-2.0. Ship `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES.md` with the binaries. The package has them at its root and in `share/doc/mossinfer/`. A launcher's "About / licences" page should show or link them.
 - **Third-party code** that is bundled or derived (CUTLASS, FlashAttention-2, SageAttention, comfy-kitchen and others) is listed in `THIRD_PARTY_NOTICES.md`. That file also carries the licence texts that have no file of their own. The vendored licence files are in `share/doc/mossinfer/third_party/<component>/`.
-- **cuBLASLt** is redistributed under the NVIDIA CUDA EULA: `share/doc/mossinfer/third_party/cuda/EULA.txt`.
+- **cuBLASLt** is redistributed under the NVIDIA CUDA EULA: `share/doc/mossinfer/third_party/cuda/EULA.txt`. The `-system-cuda` archives redistribute no CUDA library and carry no EULA.
 - **The NVIDIA driver** is not redistributed.
 - **The MOSS-Image weights** are published by OpenMOSS under Apache-2.0. They are downloaded separately, never bundled.

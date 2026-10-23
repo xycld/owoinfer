@@ -13,7 +13,7 @@
 //      "model": {"dit": {"files": [{"name": "x.safetensors", "size": 123, "xxh64": "0123456789abcdef"}]},
 //                "te": null},                     // the TE file(s), required exactly when te_precision != bf16
 //      "config": {"dit_precision": "int8_convrot", "attention": "exact", "te_precision": "bf16", "lora": "none"},
-//      "numerics": {"elementwise": 1, "fused_gemm": 1, "int8": 1, "te": 1},   // engine_numerics(config)
+//      "numerics": {"cublaslt": 130800, "elementwise": 1, "fused_gemm": 1, "int8": 1, "te": 1},  // engine_numerics()
 //      "gpu_arch": "sm_89",
 //      "prompt_set": {"id": "moss-ac6", "prompts": 23, "sha256": "<64 hex>"},
 //      "scope": {"max_pixels": 2102784, "samplers": ["euler"], "steps": [30, 50], "accelerators": "off"},
@@ -101,6 +101,9 @@ QualityTier tier_of(const CertConfig& c);
 // Engine numerics versions a configuration's output bits depend on, sorted by name. A certificate is usable only when
 // its stored versions equal these exactly, so bumping any of them (a kernel or op-order change) retires the
 // certificates measured before it. Keys:
+//   "cublaslt" cublasLtGetVersion() of the cuBLASLt copy in use (backend/cuda_libs.h; 0 when none is usable): always
+//     (every configuration runs cuBLASLt GEMMs, whose result bits may change between its versions, and a system copy
+//     may differ from the bundled one);
 //   "elementwise" kernels::kElementwiseNumericsVersion, "fused_gemm" kernels::fused::kFusedGemmVersion and "te"
 //     qwen35_text::kNumericsVersion: always (every configuration runs the bf16 elementwise ops, the bf16 GEMM routing
 //     of the layers kept in bf16, and the text encoder's own op order);
@@ -110,7 +113,8 @@ QualityTier tier_of(const CertConfig& c);
 //   "te_w4a8" kernels::quant::kGroupedDecodeVersion: when the TE is W4A8;
 //   "attention_q8" attention_q8::kNumericsVersion: when the attention is not exact.
 using EngineNumerics = std::vector<std::pair<std::string, std::uint64_t>>;
-EngineNumerics engine_numerics(const CertConfig& c);
+EngineNumerics engine_numerics(const CertConfig& c);  // with the version of the cuBLASLt copy this process uses
+EngineNumerics engine_numerics(const CertConfig& c, std::uint64_t cublaslt_version);  // pure
 // Empty when the configuration can carry a certificate, else why not (runtime LoRA).
 std::string uncertifiable_reason(const CertConfig& c);
 
@@ -259,7 +263,10 @@ struct CertificateQuery {
 };
 
 // Empty when `c` certifies this model, configuration, GPU class, engine numerics and request (passed, over the
-// certification prompt set, with enough OCR prompts behind every OCR gate), else why not.
+// certification prompt set, with enough OCR prompts behind every OCR gate), else why not. A certificate that matches in
+// everything but the "cublaslt" numerics entry says so: "certificate measured with cuBLASLt <X>; this process loaded
+// cuBLASLt <Y> (<source> copy <path>), so it does not apply ..." (find_certificate's reason carries it, after the file
+// name, into the tier report).
 std::string certificate_mismatch(const Certificate& c, const ModelIdentity& model, const CertificateQuery& q);
 
 struct CertificateSearch {
@@ -283,7 +290,9 @@ CertificateSearch find_certificate(const std::filesystem::path& dit, const std::
 // The "quality" object of a generation report (`--json-report`): what the run used and why, in the certificate's
 // own vocabulary, so the certification harness can confirm what it certifies:
 //   {"tier": "high", "config": {"dit_precision": ..., "attention": ..., "te_precision": ..., "lora": "none"|"active"},
-//    "numerics": {...engine_numerics(config)}, "gpu_arch": "sm_89", "reason": "...", "certificate": "<file>"|null,
+//    "numerics": {...engine_numerics(config)},
+//    "cublaslt": {"source": "system"|"bundled"|"env", "version": 130800, "path": "<file>"}|null (none usable),
+//    "gpu_arch": "sm_89", "reason": "...", "certificate": "<file>"|null,
 //    "dit": {"path": "...", "bytes": N, "identity": {"files": [...]}|null}, "te": {...}|null}
 struct QualityReport {
   CertConfig config;

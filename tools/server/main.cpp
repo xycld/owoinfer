@@ -459,13 +459,15 @@ class Server {
            tf(caps & MI_CAP_COMFYUI_MODELS) + ",\"model_files\":" + tf(caps & MI_CAP_MODEL_FILES) + ",\"lora\":" +
            tf(caps & MI_CAP_LORA) + ",\"tiers\":" + tf(caps & MI_CAP_TIERS) + ",\"samplers\":" + tf(caps & MI_CAP_SAMPLERS) +
            ",\"image_input\":" + tf(caps & MI_CAP_IMAGE_INPUT) + ",\"hires\":" + tf(caps & MI_CAP_HIRES) + ",\"distill\":" +
-           tf(caps & MI_CAP_DISTILL) +
+           tf(caps & MI_CAP_DISTILL) + ",\"system_cuda\":" + tf(caps & MI_CAP_SYSTEM_CUDA) +
            "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
            ",\"supported_device_count\":" + std::to_string(probe.supported_device_count) +
            ",\"build_flavour\":" + str(probe.build_flavour) + ",\"recommended_flavour\":" + str(probe.recommended_flavour) +
-           ",\"message\":" + str(probe.message) + (with_devices ? ",\"devices\":[" + devices + "]" : std::string()) + "}}";
+           ",\"message\":" + str(probe.message) + ",\"cublaslt\":{\"source\":" + str(probe.cublaslt_source) +
+           ",\"version\":" + std::to_string(probe.cublaslt_version) + ",\"path\":" + str(probe.cublaslt_path) +
+           ",\"error\":" + str(probe.cublaslt_error) + "}" + (with_devices ? ",\"devices\":[" + devices + "]" : std::string()) + "}}";
   }
 
   std::string load(const Params& p, const std::string& id) {

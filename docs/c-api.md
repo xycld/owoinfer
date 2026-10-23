@@ -59,7 +59,7 @@ cmake --build <build> --target mossinfer_example_c
 | `MI_ERR_OUT_OF_MEMORY` | the request fits the device or host budgets in no mode (planner), or a host allocation failed |
 | `MI_ERR_MODEL` | model files missing, incomplete or malformed; a LoRA file that cannot be applied (with `lora_strict`, also unknown keys and lossy merges) |
 | `MI_ERR_IO` | file-system error: reading weights, writing the PNG |
-| `MI_ERR_CUDA` | CUDA error or no usable device. Free the engine afterwards. |
+| `MI_ERR_CUDA` | CUDA error or no usable device. Free the engine afterwards. Also `mi_engine_create()` when no usable cuBLASLt is found: the message lists every candidate tried and why it was rejected (see [cuBLASLt](#cublaslt)). |
 | `MI_ERR_INTERNAL` | anything else |
 
 ## Threading model
@@ -376,6 +376,7 @@ The JSON report carries all of this as well: `quality`, `models` (sources, linea
 | `MI_CAP_IMAGE_INPUT` | 0x40 | set | img2img and inpainting: `init_image`, `mask` and their paths, `mask_encoding`, `resize`, `denoise_strength`, `mi_result_image()` |
 | `MI_CAP_HIRES` | 0x80 | set | `hires_width`, `hires_height`, `hires_strength`, `hires_steps` |
 | `MI_CAP_DISTILL` | 0x100 | set | `distill_dir` (both structs), `time_embedding_file` |
+| `MI_CAP_SYSTEM_CUDA` | 0x200 | set | cuBLASLt loaded at run time: the bundled copy, else (or with `MOSSINFER_CUDA_LIBS=system`) a compatible system copy; `mi_probe_info.cublaslt_*` |
 
 `MI_CAP_TIERS` covers `TURBO` as well.
 
@@ -386,6 +387,7 @@ The JSON report carries all of this as well: `quality`, `models` (sources, linea
 - the device counts
 - this library's flavour and the flavour the machine should install (`"cu13"`, `"cu12"` or `""`)
 - a summary message
+- the cuBLASLt copy the engine uses (`MI_CAP_SYSTEM_CUDA`, the fields after the 576-byte layout, see [cuBLASLt](#cublaslt))
 
 It works on machines without a driver or GPU and creates no CUDA context. When the driver is older than this build's CUDA version (a `cu13` build on a CUDA 12 driver), the CUDA runtime cannot list devices; the probe then lists them through the driver API. Each device the build could otherwise run is marked unsupported with the driver as the reason, and `"cu12"` is recommended when such a device exists.
 
@@ -394,6 +396,21 @@ It works on machines without a driver or GPU and creates no CUDA context. When t
 - **Fallback without NVML:** the driver API (`libcuda.so.1` / `nvcuda.dll`). It retains the device's primary context, calls `cuMemGetInfo` and releases the context again. The last release destroys it. If an engine already holds that context, the probe shares it and creates nothing.
 - **Never** through the CUDA runtime (whose context would stay for the life of the process), and never `cudaDeviceReset`.
 - `mi::backend::DeviceInfo::free_memory_source` records which method answered (`"nvml"` or `"driver"`). With a standard NVIDIA driver install it is NVML.
+
+### cuBLASLt
+
+The engine does not link cuBLASLt. It loads it at run time, once per process, at the first `mi_probe()` (with the current `struct_size`) or `mi_engine_create()`: by default (`auto`) the copy bundled next to the library, then a compatible system copy (the only choice of a `-system-cuda` package, which has no bundled copy). `MOSSINFER_CUDA_LIBS` (`auto`, `system`, `bundled`) and `MOSSINFER_CUBLASLT` (one file) steer the search; [integration.md](integration.md#cuda-libraries) lists the locations and the compatibility rule. Loading cuBLASLt creates no CUDA context.
+
+| Field | Value |
+|---|---|
+| `cublaslt_source` | `"system"`, `"bundled"` or `"env"` (`MOSSINFER_CUBLASLT`); `""` when no copy is usable |
+| `cublaslt_version` | `cublasLtGetVersion()` of that copy (`major * 10000 + minor * 100 + patch`, e.g. 130800); 0 when none |
+| `cublaslt_path` | the file loaded (symbolic links resolved), UTF-8; `""` when none. A path of 512 bytes or more is never cut: the field stays `""` and `cublaslt_error` says why, while `cublaslt_source` and `cublaslt_version` are still set. |
+| `cublaslt_error` | when no copy is usable: every candidate tried and why it was rejected (missing, not loadable, wrong major version, older than the build's), cut at 511 bytes (`mi_engine_create()`'s message has all of it); `""` otherwise |
+
+Without a usable copy, `mi_probe()` still returns `MI_OK` with the reason in `cublaslt_error`: the rejected candidates first (wrong version, missing entry point, the bundled file reached by a system search), then one line with the files that do not exist. Strings in `mi_probe_info` and `mi_device_info` are cut at a UTF-8 character boundary. `mi_engine_create()` then fails with `MI_ERR_CUDA` and the same message, after its argument checks and before any CUDA call. A 576-byte `mi_probe_info` (the 0.2.0 size) gets no cuBLASLt fields and starts no search.
+
+`src/backend/cuda_libs.{h,cpp}` implements the search, and `src/backend/cublaslt_shim.cpp` defines every `cublasLt*` function the engine calls, forwarding to the loaded copy. A new `cublasLt*` call needs an entry there, or the link fails with an undefined reference. The shared library keeps these definitions hidden, so it has no load-time dependency on cuBLASLt and exports no `cublasLt*` symbol (`check_package.py` checks both).
 
 ## Struct sizes
 
@@ -404,6 +421,7 @@ A versioned struct only grows at the end, so a program built against an older he
 | `mi_engine_params` | 80 (the 0.1.0 size, up to `_reserved1`), 120 (an earlier 0.2.0 header, up to `_reserved2`), 136 (0.2.0) |
 | `mi_gen_params` | 168 (the 0.1.0 size, up to `user_data`), 240 (an earlier 0.2.0 header, up to `_reserved2`), 320 (0.2.0) |
 | `mi_timings` (output) | 104 (the 0.1.0 size, up to `vae_load_s`), 128 (0.2.0) |
+| `mi_probe_info` (output) | 576 (the first 0.2.0 size, up to `_reserved0`), 1624 (0.2.0 with the cuBLASLt fields) |
 | every other output struct | its one size so far (table below) |
 
 Any other size is `MI_ERR_ABI_MISMATCH`, and the message lists the accepted sizes.
@@ -427,7 +445,7 @@ The enums are 4 bytes. ABI 1 is defined by this table: a change to an existing e
 | Struct | Size | Fields: offset |
 |---|---|---|
 | `mi_device_info` | 592 | `struct_size` 0, `index` 8, `name[256]` 12, `pci_bus_id[32]` 268, `compute_major` 300, `compute_minor` 304, `_reserved0` 308, `total_memory_bytes` 312, `free_memory_bytes` 320, `supported` 328, `unsupported_reason[256]` 332, `_reserved1` 588 |
-| `mi_probe_info` | 576 | `struct_size` 0, `driver_cuda_version` 8, `runtime_cuda_version` 12, `driver_compatible` 16, `device_count` 20, `supported_device_count` 24, `build_flavour[16]` 28, `recommended_flavour[16]` 44, `message[512]` 60, `_reserved0` 572 |
+| `mi_probe_info` | 1624 | `struct_size` 0, `driver_cuda_version` 8, `runtime_cuda_version` 12, `driver_compatible` 16, `device_count` 20, `supported_device_count` 24, `build_flavour[16]` 28, `recommended_flavour[16]` 44, `message[512]` 60, `_reserved0` 572; then `cublaslt_source[16]` 576, `cublaslt_version` 592, `_reserved1` 596, `cublaslt_path[512]` 600, `cublaslt_error[512]` 1112 |
 | `mi_engine_params` | 136 | `struct_size` 0, `model_path` 8, `model_format` 16, `mode` 20, `device_index` 24, `_reserved0` 28, `vram_budget_bytes` 32, `vram_reserve_bytes` 40, `host_ram_budget_bytes` 48, `cache_dir` 56, `embedding_cache` 64, `direct_io` 68, `block_path` 72, `_reserved1` 76; then `dit_file` 80, `text_encoder_file` 88, `vae_file` 96, `tier` 104, `attention` 108, `lora_strict` 112, `_reserved2` 116; then `time_embedding_file` 120, `distill_dir` 128 |
 | `mi_progress` | 40 | `struct_size` 0, `phase` 8, `step` 12, `total_steps` 16, `_reserved0` 20, `step_seconds` 24, `elapsed_seconds` 32 |
 | `mi_gen_params` | 320 | `struct_size` 0, `prompt` 8, `negative_prompt` 16, `width` 24, `height` 28, `steps` 32, `_reserved0` 36, `cfg` 40, `shift` 48, `seed` 56, `uncond_skip_layers` 64, `uncond_skip_layers_count` 72, `slg_layers` 80, `slg_layers_count` 88, `slg_scale` 96, `slg_start` 104, `slg_stop` 112, `max_sequence_length` 120, `sampler` 124, `progress_callback` 128, `plan_callback` 136, `preview_callback` 144, `preview_interval` 152, `_reserved1` 156, `user_data` 160; then `scheduler` 168, `noise_layout` 172, `noise_source` 176, `save_metadata` 180, `flow_multiplier` 184, `eta` 192, `s_noise` 200, `dataspace_path` 208, `loras` 216, `loras_count` 224, `include_prompts` 232, `_reserved2` 236; then `init_image` 240, `init_image_path` 248, `mask` 256, `mask_path` 264, `mask_encoding` 272, `resize` 276, `denoise_strength` 280, `hires_width` 288, `hires_height` 292, `hires_strength` 296, `hires_steps` 304, `_reserved3` 308, `distill_dir` 312 |
@@ -447,6 +465,7 @@ History, all with `MI_ABI_VERSION` 1:
 - 2026-10-21, during 0.1.0: the padding was made explicit; `mi_engine_params` grew `block_path` and `_reserved1` (72 → 80 bytes); `mi_dit_stream_stats` was added. Binaries built against an earlier header must be rebuilt.
 - 0.2.0: `mi_engine_params` grew to 120 bytes and `mi_gen_params` to 240, as trailing fields. The 0.1.0 sizes, 80 and 168 bytes, stay accepted ([Struct sizes](#struct-sizes)). `mi_lora`, `mi_tier_info`, `mi_prompt_tokens` and `mi_lora_report` were added, and `mi_sampler` gained values 2–8.
 - 0.2.0, image input: `steps` 0, a negative `cfg` and a negative `denoise_strength` became the unset markers, and `mi_gen_params_init()` at 320 bytes sets them. `mi_engine_params` grew to 136 bytes, `mi_gen_params` to 320 and `mi_timings` to 128, as trailing fields; the 120-, 240- and 104-byte layouts stay accepted. `mi_image` and `mi_image_info` were added.
+- 0.2.0, system CUDA: `mi_probe_info` grew to 1624 bytes (the cuBLASLt fields), as trailing fields; the 576-byte layout stays accepted. `MI_CAP_SYSTEM_CUDA` was added.
 
 ## Symbol visibility
 
@@ -483,8 +502,9 @@ Label `cpu` (`tests/unit/test_c_api.cpp`):
   - `DistillBundle`: a synthetic bundle (dataspace, LoRA and time-embedding files): the unset markers take its choices, explicit values stay, its LoRA is appended, its dataspace sampler refuses an image; not a directory (`INVALID_ARGUMENT`), no bundle files and a malformed dataspace file (`MODEL`); the engine side (`to_options`, `mi_engine_create`) with a missing, a matching and a conflicting `time_embedding_file`.
   - `ImageResultFromAPipelineResult`: `mi_image_info`, the image note, the time embedding, the new timings and an INT4 DiT as `W4A4` from a synthetic result.
 - **`c_abi_compat`** (`tests/c/test_abi_compat.c`, C11): a hand-written 0.1.0-layout `mi_engine_params` and `mi_gen_params` through `*_init`, `mi_gen_params_validate()` and `mi_engine_create()` (as far as the model path check). With weights, `c_abi_compat_gpu` (label `gpu`) also generates from them and checks that the PNG has no text chunks.
-- **`CApiReport.*`** renders the report (through the adapter and the shared renderer) from a synthetic result under a comma-decimal C++ locale with digit grouping, and under a comma-decimal C locale where the system has one. It checks for valid JSON, exact numbers, `null` for NaN and infinity, the `dit_blocks` and `dit_stream` keys, and that the document is the CLI's fields in braces.
+- **`CApiReport.*`** renders the report (through the adapter and the shared renderer) from a synthetic result under a comma-decimal C++ locale with digit grouping, and under a comma-decimal C locale where the system has one. It checks for valid JSON, exact numbers, `null` for NaN and infinity, the `dit_blocks` and `dit_stream` keys, `quality.cublaslt`, and that the document is the CLI's fields in braces.
 - **`PipelineReport.*`** (`tests/unit/test_pipeline_report.cpp`) covers the shared renderer itself: every key, the head/tail split around the image path, U+FFFD for ill-formed UTF-8, `null` for non-finite numbers, and the classic locale.
+- **`CudaLibs.*`** (`tests/unit/test_backend_cuda_libs.cpp`) covers the cuBLASLt search: `MOSSINFER_CUDA_LIBS` parsing, the compatibility rule, the candidate lists of each policy on Linux and Windows (injected environment and module directory), `MOSSINFER_CUBLASLT` as the only candidate, the error listing for a missing file and for a library without cuBLASLt's symbols, the system search on this machine, and the shim forwarding to the process's copy. `CApi.ProbeWithoutRequiringAGpu` checks the probe's cuBLASLt fields and the 576-byte size.
 
 Label `gpu`:
 - **`GpuCApiProbe.*`**: after `mi_probe_device()`, the process holds no CUDA context. This is checked through the driver's primary-context state and NVML's process list.

@@ -1,5 +1,5 @@
-# Tag v<MAJOR>.<MINOR>.<PATCH>: build and check all four flavours (build.yml), then publish their archives and a
-# SHA256SUMS file as a GitHub release. The tag must equal the MI_VERSION_* of include/mossinfer/mossinfer.h.
+# Tag v<MAJOR>.<MINOR>.<PATCH>: build and check all four flavours (build.yml), then publish their archives (the full
+# package and the -system-cuda variant of each) and a SHA256SUMS file as a GitHub release. The tag must equal the MI_VERSION_* of include/mossinfer/mossinfer.h.
 name: release
 
 on:
@@ -44,6 +44,20 @@ jobs:
           pattern: mossinfer-*
           path: dist
           merge-multiple: true
+      - name: Both variants of every flavour
+        shell: bash
+        working-directory: dist
+        run: |
+          n=0
+          for full in mossinfer-*.zip mossinfer-*.tar.gz; do
+            [ -f "$full" ] || continue
+            case "$full" in *-system-cuda.*) continue ;; esac
+            case "$full" in *.tar.gz) ext="tar.gz"; base="${full%.tar.gz}" ;; *) ext="zip"; base="${full%.zip}" ;; esac
+            test -f "$base-system-cuda.$ext" || { echo "missing $base-system-cuda.$ext"; exit 1; }
+            n=$((n + 1))
+          done
+          echo "$n full archives, each with its -system-cuda variant"
+          test "$n" -gt 0
       - name: SHA256SUMS
         shell: bash
         working-directory: dist

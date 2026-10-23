@@ -236,13 +236,24 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertEqual(res["abi_version"], 1)
         self.assertEqual(res["capabilities"], {"preview": True, "comfyui_models": False, "model_files": True,
                                                "lora": True, "tiers": True, "samplers": True,
-                                               "image_input": True, "hires": True, "distill": True})
+                                               "image_input": True, "hires": True, "distill": True,
+                                               "system_cuda": True})
         probe = res["probe"]
         self.assertGreaterEqual(probe["device_count"], probe["supported_device_count"])
         self.assertIn(probe["recommended_flavour"], ("cu12", "cu13", ""))
         self.assertIn(probe["build_flavour"], ("cu12", "cu13"))
         self.assertTrue(probe["message"])
         self.assertNotIn("devices", probe)
+        lt = probe["cublaslt"]
+        self.assertEqual(set(lt), {"source", "version", "path", "error"})
+        if lt["source"]:
+            self.assertIn(lt["source"], ("system", "bundled", "env"))
+            self.assertEqual(lt["version"] // 10000, {"cu12": 12, "cu13": 13}[probe["build_flavour"]])
+            self.assertTrue(os.path.isfile(lt["path"]), lt)
+            self.assertEqual(lt["error"], "")
+        else:
+            self.assertEqual((lt["version"], lt["path"]), (0, ""))
+            self.assertIn("tried", lt["error"])
         self.assertError(self.server.call("hello", {"protocol_version": 2}, id="v2"), "unsupported_protocol", "v2")
 
     def test_status_and_idle_commands_without_engine(self):

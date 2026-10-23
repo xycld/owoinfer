@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "api/pipeline_adapter.h"
+#include "backend/cuda_libs.h"
 #include "backend/probe.h"
 #include "core/cuda_check.h"
 #include "pipeline/pipeline_image.h"
@@ -69,7 +70,7 @@ MI_LAYOUT(mi_device_info, free_memory_bytes, 320);
 MI_LAYOUT(mi_device_info, supported, 328);
 MI_LAYOUT(mi_device_info, unsupported_reason, 332);
 MI_LAYOUT(mi_device_info, _reserved1, 588);
-static_assert(sizeof(mi_probe_info) == 576);
+static_assert(sizeof(mi_probe_info) == 1624);
 MI_LAYOUT(mi_probe_info, struct_size, 0);
 MI_LAYOUT(mi_probe_info, driver_cuda_version, 8);
 MI_LAYOUT(mi_probe_info, runtime_cuda_version, 12);
@@ -79,7 +80,12 @@ MI_LAYOUT(mi_probe_info, supported_device_count, 24);
 MI_LAYOUT(mi_probe_info, build_flavour, 28);
 MI_LAYOUT(mi_probe_info, recommended_flavour, 44);
 MI_LAYOUT(mi_probe_info, message, 60);
-MI_LAYOUT(mi_probe_info, _reserved0, 572);
+MI_LAYOUT(mi_probe_info, _reserved0, 572);  // the 0.2.0 layout ends here (576 bytes)
+MI_LAYOUT(mi_probe_info, cublaslt_source, 576);
+MI_LAYOUT(mi_probe_info, cublaslt_version, 592);
+MI_LAYOUT(mi_probe_info, _reserved1, 596);
+MI_LAYOUT(mi_probe_info, cublaslt_path, 600);
+MI_LAYOUT(mi_probe_info, cublaslt_error, 1112);
 static_assert(sizeof(mi_engine_params) == 136);
 MI_LAYOUT(mi_engine_params, struct_size, 0);
 MI_LAYOUT(mi_engine_params, model_path, 8);
@@ -259,9 +265,11 @@ constexpr std::size_t kEngineParamsSizes[] = {offsetof(mi_engine_params, dit_fil
                                                offsetof(mi_engine_params, time_embedding_file), sizeof(mi_engine_params)};
 constexpr std::size_t kGenParamsSizes[] = {offsetof(mi_gen_params, scheduler), offsetof(mi_gen_params, init_image),
                                             sizeof(mi_gen_params)};
-// Output structs that grew: mi_timings (0.1.0: 104 bytes).
+// Output structs that grew: mi_timings (0.1.0: 104 bytes), mi_probe_info (0.2.0: 576 bytes).
 constexpr std::size_t kTimingsSizes[] = {offsetof(mi_timings, vae_encoder_load_s), sizeof(mi_timings)};
+constexpr std::size_t kProbeInfoSizes[] = {offsetof(mi_probe_info, cublaslt_source), sizeof(mi_probe_info)};
 static_assert(kEngineParamsSizes[0] == 80 && kGenParamsSizes[0] == 168 && kTimingsSizes[0] == 104, "the 0.1.0 layouts");
+static_assert(kProbeInfoSizes[0] == 576, "the 0.2.0 mi_probe_info");
 static_assert(kEngineParamsSizes[1] == 120 && kGenParamsSizes[1] == 240, "the first 0.2.0 layouts");
 
 thread_local std::string t_last_error;
@@ -323,6 +331,8 @@ mi_status guarded(F&& body) noexcept {
   } catch (const std::filesystem::filesystem_error& e) {
     return fail(MI_ERR_IO, e.what());
   } catch (const mi::CudaError& e) {
+    return fail(MI_ERR_CUDA, e.what());
+  } catch (const mi::backend::CudaLibraryError& e) {
     return fail(MI_ERR_CUDA, e.what());
   } catch (const std::exception& e) {
     return fail(MI_ERR_INTERNAL, e.what());
@@ -480,10 +490,14 @@ const std::vector<std::string>* messages(const mi::api::Generation& g, mi_messag
   return nullptr;
 }
 
-// Truncating copy into a fixed char array (always NUL-terminated).
+// Truncating copy into a fixed char array (always NUL-terminated). A cut never splits a UTF-8 sequence: it backs off
+// to the start of the character that does not fit.
 template <std::size_t N>
 void copy_string(char (&dst)[N], const std::string& s) {
-  const std::size_t n = s.size() < N - 1 ? s.size() : N - 1;
+  std::size_t n = s.size() < N - 1 ? s.size() : N - 1;
+  if (n < s.size()) {
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) --n;  // s[n] continues a sequence
+  }
   std::memcpy(dst, s.data(), n);
   dst[n] = '\0';
 }
@@ -531,13 +545,13 @@ const char* mi_last_error_message(void) {
 
 uint32_t mi_capabilities(void) {
   return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS | MI_CAP_IMAGE_INPUT | MI_CAP_HIRES |
-         MI_CAP_DISTILL;
+         MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA;
 }
 
 mi_status mi_probe(mi_probe_info* info) {
   return guarded([&] {
     require(info, "info");
-    check_size(info->struct_size, sizeof(mi_probe_info), "mi_probe_info");
+    check_size(info->struct_size, kProbeInfoSizes, "mi_probe_info");
     mi::backend::ProbeOptions options;
     options.query_free_memory = false;
     const mi::backend::ProbeResult r = mi::backend::probe(options);
@@ -550,6 +564,20 @@ mi_status mi_probe(mi_probe_info* info) {
     copy_string(out.build_flavour, flavour_string(r.build_flavour));
     copy_string(out.recommended_flavour, flavour_string(r.recommended));
     copy_string(out.message, r.reason);
+    if (info->struct_size > kProbeInfoSizes[0]) {  // a 0.2.0 caller does not pay for the search
+      // Loads a shared library only: no CUDA call, no context.
+      const mi::backend::CublasLtStatus lt = mi::backend::cublaslt_status();
+      copy_string(out.cublaslt_source, lt.ok ? lt.info.source : std::string());
+      out.cublaslt_version = lt.ok ? static_cast<int32_t>(lt.info.version) : 0;
+      if (lt.ok && lt.info.path.size() >= sizeof(out.cublaslt_path)) {
+        // A cut path would name another file: no path, and why.
+        copy_string(out.cublaslt_error, "the path of the cuBLASLt copy in use (" + std::to_string(lt.info.path.size()) +
+                                            " bytes) does not fit cublaslt_path: " + lt.info.path);
+      } else {
+        copy_string(out.cublaslt_path, lt.ok ? lt.info.path : std::string());
+        copy_string(out.cublaslt_error, lt.ok ? std::string() : lt.error);
+      }
+    }
     write_output(info, out);
     return MI_OK;
   });

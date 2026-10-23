@@ -116,7 +116,7 @@ target_compile_options(mossinfer_core PRIVATE
 # Vendored CUTLASS/CuTe headers (BSD-3, see third_party/cutlass/VENDORED.md), CUDA translation units only.
 target_include_directories(mossinfer_core SYSTEM PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:${CMAKE_SOURCE_DIR}/third_party/cutlass/include ${CMAKE_SOURCE_DIR}/third_party/cutlass/tools/util/include>)
-target_link_libraries(mossinfer_core PUBLIC CUDA::cudart CUDA::cublasLt)
+target_link_libraries(mossinfer_core PUBLIC CUDA::cudart ${CMAKE_DL_LIBS})  # cuBLASLt: loaded at run time (src/backend/cuda_libs.h)
 set_target_properties(mossinfer_core PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_SEPARABLE_COMPILATION OFF)
 
 # torch_cpu_randn, the INT8 ConvRot quantizer and the LoRA merge are bit-exact only if the compiler neither contracts

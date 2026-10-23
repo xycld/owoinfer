@@ -4,9 +4,12 @@
 
 #include <gtest/gtest.h>
 
+#include <cublasLt.h>  // never cublas_api.h directly: CUDA 12 requires CUBLASAPI, which cublasLt.h defines
+
 #include <atomic>
 #include <clocale>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +25,7 @@
 #include <vector>
 
 #include "api/pipeline_adapter.h"
+#include "backend/cuda_libs.h"
 #include "cuda_context_check.h"
 #include "models/lora/lora.h"
 #include "pipeline/pipeline.h"
@@ -83,12 +87,13 @@ TEST(CApi, VersionAndAbi) {
   EXPECT_EQ(mi_abi_version(), MI_ABI_VERSION);
   // P6: preview, component files, LoRA, tiers and the extended samplers; a ComfyUI file as model_path is not.
   EXPECT_EQ(mi_capabilities(), MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS |
-                                  MI_CAP_IMAGE_INPUT | MI_CAP_HIRES | MI_CAP_DISTILL);
+                                  MI_CAP_IMAGE_INPUT | MI_CAP_HIRES | MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA);
   EXPECT_EQ(mi_capabilities() & MI_CAP_COMFYUI_MODELS, 0u);
   EXPECT_EQ(MI_CAP_PREVIEW | MI_CAP_COMFYUI_MODELS | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS, 0x3fu);
   EXPECT_EQ(MI_CAP_IMAGE_INPUT, 0x40u);
   EXPECT_EQ(MI_CAP_HIRES, 0x80u);
   EXPECT_EQ(MI_CAP_DISTILL, 0x100u);
+  EXPECT_EQ(MI_CAP_SYSTEM_CUDA, 0x200u);
   EXPECT_STREQ(mi_status_string(MI_OK), "MI_OK");
   EXPECT_STREQ(mi_status_string(MI_CANCELLED), "MI_CANCELLED");
   EXPECT_STREQ(mi_status_string(MI_ERR_BUSY), "MI_ERR_BUSY");
@@ -1016,6 +1021,14 @@ TEST(CApiReport, NumbersAreLocaleIndependent) {
   EXPECT_EQ(doc.at("dit_stream").at("bytes").as_int(), 12345678901);
   EXPECT_EQ(doc.at("dit_stream").at("h2d_gbps").as_double(), 24.6914);  // 12345678901 / 0.5 / 1e9, %.6g
   EXPECT_EQ(doc.at("dit_stream").at("steps").as_array().at(0).at("h2d_gbps").as_double(), 24.5);
+  // The quality object records the cuBLASLt copy in use (a null object when none is usable).
+  const mi::backend::CublasLtStatus lt = mi::backend::cublaslt_status();
+  const mi::json::Value& quality = doc.at("quality");
+  EXPECT_EQ(quality.at("cublaslt").is_null(), !lt.ok);
+  if (lt.ok) {
+    EXPECT_EQ(quality.at("cublaslt").at("path").as_string(), lt.info.path);
+  }
+  EXPECT_EQ(static_cast<std::uint64_t>(quality.at("numerics").at("cublaslt").as_int()), lt.ok ? lt.info.version : 0u);
   // One document: the CLI's report fields in braces.
   EXPECT_EQ(json, "{\n" + mi::pipeline::report_fields(q, r, "out.png", "") + "\n}\n");
 }
@@ -1058,6 +1071,43 @@ TEST(CApi, ProbeWithoutRequiringAGpu) {
   }
   EXPECT_EQ(std::string(info.build_flavour), CUDART_VERSION >= 13000 ? "cu13" : "cu12");
   std::printf("[c_api] probe: %s (flavour '%s')\n", info.message, info.recommended_flavour);
+  // The cuBLASLt copy: the process's search result (loading it creates no CUDA context: the cpu guard checks).
+  EXPECT_EQ(info._reserved1, 0);
+  const mi::backend::CublasLtStatus lt = mi::backend::cublaslt_status();
+  if (lt.ok) {
+    EXPECT_EQ(std::string(info.cublaslt_source), lt.info.source);
+    EXPECT_TRUE(lt.info.source == "system" || lt.info.source == "bundled" || lt.info.source == "env") << lt.info.source;
+    EXPECT_EQ(static_cast<std::size_t>(info.cublaslt_version), lt.info.version);
+    EXPECT_EQ(info.cublaslt_version / 10000, CUBLAS_VER_MAJOR);
+    EXPECT_EQ(std::string(info.cublaslt_path), lt.info.path);
+    EXPECT_TRUE(std::filesystem::exists(mi::util::path_from_utf8(info.cublaslt_path))) << info.cublaslt_path;
+    EXPECT_STREQ(info.cublaslt_error, "");
+  } else {
+    EXPECT_STREQ(info.cublaslt_source, "");
+    EXPECT_EQ(info.cublaslt_version, 0);
+    EXPECT_STREQ(info.cublaslt_path, "");
+    EXPECT_NE(std::string(info.cublaslt_error).find("tried"), std::string::npos) << info.cublaslt_error;
+  }
+  std::printf("[c_api] cuBLASLt: '%s' %d %s%s\n", info.cublaslt_source, info.cublaslt_version, info.cublaslt_path,
+              info.cublaslt_error);
+
+  // The 0.2.0 size (576 bytes, before the cuBLASLt fields) is still accepted, and nothing past it is written.
+  mi_probe_info prev;
+  std::memset(&prev, 0x5a, sizeof prev);
+  prev.struct_size = offsetof(mi_probe_info, cublaslt_source);
+  ASSERT_EQ(prev.struct_size, 576u);
+  ASSERT_EQ(mi_probe(&prev), MI_OK) << last_error();
+  EXPECT_EQ(prev.struct_size, 576u);
+  EXPECT_EQ(prev.device_count, info.device_count);
+  EXPECT_EQ(prev._reserved0, 0);
+  const auto* bytes = reinterpret_cast<const unsigned char*>(&prev);
+  for (std::size_t i = 576; i < sizeof prev; ++i) ASSERT_EQ(bytes[i], 0x5a) << "byte " << i << " written";
+  for (const std::size_t bad : {std::size_t{568}, std::size_t{584}, sizeof prev - 8, sizeof prev + 8}) {
+    mi_probe_info p{};
+    p.struct_size = bad;
+    EXPECT_EQ(mi_probe(&p), MI_ERR_ABI_MISMATCH) << bad;
+    EXPECT_NE(last_error().find("576 or 1624"), std::string::npos) << last_error();
+  }
 
   mi_device_info dev{};
   dev.struct_size = sizeof dev;

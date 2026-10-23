@@ -1,6 +1,7 @@
 # Reusable build of the four release flavours (Linux/Windows x CUDA 12/13), called by ci.yml and release.yml.
 # Per flavour: configure + build with the CMakePresets.json release preset, CPU-only tests (hosted runners have no
-# GPU), install, AC1 (no torch/python) + exports + AC17 (size) checks, the find_package consumer, CPack archives.
+# GPU), install, AC1 (no torch/python) + exports + AC17 (size) + cuBLASLt-through-the-shim checks, the find_package
+# consumer, CPack archives, and the system-CUDA variant (the install without the `cuda` component: no cuBLASLt).
 name: build
 
 on:
@@ -86,7 +87,8 @@ jobs:
       - name: CUDA DLL directory (Windows)
         if: runner.os == 'Windows'
         run: |
-          # CUDA 13 keeps its DLLs in bin/x64; tests and the consumer load cuBLASLt from PATH.
+          # CUDA 13 keeps its DLLs in bin/x64. The engine finds cuBLASLt through CUDA_PATH, never PATH
+          # (src/backend/cuda_libs.h); PATH is for other tools that look for the toolkit's DLLs.
           cuda_path="$(cygpath -u "$CUDA_PATH")"
           if [ -d "$cuda_path/bin/x64" ]; then cygpath -w "$cuda_path/bin/x64" >> "$GITHUB_PATH"; fi
           nvcc --version
@@ -109,20 +111,51 @@ jobs:
       - name: Install
         run: cmake --install "build-$preset" --prefix "build-$preset/install"
 
+      - name: Install the system-CUDA variant
+        # Everything but the `cuda` component (cmake/modules/packaging.cmake): no cuBLASLt, no CUDA EULA.
+        run: cmake --install "build-$preset" --component Unspecified --prefix "build-$preset/install-system-cuda"
+
       - name: AC1 / exports / AC17 / find_package consumer
         run: |
-          python .github/scripts/check_package.py --prefix "build-$preset/install" \
+          cuda="${{ matrix.cuda }}"
+          python .github/scripts/check_package.py --prefix "build-$preset/install" --cuda-major "${cuda%%.*}" \
             --consumer examples/consumer-cmake --consumer-build "build-$preset/consumer" --run-consumer
+
+      - name: AC1 / exports / AC17 / no CUDA libraries (system-CUDA variant)
+        run: python .github/scripts/check_package.py --prefix "build-$preset/install-system-cuda" --system-cuda
 
       - name: Package
         working-directory: build-${{ env.preset }}
         run: cpack --config CPackConfig.cmake
 
+      - name: Package the system-CUDA variant
+        # The CPack archives' layout (one top-level directory named like the archive) and checksum files, from the
+        # system-CUDA install: mossinfer-<version>-<os>-cu<N>-<arch>-system-cuda.{zip,tar.gz}.
+        working-directory: build-${{ env.preset }}
+        run: |
+          full=$(ls mossinfer-*.zip | grep -v -- '-system-cuda\.zip$')
+          [ "$(echo "$full" | wc -l)" -eq 1 ] || { echo "expected one CPack zip, got: $full"; exit 1; }
+          name="${full%.zip}-system-cuda"
+          rm -rf stage-system-cuda
+          mkdir stage-system-cuda
+          cp -a install-system-cuda "stage-system-cuda/$name"
+          formats="zip"
+          if [ "$RUNNER_OS" = "Linux" ]; then formats="zip tar.gz"; fi
+          for ext in $formats; do
+            if [ "$ext" = "zip" ]; then flags="cf"; fmt="--format=zip"; else flags="czf"; fmt="--format=gnutar"; fi
+            (cd stage-system-cuda && cmake -E tar "$flags" "../$name.$ext" "$fmt" "$name")
+            cmake -E sha256sum "$name.$ext" > "$name.$ext.sha256"
+            cat "$name.$ext.sha256"
+          done
+
       - name: AC17 size of the archive
         run: |
           for archive in build-"$preset"/mossinfer-*.zip build-"$preset"/mossinfer-*.tar.gz; do
             [ -f "$archive" ] || continue
-            python .github/scripts/check_package.py --archive "$archive"
+            case "$archive" in
+              *-system-cuda.*) python .github/scripts/check_package.py --archive "$archive" --system-cuda ;;
+              *) python .github/scripts/check_package.py --archive "$archive" ;;
+            esac
           done
           sccache --show-stats
 

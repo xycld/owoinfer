@@ -28,6 +28,7 @@
 #include <unistd.h>
 #endif
 
+#include "backend/cuda_libs.h"
 #include "core/cuda_check.h"
 #include "kernels/attention_q8/attention_q8.h"
 #include "kernels/basic/elementwise.h"
@@ -612,12 +613,53 @@ std::uint64_t hash_file(const fs::path& path, std::uint64_t expected_size) {
   return h.digest();
 }
 
-// certificate_mismatch's checks; with sizes_only the content hashes are not compared (pre-check identities).
+// The "cublaslt" entry of engine numerics; 0 when absent.
+std::uint64_t cublaslt_of(const EngineNumerics& n) {
+  for (const auto& [k, v] : n) {
+    if (k == "cublaslt") return v;
+  }
+  return 0;
+}
+
+// Equal but for the cuBLASLt version.
+bool same_except_cublaslt(const EngineNumerics& a, const EngineNumerics& b) {
+  EngineNumerics x = a, y = b;
+  const auto drop = [](EngineNumerics& n) {
+    n.erase(std::remove_if(n.begin(), n.end(), [](const auto& e) { return e.first == "cublaslt"; }), n.end());
+  };
+  drop(x);
+  drop(y);
+  return x == y;
+}
+
+// A certificate that would apply but for the cuBLASLt version: which copy this process loaded, and why that matters.
+std::string cublaslt_mismatch(const Certificate& c, const CertificateQuery& q) {
+  const std::uint64_t measured = cublaslt_of(c.numerics), loaded = cublaslt_of(q.numerics);
+  std::string copy = "cuBLASLt " + backend::cublaslt_version_string(loaded);
+  if (loaded == 0) {
+    copy = "no usable cuBLASLt";
+  } else if (const backend::CublasLtStatus lt = backend::cublaslt_status(); lt.ok && lt.info.version == loaded) {
+    copy += " (" + lt.info.source + " copy " + lt.info.path + ")";
+  }
+  return "certificate measured with cuBLASLt " + backend::cublaslt_version_string(measured) + "; this process loaded " +
+         copy + ", so it does not apply" +
+         (loaded != 0 ? std::string(" (MOSSINFER_CUDA_LIBS=bundled runs the release's own cuBLASLt)") : std::string());
+}
+
+// certificate_mismatch's checks; with sizes_only the content hashes are not compared (pre-check identities). A
+// certificate that differs from the query only in the cuBLASLt version gets its own reason, once every other check
+// has passed, so the report can say that the certificate exists but was measured with another cuBLASLt.
 std::string mismatch(const Certificate& c, const ModelIdentity& model, const CertificateQuery& q, bool sizes_only) {
   if (std::string why = uncertifiable_reason(q.config); !why.empty()) return why;
   if (c.config != q.config) return "certificate for another configuration";
   if (c.gpu_arch != q.gpu_arch) return "certificate for " + c.gpu_arch + ", this GPU is " + q.gpu_arch;
-  if (c.numerics != q.numerics) return "certificate from other engine numerics (re-certify after a numerics change)";
+  bool other_cublaslt = false;
+  if (c.numerics != q.numerics) {
+    if (!same_except_cublaslt(c.numerics, q.numerics)) {
+      return "certificate from other engine numerics (re-certify after a numerics change)";
+    }
+    other_cublaslt = true;
+  }
   if (!c.passed) return "the configuration failed certification";
   if (c.prompt_set != kCertPromptSetId || c.prompts != kCertPrompts ||
       (c.prompt_set_sha256 != kCertPromptSetSha256Base && c.prompt_set_sha256 != kCertPromptSetSha256Sft)) {
@@ -645,6 +687,7 @@ std::string mismatch(const Certificate& c, const ModelIdentity& model, const Cer
   if (c.model.te.has_value() != model.te.has_value() || (c.model.te && !same(*c.model.te, *model.te))) {
     return "certificate for other text-encoder weights";
   }
+  if (other_cublaslt) return cublaslt_mismatch(c, q);
   return {};
 }
 
@@ -716,7 +759,13 @@ QualityTier tier_of(const CertConfig& c) {
 }
 
 EngineNumerics engine_numerics(const CertConfig& c) {
-  EngineNumerics n{{"elementwise", kernels::kElementwiseNumericsVersion},
+  const backend::CublasLtStatus lt = backend::cublaslt_status();
+  return engine_numerics(c, lt.ok ? lt.info.version : 0);
+}
+
+EngineNumerics engine_numerics(const CertConfig& c, std::uint64_t cublaslt_version) {
+  EngineNumerics n{{"cublaslt", cublaslt_version},
+                   {"elementwise", kernels::kElementwiseNumericsVersion},
                    {"fused_gemm", kernels::fused::kFusedGemmVersion},
                    {"te", qwen35_text::kNumericsVersion}};
   if (c.dit == DitPrecision::kInt8ConvRot || c.te == TePrecision::kInt8ConvRot || c.te == TePrecision::kW4A8) {
@@ -1058,10 +1107,15 @@ std::string quality_report_json(const QualityReport& r) {
            ", \"identity\": " + (id ? component_json(*id) : std::string("null")) + "}";
   };
   const CertConfig& c = r.config;
+  const backend::CublasLtStatus lt = backend::cublaslt_status();
+  const std::string cublaslt = lt.ok ? "{\"source\": " + json_escape(lt.info.source) + ", \"version\": " +
+                                           std::to_string(lt.info.version) + ", \"path\": " + json_escape(lt.info.path) + "}"
+                                     : std::string("null");
   return "{\"tier\": \"" + std::string(cert_token(tier_of(c))) + "\", \"config\": {\"dit_precision\": \"" +
          std::string(cert_token(c.dit)) + "\", \"attention\": \"" + std::string(cert_token(c.attention)) +
          "\", \"te_precision\": \"" + std::string(cert_token(c.te)) + "\", \"lora\": \"" + (c.lora ? "active" : "none") +
-         "\"}, \"numerics\": " + numerics_json(engine_numerics(c)) + ", \"gpu_arch\": " + json_escape(r.gpu_arch) +
+         "\"}, \"numerics\": " + numerics_json(engine_numerics(c, lt.ok ? lt.info.version : 0)) +
+         ", \"cublaslt\": " + cublaslt + ", \"gpu_arch\": " + json_escape(r.gpu_arch) +
          ", \"reason\": " + json_escape(r.reason) + ", \"certificate\": " +
          (r.certificate.empty() ? std::string("null") : json_escape(util::path_utf8(r.certificate))) +
          ", \"dit\": " + component(r.dit, r.dit_bytes, r.dit_identity) + ", \"te\": " + component(r.te, r.te_bytes, r.te_identity) + "}";

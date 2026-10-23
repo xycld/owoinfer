@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "backend/cuda_driver.h"
+#include "backend/cuda_libs.h"
 #include "core/cuda_check.h"
 #include "models/lora/lora.h"
 #include "models/moss_dit/distill.h"
@@ -654,6 +655,7 @@ PipelineAdapter::PipelineAdapter(const mi_engine_params& params) : impl_(std::ma
   impl_->model = model_dir(params);
   const pipeline::PipelineOptions options = to_options(params);
   impl_->time_embedding = options.time_embedding_file;
+  backend::load_cublaslt();  // before any CUDA work: no usable copy is CudaLibraryError (MI_ERR_CUDA), with every candidate
   const backend::ScopedCurrentContext restore;  // the caller's CUDA context is current again on return
   int count = 0;
   MI_CUDA_CHECK(cudaGetDeviceCount(&count));
