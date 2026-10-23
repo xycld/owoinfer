@@ -12,6 +12,7 @@ namespace {
 
 constexpr std::uint64_t kOff = std::numeric_limits<std::uint64_t>::max();
 std::atomic<std::uint64_t> g_pinned_left{kOff};  // bytes still allowed before the seam fails pinned allocations
+std::atomic<std::atomic<bool>*> g_chunk_cancel{nullptr};
 std::atomic<ResidencyQuery> g_query{ResidencyQuery::kAuto};
 
 }  // namespace
@@ -19,6 +20,13 @@ std::atomic<ResidencyQuery> g_query{ResidencyQuery::kAuto};
 void fail_pinned_alloc_after(std::uint64_t bytes) { g_pinned_left.store(bytes == kOff ? kOff - 1 : bytes); }
 
 void clear_fail_pinned_alloc() { g_pinned_left.store(kOff); }
+
+void cancel_after_first_host_chunk(std::atomic<bool>* flag) { g_chunk_cancel.store(flag); }
+
+void after_host_chunk() {
+  if (g_chunk_cancel.load(std::memory_order_relaxed) == nullptr) return;  // the production path: one relaxed load
+  if (std::atomic<bool>* flag = g_chunk_cancel.exchange(nullptr)) flag->store(true);
+}
 
 void check_pinned_alloc(std::size_t bytes) {
   std::uint64_t left = g_pinned_left.load(std::memory_order_relaxed);

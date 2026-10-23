@@ -283,6 +283,21 @@ TEST(DitLoadIo, MergeMemoDropRule) {
   EXPECT_TRUE(mi::pipeline::merge_memo_unaffordable(p, 0));
 }
 
+// A release whose cancel is already set does nothing: no device memory freed, no copy made, the note says why. Nothing
+// is loaded (the constructor still creates the CUDA streams, so it is a Gpu suite), so it needs no weights.
+TEST(GpuPipelineRelease, CancelledBeforeItStartedReleasesNothing) {
+  Pipeline pipe;
+  std::atomic<bool> cancel{true};
+  for (const bool keep : {false, true}) {
+    const mi::pipeline::ReleaseReport rep = pipe.release_device_memory(keep, &cancel);
+    EXPECT_EQ(rep.note, "cancelled before it started");
+    EXPECT_EQ(rep.vram_released, std::size_t{0});
+    EXPECT_FALSE(rep.dit_host_copy);
+    EXPECT_FALSE(rep.te_host_copy);
+    EXPECT_EQ(rep.host_copy_bytes, std::uint64_t{0});
+  }
+}
+
 // preload() loads what the plan keeps (the DiT and the VAE decoder here); the next generate() of that request loads
 // nothing and gives the bits of a pipeline without the preload. A cancelled preload loads nothing and leaves the
 // pipeline usable; one that cannot fit the budgets throws before loading.
@@ -296,9 +311,30 @@ TEST(GpuPipelinePreload, FollowingGenerateReusesItBitIdentically) {
   }
   mi::pipeline::PreloadOptions po;
   po.request = req;
+  using mi::pipeline::Phase;
+  std::vector<std::string> events;  // "plan" and the phases, in order
+  const auto name = [](Phase p) { return "phase" + std::to_string(static_cast<int>(p)); };
+  mi::planner::ExecutionPlan seen;
+  po.on_plan = [&](const mi::planner::ExecutionPlan& plan) {
+    seen = plan;
+    events.push_back("plan");
+  };
+  po.on_phase = [&](Phase p) {
+    events.push_back(name(p));
+    return true;
+  };
   {
     Pipeline pipe(int4_options());
     const Result pre = pipe.preload(po);
+    ASSERT_FALSE(events.empty());
+    EXPECT_EQ(events.front(), "plan") << "the plan callback fires before the first load phase";
+    // The order of run()'s preload block, from the plan: the text encoder's host copy, the DiT (unless parked for the
+    // text encoder), the VAE decoder (unless the DiT is parked for the decode). A text-to-image request has no VAE encoder.
+    std::vector<std::string> expected{"plan"};
+    if (seen.te.run && seen.te.residency == mi::planner::TeResidency::kHostResident) expected.push_back(name(Phase::kTextEncoder));
+    if (!seen.dit.park_for_text_encoder) expected.push_back(name(Phase::kDitLoad));
+    if (!seen.dit.park_for_decode) expected.push_back(name(Phase::kDecode));
+    EXPECT_EQ(events, expected) << "plan first, then one phase per model load, in load order";
     EXPECT_FALSE(pre.cancelled);
     EXPECT_EQ(pre.memory.dit_loads, 1);
     EXPECT_EQ(pre.dit_load.source, "files");
@@ -320,6 +356,39 @@ TEST(GpuPipelinePreload, FollowingGenerateReusesItBitIdentically) {
                 r.timings.total_s, plain.timings.total_s);
   }
 
+  // on_phase returning false cancels the preload at that phase, before its load.
+  {
+    Pipeline pipe(int4_options());
+    mi::pipeline::PreloadOptions stop = po;
+    stop.on_plan = nullptr;
+    stop.on_phase = [](Phase p) { return p != Phase::kDitLoad; };
+    const Result r = pipe.preload(stop);
+    EXPECT_TRUE(r.cancelled);
+    EXPECT_EQ(r.memory.dit_loads, 0);
+  }
+  // An earlier or later phase: the text encoder's host copy if the plan has one (nothing after it loads), else the VAE
+  // (the DiT before it stays loaded, the VAE is not).
+  const bool te_first = std::find(events.begin(), events.end(), name(Phase::kTextEncoder)) != events.end();
+  if (te_first || std::find(events.begin(), events.end(), name(Phase::kDecode)) != events.end()) {
+    const Phase at = te_first ? Phase::kTextEncoder : Phase::kDecode;
+    Pipeline pipe(int4_options());
+    mi::pipeline::PreloadOptions stop = po;
+    std::vector<std::string> got;
+    stop.on_plan = nullptr;
+    stop.on_phase = [&](Phase p) {
+      got.push_back(name(p));
+      return p != at;
+    };
+    const Result r = pipe.preload(stop);
+    EXPECT_TRUE(r.cancelled);
+    ASSERT_FALSE(got.empty());
+    EXPECT_EQ(got.back(), name(at)) << "nothing fires after the cancelling phase";
+    if (te_first) {
+      EXPECT_EQ(r.memory.dit_loads, 0);
+      EXPECT_EQ(r.timings.dit_load_s, 0.0);
+    }
+    EXPECT_EQ(r.timings.vae_load_s, 0.0);
+  }
   // A preload of a blank prompt plans for a short one; a cancelled preload loads nothing.
   Pipeline fresh(int4_options());
   std::atomic<bool> cancel{true};
@@ -398,7 +467,9 @@ TEST(GpuPipelineRelease, CopyFailureCancelAndRefusalStillRelease) {
     std::atomic<bool> cancel{true};
     const mi::pipeline::ReleaseReport cancelled = pipe.release_device_memory(true, &cancel);
     EXPECT_FALSE(cancelled.dit_host_copy);
-    EXPECT_NE(cancelled.note.find("cancelled"), std::string::npos) << cancelled.note;
+    EXPECT_EQ(cancelled.note, "cancelled before it started");
+    EXPECT_EQ(cancelled.vram_released, std::size_t{0}) << "a cancel set on entry releases nothing";
+    EXPECT_EQ(pipe.generate(req).memory.dit_loads, 0) << "the DiT is still resident";
   }
   // A host budget that holds the generation but not a 2.8 GiB copy.
   PipelineOptions tight = int4_options();
@@ -412,6 +483,30 @@ TEST(GpuPipelineRelease, CopyFailureCancelAndRefusalStillRelease) {
   const mi::pipeline::ReleaseReport refused = pipe.release_device_memory(true);
   EXPECT_FALSE(refused.dit_host_copy);
   EXPECT_NE(refused.note.find("host budget"), std::string::npos) << refused.note;
+}
+
+// A cancel that arrives while the DiT's files are being copied to RAM: the release still completes (the device memory
+// is freed), the partial copy is dropped with a note, and the next load reads the files, bit-identical.
+TEST(GpuPipelineRelease, CancelMidHostCopyKeepsNoCopyAndStillReleases) {
+  if (!have_int4()) GTEST_SKIP() << "SFT bundle or INT4 DiT not present";
+  struct Clear {
+    ~Clear() { mi::weights::testing::cancel_after_first_host_chunk(nullptr); }
+  } clear;
+  const Request req = small_request();
+  Pipeline pipe(int4_options());
+  const Result first = pipe.generate(req);
+  std::atomic<bool> cancel{false};
+  mi::weights::testing::cancel_after_first_host_chunk(&cancel);
+  const mi::pipeline::ReleaseReport rep = pipe.release_device_memory(true, &cancel);
+  mi::weights::testing::cancel_after_first_host_chunk(nullptr);
+  if (!cancel.load()) GTEST_SKIP() << "the DiT copy did not start (no room for it here): " << rep.note;
+  EXPECT_GT(rep.vram_released, std::size_t{2} << 30);
+  EXPECT_FALSE(rep.dit_host_copy);
+  EXPECT_EQ(rep.host_copy_bytes, std::uint64_t{0});
+  EXPECT_NE(rep.note.find("cancelled"), std::string::npos) << rep.note;
+  const Result again = pipe.generate(req);
+  EXPECT_EQ(again.dit_load.source, "files");
+  expect_same_image(again, first, "after a release cancelled mid host copy");
 }
 
 // A pinned text-encoder copy that cannot be allocated (the test seam): the encoder streams from its file instead, the

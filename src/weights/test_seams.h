@@ -2,6 +2,7 @@
 // must reach failure and fallback paths a healthy machine never takes. Every seam is off by default and process-wide.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -14,6 +15,12 @@ void fail_pinned_alloc_after(std::uint64_t bytes);
 void clear_fail_pinned_alloc();
 // Called before every pinned allocation of `bytes`: throws when the seam says so.
 void check_pinned_alloc(std::size_t bytes);
+
+// Sets `*flag` to true after the first 64 MiB chunk read_files_to_host has read (once; the seam then disarms), so a
+// test cancels a host copy midway. nullptr disarms. `flag` must outlive the copy.
+void cancel_after_first_host_chunk(std::atomic<bool>* flag);
+// Called after every chunk read_files_to_host reads: fires the seam above (one relaxed load when it is off).
+void after_host_chunk();
 
 // page_cache_fraction's query: kAuto (cachestat, else the mincore sample), kMincore (the sample alone, as on kernels
 // without cachestat) or kNone (no query: unknown).

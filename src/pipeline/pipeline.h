@@ -517,6 +517,13 @@ struct PreloadOptions {
   // a DiT whose load was cancelled is dropped with its partial weights (the arena is recreated), and a text encoder's
   // partial host copy is freed.
   const std::atomic<bool>* cancel = nullptr;
+  // As GenerateControl's. on_plan: once, right after planning and before any load (a BudgetError is thrown before it).
+  // on_phase: before each load step, whether or not that model is already resident; returning false cancels
+  // (Result::cancelled, as `cancel`). kTextEncoder before a host-resident text encoder's host copy; kDecode before the
+  // VAE steps (Phase has no VAE value: kDecode is the VAE's; an image request fires it for the encoder and again for
+  // the decoder); kDitLoad before the DiT. A step the plan skips fires nothing. kDenoise is never reported.
+  std::function<void(const planner::ExecutionPlan&)> on_plan;
+  std::function<bool(Phase)> on_phase;
 };
 
 // Pipeline::release_device_memory: what was freed and kept.
@@ -560,7 +567,9 @@ class Pipeline {
   // set): the DiT's weight files are read into pinned memory (the next load re-uploads them from there over PCIe,
   // bit-identical, then frees them; its streamed blocks, if any, still read the files) and a host-resident text encoder
   // keeps its copy. A copy that does not fit, fails or is cancelled (`cancel`, checked between 64 MiB reads) is not
-  // kept, with the reason in ReleaseReport::note; the release itself always completes. Without keep_host_copy every
+  // kept, with the reason in ReleaseReport::note; the release itself always completes. A `cancel` already set on
+  // entry means the caller no longer wants the unload: nothing is released, the report is all zero (the copies
+  // already held are reported as they are) and note is "cancelled before it started". Without keep_host_copy every
   // host copy is freed too. The embedding cache stays. Not thread-safe (not during generate()).
   ReleaseReport release_device_memory(bool keep_host_copy, const std::atomic<bool>* cancel = nullptr);
 

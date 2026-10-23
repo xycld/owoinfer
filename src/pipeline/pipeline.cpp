@@ -1460,6 +1460,14 @@ ReleaseReport Pipeline::release_device_memory(bool keep_host_copy, const std::at
   Impl& m = *impl_;
   ReleaseReport rep;
   const auto t0 = Clock::now();
+  if (cancel != nullptr && cancel->load()) {
+    rep.note = "cancelled before it started";
+    rep.dit_host_copy = m.dit_host.has_value();
+    rep.te_host_copy = !m.te_kept.empty();
+    rep.host_copy_bytes = m.te_host_bytes() + m.dit_host_bytes();
+    rep.seconds = since(t0);
+    return rep;
+  }
   MemoryStats stats;  // the arena release samples into it
   m.mem = &stats;
   struct MemScope {
@@ -1532,6 +1540,8 @@ Result Pipeline::preload(const PreloadOptions& options) {
   Request req = options.request;
   if (tok::python_strip(req.prompt).empty()) req.prompt = "preload";  // plans for a short prompt
   GenerateControl control;
+  control.on_plan = options.on_plan;
+  control.on_phase = options.on_phase;
   control.cancel = options.cancel;
   return run(req, control, true);
 }
@@ -2277,10 +2287,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     // is all stack), the VAE encoder of a request that starts from an image, the DiT, and the VAE decoder unless the plan
     // parks the DiT for the decode (generate() then loads it after the denoise).
     if (!missing.empty() && plan.te.run && plan.te.residency == planner::TeResidency::kHostResident) {
-      if (cancel_requested()) {
-        r.cancelled = true;
-        return finish();
-      }
+      if (!keep_going(Phase::kTextEncoder)) return finish();
       const auto t0t = Clock::now();
       m.ensure_te(tes, m.te_options(tes, plan.te.residency, plan.te.buffers, plan.te.pinned));
       try {
@@ -2294,26 +2301,21 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
       m.sample_memory();
     }
     if (enc_src != nullptr) {
-      if (cancel_requested()) {
-        r.cancelled = true;
-        return finish();
-      }
+      if (!keep_going(Phase::kDecode)) return finish();
       m.ensure_encoder(*enc_src, encode_need, tm);
     }
     if (need_dit && plan.dit.park_for_text_encoder) {
       r.preload_note = "the DiT was not loaded: the plan parks it for the text encoder, so a generate() that encodes a "
                        "new prompt would evict it first; it loads after the encoder";
     } else if (need_dit) {
-      if (cancel_requested() || !prepare_dit()) {
+      if (!keep_going(Phase::kDitLoad)) return finish();
+      if (!prepare_dit()) {
         r.cancelled = true;
         return finish();
       }
     }
     if (need_decoder && !plan.dit.park_for_decode) {
-      if (cancel_requested()) {
-        r.cancelled = true;
-        return finish();
-      }
+      if (!keep_going(Phase::kDecode)) return finish();
       m.ensure_vae(vs, plan.vae.stack_bytes, false, tm);
     }
     return finish();

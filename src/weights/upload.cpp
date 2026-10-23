@@ -152,6 +152,7 @@ HostFiles read_files_to_host(const std::vector<std::filesystem::path>& paths, bo
               const std::uint64_t offset = c * kChunk;
               const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, size - offset));
               reader.read_aligned(offset, n, raw + offset, alloc - static_cast<std::size_t>(offset));
+              testing::after_host_chunk();
             }
           } catch (...) {
             errors[static_cast<std::size_t>(t)] = std::current_exception();
