@@ -1462,6 +1462,7 @@ ReleaseReport Pipeline::release_device_memory(bool keep_host_copy, const std::at
   const auto t0 = Clock::now();
   if (cancel != nullptr && cancel->load()) {
     rep.note = "cancelled before it started";
+    rep.cancelled = true;
     rep.dit_host_copy = m.dit_host.has_value();
     rep.te_host_copy = !m.te_kept.empty();
     rep.host_copy_bytes = m.te_host_bytes() + m.dit_host_bytes();

@@ -291,6 +291,7 @@ TEST(GpuPipelineRelease, CancelledBeforeItStartedReleasesNothing) {
   for (const bool keep : {false, true}) {
     const mi::pipeline::ReleaseReport rep = pipe.release_device_memory(keep, &cancel);
     EXPECT_EQ(rep.note, "cancelled before it started");
+    EXPECT_TRUE(rep.cancelled);
     EXPECT_EQ(rep.vram_released, std::size_t{0});
     EXPECT_FALSE(rep.dit_host_copy);
     EXPECT_FALSE(rep.te_host_copy);
@@ -468,6 +469,7 @@ TEST(GpuPipelineRelease, CopyFailureCancelAndRefusalStillRelease) {
     const mi::pipeline::ReleaseReport cancelled = pipe.release_device_memory(true, &cancel);
     EXPECT_FALSE(cancelled.dit_host_copy);
     EXPECT_EQ(cancelled.note, "cancelled before it started");
+    EXPECT_TRUE(cancelled.cancelled);
     EXPECT_EQ(cancelled.vram_released, std::size_t{0}) << "a cancel set on entry releases nothing";
     EXPECT_EQ(pipe.generate(req).memory.dit_loads, 0) << "the DiT is still resident";
   }

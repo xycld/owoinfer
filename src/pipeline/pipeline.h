@@ -536,6 +536,7 @@ struct ReleaseReport {
   std::uint64_t host_copy_bytes = 0;  // host memory the kept copies hold
   double host_copy_s = 0;             // reading the DiT's files into RAM (part of seconds)
   std::string note;                   // why a copy was not kept (the host budget), or empty
+  bool cancelled = false;             // the cancel flag was set on entry: returned at once, nothing was released
 };
 
 class Pipeline {
