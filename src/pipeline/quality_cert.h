@@ -200,7 +200,10 @@ double reference_drift_max(int official_images);
 //   reference.lpips_excess the mean paired excess, each prompt clipped at +-0.092 k (0.092: the largest noise excess);
 //   reference.lpips_excess_kth  the (m+1)-th largest paired excess; reference.lpips_excess_top  the largest;
 //   reference.dino_min     the lowest DINO against the official image, each credited where the bf16 engine's own
-//                          image is far from it: a prompt passes when dino(test, O) >= min(floor, dino(bf16, O) - 0.076);
+//                          image is far from it: a prompt passes when
+//                          dino(test, O) >= max(floor - 0.076, min(floor, dino(bf16, O) - 0.076)). Stored as
+//                          dino(test, O) plus the credit (0 .. 0.076), so the threshold stays the tier's floor and the
+//                          value can exceed 1; info "reference.dino_min_raw" holds the raw minimum;
 //   reference.drift_count  official prompts that drifted (same seed);
 //   *.ocr_sim_delta        mean over the text-rendering prompts of the character similarity of the OCR text to the
 //                          prompt's target text, minus the baseline's.
