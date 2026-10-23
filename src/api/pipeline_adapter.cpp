@@ -668,6 +668,7 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
   g.tier.attention = from_attention(td.attention);
   // Reference needs no certificate: certified, also for the default decision of a generation cancelled before it.
   g.tier.certified = td.certified || td.effective == planner::Tier::kReference ? 1 : 0;
+  g.tier.run_certified = td.certified ? 1 : 0;  // the run's, as the report's models.dit.certified
   g.tier.dit_precision = td.precision == planner::Precision::kInt4   ? MI_PRECISION_W4A4
                          : td.precision == planner::Precision::kInt8 ? MI_PRECISION_INT8
                                                                      : MI_PRECISION_BF16;

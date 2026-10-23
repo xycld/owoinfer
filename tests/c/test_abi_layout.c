@@ -223,14 +223,16 @@ int main(void) {
   FIELD(mi_dit_stream_stats, hidden_fraction, 56);
   FIELD(mi_dit_stream_stats, source, 64);
 
-  SIZE(mi_tier_info, 32);
+  SIZE(mi_tier_info, 40);
   FIELD(mi_tier_info, struct_size, 0);
   FIELD(mi_tier_info, requested, 8);
   FIELD(mi_tier_info, effective, 12);
   FIELD(mi_tier_info, attention, 16);
   FIELD(mi_tier_info, certified, 20);
   FIELD(mi_tier_info, dit_precision, 24);
-  FIELD(mi_tier_info, text_encoder_precision, 28);
+  FIELD(mi_tier_info, text_encoder_precision, 28); /* the 1.0.0 layout ends here (32 bytes) */
+  FIELD(mi_tier_info, run_certified, 32);
+  FIELD(mi_tier_info, _reserved0, 36);
 
   SIZE(mi_prompt_tokens, 32);
   FIELD(mi_prompt_tokens, struct_size, 0);

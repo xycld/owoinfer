@@ -116,8 +116,21 @@ std::string status_code(mi_status s) {
 
 [[noreturn]] void throw_status(mi_status s) { throw RequestError(status_code(s), mi_last_error_message()); }
 
-// An engine message with the C fields' names replaced by the protocol parameters' they come from.
+// An engine message with the C fields' names replaced by the protocol parameters' they come from. A name is replaced
+// only as a whole token, so a file path in the message that contains one (".../my_control_adapter.safetensors",
+// "/data/mask_path/x.png") comes back unchanged: it must start the message or follow a space, quote, "(" or "[" (a
+// ".image_path" must follow "]"), and end the message or precede a space, quote, ",", ":", ";", ")", "[", "]", or a
+// "." that ends a sentence.
 std::string protocol_names(std::string message) {
+  const auto token_at = [&](std::size_t at, std::string_view from) {
+    const bool starts = from.front() == '.' ? at > 0 && message[at - 1] == ']'
+                                            : at == 0 || std::string_view(" \"'([").find(message[at - 1]) != std::string_view::npos;
+    const std::size_t end = at + from.size();
+    if (!starts) return false;
+    if (end == message.size()) return true;
+    if (message[end] == '.') return end + 1 == message.size() || message[end + 1] == ' ';
+    return std::string_view(" \"',:;)[]").find(message[end]) != std::string_view::npos;
+  };
   static constexpr std::pair<std::string_view, std::string_view> kRenames[] = {
       {"dataspace_path", "dataspace"}, {"init_image_path", "init_image"}, {"mask_path", "mask"},
       {"mi_engine_params.distill_dir", "load's \"distill\""}, {"distill_dir", "distill"},
@@ -127,8 +140,13 @@ std::string protocol_names(std::string message) {
       {"control_images", "control.images"}, {".image_path", ".path"}, {"control_adapter", "control.adapter"},
       {"control_lora_strength", "control.lora_strength"}};
   for (const auto& [from, to] : kRenames) {
-    for (std::size_t at = 0; (at = message.find(from, at)) != std::string::npos; at += to.size()) {
+    for (std::size_t at = 0; (at = message.find(from, at)) != std::string::npos;) {
+      if (!token_at(at, from)) {
+        ++at;
+        continue;
+      }
       message.replace(at, from.size(), to);
+      at += to.size();
     }
   }
   return message;
@@ -848,12 +866,16 @@ class Server {
                 std::to_string(width) + ",\"height\":" + std::to_string(height) + "}");
   }
 
-  // done.warnings: the LoRA and control adapter warnings, lossy accelerators and prompt truncation, for launchers that
-  // do not read the report.
-  static std::string warnings_json(const mi_result* r) {
+  // done.warnings: the LoRA and control adapter warnings, lossy accelerators and settings without effect, prompt
+  // truncation, for launchers that do not read the report. `g` is the request.
+  static std::string warnings_json(const mi_result* r, const mi_gen_params& g) {
     std::string out;
     const auto add = [&](const std::string& w) { out += (out.empty() ? "" : ",") + str(w); };
     if (r != nullptr) {
+      // The active accelerators, as MI_TEXT_ACCELERATORS names them: CFG truncation counts only with CFG.
+      const std::string active = mi_result_text(r, MI_TEXT_ACCELERATORS);
+      const bool truncating = active.find("cfg_truncation") != std::string::npos;
+      const bool caching = active.find("step_cache") != std::string::npos;
       for (const auto& [kind, prefix] : {std::pair{MI_MESSAGE_LORA_WARNING, "LoRA "},
                                          std::pair{MI_MESSAGE_CONTROL_WARNING, "control adapter LoRA "}}) {
         const std::int32_t n = mi_result_message_count(r, kind);
@@ -865,10 +887,19 @@ class Server {
       mi_accel_info a{};
       a.struct_size = sizeof a;
       if (mi_result_accel(r, &a) == MI_OK && a.lossy) {
-        add(std::string("lossy accelerators (") + mi_result_text(r, MI_TEXT_ACCELERATORS) +
-            "), uncertified: CFG truncated on " + std::to_string(a.cfg_truncated_steps) + " steps, step cache reused " +
-            std::to_string(a.cached_calls) + " of " + std::to_string(a.dit_calls) + " DiT calls");
+        std::string what;
+        if (truncating) what = "CFG truncated on " + std::to_string(a.cfg_truncated_steps) + " steps";
+        if (caching) {
+          what += (what.empty() ? "" : ", ") + std::string("step cache reused ") + std::to_string(a.cached_calls) + " of " +
+                  std::to_string(a.dit_calls) + " DiT calls";
+        }
+        add("lossy accelerators (" + active + "), uncertified: " + what);
       }
+      // Settings without effect, as `moss-infer generate` warns about them.
+      if (g.step_cache_threshold != 0 && g.step_cache == MI_STEP_CACHE_OFF) {
+        add("step_cache_threshold has no effect without step_cache \"fbcache\"");
+      }
+      if (g.cfg_truncation < 1.0 && !truncating) add("cfg_truncation has no effect without CFG (cfg 1)");
       for (const std::int32_t negative : {0, 1}) {
         mi_prompt_tokens t{};
         t.struct_size = sizeof t;
@@ -905,7 +936,13 @@ class Server {
     } else {
       done += ",\"status\":\"error\",\"error\":" + error_json(status_code(s), protocol_names(mi_last_error_message()));
     }
-    done += ",\"warnings\":" + warnings_json(r);
+    if (r != nullptr) {
+      // Whether the run as a whole is certified (the report's models.dit.certified), without parsing the report.
+      mi_tier_info t{};
+      t.struct_size = sizeof t;
+      if (mi_result_tier(r, &t) == MI_OK) done += std::string(",\"certified\":") + tf(t.run_certified != 0);
+    }
+    done += ",\"warnings\":" + warnings_json(r, w.params);
     mi_result_free(r);
     // Idle before the done line goes out: a client may send the next generate as soon as it reads it.
     running_.store(false);

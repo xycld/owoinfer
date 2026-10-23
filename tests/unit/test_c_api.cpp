@@ -327,6 +327,8 @@ TEST(CApi, OldStructSizes) {
   ASSERT_EQ(mi_gen_params_init(&g, kGen01), MI_OK) << last_error();
   EXPECT_EQ(g.struct_size, kGen01);
   EXPECT_EQ(g.width, 1024);
+  EXPECT_EQ(g.steps, 50);  // explicit, not the unset markers of the current size
+  EXPECT_EQ(g.cfg, 3.0);
   EXPECT_EQ(g.user_data, nullptr);
   const auto* bytes = reinterpret_cast<const unsigned char*>(&g);
   for (std::size_t i = kGen01; i < sizeof g; ++i) ASSERT_EQ(bytes[i], 0x5a) << "byte " << i << " written";
@@ -1976,6 +1978,77 @@ TEST(CApi, ControlAndAcceleratorResults) {
   mi_result_free(res);
 }
 
+// mi_tier_info.certified is about the tier (1 on REFERENCE, whatever else ran); run_certified is the run's, the
+// report's models.dit.certified. The 1.0.0 size (32 bytes) gets its 32 bytes.
+TEST(CApi, TierRunCertified) {
+  const auto tier_of = [](const mi::pipeline::Request& q, mi::pipeline::Result r) {
+    mi_result* res = mi::api::new_result(mi::api::to_generation(q, r, true));
+    mi_tier_info t;
+    std::memset(&t, 0xff, sizeof t);
+    t.struct_size = sizeof t;
+    EXPECT_EQ(mi_result_tier(res, &t), MI_OK) << last_error();
+    const mi::json::Value doc = mi::json::parse(mi_result_report_json(res));
+    EXPECT_EQ(doc.at("models").at("dit").at("certified").as_bool(), t.run_certified == 1);
+    EXPECT_EQ(t._reserved0, 0);
+    mi_result_free(res);
+    return t;
+  };
+  mi::pipeline::Request q;
+  q.prompt = "a cat";
+  // REFERENCE with a LoRA: the pipeline marks the run uncertified.
+  q.loras = {{"/loras/style.safetensors", 1.0f}};
+  mi::pipeline::Result r;
+  r.tier.requested = mi::planner::Tier::kAuto;
+  r.tier.effective = mi::planner::Tier::kReference;
+  r.tier.attention = mi::planner::AttentionMode::kExact;
+  r.tier.certified = false;
+  r.tier.reason = "auto: Reference; runtime LoRAs active: uncertified (certificates cover the base model only)";
+  mi::lora::FileReport f;
+  f.file = "/loras/style.safetensors";
+  r.loras = {f};
+  mi_tier_info t = tier_of(q, r);
+  EXPECT_EQ(t.effective, MI_TIER_REFERENCE);
+  EXPECT_EQ(t.certified, 1);
+  EXPECT_EQ(t.run_certified, 0);
+  // HIGH, certified, nothing else: both 1.
+  mi::pipeline::Request plain;
+  plain.prompt = "a cat";
+  mi::pipeline::Result h;
+  h.tier.effective = mi::planner::Tier::kHigh;
+  h.tier.precision = mi::planner::Precision::kInt8;
+  h.tier.attention = mi::planner::AttentionMode::kQ8Fp8;
+  h.tier.certified = true;
+  h.tier.certificate = "/models/moss_int8.mossinfer-cert.json";
+  t = tier_of(plain, h);
+  EXPECT_EQ(t.effective, MI_TIER_HIGH);
+  EXPECT_EQ(t.certified, 1);
+  EXPECT_EQ(t.run_certified, 1);
+  // REFERENCE, nothing else: both 1. HIGH uncertified (e.g. accelerators): both 0.
+  mi::pipeline::Result ref;
+  ref.tier.effective = mi::planner::Tier::kReference;
+  ref.tier.certified = true;
+  t = tier_of(plain, ref);
+  EXPECT_EQ(t.certified, 1);
+  EXPECT_EQ(t.run_certified, 1);
+  h.tier.certified = false;
+  t = tier_of(plain, h);
+  EXPECT_EQ(t.certified, 0);
+  EXPECT_EQ(t.run_certified, 0);
+  // The 1.0.0 mi_tier_info: 32 bytes written, run_certified untouched; any other size is a mismatch.
+  mi_result* res = mi::api::new_result(mi::api::to_generation(plain, ref, true));
+  alignas(mi_tier_info) unsigned char buf[sizeof(mi_tier_info)];
+  std::memset(buf, 0x5a, sizeof buf);
+  const std::size_t old = 32;
+  std::memcpy(buf, &old, sizeof old);
+  ASSERT_EQ(mi_result_tier(res, reinterpret_cast<mi_tier_info*>(buf)), MI_OK) << last_error();
+  for (std::size_t i = old; i < sizeof buf; ++i) ASSERT_EQ(buf[i], 0x5a) << "byte " << i << " written";
+  mi_tier_info bad{};
+  bad.struct_size = 36;
+  EXPECT_EQ(mi_result_tier(res, &bad), MI_ERR_ABI_MISMATCH);
+  EXPECT_NE(last_error().find("32 or 40"), std::string::npos) << last_error();
+  mi_result_free(res);
+}
+
 // ---------------------------------------------------------------- GPU
 
 // mi_probe_device measures free memory without leaving a CUDA context behind (no engine in this suite).
@@ -2272,6 +2345,7 @@ TEST_F(GpuCApi, SamplerPreviewMetadataAndTier) {
   if (tier.effective == MI_TIER_REFERENCE) {
     EXPECT_EQ(tier.attention, MI_ATTENTION_EXACT);
     EXPECT_EQ(tier.certified, 1);
+    EXPECT_EQ(tier.run_certified, 1);  // no LoRA, control adapter or accelerator
   }
   const char* reason = mi_result_text(r, MI_TEXT_TIER_REASON);
   ASSERT_NE(reason, nullptr);
@@ -2555,6 +2629,10 @@ TEST_F(GpuCApi, ControlAdapterDepth) {
   // A control adapter is a LoRA: the run is uncertified (mi_tier_info.certified describes the tier: 1 on Reference).
   const mi::json::Value doc = mi::json::parse(mi_result_report_json(r));
   EXPECT_FALSE(doc.at("models").at("dit").at("certified").as_bool());
+  mi_tier_info tier{};
+  tier.struct_size = sizeof tier;
+  ASSERT_EQ(mi_result_tier(r, &tier), MI_OK);
+  EXPECT_EQ(tier.run_certified, 0);
   EXPECT_NE(std::string(mi_result_text(r, MI_TEXT_TIER_REASON)).find("uncertified"), std::string::npos);
   std::size_t bytes = 0;
   EXPECT_NE(mi_result_rgb(r, &bytes), nullptr);
@@ -2594,6 +2672,10 @@ TEST_F(GpuCApi, Accelerators) {
   const mi::json::Value doc = mi::json::parse(mi_result_report_json(r));
   EXPECT_FALSE(doc.at("models").at("dit").at("certified").as_bool());
   EXPECT_TRUE(doc.at("accelerators").at("lossy").as_bool());
+  mi_tier_info tier{};
+  tier.struct_size = sizeof tier;
+  ASSERT_EQ(mi_result_tier(r, &tier), MI_OK);
+  EXPECT_EQ(tier.run_certified, 0);
   EXPECT_NE(std::string(mi_result_text(r, MI_TEXT_TIER_REASON)).find("lossy accelerators"), std::string::npos);
   std::string list;
   for (std::size_t i = 0; i < count; ++i) list += (i ? "," : "") + std::to_string(steps[i]);

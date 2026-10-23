@@ -230,14 +230,16 @@ MI_LAYOUT(mi_dit_stream_stats, stall_seconds, 40);
 MI_LAYOUT(mi_dit_stream_stats, h2d_gbps, 48);
 MI_LAYOUT(mi_dit_stream_stats, hidden_fraction, 56);
 MI_LAYOUT(mi_dit_stream_stats, source, 64);
-static_assert(sizeof(mi_tier_info) == 32);
+static_assert(sizeof(mi_tier_info) == 40);
 MI_LAYOUT(mi_tier_info, struct_size, 0);
 MI_LAYOUT(mi_tier_info, requested, 8);
 MI_LAYOUT(mi_tier_info, effective, 12);
 MI_LAYOUT(mi_tier_info, attention, 16);
 MI_LAYOUT(mi_tier_info, certified, 20);
 MI_LAYOUT(mi_tier_info, dit_precision, 24);
-MI_LAYOUT(mi_tier_info, text_encoder_precision, 28);
+MI_LAYOUT(mi_tier_info, text_encoder_precision, 28);  // the 1.0.0 layout ends here (32 bytes)
+MI_LAYOUT(mi_tier_info, run_certified, 32);
+MI_LAYOUT(mi_tier_info, _reserved0, 36);
 static_assert(sizeof(mi_prompt_tokens) == 32);
 MI_LAYOUT(mi_prompt_tokens, struct_size, 0);
 MI_LAYOUT(mi_prompt_tokens, total_tokens, 8);
@@ -301,6 +303,9 @@ constexpr std::size_t kGenParamsSizes[] = {offsetof(mi_gen_params, scheduler), o
 // Output structs that grew: mi_timings (0.1.0: 104 bytes), mi_probe_info (0.2.0: 576 bytes).
 constexpr std::size_t kTimingsSizes[] = {offsetof(mi_timings, vae_encoder_load_s), sizeof(mi_timings)};
 constexpr std::size_t kProbeInfoSizes[] = {offsetof(mi_probe_info, cublaslt_source), sizeof(mi_probe_info)};
+// mi_tier_info (1.0.0: 32 bytes, before run_certified).
+constexpr std::size_t kTierInfoSizes[] = {offsetof(mi_tier_info, run_certified), sizeof(mi_tier_info)};
+static_assert(kTierInfoSizes[0] == 32, "the 1.0.0 mi_tier_info");
 static_assert(kEngineParamsSizes[0] == 80 && kGenParamsSizes[0] == 168 && kTimingsSizes[0] == 104, "the 0.1.0 layouts");
 static_assert(kProbeInfoSizes[0] == 576, "the 0.2.0 mi_probe_info");
 static_assert(kEngineParamsSizes[1] == 120 && kGenParamsSizes[1] == 240, "the first 0.2.0 layouts");
@@ -867,7 +872,9 @@ mi_status mi_result_image(const mi_result* result, mi_image_info* out) {
 mi_status mi_result_tier(const mi_result* result, mi_tier_info* out) {
   return guarded([&] {
     require(out, "out");
-    check_size(out->struct_size, sizeof(mi_tier_info), "mi_tier_info");
+    std::size_t size = 0;
+    std::memcpy(&size, out, sizeof size);  // a 1.0.0 (32-byte) mi_tier_info is accepted
+    check_size(size, kTierInfoSizes, "mi_tier_info");
     require(result, "result");
     write_output(out, result->generation.tier);
     return MI_OK;

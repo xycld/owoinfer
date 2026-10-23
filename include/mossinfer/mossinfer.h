@@ -641,20 +641,26 @@ MOSSINFER_API const char* mi_result_report_json(mi_result* result);
  * MI_ERR_INVALID_ARGUMENT when the result has no image (cancelled). */
 MOSSINFER_API mi_status mi_save_png(mi_result* result, const char* path);
 
-/* The tier that ran (MI_CAP_TIERS). A generation cancelled before its tier was resolved reports requested AUTO and
- * effective REFERENCE. `certified` describes the tier: it stays 1 for REFERENCE even when runtime LoRAs, a control
- * adapter or lossy accelerators make the run as a whole uncertified (MI_TEXT_TIER_REASON and the report's
- * models.dit.certified say so; mi_accel_info.lossy, mi_control_info.active). */
+/* The tier that ran (MI_CAP_TIERS). A generation cancelled before its tier was resolved reports requested AUTO,
+ * effective REFERENCE, certified 1 and run_certified 0. `certified` is about the tier; whether the run as a whole is
+ * certified is `run_certified` (what the report's models.dit.certified shows). */
 typedef struct mi_tier_info {
   size_t struct_size;
   mi_tier requested;                   /* mi_engine_params.tier */
   mi_tier effective;                   /* never MI_TIER_AUTO */
   mi_attention attention;              /* what ran; never MI_ATTENTION_DEFAULT */
-  int32_t certified;                   /* a quality certificate covers what ran (always 1 for REFERENCE) */
+  /* 1 when the tier needs no certificate or a certificate covers it; on the lossy tiers it is 0 with LoRAs, a control
+   * adapter or accelerators, but on REFERENCE it stays 1. */
+  int32_t certified;
   mi_precision dit_precision;          /* BF16 or INT8 */
   mi_precision text_encoder_precision; /* BF16, INT8 or W4A8 */
+  /* Fields after the 32-byte layout (1.0.0). The run is certified: a certificate covers it, or it ran REFERENCE
+   * without anything that changes the image. 0 whenever runtime LoRAs (a distill bundle's included), a control
+   * adapter or lossy accelerators make it uncertified, on every tier. Show this one to the user. */
+  int32_t run_certified;
+  int32_t _reserved0;
 } mi_tier_info;
-/* `out` has struct_size set by the caller. */
+/* `out` has struct_size set by the caller: the current size or the 32-byte one. */
 MOSSINFER_API mi_status mi_result_tier(const mi_result* result, mi_tier_info* out);
 
 typedef enum mi_result_text_kind {
@@ -672,8 +678,8 @@ typedef enum mi_result_text_kind {
   MI_TEXT_CONTROL_KINDS = 10,      /* its kinds in channel order, comma-separated, e.g. "color,depth" */
   MI_TEXT_CONTROL_BASE_MODEL = 11, /* the file's base_model metadata (informational); "" when absent */
   MI_TEXT_CONTROL_ENCODE_SCHEDULE = 12, /* how the control images were VAE-encoded: "untiled" or the tile plans */
-  /* MI_CAP_ACCEL: the lossy accelerators that changed the run, e.g. "cfg_truncation 0.8, step_cache fbcache 0.03";
-   * "off" when none. */
+  /* MI_CAP_ACCEL: the requested lossy accelerators that are active for this request (not what ran: a run cancelled
+   * before sampling reports them too), e.g. "cfg_truncation 0.8, step_cache fbcache 0.03"; "off" when none. */
   MI_TEXT_ACCELERATORS = 13,
   MI_TEXT_MAX_ENUM = 0x7fffffff
 } mi_result_text_kind;
@@ -704,7 +710,9 @@ typedef struct mi_accel_info {
   int32_t cfg_truncated_steps; /* steps run without the negative branch (CFG truncation) */
   int32_t dit_calls;           /* DiT calls with the step cache on */
   int32_t cached_calls;        /* of them, calls that reused the cache (the blocks after block 0 skipped) */
-  int32_t lossy;               /* a lossy accelerator was active, so the run is uncertified (MI_TEXT_ACCELERATORS) */
+  /* The request's settings activate a lossy accelerator (MI_TEXT_ACCELERATORS), so the run is uncertified. It describes
+   * the requested, active settings, not what ran: a run cancelled before sampling still reports 1. */
+  int32_t lossy;
 } mi_accel_info;
 /* `out` has struct_size set by the caller. */
 MOSSINFER_API mi_status mi_result_accel(const mi_result* result, mi_accel_info* out);

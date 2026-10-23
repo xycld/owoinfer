@@ -524,6 +524,28 @@ class CpuProtocolTest(ProtocolTestBase):
             self.assertIn(text, r["error"]["message"], params)
             for c_name in ("control_adapter", "control_images", "image_path", "control_lora_strength", "mi_"):
                 self.assertNotIn(c_name, r["error"]["message"], params)
+        # File paths that contain C field names come back unchanged; the field names around them are still renamed.
+        os.makedirs(os.path.join(self.tmp, "control_images"))
+        paths = {name: os.path.join(self.tmp, name) for name in (
+            "my_control_adapter.safetensors", "x_image_path.png", os.path.join("control_images", "a.png"),
+            "my_mask_path.png", "my_distill_dir", "x_dataspace_path.safetensors", "control_adapter")}
+        cases = [
+            ({"control": {"adapter": paths["my_control_adapter.safetensors"]}}, "control.adapter: file not found: ",
+             paths["my_control_adapter.safetensors"]),
+            ({"control": {"adapter": paths["control_adapter"]}}, "control.adapter: file not found: ", paths["control_adapter"]),
+            ({"control": {"adapter": adapter, "images": [{"kind": "depth", "path": paths["x_image_path.png"]}]}},
+             "control.images[0].path: file not found: ", paths["x_image_path.png"]),
+            ({"control": {"adapter": adapter, "images": [{"kind": "depth", "path": paths[os.path.join("control_images", "a.png")]}]}},
+             "control.images[0].path: file not found: ", paths[os.path.join("control_images", "a.png")]),
+            ({"init_image": depth, "mask": paths["my_mask_path.png"]}, "mask: file not found: ", paths["my_mask_path.png"]),
+            ({"distill": paths["my_distill_dir"]}, "distill: not a directory: ", paths["my_distill_dir"]),
+            ({"sampler": "dataspace", "dataspace": paths["x_dataspace_path.safetensors"]}, "dataspace: file not found: ",
+             paths["x_dataspace_path.safetensors"]),
+        ]
+        for i, (params, field, path) in enumerate(cases):
+            r = self.server.call("generate", dict(base, **params), id="p%d" % i)
+            self.assertError(r, "invalid_params", "p%d" % i)
+            self.assertIn(field + path, r["error"]["message"], params)
         # Repeated members (raw lines: json.dumps cannot repeat).
         for gid, control in (("dup0", '{"adapter": %s, "adapter": %s}' % (json.dumps(adapter), json.dumps(adapter))),
                              ("dup1", '{"adapter": %s, "images": [{"kind": "depth", "kind": "color", "path": %s}]}'
@@ -723,6 +745,7 @@ class GpuProtocolTest(ProtocolTestBase):
         done = self.wait_done(gid, events)
         self.assertEqual(done["status"], "ok", done)
         self.assertEqual(done["image"], out)
+        self.assertIs(done["certified"], done["report"]["models"]["dit"]["certified"])
         with open(out, "rb") as f:
             self.assertEqual(f.read(8), b"\x89PNG\r\n\x1a\n")
         report = done["report"]
@@ -900,7 +923,22 @@ class GpuProtocolTest(ProtocolTestBase):
         lossy = [w for w in done["warnings"] if w.startswith("lossy accelerators (")]
         self.assertEqual(len(lossy), 1, done["warnings"])
         self.assertIn("step_cache fbcache 0.5", lossy[0])
+        self.assertIn("step cache reused", lossy[0])
+        self.assertNotIn("CFG truncated", lossy[0])  # only the active accelerators
+        self.assertIs(done["certified"], False)
         print("[server] control %s, %d encodes; %s" % (control["kinds"], control["encodes"], lossy[0]))
+        # Settings without effect: a threshold without the step cache, CFG truncation at CFG 1. Nothing lossy ran, the
+        # bf16 bundle ran Reference: certified.
+        gid = self.server.send("generate", {"prompt": "a cat", "width": 256, "height": 256, "steps": 2, "cfg": 1,
+                                            "cfg_truncation": 0.5, "step_cache_threshold": 0.1, "output": out}, id="noop")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "ok", done)
+        self.assertIn('step_cache_threshold has no effect without step_cache "fbcache"', done["warnings"])
+        self.assertIn("cfg_truncation has no effect without CFG (cfg 1)", done["warnings"])
+        self.assertFalse(any(w.startswith("lossy accelerators") for w in done["warnings"]), done["warnings"])
+        self.assertIs(done["certified"], True)
+        self.assertIs(done["certified"], done["report"]["models"]["dit"]["certified"])
         # A kind the adapter does not have fails in "done", in the protocol's names.
         gid = self.server.send("generate", {"prompt": "a cat", "width": 256, "height": 256, "steps": 2, "output": out,
                                             "control": {"adapter": adapter, "images": [{"kind": "canny", "path": depth}]}},

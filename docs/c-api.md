@@ -36,7 +36,7 @@ cmake --build <build> --target mossinfer_example_c
 - **Strings** are NUL-terminated UTF-8, paths included, on Windows too. The library copies every string it keeps. A string ends at its first NUL, so a prompt cannot contain one. `moss-server` rejects a JSON string with an escaped `\u0000` as `invalid_params` instead of cutting it short.
 - **Versioned structs** start with `size_t struct_size`. Always fill them with `*_init(&s, sizeof s)`, then change the fields you need.
   - Structs only grow at the end. The library accepts every size a struct has had (see [Struct sizes](#struct-sizes)), and rejects any other `struct_size` with `MI_ERR_ABI_MISMATCH`.
-  - Output structs (`mi_timings`, `mi_memory_stats`, `mi_dit_stream_stats`, `mi_probe_info`, `mi_device_info`, `mi_tier_info`, `mi_prompt_tokens`, `mi_lora_report`) need `struct_size` set by the caller before the call.
+  - Output structs (`mi_timings`, `mi_memory_stats`, `mi_dit_stream_stats`, `mi_probe_info`, `mi_device_info`, `mi_tier_info`, `mi_prompt_tokens`, `mi_lora_report`, `mi_image_info`, `mi_control_info`, `mi_accel_info`) need `struct_size` set by the caller before the call.
   - Padding is explicit: the gaps are `int32_t _reserved*` fields (see [Frozen layout](#frozen-layout-abi-1)). `*_init()` zeroes them. `mi_engine_create()`, `mi_generate()` and `mi_gen_params_validate()` reject a nonzero one with `MI_ERR_INVALID_ARGUMENT`. The library zeroes them in output structs.
 - **Enums** are 32-bit: each one has a `*_MAX_ENUM = 0x7fffffff` member. Unknown values are rejected with `MI_ERR_INVALID_ARGUMENT`.
 - **Errors.** Every fallible call returns `mi_status`. `mi_last_error_message()` returns the reason for the last failure on the calling thread. It is thread-local, never NULL, not cleared by successful calls, and valid until the next failing call on that thread.
@@ -369,13 +369,13 @@ With `include_prompts` 0, the prompt and negative prompt are left out of both ch
 | `mi_result_plan_explanation(r)` | the execution plan as text |
 | `mi_result_report_json(r)` | the `moss-infer generate --json-report` document; `"image"` is the last path given to `mi_save_png()`. NULL, with the message set, for a NULL result or when rendering fails (out of memory). |
 | `mi_save_png(r, path)` | atomic PNG write (temporary file, then rename), with the [metadata](#png-metadata) when `save_metadata` was set |
-| `mi_result_tier(r, &t)` | `mi_tier_info`: requested and effective tier, the attention that ran, certified, DiT and text-encoder precision (below) |
+| `mi_result_tier(r, &t)` | `mi_tier_info`: requested and effective tier, the attention that ran, `certified` (the tier's), DiT and text-encoder precision, `run_certified` (the run's; below). A 32-byte (1.0.0) `mi_tier_info` is accepted and gets its 32 bytes. |
 | `mi_result_text(r, kind)` | a string of the result (below); `""` when empty, NULL for a NULL result or an unknown kind |
 | `mi_result_prompt_tokens(r, negative, &t)` | `mi_prompt_tokens` of the prompt (`negative` 0) or the negative prompt (1; all zero when CFG is off): `total_tokens` (chat template included), `kept_tokens`, `prompt_tokens` (the text's own), `dropped_tokens`, `max_length`, `truncated`. Any other `negative` is `MI_ERR_INVALID_ARGUMENT`. |
 | `mi_result_lora_count(r)`, `mi_result_lora(r, i, &l)`, `mi_result_lora_file(r, i)` | per LoRA, in request order: `mi_lora_report {adapters, side_branch, merged, unknown_keys, warnings, notes}` and the file. An index out of range is `MI_ERR_INVALID_ARGUMENT` / NULL. |
 | `mi_result_message_count(r, kind)`, `mi_result_message(r, kind, i)` | `MI_MESSAGE_LORA_WARNING`: losses to show the user (`"<module>: <reason>"`). `MI_MESSAGE_LORA_NOTE`: how the files were read. `MI_MESSAGE_CONTROL_WARNING` (2) and `MI_MESSAGE_CONTROL_NOTE` (3): the same for the control adapter's LoRA part. 0 / NULL for an unknown kind or index. |
 | `mi_result_control(r, &c)` | `mi_control_info`: `active` (a control adapter was applied), `kinds_count` (the adapter's kinds), `encodes` (control image VAE encodes, one per image and pass size), and its LoRA part as in `mi_lora_report`: `lora_adapters`, `lora_side_branch`, `lora_merged`, `lora_unknown_keys`, `lora_warnings`, `lora_notes`. All zero without a control adapter. The LoRA part is not one of `mi_result_lora()`'s files. |
-| `mi_result_accel(r, &a)` | `mi_accel_info`, over both passes of a hires fix: `cfg_truncated_steps` (steps run without the negative branch), `dit_calls` (DiT calls with the step cache on), `cached_calls` (of them, the calls that reused the cache), `lossy` (an accelerator was active: the run is uncertified). All zero with the accelerators off. |
+| `mi_result_accel(r, &a)` | `mi_accel_info`, over both passes of a hires fix: `cfg_truncated_steps` (steps run without the negative branch), `dit_calls` (DiT calls with the step cache on), `cached_calls` (of them, the calls that reused the cache), `lossy` (the request's settings activate an accelerator: the run is uncertified). All zero with the accelerators off. `lossy` and `MI_TEXT_ACCELERATORS` describe the requested, active settings, not what ran: a run cancelled before sampling still reports them. |
 | `mi_result_accel_cached_steps(r, &n)` | the 1-based steps (counting on across the passes of a hires fix) with a call that reused the step cache, in order, and their count in `n`. NULL with `n` = 0 when there are none, and for a NULL result or a NULL `n`. Owned by the result. |
 
 | `mi_result_text_kind` | Text |
@@ -395,7 +395,12 @@ With `include_prompts` 0, the prompt and negative prompt are left out of both ch
 | `MI_TEXT_CONTROL_ENCODE_SCHEDULE` (12) | how the control images were VAE-encoded: `untiled` or the tile plans |
 | `MI_TEXT_ACCELERATORS` (13) | the accelerators that changed the run, e.g. `cfg_truncation 0.8, step_cache fbcache 0.03`; `off` when none (CFG truncation without CFG counts as off) |
 
-`mi_tier_info.effective` is never `AUTO`, and `attention` is never `DEFAULT`. `certified` is 1 whenever `effective` is `REFERENCE`, which needs no certificate. It describes the tier: runtime LoRAs, a control adapter or the accelerators make the run as a whole uncertified even then, which `MI_TEXT_TIER_REASON` and the report's `models.dit.certified` say (and `mi_accel_info.lossy`, `mi_control_info.active`). A generation cancelled before its tier was resolved reports requested `AUTO`, effective `REFERENCE`, attention `EXACT`, certified 1. The precisions map the pipeline's report as follows:
+`mi_tier_info.effective` is never `AUTO`, and `attention` is never `DEFAULT`.
+- **`certified` is about the tier.** It is 1 when the tier needs no certificate or a certificate covers it. On the lossy tiers it is 0 with LoRAs, a control adapter or accelerators, but on `REFERENCE` it stays 1 (its 1.0.0 meaning).
+- **`run_certified` is about the run**, and it is the value to show the user. It is the report's `models.dit.certified`: 1 when a certificate covers the run, or it ran `REFERENCE` with nothing that changes the image. It is 0 whenever runtime LoRAs (a distill bundle's included), a control adapter or lossy accelerators make the run uncertified, on every tier. `MI_TEXT_TIER_REASON` says why.
+- A generation cancelled before its tier was resolved reports requested `AUTO`, effective `REFERENCE`, attention `EXACT`, `certified` 1 and `run_certified` 0.
+
+The precisions map the pipeline's report as follows:
 
 | Pipeline | `mi_precision` |
 |---|---|
@@ -475,13 +480,14 @@ A versioned struct only grows at the end, so a program built against an older he
 | `mi_gen_params` | 168 (the 0.1.0 size, up to `user_data`), 240 (an earlier 0.2.0 header, up to `_reserved2`), 320 (0.2.0 and 1.0.0, up to `distill_dir`), 376 (1.1.0) |
 | `mi_timings` (output) | 104 (the 0.1.0 size, up to `vae_load_s`), 128 (0.2.0) |
 | `mi_probe_info` (output) | 576 (the first 0.2.0 size, up to `_reserved0`), 1624 (0.2.0 with the cuBLASLt fields) |
+| `mi_tier_info` (output) | 32 (0.2.0 and 1.0.0, up to `text_encoder_precision`), 40 (1.1.0, with `run_certified`) |
 | every other output struct | its one size so far (table below) |
 
 Any other size is `MI_ERR_ABI_MISMATCH`, and the message lists the accepted sizes.
 - **`*_init(p, size)`** writes only the first `size` bytes: the defaults of the fields that layout has. The bytes after them are left alone.
 - **Input structs** (`mi_engine_create()`, `mi_gen_params_validate()`, `mi_generate()`): the library reads only `struct_size` bytes. It copies them over a full struct filled with the defaults for that size, so every later field keeps the behaviour of the older release:
   - an 80-byte `mi_engine_params` runs with the bundle's components, tier `AUTO` and default attention;
-  - a 168-byte `mi_gen_params` runs with the `MOSS` scheduler, the default noise and no LoRAs, and its `save_metadata` and `include_prompts` are 0: `mi_save_png()` writes a PNG without text chunks, as 0.1.0 did. A 240- or 320-byte struct defaults `save_metadata` and `include_prompts` to 1;
+  - a 168-byte `mi_gen_params` runs with the `MOSS` scheduler, the default noise and no LoRAs, and its `save_metadata` and `include_prompts` are 0: `mi_save_png()` writes a PNG without text chunks, as 0.1.0 did. A 240-, 320- or 376-byte struct defaults `save_metadata` and `include_prompts` to 1;
   - a 120-byte `mi_engine_params` or a 240-byte `mi_gen_params` runs without image input, hires fix or distill bundle;
   - a 320-byte `mi_gen_params` runs without a control adapter and with the accelerators off.
 - **Output structs**: the library writes only `struct_size` bytes.
@@ -509,7 +515,7 @@ The enums are 4 bytes. ABI 1 is defined by this table: a change to an existing e
 | `mi_timings` | 128 | `struct_size` 0, then 12 doubles from 8 in header order (`total_s` … `vae_load_s` at 96); then `vae_encoder_load_s` 104, `image_encode_s` 112, `image_ops_s` 120 |
 | `mi_memory_stats` | 56 | `struct_size` 0, then 6 `uint64_t` from 8 in header order (`arena_capacity_bytes` … `host_private_peak_bytes` at 48) |
 | `mi_dit_stream_stats` | 80 | `struct_size` 0, `streamed` 8, `resident_blocks` 12, `buffers` 16, `stalls` 20, `bytes` 24, `copy_seconds` 32, `stall_seconds` 40, `h2d_gbps` 48, `hidden_fraction` 56, `source[16]` 64 (no padding needed) |
-| `mi_tier_info` | 32 | `struct_size` 0, `requested` 8, `effective` 12, `attention` 16, `certified` 20, `dit_precision` 24, `text_encoder_precision` 28 |
+| `mi_tier_info` | 40 | `struct_size` 0, `requested` 8, `effective` 12, `attention` 16, `certified` 20, `dit_precision` 24, `text_encoder_precision` 28; then `run_certified` 32, `_reserved0` 36 |
 | `mi_prompt_tokens` | 32 | `struct_size` 0, `total_tokens` 8, `kept_tokens` 12, `prompt_tokens` 16, `dropped_tokens` 20, `max_length` 24, `truncated` 28 |
 | `mi_lora_report` | 32 | `struct_size` 0, `adapters` 8, `side_branch` 12, `merged` 16, `unknown_keys` 20, `warnings` 24, `notes` 28 |
 | `mi_image_info` | 80 | `struct_size` 0, `mode` 8, `hires_ran` 12, `first_width` 16, `first_height` 20, `first_steps_scheduled` 24, `first_start_step` 28, `first_steps_run` 32, `first_encoded` 36, `hires_width` 40, `hires_height` 44, `hires_steps_scheduled` 48, `hires_start_step` 52, `hires_steps_run` 56, `_reserved0` 60, `first_strength` 64, `hires_strength` 72 |
@@ -524,7 +530,9 @@ History, all with `MI_ABI_VERSION` 1:
 - 0.2.0, image input: `steps` 0, a negative `cfg` and a negative `denoise_strength` became the unset markers, and `mi_gen_params_init()` at 320 bytes sets them. `mi_engine_params` grew to 136 bytes, `mi_gen_params` to 320 and `mi_timings` to 128, as trailing fields; the 120-, 240- and 104-byte layouts stay accepted. `mi_image` and `mi_image_info` were added.
 - 0.2.0, system CUDA: `mi_probe_info` grew to 1624 bytes (the cuBLASLt fields), as trailing fields; the 576-byte layout stays accepted. `MI_CAP_SYSTEM_CUDA` was added.
 - 1.0.0: first stable release. No layout or behaviour change from 0.2.0; the CMake package now requires the same MAJOR version (`SameMajorVersion`).
-- 1.1.0, control adapters and accelerators: `mi_gen_params` grew to 376 bytes, as trailing fields; the 320-byte layout stays accepted (with its unset markers). `mi_control_image`, `mi_step_cache`, `mi_control_info` and `mi_accel_info` were added, `mi_result_text_kind` gained values 9–13, `mi_message_kind` values 2–3, and `MI_CAP_CONTROL` / `MI_CAP_ACCEL` were added.
+- 1.1.0, control adapters and accelerators: `mi_gen_params` grew to 376 bytes, as trailing fields; the 320-byte layout stays accepted (with its unset markers). `mi_control_image`, `mi_step_cache`, `mi_control_info` and `mi_accel_info` were added, `mi_result_text_kind` gained values 9–13, `mi_message_kind` values 2–3, and `MI_CAP_CONTROL` / `MI_CAP_ACCEL` were added. `mi_tier_info` grew to 40 bytes (`run_certified`), as trailing fields; the 32-byte layout stays accepted.
+
+The "1.1.0" labels name the release these changes are planned for: `MI_VERSION_*` is bumped at release time, so a build of this branch may still report 1.0.0. Detect the features with `MI_CAP_CONTROL` / `MI_CAP_ACCEL`, not with the version.
 
 ## Symbol visibility
 
@@ -562,6 +570,7 @@ Label `cpu` (`tests/unit/test_c_api.cpp`):
   - `ImageResultFromAPipelineResult`: `mi_image_info`, the image note, the time embedding, the new timings and an INT4 DiT as `W4A4` from a synthetic result.
   - `ControlAndAccelerators`: the mapping of the control adapter, its images (pixels copied, a file decoded as RGB, 1x1 stand-ins and no decode in validation) and the accelerators into `pipeline::Request`; every rejection (images without an adapter, a missing adapter or image file, a NULL array, more than 16, no kind, a repeated kind, both or neither of image and path, channels, sizes, strength and window ranges, the LoRA strength, `cfg_truncation`, unknown `step_cache` values, the threshold rules, `_reserved4`).
   - `Gen100StructSize`: the 320-byte layout (its unset markers, the tail neither written nor read); the new fields' defaults.
+  - `TierRunCertified`: `certified` against `run_certified` from synthetic results (`REFERENCE` with a LoRA: 1 and 0, matching the report; a certified `HIGH`: both 1; an uncertified `HIGH`: both 0), the 32-byte `mi_tier_info` and a wrong size.
   - `ControlAndAcceleratorResults`: `mi_result_control()`, `mi_result_accel()`, `mi_result_accel_cached_steps()`, the control texts and messages from a synthetic result (and without either), the zeroed padding and wrong sizes.
 - **`c_abi_compat`** (`tests/c/test_abi_compat.c`, C11): a hand-written 0.1.0-layout `mi_engine_params` and `mi_gen_params` through `*_init`, `mi_gen_params_validate()` and `mi_engine_create()` (as far as the model path check). With weights, `c_abi_compat_gpu` (label `gpu`) also generates from them and checks that the PNG has no text chunks.
 - **`CApiReport.*`** renders the report (through the adapter and the shared renderer) from a synthetic result under a comma-decimal C++ locale with digit grouping, and under a comma-decimal C locale where the system has one. It checks for valid JSON, exact numbers, `null` for NaN and infinity, the `dit_blocks` and `dit_stream` keys, `quality.cublaslt`, and that the document is the CLI's fields in braces.
