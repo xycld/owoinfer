@@ -60,7 +60,7 @@
       "name": "dev-sccache",
       "displayName": "Dev box with sccache",
       "inherits": "dev",
-      "description": "The dev preset with sccache as the C, C++ and CUDA compiler launcher, in its own build directory. Needs sccache >= 0.18 on PATH (0.16 fails on nvcc 13.4); configure checks it (cmake/sccache_version_check.cmake). C++ module scanning is off: sccache does not cache -fmodules-ts compiles, and the project has no modules.",
+      "description": "The dev preset with sccache as the C, C++ and CUDA compiler launcher, in its own build directory. Needs sccache >= 0.18 on PATH, which configure checks (cmake/sccache_version_check.cmake): 0.16 fails at nvcc 13.4's fatbinary step, 0.17 is untested. C++ module scanning is off: sccache does not cache -fmodules-ts compiles, and the project has no modules.",
       "cacheVariables": {
         "CMAKE_PROJECT_INCLUDE_BEFORE": "${sourceDir}/cmake/sccache_version_check.cmake",
         "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
