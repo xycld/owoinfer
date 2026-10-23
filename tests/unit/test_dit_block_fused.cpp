@@ -90,6 +90,9 @@ std::vector<std::uint16_t> download(const Tensor& t) {
 void upload(const Tensor& t, const std::vector<std::uint16_t>& h) {
   ASSERT_EQ(h.size(), static_cast<std::size_t>(t.numel()));
   MI_CUDA_CHECK(cudaMemcpy(t.data, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+  // A pageable cudaMemcpy may return once the data is staged, before the DMA lands, and the compute stream is
+  // cudaStreamNonBlocking (not ordered after the legacy stream): wait for the copy (as DeviceBuffer::upload).
+  MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
 }
 
 struct Compare {
@@ -178,6 +181,7 @@ StepRuns make_runs(std::int64_t hw, const std::vector<std::int64_t>& lengths, co
     }
   }
   MI_CUDA_CHECK(cudaMemcpy(cu_pool.data, cu.data(), cu.size() * 4, cudaMemcpyHostToDevice));
+  MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
   return s;
 }
 
@@ -435,6 +439,7 @@ class DitBlockFused : public ::testing::Test {
     {
       const auto nv = noise.to_vector<float>();
       MI_CUDA_CHECK(cudaMemcpy(latents.data, nv.data(), nv.size() * 4, cudaMemcpyHostToDevice));
+      MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
     const Tensor outs[] = {arena.alloc_persistent_tensor(DType::kF32, {128, h, w}),
                            arena.alloc_persistent_tensor(DType::kF32, {128, h, w})};
@@ -1205,6 +1210,7 @@ int in_flight_poisoning_failures() {
   std::vector<float> lv(static_cast<std::size_t>(latents.numel()));
   for (std::size_t i = 0; i < lv.size(); ++i) lv[i] = std::sin(0.37f * static_cast<float>(i));
   MI_CUDA_CHECK(cudaMemcpy(latents.data, lv.data(), lv.size() * 4, cudaMemcpyHostToDevice));
+  MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
   const Tensor outs[] = {arena.alloc_persistent_tensor(DType::kF32, {128, kGrid, kGrid}),
                          arena.alloc_persistent_tensor(DType::kF32, {128, kGrid, kGrid})};
   md::SkipSet skip22;
@@ -1318,6 +1324,7 @@ int request_route_failures() {
   std::vector<float> lv(static_cast<std::size_t>(latents.numel()));
   for (std::size_t i = 0; i < lv.size(); ++i) lv[i] = std::sin(0.37f * static_cast<float>(i));
   MI_CUDA_CHECK(cudaMemcpy(latents.data, lv.data(), lv.size() * 4, cudaMemcpyHostToDevice));
+  MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
   const Tensor outs[] = {arena.alloc_persistent_tensor(DType::kF32, {128, kGrid, kGrid}),
                          arena.alloc_persistent_tensor(DType::kF32, {128, kGrid, kGrid})};
   md::SkipSet skip22;
@@ -1444,6 +1451,7 @@ TEST(DitSmallImages, ForwardFusedMatchesOpByOpBitForBit) {
     std::vector<float> lv(static_cast<std::size_t>(latents.numel()));
     for (std::size_t i = 0; i < lv.size(); ++i) lv[i] = std::sin(0.37f * static_cast<float>(i));
     MI_CUDA_CHECK(cudaMemcpy(latents.data, lv.data(), lv.size() * 4, cudaMemcpyHostToDevice));
+    MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
     const Tensor outs[] = {arena.alloc_persistent_tensor(DType::kF32, {128, g, g}),
                            arena.alloc_persistent_tensor(DType::kF32, {128, g, g}),
                            arena.alloc_persistent_tensor(DType::kF32, {128, g, g})};

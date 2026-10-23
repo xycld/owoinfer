@@ -446,6 +446,7 @@ void GpuAttentionQ8Dit::run_case(const CaseSpec& c) {
     for (std::size_t i = 0; i < hv.size(); ++i) hv[i] = to_bf16(v[i]);
     const Tensor in = arena.alloc_persistent_tensor(DType::kBF16, {rows, md::kTextDim});
     MI_CUDA_CHECK(cudaMemcpy(in.data, hv.data(), hv.size() * 2, cudaMemcpyHostToDevice));
+    MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));  // pageable H2D copy: wait for the DMA (compute stream is non-blocking)
     const Tensor out = arena.alloc_persistent_tensor(DType::kBF16, {rows, kDim});
     model.encode_text(in, out, stream);
     return out;
@@ -455,6 +456,7 @@ void GpuAttentionQ8Dit::run_case(const CaseSpec& c) {
   {
     const auto nv = noise.to_vector<float>();
     MI_CUDA_CHECK(cudaMemcpy(latents.data, nv.data(), nv.size() * 4, cudaMemcpyHostToDevice));
+    MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));  // pageable H2D copy: wait for the DMA (compute stream is non-blocking)
   }
   const Tensor outs[] = {arena.alloc_persistent_tensor(DType::kF32, {128, h, w}),
                          arena.alloc_persistent_tensor(DType::kF32, {128, h, w})};
@@ -491,6 +493,7 @@ void GpuAttentionQ8Dit::run_case(const CaseSpec& c) {
   std::vector<std::int32_t> cu_host = {0, static_cast<std::int32_t>(off[1]), static_cast<std::int32_t>(off[2]), 0,
                                        static_cast<std::int32_t>(off[1])};
   MI_CUDA_CHECK(cudaMemcpy(cu_pool.data, cu_host.data(), cu_host.size() * 4, cudaMemcpyHostToDevice));
+  MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));  // pageable H2D copy: wait for the DMA (compute stream is non-blocking)
   const AttnRun both{0, total, cu_pool.slice0(0, 3), max_len};
   const AttnRun cond_only{0, off[1], cu_pool.slice0(3, 5), static_cast<int>(off[1])};
   const auto runs_of = [&](int bi) { return std::vector<AttnRun>{bi == 22 ? cond_only : both}; };
