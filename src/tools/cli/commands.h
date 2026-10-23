@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "mossinfer/mossinfer.h"  // MOSSINFER_API
+
 namespace mi::cli {
 
 // `args` excludes the program name and the subcommand. Returns the process exit code.
@@ -15,4 +17,13 @@ int cmd_inspect(const std::vector<std::string>& args);
 int cmd_generate(const std::vector<std::string>& args);
 int cmd_quantize(const std::vector<std::string>& args);
 
+// The whole CLI: `argv` as UTF-8 strings, program name first. Returns the process exit code. Exceptions, output and
+// locale state stay inside, so the process entry (src/tools/moss_infer/main.cpp) only converts argv.
+int run_main(const std::vector<std::string>& argv);
+
 }  // namespace mi::cli
+
+// run_main() for the process entry, which may sit in another module than the CLI: in release packages
+// (MOSSINFER_CLI_SHARED) the CLI is compiled into libmossinfer and moss-infer calls this export. `argv`: UTF-8, program
+// name first. Internal to moss-infer, not part of the C API, may change without notice.
+extern "C" MOSSINFER_API int mi_internal_cli_main(int argc, char** argv);

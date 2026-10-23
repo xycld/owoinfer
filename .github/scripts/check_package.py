@@ -2,7 +2,8 @@
 """Checks an installed MossInfer tree or a CPack archive (CI and local).
 
   AC1   no torch / c10 / python among the dependencies of any shipped binary (readelf+ldd / dumpbin /dependents)
-  ABI   the shared library exports only mi_* symbols (nm -D / dumpbin /exports)
+  ABI   the shared library exports exactly the C API functions of include/mossinfer/mossinfer.h (its MOSSINFER_API
+        declarations), plus mi_internal_cli_main, moss-infer's entry point (nm -D / dumpbin /exports)
   AC17  engine library <= 150 MB, whole redistributable (uncompressed, CUDA libraries included) <= 800 MB;
         900 MB for CUDA 12 packages, whose bundled cuBLASLt alone is ~752 MB (CUDA 12.8)
   LIC   the project's LICENSE, NOTICE and THIRD_PARTY_NOTICES.md at the root and in share/doc/mossinfer/
@@ -42,6 +43,11 @@ CUBLASLT_FILE = re.compile(r"^(libcublasLt\.so|cublasLt64_)", re.IGNORECASE)
 CUDA_LIB_FILE = re.compile(r"^(lib)?(cublas|cudart)", re.IGNORECASE)
 CUBLASLT_DEP = re.compile(r"cublasLt", re.IGNORECASE)
 IS_WINDOWS = os.name == "nt"
+# ABI: the shared library exports exactly the C API (every MOSSINFER_API declaration of the installed header) plus
+# moss-infer's internal entry point.
+HEADER = "include/mossinfer/mossinfer.h"
+API_DECL = re.compile(r"^\s*MOSSINFER_API\b[^;(]*?\b(\w+)\s*\(", re.MULTILINE)
+INTERNAL_CLI_ENTRY = "mi_internal_cli_main"
 
 
 # The C++ runtime DLLs of MSVC's /MD (the UCRT, api-ms-win-*, ships with Windows 10 and newer).
@@ -117,6 +123,15 @@ def exported_symbols(lib):
         return [m.group(1) for m in re.finditer(r"^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(\S+)", text, re.MULTILINE)]
     text = run(["nm", "-D", "--defined-only", lib])
     return [l.split()[-1] for l in text.splitlines() if l.strip()]
+
+
+def c_api_functions(prefix):
+    """The names of the functions the installed header declares MOSSINFER_API."""
+    path = os.path.join(prefix, *HEADER.split("/"))
+    if not os.path.isfile(path):
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return set(API_DECL.findall(f.read()))
 
 
 def tree_size(prefix):
@@ -201,13 +216,22 @@ def main():
         b for b in bins if re.match(r"libmossinfer\.so(\.\d+)*$", os.path.basename(b))]
     if not libs:
         failures.append("shared library libmossinfer.so / mossinfer.dll not in the tree")
+    api = c_api_functions(prefix)
+    if not api:
+        failures.append(f"ABI: no MOSSINFER_API functions found in {HEADER}")
     for lib in libs:
-        syms = exported_symbols(lib)
+        syms = set(exported_symbols(lib))
+        # mi_internal_cli_main: moss-infer's entry when it links the library (MOSSINFER_CLI_SHARED); not C API.
         # cudart_static.lib (Windows) exports NvOptimusEnablementCuda itself, a DWORD hint for Optimus laptops.
-        foreign = [s for s in syms if not s.startswith("mi_") and s != "NvOptimusEnablementCuda"]
-        print(f"ABI {os.path.relpath(lib, prefix)}: {len(syms)} exported symbols, {len(foreign)} not mi_*")
-        if not syms or foreign:
-            failures.append(f"ABI: exports other than mi_*: {foreign[:20]}")
+        foreign = sorted(syms - api - {INTERNAL_CLI_ENTRY, "NvOptimusEnablementCuda"})
+        missing = sorted(api - syms)
+        print(f"ABI {os.path.relpath(lib, prefix)}: {len(syms)} exported symbols ({len(api)} C API functions in "
+              f"{HEADER}" + (f", {INTERNAL_CLI_ENTRY}" if INTERNAL_CLI_ENTRY in syms else "") + f"), "
+              f"{len(foreign)} foreign, {len(missing)} missing")
+        if foreign:
+            failures.append(f"ABI: exports beyond the C API and {INTERNAL_CLI_ENTRY}: {foreign[:20]}")
+        if missing:
+            failures.append(f"ABI: C API functions not exported: {missing[:20]}")
         size = os.path.getsize(lib)
         print(f"AC17 engine library {size / MB:.1f} MB (limit {ENGINE_LIMIT / MB:.0f} MB)")
         if size > ENGINE_LIMIT:
