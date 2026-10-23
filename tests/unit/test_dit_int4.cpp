@@ -56,6 +56,7 @@
 #include "models/moss_dit/moss_dit.h"
 #include "runtime/device_arena.h"
 #include "runtime/pinned_ring.h"
+#include "reference_gpu.h"
 #include "runtime/stream_set.h"
 #include "test_lora_util.h"
 #include "util/json.h"
@@ -497,8 +498,13 @@ TEST_F(DitInt4Block, AllInt4MatchesQuantizedReference) {
   // Bit-exact on these inputs (measured 100 %). Elsewhere attention (FA2 here, SDPA in the reference) can differ in last
   // bits, and the o-proj / ffn_down inputs are re-quantized after it, where a 1-ULP difference moves an INT4 value by a
   // step (absmax / 7): a change of GPU, driver or attention kernel may need this gate revisited.
-  EXPECT_EQ(a.exact, 1.0);
-  EXPECT_GE(a.cosine, 0.99999);
+  // Recorded on sm_89; on sm_120 the attention's last bits differ (tensor-core rounding): 99.19 % bit-exact, cos 0.99998.
+  if (mi::testing::on_reference_gpu()) {
+    EXPECT_EQ(a.exact, 1.0);
+    EXPECT_GE(a.cosine, 0.99999);
+  } else {
+    EXPECT_GE(a.cosine, 0.99995);
+  }
   EXPECT_GE(a.update_cosine, 0.9999);
 
   // The INT4 block itself against the bf16 block (same input): the Turbo tier's own loss at this block, for scale.
@@ -541,9 +547,14 @@ TEST_F(DitInt4Block, MixedPrecisionBlockMatchesReference) {
   std::printf("[dit_int4] mixed INT4/INT8/bf16 block vs reference: %.4f%% bit-exact, %.4f%% within 1 ULP of scale (max "
               "%.2f), max %d raw ULP, cos %.9f, update cos %.7f\n",
               100 * a.exact, 100 * a.within1, a.max_scaled, a.max_ulp, a.cosine, a.update_cosine);
-  EXPECT_GE(a.cosine, 0.99999);
+  // Off sm_89 the bf16 linears also run other cuBLASLt algorithms than torch did (sm_120: 76 % within 1 ULP, cos 0.99997).
+  if (mi::testing::on_reference_gpu()) {
+    EXPECT_GE(a.cosine, 0.99999);
+    EXPECT_GE(a.within1, 0.99);
+  } else {
+    EXPECT_GE(a.cosine, 0.99995);
+  }
   EXPECT_GE(a.update_cosine, 0.9999);
-  EXPECT_GE(a.within1, 0.99);
 }
 
 // `big` sized exactly as forward() sizes it for an INT4 file (kFusedBigCols per token): the same bits as with the wide

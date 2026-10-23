@@ -24,6 +24,7 @@
 #include "core/cuda_check.h"
 #include "core/tensor.h"
 #include "kernels/vae/vae_kernels.h"
+#include "reference_gpu.h"
 #include "util/npy.h"
 #include "weights/safetensors.h"
 
@@ -273,7 +274,9 @@ TEST_P(VaeConv, MatchesTorchTf32) {
   }
   // Same TF32 rounding and accumulation order as cuDNN (bit-identical on most cases): far tighter than the
   // ~3e-4 TF32-vs-fp32 gap, so a change of rounding mode or tile order shows up here.
-  EXPECT_LT(tf32.rel, 1e-5);
+  // Off sm_89 cuDNN runs another TF32 algorithm (sm_120: 1.2e-5 to 8.6e-5, the same against torch run there), while the
+  // error against strict fp32 below stays at the reference's level.
+  EXPECT_LT(tf32.rel, mi::testing::on_reference_gpu() ? 1e-5 : 1.5e-4);
   EXPECT_GE(f32.cos, 0.99999);
   EXPECT_GE(full.cos, 0.99999);
   // Our TF32 error sits at the reference's own TF32 noise level: max error vs strict fp32 below 1e-3 of the range.

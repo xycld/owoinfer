@@ -26,6 +26,7 @@
 
 #include "core/cuda_check.h"
 #include "models/qwen35_text/text_encoder.h"
+#include "reference_gpu.h"
 #include "runtime/device_arena.h"
 #include "runtime/stream_set.h"
 #include "tokenizer/qwen_bpe.h"
@@ -50,7 +51,9 @@ constexpr int kGoldenLayers[] = {0, 3, 31};
 constexpr double kAc4MinCosine = 0.9995;
 constexpr double kAc4MaxRowRelL2 = 1e-2;
 // Engine deviation allowed relative to the torch noise floor (two perturbation sources at once).
-constexpr double kFloorFactor = 2.0;
+// Off sm_89 (where the floor was measured) torch itself drifts further from the goldens: on sm_120 its default run sits
+// at 1.5x the sm_89 floor (g_long4096_1024.cond last_hidden), the engine at up to 2.23x. 2.5x there.
+double floor_factor() { return mi::testing::on_reference_gpu() ? 2.0 : 2.5; }
 // Layers 0 and 3 (the first GatedDeltaNet and the first full-attention layer).
 constexpr double kEarlyMinCosine = 0.99998;
 constexpr double kEarlyMaxRowRelL2 = 2e-2;
@@ -143,8 +146,8 @@ Floor noise_floor(const mi::json::Value& nf, const std::string& key, const std::
 }
 
 void expect_within_floor(const std::string& what, const Metrics& m, const Floor& f) {
-  EXPECT_GE(m.cosine, 1 - kFloorFactor * (1 - f.cosine)) << what << " (torch floor cosine " << f.cosine << ")";
-  EXPECT_LE(m.mean_row_rel_l2, kFloorFactor * f.mean_row_rel_l2) << what << " (torch floor mean row rel-L2 "
+  EXPECT_GE(m.cosine, 1 - floor_factor() * (1 - f.cosine)) << what << " (torch floor cosine " << f.cosine << ")";
+  EXPECT_LE(m.mean_row_rel_l2, floor_factor() * f.mean_row_rel_l2) << what << " (torch floor mean row rel-L2 "
                                                                   << f.mean_row_rel_l2 << ")";
 }
 

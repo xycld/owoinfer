@@ -99,13 +99,20 @@ class GpuFusedGemm : public ::testing::Test {
   mi::DeviceBuffer ws_{mi::kernels::Gemm::kWorkspaceBytes};
 };
 
+// Bit-identity holds for the cuBLASLt configurations matches_cublaslt() accepts (what models/moss_dit routes fused);
+// for the others (split-K: on sm_120 cuBLASLt picks it for the 37-row o-proj) the difference is printed, not asserted.
 TEST_F(GpuFusedGemm, PlainMatchesCublasLtBitForBit) {
+  std::size_t asserted = 0;
   for (const Shape& s : kShapes) {
     const auto xv = synth_bf16(1, static_cast<std::size_t>(s.m * s.k), 1);
     const auto wv = synth_bf16(2, static_cast<std::size_t>(s.n * s.k), -5);
     Dev x({s.m, s.k}, &xv), w({s.n, s.k}, &wv), ref({s.m, s.n}), got({s.m, s.n});
     linear(ref.t, x.t, w.t);
     const auto r = ref.download();
+    const auto algo = gemm_.algo_config(ref.t, x.t, w.t, nullptr, ws_.size());
+    const bool k_ordered = mi::kernels::fused::matches_cublaslt(algo);
+    if (!k_ordered) std::printf("[fused gemm] %-12s cuBLASLt runs %s: op by op, not asserted\n", s.name, algo.describe().c_str());
+    asserted += k_ordered;
     for (GemmTile tile : kTiles) {
       mi::kernels::fused::set_gemm_tile_override(tile);
       MI_CUDA_CHECK(cudaMemset(got.t.data, 0xff, got.t.nbytes()));
@@ -113,9 +120,12 @@ TEST_F(GpuFusedGemm, PlainMatchesCublasLtBitForBit) {
       const std::size_t diff = differing(r, got.download());
       std::printf("[fused gemm] %-12s M=%-6lld tile %-7s: %zu of %zu differ\n", s.name, static_cast<long long>(s.m),
                   tile_name(tile), diff, r.size());
-      EXPECT_EQ(diff, 0u) << s.name << " tile " << tile_name(tile);
+      if (k_ordered) {
+        EXPECT_EQ(diff, 0u) << s.name << " tile " << tile_name(tile);
+      }
     }
   }
+  EXPECT_GE(asserted, std::size(kShapes) - 1);  // the large shapes run k-ordered algorithms everywhere seen
 }
 
 // Row counts of every realistic DiT run: a block runs on one contiguous run of a step's rows (cond, uncond, SLG), each
@@ -276,14 +286,17 @@ TEST_F(GpuFusedGemm, GatedResidualMatchesOpByOp) {
     linear(y.t, x.t, w.t);
     mi::kernels::gated_residual(ref.t, y.t, gate.t, ref.t, nullptr);
     const auto r = ref.download();
+    const bool k_ordered = mi::kernels::fused::matches_cublaslt(gemm_.algo_config(y.t, x.t, w.t, nullptr, ws_.size()));
     for (GemmTile tile : kTiles) {
       mi::kernels::fused::set_gemm_tile_override(tile);
       got.buf.upload(rv.data(), rv.size() * 2);
       mi::kernels::fused::gemm_gated_residual(got.t, x.t, w.t, gate.t, nullptr);
       const std::size_t diff = differing(r, got.download());
-      std::printf("[fused gated_residual] %-12s M=%-6lld tile %-7s: %zu of %zu differ\n", s.name,
-                  static_cast<long long>(s.m), tile_name(tile), diff, r.size());
-      EXPECT_EQ(diff, 0u) << s.name << " tile " << tile_name(tile);
+      std::printf("[fused gated_residual] %-12s M=%-6lld tile %-7s: %zu of %zu differ%s\n", s.name,
+                  static_cast<long long>(s.m), tile_name(tile), diff, r.size(), k_ordered ? "" : " (op by op: not asserted)");
+      if (k_ordered) {
+        EXPECT_EQ(diff, 0u) << s.name << " tile " << tile_name(tile);
+      }
     }
   }
 }
@@ -298,14 +311,17 @@ TEST_F(GpuFusedGemm, SituGluMatchesOpByOp) {
     linear(up_gate.t, x.t, w.t);
     mi::kernels::situ_glu(up_gate.t, ref.t, nullptr);
     const auto r = ref.download();
+    const bool k_ordered = mi::kernels::fused::matches_cublaslt(gemm_.algo_config(up_gate.t, x.t, w.t, nullptr, ws_.size()));
     for (GemmTile tile : kTiles) {
       mi::kernels::fused::set_gemm_tile_override(tile);
       MI_CUDA_CHECK(cudaMemset(got.t.data, 0xff, got.t.nbytes()));
       mi::kernels::fused::gemm_situ_glu(got.t, x.t, w.t, nullptr);
       const std::size_t diff = differing(r, got.download());
-      std::printf("[fused situ_glu] %-12s M=%-6lld tile %-7s: %zu of %zu differ\n", s.name, static_cast<long long>(s.m),
-                  tile_name(tile), diff, r.size());
-      EXPECT_EQ(diff, 0u) << s.name << " tile " << tile_name(tile);
+      std::printf("[fused situ_glu] %-12s M=%-6lld tile %-7s: %zu of %zu differ%s\n", s.name, static_cast<long long>(s.m),
+                  tile_name(tile), diff, r.size(), k_ordered ? "" : " (op by op: not asserted)");
+      if (k_ordered) {
+        EXPECT_EQ(diff, 0u) << s.name << " tile " << tile_name(tile);
+      }
     }
   }
 }

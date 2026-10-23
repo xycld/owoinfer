@@ -97,7 +97,9 @@ std::string set_comma_locale(const fs::path& tmp) {
   const fs::path dir = tmp / "locale";
   fs::create_directories(dir);
   const std::string cmd = "localedef -c -i de_DE -f UTF-8 '" + (dir / "de_DE.UTF-8").string() + "' >/dev/null 2>&1";
-  static_cast<void>(std::system(cmd.c_str()));  // warnings make the status nonzero; setlocale decides
+  // glibc declares system() warn_unused_result under _FORTIFY_SOURCE (Ubuntu's GCC defines it by default), and a
+  // void cast does not silence that.
+  [[maybe_unused]] const int status = std::system(cmd.c_str());  // warnings make it nonzero; setlocale decides
   setenv("LOCPATH", dir.c_str(), 1);
   if (std::setlocale(LC_ALL, "de_DE.UTF-8") != nullptr) return "de_DE.UTF-8 (localedef)";
   unsetenv("LOCPATH");
