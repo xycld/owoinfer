@@ -11,6 +11,7 @@
 #include <fstream>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -50,9 +51,24 @@ std::string json_string(const std::string& s) {
   return out + "\"";
 }
 
-std::string rates_json(const planner::HardwareProfile& hw) {
+// `loads`: with the learned DiT load rates (the probe measures none).
+std::string rates_json(const planner::HardwareProfile& hw, bool loads = false) {
   return "{\"h2d_gbps\": " + num(hw.h2d_gbps) + ", \"host_gbps\": " + num(hw.host_gbps) + ", \"disk_gbps\": " +
-         num(hw.disk_gbps) + ", \"bf16_tflops\": " + num(hw.bf16_tflops) + "}";
+         num(hw.disk_gbps) + ", \"bf16_tflops\": " + num(hw.bf16_tflops) +
+         (loads ? ", \"dit_direct_gbps\": " + num(hw.direct_gbps) + ", \"dit_buffered_warm_gbps\": " + num(hw.buffered_warm_gbps)
+                : std::string()) +
+         "}";
+}
+
+// A learned DiT load rate of `v` (HardwareProfile::direct_gbps, buffered_warm_gbps): absent, null or 0 is not learned
+// (0); anything else must be plausible (throws, as an implausible rate makes the profile unusable).
+double load_rate_from(const json::Value& v, const char* name) {
+  const json::Value* r = v.find(name);
+  if (r == nullptr || r->is_null()) return 0;
+  const double g = r->as_double();
+  if (g == 0) return 0;
+  if (!std::isfinite(g) || g <= 0.01 || g >= 1e4) throw std::out_of_range(name);
+  return g;
 }
 
 // The rates of `v`; a missing (absent or null) rate is taken from `fallback`, else the rates are unusable.
@@ -164,6 +180,8 @@ std::optional<StoredProfile> read_profile(const std::filesystem::path& path, con
     if (!learned) return std::nullopt;
     p.probe = *probe;
     p.learned = *learned;
+    p.learned.direct_gbps = load_rate_from(v.at("learned"), "dit_direct_gbps");
+    p.learned.buffered_warm_gbps = load_rate_from(v.at("learned"), "dit_buffered_warm_gbps");
     if (const json::Value* fc = v.find("fused_check"); fc != nullptr) p.fused_check = fused_check_from(*fc);
     return p;
   } catch (const std::exception&) {
@@ -174,7 +192,7 @@ std::optional<StoredProfile> read_profile(const std::filesystem::path& path, con
 bool write_profile(const std::filesystem::path& path, const std::string& key, const StoredProfile& p) {
   std::string doc = "{\"version\": " + std::to_string(kVersion) + ", \"key\": " + json_string(key) +
                     ", \"probed_at\": " + std::to_string(p.probed_at) + ",\n \"probe\": " + rates_json(p.probe) +
-                    ",\n \"learned\": " + rates_json(p.learned);
+                    ",\n \"learned\": " + rates_json(p.learned, true);
   if (p.fused_check) {
     doc += ",\n \"fused_check\": {\"kernels_version\": " + std::to_string(kernels::fused::kFusedKernelsVersion) +
            ", \"ok\": " + std::string(p.fused_check->ok ? "true" : "false") + ", \"detail\": " +
@@ -239,15 +257,28 @@ double ProfileLearner::Series::median() const {
   return n % 2 == 1 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
+bool ProfileLearner::Series::agree() const {
+  const double m = median();
+  return std::all_of(values.begin(), values.end(), [&](double x) { return std::abs(x - m) <= kSpread * m; });
+}
+
 bool ProfileLearner::Series::consistent() const {
   if (values.size() < static_cast<std::size_t>(kEvidence)) return false;
   Series last;
   last.values.assign(values.end() - kEvidence, values.end());
-  const double m = last.median();
-  return std::all_of(last.values.begin(), last.values.end(), [&](double x) { return std::abs(x - m) <= kSpread * m; });
+  return last.agree();
 }
 
-ProfileLearner::ProfileLearner(StoredProfile profile) : stored_(std::move(profile)), current_(stored_.learned) {}
+ProfileLearner::ProfileLearner(StoredProfile profile) : stored_(std::move(profile)), current_(stored_.learned) {
+  // A stored load rate counts as kEvidence agreeing loads: one disturbed load cannot move the median (nor flip the warm
+  // choice), kEvidence agreeing ones replace it, and one that agrees with it confirms it.
+  for (int i = 0; i < kEvidence; ++i) {
+    if (stored_.learned.direct_gbps > 0) direct_load_gbps_.push(stored_.learned.direct_gbps);
+    if (stored_.learned.buffered_warm_gbps > 0) warm_load_gbps_.push(stored_.learned.buffered_warm_gbps);
+  }
+  current_.warm_direct = current_.direct_gbps > 0 && current_.buffered_warm_gbps > 0 &&
+                         planner::warm_dit_load_direct(current_.direct_gbps, current_.buffered_warm_gbps, false);
+}
 
 bool ProfileLearner::cached_rate(double gbps) const {
   return gbps >= std::sqrt(stored_.probe.host_gbps * stored_.probe.disk_gbps);
@@ -280,11 +311,28 @@ void ProfileLearner::observe_dit_load(double gbps) {
   if (std::isfinite(gbps) && gbps > 0) dit_cached_.vote(cached_rate(gbps));
 }
 
-void ProfileLearner::observe_dit_load_rate(bool direct, double gbps) {
-  if (!std::isfinite(gbps) || gbps <= 0) return;
-  Series& s = direct ? direct_load_gbps_ : buffered_load_gbps_;
+bool ProfileLearner::observe_dit_load_rate(bool direct, double gbps, bool warm) {
+  if (!std::isfinite(gbps) || gbps <= 0) return false;
+  if (!direct) buffered_load_gbps_.push(gbps);
+  if (!direct && !warm) return false;
+  Series& s = direct ? direct_load_gbps_ : warm_load_gbps_;
+  double planner::HardwareProfile::*field = direct ? &planner::HardwareProfile::direct_gbps
+                                                   : &planner::HardwareProfile::buffered_warm_gbps;
   s.push(gbps);
-  if (direct) current_.direct_gbps = s.median();
+  current_.*field = s.median();
+  const double other = direct ? current_.buffered_warm_gbps : current_.direct_gbps;
+  if (current_.direct_gbps > 0 && other > 0) {
+    current_.warm_direct = planner::warm_dit_load_direct(current_.direct_gbps, current_.buffered_warm_gbps, current_.warm_direct);
+  }
+  // Nothing stored yet and the other warm rate known: the loads so far are enough when they agree (one load: an
+  // exploration, which a new process would otherwise repeat). Otherwise kEvidence agreeing loads; a load that agrees
+  // with a stored rate leaves the median, and so the stored rate, where it is.
+  const double was = stored_.learned.*field;
+  const bool early = other > 0 && was == 0 && s.agree();
+  if (!(early || s.consistent()) || std::abs(was - current_.*field) < 1e-3 * current_.*field) return false;
+  stored_.learned.*field = current_.*field;
+  s.values.assign(kEvidence, current_.*field);  // as at construction: the stored rate stands for kEvidence loads
+  return true;
 }
 
 double ProfileLearner::dit_load_gbps(bool direct) const {

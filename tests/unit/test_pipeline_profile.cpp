@@ -128,6 +128,33 @@ TEST(HardwareProfile, RoundTrip) {
   int entries = 0;
   for (const auto& e : fs::directory_iterator(file.parent_path())) entries += e.is_regular_file();
   EXPECT_EQ(entries, 1);
+  // The learned DiT load rates, and a profile written before them (no fields: not learned yet; still version 2).
+  StoredProfile loads = sample();
+  loads.learned.direct_gbps = 9.75;
+  loads.learned.buffered_warm_gbps = 4.25;
+  ASSERT_TRUE(mi::pipeline::write_profile(file, kKey, loads));
+  const std::string text = read_text(file);
+  const auto rates = mi::pipeline::read_profile(file, kKey, kNow);
+  ASSERT_TRUE(rates.has_value()) << text;
+  EXPECT_EQ(rates->learned.direct_gbps, 9.75);
+  EXPECT_EQ(rates->learned.buffered_warm_gbps, 4.25);
+  EXPECT_EQ(rates->probe.direct_gbps, 0.0);
+  EXPECT_EQ(text.find("dit_direct_gbps"), text.rfind("dit_direct_gbps")) << "learned only: " << text;
+  const std::string fields = ", \"dit_direct_gbps\": 9.75, \"dit_buffered_warm_gbps\": 4.25";
+  const std::size_t at = text.find(fields);
+  ASSERT_NE(at, std::string::npos) << text;
+  write_text(file, std::string(text).erase(at, fields.size()));
+  const auto older = mi::pipeline::read_profile(file, kKey, kNow);
+  ASSERT_TRUE(older.has_value());
+  EXPECT_EQ(older->learned.direct_gbps, 0.0);
+  EXPECT_EQ(older->learned.buffered_warm_gbps, 0.0);
+  EXPECT_EQ(older->learned.bf16_tflops, 73.7);
+  for (const char* bad : {"-9.75", "1e300", "\"fast\""}) {
+    std::string t = text;
+    t.replace(t.find("9.75"), 4, bad);
+    write_text(file, t);
+    EXPECT_FALSE(mi::pipeline::read_profile(file, kKey, kNow).has_value()) << t;
+  }
   // Without a self-check result.
   StoredProfile p = sample();
   p.fused_check.reset();
@@ -420,6 +447,95 @@ TEST(ProfileLearner, RatesAreRobustAndPersistOnlyWhenConsistent) {
   // Non-finite or non-positive estimates are ignored.
   EXPECT_FALSE(l.observe_tflops(std::numeric_limits<double>::quiet_NaN()));
   EXPECT_FALSE(l.observe_tflops(-1.0));
+}
+
+// The DiT load rates: direct loads (warm or cold) and warm buffered loads are learned apart from cold buffered ones and
+// drive the warm choice (current().warm_direct) with hysteresis; a cold buffered load only feeds the mixed rate. A rate
+// persists once kEvidence loads agree, or at once when nothing is stored for it and the other warm rate is known (the
+// exploration), so a new process does not explore again.
+TEST(ProfileLearner, DitLoadRatesPerModeAndWarmth) {
+  ProfileLearner l(sample());
+  EXPECT_EQ(l.current().direct_gbps, 0.0);
+  EXPECT_FALSE(l.current().warm_direct);
+  EXPECT_FALSE(l.observe_dit_load_rate(false, 2.2, false));  // cold buffered: the mixed rate only
+  EXPECT_EQ(l.current().buffered_warm_gbps, 0.0);
+  EXPECT_EQ(l.dit_load_gbps(false), 2.2);
+  EXPECT_FALSE(l.observe_dit_load_rate(true, 9.2, false)) << "no warm buffered rate yet: one load is not persisted";
+  EXPECT_EQ(l.current().direct_gbps, 9.2);
+  EXPECT_FALSE(l.current().warm_direct) << "no warm buffered rate yet";
+  EXPECT_TRUE(l.observe_dit_load_rate(false, 4.3, true)) << "the exploration persists at once";
+  EXPECT_EQ(l.stored().learned.buffered_warm_gbps, 4.3);
+  EXPECT_EQ(l.dit_load_gbps(false), 3.25) << "the mixed rate counts warm loads too";
+  EXPECT_TRUE(l.current().warm_direct);
+  EXPECT_TRUE(l.observe_dit_load_rate(true, 9.5, true)) << "nothing stored, the warm rate known, 9.2 and 9.5 agree";
+  EXPECT_EQ(l.stored().learned.direct_gbps, 9.35);
+  EXPECT_FALSE(l.stored().learned.warm_direct) << "the choice follows the rates; it is not stored";
+  // A new process starts from the stored rates: both known, nothing to explore, the warm choice derived from them.
+  ProfileLearner next(l.stored());
+  EXPECT_EQ(next.current().direct_gbps, 9.35);
+  EXPECT_EQ(next.current().buffered_warm_gbps, 4.3);
+  EXPECT_TRUE(next.current().warm_direct);
+  // A load that agrees with a stored rate confirms it; nothing to write.
+  EXPECT_FALSE(next.observe_dit_load_rate(false, 4.5, true));
+  EXPECT_EQ(next.current().buffered_warm_gbps, 4.3);
+  // The exploration of direct, with the warm buffered rate stored: persisted at once.
+  StoredProfile stored_warm = sample();
+  stored_warm.learned.buffered_warm_gbps = 4.3;
+  ProfileLearner e(stored_warm);
+  EXPECT_TRUE(e.observe_dit_load_rate(true, 9.2, false));
+  EXPECT_EQ(e.stored().learned.direct_gbps, 9.2);
+  // Disagreeing loads of a mode with nothing stored wait for kEvidence agreeing ones, the other rate known or not.
+  ProfileLearner d(sample());
+  EXPECT_FALSE(d.observe_dit_load_rate(true, 9.2, false));
+  EXPECT_FALSE(d.observe_dit_load_rate(true, 3.0, false));
+  EXPECT_TRUE(d.observe_dit_load_rate(false, 4.3, true));
+  EXPECT_FALSE(d.observe_dit_load_rate(true, 9.1, false)) << "9.2, 3.0, 9.1 disagree";
+  EXPECT_FALSE(d.observe_dit_load_rate(true, 9.0, false));
+  EXPECT_EQ(d.stored().learned.direct_gbps, 0.0);
+  EXPECT_TRUE(d.observe_dit_load_rate(true, 9.3, false));  // 9.1, 9.0, 9.3 agree
+  EXPECT_EQ(d.stored().learned.direct_gbps, 9.1);
+  EXPECT_FALSE(d.observe_dit_load_rate(true, std::numeric_limits<double>::quiet_NaN(), false));
+  EXPECT_FALSE(d.observe_dit_load_rate(false, -1.0, true));
+}
+
+// A persisted rate stands for kEvidence loads: one disturbed load (a busy disk, another program's I/O) neither moves it
+// nor flips the warm choice; kEvidence agreeing loads replace it. Hysteresis keeps the mode in use through near-ties.
+TEST(ProfileLearner, OneDisturbedLoadDoesNotFlipTheWarmChoice) {
+  StoredProfile p = sample();
+  p.learned.direct_gbps = 9.2;
+  p.learned.buffered_warm_gbps = 4.3;
+  ProfileLearner l(p);
+  ASSERT_TRUE(l.current().warm_direct);
+  EXPECT_FALSE(l.observe_dit_load_rate(true, 2.0, true));  // one disturbed direct load
+  EXPECT_EQ(l.current().direct_gbps, 9.2);
+  EXPECT_TRUE(l.current().warm_direct);
+  EXPECT_FALSE(l.observe_dit_load_rate(false, 20.0, true));  // one wild warm buffered load
+  EXPECT_EQ(l.current().buffered_warm_gbps, 4.3);
+  EXPECT_TRUE(l.current().warm_direct);
+  EXPECT_EQ(l.stored().learned.direct_gbps, 9.2);
+  // The machine really changed: kEvidence agreeing loads replace the stored rate, and the choice follows.
+  EXPECT_FALSE(l.observe_dit_load_rate(true, 2.1, false));
+  EXPECT_EQ(l.current().direct_gbps, 9.2) << "two of five loads";
+  EXPECT_TRUE(l.observe_dit_load_rate(true, 2.05, false));  // 2.0, 2.1, 2.05 agree: the median of five
+  EXPECT_EQ(l.stored().learned.direct_gbps, 2.1);
+  EXPECT_FALSE(l.current().warm_direct);
+  EXPECT_FALSE(l.observe_dit_load_rate(true, 9.0, false)) << "the new rate stands for kEvidence loads in turn";
+  EXPECT_EQ(l.current().direct_gbps, 2.1);
+  // Hysteresis: direct in use stays while buffered is within kWarmLoadHysteresis of it.
+  StoredProfile tie = sample();
+  tie.learned.direct_gbps = 10.0;
+  ProfileLearner h(tie);
+  h.observe_dit_load_rate(false, 11.0, true);  // the exploration: 10 % faster than direct
+  EXPECT_FALSE(h.current().warm_direct) << "buffered in use (no earlier choice): direct is not 15 % faster";
+  StoredProfile both = tie;
+  both.learned.buffered_warm_gbps = 8.0;
+  ProfileLearner k(both);
+  ASSERT_TRUE(k.current().warm_direct);
+  for (const double g : {11.4, 11.4, 11.4}) k.observe_dit_load_rate(false, g, true);  // 14 % faster
+  EXPECT_EQ(k.current().buffered_warm_gbps, 11.4);
+  EXPECT_TRUE(k.current().warm_direct);
+  for (const double g : {12.0, 12.0, 12.0}) k.observe_dit_load_rate(false, g, true);  // 20 % faster
+  EXPECT_FALSE(k.current().warm_direct);
 }
 
 }  // namespace

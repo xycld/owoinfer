@@ -5,9 +5,11 @@
 // versions) and probed again when the key changes or the probe is older than kProfileMaxAgeSeconds. It is replaced
 // atomically (a unique temporary file, then a rename), its numbers are written locale-independently (a non-finite one
 // as null, which reads as missing: a learned rate falls back to the probed one), and anything unreadable, malformed or
-// implausible reads as "no profile" (measure again). The fused self-check is stored with the fused kernels' version
-// (kernels::fused::kFusedKernelsVersion) and the configurations it validated; one from other kernels, or malformed,
-// reads as "not checked" (check again) and leaves the rates.
+// implausible reads as "no profile" (measure again). The learned DiT load rates (dit_direct_gbps,
+// dit_buffered_warm_gbps) are optional fields of "learned": absent or 0 reads as not learned yet (files written before
+// them), and readers that predate them ignore them, so the format version is unchanged. The fused self-check is stored
+// with the fused kernels' version (kernels::fused::kFusedKernelsVersion) and the configurations it validated; one from
+// other kernels, or malformed, reads as "not checked" (check again) and leaves the rates.
 //
 // Learning (ProfileLearner): one disturbed generation (a busy host, a page cache another program just evicted) must not
 // steer the planner. A boolean (are the weight files in the page cache?) flips only after kEvidence consecutive
@@ -72,8 +74,15 @@ class ProfileLearner {
   // A DiT load from the weight files (one reader, buffered): a cached/cold vote.
   void observe_dit_load(double gbps);
   // A DiT load's rate by I/O mode (direct or buffered), kept per mode: the median of the recent loads (0: none yet).
-  // The direct one also prices cold loads in the plans (HardwareProfile::direct_gbps). In memory only.
-  void observe_dit_load_rate(bool direct, double gbps);
+  // `warm`: at least 90 % of the files were in the page cache before the load. Direct loads (warm or cold alike) and
+  // warm buffered ones are learned as HardwareProfile::direct_gbps and buffered_warm_gbps (the warm I/O choice and the
+  // plans' load prices; unbounded: nothing probes them), and current().warm_direct follows them
+  // (planner::warm_dit_load_direct). A stored rate (read or just persisted) stands in its series as kEvidence loads,
+  // so one disturbed load moves neither it nor the warm choice. Persisted once kEvidence loads agree within kSpread,
+  // or, with nothing stored for it and the other warm rate known, as soon as its loads agree (one load: the
+  // exploration, so the next process does not repeat it). Every buffered load also feeds the in-memory
+  // dit_load_gbps(false), warm and cold mixed (the choice where residency is unknown). True when stored() changed.
+  bool observe_dit_load_rate(bool direct, double gbps, bool warm);
   double dit_load_gbps(bool direct) const;
   // One file-streamed text-encoder pass (planner::weights_cached_from_stream): a vote.
   void observe_te_stream(bool cached);
@@ -92,6 +101,7 @@ class ProfileLearner {
     std::deque<double> values;  // the last kHistory estimates
     void push(double v);
     double median() const;
+    bool agree() const;       // every estimate within kSpread of the median
     bool consistent() const;  // the last kEvidence estimates agree within kSpread
   };
   // Whether a weight-file read at `gbps` came from the page cache: above the geometric mean of the probed page-cache
@@ -101,7 +111,7 @@ class ProfileLearner {
   StoredProfile stored_;
   planner::HardwareProfile current_;
   Verdict dit_cached_, te_cached_;
-  Series tflops_, host_gbps_, direct_load_gbps_, buffered_load_gbps_;
+  Series tflops_, host_gbps_, direct_load_gbps_, buffered_load_gbps_, warm_load_gbps_;
 };
 
 }  // namespace mi::pipeline

@@ -134,6 +134,9 @@ struct DitSource {
   // the first that does not decides), checked once per source.
   std::vector<std::filesystem::path> files;
   mutable std::optional<weights::DirectIoSupport> direct;
+  // An O_DIRECT open of the files was refused (the load read buffered): direct I/O is not explored on them again in
+  // this process (choose_dit_load_io).
+  mutable bool direct_refused = false;
   // The model it was trained as (dit_lineage): "base", "sft" or "" (unknown).
   std::string lineage;
 };
@@ -163,15 +166,50 @@ bool merge_memo_unaffordable(const planner::ExecutionPlan& plan, std::size_t hos
 }
 
 DitIoDecision choose_dit_load_io(const DitIoInputs& in) {
-  if (in.forced_buffered) return {false, "buffered reads requested"};
-  if (in.forced_direct) return {true, in.support.supported ? std::string() : "direct I/O requested; " + in.support.reason};
-  if (!in.support.supported) return {false, in.support.reason};
-  if (in.parked) return {false, "a parking reload: buffered, so the page cache keeps the DiT's files for the next one"};
-  char text[200];
-  if (in.cached_fraction >= kDitCachedFraction) {
-    std::snprintf(text, sizeof(text), "%.0f%% of the DiT's files are in the page cache: buffered reads serve them from RAM",
-                  100.0 * in.cached_fraction);
-    return {false, text};
+  const bool warm = in.cached_fraction >= kDitCachedFraction;
+  if (in.forced_buffered) return {false, "buffered reads requested", warm};
+  if (in.forced_direct) {
+    return {true, in.support.supported ? std::string() : "direct I/O requested; " + in.support.reason, warm};
+  }
+  if (!in.support.supported) return {false, in.support.reason, warm};
+  char text[240];
+  // Both warm rates measured: the faster mode, unless the hysteresis keeps the one in use (said so).
+  const bool both = in.direct_gbps > 0 && in.buffered_warm_gbps > 0;
+  const bool warm_direct = both && planner::warm_dit_load_direct(in.direct_gbps, in.buffered_warm_gbps, in.warm_direct_before);
+  std::string rates;
+  if (both) {
+    const double chosen = warm_direct ? in.direct_gbps : in.buffered_warm_gbps;
+    const double other = warm_direct ? in.buffered_warm_gbps : in.direct_gbps;
+    std::snprintf(text, sizeof(text), "warm: %s measured %.1f GB/s vs %s %.1f GB/s", warm_direct ? "direct" : "buffered", chosen,
+                  warm_direct ? "buffered" : "direct", other);
+    rates = text;
+    if (chosen < other) {
+      std::snprintf(text, sizeof(text), " (kept: within %.0f%% of it)", 100.0 * planner::kWarmLoadHysteresis);
+      rates += text;
+    }
+  }
+  if (in.parked) {
+    if (warm_direct) return {true, "a parking reload; " + rates, warm};
+    return {false, "a parking reload: buffered, so the page cache keeps the DiT's files for the next one", warm};
+  }
+  if (warm) {
+    std::snprintf(text, sizeof(text), "%.0f%% of the DiT's files are in the page cache", 100.0 * in.cached_fraction);
+    const std::string resident = text;
+    if (both) return {warm_direct, resident + "; " + rates, true};
+    // One mode measured: the other, once, so both are known from then on (a load too small to measure explores nothing).
+    const bool measured = in.bytes >= kDitLoadMeasureBytes;
+    if (in.direct_gbps > 0 && measured) {
+      std::snprintf(text, sizeof(text), "; warm: direct measured %.1f GB/s, buffered not yet: buffered this once", in.direct_gbps);
+      return {false, resident + text, true};
+    }
+    if (in.buffered_warm_gbps > 0 && measured) {
+      std::snprintf(text, sizeof(text),
+                    in.direct_refused ? "; warm: buffered measured %.1f GB/s, direct not tried: an O_DIRECT open of these files was refused"
+                                      : "; warm: buffered measured %.1f GB/s, direct not yet: direct this once",
+                    in.buffered_warm_gbps);
+      return {!in.direct_refused, resident + text, true};
+    }
+    return {false, resident + ": buffered reads serve them from RAM", true};
   }
   if (in.cached_fraction >= 0) return {true, {}};
   // Residency unknown (Windows, or a file the process may not query): the learner's measured rates decide, else the
@@ -782,8 +820,10 @@ struct Pipeline::Impl {
   std::map<std::string, std::unique_ptr<EncoderSource>> encoder_sources;
   // DiT source whose resident DiT was last dropped outside the plan's parking (its next load is a reload).
   const DitSource* dit_lost = nullptr;
-  // DiT source the plan last parked (its next load is a parking reload: buffered reads, dit_direct_io).
+  // DiT source the plan last parked (its next load is a parking reload: buffered unless direct is the warm choice,
+  // dit_direct_io).
   const DitSource* dit_parked = nullptr;
+  bool dit_load_warm = false;  // the last DiT load from the files found them in the page cache (DitIoDecision::warm)
   // Transfer rates for the cost model and whether the weight files are page-cached: probed (or read from the cache
   // directory) at the first generate(), refined from every pass (pipeline/hardware_profile.h). Unset with
   // options.hardware.
@@ -1241,14 +1281,17 @@ struct Pipeline::Impl {
     return false;
   }
 
-  // Whether a load of `src` from its files uses direct I/O, with the reason in `note` (choose_dit_load_io on what this
-  // machine says now: the files' direct-I/O support, checked once per source; their page-cache residency, per load;
-  // the learner's per-mode load rates).
-  bool dit_direct_io(const DitSource& src, bool parked, std::string& note) const {
+  // How a load of `src` from its files reads them (choose_dit_load_io on what this machine says now: the files'
+  // direct-I/O support, checked once per source; their page-cache residency, per load; the learner's load rates and its
+  // warm choice).
+  DitIoDecision dit_direct_io(const DitSource& src, bool parked) const {
     DitIoInputs in;
     in.forced_direct = options.direct_io || options.dit_load_direct_io == true;
     in.forced_buffered = !options.direct_io && options.dit_load_direct_io == false;
     in.parked = parked;
+    in.direct_refused = src.direct_refused;
+    // Forced buffered reads skip the residency query: such a load is not counted as warm, so its rate never feeds the
+    // warm buffered one (DitIoDecision::warm stays false).
     if (!in.forced_buffered) {
       if (!src.direct) {
         src.direct = weights::DirectIoSupport{true, {}};
@@ -1272,14 +1315,15 @@ struct Pipeline::Impl {
         total += bytes;
       }
       in.cached_fraction = known && total > 0 ? cached / total : -1.0;
+      in.bytes = static_cast<std::uint64_t>(total);
       if (learner) {
         in.buffered_gbps = learner->dit_load_gbps(false);
-        in.direct_gbps = learner->dit_load_gbps(true);
+        in.direct_gbps = learner->current().direct_gbps;
+        in.buffered_warm_gbps = learner->current().buffered_warm_gbps;
+        in.warm_direct_before = learner->current().warm_direct;
       }
     }
-    const DitIoDecision d = choose_dit_load_io(in);
-    note = d.note;
-    return d.direct;
+    return choose_dit_load_io(in);
   }
 
   // The plan counts the DiT and every resident model, so a resident DiT is never expected to be dropped here; when
@@ -1298,8 +1342,11 @@ struct Pipeline::Impl {
       throw runtime::BudgetError(persistent + stack_need, arena->available());
     }
     const weights::HostFiles* host = dit_host && dit_host_src == &src ? &*dit_host : nullptr;
-    std::string note;
-    const bool direct = host == nullptr && dit_direct_io(src, dit_parked == &src, note);
+    DitIoDecision io;
+    if (host == nullptr) io = dit_direct_io(src, dit_parked == &src);
+    const bool direct = host == nullptr && io.direct;
+    std::string note = std::move(io.note);
+    dit_load_warm = io.warm;
     dit_parked = nullptr;
     const auto t0 = Clock::now();
     try {
@@ -1322,7 +1369,10 @@ struct Pipeline::Impl {
     load.source = host != nullptr ? "host_copy" : "files";
     // What the readers did (an open that refused O_DIRECT reads buffered).
     load.io = host != nullptr ? std::string() : dit->load_stats().direct ? "direct" : "buffered";
-    if (direct && !dit->load_stats().direct && note.empty()) note = "direct I/O was refused: the files were read buffered";
+    if (direct && !dit->load_stats().direct) {
+      src.direct_refused = true;
+      note += (note.empty() ? "" : "; ") + std::string("direct I/O was refused: the files were read buffered");
+    }
     if (host != nullptr && residency.streamed()) {
       note = "the streamed blocks read the weight files (the host copy serves the resident part)";
     }
@@ -1449,8 +1499,7 @@ ReleaseReport Pipeline::release_device_memory(bool keep_host_copy, const std::at
     } else {
       const auto t1 = Clock::now();
       try {
-        std::string io_note;
-        const bool direct = m.dit_direct_io(*copy_src, false, io_note);
+        const bool direct = m.dit_direct_io(*copy_src, false).direct;
         weights::HostFiles copy = weights::read_files_to_host(copy_src->files, true, direct, 4, cancel);
         if (cancel != nullptr && cancel->load()) {
           rep.note = "the DiT's host copy was cancelled";
@@ -2200,12 +2249,15 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     m.dit->set_cancel(control.cancel);
     // A DiT read buffered from the weight files: page-cached or cold (the loader's one reader). Direct reads and a soft
     // unload's host copy bypass the page cache, so they say nothing about it.
-    // Each mode's load rate is kept (the direct one prices cold loads; on Windows the two decide the mode).
+    // Each mode's load rate is kept, buffered ones from a warm cache apart (they price loads and decide the warm mode;
+    // on Windows direct and buffered decide the mode).
     const moss_dit::LoadStats& ls = m.dit->load_stats();
     if (r.memory.dit_loads > loads_before && m.learner && r.dit_load.source == "files" && ls.seconds > 0 &&
-        ls.bytes >= (std::uint64_t{1} << 30)) {
+        ls.bytes >= kDitLoadMeasureBytes) {
       const double gbps = static_cast<double>(ls.bytes) / ls.seconds / 1e9;
-      m.learner->observe_dit_load_rate(ls.direct, gbps);
+      if (m.learner->observe_dit_load_rate(ls.direct, gbps, m.dit_load_warm) && !m.options.hardware) {
+        m.save_profile(m.learner->stored());
+      }
       if (!ls.direct) m.learner->observe_dit_load(gbps);
     }
     if (m.dit->block_path() != block_path) m.dit->set_block_path(block_path);

@@ -148,6 +148,129 @@ TEST(DitLoadIo, EveryBranch) {
   EXPECT_EQ(choose_dit_load_io(f).note, "page-cache residency unknown: direct, the cold-cache choice");
 }
 
+// With the files in the page cache the learned rates decide: both warm rates known (either way, the measured rates in
+// the note), one known (the other is tried, unless the load is too small to measure or direct was refused on the
+// files), the hysteresis around a tie, a parking reload (direct only where the warm choice is direct), and what stays
+// as it was: cold files, unknown residency, the forced modes, unsupported files.
+TEST(DitLoadIo, WarmChoiceIsMeasured) {
+  using mi::pipeline::choose_dit_load_io;
+  using mi::pipeline::DitIoInputs;
+  DitIoInputs warm;
+  warm.cached_fraction = 0.97;
+  warm.bytes = 10'160'000'000;  // the SFT bf16 DiT
+  // Both known, RTX 5090: direct beats even a fully cached buffered read.
+  DitIoInputs f = warm;
+  f.direct_gbps = 9.2;
+  f.buffered_warm_gbps = 4.3;
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  EXPECT_TRUE(choose_dit_load_io(f).warm);
+  EXPECT_EQ(choose_dit_load_io(f).note, "97% of the DiT's files are in the page cache; warm: direct measured 9.2 GB/s vs buffered 4.3 GB/s");
+  // Both known, the dev laptop: buffered from RAM wins.
+  f.direct_gbps = 6.2;
+  f.buffered_warm_gbps = 11.3;
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  EXPECT_EQ(choose_dit_load_io(f).note, "97% of the DiT's files are in the page cache; warm: buffered measured 11.3 GB/s vs direct 6.2 GB/s");
+  f.warm_direct_before = true;  // direct in use, buffered far faster: switched
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  // Only one known: the other mode, once.
+  f = warm;
+  f.direct_gbps = 9.2;
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  EXPECT_EQ(choose_dit_load_io(f).note,
+            "97% of the DiT's files are in the page cache; warm: direct measured 9.2 GB/s, buffered not yet: buffered this once");
+  f.buffered_gbps = 4.0;  // the mixed buffered rate (cold loads) is not a warm one
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  f = warm;
+  f.buffered_warm_gbps = 4.3;
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  EXPECT_EQ(choose_dit_load_io(f).note,
+            "97% of the DiT's files are in the page cache; warm: buffered measured 4.3 GB/s, direct not yet: direct this once");
+  // A refused O_DIRECT open on these files earlier: direct is not explored again (said so); a known comparison stands.
+  f.direct_refused = true;
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  EXPECT_EQ(choose_dit_load_io(f).note, "97% of the DiT's files are in the page cache; warm: buffered measured 4.3 GB/s, "
+                                        "direct not tried: an O_DIRECT open of these files was refused");
+  f.direct_gbps = 9.2;
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  // A load too small to measure explores nothing: buffered from RAM, either rate known.
+  f = warm;
+  f.bytes = mi::pipeline::kDitLoadMeasureBytes - 1;
+  f.buffered_warm_gbps = 4.3;
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  EXPECT_EQ(choose_dit_load_io(f).note, "97% of the DiT's files are in the page cache: buffered reads serve them from RAM");
+  f.buffered_warm_gbps = 0;
+  f.direct_gbps = 9.2;
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  EXPECT_EQ(choose_dit_load_io(f).note, "97% of the DiT's files are in the page cache: buffered reads serve them from RAM");
+  f.bytes = mi::pipeline::kDitLoadMeasureBytes;
+  EXPECT_NE(choose_dit_load_io(f).note.find("buffered this once"), std::string::npos);
+  f.buffered_warm_gbps = 4.3;  // both known: the comparison holds for small loads too
+  f.bytes = 0;
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  // Neither known: buffered, as before the rates (its load measures the warm buffered rate).
+  EXPECT_FALSE(choose_dit_load_io(warm).direct);
+  // Hysteresis: the mode in use stays until the other is more than kWarmLoadHysteresis faster.
+  f = warm;
+  f.buffered_warm_gbps = 10.0;
+  f.direct_gbps = 11.0;  // 10 % faster
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  EXPECT_EQ(choose_dit_load_io(f).note, "97% of the DiT's files are in the page cache; warm: buffered measured 10.0 GB/s vs direct 11.0 GB/s (kept: within 15% of it)");
+  f.warm_direct_before = true;
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  f.direct_gbps = 9.0;  // direct in use, buffered 11 % faster: kept
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  EXPECT_NE(choose_dit_load_io(f).note.find("warm: direct measured 9.0 GB/s vs buffered 10.0 GB/s (kept"), std::string::npos);
+  f.direct_gbps = 8.6;  // buffered 16 % faster: switched
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  f.warm_direct_before = false;
+  f.direct_gbps = 11.6;  // direct 16 % faster: switched
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  EXPECT_TRUE(mi::planner::warm_dit_load_direct(11.6, 10.0, false));
+  EXPECT_FALSE(mi::planner::warm_dit_load_direct(11.4, 10.0, false));
+  EXPECT_TRUE(mi::planner::warm_dit_load_direct(8.8, 10.0, true));
+  EXPECT_FALSE(mi::planner::warm_dit_load_direct(8.6, 10.0, true));
+  // Parking reloads: buffered unless both rates are known and direct is the warm choice, warm or cold files alike.
+  f = warm;
+  f.parked = true;
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  EXPECT_NE(choose_dit_load_io(f).note.find("parking reload: buffered"), std::string::npos);
+  f.direct_gbps = 9.2;  // one known: no exploration on a parking reload
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  f.buffered_warm_gbps = 4.3;
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  EXPECT_EQ(choose_dit_load_io(f).note, "a parking reload; warm: direct measured 9.2 GB/s vs buffered 4.3 GB/s");
+  f.cached_fraction = 0.1;
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  EXPECT_FALSE(choose_dit_load_io(f).warm);
+  f.buffered_warm_gbps = 11.3;
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  EXPECT_NE(choose_dit_load_io(f).note.find("parking reload: buffered"), std::string::npos);
+  // Unchanged by the warm rates: cold files read direct, unknown residency compares the mixed rates, the forced
+  // modes and unsupported files win.
+  f = warm;
+  f.direct_gbps = 6.2;
+  f.buffered_warm_gbps = 11.3;
+  f.cached_fraction = 0.5;
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  EXPECT_TRUE(choose_dit_load_io(f).note.empty());
+  f.cached_fraction = -1;
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  EXPECT_EQ(choose_dit_load_io(f).note, "page-cache residency unknown: direct, the cold-cache choice");
+  f.cached_fraction = 0.97;
+  f.forced_direct = true;
+  EXPECT_TRUE(choose_dit_load_io(f).direct);
+  EXPECT_TRUE(choose_dit_load_io(f).warm);
+  f.forced_direct = false;
+  f.buffered_warm_gbps = 4.3;
+  f.direct_gbps = 9.2;
+  f.forced_buffered = true;
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  f.forced_buffered = false;
+  f.support = {false, "x.safetensors is on a RAM file system"};
+  EXPECT_FALSE(choose_dit_load_io(f).direct);
+  EXPECT_EQ(choose_dit_load_io(f).note, "x.safetensors is on a RAM file system");
+}
+
 // The merge memo goes when the plan is over the target its configuration is held to, or over an explicit budget.
 TEST(DitLoadIo, MergeMemoDropRule) {
   mi::planner::ExecutionPlan p;

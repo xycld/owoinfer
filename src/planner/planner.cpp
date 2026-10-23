@@ -112,12 +112,24 @@ class Planner {
     const std::size_t bytes = dit_persistent(d) + (d.source == DitSource::kHostPinned ? dit_streamed_bytes(d) : 0);
     return static_cast<double>(bytes) / (load_rate_gbps() * 1e9);
   }
-  // A DiT load's rate (the first load; prefer_held's reload): the page cache when the files are expected there, else the
-  // measured direct-I/O load rate (the pipeline reads a cold DiT with direct I/O), else the cold-disk rate. Parking
-  // reloads read buffered (evaluate).
+  // A DiT load's rate (the first load; prefer_held's reload), at the I/O mode the pipeline picks (choose_dit_load_io):
+  // files expected in the page cache: the warm rate (warm_load_rate_gbps); cold: the measured direct-I/O load rate (the
+  // pipeline reads a cold DiT with direct I/O), else the cold-disk rate.
   double load_rate_gbps() const {
-    if (r_.dit_weights_cached || hw_.direct_gbps <= 0) return weight_rate_gbps(false, r_.dit_weights_cached);
+    if (r_.dit_weights_cached) return warm_load_rate_gbps();
+    if (hw_.direct_gbps <= 0) return weight_rate_gbps(false, false);
     return std::max(1e-3, std::min(hw_.direct_gbps, hw_.h2d_gbps));
+  }
+  // A warm load: direct where the learned rates chose it (warm_direct), else buffered at its measured warm rate, else
+  // the page-cache rate.
+  double warm_load_rate_gbps() const {
+    const double g = hw_.warm_direct ? hw_.direct_gbps : hw_.buffered_warm_gbps;
+    return g > 0 ? std::max(1e-3, std::min(g, hw_.h2d_gbps)) : weight_rate_gbps(false, true);
+  }
+  // A parking reload: buffered (the page cache keeps the files for the next one) at the warm or cold rate, or direct
+  // where the learned rates chose direct for warm loads.
+  double reload_rate_gbps() const {
+    return hw_.warm_direct || r_.dit_weights_cached ? warm_load_rate_gbps() : weight_rate_gbps(false, false);
   }
 
   ExecutionPlan run() {
@@ -305,8 +317,7 @@ class Planner {
     c.host_without_cache = host;
 
     c.time.text_encoder_s = te_seconds(c.te);
-    // Parking reloads read buffered (the pipeline keeps the files in the page cache for the next one).
-    c.time.dit_load_s = c.parks() ? static_cast<double>(s_.dit_bytes) / (weight_rate_gbps(false, r_.dit_weights_cached) * 1e9) : 0;
+    c.time.dit_load_s = c.parks() ? static_cast<double>(s_.dit_bytes) / (reload_rate_gbps() * 1e9) : 0;
     c.time.denoise_s = step_seconds(c.dit) * r_.steps;
     c.time.decode_s = decode_seconds(c.vae);
   }
@@ -1021,6 +1032,11 @@ bool weights_cached_from_stream(std::uint64_t bytes, double load_s, double wait_
   const bool slow = static_cast<double>(bytes) / load_s < 0.5 * cached_bps;
   const bool stalled = wait_s > 0.1 * load_s;
   return !(slow && stalled);
+}
+
+bool warm_dit_load_direct(double direct_gbps, double buffered_warm_gbps, bool direct_before) {
+  if (direct_before) return buffered_warm_gbps <= direct_gbps * (1.0 + kWarmLoadHysteresis);
+  return direct_gbps > buffered_warm_gbps * (1.0 + kWarmLoadHysteresis);
 }
 
 std::size_t arena_cap(const Budgets& b) {

@@ -155,9 +155,21 @@ struct HardwareProfile {
   double bf16_tflops = 40.0;  // sustained dense bf16 GEMM
   bool measured = false;      // the transfer rates were measured on this machine
   // DiT loads from the weight files with direct I/O, as measured by the pipeline (0: none yet): a cold DiT load or
-  // reload (parking, prefer_held) is priced at it instead of disk_gbps. Not persisted.
+  // reload (prefer_held) is priced at it instead of disk_gbps. Learned (persisted once consistent), never probed.
   double direct_gbps = 0;
+  // DiT loads read buffered from a warm page cache (>= 90 % of the files resident), as measured by the pipeline (0: none
+  // yet). Learned like direct_gbps.
+  double buffered_warm_gbps = 0;
+  // Warm DiT loads and parking reloads read with direct I/O: both rates above are known and warm_dit_load_direct chose
+  // direct (the pipeline's choose_dit_load_io decides the same). Kept by the pipeline's learner, not persisted.
+  bool warm_direct = false;
 };
+
+// A warm DiT load's I/O mode from the measured rates (both > 0): the faster one, with hysteresis: the mode in use
+// (`direct_before`) is kept until the other is more than kWarmLoadHysteresis faster, so medians that drift around a tie
+// do not flip it on every load.
+inline constexpr double kWarmLoadHysteresis = 0.15;
+bool warm_dit_load_direct(double direct_gbps, double buffered_warm_gbps, bool direct_before);
 
 // Sizes of the model's weight groups (ModelIndex group totals).
 struct ModelShapes {

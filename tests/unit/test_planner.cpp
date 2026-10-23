@@ -476,6 +476,50 @@ TEST(Planner, DirectLoadRatePricesColdLoadsNotParkingReloads) {
   EXPECT_LT(direct, disk / 2);
 }
 
+// Loads from a warm page cache are priced at the mode the pipeline picks (choose_dit_load_io): the measured warm
+// buffered rate, or the direct one where the learned rates chose direct (warm_direct), parking reloads included.
+TEST(Planner, WarmLoadsArePricedAtTheChosenMode) {
+  Scenario s;
+  s.vram_free_gib = 11.5;
+  s.tiles = false;
+  PlanInputs in = s.inputs();
+  const ExecutionPlan page_cache = plan(in);  // host_gbps 8
+  ASSERT_EQ(page_cache.dit.residency, DitResidency::kParked) << page_cache.explanation;
+  in.hardware.direct_gbps = 10.0;
+  EXPECT_EQ(plan(in).time.dit_load_s, page_cache.time.dit_load_s) << "direct measured, warm buffered not yet: buffered";
+  in.hardware.buffered_warm_gbps = 4.0;
+  const ExecutionPlan buffered = plan(in);
+  EXPECT_NEAR(buffered.time.dit_load_s, page_cache.time.dit_load_s * 2, 1e-9 * page_cache.time.dit_load_s);
+  in.hardware.warm_direct = true;
+  const ExecutionPlan direct = plan(in);
+  EXPECT_NEAR(direct.time.dit_load_s, buffered.time.dit_load_s * 0.4, 1e-9 * buffered.time.dit_load_s);
+  // A cold parking reload reads direct too when direct is the warm choice.
+  in.request.dit_weights_cached = false;
+  EXPECT_EQ(plan(in).time.dit_load_s, direct.time.dit_load_s);
+  in.hardware.warm_direct = false;
+  EXPECT_GT(plan(in).time.dit_load_s, buffered.time.dit_load_s) << "cold buffered: the disk rate";
+  // prefer_held's reload of a warm DiT: the same rates.
+  Scenario big;
+  PlanInputs pi = big.inputs();
+  HeldDit held;
+  held.arena_bytes = plan(pi).arena_bytes;
+  held.dit.residency = DitResidency::kStreamed;
+  held.dit.resident_blocks = 41;
+  held.dit.buffers = 2;
+  const auto reload_seconds = [&]() {
+    const std::string e = prefer_held(pi, plan(pi), held).explanation;
+    const std::size_t at = e.find("(~");
+    return at == std::string::npos ? -1.0 : std::stod(e.substr(at + 2));
+  };
+  pi.hardware.direct_gbps = 16.0;
+  pi.hardware.buffered_warm_gbps = 4.0;
+  const double slow = reload_seconds();
+  pi.hardware.warm_direct = true;
+  const double fast = reload_seconds();
+  ASSERT_GT(fast, 0) << "prefer_held states the reload cost";
+  EXPECT_LT(fast, slow / 2);  // 12 GB/s (direct capped at h2d) against 4
+}
+
 // The margin rule shared with the soft unload: max(8 GiB, 25 % of the RAM).
 TEST(Planner, HostPinMargin) {
   EXPECT_EQ(host_pin_margin(0), kHostPinMarginFloor);

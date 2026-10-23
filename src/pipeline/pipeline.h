@@ -206,8 +206,10 @@ struct PipelineOptions {
   // 10.9 GB/s against 4.3 GB/s buffered) unless direct I/O gains nothing on the files (weights::direct_io_support:
   // tmpfs, network file systems, btrfs compressed extents, a refused open), the load is a parking reload, or at least
   // 90 % of the files is in the page cache already (Linux: weights::page_cache_fraction before every load; Windows: once
-  // buffered loads are measured faster than direct ones); then buffered. false = buffered; true = direct I/O (a refused
-  // open still reads buffered). direct_io implies true. Streamed DiT blocks keep reading buffered every step (the page
+  // buffered loads are measured faster than direct ones); then buffered. With the files in the page cache the learned
+  // load rates decide once both modes were measured from it (each is tried once when only the other is known), and a
+  // parking reload reads direct when they chose direct (choose_dit_load_io). false = buffered; true = direct I/O (a
+  // refused open still reads buffered). direct_io implies true. Streamed DiT blocks keep reading buffered every step (the page
   // cache serves them) unless direct_io. Result::dit_load reports what a load used and why.
   std::optional<bool> dit_load_direct_io;
   bool embedding_cache = true;
@@ -464,20 +466,33 @@ std::string dit_lineage(const weights::ModelIndex& index);
 // How a DiT load reads its weight files (PipelineOptions::dit_load_direct_io; pure, for the pipeline and its tests).
 // forced_*: the options; support: weights::direct_io_support of the files (the first that does not gain); parked: a
 // parking reload; cached_fraction: the files' bytes in the page cache (weights::page_cache_fraction), negative when
-// unknown; *_gbps: the learner's median load rates per mode (0: none measured). The learner's buffered rate mixes warm
-// and cold loads; it only decides where residency is unknown (Windows), and there a warm buffered load beating a direct
-// one is exactly the case to switch.
-inline constexpr double kDitCachedFraction = 0.9;  // at least this much resident: buffered
+// unknown; *_gbps: the learner's load rates (0: none measured): direct_gbps (warm or cold alike), buffered_warm_gbps
+// (buffered loads from a warm cache), buffered_gbps (every buffered load, warm and cold mixed); warm_direct_before: the
+// warm mode in use (HardwareProfile::warm_direct), for the hysteresis; bytes: the files' size; direct_refused: an
+// O_DIRECT open of these files was refused earlier in this process.
+//   - at least kDitCachedFraction resident: with both warm rates known, the faster mode (planner::warm_dit_load_direct,
+//     with hysteresis); with one known, the other, so the learner measures both: only for a load it measures (bytes
+//     >= kDitLoadMeasureBytes), and direct never where an open refused it; otherwise buffered. The rates are kept in
+//     the hardware profile, so a new process explores again only when a rate is missing from it;
+//   - a parking reload: buffered, so the page cache keeps the files for the next one, unless both warm rates are known
+//     and direct is the warm choice;
+//   - less resident: direct; residency unknown (Windows): buffered only once the mixed buffered rate beats direct.
+inline constexpr double kDitCachedFraction = 0.9;
+inline constexpr std::uint64_t kDitLoadMeasureBytes = std::uint64_t{1} << 30;  // smaller loads are not measured
 struct DitIoInputs {
   bool forced_direct = false, forced_buffered = false;
   weights::DirectIoSupport support{true, {}};
   bool parked = false;
   double cached_fraction = -1.0;
-  double buffered_gbps = 0, direct_gbps = 0;
+  double buffered_gbps = 0, direct_gbps = 0, buffered_warm_gbps = 0;
+  bool warm_direct_before = false;
+  std::uint64_t bytes = 0;
+  bool direct_refused = false;
 };
 struct DitIoDecision {
   bool direct = true;
-  std::string note;  // why buffered, or what decided (empty for a plain direct load)
+  std::string note;   // why buffered, or what decided (empty for a plain direct load)
+  bool warm = false;  // at least kDitCachedFraction resident: a buffered load's rate is a warm one
 };
 DitIoDecision choose_dit_load_io(const DitIoInputs& in);
 
