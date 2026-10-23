@@ -56,6 +56,19 @@ inline constexpr Name<mi_tier> kTierNames[] = {
     {"turbo", MI_TIER_TURBO},
 };
 
+// resize_mode_name()'s spellings.
+inline constexpr Name<mi_resize_mode> kResizeNames[] = {
+    {"crop", MI_RESIZE_CROP},
+    {"fit", MI_RESIZE_FIT},
+    {"stretch", MI_RESIZE_STRETCH},
+};
+
+// The server's own spellings (the pipeline has no mask encodings: it takes 8-bit masks).
+inline constexpr Name<mi_mask_encoding> kMaskEncodingNames[] = {
+    {"u8", MI_MASK_U8},
+    {"binary01", MI_MASK_BINARY01},
+};
+
 // "default" is the server's spelling of an unset attention (the tier's choice); the others are attention_name()'s.
 inline constexpr Name<mi_attention> kAttentionNames[] = {
     {"default", MI_ATTENTION_DEFAULT},

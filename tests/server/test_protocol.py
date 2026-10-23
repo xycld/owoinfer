@@ -8,6 +8,7 @@ The CPU tests never create an engine on a real bundle, so they run on machines w
 need the base bundle under $MOSS_WEIGHTS (default /workspace/Models/MOSS-Image) and should run under the GPU lock.
 """
 import json
+import struct
 import os
 import queue
 import shutil
@@ -18,6 +19,7 @@ import textwrap
 import threading
 import time
 import unittest
+import zlib
 
 SERVER = os.environ.get("MOSS_SERVER", "")
 GPU = os.environ.get("MOSSINFER_GPU_TESTS", "0") == "1"
@@ -42,6 +44,27 @@ def process_gone(pid):
             return f.read().rsplit(")", 1)[1].split()[0] == "Z"
     except OSError:
         return False
+
+
+def write_png(path, width, height, pixel):
+    """An 8-bit RGB PNG (color type 2) whose pixel (x, y) is pixel(x, y) -> (r, g, b)."""
+    raw = b"".join(b"\0" + bytes(c for x in range(width) for c in pixel(x, y)) for y in range(height))
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xffffffff)
+
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+                chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def write_dataspace(path, codes):
+    """A dataspace.safetensors: an identity 2x2 latent_mix.Q and F32 step codes."""
+    header = json.dumps({"latent_mix.Q": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]},
+                         "step_codes": {"dtype": "F32", "shape": [len(codes)], "data_offsets": [16, 16 + 4 * len(codes)]}})
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(header)) + header.encode() + struct.pack("<4f", 1, 0, 0, 1) +
+                struct.pack("<%df" % len(codes), *codes))
 
 
 def png_chunks(path):
@@ -212,7 +235,8 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertRegex(res["version"], r"^\d+\.\d+\.\d+$")
         self.assertEqual(res["abi_version"], 1)
         self.assertEqual(res["capabilities"], {"preview": True, "comfyui_models": False, "model_files": True,
-                                               "lora": True, "tiers": True, "samplers": True})
+                                               "lora": True, "tiers": True, "samplers": True,
+                                               "image_input": True, "hires": True, "distill": True})
         probe = res["probe"]
         self.assertGreaterEqual(probe["device_count"], probe["supported_device_count"])
         self.assertIn(probe["recommended_flavour"], ("cu12", "cu13", ""))
@@ -339,7 +363,9 @@ class CpuProtocolTest(ProtocolTestBase):
         for key, values in names.items():
             for v in values:
                 self.assertError(self.server.call("generate", dict(base, **{key: v}), id=v), "no_engine", v)
-        ok = dict(base, sampler="dataspace", dataspace=lora, loras=[{"path": lora, "strength": 0.5}, {"path": lora}],
+        ds = os.path.join(self.tmp, "dataspace.safetensors")
+        write_dataspace(ds, [1000, 750, 500, 250])  # read by the pre-check: the step codes bound the steps
+        ok = dict(base, sampler="dataspace", dataspace=ds, loras=[{"path": lora, "strength": 0.5}, {"path": lora}],
                   flow_multiplier=1.5, eta=0.5, s_noise=1.0, save_metadata=False, include_prompts=False,
                   preview_output=os.path.join(self.tmp, "p.png"), preview_every=2)
         self.assertError(self.server.call("generate", ok, id="ok"), "no_engine", "ok")
@@ -360,6 +386,79 @@ class CpuProtocolTest(ProtocolTestBase):
             r = self.server.read()
             self.assertError(r, "invalid_params", "dup%d" % i)
             self.assertIn("more than once", r["error"]["message"])
+
+    def test_p7b_load_params(self):
+        bundle = self.fake_bundle()
+        missing = os.path.join(self.tmp, "missing")
+        for i, params in enumerate(({"time_embedding_file": 5}, {"distill": ["x"]}, {"distill": "a\u0000b"},
+                                    {"distill": ""}, {"time_embedding_file": ""})):
+            self.assertError(self.server.call("load", dict(params, model=bundle), id=i), "invalid_params", i)
+        r = self.server.call("load", {"model": bundle, "time_embedding_file": missing}, id="te")
+        self.assertError(r, "invalid_argument", "te")
+        self.assertIn("time_embedding_file", r["error"]["message"])
+        r = self.server.call("load", {"model": bundle, "distill": missing}, id="d")
+        self.assertError(r, "invalid_argument", "d")
+        self.assertIn("distill: not a directory", r["error"]["message"])
+        empty = os.path.join(self.tmp, "empty_bundle")
+        os.makedirs(empty)
+        self.assertError(self.server.call("load", {"model": bundle, "distill": empty}, id="e"), "model", "e")
+        self.assertEqual(self.server.call("status")["result"], {"state": "unloaded"})
+
+    def test_p7b_generate_params(self):
+        png = os.path.join(self.tmp, "init.png")
+        write_png(png, 32, 16, lambda x, y: (x * 8, y * 16, 100))
+        mask = os.path.join(self.tmp, "mask.png")
+        write_png(mask, 32, 16, lambda x, y: (255, 255, 255) if x < 16 else (0, 0, 0))
+        mask01 = os.path.join(self.tmp, "mask01.png")
+        write_png(mask01, 32, 16, lambda x, y: (1, 1, 1) if x < 16 else (0, 0, 0))
+        missing = os.path.join(self.tmp, "missing.png")
+        dmd = os.path.join(self.tmp, "dmd")
+        os.makedirs(dmd)
+        write_dataspace(os.path.join(dmd, "dataspace.safetensors"), [1000, 750, 500, 250])
+        base = {"prompt": "a cat", "output": os.path.join(self.tmp, "x.png")}
+        img = dict(base, init_image=png, denoise_strength=0.5)
+        bad = [
+            ({"init_image": 5}, "init_image"), (dict(img, init_image=missing), "init_image: file not found"),
+            ({"denoise_strength": 0.5}, "needs an init image"), (dict(img, denoise_strength="0.5"), "denoise_strength"),
+            (dict(img, denoise_strength=2), "Denoise strength"), ({"mask": mask}, "needs an init image"),
+            (dict(img, mask=missing), "mask: file not found"),
+            ({"steps": 0}, "steps"), ({"cfg": -1}, "cfg"), (dict(img, denoise_strength=-0.1), "denoise_strength"),
+            ({"init_image": ""}, "non-empty path"), (dict(img, mask=""), "non-empty path"), ({"distill": ""}, "non-empty path"),
+            ({"hires": {"width": 0, "height": 384}}, "hires.width"), ({"hires": {"width": 384, "height": 0, "steps": 2}}, "hires.height"),
+            (dict(img, mask_encoding="bin"), "mask_encoding"), (dict(img, resize="cover"), "resize"),
+            ({"hires": [384, 384]}, "hires"), ({"hires": {"width": 384}}, "needs \"width\" and \"height\""),
+            ({"hires": {"width": 384, "height": 384, "scale": 2}}, "unknown member"),
+            ({"hires": {"width": "384", "height": 384}}, "hires.width"), ({"hires": {"width": 380, "height": 384}}, "multiples of 16"),
+            ({"hires": {"width": 384, "height": 384, "strength": "x"}}, "hires.strength"),
+            ({"hires": {"width": 384, "height": 384, "strength": 2}}, "denoise strength"),
+            ({"distill": 3}, "distill"), ({"distill": missing}, "distill: not a directory"),
+            (dict(img, distill=dmd), "distill selected the bundle's dataspace sampler"),
+        ]
+        for i, (params, text) in enumerate(bad):
+            r = self.server.call("generate", dict(base, **params), id=i)
+            self.assertError(r, "invalid_params", i)
+            self.assertIn(text, r["error"]["message"], params)
+            for c_name in ("init_image_path", "mask_path", "distill_dir", "hires_width"):
+                self.assertNotIn(c_name, r["error"]["message"], params)
+        # Repeated hires members (a raw line: json.dumps cannot repeat).
+        line = ('{"id": "dup", "method": "generate", "params": {"prompt": "a cat", "output": %s, '
+                '"hires": {"width": 384, "width": 512, "height": 384}}}\n' % json.dumps(base["output"]))
+        self.server.send_raw(line.encode("utf-8"))
+        r = self.server.read()
+        self.assertError(r, "invalid_params", "dup")
+        self.assertIn("more than once", r["error"]["message"])
+        # Valid requests reach the server's state check.
+        ok = [dict(img, mask=mask, resize="fit"), dict(img, mask=mask01, mask_encoding="binary01", resize="stretch"),
+              dict(img, mask=mask, mask_encoding="u8", resize="crop", denoise_strength=0),
+              dict(base, hires={"width": 384, "height": 384}), dict(img, hires={"width": 384, "height": 384, "strength": 0.4, "steps": 2}),
+              dict(base, distill=dmd), dict(img, distill=dmd, sampler="euler_ancestral"),
+              dict(base, hires={"width": 384, "height": 384, "steps": 0}),
+              # Files are decoded at generate time, not by the pre-check: a binary01 mask with other values and an
+              # undecodable init image are accepted here (and fail in "done").
+              dict(img, mask=mask, mask_encoding="binary01"), dict(img, init_image=os.path.join(self.tmp, "x.png"))]
+        open(os.path.join(self.tmp, "x.png"), "wb").write(b"not a png")
+        for i, params in enumerate(ok):
+            self.assertError(self.server.call("generate", params, id="ok%d" % i), "no_engine", "ok%d" % i)
 
     def test_load_errors_are_engine_statuses(self):
         missing = os.path.join(self.tmp, "missing")
@@ -633,6 +732,55 @@ class GpuProtocolTest(ProtocolTestBase):
         self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
         self.assertEqual(self.wait_done(gid, events)["status"], "ok")
         self.assertEqual(png_text(out), {})
+
+    def test_p7b_img2img_from_a_path(self):
+        self.load_base()
+        init = os.path.join(self.tmp, "init.png")
+        write_png(init, 256, 256, lambda x, y: (x, y, 255 - x))
+        out = os.path.join(self.tmp, "img2img.png")
+        events = []
+        gid = self.server.send("generate", {"prompt": "a red apple on a wooden table", "width": 256, "height": 256,
+                                            "steps": 4, "init_image": init, "denoise_strength": 0.5, "resize": "crop",
+                                            "output": out}, id="i2i")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "ok", done)
+        self.assertEqual(png_size(out), (256, 256))
+        img = done["report"]["img2img"]
+        self.assertEqual(img["mode"], "img2img")
+        self.assertEqual(img["first_pass"]["start_step"], 2, img)
+        self.assertEqual(done["report"]["steps_run"], 2)
+        progress = [e for e in events if e["event"] == "progress"]
+        self.assertTrue(all(e["total_steps"] == 2 for e in progress), progress)
+        self.assertEqual(done["warnings"], [])
+        # Strength 1 without a mask ignores the image: done.warnings carries the note.
+        gid = self.server.send("generate", {"prompt": "a cat", "width": 256, "height": 256, "steps": 2,
+                                            "init_image": init, "denoise_strength": 1, "output": out}, id="s1")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "ok", done)
+        self.assertEqual(done["report"]["img2img"]["mode"], "txt2img")
+        self.assertTrue(any(w.startswith("image input: ") for w in done["warnings"]), done["warnings"])
+        # Errors found during the generation name the protocol's parameters, never a C field.
+        white = os.path.join(self.tmp, "white.png")
+        write_png(white, 256, 256, lambda x, y: (255, 255, 255))
+        dmd = os.path.join(self.tmp, "dmd")
+        os.makedirs(dmd)
+        write_dataspace(os.path.join(dmd, "dataspace.safetensors"), [1000, 750, 500, 250])
+        open(os.path.join(dmd, "time_embedding.safetensors"), "wb").write(b"x")  # this engine has none
+        for gid, params, text in (
+                ("bin", {"init_image": init, "mask": white, "mask_encoding": "binary01"}, 'mask_encoding "binary01"'),
+                ("te", {"distill": dmd}, "load's \"distill\""),
+                ("dec", {"init_image": os.path.join(dmd, "time_embedding.safetensors")}, "init_image: ")):
+            self.server.send("generate", dict({"prompt": "a cat", "width": 256, "height": 256, "output": out}, **params), id=gid)
+            self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+            done = self.wait_done(gid, events)
+            self.assertEqual(done["status"], "error", done)
+            self.assertEqual(done["error"]["code"], "invalid_argument", done)
+            message = done["error"]["message"]
+            self.assertIn(text, message)
+            for c_name in ("mi_", "MI_", "_dir", "_path", "init_image_path", "mask_path"):
+                self.assertNotIn(c_name, message)
 
     def test_cancel_mid_run(self):
         self.load_base()

@@ -105,8 +105,12 @@ The weights load on the first `mi_generate()`. The DiT stays resident across gen
 | `tier` | `AUTO` | quality tier, see below |
 | `attention` | `DEFAULT` (the tier's choice) | DiT attention kernel: `EXACT` (FlashAttention-2) or an 8-bit mode |
 | `lora_strict` | 0 | 1: unknown LoRA keys and lossy merges fail the generation with `MI_ERR_MODEL` instead of being reported |
+| `time_embedding_file` | NULL = none | a step-embedder replacement (`time_embedding.safetensors`: the step embedder and modulation biases, computed in fp32), applied to the loaded DiT |
+| `distill_dir` | NULL = none | a distill bundle directory. The engine takes its time embedding (as `time_embedding_file`); `mi_gen_params.distill_dir` takes the rest per generation (see [Distill bundles](#distill-bundles)). |
 
 The three sizes (`vram_budget_bytes`, `vram_reserve_bytes`, `host_ram_budget_bytes`) share one range rule: 0, or a value in [1 MiB, 1 TiB]. Anything else fails `mi_engine_create()` with `MI_ERR_INVALID_ARGUMENT`, naming the field.
+
+The time embedding is per engine because it replaces part of the loaded DiT. Setting both `time_embedding_file` and a `distill_dir` whose bundle has a different time embedding is `MI_ERR_INVALID_ARGUMENT`. A `distill_dir` that is not a directory is `MI_ERR_INVALID_ARGUMENT`; a directory with none of the bundle files is `MI_ERR_MODEL`. A malformed time embedding file fails `mi_engine_create()` with `MI_ERR_MODEL`: it is read when the pipeline is constructed.
 
 The three file fields are UTF-8 paths; NULL or `""` means the bundle's component. A path that does not exist, or names a directory, fails `mi_engine_create()` with `MI_ERR_INVALID_ARGUMENT`, naming the field. ComfyUI and quantized files are supported as component files only: `model_path` stays a bundle directory (`MI_CAP_MODEL_FILES`, not `MI_CAP_COMFYUI_MODELS`).
 
@@ -116,10 +120,12 @@ The loaded weights fix the GEMM precision: an INT8 DiT runs INT8 GEMMs. The tier
 
 | `mi_tier` | Runs |
 |---|---|
-| `AUTO` (0) | with `attention` set: that configuration. Otherwise the fastest lossy configuration of the loaded DiT that has a quality certificate. Without one: Reference for a bf16 DiT; INT8 GEMMs with exact attention, uncertified, for an INT8 DiT. |
+| `AUTO` (0) | with `attention` set: that configuration. Otherwise the fastest lossy configuration of the loaded DiT that has a quality certificate. Without one: Reference for a bf16 DiT; INT8 GEMMs with exact attention, uncertified, for an INT8 DiT. An INT4 DiT without a certificate is refused (`MI_ERR_INVALID_ARGUMENT`, with the pipeline's message): choose `TURBO` explicitly. |
 | `REFERENCE` (1) | bf16 DiT and text encoder, exact attention. Refused for quantized files and for an 8-bit `attention`. |
 | `HIGH` (2) | the loaded DiT's precision plus 8-bit attention (`Q8_FP8` unless `attention` says otherwise), certified or not. Refused for a bf16 DiT with exact attention. |
-| `TURBO` (3) | reserved: refused by this build |
+| `TURBO` (3) | an INT4 DiT file (`dit_file`): INT4 GEMMs plus 8-bit attention, as for `HIGH`. Runs certified or not (reported uncertified without a certificate). Refused for any other DiT. |
+
+Offer `TURBO` for INT4 DiT files only, as an explicit choice: this build has no certificate for the INT4 path, so `AUTO` refuses such a file.
 
 | `mi_attention` | Pipeline name |
 |---|---|
@@ -136,7 +142,7 @@ Certificates are looked up next to the DiT file (`<dit>.mossinfer-cert.json`) an
 
 `mi_gen_params` mirrors the asset `parameters.json`:
 - `prompt`, `negative_prompt`
-- `width`, `height`, `steps`, `cfg`, `shift`, `seed` (-1 = random)
+- `width`, `height`, `steps`, `cfg`, `shift`, `seed` (-1 = random). `steps` and `cfg` default to "unset" (see [Unset markers](#unset-markers)).
 - `uncond_skip_layers` (default `{22}`)
 - `slg_layers`, `slg_scale`, `slg_start`, `slg_stop`
 - `max_sequence_length`
@@ -158,7 +164,83 @@ The fields after the 0.1.0 layout (new in 0.2.0):
 | `include_prompts` | 1 (0 for a 168-byte struct) | the PNG metadata includes the prompt and negative prompt |
 | `_reserved2` | 0 | must be 0 |
 
-`mi_gen_params_validate()` performs the same checks as `mi_generate()` without an engine or GPU, including the existence of the LoRA and dataspace files. A launcher can call it as the user types.
+The fields after the 240-byte layout:
+
+| `mi_gen_params` field | Default | Meaning |
+|---|---|---|
+| `init_image`, `init_image_path` | NULL | the init image of img2img: RGB pixels (`mi_image`, 3 channels) or a PNG / JPEG file. At most one of the two. |
+| `mask`, `mask_path` | NULL | the inpainting mask: 1-channel pixels or a file (read as grayscale), the init image's size. At most one of the two; needs an init image. |
+| `mask_encoding` | `MI_MASK_U8` | how mask values are read (below) |
+| `resize` | `MI_RESIZE_CROP` | how the init image and mask are brought to `width` × `height` (below) |
+| `denoise_strength` | -1 (unset: 0.75 with an init image, else 1.0) | [0, 1], the share of the schedule run from the init image. Below 1 needs an init image. |
+| `hires_width`, `hires_height` | 0, 0 (off) | the hires fix's target size: multiples of 16, at most 4096 per side and 4.2 MP. Negative is invalid. `hires_strength` and `hires_steps` are checked only when the hires fix is on. |
+| `hires_strength` | 0.45 | [0, 1], the hires pass's denoise strength |
+| `hires_steps` | 0 (= `steps`) | the hires pass's schedule, 0 to 10000 |
+| `_reserved3` | 0 | must be 0 |
+| `distill_dir` | NULL | a distill bundle directory, expanded per generation |
+
+`mi_gen_params_validate()` performs the same checks as `mi_generate()` without an engine or GPU: the LoRA files' existence, the distill bundle (opened) and the dataspace file (read: its step codes bound `steps`), and the image inputs without copying or decoding them. Pixel images get their sizes and channels checked, and a `MI_MASK_BINARY01` mask its values. Image files get checked for existence, for being regular files and for size (at most 64 MiB); they are decoded by `mi_generate()`, which reports a file it cannot decode, or a binary01 file mask with other values, as `MI_ERR_INVALID_ARGUMENT`. The match of a bundle's time embedding with the engine's is also left to `mi_generate()`. A launcher can call it as the user types.
+
+### Unset markers
+
+`mi_gen_params_init()` at the current size (320 bytes) leaves the fields whose default depends on the rest of the request unset. Each resolves when the request is checked:
+
+| Field | Unset | Resolves to | Invalid |
+|---|---|---|---|
+| `steps` | 0 | the dataspace file's step count with the `DATASPACE` sampler (e.g. a distill bundle's), else `MI_DEFAULT_STEPS` (50) | negative |
+| `cfg` | negative (finite) | 1.0 with `distill_dir`, else `MI_DEFAULT_CFG` (3.0) | NaN, ±infinity |
+| `denoise_strength` | negative (finite) | `MI_DEFAULT_DENOISE_STRENGTH` (0.75) with an init image, else 1.0 | NaN, ±infinity; above 1 |
+| `sampler` | `EULER` with no `dataspace_path` | a distill bundle's `DATASPACE` sampler, when the bundle has a dataspace file | |
+
+- The macros `MI_DEFAULT_STEPS`, `MI_DEFAULT_CFG` and `MI_DEFAULT_DENOISE_STRENGTH` let a UI pre-fill its fields with what an unset field resolves to.
+- An explicit value stays as given. An explicit `denoise_strength` of 1.0 with an init image and no mask runs txt2img, and `MI_TEXT_IMAGE_NOTE` says why.
+- With the `DATASPACE` sampler, `steps` must lie in [1, the file's step-code count]; otherwise `MI_ERR_INVALID_ARGUMENT` names the count.
+- With a distill bundle that has a dataspace file, `EULER` is the unset marker and cannot be forced: choose any other sampler to keep the bundle's from being selected.
+- The older sizes keep their init values: steps 50 and cfg 3.0 for 168- and 240-byte structs. Those cannot carry an init image, so their strength resolves to 1.0.
+
+### Image input
+
+`mi_image {const uint8_t* pixels; int32_t width, height, channels; int32_t _reserved0;}` is a fixed 24-byte element without `struct_size`. The pixels are row-major, tightly packed and 8-bit: `[height][width][channels]`. An init image has 3 channels (RGB), a mask 1. The library copies the pixels during `mi_gen_params_validate()` / `mi_generate()`; the caller may free them as soon as the call returns.
+
+Limits, checked before any pixel is read: each side 1 to 16384, at most 64,000,000 pixels; files at most 64 MiB. `pixels` NULL, another channel count, a nonzero `_reserved0`, both pixels and a path for one image, or a file that cannot be read or decoded are `MI_ERR_INVALID_ARGUMENT`. A file that cannot be read is `MI_ERR_INVALID_ARGUMENT` too, not `MI_ERR_IO`: the decoder does not tell read errors from format errors.
+
+**The output size is `width` × `height`.** The init image (and its mask) is resized to it with `resize`; the library does not take the size from the image. Set `width` and `height` from the init image (rounded to multiples of 16 within the size bounds) to keep its aspect ratio. `moss-infer generate --init-image` does this itself when no size is given; the C API does not.
+
+| Mode | Set | Runs |
+|---|---|---|
+| img2img | an init image, `denoise_strength` < 1 | the init image is resized to the request size, VAE-encoded, and the last `denoise_strength` share of the schedule runs from it |
+| inpainting | an init image and a mask | the same, blending the kept region back after every step. White (≥ 128) regenerates, black keeps. Works at any strength. |
+| hires fix | `hires_width` × `hires_height` | the first pass (txt2img, img2img or inpainting) is decoded, Lanczos-upscaled, encoded and refined at the target size |
+
+- `denoise_strength` unset with an init image is 0.75. An explicit 1 with an init image and no mask is txt2img: the image is not used, and `MI_TEXT_IMAGE_NOTE` says so. 0 runs no step: the result is the image's VAE round trip.
+- The steps that run: of a pass's N scheduled steps (after snapping), the first `int(N - N * strength)` are skipped. `mi_result_steps_scheduled()` and the progress callback's `total_steps` count the steps that run, both passes of a hires fix included.
+- The `DATASPACE` sampler cannot start from an image (img2img, inpainting, hires fix).
+
+| `mi_mask_encoding` | Values |
+|---|---|
+| `MI_MASK_U8` (0) | 0..255 as given: ≥ 128 regenerates, < 128 keeps |
+| `MI_MASK_BINARY01` (1) | every value 0 (keep) or 1 (regenerate), scaled to 0 / 255. Any other value is `MI_ERR_INVALID_ARGUMENT`. Applies to `mask` and `mask_path` alike. |
+
+| `mi_resize_mode` | Pipeline name | Meaning |
+|---|---|---|
+| `MI_RESIZE_CROP` (0) | `crop` | cover the target keeping the aspect ratio, then center-crop |
+| `MI_RESIZE_FIT` (1) | `fit` | fit inside keeping the aspect ratio, fill the two bands from the edge rows / columns |
+| `MI_RESIZE_STRETCH` (2) | `stretch` | scale each axis independently |
+
+**Untrusted images.** The image file decoder (`init_image_path`, `mask_path`) is the vendored stb_image. It is hardened (the file-size cap, a header check before any allocation, fuzzing) but it is not memory-safe. A program that takes images from untrusted parties (a network, web uploads, other users' files) must decode them itself with a memory-safe decoder and pass pixels in `init_image` / `mask`, or decode in a sandboxed process.
+
+### Distill bundles
+
+A distill bundle (the lodestones data-space DMD repositories and their derivatives) is a directory with any of `time_embedding.safetensors`, `lora.safetensors` and `dataspace.safetensors`. `distill_dir` expands it per generation, as `moss-infer generate --distill` does:
+
+| Bundle file | Effect |
+|---|---|
+| `lora.safetensors` | appended to `loras` at strength 1, after the caller's |
+| `dataspace.safetensors` | sampler `DATASPACE` when the sampler is unset; `dataspace_path` whenever the sampler is `DATASPACE` without one (an explicit `DATASPACE` included); `steps` = its step-code count when `steps` is unset |
+| (any bundle) | `cfg` 1, when `cfg` is unset |
+| `time_embedding.safetensors` | must be the engine's: `mi_engine_params.distill_dir` (the same bundle) or `time_embedding_file` (the same file). Otherwise `mi_generate()` fails with `MI_ERR_INVALID_ARGUMENT`, saying to set it on the engine. |
+
+The markers are those of [Unset markers](#unset-markers): with `mi_gen_params_init()`'s defaults, a bundle's choices apply. With the bundle's dataspace sampler, an init image or a hires fix is `MI_ERR_INVALID_ARGUMENT`: set another sampler. A directory that is not one is `MI_ERR_INVALID_ARGUMENT`; one without bundle files, or a malformed dataspace file, is `MI_ERR_MODEL`.
 
 ### Samplers and schedulers
 
@@ -236,7 +318,8 @@ With `include_prompts` 0, the prompt and negative prompt are left out of both ch
 |---|---|
 | `mi_result_rgb(r, &bytes)` | row-major RGB8 `[height][width][3]`, or NULL when cancelled |
 | `mi_result_width/height/seed/steps_run/steps_scheduled/cancelled` | scalars |
-| `mi_result_timings(r, &t)` | `total, load, encode, denoise, decode` and their parts, in seconds |
+| `mi_result_timings(r, &t)` | `total, load, encode, denoise, decode` and their parts, in seconds; then `vae_encoder_load_s`, `image_encode_s` (every VAE encode) and `image_ops_s` (resizes, the hires upscale, mask preparation, inpainting blends), which are not part of `load_s`. A 104-byte (0.1.0) `mi_timings` is accepted and gets its 104 bytes. |
+| `mi_result_image(r, &i)` | `mi_image_info`: the mode (`TXT2IMG`, `IMG2IMG`, `INPAINT`), and per pass (the first, the hires fix's) the size, steps scheduled, the start step (skipped by the strength), steps run and the strength; `first_encoded`; `hires_ran`. The hires fields are 0 without the hires fix. |
 | `mi_result_memory(r, &m)` | arena capacity and high-water, device peak, host private start and peak |
 | `mi_result_dit_stream(r, &s)` | DiT block streaming over the denoise: streamed, resident blocks, buffers, stalls, bytes copied, copy and stall seconds, GB/s, hidden fraction, source (`"file"` / `"host_pinned"`). All zero when every block was resident. |
 | `mi_result_block_path(r)` / `mi_result_block_path_note(r)` | the DiT block path that ran (`OP_BY_OP`, `FUSED` or `FUSED_GRAPHS`), and why it differs from the requested one (`""` when it does not). A cancel that landed before the denoise (text encoder or DiT load) ran no block; the path is then `FUSED`, the engine default, whatever was requested. |
@@ -258,6 +341,8 @@ With `include_prompts` 0, the prompt and negative prompt are left out of both ch
 | `MI_TEXT_TEXT_ENCODER_SOURCE` (4) | the bundle's `text_encoder` folder, or `text_encoder_file` |
 | `MI_TEXT_VAE_SOURCE` (5) | the bundle's `vae` folder, or `vae_file` |
 | `MI_TEXT_QUALITY_JSON` (6) | the report's `quality` object, as JSON |
+| `MI_TEXT_IMAGE_NOTE` (7) | a remark on the image input, e.g. why an init image was not used; `""` for none |
+| `MI_TEXT_TIME_EMBEDDING` (8) | the replacement step embedder that ran; `""` for none |
 
 `mi_tier_info.effective` is never `AUTO`, and `attention` is never `DEFAULT`. `certified` is 1 whenever `effective` is `REFERENCE`, which needs no certificate. A generation cancelled before its tier was resolved reports requested `AUTO`, effective `REFERENCE`, attention `EXACT`, certified 1. The precisions map the pipeline's report as follows:
 
@@ -268,13 +353,13 @@ With `include_prompts` 0, the prompt and negative prompt are left out of both ch
 | text encoder `bf16` (the bundle's) | `BF16` (0) |
 | text encoder `int8` | `INT8` (1) |
 | text encoder `w4a8` | `W4A8` (2) |
-| `w4a4` | `W4A4` (3): reserved; this build loads no W4A4 model |
+| DiT `int4` (an INT4 ConvRot file, the Turbo tier) | `W4A4` (3) |
 
 Strings returned by accessors are owned by the result. They stay valid until `mi_result_free()`; the report string stays valid until the next `mi_result_report_json()` or `mi_save_png()` call on the same result.
 
 `mi_write_png(path, rgb, width, height)` writes RGB8 `[height][width][3]` as a PNG without metadata, atomically. It needs no result and is meant for previews. A NULL or empty path, NULL `rgb`, or a width or height outside [1, 16384] is `MI_ERR_INVALID_ARGUMENT`; a write failure is `MI_ERR_IO`.
 
-The JSON report carries all of this as well: `quality`, `models` (sources, linears, tiers, text-encoder precision), `loras`, `lora_warnings`, `lora_notes` and `tokens`.
+The JSON report carries all of this as well: `quality`, `models` (sources, linears, tiers, text-encoder precision, time embedding), `loras`, `lora_warnings`, `lora_notes`, `tokens` and `img2img` (mode, note, VAE encoder, both passes).
 
 ## Capabilities
 
@@ -288,6 +373,11 @@ The JSON report carries all of this as well: `quality`, `models` (sources, linea
 | `MI_CAP_LORA` | 0x8 | set | `loras`, `lora_strict`, the LoRA accessors |
 | `MI_CAP_TIERS` | 0x10 | set | `tier`, `attention`, `mi_result_tier()` |
 | `MI_CAP_SAMPLERS` | 0x20 | set | the samplers after `AB2`, `scheduler`, `noise_layout`, `noise_source`, `flow_multiplier`, `eta`, `s_noise`, `dataspace_path` |
+| `MI_CAP_IMAGE_INPUT` | 0x40 | set | img2img and inpainting: `init_image`, `mask` and their paths, `mask_encoding`, `resize`, `denoise_strength`, `mi_result_image()` |
+| `MI_CAP_HIRES` | 0x80 | set | `hires_width`, `hires_height`, `hires_strength`, `hires_steps` |
+| `MI_CAP_DISTILL` | 0x100 | set | `distill_dir` (both structs), `time_embedding_file` |
+
+`MI_CAP_TIERS` covers `TURBO` as well.
 
 ## Device probe
 
@@ -311,18 +401,20 @@ A versioned struct only grows at the end, so a program built against an older he
 
 | Struct | Accepted `struct_size` |
 |---|---|
-| `mi_engine_params` | 80 (the 0.1.0 size, up to `_reserved1`), 120 (0.2.0) |
-| `mi_gen_params` | 168 (the 0.1.0 size, up to `user_data`), 240 (0.2.0) |
-| every output struct | its one size so far (table below) |
+| `mi_engine_params` | 80 (the 0.1.0 size, up to `_reserved1`), 120 (an earlier 0.2.0 header, up to `_reserved2`), 136 (0.2.0) |
+| `mi_gen_params` | 168 (the 0.1.0 size, up to `user_data`), 240 (an earlier 0.2.0 header, up to `_reserved2`), 320 (0.2.0) |
+| `mi_timings` (output) | 104 (the 0.1.0 size, up to `vae_load_s`), 128 (0.2.0) |
+| every other output struct | its one size so far (table below) |
 
 Any other size is `MI_ERR_ABI_MISMATCH`, and the message lists the accepted sizes.
 - **`*_init(p, size)`** writes only the first `size` bytes: the defaults of the fields that layout has. The bytes after them are left alone.
 - **Input structs** (`mi_engine_create()`, `mi_gen_params_validate()`, `mi_generate()`): the library reads only `struct_size` bytes. It copies them over a full struct filled with the defaults for that size, so every later field keeps the behaviour of the older release:
   - an 80-byte `mi_engine_params` runs with the bundle's components, tier `AUTO` and default attention;
-  - a 168-byte `mi_gen_params` runs with the `MOSS` scheduler, the default noise and no LoRAs, and its `save_metadata` and `include_prompts` are 0: `mi_save_png()` writes a PNG without text chunks, as 0.1.0 did. Only a 240-byte struct (from `mi_gen_params_init(p, 240)`) defaults `save_metadata` and `include_prompts` to 1.
+  - a 168-byte `mi_gen_params` runs with the `MOSS` scheduler, the default noise and no LoRAs, and its `save_metadata` and `include_prompts` are 0: `mi_save_png()` writes a PNG without text chunks, as 0.1.0 did. A 240- or 320-byte struct defaults `save_metadata` and `include_prompts` to 1;
+  - a 120-byte `mi_engine_params` or a 240-byte `mi_gen_params` runs without image input, hires fix or distill bundle.
 - **Output structs**: the library writes only `struct_size` bytes.
 
-`CApi.OldStructSizes` (`tests/unit/test_c_api.cpp`) and the C test `c_abi_compat` (`tests/c/test_abi_compat.c`, a hand-written 0.1.0-layout struct, label `cpu`; `c_abi_compat_gpu`, label `gpu`, also generates from it) check this.
+`CApi.OldStructSizes` and `CApi.Earlier020StructSizes` (`tests/unit/test_c_api.cpp`) and the C test `c_abi_compat` (`tests/c/test_abi_compat.c`, a hand-written 0.1.0-layout struct, label `cpu`; `c_abi_compat_gpu`, label `gpu`, also generates from it) check this.
 
 ## Frozen layout (ABI 1)
 
@@ -336,23 +428,25 @@ The enums are 4 bytes. ABI 1 is defined by this table: a change to an existing e
 |---|---|---|
 | `mi_device_info` | 592 | `struct_size` 0, `index` 8, `name[256]` 12, `pci_bus_id[32]` 268, `compute_major` 300, `compute_minor` 304, `_reserved0` 308, `total_memory_bytes` 312, `free_memory_bytes` 320, `supported` 328, `unsupported_reason[256]` 332, `_reserved1` 588 |
 | `mi_probe_info` | 576 | `struct_size` 0, `driver_cuda_version` 8, `runtime_cuda_version` 12, `driver_compatible` 16, `device_count` 20, `supported_device_count` 24, `build_flavour[16]` 28, `recommended_flavour[16]` 44, `message[512]` 60, `_reserved0` 572 |
-| `mi_engine_params` | 120 | `struct_size` 0, `model_path` 8, `model_format` 16, `mode` 20, `device_index` 24, `_reserved0` 28, `vram_budget_bytes` 32, `vram_reserve_bytes` 40, `host_ram_budget_bytes` 48, `cache_dir` 56, `embedding_cache` 64, `direct_io` 68, `block_path` 72, `_reserved1` 76; then `dit_file` 80, `text_encoder_file` 88, `vae_file` 96, `tier` 104, `attention` 108, `lora_strict` 112, `_reserved2` 116 |
+| `mi_engine_params` | 136 | `struct_size` 0, `model_path` 8, `model_format` 16, `mode` 20, `device_index` 24, `_reserved0` 28, `vram_budget_bytes` 32, `vram_reserve_bytes` 40, `host_ram_budget_bytes` 48, `cache_dir` 56, `embedding_cache` 64, `direct_io` 68, `block_path` 72, `_reserved1` 76; then `dit_file` 80, `text_encoder_file` 88, `vae_file` 96, `tier` 104, `attention` 108, `lora_strict` 112, `_reserved2` 116; then `time_embedding_file` 120, `distill_dir` 128 |
 | `mi_progress` | 40 | `struct_size` 0, `phase` 8, `step` 12, `total_steps` 16, `_reserved0` 20, `step_seconds` 24, `elapsed_seconds` 32 |
-| `mi_gen_params` | 240 | `struct_size` 0, `prompt` 8, `negative_prompt` 16, `width` 24, `height` 28, `steps` 32, `_reserved0` 36, `cfg` 40, `shift` 48, `seed` 56, `uncond_skip_layers` 64, `uncond_skip_layers_count` 72, `slg_layers` 80, `slg_layers_count` 88, `slg_scale` 96, `slg_start` 104, `slg_stop` 112, `max_sequence_length` 120, `sampler` 124, `progress_callback` 128, `plan_callback` 136, `preview_callback` 144, `preview_interval` 152, `_reserved1` 156, `user_data` 160; then `scheduler` 168, `noise_layout` 172, `noise_source` 176, `save_metadata` 180, `flow_multiplier` 184, `eta` 192, `s_noise` 200, `dataspace_path` 208, `loras` 216, `loras_count` 224, `include_prompts` 232, `_reserved2` 236 |
+| `mi_gen_params` | 320 | `struct_size` 0, `prompt` 8, `negative_prompt` 16, `width` 24, `height` 28, `steps` 32, `_reserved0` 36, `cfg` 40, `shift` 48, `seed` 56, `uncond_skip_layers` 64, `uncond_skip_layers_count` 72, `slg_layers` 80, `slg_layers_count` 88, `slg_scale` 96, `slg_start` 104, `slg_stop` 112, `max_sequence_length` 120, `sampler` 124, `progress_callback` 128, `plan_callback` 136, `preview_callback` 144, `preview_interval` 152, `_reserved1` 156, `user_data` 160; then `scheduler` 168, `noise_layout` 172, `noise_source` 176, `save_metadata` 180, `flow_multiplier` 184, `eta` 192, `s_noise` 200, `dataspace_path` 208, `loras` 216, `loras_count` 224, `include_prompts` 232, `_reserved2` 236; then `init_image` 240, `init_image_path` 248, `mask` 256, `mask_path` 264, `mask_encoding` 272, `resize` 276, `denoise_strength` 280, `hires_width` 288, `hires_height` 292, `hires_strength` 296, `hires_steps` 304, `_reserved3` 308, `distill_dir` 312 |
 | `mi_lora` | 16 | `path` 0, `strength` 8 (array element, no `struct_size`: frozen as it is) |
-| `mi_timings` | 104 | `struct_size` 0, then 12 doubles from 8 in header order (`total_s` … `vae_load_s` at 96) |
+| `mi_image` | 24 | `pixels` 0, `width` 8, `height` 12, `channels` 16, `_reserved0` 20 (no `struct_size`: frozen as it is) |
+| `mi_timings` | 128 | `struct_size` 0, then 12 doubles from 8 in header order (`total_s` … `vae_load_s` at 96); then `vae_encoder_load_s` 104, `image_encode_s` 112, `image_ops_s` 120 |
 | `mi_memory_stats` | 56 | `struct_size` 0, then 6 `uint64_t` from 8 in header order (`arena_capacity_bytes` … `host_private_peak_bytes` at 48) |
 | `mi_dit_stream_stats` | 80 | `struct_size` 0, `streamed` 8, `resident_blocks` 12, `buffers` 16, `stalls` 20, `bytes` 24, `copy_seconds` 32, `stall_seconds` 40, `h2d_gbps` 48, `hidden_fraction` 56, `source[16]` 64 (no padding needed) |
 | `mi_tier_info` | 32 | `struct_size` 0, `requested` 8, `effective` 12, `attention` 16, `certified` 20, `dit_precision` 24, `text_encoder_precision` 28 |
 | `mi_prompt_tokens` | 32 | `struct_size` 0, `total_tokens` 8, `kept_tokens` 12, `prompt_tokens` 16, `dropped_tokens` 20, `max_length` 24, `truncated` 28 |
 | `mi_lora_report` | 32 | `struct_size` 0, `adapters` 8, `side_branch` 12, `merged` 16, `unknown_keys` 20, `warnings` 24, `notes` 28 |
+| `mi_image_info` | 80 | `struct_size` 0, `mode` 8, `hires_ran` 12, `first_width` 16, `first_height` 20, `first_steps_scheduled` 24, `first_start_step` 28, `first_steps_run` 32, `first_encoded` 36, `hires_width` 40, `hires_height` 44, `hires_steps_scheduled` 48, `hires_start_step` 52, `hires_steps_run` 56, `_reserved0` 60, `first_strength` 64, `hires_strength` 72 |
 
-The 32-bit enums: `mi_status`, `mi_mode`, `mi_model_format`, `mi_block_path`, `mi_tier`, `mi_attention`, `mi_precision`, `mi_sampler`, `mi_scheduler`, `mi_noise_layout`, `mi_noise_source`, `mi_phase`, `mi_result_text_kind`, `mi_message_kind`.
+The 32-bit enums: `mi_status`, `mi_mode`, `mi_model_format`, `mi_block_path`, `mi_tier`, `mi_attention`, `mi_precision`, `mi_sampler`, `mi_scheduler`, `mi_noise_layout`, `mi_noise_source`, `mi_phase`, `mi_result_text_kind`, `mi_message_kind`, `mi_mask_encoding`, `mi_resize_mode`, `mi_image_mode`.
 
 History, all with `MI_ABI_VERSION` 1:
 - 2026-10-21, during 0.1.0: the padding was made explicit; `mi_engine_params` grew `block_path` and `_reserved1` (72 → 80 bytes); `mi_dit_stream_stats` was added. Binaries built against an earlier header must be rebuilt.
 - 0.2.0: `mi_engine_params` grew to 120 bytes and `mi_gen_params` to 240, as trailing fields. The 0.1.0 sizes, 80 and 168 bytes, stay accepted ([Struct sizes](#struct-sizes)). `mi_lora`, `mi_tier_info`, `mi_prompt_tokens` and `mi_lora_report` were added, and `mi_sampler` gained values 2–8.
-- Planned: img2img (an init image, denoise strength and mask) will append further trailing fields to `mi_gen_params`.
+- 0.2.0, image input: `steps` 0, a negative `cfg` and a negative `denoise_strength` became the unset markers, and `mi_gen_params_init()` at 320 bytes sets them. `mi_engine_params` grew to 136 bytes, `mi_gen_params` to 320 and `mi_timings` to 128, as trailing fields; the 120-, 240- and 104-byte layouts stay accepted. `mi_image` and `mi_image_info` were added.
 
 ## Symbol visibility
 
@@ -383,13 +477,18 @@ Label `cpu` (`tests/unit/test_c_api.cpp`):
   - `ComponentFiles`: missing or directory `dit_file`, `text_encoder_file` and `vae_file`, and unknown tier and attention values, before CUDA.
   - `GenerationFromAPipelineResult`: a synthetic pipeline result through the adapter: tier info, texts, prompt tokens, LoRA reports and messages, and the PNG metadata with and without the prompts, off, and after a cancel.
   - `WritePng`: the `mi_write_png()` round trip (size, no text chunks, the pipeline encoder's bytes) and its errors.
+  - `Earlier020StructSizes`, `UnsetMarkers`: the 240- and 120-byte layouts; steps 0 and a negative cfg.
+  - `ImageInput`: pixels copied and files decoded, both forms of one image, NULL pixels, channels, sizes over the limits, a nonzero `_reserved0`, missing and undecodable files, `MI_MASK_BINARY01` scaling and a value of 2, mask channels and size, strength and mask without an init image, the resize modes, the dataspace sampler with an image, `_reserved3`.
+  - `HiresFix`: the mapping, multiples of 16, the size bound, strength and steps.
+  - `DistillBundle`: a synthetic bundle (dataspace, LoRA and time-embedding files): the unset markers take its choices, explicit values stay, its LoRA is appended, its dataspace sampler refuses an image; not a directory (`INVALID_ARGUMENT`), no bundle files and a malformed dataspace file (`MODEL`); the engine side (`to_options`, `mi_engine_create`) with a missing, a matching and a conflicting `time_embedding_file`.
+  - `ImageResultFromAPipelineResult`: `mi_image_info`, the image note, the time embedding, the new timings and an INT4 DiT as `W4A4` from a synthetic result.
 - **`c_abi_compat`** (`tests/c/test_abi_compat.c`, C11): a hand-written 0.1.0-layout `mi_engine_params` and `mi_gen_params` through `*_init`, `mi_gen_params_validate()` and `mi_engine_create()` (as far as the model path check). With weights, `c_abi_compat_gpu` (label `gpu`) also generates from them and checks that the PNG has no text chunks.
 - **`CApiReport.*`** renders the report (through the adapter and the shared renderer) from a synthetic result under a comma-decimal C++ locale with digit grouping, and under a comma-decimal C locale where the system has one. It checks for valid JSON, exact numbers, `null` for NaN and infinity, the `dit_blocks` and `dit_stream` keys, and that the document is the CLI's fields in braces.
 - **`PipelineReport.*`** (`tests/unit/test_pipeline_report.cpp`) covers the shared renderer itself: every key, the head/tail split around the image path, U+FFFD for ill-formed UTF-8, `null` for non-finite numbers, and the classic locale.
 
 Label `gpu`:
 - **`GpuCApiProbe.*`**: after `mi_probe_device()`, the process holds no CUDA context. This is checked through the driver's primary-context state and NVML's process list.
-- **`GpuCApi.*`** covers the device probe, and a 256², 2-step generation with callbacks, a concurrent call rejected as busy, the block path accessors and `mi_result_dit_stream()` (nothing streamed in balanced mode on a 16 GiB card), and PNG and report checks. It also covers cancel from another thread with no carry-over, and the caller's current context restored by create, generate and free. `SamplerPreviewMetadataAndTier` runs a 256², 3-step `DPMPP_2M` + `KARRAS` generation with `preview_interval` 2 (previews after steps 2 and 3, at the image size), checks the `generation` chunk of the saved PNG, `mi_result_tier()` (the bf16 bundle with tier `AUTO` and no certificate runs `REFERENCE` with exact attention), the texts, the prompt tokens, and the LoRA and message accessors' bounds. `OldSizeWritesNoMetadata` generates from a 168-byte `mi_gen_params` and checks that the PNG has no text chunks. LoRAs on the GPU are not covered here: the repository has no small LoRA file, so they are covered by the CPU validation and adapter tests.
+- **`GpuCApi.*`** covers the device probe, and a 256², 2-step generation with callbacks, a concurrent call rejected as busy, the block path accessors and `mi_result_dit_stream()` (nothing streamed in balanced mode on a 16 GiB card), and PNG and report checks. It also covers cancel from another thread with no carry-over, and the caller's current context restored by create, generate and free. `SamplerPreviewMetadataAndTier` runs a 256², 3-step `DPMPP_2M` + `KARRAS` generation with `preview_interval` 2 (previews after steps 2 and 3, at the image size), checks the `generation` chunk of the saved PNG, `mi_result_tier()` (the bf16 bundle with tier `AUTO` and no certificate runs `REFERENCE` with exact attention), the texts, the prompt tokens, and the LoRA and message accessors' bounds. `OldSizeWritesNoMetadata` generates from a 168-byte `mi_gen_params` and checks that the PNG has no text chunks. `ImageToImageFromPixels` (256², 4 steps at strength 0.5: 2 run from step 2, `total_steps` 2, a 104-byte `mi_timings` gets 104 bytes), `InpaintBinary01Mask` (the kept half stays closer to the init image than the regenerated half), `HiresFix` (256 → 384, 2 + 2 steps) and `DistillTimeEmbeddingNeedsTheEngine` cover image input and the engine check. **`GpuCApiModels.*`** create their own engine on the SFT bundle when the files exist under `/workspace/Models/community`: `DistillBundle` (the lodestones SFT 8-step bundle on the engine and the request: 8 data-space steps at CFG 1, its LoRA and time embedding) and `TurboInt4` (an INT4 DiT: tier `AUTO` refused, `TURBO` runs it as `W4A4`). Runtime LoRA files of one's own on the GPU are covered only by the distill bundle's LoRA; the repository has no small LoRA file.
 
 Run the GPU tests on a machine with a supported GPU:
 

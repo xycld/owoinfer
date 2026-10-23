@@ -51,7 +51,8 @@ static_assert(sizeof(mi_status) == 4 && sizeof(mi_mode) == 4 && sizeof(mi_model_
               sizeof(mi_sampler) == 4 && sizeof(mi_phase) == 4 && sizeof(mi_block_path) == 4 && sizeof(mi_tier) == 4 &&
               sizeof(mi_attention) == 4 && sizeof(mi_precision) == 4 && sizeof(mi_scheduler) == 4 &&
               sizeof(mi_noise_layout) == 4 && sizeof(mi_noise_source) == 4 && sizeof(mi_result_text_kind) == 4 &&
-              sizeof(mi_message_kind) == 4,
+              sizeof(mi_message_kind) == 4 && sizeof(mi_mask_encoding) == 4 && sizeof(mi_resize_mode) == 4 &&
+              sizeof(mi_image_mode) == 4,
               "C API enums are 32-bit");
 #define MI_LAYOUT(type, field, offset) static_assert(offsetof(type, field) == (offset), #type "." #field)
 static_assert(sizeof(mi_device_info) == 592);
@@ -78,7 +79,7 @@ MI_LAYOUT(mi_probe_info, build_flavour, 28);
 MI_LAYOUT(mi_probe_info, recommended_flavour, 44);
 MI_LAYOUT(mi_probe_info, message, 60);
 MI_LAYOUT(mi_probe_info, _reserved0, 572);
-static_assert(sizeof(mi_engine_params) == 120);
+static_assert(sizeof(mi_engine_params) == 136);
 MI_LAYOUT(mi_engine_params, struct_size, 0);
 MI_LAYOUT(mi_engine_params, model_path, 8);
 MI_LAYOUT(mi_engine_params, model_format, 16);
@@ -99,7 +100,9 @@ MI_LAYOUT(mi_engine_params, vae_file, 96);
 MI_LAYOUT(mi_engine_params, tier, 104);
 MI_LAYOUT(mi_engine_params, attention, 108);
 MI_LAYOUT(mi_engine_params, lora_strict, 112);
-MI_LAYOUT(mi_engine_params, _reserved2, 116);
+MI_LAYOUT(mi_engine_params, _reserved2, 116);  // the first 0.2.0 layout ends here (120 bytes)
+MI_LAYOUT(mi_engine_params, time_embedding_file, 120);
+MI_LAYOUT(mi_engine_params, distill_dir, 128);
 static_assert(sizeof(mi_progress) == 40);
 MI_LAYOUT(mi_progress, struct_size, 0);
 MI_LAYOUT(mi_progress, phase, 8);
@@ -108,7 +111,7 @@ MI_LAYOUT(mi_progress, total_steps, 16);
 MI_LAYOUT(mi_progress, _reserved0, 20);
 MI_LAYOUT(mi_progress, step_seconds, 24);
 MI_LAYOUT(mi_progress, elapsed_seconds, 32);
-static_assert(sizeof(mi_gen_params) == 240);
+static_assert(sizeof(mi_gen_params) == 320);
 MI_LAYOUT(mi_gen_params, struct_size, 0);
 MI_LAYOUT(mi_gen_params, prompt, 8);
 MI_LAYOUT(mi_gen_params, negative_prompt, 16);
@@ -145,11 +148,30 @@ MI_LAYOUT(mi_gen_params, dataspace_path, 208);
 MI_LAYOUT(mi_gen_params, loras, 216);
 MI_LAYOUT(mi_gen_params, loras_count, 224);
 MI_LAYOUT(mi_gen_params, include_prompts, 232);
-MI_LAYOUT(mi_gen_params, _reserved2, 236);
+MI_LAYOUT(mi_gen_params, _reserved2, 236);  // the first 0.2.0 layout ends here (240 bytes)
+MI_LAYOUT(mi_gen_params, init_image, 240);
+MI_LAYOUT(mi_gen_params, init_image_path, 248);
+MI_LAYOUT(mi_gen_params, mask, 256);
+MI_LAYOUT(mi_gen_params, mask_path, 264);
+MI_LAYOUT(mi_gen_params, mask_encoding, 272);
+MI_LAYOUT(mi_gen_params, resize, 276);
+MI_LAYOUT(mi_gen_params, denoise_strength, 280);
+MI_LAYOUT(mi_gen_params, hires_width, 288);
+MI_LAYOUT(mi_gen_params, hires_height, 292);
+MI_LAYOUT(mi_gen_params, hires_strength, 296);
+MI_LAYOUT(mi_gen_params, hires_steps, 304);
+MI_LAYOUT(mi_gen_params, _reserved3, 308);
+MI_LAYOUT(mi_gen_params, distill_dir, 312);
 static_assert(sizeof(mi_lora) == 16);  // array element: no struct_size, frozen
 MI_LAYOUT(mi_lora, path, 0);
 MI_LAYOUT(mi_lora, strength, 8);
-static_assert(sizeof(mi_timings) == 104);
+static_assert(sizeof(mi_image) == 24);  // array-style element: no struct_size, frozen
+MI_LAYOUT(mi_image, pixels, 0);
+MI_LAYOUT(mi_image, width, 8);
+MI_LAYOUT(mi_image, height, 12);
+MI_LAYOUT(mi_image, channels, 16);
+MI_LAYOUT(mi_image, _reserved0, 20);
+static_assert(sizeof(mi_timings) == 128);
 MI_LAYOUT(mi_timings, struct_size, 0);
 MI_LAYOUT(mi_timings, total_s, 8);
 MI_LAYOUT(mi_timings, load_s, 16);
@@ -162,7 +184,10 @@ MI_LAYOUT(mi_timings, plan_s, 64);
 MI_LAYOUT(mi_timings, text_encode_s, 72);
 MI_LAYOUT(mi_timings, dit_load_s, 80);
 MI_LAYOUT(mi_timings, refine_s, 88);
-MI_LAYOUT(mi_timings, vae_load_s, 96);
+MI_LAYOUT(mi_timings, vae_load_s, 96);  // the 0.1.0 layout ends here (104 bytes)
+MI_LAYOUT(mi_timings, vae_encoder_load_s, 104);
+MI_LAYOUT(mi_timings, image_encode_s, 112);
+MI_LAYOUT(mi_timings, image_ops_s, 120);
 static_assert(sizeof(mi_memory_stats) == 56);
 MI_LAYOUT(mi_memory_stats, struct_size, 0);
 MI_LAYOUT(mi_memory_stats, arena_capacity_bytes, 8);
@@ -207,13 +232,36 @@ MI_LAYOUT(mi_lora_report, merged, 16);
 MI_LAYOUT(mi_lora_report, unknown_keys, 20);
 MI_LAYOUT(mi_lora_report, warnings, 24);
 MI_LAYOUT(mi_lora_report, notes, 28);
+static_assert(sizeof(mi_image_info) == 80);
+MI_LAYOUT(mi_image_info, struct_size, 0);
+MI_LAYOUT(mi_image_info, mode, 8);
+MI_LAYOUT(mi_image_info, hires_ran, 12);
+MI_LAYOUT(mi_image_info, first_width, 16);
+MI_LAYOUT(mi_image_info, first_height, 20);
+MI_LAYOUT(mi_image_info, first_steps_scheduled, 24);
+MI_LAYOUT(mi_image_info, first_start_step, 28);
+MI_LAYOUT(mi_image_info, first_steps_run, 32);
+MI_LAYOUT(mi_image_info, first_encoded, 36);
+MI_LAYOUT(mi_image_info, hires_width, 40);
+MI_LAYOUT(mi_image_info, hires_height, 44);
+MI_LAYOUT(mi_image_info, hires_steps_scheduled, 48);
+MI_LAYOUT(mi_image_info, hires_start_step, 52);
+MI_LAYOUT(mi_image_info, hires_steps_run, 56);
+MI_LAYOUT(mi_image_info, _reserved0, 60);
+MI_LAYOUT(mi_image_info, first_strength, 64);
+MI_LAYOUT(mi_image_info, hires_strength, 72);
 #undef MI_LAYOUT
 
 // Every size a versioned input struct has had: the 0.1 layout, then today's. A struct of an older size is read as
 // its prefix over the defaults.
-constexpr std::size_t kEngineParamsSizes[] = {offsetof(mi_engine_params, dit_file), sizeof(mi_engine_params)};
-constexpr std::size_t kGenParamsSizes[] = {offsetof(mi_gen_params, scheduler), sizeof(mi_gen_params)};
-static_assert(kEngineParamsSizes[0] == 80 && kGenParamsSizes[0] == 168, "the 0.1 layouts");
+constexpr std::size_t kEngineParamsSizes[] = {offsetof(mi_engine_params, dit_file),
+                                               offsetof(mi_engine_params, time_embedding_file), sizeof(mi_engine_params)};
+constexpr std::size_t kGenParamsSizes[] = {offsetof(mi_gen_params, scheduler), offsetof(mi_gen_params, init_image),
+                                            sizeof(mi_gen_params)};
+// Output structs that grew: mi_timings (0.1.0: 104 bytes).
+constexpr std::size_t kTimingsSizes[] = {offsetof(mi_timings, vae_encoder_load_s), sizeof(mi_timings)};
+static_assert(kEngineParamsSizes[0] == 80 && kGenParamsSizes[0] == 168 && kTimingsSizes[0] == 104, "the 0.1.0 layouts");
+static_assert(kEngineParamsSizes[1] == 120 && kGenParamsSizes[1] == 240, "the first 0.2.0 layouts");
 
 thread_local std::string t_last_error;
 // Set instead of t_last_error when copying a message failed (no memory): mi_last_error_message() must stay valid.
@@ -299,14 +347,15 @@ void check_reserved(const mi_gen_params& p) {
   check_reserved(p._reserved0, "mi_gen_params._reserved0");
   check_reserved(p._reserved1, "mi_gen_params._reserved1");
   check_reserved(p._reserved2, "mi_gen_params._reserved2");
+  check_reserved(p._reserved3, "mi_gen_params._reserved3");
 }
 
 // Versioned structs: `known` lists every size the struct has had (ABI 1: it only grows at the end).
 void check_size(std::size_t got, std::span<const std::size_t> known, const char* name) {
   std::string sizes;
-  for (const std::size_t k : known) {
-    if (got == k) return;
-    sizes += (sizes.empty() ? "" : " or ") + std::to_string(k);
+  for (std::size_t i = 0; i < known.size(); ++i) {
+    if (got == known[i]) return;
+    sizes += std::string(i == 0 ? "" : i + 1 == known.size() ? " or " : ", ") + std::to_string(known[i]);
   }
   throw StatusError(MI_ERR_ABI_MISMATCH, std::string(name) + ".struct_size is " + std::to_string(got) +
                                              "; this library accepts " + sizes + ".");
@@ -355,8 +404,18 @@ mi_gen_params gen_params_defaults(std::size_t size = sizeof(mi_gen_params)) {
   p.eta = 1.0;
   p.s_noise = 1.0;
   p.include_prompts = 1;
+  p.denoise_strength = -1.0;  // unset
+  p.hires_strength = 0.45;
+  p.mask_encoding = MI_MASK_U8;
+  p.resize = MI_RESIZE_CROP;
   // A 0.1.0 program (168 bytes) wrote PNGs without metadata: it keeps doing so.
-  if (size < sizeof p) p.save_metadata = p.include_prompts = 0;
+  if (size <= offsetof(mi_gen_params, scheduler)) p.save_metadata = p.include_prompts = 0;
+  // The current layout leaves the context-dependent fields unset (mossinfer.h, "Unset markers"); the older ones
+  // keep their explicit 50 steps and CFG 3.
+  if (size == sizeof p) {
+    p.steps = 0;
+    p.cfg = -1.0;
+  }
   return p;
 }
 
@@ -383,8 +442,9 @@ T read_input(const void* in, std::span<const std::size_t> known, T (*defaults)(s
 
 // Output structs: only the caller's struct_size bytes (checked by the caller with check_size) are written.
 template <class T>
-void write_output(T* out, T value) {
-  const std::size_t size = out->struct_size;
+void write_output(void* out, T value) {
+  std::size_t size = 0;
+  std::memcpy(&size, out, sizeof size);  // never viewing a shorter caller struct as a full T
   value.struct_size = size;
   std::memcpy(out, &value, std::min(size, sizeof value));
 }
@@ -467,7 +527,8 @@ const char* mi_last_error_message(void) {
 }
 
 uint32_t mi_capabilities(void) {
-  return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS;
+  return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS | MI_CAP_IMAGE_INPUT | MI_CAP_HIRES |
+         MI_CAP_DISTILL;
 }
 
 mi_status mi_probe(mi_probe_info* info) {
@@ -646,7 +707,9 @@ int32_t mi_result_steps_run(const mi_result* result) {
 mi_status mi_result_timings(const mi_result* result, mi_timings* out) {
   return guarded([&] {
     require(out, "out");
-    check_size(out->struct_size, sizeof(mi_timings), "mi_timings");
+    std::size_t size = 0;
+    std::memcpy(&size, out, sizeof size);  // an older, shorter mi_timings is accepted
+    check_size(size, kTimingsSizes, "mi_timings");
     require(result, "result");
     write_output(out, result->generation.timings);
     return MI_OK;
@@ -713,6 +776,16 @@ mi_status mi_save_png(mi_result* result, const char* path) {
   });
 }
 
+mi_status mi_result_image(const mi_result* result, mi_image_info* out) {
+  return guarded([&] {
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_image_info), "mi_image_info");
+    require(result, "result");
+    write_output(out, result->generation.image);
+    return MI_OK;
+  });
+}
+
 mi_status mi_result_tier(const mi_result* result, mi_tier_info* out) {
   return guarded([&] {
     require(out, "out");
@@ -733,6 +806,8 @@ const char* mi_result_text(const mi_result* result, mi_result_text_kind kind) {
       case MI_TEXT_TEXT_ENCODER_SOURCE: return g.te_source.c_str();
       case MI_TEXT_VAE_SOURCE: return g.vae_source.c_str();
       case MI_TEXT_QUALITY_JSON: return g.quality_json.c_str();
+      case MI_TEXT_IMAGE_NOTE: return g.image_note.c_str();
+      case MI_TEXT_TIME_EMBEDDING: return g.time_embedding.c_str();
       case MI_TEXT_MAX_ENUM: break;
     }
     set_error("mi_result_text: unknown kind.");

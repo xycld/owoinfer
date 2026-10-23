@@ -178,6 +178,20 @@ int main(int argc, char** argv) {
   e.p.struct_size = 96;
   expect(mi_engine_create((const mi_engine_params*)&e.p, &engine) == MI_ERR_ABI_MISMATCH, "unknown engine size rejected");
 
+  /* An earlier 0.2.0 header's mi_gen_params (240 bytes, before image input): the same rules. */
+  {
+    union {
+      mi_gen_params p;
+      unsigned char bytes[sizeof(mi_gen_params)];
+    } u;
+    memset(&u, 0x5a, sizeof u);
+    expect(mi_gen_params_init(&u.p, 240) == MI_OK, "mi_gen_params_init accepts 240");
+    expect(untouched(u.bytes + 240, sizeof u - 240), "mi_gen_params_init writes no byte past 240");
+    expect(u.p.save_metadata == 1 && u.p.include_prompts == 1, "a 240-byte struct keeps the metadata on");
+    u.p.prompt = "a red apple on a wooden table";
+    expect(mi_gen_params_validate(&u.p) == MI_OK, "mi_gen_params_validate accepts a 240-byte struct");
+  }
+
   if (argc > 2) generate_old(argv[1], argv[2]);
 
   printf("%s: 0.1-layout structs %s\n", failures ? "FAIL" : "ok", failures ? "are mishandled" : "are accepted");

@@ -116,6 +116,21 @@ std::string status_code(mi_status s) {
 
 [[noreturn]] void throw_status(mi_status s) { throw RequestError(status_code(s), mi_last_error_message()); }
 
+// An engine message with the C fields' names replaced by the protocol parameters' they come from.
+std::string protocol_names(std::string message) {
+  static constexpr std::pair<std::string_view, std::string_view> kRenames[] = {
+      {"dataspace_path", "dataspace"}, {"init_image_path", "init_image"}, {"mask_path", "mask"},
+      {"mi_engine_params.distill_dir", "load's \"distill\""}, {"distill_dir", "distill"},
+      {"hires_width / hires_height", "hires"}, {"hires_width and hires_height", "hires width and height"},
+      {"with MI_MASK_BINARY01", "with mask_encoding \"binary01\""}};
+  for (const auto& [from, to] : kRenames) {
+    for (std::size_t at = 0; (at = message.find(from, at)) != std::string::npos; at += to.size()) {
+      message.replace(at, from.size(), to);
+    }
+  }
+  return message;
+}
+
 std::string error_json(const std::string& code, const std::string& message) {
   return "{\"code\":" + str(code) + ",\"message\":" + str(message) + "}";
 }
@@ -166,6 +181,12 @@ class Params {
     // The C API takes NUL-terminated strings: an escaped \u0000 would silently cut the prompt or path short.
     if (v->as_string().find('\0') != std::string::npos) throw bad(key, "a string without NUL characters");
     return v->as_string();
+  }
+  // A path: a non-empty string.
+  std::optional<std::string> path(std::string_view key) const {
+    std::optional<std::string> v = string(key);
+    if (v && v->empty()) throw bad(key, "a non-empty path");
+    return v;
   }
   std::optional<std::int64_t> integer(std::string_view key, std::int64_t lo, std::int64_t hi) const {
     const Value* v = find(key);
@@ -227,6 +248,39 @@ class Params {
       names += std::string(i == 0 ? "" : i + 1 == N ? " or " : ", ") + "\"" + std::string(table[i].name) + "\"";
     }
     throw bad(key, names);
+  }
+  // `hires`: {"width": int, "height": int, "strength": number (optional), "steps": int (optional)}.
+  struct Hires {
+    std::int32_t width = 0, height = 0, steps = 0;
+    std::optional<double> strength;
+  };
+  std::optional<Hires> hires(std::string_view key) const {
+    const Value* v = find(key);
+    if (v == nullptr) return std::nullopt;
+    const std::string k0(key);
+    if (!v->is_object()) throw bad(key, "an object {\"width\", \"height\", \"strength\"?, \"steps\"?}");
+    Hires h;
+    bool have_width = false, have_height = false, have_steps = false;
+    constexpr std::int64_t kI32 = std::numeric_limits<std::int32_t>::max();
+    for (const auto& [k, m] : v->as_object()) {
+      if (k == "strength") {
+        if (h.strength) throw RequestError("invalid_params", "\"" + k0 + "\" has \"strength\" more than once");
+        if (!m.is_number()) throw bad(k0 + ".strength", "a number");
+        h.strength = m.as_double();
+        continue;
+      }
+      bool* seen = k == "width" ? &have_width : k == "height" ? &have_height : k == "steps" ? &have_steps : nullptr;
+      if (seen == nullptr) throw RequestError("invalid_params", "\"" + k0 + "\" has an unknown member \"" + k + "\"");
+      if (*seen) throw RequestError("invalid_params", "\"" + k0 + "\" has \"" + k + "\" more than once");
+      *seen = true;
+      const std::int64_t lo = k == "steps" ? 0 : 1;  // a given size is positive; steps 0 = the request's
+      if (!m.is_int() || m.as_int() < lo || m.as_int() > kI32) {
+        throw bad(k0 + "." + k, "an integer in [" + std::to_string(lo) + ", " + std::to_string(kI32) + "]");
+      }
+      (k == "width" ? h.width : k == "height" ? h.height : h.steps) = static_cast<std::int32_t>(m.as_int());
+    }
+    if (!have_width || !have_height) throw RequestError("invalid_params", "\"" + k0 + "\" needs \"width\" and \"height\"");
+    return h;
   }
   // `loras`: an array of {"path": string, "strength": number (default 1)}.
   std::optional<std::vector<std::pair<std::string, double>>> loras(std::string_view key) const {
@@ -404,6 +458,8 @@ class Server {
            ",\"capabilities\":{\"preview\":" + tf(caps & MI_CAP_PREVIEW) + ",\"comfyui_models\":" +
            tf(caps & MI_CAP_COMFYUI_MODELS) + ",\"model_files\":" + tf(caps & MI_CAP_MODEL_FILES) + ",\"lora\":" +
            tf(caps & MI_CAP_LORA) + ",\"tiers\":" + tf(caps & MI_CAP_TIERS) + ",\"samplers\":" + tf(caps & MI_CAP_SAMPLERS) +
+           ",\"image_input\":" + tf(caps & MI_CAP_IMAGE_INPUT) + ",\"hires\":" + tf(caps & MI_CAP_HIRES) + ",\"distill\":" +
+           tf(caps & MI_CAP_DISTILL) +
            "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
@@ -415,7 +471,7 @@ class Server {
   std::string load(const Params& p, const std::string& id) {
     p.only({"model", "mode", "device", "vram_budget_bytes", "vram_reserve_bytes", "host_ram_budget_bytes", "cache_dir",
             "embedding_cache", "direct_io", "block_path", "dit_file", "text_encoder_file", "vae_file", "tier", "attention",
-            "lora_strict"});
+            "lora_strict", "time_embedding_file", "distill"});
     if (generating()) throw RequestError("busy", "a generation is running; cancel it or wait for its done event");
     mi_engine_params e;
     if (const mi_status s = mi_engine_params_init(&e, sizeof e); s != MI_OK) throw_status(s);
@@ -454,13 +510,19 @@ class Server {
     if (const auto v = p.name("tier", mi::server::kTierNames)) e.tier = *v;
     if (const auto v = p.name("attention", mi::server::kAttentionNames)) e.attention = *v;
     if (const auto v = p.boolean("lora_strict")) e.lora_strict = *v ? 1 : 0;
+    const std::optional<std::string> te = p.path("time_embedding_file");
+    const std::optional<std::string> distill = p.path("distill");
+    if (te) e.time_embedding_file = te->c_str();
+    if (distill) e.distill_dir = distill->c_str();
     // The old engine goes first: two engines would hold two arenas.
     join_worker();
     mi_engine_free(engine_);
     engine_ = nullptr;
     model_.clear();
     mi_engine* engine = nullptr;
-    if (const mi_status s = mi_engine_create(&e, &engine); s != MI_OK) throw_status(s);
+    if (const mi_status s = mi_engine_create(&e, &engine); s != MI_OK) {
+      throw RequestError(status_code(s), protocol_names(mi_last_error_message()));
+    }
     engine_ = engine;
     model_ = *model;
     mode_ = e.mode;
@@ -474,7 +536,8 @@ class Server {
     p.only({"output", "prompt", "negative_prompt", "width", "height", "steps", "cfg", "shift", "seed", "uncond_skip_layers",
             "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length", "sampler", "scheduler",
             "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise", "dataspace", "loras", "save_metadata",
-            "include_prompts", "preview_output", "preview_every"});
+            "include_prompts", "preview_output", "preview_every", "init_image", "mask", "mask_encoding",
+            "denoise_strength", "resize", "hires", "distill"});
     auto w = std::make_unique<Work>();
     mi_gen_params& g = w->params;
     if (const mi_status s = mi_gen_params_init(&g, sizeof g); s != MI_OK) throw_status(s);
@@ -488,8 +551,13 @@ class Server {
     constexpr std::int64_t kI32 = std::numeric_limits<std::int32_t>::max();
     if (const auto v = p.integer("width", 0, kI32)) g.width = static_cast<std::int32_t>(*v);
     if (const auto v = p.integer("height", 0, kI32)) g.height = static_cast<std::int32_t>(*v);
-    if (const auto v = p.integer("steps", 0, kI32)) g.steps = static_cast<std::int32_t>(*v);
-    if (const auto v = p.number("cfg")) g.cfg = *v;
+    // Absent steps and cfg are the C API's unset markers: the defaults, or a distill bundle's.
+    // Absent = unset: mi_gen_params_init leaves steps, cfg and denoise_strength at their markers (mossinfer.h).
+    if (const auto v = p.integer("steps", 1, kI32)) g.steps = static_cast<std::int32_t>(*v);
+    if (const auto v = p.number("cfg")) {
+      if (*v < 0) throw RequestError("invalid_params", "\"cfg\" must be a number >= 0");
+      g.cfg = *v;
+    }
     if (const auto v = p.number("shift")) g.shift = *v;
     // A JSON null seed means random, like parameters.json.
     if (p.is_null("seed")) g.seed = -1;
@@ -530,6 +598,31 @@ class Server {
     }
     if (const auto v = p.boolean("save_metadata")) g.save_metadata = *v ? 1 : 0;
     if (const auto v = p.boolean("include_prompts")) g.include_prompts = *v ? 1 : 0;
+    // Image input: paths only (the server never takes pixels over the protocol).
+    if (const auto v = p.path("init_image")) {
+      w->init_image = *v;
+      g.init_image_path = w->init_image.c_str();
+    }
+    if (const auto v = p.path("mask")) {
+      w->mask = *v;
+      g.mask_path = w->mask.c_str();
+    }
+    if (const auto v = p.name("mask_encoding", mi::server::kMaskEncodingNames)) g.mask_encoding = *v;
+    if (const auto v = p.name("resize", mi::server::kResizeNames)) g.resize = *v;
+    if (const auto v = p.number("denoise_strength")) {
+      if (*v < 0) throw RequestError("invalid_params", "\"denoise_strength\" must be a number in [0, 1]");
+      g.denoise_strength = *v;
+    }
+    if (const auto h = p.hires("hires")) {
+      g.hires_width = h->width;
+      g.hires_height = h->height;
+      g.hires_steps = h->steps;
+      if (h->strength) g.hires_strength = *h->strength;
+    }
+    if (const auto v = p.path("distill")) {
+      w->distill = *v;
+      g.distill_dir = w->distill.c_str();
+    }
     const auto preview_every = p.integer("preview_every", 1, kI32);
     if (const auto v = p.string("preview_output")) {
       if (v->empty()) throw RequestError("invalid_params", "\"preview_output\" must be a PNG path");
@@ -539,13 +632,8 @@ class Server {
       throw RequestError("invalid_params", "\"preview_every\" needs \"preview_output\"");
     }
     if (const mi_status s = mi_gen_params_validate(&g); s != MI_OK) {
-      // The engine names its C field; the protocol's parameter is "dataspace".
-      std::string message = mi_last_error_message();
-      for (std::size_t at = 0; (at = message.find("dataspace_path", at)) != std::string::npos;) {
-        message.replace(at, 14, "dataspace");
-        at += 9;
-      }
-      throw RequestError(s == MI_ERR_INVALID_ARGUMENT ? "invalid_params" : status_code(s), message);
+      throw RequestError(s == MI_ERR_INVALID_ARGUMENT ? "invalid_params" : status_code(s),
+                         protocol_names(mi_last_error_message()));
     }
     // The request is checked first (no engine or GPU needed), then the server's state.
     if (engine_ == nullptr) throw RequestError("no_engine", "no model loaded; send \"load\" first");
@@ -609,7 +697,7 @@ class Server {
   // One generation's inputs; owned by the worker thread.
   struct Work {
     mi_gen_params params{};
-    std::string output, prompt, negative, dataspace, preview;
+    std::string output, prompt, negative, dataspace, preview, init_image, mask, distill;
     std::vector<std::int32_t> uncond, slg;
     std::vector<std::string> lora_paths;
     std::vector<mi_lora> loras;  // points into lora_paths
@@ -669,6 +757,11 @@ class Server {
             " dropped; max_sequence_length " + std::to_string(t.max_length) + ")");
       }
     }
+    if (r != nullptr) {
+      if (const char* note = mi_result_text(r, MI_TEXT_IMAGE_NOTE); note != nullptr && *note != '\0') {
+        add(std::string("image input: ") + note);
+      }
+    }
     return "[" + out + "]";
   }
 
@@ -682,14 +775,14 @@ class Server {
       if (const mi_status ws = mi_save_png(r, w.output.c_str()); ws == MI_OK) {
         done += ",\"status\":\"ok\",\"image\":" + str(w.output) + ",\"report\":" + one_line(mi_result_report_json(r));
       } else {
-        done += ",\"status\":\"error\",\"error\":" + error_json(status_code(ws), mi_last_error_message());
+        done += ",\"status\":\"error\",\"error\":" + error_json(status_code(ws), protocol_names(mi_last_error_message()));
         done += ",\"report\":" + one_line(mi_result_report_json(r));  // after the message: a failing report would replace it
       }
     } else if (s == MI_CANCELLED) {
       done += ",\"status\":\"cancelled\",\"steps_run\":" + std::to_string(mi_result_steps_run(r)) +
               ",\"report\":" + one_line(mi_result_report_json(r));
     } else {
-      done += ",\"status\":\"error\",\"error\":" + error_json(status_code(s), mi_last_error_message());
+      done += ",\"status\":\"error\",\"error\":" + error_json(status_code(s), protocol_names(mi_last_error_message()));
     }
     done += ",\"warnings\":" + warnings_json(r);
     mi_result_free(r);

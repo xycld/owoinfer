@@ -34,6 +34,9 @@ int main(void) {
   check("sizeof(mi_noise_source)", sizeof(mi_noise_source), 4);
   check("sizeof(mi_result_text_kind)", sizeof(mi_result_text_kind), 4);
   check("sizeof(mi_message_kind)", sizeof(mi_message_kind), 4);
+  check("sizeof(mi_mask_encoding)", sizeof(mi_mask_encoding), 4);
+  check("sizeof(mi_resize_mode)", sizeof(mi_resize_mode), 4);
+  check("sizeof(mi_image_mode)", sizeof(mi_image_mode), 4);
 
   SIZE(mi_device_info, 592);
   FIELD(mi_device_info, struct_size, 0);
@@ -61,7 +64,7 @@ int main(void) {
   FIELD(mi_probe_info, message, 60);
   FIELD(mi_probe_info, _reserved0, 572);
 
-  SIZE(mi_engine_params, 120);
+  SIZE(mi_engine_params, 136);
   FIELD(mi_engine_params, struct_size, 0);
   FIELD(mi_engine_params, model_path, 8);
   FIELD(mi_engine_params, model_format, 16);
@@ -82,7 +85,9 @@ int main(void) {
   FIELD(mi_engine_params, tier, 104);
   FIELD(mi_engine_params, attention, 108);
   FIELD(mi_engine_params, lora_strict, 112);
-  FIELD(mi_engine_params, _reserved2, 116);
+  FIELD(mi_engine_params, _reserved2, 116); /* the first 0.2.0 layout ends here (120 bytes) */
+  FIELD(mi_engine_params, time_embedding_file, 120);
+  FIELD(mi_engine_params, distill_dir, 128);
 
   SIZE(mi_progress, 40);
   FIELD(mi_progress, struct_size, 0);
@@ -93,7 +98,7 @@ int main(void) {
   FIELD(mi_progress, step_seconds, 24);
   FIELD(mi_progress, elapsed_seconds, 32);
 
-  SIZE(mi_gen_params, 240);
+  SIZE(mi_gen_params, 320);
   FIELD(mi_gen_params, struct_size, 0);
   FIELD(mi_gen_params, prompt, 8);
   FIELD(mi_gen_params, negative_prompt, 16);
@@ -130,13 +135,33 @@ int main(void) {
   FIELD(mi_gen_params, loras, 216);
   FIELD(mi_gen_params, loras_count, 224);
   FIELD(mi_gen_params, include_prompts, 232);
-  FIELD(mi_gen_params, _reserved2, 236);
+  FIELD(mi_gen_params, _reserved2, 236); /* the first 0.2.0 layout ends here (240 bytes) */
+  FIELD(mi_gen_params, init_image, 240);
+  FIELD(mi_gen_params, init_image_path, 248);
+  FIELD(mi_gen_params, mask, 256);
+  FIELD(mi_gen_params, mask_path, 264);
+  FIELD(mi_gen_params, mask_encoding, 272);
+  FIELD(mi_gen_params, resize, 276);
+  FIELD(mi_gen_params, denoise_strength, 280);
+  FIELD(mi_gen_params, hires_width, 288);
+  FIELD(mi_gen_params, hires_height, 292);
+  FIELD(mi_gen_params, hires_strength, 296);
+  FIELD(mi_gen_params, hires_steps, 304);
+  FIELD(mi_gen_params, _reserved3, 308);
+  FIELD(mi_gen_params, distill_dir, 312);
 
   SIZE(mi_lora, 16); /* array element without struct_size: frozen */
   FIELD(mi_lora, path, 0);
   FIELD(mi_lora, strength, 8);
 
-  SIZE(mi_timings, 104);
+  SIZE(mi_image, 24); /* array-style element without struct_size: frozen */
+  FIELD(mi_image, pixels, 0);
+  FIELD(mi_image, width, 8);
+  FIELD(mi_image, height, 12);
+  FIELD(mi_image, channels, 16);
+  FIELD(mi_image, _reserved0, 20);
+
+  SIZE(mi_timings, 128);
   FIELD(mi_timings, struct_size, 0);
   FIELD(mi_timings, total_s, 8);
   FIELD(mi_timings, load_s, 16);
@@ -149,7 +174,10 @@ int main(void) {
   FIELD(mi_timings, text_encode_s, 72);
   FIELD(mi_timings, dit_load_s, 80);
   FIELD(mi_timings, refine_s, 88);
-  FIELD(mi_timings, vae_load_s, 96);
+  FIELD(mi_timings, vae_load_s, 96); /* the 0.1.0 layout ends here (104 bytes) */
+  FIELD(mi_timings, vae_encoder_load_s, 104);
+  FIELD(mi_timings, image_encode_s, 112);
+  FIELD(mi_timings, image_ops_s, 120);
 
   SIZE(mi_memory_stats, 56);
   FIELD(mi_memory_stats, struct_size, 0);
@@ -199,6 +227,25 @@ int main(void) {
   FIELD(mi_lora_report, unknown_keys, 20);
   FIELD(mi_lora_report, warnings, 24);
   FIELD(mi_lora_report, notes, 28);
+
+  SIZE(mi_image_info, 80);
+  FIELD(mi_image_info, struct_size, 0);
+  FIELD(mi_image_info, mode, 8);
+  FIELD(mi_image_info, hires_ran, 12);
+  FIELD(mi_image_info, first_width, 16);
+  FIELD(mi_image_info, first_height, 20);
+  FIELD(mi_image_info, first_steps_scheduled, 24);
+  FIELD(mi_image_info, first_start_step, 28);
+  FIELD(mi_image_info, first_steps_run, 32);
+  FIELD(mi_image_info, first_encoded, 36);
+  FIELD(mi_image_info, hires_width, 40);
+  FIELD(mi_image_info, hires_height, 44);
+  FIELD(mi_image_info, hires_steps_scheduled, 48);
+  FIELD(mi_image_info, hires_start_step, 52);
+  FIELD(mi_image_info, hires_steps_run, 56);
+  FIELD(mi_image_info, _reserved0, 60);
+  FIELD(mi_image_info, first_strength, 64);
+  FIELD(mi_image_info, hires_strength, 72);
 
   printf("%s: C struct layouts %s the frozen ABI %d table\n", failures ? "FAIL" : "ok",
          failures ? "differ from" : "match", MI_ABI_VERSION);
