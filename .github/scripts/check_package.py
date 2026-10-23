@@ -327,7 +327,7 @@ def main():
         print(f"CERT {cert_rel}: none (no directory)")
 
     total = tree_size(prefix)
-    cuda12 =any(CUBLASLT_12.match(n) for _, _, files in os.walk(prefix) for n in files)
+    cuda12 = any(CUBLASLT_12.match(n) for _, _, files in os.walk(prefix) for n in files)
     total_limit = TOTAL_LIMIT_CUDA12 if cuda12 else TOTAL_LIMIT
     print(f"AC17 redistributable {total / MB:.1f} MB uncompressed (limit {total_limit / MB:.0f} MB"
           f"{', CUDA 12 cuBLASLt bundled' if cuda12 else ''})")
