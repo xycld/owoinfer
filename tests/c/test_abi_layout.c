@@ -38,6 +38,10 @@ int main(void) {
   check("sizeof(mi_resize_mode)", sizeof(mi_resize_mode), 4);
   check("sizeof(mi_image_mode)", sizeof(mi_image_mode), 4);
   check("sizeof(mi_step_cache)", sizeof(mi_step_cache), 4);
+  check("sizeof(mi_direct_io)", sizeof(mi_direct_io), 4);
+  check("sizeof(mi_te_host_pin)", sizeof(mi_te_host_pin), 4);
+  check("sizeof(mi_dit_load_source)", sizeof(mi_dit_load_source), 4);
+  check("sizeof(mi_load_io)", sizeof(mi_load_io), 4);
 
   SIZE(mi_device_info, 592);
   FIELD(mi_device_info, struct_size, 0);
@@ -70,7 +74,7 @@ int main(void) {
   FIELD(mi_probe_info, cublaslt_path, 600);
   FIELD(mi_probe_info, cublaslt_error, 1112);
 
-  SIZE(mi_engine_params, 136);
+  SIZE(mi_engine_params, 160);
   FIELD(mi_engine_params, struct_size, 0);
   FIELD(mi_engine_params, model_path, 8);
   FIELD(mi_engine_params, model_format, 16);
@@ -93,7 +97,11 @@ int main(void) {
   FIELD(mi_engine_params, lora_strict, 112);
   FIELD(mi_engine_params, _reserved2, 116); /* the first 0.2.0 layout ends here (120 bytes) */
   FIELD(mi_engine_params, time_embedding_file, 120);
-  FIELD(mi_engine_params, distill_dir, 128);
+  FIELD(mi_engine_params, distill_dir, 128); /* the 1.0.0 layout ends here (136 bytes) */
+  FIELD(mi_engine_params, certificate_dirs, 136);
+  FIELD(mi_engine_params, certificate_dirs_count, 144);
+  FIELD(mi_engine_params, dit_direct_io, 152);
+  FIELD(mi_engine_params, te_host_pin, 156);
 
   SIZE(mi_progress, 40);
   FIELD(mi_progress, struct_size, 0);
@@ -183,7 +191,7 @@ int main(void) {
   FIELD(mi_image, channels, 16);
   FIELD(mi_image, _reserved0, 20);
 
-  SIZE(mi_timings, 128);
+  SIZE(mi_timings, 144);
   FIELD(mi_timings, struct_size, 0);
   FIELD(mi_timings, total_s, 8);
   FIELD(mi_timings, load_s, 16);
@@ -199,16 +207,22 @@ int main(void) {
   FIELD(mi_timings, vae_load_s, 96); /* the 0.1.0 layout ends here (104 bytes) */
   FIELD(mi_timings, vae_encoder_load_s, 104);
   FIELD(mi_timings, image_encode_s, 112);
-  FIELD(mi_timings, image_ops_s, 120);
+  FIELD(mi_timings, image_ops_s, 120); /* the 1.0.0 layout ends here (128 bytes) */
+  FIELD(mi_timings, lora_load_s, 128);
+  FIELD(mi_timings, lora_merge_s, 136);
 
-  SIZE(mi_memory_stats, 56);
+  SIZE(mi_memory_stats, 80);
   FIELD(mi_memory_stats, struct_size, 0);
   FIELD(mi_memory_stats, arena_capacity_bytes, 8);
   FIELD(mi_memory_stats, arena_high_water_bytes, 16);
   FIELD(mi_memory_stats, device_peak_bytes, 24);
   FIELD(mi_memory_stats, device_free_at_start_bytes, 32);
   FIELD(mi_memory_stats, host_private_start_bytes, 40);
-  FIELD(mi_memory_stats, host_private_peak_bytes, 48);
+  FIELD(mi_memory_stats, host_private_peak_bytes, 48); /* the 1.0.0 layout ends here (56 bytes) */
+  FIELD(mi_memory_stats, host_copy_bytes, 56);
+  FIELD(mi_memory_stats, merge_memo_bytes, 64);
+  FIELD(mi_memory_stats, dit_loads, 72);
+  FIELD(mi_memory_stats, _reserved0, 76);
 
   SIZE(mi_dit_stream_stats, 80);
   FIELD(mi_dit_stream_stats, struct_size, 0);
@@ -284,12 +298,30 @@ int main(void) {
   FIELD(mi_control_info, lora_notes, 40);
   FIELD(mi_control_info, _reserved0, 44);
 
-  SIZE(mi_accel_info, 24);
+  SIZE(mi_accel_info, 32);
   FIELD(mi_accel_info, struct_size, 0);
   FIELD(mi_accel_info, cfg_truncated_steps, 8);
   FIELD(mi_accel_info, dit_calls, 12);
   FIELD(mi_accel_info, cached_calls, 16);
-  FIELD(mi_accel_info, lossy, 20);
+  FIELD(mi_accel_info, lossy, 20); /* the 1.0.0 layout ends here (24 bytes) */
+  FIELD(mi_accel_info, step_cache_threshold, 24);
+
+  SIZE(mi_release_info, 560);
+  FIELD(mi_release_info, struct_size, 0);
+  FIELD(mi_release_info, seconds, 8);
+  FIELD(mi_release_info, vram_released_bytes, 16);
+  FIELD(mi_release_info, host_copy_bytes, 24);
+  FIELD(mi_release_info, host_copy_seconds, 32);
+  FIELD(mi_release_info, dit_host_copy, 40);
+  FIELD(mi_release_info, te_host_copy, 44);
+  FIELD(mi_release_info, note, 48);
+
+  SIZE(mi_dit_load_info, 32);
+  FIELD(mi_dit_load_info, struct_size, 0);
+  FIELD(mi_dit_load_info, source, 8);
+  FIELD(mi_dit_load_info, io, 12);
+  FIELD(mi_dit_load_info, bytes, 16);
+  FIELD(mi_dit_load_info, seconds, 24);
 
   printf("%s: C struct layouts %s the frozen ABI %d table\n", failures ? "FAIL" : "ok",
          failures ? "differ from" : "match", MI_ABI_VERSION);
