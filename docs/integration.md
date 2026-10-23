@@ -136,7 +136,7 @@ cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-
 | Path | What |
 |---|---|
 | `bin/moss-server` (`moss-server.exe`) | the sidecar |
-| `bin/moss-infer` | command-line tool for debugging and for converting models. The launcher doesn't need it. It runs the engine in `libmossinfer` and no longer carries its own copy of the engine. |
+| `bin/moss-infer` | command-line tool for debugging and for converting models. The launcher doesn't need it. It runs the engine in `libmossinfer` rather than carrying its own copy. |
 | `lib/libmossinfer.so.1` (Windows: `bin/mossinfer.dll` + `lib/mossinfer.lib`) | the engine, the C API and the `moss-infer` commands. It exports the C API functions and `mi_internal_cli_main`, `moss-infer`'s entry point, which is not part of the C API. |
 | `lib/libcublasLt.so.<major>` (Windows: `bin/cublasLt64_<major>.dll`) | NVIDIA cuBLASLt, redistributed under the CUDA EULA; full package only |
 | Windows: `bin/vcruntime140*.dll`, `bin/msvcp140.dll` | the MSVC runtime, so users need no Visual C++ Redistributable |
