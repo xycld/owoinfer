@@ -122,7 +122,10 @@ std::string protocol_names(std::string message) {
       {"dataspace_path", "dataspace"}, {"init_image_path", "init_image"}, {"mask_path", "mask"},
       {"mi_engine_params.distill_dir", "load's \"distill\""}, {"distill_dir", "distill"},
       {"hires_width / hires_height", "hires"}, {"hires_width and hires_height", "hires width and height"},
-      {"with MI_MASK_BINARY01", "with mask_encoding \"binary01\""}};
+      {"with MI_MASK_BINARY01", "with mask_encoding \"binary01\""},
+      // "control_images[0].image_path" -> "control.images[0].path".
+      {"control_images", "control.images"}, {".image_path", ".path"}, {"control_adapter", "control.adapter"},
+      {"control_lora_strength", "control.lora_strength"}};
   for (const auto& [from, to] : kRenames) {
     for (std::size_t at = 0; (at = message.find(from, at)) != std::string::npos; at += to.size()) {
       message.replace(at, from.size(), to);
@@ -315,6 +318,77 @@ class Params {
     }
     return out;
   }
+  // `control`: {"adapter": path, "lora_strength": number (optional), "images": [{"kind": string, "path": path,
+  // "strength", "start", "end": numbers (optional)}] (optional)}. Absent numbers keep the C API's defaults.
+  struct ControlImage {
+    std::string kind, path;
+    std::optional<double> strength, start, end;
+  };
+  struct Control {
+    std::string adapter;
+    std::optional<double> lora_strength;
+    std::vector<ControlImage> images;
+  };
+  std::optional<Control> control(std::string_view key) const {
+    const Value* v = find(key);
+    if (v == nullptr) return std::nullopt;
+    const std::string k0(key);
+    if (!v->is_object()) throw bad(key, "an object {\"adapter\", \"lora_strength\"?, \"images\"?}");
+    // Each member once; strings non-empty and without NUL characters.
+    const auto members = [](const mi::json::Value& obj, const std::string& field,
+                            std::initializer_list<std::string_view> known) {
+      const mi::json::Object& o = obj.as_object();
+      for (std::size_t i = 0; i < o.size(); ++i) {
+        bool ok = false;
+        for (const std::string_view n : known) ok = ok || o[i].first == n;
+        if (!ok) throw RequestError("invalid_params", "\"" + field + "\" has an unknown member \"" + o[i].first + "\"");
+        for (std::size_t j = 0; j < i; ++j) {
+          if (o[j].first == o[i].first) {
+            throw RequestError("invalid_params", "\"" + field + "\" has \"" + o[i].first + "\" more than once");
+          }
+        }
+      }
+    };
+    const auto nonempty = [](const mi::json::Value& m, const std::string& field, const std::string& what) {
+      if (!m.is_string() || m.as_string().empty()) throw bad(field, "a non-empty string (" + what + ")");
+      if (m.as_string().find('\0') != std::string::npos) throw bad(field, "a string without NUL characters");
+      return m.as_string();
+    };
+    const auto numeric = [](const mi::json::Value& m, const std::string& field) {
+      if (!m.is_number()) throw bad(field, "a number");
+      return m.as_double();
+    };
+    members(*v, k0, {"adapter", "lora_strength", "images"});
+    Control c;
+    bool have_adapter = false;
+    for (const auto& [k, m] : v->as_object()) {
+      if (k == "adapter") {
+        c.adapter = nonempty(m, k0 + ".adapter", "the control adapter file");
+        have_adapter = true;
+      } else if (k == "lora_strength") {
+        c.lora_strength = numeric(m, k0 + ".lora_strength");
+      } else if (!m.is_array()) {
+        throw bad(k0 + ".images", "an array of {\"kind\", \"path\", \"strength\"?, \"start\"?, \"end\"?} objects");
+      } else {
+        for (const Value& e : m.as_array()) {
+          const std::string item = k0 + ".images[" + std::to_string(c.images.size()) + "]";
+          if (!e.is_object()) throw bad(item, "an object {\"kind\", \"path\", \"strength\"?, \"start\"?, \"end\"?}");
+          members(e, item, {"kind", "path", "strength", "start", "end"});
+          ControlImage im;
+          for (const auto& [ik, iv] : e.as_object()) {
+            if (ik == "kind") im.kind = nonempty(iv, item + ".kind", "one of the adapter's kinds, e.g. depth");
+            else if (ik == "path") im.path = nonempty(iv, item + ".path", "the image file");
+            else (ik == "strength" ? im.strength : ik == "start" ? im.start : im.end) = numeric(iv, item + "." + ik);
+          }
+          if (im.kind.empty()) throw RequestError("invalid_params", "\"" + item + ".kind\" is required");
+          if (im.path.empty()) throw RequestError("invalid_params", "\"" + item + ".path\" (the image file) is required");
+          c.images.push_back(std::move(im));
+        }
+      }
+    }
+    if (!have_adapter) throw RequestError("invalid_params", "\"" + k0 + ".adapter\" (the control adapter file) is required");
+    return c;
+  }
 
  private:
   static RequestError bad(std::string_view key, const std::string& what) {
@@ -459,8 +533,8 @@ class Server {
            tf(caps & MI_CAP_COMFYUI_MODELS) + ",\"model_files\":" + tf(caps & MI_CAP_MODEL_FILES) + ",\"lora\":" +
            tf(caps & MI_CAP_LORA) + ",\"tiers\":" + tf(caps & MI_CAP_TIERS) + ",\"samplers\":" + tf(caps & MI_CAP_SAMPLERS) +
            ",\"image_input\":" + tf(caps & MI_CAP_IMAGE_INPUT) + ",\"hires\":" + tf(caps & MI_CAP_HIRES) + ",\"distill\":" +
-           tf(caps & MI_CAP_DISTILL) + ",\"system_cuda\":" + tf(caps & MI_CAP_SYSTEM_CUDA) +
-           "},\"probe\":{\"driver_cuda_version\":" +
+           tf(caps & MI_CAP_DISTILL) + ",\"system_cuda\":" + tf(caps & MI_CAP_SYSTEM_CUDA) + ",\"control\":" +
+           tf(caps & MI_CAP_CONTROL) + ",\"accel\":" + tf(caps & MI_CAP_ACCEL) + "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
            ",\"supported_device_count\":" + std::to_string(probe.supported_device_count) +
@@ -539,7 +613,8 @@ class Server {
             "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length", "sampler", "scheduler",
             "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise", "dataspace", "loras", "save_metadata",
             "include_prompts", "preview_output", "preview_every", "init_image", "mask", "mask_encoding",
-            "denoise_strength", "resize", "hires", "distill"});
+            "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation", "step_cache",
+            "step_cache_threshold"});
     auto w = std::make_unique<Work>();
     mi_gen_params& g = w->params;
     if (const mi_status s = mi_gen_params_init(&g, sizeof g); s != MI_OK) throw_status(s);
@@ -625,6 +700,35 @@ class Server {
       w->distill = *v;
       g.distill_dir = w->distill.c_str();
     }
+    // Control adapter: paths only, like init_image.
+    if (auto c = p.control("control")) {
+      w->control_adapter = std::move(c->adapter);
+      g.control_adapter = w->control_adapter.c_str();
+      if (c->lora_strength) g.control_lora_strength = *c->lora_strength;
+      // Every string is stored before the array points into them.
+      for (Params::ControlImage& im : c->images) {
+        w->control_strings.push_back(std::move(im.kind));
+        w->control_strings.push_back(std::move(im.path));
+      }
+      for (std::size_t i = 0; i < c->images.size(); ++i) {
+        mi_control_image ci{};
+        ci.kind = w->control_strings[2 * i].c_str();
+        ci.image_path = w->control_strings[2 * i + 1].c_str();
+        ci.strength = c->images[i].strength.value_or(1.0);
+        ci.start = c->images[i].start.value_or(0.0);
+        ci.end = c->images[i].end.value_or(1.0);
+        w->control_images.push_back(ci);
+      }
+      g.control_images = w->control_images.data();
+      g.control_images_count = w->control_images.size();
+    }
+    if (const auto v = p.number("cfg_truncation")) g.cfg_truncation = *v;
+    if (const auto v = p.name("step_cache", mi::server::kStepCacheNames)) g.step_cache = *v;
+    if (const auto v = p.number("step_cache_threshold")) {
+      // 0 is the C API's "default": the protocol spells that by leaving the parameter out.
+      if (!(*v > 0 && *v <= 1)) throw RequestError("invalid_params", "\"step_cache_threshold\" must be a number in (0, 1]");
+      g.step_cache_threshold = *v;
+    }
     const auto preview_every = p.integer("preview_every", 1, kI32);
     if (const auto v = p.string("preview_output")) {
       if (v->empty()) throw RequestError("invalid_params", "\"preview_output\" must be a PNG path");
@@ -703,6 +807,9 @@ class Server {
     std::vector<std::int32_t> uncond, slg;
     std::vector<std::string> lora_paths;
     std::vector<mi_lora> loras;  // points into lora_paths
+    std::string control_adapter;
+    std::vector<std::string> control_strings;    // kind, path of each control image
+    std::vector<mi_control_image> control_images;  // points into control_strings
     Job* job = nullptr;
     Output* out = nullptr;
     mi_engine* engine = nullptr;
@@ -741,14 +848,26 @@ class Server {
                 std::to_string(width) + ",\"height\":" + std::to_string(height) + "}");
   }
 
-  // done.warnings: the LoRA warnings and prompt truncation, for launchers that do not read the report.
+  // done.warnings: the LoRA and control adapter warnings, lossy accelerators and prompt truncation, for launchers that
+  // do not read the report.
   static std::string warnings_json(const mi_result* r) {
     std::string out;
     const auto add = [&](const std::string& w) { out += (out.empty() ? "" : ",") + str(w); };
     if (r != nullptr) {
-      const std::int32_t n = mi_result_message_count(r, MI_MESSAGE_LORA_WARNING);
-      for (std::int32_t i = 0; i < n; ++i) {
-        if (const char* m = mi_result_message(r, MI_MESSAGE_LORA_WARNING, i)) add(std::string("LoRA ") + m);
+      for (const auto& [kind, prefix] : {std::pair{MI_MESSAGE_LORA_WARNING, "LoRA "},
+                                         std::pair{MI_MESSAGE_CONTROL_WARNING, "control adapter LoRA "}}) {
+        const std::int32_t n = mi_result_message_count(r, kind);
+        for (std::int32_t i = 0; i < n; ++i) {
+          if (const char* m = mi_result_message(r, kind, i)) add(prefix + std::string(m));
+        }
+      }
+      // The tier reason says it too, but only in the report: the accelerators are the one opt-in that trades quality.
+      mi_accel_info a{};
+      a.struct_size = sizeof a;
+      if (mi_result_accel(r, &a) == MI_OK && a.lossy) {
+        add(std::string("lossy accelerators (") + mi_result_text(r, MI_TEXT_ACCELERATORS) +
+            "), uncertified: CFG truncated on " + std::to_string(a.cfg_truncated_steps) + " steps, step cache reused " +
+            std::to_string(a.cached_calls) + " of " + std::to_string(a.dit_calls) + " DiT calls");
       }
       for (const std::int32_t negative : {0, 1}) {
         mi_prompt_tokens t{};

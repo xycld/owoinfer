@@ -237,7 +237,7 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertEqual(res["capabilities"], {"preview": True, "comfyui_models": False, "model_files": True,
                                                "lora": True, "tiers": True, "samplers": True,
                                                "image_input": True, "hires": True, "distill": True,
-                                               "system_cuda": True})
+                                               "system_cuda": True, "control": True, "accel": True})
         probe = res["probe"]
         self.assertGreaterEqual(probe["device_count"], probe["supported_device_count"])
         self.assertIn(probe["recommended_flavour"], ("cu12", "cu13", ""))
@@ -468,6 +468,82 @@ class CpuProtocolTest(ProtocolTestBase):
               # undecodable init image are accepted here (and fail in "done").
               dict(img, mask=mask, mask_encoding="binary01"), dict(img, init_image=os.path.join(self.tmp, "x.png"))]
         open(os.path.join(self.tmp, "x.png"), "wb").write(b"not a png")
+        for i, params in enumerate(ok):
+            self.assertError(self.server.call("generate", params, id="ok%d" % i), "no_engine", "ok%d" % i)
+
+    def test_control_and_accelerator_params(self):
+        adapter = os.path.join(self.tmp, "control.safetensors")
+        with open(adapter, "wb") as f:
+            f.write(b"read by generate, not by the pre-check")
+        depth = os.path.join(self.tmp, "depth.png")
+        write_png(depth, 32, 16, lambda x, y: (x * 8, x * 8, x * 8))
+        missing = os.path.join(self.tmp, "missing.png")
+        base = {"prompt": "a cat", "output": os.path.join(self.tmp, "x.png")}
+        ctl = {"adapter": adapter, "images": [{"kind": "depth", "path": depth}]}
+        bad = [
+            ({"control": adapter}, '"control" must be an object'),
+            ({"control": {}}, '"control.adapter" (the control adapter file) is required'),
+            ({"control": {"adapter": ""}}, '"control.adapter" must be a non-empty string'),
+            ({"control": {"adapter": 5}}, '"control.adapter" must be a non-empty string'),
+            ({"control": {"adapter": adapter, "scale": 1}}, '"control" has an unknown member "scale"'),
+            ({"control": {"adapter": adapter, "lora_strength": "1"}}, '"control.lora_strength" must be a number'),
+            ({"control": {"adapter": adapter, "images": {}}}, '"control.images" must be an array'),
+            ({"control": {"adapter": adapter, "images": ["x"]}}, '"control.images[0]" must be an object'),
+            ({"control": {"adapter": adapter, "images": [{"path": depth}]}}, '"control.images[0].kind" is required'),
+            ({"control": {"adapter": adapter, "images": [{"kind": "depth"}]}}, '"control.images[0].path" (the image file) is required'),
+            ({"control": {"adapter": adapter, "images": [{"kind": "", "path": depth}]}}, '"control.images[0].kind" must be'),
+            ({"control": {"adapter": adapter, "images": [{"kind": "depth", "path": ""}]}}, '"control.images[0].path" must be'),
+            ({"control": {"adapter": adapter, "images": [{"kind": "depth", "path": depth, "image": depth}]}},
+             '"control.images[0]" has an unknown member "image"'),
+            ({"control": {"adapter": adapter, "images": [{"kind": "depth", "path": depth, "strength": "2"}]}},
+             '"control.images[0].strength" must be a number'),
+            ({"control": {"adapter": adapter, "images": [{"kind": "depth", "path": depth, "start": None}]}},
+             '"control.images[0].start" must be a number'),
+            ({"control": {"adapter": adapter + ".missing"}}, "control.adapter: file not found"),
+            ({"control": {"adapter": adapter, "images": [{"kind": "depth", "path": missing}]}},
+             "control.images[0].path: file not found"),
+            ({"control": {"adapter": adapter, "images": [{"kind": "depth", "path": depth, "strength": 11}]}},
+             "control.images[0].strength must be between 0 and 10"),
+            ({"control": {"adapter": adapter, "images": [{"kind": "depth", "path": depth, "start": 0.8, "end": 0.2}]}},
+             "control.images[0]: require 0 <= start <= end <= 1"),
+            ({"control": dict(ctl, images=ctl["images"] * 2)}, 'Two control images of kind "depth"'),
+            ({"control": dict(ctl, images=ctl["images"] * 17)}, "control.images: at most 16 entries"),
+            ({"control": dict(ctl, lora_strength=1e300)}, "control.lora_strength must be a finite number"),
+            ({"cfg_truncation": "0.5"}, '"cfg_truncation" must be a number'),
+            ({"cfg_truncation": 1.5}, "cfg_truncation must be between 0 and 1"),
+            ({"cfg_truncation": -0.1}, "cfg_truncation must be between 0 and 1"),
+            ({"step_cache": "teacache"}, '"step_cache" must be "off" or "fbcache"'),
+            ({"step_cache": True}, '"step_cache" must be a string'),
+            ({"step_cache": "fbcache", "step_cache_threshold": 0}, '"step_cache_threshold" must be a number in (0, 1]'),
+            ({"step_cache": "fbcache", "step_cache_threshold": 1.5}, '"step_cache_threshold" must be a number in (0, 1]'),
+            ({"step_cache_threshold": "0.05"}, '"step_cache_threshold" must be a number'),
+        ]
+        for i, (params, text) in enumerate(bad):
+            r = self.server.call("generate", dict(base, **params), id=i)
+            self.assertError(r, "invalid_params", i)
+            self.assertIn(text, r["error"]["message"], params)
+            for c_name in ("control_adapter", "control_images", "image_path", "control_lora_strength", "mi_"):
+                self.assertNotIn(c_name, r["error"]["message"], params)
+        # Repeated members (raw lines: json.dumps cannot repeat).
+        for gid, control in (("dup0", '{"adapter": %s, "adapter": %s}' % (json.dumps(adapter), json.dumps(adapter))),
+                             ("dup1", '{"adapter": %s, "images": [{"kind": "depth", "kind": "color", "path": %s}]}'
+                              % (json.dumps(adapter), json.dumps(depth)))):
+            line = ('{"id": "%s", "method": "generate", "params": {"prompt": "a cat", "output": %s, "control": %s}}\n'
+                    % (gid, json.dumps(base["output"]), control))
+            self.server.send_raw(line.encode("utf-8"))
+            r = self.server.read()
+            self.assertError(r, "invalid_params", gid)
+            self.assertIn("more than once", r["error"]["message"])
+        # Valid requests reach the server's state check: the adapter's format and kinds, and the images' contents,
+        # are checked at generate time.
+        ok = [dict(base, control=ctl), dict(base, control={"adapter": adapter}),
+              dict(base, control={"adapter": adapter, "lora_strength": 0.5, "images": [
+                  {"kind": "depth", "path": depth, "strength": 0.5, "start": 0, "end": 0.6},
+                  {"kind": "color", "path": depth, "strength": 2}]}),
+              dict(base, control={"adapter": adapter, "images": [{"kind": "canny", "path": adapter}]}),
+              dict(base, cfg_truncation=0.8), dict(base, step_cache="fbcache"), dict(base, step_cache="off"),
+              dict(base, step_cache="fbcache", step_cache_threshold=0.05), dict(base, step_cache_threshold=1),
+              dict(base, control=ctl, cfg_truncation=0, step_cache="fbcache", hires={"width": 384, "height": 384})]
         for i, params in enumerate(ok):
             self.assertError(self.server.call("generate", params, id="ok%d" % i), "no_engine", "ok%d" % i)
 
@@ -792,6 +868,48 @@ class GpuProtocolTest(ProtocolTestBase):
             self.assertIn(text, message)
             for c_name in ("mi_", "MI_", "_dir", "_path", "init_image_path", "mask_path"):
                 self.assertNotIn(c_name, message)
+
+    def test_control_and_step_cache(self):
+        community = os.environ.get("MOSS_COMMUNITY_MODELS") or "/workspace/Models/community"
+        adapter = os.path.join(community, "comfy-org", "moss_image_color_depth_control.safetensors")
+        if not os.path.isfile(adapter):
+            self.skipTest("no control adapter: " + adapter + " (set MOSS_COMMUNITY_MODELS)")
+        self.load_base()
+        depth = os.path.join(self.tmp, "depth.png")
+        write_png(depth, 256, 256, lambda x, y: (230,) * 3 if (x - 128) ** 2 + (y - 150) ** 2 < 70 ** 2 else (40 + y // 4,) * 3)
+        out = os.path.join(self.tmp, "control.png")
+        events = []
+        gid = self.server.send("generate", {"prompt": "a red apple on a wooden table", "width": 256, "height": 256,
+                                            "steps": 4, "output": out, "step_cache": "fbcache",
+                                            "step_cache_threshold": 0.5, "control": {
+                                                "adapter": adapter, "images": [{"kind": "depth", "path": depth}]}},
+                               id="ctl")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "ok", done)
+        self.assertEqual(png_size(out), (256, 256))
+        control = done["report"]["control"]
+        self.assertEqual(control["adapter"], adapter)
+        self.assertIn("depth", control["kinds"])
+        self.assertGreater(control["encodes"], 0)
+        accel = done["report"]["accelerators"]
+        self.assertTrue(accel["lossy"], accel)
+        self.assertGreater(accel["step_cache_calls"], 0, accel)
+        self.assertFalse(done["report"]["models"]["dit"]["certified"], done["report"]["models"])
+        self.assertIn("uncertified", done["report"]["quality"]["reason"])
+        lossy = [w for w in done["warnings"] if w.startswith("lossy accelerators (")]
+        self.assertEqual(len(lossy), 1, done["warnings"])
+        self.assertIn("step_cache fbcache 0.5", lossy[0])
+        print("[server] control %s, %d encodes; %s" % (control["kinds"], control["encodes"], lossy[0]))
+        # A kind the adapter does not have fails in "done", in the protocol's names.
+        gid = self.server.send("generate", {"prompt": "a cat", "width": 256, "height": 256, "steps": 2, "output": out,
+                                            "control": {"adapter": adapter, "images": [{"kind": "canny", "path": depth}]}},
+                               id="kind")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "error", done)
+        self.assertEqual(done["error"]["code"], "invalid_argument", done)
+        self.assertIn('no "canny" input', done["error"]["message"])
 
     def test_cancel_mid_run(self):
         self.load_base()

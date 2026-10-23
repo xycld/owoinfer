@@ -26,12 +26,12 @@ If `<pid>` is not running at startup, the server exits with status 1. A malforme
 
 The server trusts its launcher completely: whoever writes to its stdin has the server's file-system rights. The protocol is a local pipe between a launcher and the child it spawned, not an interface for untrusted input.
 - **No network surface.** The server opens no socket and listens on no port. Its only input is stdin.
-- **Paths are used as given.** `generate`'s `output` and `preview_output` are written wherever they point, and an existing file there is overwritten (atomically: a temporary file renamed over it). `load`'s `model`, `dit_file`, `text_encoder_file`, `vae_file`, `time_embedding_file`, `distill` and `cache_dir`, and `generate`'s `loras` paths, `dataspace`, `init_image`, `mask` and `distill`, are read, and the cache directory is written to. The server does not confine any path to a directory, resolve symlinks, or check ownership.
+- **Paths are used as given.** `generate`'s `output` and `preview_output` are written wherever they point, and an existing file there is overwritten (atomically: a temporary file renamed over it). `load`'s `model`, `dit_file`, `text_encoder_file`, `vae_file`, `time_embedding_file`, `distill` and `cache_dir`, and `generate`'s `loras` paths, `dataspace`, `init_image`, `mask`, `distill` and `control` (the adapter and image paths), are read, and the cache directory is written to. The server does not confine any path to a directory, resolve symlinks, or check ownership.
 - **The launcher validates paths.** A launcher that takes any of these paths from a user, a web page, a workflow file or another program must check them first. For example, it can confine outputs to its own output directory, reject `..` components and symlinks it did not create, and refuse to overwrite files it does not own.
 - **Run it as the user.** Run the server with the launcher's own (unprivileged) rights, never elevated.
-- **Images are decoded in-process.** `generate`'s `init_image` and `mask` are PNG / JPEG files that moss-server decodes itself, with the vendored stb_image decoder. That decoder is hardened (at most 64 MiB per file, at most 16384 pixels per side and 64,000,000 pixels in all, checked from the header before any pixel allocation; fuzzed), but it is not memory-safe: a crafted file can exploit it.
+- **Images are decoded in-process.** `generate`'s `init_image`, `mask` and `control` image paths are PNG / JPEG files that moss-server decodes itself, with the vendored stb_image decoder. That decoder is hardened (at most 64 MiB per file, at most 16384 pixels per side and 64,000,000 pixels in all, checked from the header before any pixel allocation; fuzzed), but it is not memory-safe: a crafted file can exploit it.
   - The server takes image paths only, never pixel data over the protocol.
-  - A launcher that takes images from an untrusted source (a network, web uploads, files from other users) must decode them itself with a memory-safe decoder and use the C API's pixel input (`mi_gen_params.init_image` / `mask`, [c-api.md](c-api.md#image-input)), or run moss-server sandboxed (no network, no access beyond its input and output directories).
+  - A launcher that takes images from an untrusted source (a network, web uploads, files from other users) must decode them itself with a memory-safe decoder and use the C API's pixel input (`mi_gen_params.init_image` / `mask`, `mi_control_image.image`, [c-api.md](c-api.md#image-input)), or run moss-server sandboxed (no network, no access beyond its input and output directories).
 
 ## Framing
 
@@ -56,7 +56,7 @@ The server trusts its launcher completely: whoever writes to its stdin has the s
 
 Every request gets exactly one response. Responses to different requests can interleave with events, so a client should match responses by `id`. A request whose `id` could not be read (malformed JSON, for example) is answered with `"id": null`.
 
-Unknown members in `params` are rejected (`invalid_params`), so a typo cannot be silently ignored. So is a member given twice, in `params` and in a `loras` entry, because one of its values would be lost.
+Unknown members in `params` are rejected (`invalid_params`), so a typo cannot be silently ignored. So is a member given twice, in `params` and in its objects (`loras` entries, `hires`, `control` and its images), because one of its values would be lost.
 
 ### Error codes
 
@@ -84,7 +84,8 @@ Params (all optional):
 >> {"id": 1, "method": "hello", "params": {"client": "launcher", "protocol_version": 1}}
 << {"id": 1, "result": {"protocol_version": 1, "server": "moss-server", "version": "1.0.0", "abi_version": 1,
     "capabilities": {"preview": true, "comfyui_models": false, "model_files": true, "lora": true, "tiers": true,
-                     "samplers": true, "image_input": true, "hires": true, "distill": true, "system_cuda": true},
+                     "samplers": true, "image_input": true, "hires": true, "distill": true, "system_cuda": true,
+                     "control": true, "accel": true},
     "probe": {"driver_cuda_version": 13040, "runtime_cuda_version": 13040, "driver_compatible": true,
               "device_count": 1, "supported_device_count": 1, "build_flavour": "cu13", "recommended_flavour": "cu13",
               "message": "recommended flavour cu13 (the driver supports CUDA 13.4)",
@@ -121,6 +122,8 @@ The server's environment steers the search: `MOSSINFER_CUDA_LIBS` (`auto`: the b
 | `hires` | `MI_CAP_HIRES` | true | `generate`'s `hires` |
 | `distill` | `MI_CAP_DISTILL` | true | `load`'s `time_embedding_file` and `distill`, `generate`'s `distill` |
 | `system_cuda` | `MI_CAP_SYSTEM_CUDA` | true | `probe.cublaslt`; cuBLASLt loaded at run time: the bundled copy, else (or with `MOSSINFER_CUDA_LIBS=system`) a compatible system copy |
+| `control` | `MI_CAP_CONTROL` | true | `generate`'s `control` |
+| `accel` | `MI_CAP_ACCEL` | true | `generate`'s `cfg_truncation`, `step_cache`, `step_cache_threshold` |
 
 ### `load`
 
@@ -197,12 +200,16 @@ The params are those of `parameters.json`, plus `output`:
 | `resize` | string | `"crop"`, or `"fit"`, `"stretch"` (the pipeline's `resize_mode_name()` spellings) |
 | `hires` | object | none. The hires fix: `{"width": int, "height": int, "strength": number, "steps": int}`. `width` and `height` are required and positive (multiples of 16, at most 4096 per side and 4.2 MP); `strength` defaults to 0.45, `steps` to 0 (= `steps`). Other or repeated members are rejected. |
 | `distill` | string | none. A distill bundle directory: its LoRA is appended at strength 1, its dataspace sampler and step count and CFG 1 apply when `sampler`, `steps` and `cfg` are absent (`"euler"` counts as absent and cannot be forced with a dataspace bundle; any other sampler can). A bundle with a time embedding needs the same bundle in `load`'s `distill` (or its file in `time_embedding_file`); otherwise the generation ends in `done` with `invalid_argument`. |
+| `control` | object | none. A control adapter ([c-api.md](c-api.md#control-adapters)): `{"adapter": string, "lora_strength": number, "images": [{"kind": string, "path": string, "strength": number, "start": number, "end": number}]}`. `adapter` (the file) is required; `lora_strength` (its LoRA part) defaults to 1. `images` defaults to `[]`, at most 16, one per kind: `kind` (one of the adapter's, e.g. `"depth"`) and `path` (a PNG or JPEG file, decoded by the server as RGB, see [Security](#security)) are required; `strength` defaults to 1 (0 to 10), `start` and `end` to 0 and 1 (0 ≤ `start` ≤ `end` ≤ 1: the share of the steps the control is active in). Other or repeated members are rejected. Lossy: the run is uncertified. |
+| `cfg_truncation` | number in [0, 1] | 1 (off). Lossy: classifier-free guidance only for the first `cfg_truncation` share of the steps; no effect without CFG (`cfg` 1). |
+| `step_cache` | string | `"off"`, or `"fbcache"` (the First-Block Cache: DiT blocks after the first are skipped while block 0's output barely changes). Lossy. |
+| `step_cache_threshold` | number in (0, 1] | absent = the recommended value (0.03). The step cache's relative-change threshold: larger is faster and further from the uncached image. Ignored without `step_cache`. |
 
 `save_metadata` and `include_prompts` default to true for every client. The server has not been released before 0.2.0, so no client depends on the C API's 0.1.0 behaviour (no metadata), which only a program built against the 0.1.0 header keeps ([c-api.md](c-api.md#struct-sizes)).
 
-The names are the pipeline's own spellings (`sampler_name()`, `scheduler_name()`, `noise_layout_name()`, `noise_source_name()`). The server maps them to the C API's enum values through its own table (`tools/server/names.h`), which a `cpu` test checks against the pipeline.
+The names are the pipeline's own spellings (`sampler_name()`, `scheduler_name()`, `noise_layout_name()`, `noise_source_name()`, `step_cache_name()`). The server maps them to the C API's enum values through its own table (`tools/server/names.h`), which a `cpu` test checks against the pipeline.
 
-Paths (`init_image`, `mask`, `distill`, and `load`'s `time_embedding_file` and `distill`) must be non-empty. The request is validated before it is accepted, so an invalid request gets an `invalid_params` error and no events. Image files are checked then for existence and size only; the worker decodes them once, during the generation, so an undecodable image (or a `binary01` mask file with other values) ends in `done` with `"status": "error"` and the code `invalid_argument`. Error messages in responses and in `done` name the protocol's parameters, not the C API's fields. Validation comes before the server's state: an invalid request gets `invalid_params` even without an engine or while a generation runs. It includes the existence of the LoRA and dataspace files.
+Paths (`init_image`, `mask`, `distill`, `control`'s `adapter` and image `path`s, and `load`'s `time_embedding_file` and `distill`) must be non-empty. The request is validated before it is accepted, so an invalid request gets an `invalid_params` error and no events. Image files are checked then for existence and size only; the worker decodes them once, during the generation, so an undecodable image (or a `binary01` mask file with other values) ends in `done` with `"status": "error"` and the code `invalid_argument`. Error messages in responses and in `done` name the protocol's parameters, not the C API's fields. Validation comes before the server's state: an invalid request gets `invalid_params` even without an engine or while a generation runs. It includes the existence of the LoRA, dataspace and control adapter files. The control adapter itself is read during the generation: a file that is not a control adapter ends in `done` with `model`, and an image `kind` the adapter does not have with `invalid_argument` (the message lists its kinds).
 
 ```
 >> {"id": "bad", "method": "generate", "params": {"prompt": "x", "width": 1000, "output": "x.png"}}
@@ -260,7 +267,8 @@ The fields of `done` depend on `status`:
 | `"error"` | `error: {code, message}`, plus `report` when only the PNG write failed |
 
 `warnings` is always present: an array of strings for the launcher to show, empty when there is nothing to say.
-- One entry per LoRA warning, `"LoRA <module>: <reason>"` (e.g. an adapter requantized on INT8 GEMMs).
+- One entry per LoRA warning, `"LoRA <module>: <reason>"` (e.g. an adapter requantized on INT8 GEMMs), and per warning on the control adapter's LoRA part, `"control adapter LoRA <module>: <reason>"`.
+- `"lossy accelerators (<the active ones>), uncertified: CFG truncated on N steps, step cache reused C of D DiT calls"` when `cfg_truncation` (with CFG) or `step_cache` changed the run. A control adapter, like any LoRA, gets no such line: the report's `quality.reason` and `models.dit.certified` say that the run is uncertified.
 - `"prompt truncated to K of N tokens (D dropped; max_sequence_length M)"`, and the same for the `"negative prompt"`, when the text encoder cut the end of a prompt.
 - `"image input: <note>"` when the image input has a remark, e.g. an init image not used at strength 1 without a mask.
 
@@ -274,7 +282,7 @@ The fields of `done` depend on `status`:
 - `tokens`: per prompt, `total`, `kept`, `template`, `prompt`, `dropped`, `max_length`, `truncated`
 - `quality` (tier, configuration, certificate, GPU class) and `models` (DiT, text encoder and VAE sources, DiT linears, requested and effective tier, certified, text-encoder precision)
 - `loras` (per file: adapters, side branch, merged, unknown keys, strength), `lora_warnings`, `lora_notes`
-- `control` and `accelerators`: always `null` and inactive here, because only `moss-infer` sets control LoRAs and the accelerators in 1.0 (the server gets them in 1.1)
+- `control` (`null` without `control`: the adapter, kinds, base model, inputs, its LoRA part, encodes, encode schedule) and `accelerators` (`lossy`, `active`, `cfg_truncated_steps`, `step_cache_calls`, `step_cache_reused`, `cached_steps`)
 
 The server is idle again by the time `done` is written, so the next `generate` can follow it immediately.
 
@@ -334,7 +342,7 @@ send({"id": 3, "method": "shutdown"})
 |---|---|---|
 | `server_protocol` | `cpu` | No GPU or weights needed (details below) |
 | `package_install_tree` | `cpu` | `tests/server/test_install_tree.py`: installs the build twice (full, and `--component Unspecified` without CUDA libraries), asks each tree's `hello` which cuBLASLt it uses under `MOSSINFER_CUDA_LIBS` `auto` / `system` / `bundled` and `MOSSINFER_CUBLASLT` (a bundled copy found, a system copy outside the tree, clean errors for a missing copy or file and a bad policy), and runs `check_package.py` on both trees |
-| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params`; a 256² img2img from a PNG path (4 steps at strength 0.5: 2 run, `total_steps` 2) and the strength-1 note in `done.warnings` |
+| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params`; a 256² img2img from a PNG path (4 steps at strength 0.5: 2 run, `total_steps` 2) and the strength-1 note in `done.warnings`; a 256², 4-step generate with the color/depth `control` adapter (`$MOSS_COMMUNITY_MODELS`, skipped when absent) and a depth PNG plus `step_cache` `fbcache` (the report's `control` and `accelerators`, uncertified, the accelerator line in `done.warnings`), then a kind the adapter lacks (`done` with `invalid_argument`) |
 
 `server_protocol` covers:
 - `hello` (the capabilities and `probe.cublaslt` included), `status`, and idle `cancel` / `unload`
@@ -342,6 +350,7 @@ send({"id": 3, "method": "shutdown"})
 - `load` errors mapped from engine statuses
 - the P6 `load` params: bad `tier` / `attention` names (`"q8"` and `"auto"` included) and types, every valid name, missing component files
 - the image, hires and distill params: bad paths, types and names, a mask without an init image, a `binary01` mask with other values, bad `hires` shapes (not an object, a missing, unknown or repeated member, a non-integer size, not multiples of 16, a bad strength), a missing `distill` directory, the bundle's dataspace sampler with an image; messages name the protocol's parameters (`init_image`, `mask`, `distill`, `hires`), never the C fields; `load`'s `time_embedding_file` and `distill` errors; every valid combination reaches `no_engine`
+- the control and accelerator params: `control` shapes (not an object, no or an empty `adapter`, unknown and repeated members in `control` and its images, a missing `kind` or `path`, non-number strengths and windows), a missing adapter or image file, the ranges, a repeated kind, more than 16 images, bad `cfg_truncation`, `step_cache` names and types, the threshold rules; messages name `control.adapter`, `control.images[i].path` and so on, never the C fields; valid combinations (an unknown kind and an undecodable image included: those are the generation's to check) reach `no_engine`
 - the P6 `generate` params, checked without an engine: bad enum names and types, bad numbers, the `dataspace` sampler without or with a missing file (the message names `dataspace`), repeated members in `params` and in a `loras` entry, bad `loras` shapes (not an array, a string element, no or empty `path`, unknown members, a bad `strength`, a missing file), `preview_every` without `preview_output`, and every valid name
 - `shutdown`, end of input, and `--version` / usage errors
 - stdout set up with stderr sent to a file, to `DEVNULL`, merged into stdout, or closed. On Linux, `/proc` shows exactly one fd on the protocol pipe, at 3 or higher, close-on-exec.

@@ -120,6 +120,12 @@ MOSSINFER_API const char* mi_last_error_message(void);
  * without one or with MOSSINFER_CUDA_LIBS=system (also MOSSINFER_CUBLASLT; docs/integration.md), and
  * mi_probe_info.cublaslt_* reports the copy. */
 #define MI_CAP_SYSTEM_CUDA 0x200u
+/* Control adapters: mi_gen_params.control_adapter / control_lora_strength / control_images, mi_result_control(), the
+ * MI_TEXT_CONTROL_* texts and the MI_MESSAGE_CONTROL_* messages. */
+#define MI_CAP_CONTROL 0x400u
+/* The lossy accelerators: mi_gen_params.cfg_truncation / step_cache / step_cache_threshold, mi_result_accel(),
+ * mi_result_accel_cached_steps() and MI_TEXT_ACCELERATORS. */
+#define MI_CAP_ACCEL 0x800u
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -358,6 +364,32 @@ typedef struct mi_image {
   int32_t _reserved0; /* must be 0 */
 } mi_image;
 
+/* One conditioning image of a control adapter (MI_CAP_CONTROL). A fixed 48-byte layout without struct_size. The image
+ * comes as pixels or as a PNG / JPEG file, exactly one of the two, and is brought to each pass's size by
+ * mi_gen_params.resize, like an init image. Pixels are read (copied) during mi_gen_params_validate() / mi_generate()
+ * only. A file is decoded in the library by the same decoder as init_image_path (not memory-safe: decode untrusted
+ * images yourself and pass pixels), as RGB (a grayscale file is replicated to RGB). It has no init function: set every
+ * field (a zeroed entry has strength 0 and an empty window, i.e. no control; as trained is strength 1, start 0, end 1). */
+typedef struct mi_control_image {
+  const char* kind;        /* required: one of the adapter's kinds (MI_TEXT_CONTROL_KINDS), e.g. "depth"; unique */
+  const mi_image* image;   /* RGB (3 channels), or grayscale (1, replicated to RGB: a depth map, near = white) */
+  const char* image_path;  /* UTF-8; NULL or "" = none */
+  double strength;         /* [0, 10]: multiplies the control latent (0 = no control); 1 = as trained */
+  /* 0 <= start <= end <= 1: the control is active on the steps i of a pass with start <= i / steps < end (the
+   * guidance windows' convention); outside it this kind gets no control. Use 0 and 1 for every step. */
+  double start;
+  double end;
+} mi_control_image;
+
+/* Step caching (MI_CAP_ACCEL). */
+typedef enum mi_step_cache {
+  MI_STEP_CACHE_OFF = 0, /* default */
+  /* First-Block Cache: while the output of DiT block 0 changed by less than step_cache_threshold (relative L1) since
+   * the last call that ran every block, the other blocks are skipped and their residual from that call is reused. */
+  MI_STEP_CACHE_FBCACHE = 1,
+  MI_STEP_CACHE_MAX_ENUM = 0x7fffffff
+} mi_step_cache;
+
 /* How mask values are read (mi_gen_params.mask / mask_path). */
 typedef enum mi_mask_encoding {
   MI_MASK_U8 = 0,       /* 0..255 as given: >= 128 regenerates, < 128 keeps (default) */
@@ -475,13 +507,35 @@ typedef struct mi_gen_params {
    * is unset (0). A bundle with a time_embedding.safetensors needs that file on the engine (mi_engine_params
    * distill_dir or time_embedding_file), else mi_generate() fails with MI_ERR_INVALID_ARGUMENT. NULL or "" = none. */
   const char* distill_dir;
+  /* Fields after the 320-byte layout (1.0.0). A control adapter (MI_CAP_CONTROL): a file pairing a LoRA with a widened
+   * DiT input embedder (e.g. the MOSS-Image color/depth control), and its conditioning images. Its LoRA part joins the
+   * runtime LoRAs after `loras`, and a result with a control adapter is uncertified, like any LoRA. Default none. */
+  const char* control_adapter;      /* UTF-8; NULL or "" = none. The file must exist; mi_generate() reads its format
+                                     * (MI_ERR_MODEL when it is not a control adapter) */
+  double control_lora_strength;     /* the adapter's LoRA part (the embedder is never scaled); finite; default 1.0 */
+  /* At most 16, one per kind; needs control_adapter. mi_generate() checks each kind against the adapter's
+   * (MI_ERR_INVALID_ARGUMENT); a kind without an image gets no control. The array and its images are read during
+   * mi_gen_params_validate() / mi_generate() only. Default none. */
+  const mi_control_image* control_images;
+  size_t control_images_count;
+  /* Lossy accelerators (MI_CAP_ACCEL), off by default. They change the image, and a result with any of them active is
+   * uncertified (the tier is resolved as without them). They apply to each sampling pass (a hires fix's too).
+   * CFG truncation: classifier-free guidance only on the steps i of a pass with i / steps < cfg_truncation; the later
+   * steps run the conditional row alone. [0, 1]; default 1.0 = off. No effect without CFG (cfg 1). */
+  double cfg_truncation;
+  mi_step_cache step_cache;         /* default MI_STEP_CACHE_OFF */
+  int32_t _reserved4;               /* must be 0 */
+  /* The step cache's threshold: 0 (default) = the engine's recommended value (0.03), else (0, 1]; larger is faster
+   * and further from the uncached image. Ignored with the step cache off. */
+  double step_cache_threshold;
 } mi_gen_params;
 
 /* Fills the first `struct_size` bytes of `params` with the defaults. struct_size is sizeof(mi_gen_params) of the
- * caller's header: 320, 240 (an earlier 0.2.0 header), or 168 for a program built against the 0.1.0 header
- * (whose generations then keep the 0.1.0 behaviour: save_metadata and include_prompts are 0).
+ * caller's header: 376, 320 (the 1.0.0 header), 240 (an earlier 0.2.0 header), or 168 for a program built against
+ * the 0.1.0 header (whose generations then keep the 0.1.0 behaviour: save_metadata and include_prompts are 0). The
+ * fields after an older size keep their defaults (for 320 bytes: no control adapter, accelerators off).
  *
- * Unset markers. At the current size, init leaves the context-dependent fields unset, and each resolves when the
+ * Unset markers. At 376 and 320 bytes, init leaves the context-dependent fields unset, and each resolves when the
  * request is checked:
  *   steps 0                  -> the dataspace file's step count with the DATASPACE sampler (a distill bundle's), else
  *                               MI_DEFAULT_STEPS (50). Negative is invalid.
@@ -493,10 +547,12 @@ typedef struct mi_gen_params {
  * The older sizes keep their init values: steps 50 and cfg 3.0 (168 and 240 bytes; a strength there resolves to 1.0:
  * they cannot carry an init image). */
 MOSSINFER_API mi_status mi_gen_params_init(mi_gen_params* params, size_t struct_size);
-/* Checks `params` the way mi_generate() does, without an engine or GPU: the existence of the LoRA and dataspace files,
- * the image inputs (files are decoded) and the distill bundle (opened, its dataspace file read) included. Only the
- * match of a distill bundle's time embedding with the engine's is left to mi_generate(). MI_ERR_INVALID_ARGUMENT
- * names the problem; a malformed distill bundle or dataspace file is MI_ERR_MODEL. */
+/* Checks `params` the way mi_generate() does, without an engine or GPU: the existence of the LoRA, dataspace and
+ * control adapter files, the image inputs (control images included) and the distill bundle (opened, its dataspace
+ * file read) included. Image inputs are checked (sizes, channels, file existence and size) but neither copied nor
+ * decoded. Left to mi_generate(): the match of a distill bundle's time embedding with the engine's, and the control
+ * adapter's format and kinds. MI_ERR_INVALID_ARGUMENT names the problem; a malformed distill bundle or dataspace file
+ * is MI_ERR_MODEL. */
 MOSSINFER_API mi_status mi_gen_params_validate(const mi_gen_params* params);
 
 /* Runs one generation to completion. Returns MI_OK with the image, or MI_CANCELLED after mi_cancel() (the result then
@@ -586,7 +642,9 @@ MOSSINFER_API const char* mi_result_report_json(mi_result* result);
 MOSSINFER_API mi_status mi_save_png(mi_result* result, const char* path);
 
 /* The tier that ran (MI_CAP_TIERS). A generation cancelled before its tier was resolved reports requested AUTO and
- * effective REFERENCE. */
+ * effective REFERENCE. `certified` describes the tier: it stays 1 for REFERENCE even when runtime LoRAs, a control
+ * adapter or lossy accelerators make the run as a whole uncertified (MI_TEXT_TIER_REASON and the report's
+ * models.dit.certified say so; mi_accel_info.lossy, mi_control_info.active). */
 typedef struct mi_tier_info {
   size_t struct_size;
   mi_tier requested;                   /* mi_engine_params.tier */
@@ -609,10 +667,51 @@ typedef enum mi_result_text_kind {
   MI_TEXT_QUALITY_JSON = 6,        /* the report's "quality" object, as JSON */
   MI_TEXT_IMAGE_NOTE = 7,          /* a remark on the image input, e.g. why an init image was not used; "" for none */
   MI_TEXT_TIME_EMBEDDING = 8,      /* the replacement step embedder that ran (time_embedding_file); "" for none */
+  /* MI_CAP_CONTROL; all "" without a control adapter. */
+  MI_TEXT_CONTROL_ADAPTER = 9,     /* the control adapter file */
+  MI_TEXT_CONTROL_KINDS = 10,      /* its kinds in channel order, comma-separated, e.g. "color,depth" */
+  MI_TEXT_CONTROL_BASE_MODEL = 11, /* the file's base_model metadata (informational); "" when absent */
+  MI_TEXT_CONTROL_ENCODE_SCHEDULE = 12, /* how the control images were VAE-encoded: "untiled" or the tile plans */
+  /* MI_CAP_ACCEL: the lossy accelerators that changed the run, e.g. "cfg_truncation 0.8, step_cache fbcache 0.03";
+   * "off" when none. */
+  MI_TEXT_ACCELERATORS = 13,
   MI_TEXT_MAX_ENUM = 0x7fffffff
 } mi_result_text_kind;
 /* Owned by the result; "" when empty (e.g. cancelled early). NULL for a NULL result or an unknown kind. */
 MOSSINFER_API const char* mi_result_text(const mi_result* result, mi_result_text_kind kind);
+
+/* The control adapter of a generation (MI_CAP_CONTROL); all zero without one. */
+typedef struct mi_control_info {
+  size_t struct_size;
+  int32_t active;             /* a control adapter was applied (0 also when cancelled before it was read) */
+  int32_t kinds_count;        /* the adapter's kinds (MI_TEXT_CONTROL_KINDS) */
+  int32_t encodes;            /* control image VAE encodes (one per image and pass size) */
+  /* How the adapter's LoRA part was applied, as in mi_lora_report (it is not one of mi_result_lora()'s files). */
+  int32_t lora_adapters;
+  int32_t lora_side_branch;
+  int32_t lora_merged;
+  int32_t lora_unknown_keys;
+  int32_t lora_warnings;      /* MI_MESSAGE_CONTROL_WARNING */
+  int32_t lora_notes;         /* MI_MESSAGE_CONTROL_NOTE */
+  int32_t _reserved0;
+} mi_control_info;
+/* `out` has struct_size set by the caller. */
+MOSSINFER_API mi_status mi_result_control(const mi_result* result, mi_control_info* out);
+
+/* What the lossy accelerators did (MI_CAP_ACCEL), over both passes of a hires fix; all zero with them off. */
+typedef struct mi_accel_info {
+  size_t struct_size;
+  int32_t cfg_truncated_steps; /* steps run without the negative branch (CFG truncation) */
+  int32_t dit_calls;           /* DiT calls with the step cache on */
+  int32_t cached_calls;        /* of them, calls that reused the cache (the blocks after block 0 skipped) */
+  int32_t lossy;               /* a lossy accelerator was active, so the run is uncertified (MI_TEXT_ACCELERATORS) */
+} mi_accel_info;
+/* `out` has struct_size set by the caller. */
+MOSSINFER_API mi_status mi_result_accel(const mi_result* result, mi_accel_info* out);
+/* The 1-based steps (counting on across the passes of a hires fix) with a DiT call that reused the step cache, in
+ * order; owned by the result. `count` (required) receives their number. NULL with *count 0 when there are none, and
+ * for a NULL result or count (mi_last_error_message() then set). */
+MOSSINFER_API const int32_t* mi_result_accel_cached_steps(const mi_result* result, size_t* count);
 
 /* What the image input ran (MI_CAP_IMAGE_INPUT, MI_CAP_HIRES). */
 typedef enum mi_image_mode {
@@ -679,6 +778,9 @@ MOSSINFER_API const char* mi_result_lora_file(const mi_result* result, int32_t i
 typedef enum mi_message_kind {
   MI_MESSAGE_LORA_WARNING = 0, /* losses to show the user, "<module>: <reason>" */
   MI_MESSAGE_LORA_NOTE = 1,    /* how the files were read */
+  /* MI_CAP_CONTROL: the same for the control adapter's LoRA part. */
+  MI_MESSAGE_CONTROL_WARNING = 2,
+  MI_MESSAGE_CONTROL_NOTE = 3,
   MI_MESSAGE_MAX_ENUM = 0x7fffffff
 } mi_message_kind;
 /* 0 for a NULL result or an unknown kind. */

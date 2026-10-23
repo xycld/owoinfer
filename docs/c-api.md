@@ -179,11 +179,23 @@ The fields after the 240-byte layout:
 | `_reserved3` | 0 | must be 0 |
 | `distill_dir` | NULL | a distill bundle directory, expanded per generation |
 
-`mi_gen_params_validate()` performs the same checks as `mi_generate()` without an engine or GPU: the LoRA files' existence, the distill bundle (opened) and the dataspace file (read: its step codes bound `steps`), and the image inputs without copying or decoding them. Pixel images get their sizes and channels checked, and a `MI_MASK_BINARY01` mask its values. Image files get checked for existence, for being regular files and for size (at most 64 MiB); they are decoded by `mi_generate()`, which reports a file it cannot decode, or a binary01 file mask with other values, as `MI_ERR_INVALID_ARGUMENT`. The match of a bundle's time embedding with the engine's is also left to `mi_generate()`. A launcher can call it as the user types.
+The fields after the 320-byte (1.0.0) layout:
+
+| `mi_gen_params` field | Default | Meaning |
+|---|---|---|
+| `control_adapter` | NULL (none) | a control adapter file (`MI_CAP_CONTROL`), see [Control adapters](#control-adapters). It must exist. |
+| `control_lora_strength` | 1.0 | the strength of the adapter's LoRA part; finite and within the range of a float |
+| `control_images`, `control_images_count` | NULL, 0 | its conditioning images (`mi_control_image`), at most 16; they need `control_adapter` |
+| `cfg_truncation` | 1.0 (off) | [0, 1]: CFG truncation (`MI_CAP_ACCEL`), see [Accelerators](#accelerators) |
+| `step_cache` | `MI_STEP_CACHE_OFF` | the step cache |
+| `_reserved4` | 0 | must be 0 |
+| `step_cache_threshold` | 0 (the recommended value, 0.03) | 0, or (0, 1]. Used with the step cache only, but checked always. |
+
+`mi_gen_params_validate()` performs the same checks as `mi_generate()` without an engine or GPU: the LoRA and control adapter files' existence, the distill bundle (opened) and the dataspace file (read: its step codes bound `steps`), and the image inputs without copying or decoding them. Pixel images get their sizes and channels checked, and a `MI_MASK_BINARY01` mask its values. Image files get checked for existence, for being regular files and for size (at most 64 MiB); they are decoded by `mi_generate()`, which reports a file it cannot decode, or a binary01 file mask with other values, as `MI_ERR_INVALID_ARGUMENT`. Also left to `mi_generate()`: the match of a bundle's time embedding with the engine's, and the control adapter's format and kinds. A launcher can call it as the user types.
 
 ### Unset markers
 
-`mi_gen_params_init()` at the current size (320 bytes) leaves the fields whose default depends on the rest of the request unset. Each resolves when the request is checked:
+`mi_gen_params_init()` at the current size (376 bytes) and at the 1.0.0 size (320 bytes) leaves the fields whose default depends on the rest of the request unset. Each resolves when the request is checked:
 
 | Field | Unset | Resolves to | Invalid |
 |---|---|---|---|
@@ -227,7 +239,38 @@ Limits, checked before any pixel is read: each side 1 to 16384, at most 64,000,0
 | `MI_RESIZE_FIT` (1) | `fit` | fit inside keeping the aspect ratio, fill the two bands from the edge rows / columns |
 | `MI_RESIZE_STRETCH` (2) | `stretch` | scale each axis independently |
 
-**Untrusted images.** The image file decoder (`init_image_path`, `mask_path`) is the vendored stb_image. It is hardened (the file-size cap, a header check before any allocation, fuzzing) but it is not memory-safe. A program that takes images from untrusted parties (a network, web uploads, other users' files) must decode them itself with a memory-safe decoder and pass pixels in `init_image` / `mask`, or decode in a sandboxed process.
+**Untrusted images.** The image file decoder (`init_image_path`, `mask_path`, and `mi_control_image.image_path`) is the vendored stb_image. It is hardened (the file-size cap, a header check before any allocation, fuzzing) but it is not memory-safe. A program that takes images from untrusted parties (a network, web uploads, other users' files) must decode them itself with a memory-safe decoder and pass pixels in `init_image` / `mask` / `mi_control_image.image`, or decode in a sandboxed process.
+
+### Control adapters
+
+A control adapter (`MI_CAP_CONTROL`; e.g. the MOSS-Image color/depth control, `darask0/MOSS-Image-color-depth-control`) is one safetensors file that pairs a LoRA with a widened DiT input embedder. With `control_adapter` set, the embedder replaces the DiT's (never scaled), and the file's LoRA part joins the runtime LoRAs after `loras`, at `control_lora_strength`. It is the same engine path as `moss-infer generate --control`.
+
+`mi_control_image {const char* kind; const mi_image* image; const char* image_path; double strength, start, end;}` is a fixed 48-byte array element without `struct_size`. There is no init function: set every field. A zeroed entry has strength 0 and an empty window, which means no control; the trained behaviour is strength 1, start 0, end 1.
+
+| Field | Meaning |
+|---|---|
+| `kind` | required: one of the adapter's kinds (`MI_TEXT_CONTROL_KINDS`, e.g. `color`, `depth`), at most one image per kind. A kind without an image gets no control. |
+| `image`, `image_path` | exactly one of the two. Pixels: 3 channels (RGB) or 1 (grayscale, replicated to RGB: a depth map, near = white), with the limits of [Image input](#image-input). A file is decoded as RGB, so a grayscale file is replicated. |
+| `strength` | [0, 10]: multiplies the control latent; 0 = no control |
+| `start`, `end` | 0 ≤ `start` ≤ `end` ≤ 1: the control is active on the steps i of a pass with `start` ≤ i / steps < `end` (the guidance windows' convention) |
+
+Each image is brought to the pass's size with `resize` (as an init image), VAE-encoded once per pass size (a hires fix encodes it again at the target size), multiplied by its strength, and fed clean to every CFG row on the steps of its window. A control adapter works with every tier, streaming, sampler, img2img / inpainting and the hires fix.
+
+Validation: `mi_gen_params_validate()` checks the adapter file's existence, the array (NULL with a count, more than 16 entries), each entry's kind, image (as an init image, without copying or decoding) and ranges, and a repeated kind. `mi_generate()` reads the adapter: a file that is not a control adapter is `MI_ERR_MODEL`, a kind it does not have is `MI_ERR_INVALID_ARGUMENT` (the message lists its kinds). A generation with a control adapter is uncertified, as with any LoRA. `mi_result_control()` reports it.
+
+### Accelerators
+
+The accelerators (`MI_CAP_ACCEL`) are lossy and opt-in, and off by default. They change the image, and a run with any of them active is uncertified. The tier is resolved as if they were off, so `AUTO` picks the same tier. They apply to each sampling pass (a hires fix's too). It is the same engine path as `moss-infer generate --cfg-truncation` / `--step-cache`.
+
+- **CFG truncation**, `cfg_truncation` = c in [0, 1] (1 = off): classifier-free guidance only on the steps i of a pass with i / steps < c. The later steps run the conditional row alone. It has no effect without CFG (`cfg` 1).
+- **Step cache**, `step_cache` = `MI_STEP_CACHE_FBCACHE` (First-Block Cache): every DiT call runs block 0. While block 0's output changed by less than `step_cache_threshold` (relative L1) since the last call that ran every block, the other blocks are skipped and their residual from that call is reused. `step_cache_threshold` 0 means the recommended value (0.03). Larger values are faster and move the image further from the uncached one.
+
+| `mi_step_cache` | Pipeline name |
+|---|---|
+| `MI_STEP_CACHE_OFF` (0) | `off` |
+| `MI_STEP_CACHE_FBCACHE` (1) | `fbcache` |
+
+`mi_result_accel()` reports what they skipped; `MI_TEXT_ACCELERATORS` names the active ones.
 
 ### Distill bundles
 
@@ -303,11 +346,11 @@ The files are safetensors in the training tools' formats: kohya and PEFT / diffu
 
 ### PNG metadata
 
-With `save_metadata` set (the default of 240- and 320-byte structs), `mi_save_png()` writes two text chunks after `IHDR`, the same ones as `moss-infer generate`:
+With `save_metadata` set (the default of 240-, 320- and 376-byte structs), `mi_save_png()` writes two text chunks after `IHDR`, the same ones as `moss-infer generate`:
 
 | Keyword | Chunk | Content |
 |---|---|---|
-| `generation` | iTXt | one JSON object, schema `mossinfer.generation/1`: engine version and tier, models by file name, LoRAs and strengths, prompt and negative prompt, sampler, scheduler, steps, CFG, shift, seed, size, and extra settings (attention, DiT linears, noise layout, noise source) |
+| `generation` | iTXt | one JSON object, schema `mossinfer.generation/1`: engine version and tier, models by file name, LoRAs and strengths, prompt and negative prompt, sampler, scheduler, steps, CFG, shift, seed, size, and extra settings (attention, DiT linears, noise layout, noise source, the image input and hires fix, the control adapter and its images, the accelerators that changed the image) |
 | `parameters` | tEXt (iTXt when not ASCII) | the plain-text settings block that image tools and galleries read |
 
 With `include_prompts` 0, the prompt and negative prompt are left out of both chunks. Model and LoRA names are reduced to their base names, so no directory reaches the file. `save_metadata` 0 writes a PNG without text chunks.
@@ -330,7 +373,10 @@ With `include_prompts` 0, the prompt and negative prompt are left out of both ch
 | `mi_result_text(r, kind)` | a string of the result (below); `""` when empty, NULL for a NULL result or an unknown kind |
 | `mi_result_prompt_tokens(r, negative, &t)` | `mi_prompt_tokens` of the prompt (`negative` 0) or the negative prompt (1; all zero when CFG is off): `total_tokens` (chat template included), `kept_tokens`, `prompt_tokens` (the text's own), `dropped_tokens`, `max_length`, `truncated`. Any other `negative` is `MI_ERR_INVALID_ARGUMENT`. |
 | `mi_result_lora_count(r)`, `mi_result_lora(r, i, &l)`, `mi_result_lora_file(r, i)` | per LoRA, in request order: `mi_lora_report {adapters, side_branch, merged, unknown_keys, warnings, notes}` and the file. An index out of range is `MI_ERR_INVALID_ARGUMENT` / NULL. |
-| `mi_result_message_count(r, kind)`, `mi_result_message(r, kind, i)` | `MI_MESSAGE_LORA_WARNING`: losses to show the user (`"<module>: <reason>"`). `MI_MESSAGE_LORA_NOTE`: how the files were read. 0 / NULL for an unknown kind or index. |
+| `mi_result_message_count(r, kind)`, `mi_result_message(r, kind, i)` | `MI_MESSAGE_LORA_WARNING`: losses to show the user (`"<module>: <reason>"`). `MI_MESSAGE_LORA_NOTE`: how the files were read. `MI_MESSAGE_CONTROL_WARNING` (2) and `MI_MESSAGE_CONTROL_NOTE` (3): the same for the control adapter's LoRA part. 0 / NULL for an unknown kind or index. |
+| `mi_result_control(r, &c)` | `mi_control_info`: `active` (a control adapter was applied), `kinds_count` (the adapter's kinds), `encodes` (control image VAE encodes, one per image and pass size), and its LoRA part as in `mi_lora_report`: `lora_adapters`, `lora_side_branch`, `lora_merged`, `lora_unknown_keys`, `lora_warnings`, `lora_notes`. All zero without a control adapter. The LoRA part is not one of `mi_result_lora()`'s files. |
+| `mi_result_accel(r, &a)` | `mi_accel_info`, over both passes of a hires fix: `cfg_truncated_steps` (steps run without the negative branch), `dit_calls` (DiT calls with the step cache on), `cached_calls` (of them, the calls that reused the cache), `lossy` (an accelerator was active: the run is uncertified). All zero with the accelerators off. |
+| `mi_result_accel_cached_steps(r, &n)` | the 1-based steps (counting on across the passes of a hires fix) with a call that reused the step cache, in order, and their count in `n`. NULL with `n` = 0 when there are none, and for a NULL result or a NULL `n`. Owned by the result. |
 
 | `mi_result_text_kind` | Text |
 |---|---|
@@ -343,8 +389,13 @@ With `include_prompts` 0, the prompt and negative prompt are left out of both ch
 | `MI_TEXT_QUALITY_JSON` (6) | the report's `quality` object, as JSON |
 | `MI_TEXT_IMAGE_NOTE` (7) | a remark on the image input, e.g. why an init image was not used; `""` for none |
 | `MI_TEXT_TIME_EMBEDDING` (8) | the replacement step embedder that ran; `""` for none |
+| `MI_TEXT_CONTROL_ADAPTER` (9) | the control adapter file; `""` without one |
+| `MI_TEXT_CONTROL_KINDS` (10) | its kinds in channel order, comma-separated, e.g. `color,depth` |
+| `MI_TEXT_CONTROL_BASE_MODEL` (11) | the file's `base_model` metadata (informational); `""` when absent |
+| `MI_TEXT_CONTROL_ENCODE_SCHEDULE` (12) | how the control images were VAE-encoded: `untiled` or the tile plans |
+| `MI_TEXT_ACCELERATORS` (13) | the accelerators that changed the run, e.g. `cfg_truncation 0.8, step_cache fbcache 0.03`; `off` when none (CFG truncation without CFG counts as off) |
 
-`mi_tier_info.effective` is never `AUTO`, and `attention` is never `DEFAULT`. `certified` is 1 whenever `effective` is `REFERENCE`, which needs no certificate. A generation cancelled before its tier was resolved reports requested `AUTO`, effective `REFERENCE`, attention `EXACT`, certified 1. The precisions map the pipeline's report as follows:
+`mi_tier_info.effective` is never `AUTO`, and `attention` is never `DEFAULT`. `certified` is 1 whenever `effective` is `REFERENCE`, which needs no certificate. It describes the tier: runtime LoRAs, a control adapter or the accelerators make the run as a whole uncertified even then, which `MI_TEXT_TIER_REASON` and the report's `models.dit.certified` say (and `mi_accel_info.lossy`, `mi_control_info.active`). A generation cancelled before its tier was resolved reports requested `AUTO`, effective `REFERENCE`, attention `EXACT`, certified 1. The precisions map the pipeline's report as follows:
 
 | Pipeline | `mi_precision` |
 |---|---|
@@ -359,7 +410,7 @@ Strings returned by accessors are owned by the result. They stay valid until `mi
 
 `mi_write_png(path, rgb, width, height)` writes RGB8 `[height][width][3]` as a PNG without metadata, atomically. It needs no result and is meant for previews. A NULL or empty path, NULL `rgb`, or a width or height outside [1, 16384] is `MI_ERR_INVALID_ARGUMENT`; a write failure is `MI_ERR_IO`.
 
-The JSON report carries all of this as well: `quality`, `models` (sources, linears, tiers, text-encoder precision, time embedding), `loras`, `lora_warnings`, `lora_notes`, `tokens` and `img2img` (mode, note, VAE encoder, both passes). Its `control` (`null`) and `accelerators` (inactive) objects are set only by `moss-infer` in 1.0: the C API gets control LoRAs and the accelerators in 1.1.
+The JSON report carries all of this as well: `quality`, `models` (sources, linears, tiers, text-encoder precision, time embedding), `loras`, `lora_warnings`, `lora_notes`, `tokens`, `img2img` (mode, note, VAE encoder, both passes), `control` (`null` without an adapter: the file, kinds, inputs, its LoRA part, encodes) and `accelerators` (`lossy`, the active ones, what they skipped, the cached steps).
 
 ## Capabilities
 
@@ -377,6 +428,8 @@ The JSON report carries all of this as well: `quality`, `models` (sources, linea
 | `MI_CAP_HIRES` | 0x80 | set | `hires_width`, `hires_height`, `hires_strength`, `hires_steps` |
 | `MI_CAP_DISTILL` | 0x100 | set | `distill_dir` (both structs), `time_embedding_file` |
 | `MI_CAP_SYSTEM_CUDA` | 0x200 | set | cuBLASLt loaded at run time: the bundled copy, else (or with `MOSSINFER_CUDA_LIBS=system`) a compatible system copy; `mi_probe_info.cublaslt_*` |
+| `MI_CAP_CONTROL` | 0x400 | set | control adapters: `control_adapter`, `control_lora_strength`, `control_images` (`mi_control_image`), `mi_result_control()`, `MI_TEXT_CONTROL_*`, `MI_MESSAGE_CONTROL_*` |
+| `MI_CAP_ACCEL` | 0x800 | set | the lossy accelerators: `cfg_truncation`, `step_cache`, `step_cache_threshold`, `mi_result_accel()`, `mi_result_accel_cached_steps()`, `MI_TEXT_ACCELERATORS` |
 
 `MI_CAP_TIERS` covers `TURBO` as well.
 
@@ -419,7 +472,7 @@ A versioned struct only grows at the end, so a program built against an older he
 | Struct | Accepted `struct_size` |
 |---|---|
 | `mi_engine_params` | 80 (the 0.1.0 size, up to `_reserved1`), 120 (an earlier 0.2.0 header, up to `_reserved2`), 136 (0.2.0) |
-| `mi_gen_params` | 168 (the 0.1.0 size, up to `user_data`), 240 (an earlier 0.2.0 header, up to `_reserved2`), 320 (0.2.0) |
+| `mi_gen_params` | 168 (the 0.1.0 size, up to `user_data`), 240 (an earlier 0.2.0 header, up to `_reserved2`), 320 (0.2.0 and 1.0.0, up to `distill_dir`), 376 (1.1.0) |
 | `mi_timings` (output) | 104 (the 0.1.0 size, up to `vae_load_s`), 128 (0.2.0) |
 | `mi_probe_info` (output) | 576 (the first 0.2.0 size, up to `_reserved0`), 1624 (0.2.0 with the cuBLASLt fields) |
 | every other output struct | its one size so far (table below) |
@@ -429,10 +482,11 @@ Any other size is `MI_ERR_ABI_MISMATCH`, and the message lists the accepted size
 - **Input structs** (`mi_engine_create()`, `mi_gen_params_validate()`, `mi_generate()`): the library reads only `struct_size` bytes. It copies them over a full struct filled with the defaults for that size, so every later field keeps the behaviour of the older release:
   - an 80-byte `mi_engine_params` runs with the bundle's components, tier `AUTO` and default attention;
   - a 168-byte `mi_gen_params` runs with the `MOSS` scheduler, the default noise and no LoRAs, and its `save_metadata` and `include_prompts` are 0: `mi_save_png()` writes a PNG without text chunks, as 0.1.0 did. A 240- or 320-byte struct defaults `save_metadata` and `include_prompts` to 1;
-  - a 120-byte `mi_engine_params` or a 240-byte `mi_gen_params` runs without image input, hires fix or distill bundle.
+  - a 120-byte `mi_engine_params` or a 240-byte `mi_gen_params` runs without image input, hires fix or distill bundle;
+  - a 320-byte `mi_gen_params` runs without a control adapter and with the accelerators off.
 - **Output structs**: the library writes only `struct_size` bytes.
 
-`CApi.OldStructSizes` and `CApi.Earlier020StructSizes` (`tests/unit/test_c_api.cpp`) and the C test `c_abi_compat` (`tests/c/test_abi_compat.c`, a hand-written 0.1.0-layout struct, label `cpu`; `c_abi_compat_gpu`, label `gpu`, also generates from it) check this.
+`CApi.OldStructSizes`, `CApi.Earlier020StructSizes` and `CApi.Gen100StructSize` (`tests/unit/test_c_api.cpp`) and the C test `c_abi_compat` (`tests/c/test_abi_compat.c`, a hand-written 0.1.0-layout struct, label `cpu`; `c_abi_compat_gpu`, label `gpu`, also generates from it) check this.
 
 ## Frozen layout (ABI 1)
 
@@ -448,9 +502,10 @@ The enums are 4 bytes. ABI 1 is defined by this table: a change to an existing e
 | `mi_probe_info` | 1624 | `struct_size` 0, `driver_cuda_version` 8, `runtime_cuda_version` 12, `driver_compatible` 16, `device_count` 20, `supported_device_count` 24, `build_flavour[16]` 28, `recommended_flavour[16]` 44, `message[512]` 60, `_reserved0` 572; then `cublaslt_source[16]` 576, `cublaslt_version` 592, `_reserved1` 596, `cublaslt_path[512]` 600, `cublaslt_error[512]` 1112 |
 | `mi_engine_params` | 136 | `struct_size` 0, `model_path` 8, `model_format` 16, `mode` 20, `device_index` 24, `_reserved0` 28, `vram_budget_bytes` 32, `vram_reserve_bytes` 40, `host_ram_budget_bytes` 48, `cache_dir` 56, `embedding_cache` 64, `direct_io` 68, `block_path` 72, `_reserved1` 76; then `dit_file` 80, `text_encoder_file` 88, `vae_file` 96, `tier` 104, `attention` 108, `lora_strict` 112, `_reserved2` 116; then `time_embedding_file` 120, `distill_dir` 128 |
 | `mi_progress` | 40 | `struct_size` 0, `phase` 8, `step` 12, `total_steps` 16, `_reserved0` 20, `step_seconds` 24, `elapsed_seconds` 32 |
-| `mi_gen_params` | 320 | `struct_size` 0, `prompt` 8, `negative_prompt` 16, `width` 24, `height` 28, `steps` 32, `_reserved0` 36, `cfg` 40, `shift` 48, `seed` 56, `uncond_skip_layers` 64, `uncond_skip_layers_count` 72, `slg_layers` 80, `slg_layers_count` 88, `slg_scale` 96, `slg_start` 104, `slg_stop` 112, `max_sequence_length` 120, `sampler` 124, `progress_callback` 128, `plan_callback` 136, `preview_callback` 144, `preview_interval` 152, `_reserved1` 156, `user_data` 160; then `scheduler` 168, `noise_layout` 172, `noise_source` 176, `save_metadata` 180, `flow_multiplier` 184, `eta` 192, `s_noise` 200, `dataspace_path` 208, `loras` 216, `loras_count` 224, `include_prompts` 232, `_reserved2` 236; then `init_image` 240, `init_image_path` 248, `mask` 256, `mask_path` 264, `mask_encoding` 272, `resize` 276, `denoise_strength` 280, `hires_width` 288, `hires_height` 292, `hires_strength` 296, `hires_steps` 304, `_reserved3` 308, `distill_dir` 312 |
+| `mi_gen_params` | 320 | `struct_size` 0, `prompt` 8, `negative_prompt` 16, `width` 24, `height` 28, `steps` 32, `_reserved0` 36, `cfg` 40, `shift` 48, `seed` 56, `uncond_skip_layers` 64, `uncond_skip_layers_count` 72, `slg_layers` 80, `slg_layers_count` 88, `slg_scale` 96, `slg_start` 104, `slg_stop` 112, `max_sequence_length` 120, `sampler` 124, `progress_callback` 128, `plan_callback` 136, `preview_callback` 144, `preview_interval` 152, `_reserved1` 156, `user_data` 160; then `scheduler` 168, `noise_layout` 172, `noise_source` 176, `save_metadata` 180, `flow_multiplier` 184, `eta` 192, `s_noise` 200, `dataspace_path` 208, `loras` 216, `loras_count` 224, `include_prompts` 232, `_reserved2` 236; then `init_image` 240, `init_image_path` 248, `mask` 256, `mask_path` 264, `mask_encoding` 272, `resize` 276, `denoise_strength` 280, `hires_width` 288, `hires_height` 292, `hires_strength` 296, `hires_steps` 304, `_reserved3` 308, `distill_dir` 312; then `control_adapter` 320, `control_lora_strength` 328, `control_images` 336, `control_images_count` 344, `cfg_truncation` 352, `step_cache` 360, `_reserved4` 364, `step_cache_threshold` 368 (376 bytes) |
 | `mi_lora` | 16 | `path` 0, `strength` 8 (array element, no `struct_size`: frozen as it is) |
 | `mi_image` | 24 | `pixels` 0, `width` 8, `height` 12, `channels` 16, `_reserved0` 20 (no `struct_size`: frozen as it is) |
+| `mi_control_image` | 48 | `kind` 0, `image` 8, `image_path` 16, `strength` 24, `start` 32, `end` 40 (array element, no `struct_size`: frozen as it is) |
 | `mi_timings` | 128 | `struct_size` 0, then 12 doubles from 8 in header order (`total_s` … `vae_load_s` at 96); then `vae_encoder_load_s` 104, `image_encode_s` 112, `image_ops_s` 120 |
 | `mi_memory_stats` | 56 | `struct_size` 0, then 6 `uint64_t` from 8 in header order (`arena_capacity_bytes` … `host_private_peak_bytes` at 48) |
 | `mi_dit_stream_stats` | 80 | `struct_size` 0, `streamed` 8, `resident_blocks` 12, `buffers` 16, `stalls` 20, `bytes` 24, `copy_seconds` 32, `stall_seconds` 40, `h2d_gbps` 48, `hidden_fraction` 56, `source[16]` 64 (no padding needed) |
@@ -458,8 +513,10 @@ The enums are 4 bytes. ABI 1 is defined by this table: a change to an existing e
 | `mi_prompt_tokens` | 32 | `struct_size` 0, `total_tokens` 8, `kept_tokens` 12, `prompt_tokens` 16, `dropped_tokens` 20, `max_length` 24, `truncated` 28 |
 | `mi_lora_report` | 32 | `struct_size` 0, `adapters` 8, `side_branch` 12, `merged` 16, `unknown_keys` 20, `warnings` 24, `notes` 28 |
 | `mi_image_info` | 80 | `struct_size` 0, `mode` 8, `hires_ran` 12, `first_width` 16, `first_height` 20, `first_steps_scheduled` 24, `first_start_step` 28, `first_steps_run` 32, `first_encoded` 36, `hires_width` 40, `hires_height` 44, `hires_steps_scheduled` 48, `hires_start_step` 52, `hires_steps_run` 56, `_reserved0` 60, `first_strength` 64, `hires_strength` 72 |
+| `mi_control_info` | 48 | `struct_size` 0, `active` 8, `kinds_count` 12, `encodes` 16, `lora_adapters` 20, `lora_side_branch` 24, `lora_merged` 28, `lora_unknown_keys` 32, `lora_warnings` 36, `lora_notes` 40, `_reserved0` 44 |
+| `mi_accel_info` | 24 | `struct_size` 0, `cfg_truncated_steps` 8, `dit_calls` 12, `cached_calls` 16, `lossy` 20 |
 
-The 32-bit enums: `mi_status`, `mi_mode`, `mi_model_format`, `mi_block_path`, `mi_tier`, `mi_attention`, `mi_precision`, `mi_sampler`, `mi_scheduler`, `mi_noise_layout`, `mi_noise_source`, `mi_phase`, `mi_result_text_kind`, `mi_message_kind`, `mi_mask_encoding`, `mi_resize_mode`, `mi_image_mode`.
+The 32-bit enums: `mi_status`, `mi_mode`, `mi_model_format`, `mi_block_path`, `mi_tier`, `mi_attention`, `mi_precision`, `mi_sampler`, `mi_scheduler`, `mi_noise_layout`, `mi_noise_source`, `mi_phase`, `mi_result_text_kind`, `mi_message_kind`, `mi_mask_encoding`, `mi_resize_mode`, `mi_image_mode`, `mi_step_cache`.
 
 History, all with `MI_ABI_VERSION` 1:
 - 2026-10-21, during 0.1.0: the padding was made explicit; `mi_engine_params` grew `block_path` and `_reserved1` (72 → 80 bytes); `mi_dit_stream_stats` was added. Binaries built against an earlier header must be rebuilt.
@@ -467,6 +524,7 @@ History, all with `MI_ABI_VERSION` 1:
 - 0.2.0, image input: `steps` 0, a negative `cfg` and a negative `denoise_strength` became the unset markers, and `mi_gen_params_init()` at 320 bytes sets them. `mi_engine_params` grew to 136 bytes, `mi_gen_params` to 320 and `mi_timings` to 128, as trailing fields; the 120-, 240- and 104-byte layouts stay accepted. `mi_image` and `mi_image_info` were added.
 - 0.2.0, system CUDA: `mi_probe_info` grew to 1624 bytes (the cuBLASLt fields), as trailing fields; the 576-byte layout stays accepted. `MI_CAP_SYSTEM_CUDA` was added.
 - 1.0.0: first stable release. No layout or behaviour change from 0.2.0; the CMake package now requires the same MAJOR version (`SameMajorVersion`).
+- 1.1.0, control adapters and accelerators: `mi_gen_params` grew to 376 bytes, as trailing fields; the 320-byte layout stays accepted (with its unset markers). `mi_control_image`, `mi_step_cache`, `mi_control_info` and `mi_accel_info` were added, `mi_result_text_kind` gained values 9–13, `mi_message_kind` values 2–3, and `MI_CAP_CONTROL` / `MI_CAP_ACCEL` were added.
 
 ## Symbol visibility
 
@@ -502,6 +560,9 @@ Label `cpu` (`tests/unit/test_c_api.cpp`):
   - `HiresFix`: the mapping, multiples of 16, the size bound, strength and steps.
   - `DistillBundle`: a synthetic bundle (dataspace, LoRA and time-embedding files): the unset markers take its choices, explicit values stay, its LoRA is appended, its dataspace sampler refuses an image; not a directory (`INVALID_ARGUMENT`), no bundle files and a malformed dataspace file (`MODEL`); the engine side (`to_options`, `mi_engine_create`) with a missing, a matching and a conflicting `time_embedding_file`.
   - `ImageResultFromAPipelineResult`: `mi_image_info`, the image note, the time embedding, the new timings and an INT4 DiT as `W4A4` from a synthetic result.
+  - `ControlAndAccelerators`: the mapping of the control adapter, its images (pixels copied, a file decoded as RGB, 1x1 stand-ins and no decode in validation) and the accelerators into `pipeline::Request`; every rejection (images without an adapter, a missing adapter or image file, a NULL array, more than 16, no kind, a repeated kind, both or neither of image and path, channels, sizes, strength and window ranges, the LoRA strength, `cfg_truncation`, unknown `step_cache` values, the threshold rules, `_reserved4`).
+  - `Gen100StructSize`: the 320-byte layout (its unset markers, the tail neither written nor read); the new fields' defaults.
+  - `ControlAndAcceleratorResults`: `mi_result_control()`, `mi_result_accel()`, `mi_result_accel_cached_steps()`, the control texts and messages from a synthetic result (and without either), the zeroed padding and wrong sizes.
 - **`c_abi_compat`** (`tests/c/test_abi_compat.c`, C11): a hand-written 0.1.0-layout `mi_engine_params` and `mi_gen_params` through `*_init`, `mi_gen_params_validate()` and `mi_engine_create()` (as far as the model path check). With weights, `c_abi_compat_gpu` (label `gpu`) also generates from them and checks that the PNG has no text chunks.
 - **`CApiReport.*`** renders the report (through the adapter and the shared renderer) from a synthetic result under a comma-decimal C++ locale with digit grouping, and under a comma-decimal C locale where the system has one. It checks for valid JSON, exact numbers, `null` for NaN and infinity, the `dit_blocks` and `dit_stream` keys, `quality.cublaslt`, and that the document is the CLI's fields in braces.
 - **`PipelineReport.*`** (`tests/unit/test_pipeline_report.cpp`) covers the shared renderer itself: every key, the head/tail split around the image path, U+FFFD for ill-formed UTF-8, `null` for non-finite numbers, and the classic locale.
@@ -509,7 +570,7 @@ Label `cpu` (`tests/unit/test_c_api.cpp`):
 
 Label `gpu`:
 - **`GpuCApiProbe.*`**: after `mi_probe_device()`, the process holds no CUDA context. This is checked through the driver's primary-context state and NVML's process list.
-- **`GpuCApi.*`** covers the device probe, and a 256², 2-step generation with callbacks, a concurrent call rejected as busy, the block path accessors and `mi_result_dit_stream()` (nothing streamed in balanced mode on a 16 GiB card), and PNG and report checks. It also covers cancel from another thread with no carry-over, and the caller's current context restored by create, generate and free. `SamplerPreviewMetadataAndTier` runs a 256², 3-step `DPMPP_2M` + `KARRAS` generation with `preview_interval` 2 (previews after steps 2 and 3, at the image size), checks the `generation` chunk of the saved PNG, `mi_result_tier()` (the bf16 bundle with tier `AUTO` and no certificate runs `REFERENCE` with exact attention), the texts, the prompt tokens, and the LoRA and message accessors' bounds. `OldSizeWritesNoMetadata` generates from a 168-byte `mi_gen_params` and checks that the PNG has no text chunks. `ImageToImageFromPixels` (256², 4 steps at strength 0.5: 2 run from step 2, `total_steps` 2, a 104-byte `mi_timings` gets 104 bytes), `InpaintBinary01Mask` (the kept half stays closer to the init image than the regenerated half), `HiresFix` (256 → 384, 2 + 2 steps) and `DistillTimeEmbeddingNeedsTheEngine` cover image input and the engine check. **`GpuCApiModels.*`** create their own engine on the SFT bundle when the files exist under `/workspace/Models/community`: `DistillBundle` (the lodestones SFT 8-step bundle on the engine and the request: 8 data-space steps at CFG 1, its LoRA and time embedding) and `TurboInt4` (an INT4 DiT: tier `AUTO` refused, `TURBO` runs it as `W4A4`). Runtime LoRA files of one's own on the GPU are covered only by the distill bundle's LoRA; the repository has no small LoRA file.
+- **`GpuCApi.*`** covers the device probe, and a 256², 2-step generation with callbacks, a concurrent call rejected as busy, the block path accessors and `mi_result_dit_stream()` (nothing streamed in balanced mode on a 16 GiB card), and PNG and report checks. It also covers cancel from another thread with no carry-over, and the caller's current context restored by create, generate and free. `SamplerPreviewMetadataAndTier` runs a 256², 3-step `DPMPP_2M` + `KARRAS` generation with `preview_interval` 2 (previews after steps 2 and 3, at the image size), checks the `generation` chunk of the saved PNG, `mi_result_tier()` (the bf16 bundle with tier `AUTO` and no certificate runs `REFERENCE` with exact attention), the texts, the prompt tokens, and the LoRA and message accessors' bounds. `OldSizeWritesNoMetadata` generates from a 168-byte `mi_gen_params` and checks that the PNG has no text chunks. `ImageToImageFromPixels` (256², 4 steps at strength 0.5: 2 run from step 2, `total_steps` 2, a 104-byte `mi_timings` gets 104 bytes), `InpaintBinary01Mask` (the kept half stays closer to the init image than the regenerated half), `HiresFix` (256 → 384, 2 + 2 steps) and `DistillTimeEmbeddingNeedsTheEngine` cover image input and the engine check. `ControlAdapterDepth` runs the color/depth control adapter (`$MOSS_COMMUNITY_MODELS/comfy-org/moss_image_color_depth_control.safetensors`, skipped when absent) with a generated grayscale depth image from pixels, 256², 3 steps, and checks `mi_result_control()` and the texts, then a kind the adapter lacks (`MI_ERR_INVALID_ARGUMENT` from `mi_generate()`, not from validation). `Accelerators` runs CFG truncation 0.5 with the step cache at threshold 0.5, 256², 6 steps, and checks `mi_result_accel()` and the cached steps. **`GpuCApiModels.*`** create their own engine on the SFT bundle when the files exist under `/workspace/Models/community`: `DistillBundle` (the lodestones SFT 8-step bundle on the engine and the request: 8 data-space steps at CFG 1, its LoRA and time embedding) and `TurboInt4` (an INT4 DiT: tier `AUTO` refused, `TURBO` runs it as `W4A4`). Runtime LoRA files of one's own on the GPU are covered only by the distill bundle's LoRA; the repository has no small LoRA file.
 
 Run the GPU tests on a machine with a supported GPU:
 
