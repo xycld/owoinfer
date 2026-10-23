@@ -106,6 +106,14 @@ TEST(Accel, OptionsParseValidateDescribe) {
   edge.cfg_truncation = 0.0;
   edge.step_cache_threshold = 1.0;
   EXPECT_NO_THROW(accel::validate(edge));
+  // An unset threshold is the model's default: 0.02 on the base model, 0.03 otherwise (the pipeline fills it in).
+  accel::Options dflt;
+  dflt.step_cache = accel::StepCacheKind::kFbCache;
+  EXPECT_NO_THROW(accel::validate(dflt));
+  EXPECT_EQ(dflt.describe(false), "step_cache fbcache default");
+  EXPECT_EQ(accel::default_fbcache_threshold("base"), accel::kBaseModelFbCacheThreshold);
+  EXPECT_EQ(accel::default_fbcache_threshold("sft"), accel::kDefaultFbCacheThreshold);
+  EXPECT_EQ(accel::default_fbcache_threshold(""), accel::kDefaultFbCacheThreshold);
 }
 
 TEST(Accel, CfgTruncationWindow) {
@@ -122,6 +130,61 @@ TEST(Accel, CfgTruncationWindow) {
   g.cfg_truncation = 0.5;
   g.cfg = 1.0;  // no CFG at all
   for (int i = 0; i < 10; ++i) EXPECT_FALSE(g.cfg_active(i, 10));
+}
+
+// 1.1: the threshold is optional (unset = the model's default). parameters.json: absent or null leaves it unset; the
+// report shows the request's (null when unset) and what ran with its source; the PNG metadata records what ran; the
+// warnings: a set threshold above 0.02 on the base model, and a cache that never engaged.
+TEST(Accel, OptionalThresholdParamsReportMetadataAndWarnings) {
+  using mi::pipeline::request_from_parameters;
+  EXPECT_FALSE(request_from_parameters(mi::json::parse(R"({"prompt": "a", "step_cache": "fbcache"})")).accel.step_cache_threshold);
+  EXPECT_FALSE(request_from_parameters(mi::json::parse(R"({"prompt": "a", "step_cache": "fbcache", "step_cache_threshold": null})"))
+                   .accel.step_cache_threshold);
+  const mi::pipeline::Request q = request_from_parameters(mi::json::parse(R"({"prompt": "a", "step_cache": "fbcache"})"));
+  EXPECT_NO_THROW(mi::pipeline::validate(q));
+  mi::pipeline::Result r;
+  r.accel.dit_calls = 10;
+  r.accel.step_cache_threshold = accel::kBaseModelFbCacheThreshold;  // what the pipeline fills in on the base model
+  r.accel.step_cache_threshold_source = accel::threshold_source(q.accel, "base");
+  EXPECT_EQ(r.accel.step_cache_threshold_source, "default for the base model");
+  EXPECT_EQ(accel::threshold_source(q.accel, ""), "default for the unrecognized model");
+  const mi::json::Value rep = mi::json::parse("{" + mi::pipeline::report_fields(q, r, "", "") + "}");
+  EXPECT_TRUE(rep.at("request").at("step_cache_threshold").is_null());
+  EXPECT_EQ(rep.at("accelerators").at("step_cache_threshold").as_double(), 0.02);
+  EXPECT_EQ(rep.at("accelerators").at("step_cache_threshold_source").as_string(), "default for the base model");
+  EXPECT_EQ(rep.at("accelerators").at("active").as_string(), "step_cache fbcache 0.02");
+  bool found = false;
+  for (const auto& [k, v] : mi::pipeline::generation_metadata(q, r).extra) {
+    if (k == "step_cache_threshold") {
+      EXPECT_EQ(v, "0.02");
+      found = true;
+    }
+  }
+  EXPECT_TRUE(found) << "the metadata records the threshold that ran";
+
+  accel::Options set;
+  set.step_cache = accel::StepCacheKind::kFbCache;
+  set.step_cache_threshold = 0.03;
+  EXPECT_EQ(accel::threshold_source(set, "base"), "request");
+  EXPECT_NE(accel::base_model_threshold_warning(set, "base").find("fbcache 0.03 on the base model"), std::string::npos);
+  EXPECT_EQ(accel::base_model_threshold_warning(set, "sft"), "");
+  EXPECT_EQ(accel::base_model_threshold_warning(q.accel, "base"), "") << "the default is never warned about";
+  set.step_cache_threshold = 0.02;
+  EXPECT_EQ(accel::base_model_threshold_warning(set, "base"), "");
+
+  accel::Stats st;
+  st.step_cache_threshold = 0.05;
+  st.dit_calls = 6;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  st.step_cache_diffs = {nan, 0.09, 0.07, nan, 0.11};  // three comparable calls: not enough evidence
+  EXPECT_EQ(accel::never_engaged_warning(st), "");
+  st.step_cache_diffs.push_back(0.08);
+  const std::string w = accel::never_engaged_warning(st);
+  EXPECT_NE(w.find("never engaged"), std::string::npos) << w;
+  EXPECT_NE(w.find("at least 0.07"), std::string::npos) << w;
+  EXPECT_NE(w.find("over 4 comparable"), std::string::npos) << w;
+  st.cached_calls = 1;
+  EXPECT_EQ(accel::never_engaged_warning(st), "");
 }
 
 TEST(Accel, RequestParametersValidationAndReport) {

@@ -71,6 +71,10 @@ class ProfileLearner {
   bool observe_dit_stream(double gbps);
   // A DiT load from the weight files (one reader, buffered): a cached/cold vote.
   void observe_dit_load(double gbps);
+  // A DiT load's rate by I/O mode (direct or buffered), kept per mode: the median of the recent loads (0: none yet).
+  // The direct one also prices cold loads in the plans (HardwareProfile::direct_gbps). In memory only.
+  void observe_dit_load_rate(bool direct, double gbps);
+  double dit_load_gbps(bool direct) const;
   // One file-streamed text-encoder pass (planner::weights_cached_from_stream): a vote.
   void observe_te_stream(bool cached);
   // After every generation: counts generations without evidence for the re-check.
@@ -97,7 +101,7 @@ class ProfileLearner {
   StoredProfile stored_;
   planner::HardwareProfile current_;
   Verdict dit_cached_, te_cached_;
-  Series tflops_, host_gbps_;
+  Series tflops_, host_gbps_, direct_load_gbps_, buffered_load_gbps_;
 };
 
 }  // namespace mi::pipeline

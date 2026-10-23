@@ -2,6 +2,8 @@
 
 A native C++/CUDA inference engine for the MOSS-Image text-to-image model (5B DiT, Qwen3.5 text encoder, FLUX.2 VAE), with no PyTorch or Python at run time. It plans memory against the GPU it finds and streams the model when it does not fit.
 
+Models: MOSS-Image Base and SFT only (`OpenMOSS-Team/MOSS-Image-Base`, `OpenMOSS-Team/MOSS-Image-SFT`); other models are refused ([supported models](docs/integration.md#supported-models)).
+
 Version 1.0.0. Supported: Linux x86-64 and Windows x64 (MSVC), each with a CUDA 12 and a CUDA 13 build, as a full package and a `-system-cuda` package. The full support matrix is in [docs/integration.md](docs/integration.md#support-status).
 
 - [docs/integration.md](docs/integration.md): building the engine into an application. Start here.

@@ -44,7 +44,8 @@ constexpr const char* kUsage =
     "                           [--noise-layout <layout>] [--noise-source philox|philox_device|brownian_tree]\n"
     "                           [--eta X] [--s-noise X] [--dataspace <file>] [--no-metadata]\n"
     "                           [--mode min_memory|balanced|max_speed] [--vram-budget GiB] [--vram-reserve MiB]\n"
-    "                           [--host-ram-budget GiB] [--cache-dir <dir>] [--then-prompt <text>]... [--direct-io]\n"
+    "                           [--host-ram-budget GiB] [--cache-dir <dir>] [--then-prompt <text>]...\n"
+    "                           [--direct-io | --buffered-io] [--te-host-pin auto|on|off] [--cert-dir <dir>]...\n"
     "                           [--dit-blocks op_by_op|fused|fused_graphs] [--dit <file>] [--te <file>] [--vae <file>]\n"
     "                           [--tier reference|high|turbo|auto] [--attention auto|exact|q8|q8_fp8|q8_fp16|...]\n"
     "                           [--preview <preview.png> [--preview-every N]] [--lora <file> [--lora-scale S]]...\n"
@@ -67,7 +68,13 @@ constexpr const char* kUsage =
     "--tier (default auto): reference = bf16 exact; high = the loaded DiT's GEMMs + 8-bit attention; turbo = an INT4\n"
     "ConvRot DiT (--dit) + 8-bit attention; auto = the fastest certified configuration of the loaded DiT (else\n"
     "reference; an INT8 DiT then runs with exact attention, uncertified; an uncertified INT4 DiT needs --tier turbo).\n"
-    "Certificates: <dit>.mossinfer-cert.json or <cache-dir>/quality_certs/.\n"
+    "Certificates are searched in each --cert-dir, then <cache-dir>/quality_certs/, <dit>.mossinfer-cert.json and the\n"
+    "install tree's share/mossinfer/quality_certs/ (the first usable one wins).\n"
+    "The DiT is loaded with direct I/O (O_DIRECT / FILE_FLAG_NO_BUFFERING) where the file system supports it and its\n"
+    "files are not already in the page cache, else buffered (the report's \"dit_load\" says which and why);\n"
+    "--buffered-io forces buffered DiT loads, --direct-io direct I/O for every weight read (cold-cache behaviour).\n"
+    "--te-host-pin (default auto) decides whether a text encoder kept in RAM may be pinned: auto where the machine has\n"
+    "clearly the room, on whenever it fits, off never.\n"
     "--attention overrides the tier's attention kernel: exact (FlashAttention-2) or an 8-bit variant q8_fp8 (= q8),\n"
     "q8_fp16, q8_fp8_f32acc, q8_fp16_f32acc (lossy).\n"
     "--init-image (PNG or JPEG, EXIF orientation applied) runs img2img: the image is brought to the output size with\n"
@@ -88,8 +95,9 @@ constexpr const char* kUsage =
     "off) drops the negative branch for the steps from X * steps on, counting the steps each pass runs (img2img and the\n"
     "hires pass: their strength-cropped steps); multistep samplers carry one guided step into the first unguided one.\n"
     "--step-cache fbcache reuses the DiT's blocks 1..41 from the last full DiT call while block 0's output residual changed\n"
-    "by less than --step-cache-threshold (default 0.03, relative L1; 0.05-0.08 are faster but may change the\n"
-    "composition). --params may carry \"cfg_truncation\", \"step_cache\" and \"step_cache_threshold\".\n"
+    "by less than --step-cache-threshold (relative L1; default 0.02 on the base model, 0.03 on the SFT model and its\n"
+    "derived files; 0.05-0.08 are faster but may change the composition, the base model's from 0.03).\n"
+    "--params may carry \"cfg_truncation\", \"step_cache\" and \"step_cache_threshold\".\n"
     "--control loads a control adapter (a LoRA with a widened DiT input embedder, e.g. the MOSS-Image color/depth\n"
     "control); --control-scale sets its LoRA strength (default 1). Each --control-image gives one input of the\n"
     "adapter's kinds (e.g. color=map.png, depth=depth.png: near = white), brought to the output size with --resize and\n"
@@ -258,7 +266,7 @@ int cmd_generate(const std::vector<std::string>& args) {
   std::vector<std::pair<std::string, std::string>> flags;
   for (std::size_t i = 0; i < args.size(); ++i) {
     const std::string& a = args[i];
-    if (a == "--direct-io" || a == "--quiet" || a == "--no-metadata" || a == "--lora-strict") {
+    if (a == "--direct-io" || a == "--buffered-io" || a == "--quiet" || a == "--no-metadata" || a == "--lora-strict") {
       flags.emplace_back(a, "");
       continue;
     }
@@ -368,6 +376,9 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--cache-dir") options.cache_dir = path_from_utf8(v);
       else if (f == "--then-prompt") then_prompts.push_back(v);
       else if (f == "--direct-io") options.direct_io = true;
+      else if (f == "--buffered-io") options.dit_load_direct_io = false;
+      else if (f == "--te-host-pin") options.te_host_pin = planner::parse_te_host_pin(v);
+      else if (f == "--cert-dir") options.certificate_dirs.push_back(path_from_utf8(v));
       else if (f == "--dit-blocks") options.block_path = moss_dit::parse_block_path(v);
       else if (f == "--dit") options.dit_file = path_from_utf8(v);
       else if (f == "--te") options.text_encoder_file = path_from_utf8(v);
@@ -399,6 +410,10 @@ int cmd_generate(const std::vector<std::string>& args) {
   const auto given = [&](const char* flag) {
     return std::any_of(flags.begin(), flags.end(), [&](const auto& fv) { return fv.first == flag; });
   };
+  if (given("--direct-io") && given("--buffered-io")) {
+    std::cerr << "moss-infer generate: --direct-io and --buffered-io contradict each other\n" << kUsage;
+    return 2;
+  }
   if (distill) {
     // The bundle's defaults where the command line does not set them: no CFG, the trained number of steps.
     if (!given("--cfg") && !in_params("cfg")) req.cfg = 1.0;
@@ -513,6 +528,7 @@ int cmd_generate(const std::vector<std::string>& args) {
       std::fprintf(stderr, "warning: lossy accelerators (%s), uncertified: CFG truncated on %d steps, step cache reused %d of %d DiT calls\n",
                    q.accel.describe(q.cfg != 1.0).c_str(), r.accel.cfg_truncated_steps, r.accel.cached_calls, r.accel.dit_calls);
     }
+    for (const std::string& w : r.accel_warnings) std::fprintf(stderr, "warning: %s\n", w.c_str());
     if (!r.image_note.empty()) std::fprintf(stderr, "note: %s\n", r.image_note.c_str());
     for (const auto* t : {&r.cond_token_report, &r.uncond_token_report}) {
       if (t->truncated) {

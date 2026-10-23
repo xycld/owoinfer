@@ -111,7 +111,8 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
     << ", \"dataspace\": " << json_escape(util::path_utf8(q.dataspace_path));
   // P6b accelerators as requested.
   o << ", \"cfg_truncation\": " << num(q.accel.cfg_truncation) << ", \"step_cache\": \""
-    << accel::step_cache_name(q.accel.step_cache) << "\", \"step_cache_threshold\": " << num(q.accel.step_cache_threshold);
+    << accel::step_cache_name(q.accel.step_cache) << "\", \"step_cache_threshold\": "
+    << (q.accel.step_cache_threshold ? num(*q.accel.step_cache_threshold) : std::string("null"));
   // img2img / inpainting / hires fix (P7b): the images by name and size (their pixels are not reported).
   const auto image = [&](const std::shared_ptr<const Image>& p) {
     if (p == nullptr) return std::string("null");
@@ -165,12 +166,24 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
     << ", \"hires\": " << (q.hires.enabled() ? pass(r.hires) : std::string("null")) << "},\n";
   o << " \"dit_blocks\": {\"path\": \"" << moss_dit::block_path_name(r.block_path) << "\", \"note\": "
     << json_escape(r.block_path_note) << "},\n";
+  const auto strings = [&](const std::vector<std::string>& v) {
+    std::string out = "[";
+    for (std::size_t i = 0; i < v.size(); ++i) out += (i ? ", " : "") + json_escape(v[i]);
+    return out + "]";
+  };
   // P6b: the lossy accelerators that ran (an active one makes the run uncertified) and what they skipped.
   const accel::Stats& ac = r.accel;
+  accel::Options ran = q.accel;  // the threshold that ran (an unset one: the model's default the pipeline filled in)
+  if (ran.step_cache_on() && ac.step_cache_threshold > 0) ran.step_cache_threshold = ac.step_cache_threshold;
   o << " \"accelerators\": {\"lossy\": " << tf(q.accel.active(q.cfg != 1.0)) << ", \"active\": "
-    << json_escape(q.accel.describe(q.cfg != 1.0)) << ", \"cfg_truncated_steps\": " << ac.cfg_truncated_steps
+    << json_escape(ran.describe(q.cfg != 1.0)) << ", \"step_cache_threshold\": "
+    << (ac.step_cache_threshold > 0 ? num(ac.step_cache_threshold) : std::string("null")) << ", \"step_cache_threshold_source\": "
+    << json_escape(ac.step_cache_threshold_source) << ", \"cfg_truncated_steps\": " << ac.cfg_truncated_steps
     << ", \"step_cache_calls\": " << ac.dit_calls << ", \"step_cache_reused\": " << ac.cached_calls
-    << ", \"cached_steps\": " << json_layers(ac.cached_steps) << "},\n";
+    << ", \"cached_steps\": " << json_layers(ac.cached_steps) << ", \"step_cache_diffs\": [";
+  // Every call's relative change of block 0 (null where there was nothing to compare with): what the threshold saw.
+  for (std::size_t i = 0; i < ac.step_cache_diffs.size(); ++i) o << (i ? ", " : "") << num(ac.step_cache_diffs[i]);
+  o << "], \"warnings\": " << strings(r.accel_warnings) << "},\n";
   // P6: the quality object in the certificates' vocabulary (pipeline/quality_cert.h: tier, config, engine numerics, GPU
   // class, reason, certificate, models), filled by generate(), and where each model came from.
   const planner::TierDecision& td = r.tier;
@@ -180,14 +193,10 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
     << planner::tier_name(td.effective) << "\", \"certified\": " << tf(td.certified) << ", \"time_embedding\": "
     << (r.time_embedding.empty() ? std::string("null") : json_escape(r.time_embedding))
     << "}, \"text_encoder\": {\"source\": " << json_escape(r.te_source) << ", \"precision\": "
-    << json_escape(r.te_precision.empty() ? "bf16" : r.te_precision) << "}, \"vae\": {\"source\": " << json_escape(r.vae_source)
+    << json_escape(r.te_precision.empty() ? "bf16" : r.te_precision) << ", \"note\": " << json_escape(r.te_note)
+    << "}, \"vae\": {\"source\": " << json_escape(r.vae_source)
     << "}},\n";
   // Runtime LoRAs: how each file was read and applied, and the lossy merges.
-  const auto strings = [&](const std::vector<std::string>& v) {
-    std::string out = "[";
-    for (std::size_t i = 0; i < v.size(); ++i) out += (i ? ", " : "") + json_escape(v[i]);
-    return out + "]";
-  };
   o << " \"loras\": [";
   for (std::size_t i = 0; i < r.loras.size(); ++i) {
     const lora::FileReport& f = r.loras[i];
@@ -229,7 +238,8 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
     << ", \"denoise\": " << num(t.denoise_s) << ", \"decode\": " << num(t.decode_s) << ", \"index_load\": " << num(t.index_load_s)
     << ", \"tokenize\": " << num(t.tokenize_s) << ", \"plan\": " << num(t.plan_s) << ", \"text_encode\": " << num(t.text_encode_s)
     << ", \"te_weight_load\": " << num(t.te_weight_load_s) << ", \"te_weight_wait\": " << num(t.te_weight_wait_s)
-    << ", \"te_compute\": " << num(t.te_compute_s) << ", \"dit_load\": " << num(t.dit_load_s) << ", \"refine\": " << num(t.refine_s)
+    << ", \"te_compute\": " << num(t.te_compute_s) << ", \"dit_load\": " << num(t.dit_load_s)
+    << ", \"lora_load\": " << num(t.lora_load_s) << ", \"lora_merge\": " << num(t.lora_merge_s) << ", \"refine\": " << num(t.refine_s)
     << ", \"vae_load\": " << num(t.vae_load_s) << ", \"vae_encoder_load\": " << num(t.vae_encoder_load_s)
     << ", \"vae_encode\": " << num(t.encode_s) << ", \"image_ops\": " << num(t.image_ops_s) << ", \"steps\": [";
   for (std::size_t i = 0; i < t.step_s.size(); ++i) o << (i ? ", " : "") << num(t.step_s[i]);
@@ -238,7 +248,15 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
     << ", \"device_peak\": " << g(m.device_peak) << ", \"free_at_start\": " << g(m.free_at_start)
     << ", \"arena_creations\": " << m.arena_creations << ", \"dit_parked_for_text_encoder\": " << tf(m.dit_parked_for_text_encoder)
     << ", \"dit_parked_for_decode\": " << tf(m.dit_parked_for_decode) << ", \"dit_reloaded\": " << tf(m.dit_reloaded) << ", \"dit_loads\": " << m.dit_loads << "},\n";
-  o << " \"host_memory_gib\": {\"start\": " << g(m.host_private_start) << ", \"private_peak\": " << g(m.host_private_peak) << "},\n";
+  o << " \"host_memory_gib\": {\"start\": " << g(m.host_private_start) << ", \"private_peak\": " << g(m.host_private_peak)
+    << ", \"host_copies\": " << g(m.host_copy_bytes) << ", \"merge_memo\": " << g(m.merge_memo_bytes) << "},\n";
+  // How the DiT's weights were read when the call loaded it (source "" when it was resident): from the files with
+  // direct or buffered I/O (and why buffered), or from a soft unload's host copy.
+  if (!r.preload_note.empty()) o << " \"preload_note\": " << json_escape(r.preload_note) << ",\n";
+  const DitLoadReport& dl = r.dit_load;
+  o << " \"dit_load\": {\"source\": " << (dl.source.empty() ? std::string("null") : json_escape(dl.source)) << ", \"io\": "
+    << (dl.io.empty() ? std::string("null") : json_escape(dl.io)) << ", \"note\": " << json_escape(dl.note)
+    << ", \"bytes\": " << dl.bytes << ", \"seconds\": " << num(dl.seconds) << ", \"gbps\": " << num(dl.gbps()) << "},\n";
   const auto& hw = r.hardware;
   o << " \"hardware\": {\"measured\": " << tf(hw.measured) << ", \"h2d_gbps\": " << num(hw.h2d_gbps) << ", \"host_gbps\": "
     << num(hw.host_gbps) << ", \"disk_gbps\": " << num(hw.disk_gbps) << ", \"bf16_tflops\": " << num(hw.bf16_tflops) << "},\n";

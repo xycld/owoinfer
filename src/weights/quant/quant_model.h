@@ -11,8 +11,14 @@
 //   int8_tensorwise (+ convrot / convrot_groupsize)  -> kInt8ConvRot(G) or kInt8Plain, raw bytes
 //   asym_w4a8_int8 (Lloyd-Max codebook or uniform), w6a8_int8, convrot_w4a4  -> decoded exactly to kInt8ConvRot
 //   convrot_w4a4 (INT4 activations), with IndexOptions::native_int4            -> kInt4ConvRot, raw packed bytes
+//   nvfp4 (E2M1 [N, K/2] hi_first, swizzled UE4M3 block scales, F32 weight_scale_2) -> kNvfp4, raw bytes as stored
+//     (nvfp4_codec.h). The NVIDIA ModelOpt convention (the same tensor names without a comfy_quant config; low-first
+//     nibbles and linear scales by default, indistinguishable by shape) is refused, as are pre_quant_scale, config
+//     fields of other formats and full_precision_matrix_mult (not honoured); a static input_scale is kept on the
+//     QuantLinear but ignored (the engine scales activations per token).
 // A fused DiT `layers.N.proj.qkv` ([3 * dim, dim] = cat([q, k, v], 0)) is split into proj.q / proj.k / proj.v by
-// row slices of every per-row tensor; the slices are plain byte ranges of the file.
+// row slices of every per-row tensor; the slices are plain byte ranges of the file (nvfp4: whole 128-row scale tiles,
+// so each third must be a multiple of 128 rows; the three parts share the tensor scale).
 //
 // For the engine a linear is what a GEMM consumes (QuantWeights): an INT8 [N, K] row-major weight with an f32
 // per-row scale [N] (y = (x_q . w_q^T) * s_x * s_w), or a bf16 [N, K] weight. Raw linears are uploaded or
@@ -60,7 +66,9 @@ struct QuantError : std::runtime_error {
 
 // kInt4ConvRot: the convrot_w4a4 weights kept packed (signed nibbles [N, K/2], even column in the low nibble, f32
 // per-row scale) for the INT4 GEMMs (kernels/quant4); only to_model_index(model, {.native_int4 = true}) gives it.
-enum class QuantFormat : std::uint8_t { kBF16, kInt8ConvRot, kInt8Plain, kInt4ConvRot };
+// kNvfp4: E2M1 [N, K/2] bytes (hi_first), UE4M3 block scales per 16 along K in the cuBLAS/CUTLASS swizzle and an F32
+// tensor scale (nvfp4_codec.h), for the sm_120a NVFP4 GEMMs (kernels/nvfp4).
+enum class QuantFormat : std::uint8_t { kBF16, kInt8ConvRot, kInt8Plain, kInt4ConvRot, kNvfp4 };
 const char* format_name(QuantFormat f);
 
 // How one GEMM's weight is quantized.
@@ -72,10 +80,11 @@ struct QuantSpec {
   static QuantSpec int8_convrot(int g) { return {QuantFormat::kInt8ConvRot, g}; }
   static QuantSpec int8_plain() { return {QuantFormat::kInt8Plain, 0}; }
   static QuantSpec int4_convrot(int g) { return {QuantFormat::kInt4ConvRot, g}; }
+  static QuantSpec nvfp4() { return {QuantFormat::kNvfp4, 0}; }
   bool quantized() const { return format != QuantFormat::kBF16; }
   bool operator==(const QuantSpec&) const = default;
 };
-std::string describe(const QuantSpec& s);  // "bf16", "int8_convrot256", "int8_plain", "int4_convrot256"
+std::string describe(const QuantSpec& s);  // "bf16", "int8_convrot256", "int8_plain", "int4_convrot256", "nvfp4"
 
 // How the stored bytes become the spec's weight (+ scale).
 enum class Encoding : std::uint8_t {
@@ -84,6 +93,7 @@ enum class Encoding : std::uint8_t {
   kW4A8,         // asym_w4a8_int8: 4-bit codes [N, K/2], e4m3 group scales, F32 s_channel, optional codebook
   kW6A8,         // w6a8_int8: 6-bit codes [N, 3K/4], e4m3 group scales, F32 s_channel
   kW4A4,         // convrot_w4a4: signed nibbles [N, K/2], F32 per-row scale
+  kNvfp4Raw,     // nvfp4: U8 [N, K/2] + swizzled F8_E4M3 block scales + F32 scalar tensor scale, used as stored
 };
 const char* encoding_name(Encoding e);
 
@@ -98,7 +108,10 @@ struct QuantLinear {
   Encoding encoding = Encoding::kRaw;
   std::int64_t n = 0, k = 0;
   weights::IndexedTensor weight;
-  std::optional<weights::IndexedTensor> scale;      // kRaw int8, kScalarScale, kW4A4
+  std::optional<weights::IndexedTensor> scale;      // kRaw int8, kScalarScale, kW4A4; kNvfp4Raw: the block scales,
+                                                    // F8_E4M3 or U8 [round_up(N,128), round_up(K/16,4)] (swizzled)
+  std::optional<weights::IndexedTensor> scale_2;    // kNvfp4Raw: F32 scalar tensor scale (weight_scale_2)
+  std::optional<weights::IndexedTensor> input_scale;  // kNvfp4Raw: a static activation scale; ignored (per-token)
   std::optional<weights::IndexedTensor> s_rel;      // kW4A8 / kW6A8: F8_E4M3 [N, K / quant_group]
   std::optional<weights::IndexedTensor> s_channel;  // kW4A8 / kW6A8: F32 [N]
   std::optional<weights::IndexedTensor> codebook;   // kW4A8: F32 [16]; absent = uniform codes (code - 8)
@@ -109,7 +122,8 @@ struct QuantLinear {
   bool int8_activations = false;   // kW4A4 with linear_dtype "int8": INT8 activations (W4A8 compute), never native INT4
   std::string source_module;    // module name in the file (e.g. "layers.3.proj.qkv")
 
-  bool needs_decode() const { return encoding != Encoding::kRaw; }
+  // Encodings that must be decoded to the INT8 grid before an engine GEMM can use them (nvfp4 is consumed natively).
+  bool needs_decode() const { return encoding != Encoding::kRaw && encoding != Encoding::kNvfp4Raw; }
 };
 
 struct QuantModel {
@@ -143,8 +157,10 @@ bool is_gemm_module(ModelKind kind, std::string_view module);
 struct QuantWeights {
   QuantSpec spec;
   std::int64_t n = 0, k = 0;
-  const void* weight = nullptr;  // bf16 or int8 [n, k] row-major; kInt4ConvRot: packed int4 [n, k/2] bytes
-  const float* scale = nullptr;  // [n] per-row scale; null for bf16
+  const void* weight = nullptr;  // bf16 or int8 [n, k] row-major; kInt4ConvRot / kNvfp4: packed [n, k/2] bytes
+  const float* scale = nullptr;  // [n] per-row scale; null for bf16 and kNvfp4
+  const std::uint8_t* block_scale = nullptr;  // kNvfp4: swizzled UE4M3 [round_up(n,128) * round_up(k/16,4)] bytes
+  float tensor_scale = 0.0f;                  // kNvfp4: the F32 weight_scale_2 (a host value, the GEMM's alpha)
   const void* bias = nullptr;    // [n] in bias_dtype, or null
   DType bias_dtype = DType::kBF16;
   Device device = Device::kCPU;
@@ -153,10 +169,13 @@ struct QuantWeights {
 // The model as a weights::ModelIndex with the engine's group names (weights::classify_tensor, so they equal
 // build_index's: DiT "globals", "text_embedder", "block.N"; TE "embed_tokens", "layers.N" with layer_type,
 // "final_norm"), plus every linear's spec. A raw linear contributes `<module>.weight` (bf16 or I8 [N, K]) and, when
-// quantized, `<module>.weight_scale` (F32 [N]) plus `<module>.bias`.
+// quantized, `<module>.weight_scale` (F32 [N]) plus `<module>.bias`. An nvfp4 linear contributes `<module>.weight`
+// (U8 [N, K/2]) and `<module>.weight_scale` (U8, the swizzled block scales, [round_up(N,128), round_up(K/16,4)]); its
+// tensor scale is read here (4 bytes, shared by the parts of a fused qkv) and kept in tensor_scales, not uploaded.
 struct QuantIndex {
   weights::ModelIndex index;
   std::map<std::string, QuantSpec, std::less<>> specs;  // canonical module name -> spec, bf16 linears included
+  std::map<std::string, float, std::less<>> tensor_scales;  // nvfp4 linears: module -> weight_scale_2
 
   const QuantSpec* find_spec(std::string_view module) const;
 };
@@ -168,12 +187,15 @@ struct IndexOptions {
   bool native_int4 = false;
 };
 
-// Reads each quantized linear's scales (a few MB in all) to validate them. Throws QuantError if a linear needs
-// decoding (convert it first), a stored scale is invalid or a tensor has no group.
+// Reads each quantized linear's scales to validate them (a few MB in all for INT8; nvfp4 block scales are 1/32 of the
+// weight bytes, ~130 MB for a half-NVFP4 DiT, checked non-negative, non-NaN and zero-padded). Throws QuantError if a
+// linear needs decoding (convert it first), a stored scale is invalid or a tensor has no group.
 QuantIndex to_model_index(const QuantModel& model, const IndexOptions& options = {});
 
 // The linear `module` out of a group uploaded from `index`: `<module>.weight` (+ `.weight_scale`, `.bias`); for
-// kInt4ConvRot the weight is the packed I8 [N, K/2] tensor and the view's k is 2 * K/2.
+// kInt4ConvRot the weight is the packed I8 [N, K/2] tensor and the view's k is 2 * K/2; for kNvfp4 the weight is
+// U8 [N, K/2] (k = 2 * K/2), `.weight_scale` the swizzled block scales and tensor_scale comes from index.tensor_scales;
+// the NVFP4 GEMMs also need K % 32 == 0 and 16-byte aligned weight and block scales (checked).
 // `expected` is the spec the caller's GEMM implements; it must equal the file's (index.specs), so a bf16 GEMM can
 // never consume INT8 bytes or a ConvRot256 kernel a ConvRot64 weight. Checks dtypes, shapes, contiguity, devices
 // and element alignment (host groups keep each tensor's file offset modulo 4096; files written by the safetensors
@@ -183,17 +205,25 @@ QuantWeights view(const QuantIndex& index, const weights::TensorMap& m, std::str
 // ---- CPU decode --------------------------------------------------------------------------------------------
 
 // Rows [row0, row0 + rows) of a quantized linear as the INT8 grid [rows, k] and per-row scales [rows], reading only
-// those rows from disk (any encoding). Throws QuantError for bf16 linears, bad ranges or invalid stored values
-// (NaN or negative group scales, non-finite codebook entries, per-row scales that are not finite and > 0).
+// those rows from disk (any encoding but nvfp4, which has no INT8 grid). Throws QuantError for bf16 and nvfp4 linears,
+// bad ranges or invalid stored values (NaN or negative group scales, non-finite codebook entries, per-row scales that
+// are not finite and > 0).
 void decode_rows(const QuantModel& model, const QuantLinear& l, std::int64_t row0, std::int64_t rows, std::int8_t* q,
                  float* scale);
 
 // The whole linear decoded (decode_rows over row chunks on `threads` threads, 0 = all cores); q is [n, k].
 void decode_linear(const QuantModel& model, const QuantLinear& l, std::int8_t* q, float* scale, int threads = 0);
 
-// Rows of any linear in the original basis as fp32 (bf16 widened; quantized: decode + un-rotate).
+// Rows of any linear in the original basis as fp32 (bf16 widened; quantized: decode + un-rotate; nvfp4:
+// dequantize_nvfp4_rows, comfy-kitchen's fp32 dequantization).
 void dequantize_linear_rows(const QuantModel& model, const QuantLinear& l, std::int64_t row0, std::int64_t rows,
                             float* out);
+
+// Rows of an nvfp4 linear dequantized on the CPU, into fp32 (`out`, comfy-kitchen's dequantize_nvfp4 to fp32) and/or
+// bf16 bits (`out_bf16`, its bf16 order: what ComfyUI computes for a bf16 model); either may be null. Reads only the
+// rows and their 128-row scale tiles; validates the scales read. Throws QuantError.
+void dequantize_nvfp4_linear_rows(const QuantModel& model, const QuantLinear& l, std::int64_t row0, std::int64_t rows,
+                                  float* out, std::uint16_t* out_bf16);
 
 // An embedding lookup on a linear-shaped table (Comfy-Org's TE embed_tokens): rows `ids` as bf16 bits, out is
 // [ids.size(), k]. Quantized rows are decoded and un-rotated in fp32 (dequantize_rows' order), then rounded to bf16:

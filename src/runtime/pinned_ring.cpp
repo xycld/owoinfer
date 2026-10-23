@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include "core/cuda_check.h"
+#include "util/path.h"
 
 namespace mi::runtime {
 
@@ -67,7 +69,25 @@ void PinnedRing::mark_enqueued(Slot& s) {
   stats_.chunks.fetch_add(1, std::memory_order_relaxed);
 }
 
+void PinnedRing::copy_pinned(const weights::FileReader& file, std::span<const Piece> pieces) {
+  for (const Piece& p : pieces) {
+    if (p.size == 0) continue;
+    if (p.file_offset > file.size() || p.size > file.size() - p.file_offset) {
+      throw weights::IoError(util::path_utf8(file.path()) + ": read of " + std::to_string(p.size) + " bytes at offset " +
+                             std::to_string(p.file_offset) + " is past end of file");
+    }
+    MI_CUDA_CHECK(cudaMemcpyAsync(p.dst, file.memory() + p.file_offset, p.size, cudaMemcpyHostToDevice, copy_stream_));
+    stats_.bytes.fetch_add(p.size, std::memory_order_relaxed);
+  }
+  mark_enqueued(next_slot());
+}
+
 void PinnedRing::copy_range(const weights::FileReader& file, std::uint64_t file_offset, std::size_t size, void* dst) {
+  if (file.pinned()) {
+    const Piece piece{file_offset, size, dst};
+    copy_pinned(file, std::span<const Piece>(&piece, 1));
+    return;
+  }
   auto* out = static_cast<std::byte*>(dst);
   while (size > 0) {
     // Chunks after the first end on a kDirectAlign boundary, so they start aligned (skip == 0).
@@ -101,6 +121,10 @@ void PinnedRing::copy_host(const void* src, std::size_t size, void* dst) {
 }
 
 void PinnedRing::copy_pieces(const weights::FileReader& file, std::span<const Piece> pieces) {
+  if (file.pinned()) {
+    copy_pinned(file, pieces);
+    return;
+  }
   std::size_t i = 0;
   while (i < pieces.size()) {
     const Piece& first = pieces[i];

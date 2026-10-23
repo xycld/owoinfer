@@ -16,6 +16,8 @@
 #pragma once
 
 #include <cstddef>
+#include <filesystem>
+#include <string_view>
 
 namespace mi::planner {
 
@@ -31,7 +33,41 @@ struct HostMemory {
 HostMemory process_host_memory();
 
 // Host RAM still available to new allocations without swapping (Linux MemAvailable, Windows ullAvailPhys); 0 if
-// unknown.
+// unknown. Linux: capped by the process's memory cgroup (cgroup_memory()), so a container's limit counts rather than
+// the host's free memory.
 std::size_t host_available_bytes();
+
+// The process's memory-cgroup limit and headroom (Linux; never limited elsewhere). Pure apart from reading the cgroup
+// files under `root` ("/" for the machine, a fixture directory in tests): `self_cgroup` is /proc/self/cgroup's text,
+// `mountinfo` /proc/self/mountinfo's. The cgroup directory is resolved through the mount that holds it (its root and
+// mount point: a container, or a namespace with the host's /sys/fs/cgroup bind-mounted, sees its own cgroup at the
+// mount point); a path that does not exist falls back to the mount point. cgroup v2 first: at the cgroup and every
+// ancestor up to the mount point, limit = min(memory.max, memory.high) and used = memory.current - inactive_file
+// (memory.stat; reclaimable page cache is not "used": kubelet's working-set rule); the tightest headroom (limit - used)
+// wins. No v2 limit (a hybrid host): cgroup v1's memory controller, with memory.limit_in_bytes (2^62 and above: none),
+// memory.usage_in_bytes and total_inactive_file. A limited cgroup's headroom is at least 1, so 0 never reads as
+// "unknown"; missing or malformed files count as no limit.
+struct CgroupMemory {
+  bool limited = false;
+  std::size_t limit = 0;
+  std::size_t headroom = 0;
+};
+CgroupMemory cgroup_memory(std::string_view self_cgroup, std::string_view mountinfo, const std::filesystem::path& root);
+// Host RAM of the machine (Linux MemTotal, capped by the memory cgroup's limit as above; Windows ullTotalPhys); 0 if
+// unknown.
+std::size_t host_total_bytes();
+
+// Host memory a large pinned or kept copy the engine holds on its own initiative (a pinned text-encoder copy, a soft
+// unload's DiT copy) must leave available: max(8 GiB, 25 % of the machine's RAM). Page-locked memory cannot be swapped
+// or reclaimed, and the OS, the page cache and other applications need room around it.
+inline constexpr std::size_t kHostPinMarginFloor = std::size_t{8} << 30;
+inline std::size_t host_pin_margin(std::size_t host_total) {
+  return host_total / 4 > kHostPinMarginFloor ? host_total / 4 : kHostPinMarginFloor;
+}
+// Whether holding `needed` bytes of host memory still leaves host_pin_margin(host_total) of `room` (what the system can
+// still give the process; 0 = unknown: never fits).
+inline bool fits_pin_margin(std::size_t needed, std::size_t room, std::size_t host_total) {
+  return room != 0 && needed <= room && room - needed >= host_pin_margin(host_total);
+}
 
 }  // namespace mi::planner

@@ -592,7 +592,7 @@ struct TextEncoder::Impl {
   void release_quant_scratch();
   void check_decode();
   void create_streaming_resources();
-  void load_host();
+  void load_host(const std::atomic<bool>* cancel = nullptr);
   std::vector<LayerPlan> plan_layers(const std::vector<void*>& bufs) const;
   void reader_loop(std::size_t r, const std::vector<LayerPlan>& plans, StreamSync& sync,
                    std::vector<std::uint64_t>& layer_bytes, std::uint64_t& chunks, const ReaderHook& hook);
@@ -636,8 +636,8 @@ void TextEncoder::Impl::create_streaming_resources() {
   for (int i = 0; i < kNumTimingEvents; ++i) MI_CUDA_CHECK(cudaEventCreate(&timing.emplace_back()));
 }
 
-// Reads every layer group into host memory, groups spread over the reader threads.
-void TextEncoder::Impl::load_host() {
+// Reads every layer group into host memory, groups spread over the reader threads; `cancel` is checked between groups.
+void TextEncoder::Impl::load_host(const std::atomic<bool>* cancel) {
   if (!host_layers.empty()) return;
   const weights::HostMemory mem =
       opts.source == WeightSource::kHostPinned ? weights::HostMemory::kPinned : weights::HostMemory::kPlain;
@@ -652,6 +652,7 @@ void TextEncoder::Impl::load_host() {
         try {
           MI_CUDA_CHECK(cudaSetDevice(device));
           for (int i = t; i < kNumLayers; i += opts.reader_threads) {
+            if (cancel != nullptr && cancel->load()) return;
             loaded[static_cast<std::size_t>(i)] = weights::load_group_to_host(readers, *layers[static_cast<std::size_t>(i)].group, mem);
           }
         } catch (...) {
@@ -663,6 +664,7 @@ void TextEncoder::Impl::load_host() {
   for (const auto& e : errors) {
     if (e) std::rethrow_exception(e);
   }
+  if (cancel != nullptr && cancel->load()) throw Cancelled();
   host_layers = std::move(loaded);
 }
 
@@ -1020,11 +1022,31 @@ std::size_t TextEncoder::host_bytes(const QuantTextModel& model, const EncoderOp
   return host_bytes_impl(model.index(), &model, options);
 }
 
-void TextEncoder::preload_host() {
-  if (host_resident(impl_->opts)) impl_->load_host();
+void TextEncoder::preload_host(const std::atomic<bool>* cancel) {
+  if (host_resident(impl_->opts)) impl_->load_host(cancel);
 }
 
 void TextEncoder::release_host() { impl_->host_layers.clear(); }
+
+std::vector<weights::HostGroup> TextEncoder::share_host() const { return impl_->host_layers; }
+
+void TextEncoder::adopt_host(std::vector<weights::HostGroup> layers) {
+  if (!host_resident(impl_->opts)) {
+    throw std::invalid_argument("qwen35_text::adopt_host: the encoder's weight source is not host-resident");
+  }
+  if (layers.size() != static_cast<std::size_t>(kNumLayers)) {
+    throw std::invalid_argument("qwen35_text::adopt_host: one group per layer expected");
+  }
+  for (std::size_t i = 0; i < layers.size(); ++i) {
+    for (const weights::IndexedTensor& t : impl_->layers[i].group->tensors) {
+      const auto it = layers[i].tensors.find(t.name);
+      if (it == layers[i].tensors.end() || it->second.nbytes() != t.nbytes) {
+        throw std::invalid_argument("qwen35_text::adopt_host: layer " + std::to_string(i) + " does not hold " + t.name);
+      }
+    }
+  }
+  impl_->host_layers = std::move(layers);
+}
 
 std::size_t TextEncoder::host_resident_bytes() const {
   std::size_t total = 0;

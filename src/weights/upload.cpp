@@ -3,12 +3,16 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <exception>
 #include <new>
 #include <numeric>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include "core/cuda_check.h"
+#include "weights/test_seams.h"
 
 namespace mi::weights {
 
@@ -86,9 +90,83 @@ const FileReader& ReaderCache::get(std::uint32_t file_id) {
   std::lock_guard<std::mutex> lock(mu_);
   auto it = readers_.find(file_id);
   if (it == readers_.end()) {
-    it = readers_.emplace(file_id, std::make_unique<FileReader>(index_.file_path(file_id), direct_)).first;
+    const std::filesystem::path path = index_.file_path(file_id);
+    std::unique_ptr<FileReader> reader;
+    if (host_ != nullptr) {
+      if (const auto held = host_->files.find(path); held != host_->files.end()) {
+        reader = std::make_unique<FileReader>(path, held->second.data, held->second.size, held->second.pinned);
+      }
+    }
+    if (!reader) reader = std::make_unique<FileReader>(path, direct_);
+    it = readers_.emplace(file_id, std::move(reader)).first;
   }
   return *it->second;
+}
+
+bool ReaderCache::all_direct() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (readers_.empty()) return false;
+  return std::all_of(readers_.begin(), readers_.end(), [](const auto& r) { return r.second->direct(); });
+}
+
+std::uint64_t HostFiles::bytes() const {
+  std::uint64_t total = 0;
+  for (const auto& [path, f] : files) total += f.size;
+  return total;
+}
+
+HostFiles read_files_to_host(const std::vector<std::filesystem::path>& paths, bool pinned, bool direct, int threads,
+                             const std::atomic<bool>* cancel) {
+  constexpr std::size_t kChunk = std::size_t{64} << 20;  // a multiple of kDirectAlign: every chunk starts aligned
+  HostFiles out;
+  for (const std::filesystem::path& path : paths) {
+    if (out.files.count(path) != 0) continue;
+    const FileReader reader(path, direct);
+    const std::uint64_t size = reader.size();
+    // Rounded up to kDirectAlign: a direct read of the last chunk may fill its whole aligned tail.
+    const std::size_t alloc = static_cast<std::size_t>((size + kDirectAlign - 1) / kDirectAlign * kDirectAlign);
+    std::byte* raw = nullptr;
+    std::shared_ptr<std::byte> storage;
+    if (pinned) {
+      testing::check_pinned_alloc(alloc);
+      MI_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&raw), std::max<std::size_t>(alloc, 1), cudaHostAllocDefault));
+      storage.reset(raw, [](std::byte* p) { cudaFreeHost(p); });
+    } else {
+      raw = static_cast<std::byte*>(::operator new(std::max<std::size_t>(alloc, 1), std::align_val_t{kDirectAlign}));
+      storage.reset(raw, [](std::byte* p) { ::operator delete(p, std::align_val_t{kDirectAlign}); });
+    }
+    const std::uint64_t chunks = (size + kChunk - 1) / kChunk;
+    std::atomic<std::uint64_t> next{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::exception_ptr> errors(static_cast<std::size_t>(std::max(1, threads)));
+    {
+      std::vector<std::jthread> workers;
+      for (int t = 0; t < std::max(1, threads); ++t) {
+        workers.emplace_back([&, t] {
+          try {
+            for (std::uint64_t c = next++; c < chunks && !stop.load(); c = next++) {
+              if (cancel != nullptr && cancel->load()) {
+                stop.store(true);
+                return;
+              }
+              const std::uint64_t offset = c * kChunk;
+              const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, size - offset));
+              reader.read_aligned(offset, n, raw + offset, alloc - static_cast<std::size_t>(offset));
+            }
+          } catch (...) {
+            errors[static_cast<std::size_t>(t)] = std::current_exception();
+            stop.store(true);
+          }
+        });
+      }
+    }
+    for (const auto& e : errors) {
+      if (e) std::rethrow_exception(e);
+    }
+    if (cancel != nullptr && cancel->load()) return {};
+    out.files.emplace(path, HostFiles::File{std::move(storage), size, pinned});
+  }
+  return out;
 }
 
 std::size_t group_device_bytes(const WeightGroup& group) {
@@ -182,6 +260,7 @@ HostGroup load_group_to_host(ReaderCache& readers, const WeightGroup& group, Hos
   std::byte* raw = nullptr;
   std::shared_ptr<std::byte> storage;
   if (memory == HostMemory::kPinned) {
+    testing::check_pinned_alloc(total);
     MI_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&raw), std::max<std::size_t>(total, 1), cudaHostAllocDefault));
     storage.reset(raw, [](std::byte* p) { cudaFreeHost(p); });
   } else {

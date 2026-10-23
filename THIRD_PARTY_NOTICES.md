@@ -5,7 +5,7 @@ the upstream licence file; its `VENDORED.md` lists what was kept and what was ch
 
 | Component | Licence | Copyright | Upstream (commit) | In this repository |
 |---|---|---|---|---|
-| CUTLASS / CuTe (C++ headers) | BSD-3-Clause | Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES | https://github.com/NVIDIA/cutlass, v4.7.1 (`cb4247394dd82148787aed73e5dc7cef33cbf862`) | `third_party/cutlass/` (licence: `LICENSE.txt`). `UpGateScaleBroadcast` in `src/kernels/quant/int8_gemm_impl.cuh` derives from its `VisitorRowBroadcast`; `LoraGemmKernel` and `VisitorKernel` in `src/kernels/lora/lora_gemm_kernel.cuh` are adapted from its `GemmWithEpilogueVisitor` and `DefaultGemmWithVisitor` (Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES) |
+| CUTLASS / CuTe (C++ headers) | BSD-3-Clause | Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES | https://github.com/NVIDIA/cutlass, v4.7.1 (`cb4247394dd82148787aed73e5dc7cef33cbf862`) | `third_party/cutlass/` (licence: `LICENSE.txt`). `UpGateScaleBroadcast` in `src/kernels/quant/int8_gemm_impl.cuh` derives from its `VisitorRowBroadcast`; `LoraGemmKernel` and `VisitorKernel` in `src/kernels/lora/lora_gemm_kernel.cuh` are adapted from its `GemmWithEpilogueVisitor` and `DefaultGemmWithVisitor` (Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES); `src/kernels/nvfp4/gemm_sm120a_impl.cuh` follows its example `79a_blackwell_geforce_nvfp4_bf16_gemm.cu` |
 | FlashAttention-2 (forward kernel headers) | BSD-3-Clause | Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file (Tri Dao) | https://github.com/Dao-AILab/flash-attention, v2.8.3 (`060c9188beec3a8b62b33a3bfa6d5d2d44975fab`) | `third_party/flash-attention/` (`LICENSE`, `AUTHORS`), launched from `src/kernels/attention/` |
 | SageAttention (CUDA headers) | Apache-2.0 | Copyright 2024 Jintao Zhang, Haofeng Huang (file headers: Copyright (c) 2024 by SageAttention team). Embedded, also Apache-2.0: FlashInfer team 2023, adapted from flashinfer v0.1.5 (`cp_async.cuh`, `math.cuh`, `mma.cuh`, `permuted_smem.cuh`); vLLM team 2023 and NVIDIA 2020–2023 from FasterTransformer (`reduction_utils.cuh`) | https://github.com/thu-ml/SageAttention (`d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5`) | `third_party/sageattention/` (`LICENSE`, identical to upstream's). `attn_utils.cuh`, `qk_int_sv_f8_cuda_sm89.cuh` and `qk_int_sv_f16_cuda_sm80.cuh` are modified and each carries a "MossInfer modifications" notice. Launchers in `src/kernels/attention_q8/`; `q8_preprocess.cu` there derives from upstream `csrc/fused/fused.cu`. Upstream has no NOTICE file |
 | comfy-kitchen | Apache-2.0 | Copyright (c) 2025 Comfy Org | https://github.com/Comfy-Org/comfy-kitchen (`dba9fac464e93143146f9bafa4f9cb0a9a116bc5`) | `src/kernels/quant/int8_gemm_impl.cuh` is adapted from `comfy_kitchen/backends/cuda/ops/cutlass_gemm_int8.cu` (modified; the file says how). `src/kernels/quant/` and `src/weights/quant/` reproduce its INT8 ConvRot math (rotation order, quantization, dequantization). `src/kernels/quant4/int4_gemm_impl.cuh` adapts `FusedInt4Gemm` from `comfy_kitchen/backends/cuda/ops/convrot_w4a4.cu`, and `src/kernels/quant4/` with `src/weights/quant/convrot_w4a4.*` reproduce its W4A4 ConvRot quantization math |
@@ -32,6 +32,11 @@ our code reproduces a numeric operation order, that order is a functional requir
 underlying methods are published (Karras et al. 2022; Lu et al. 2022, DPM-Solver++; Cui et al. 2023, ER-SDE-Solver;
 Zhang et al. 2023, arXiv 2308.02157). The same applies to the official MOSS-Image pipeline and diffusers, used as
 references for exactness.
+
+The NVFP4 codec and reader (`src/weights/quant/nvfp4_codec.*`, the `nvfp4` case of `src/weights/quant/quant_model.*`)
+are written from the format definition (NVIDIA's NVFP4 description, the cuBLAS 1D block-scaling layout and CUTLASS's
+`Sm1xxBlockScaledConfig`) and ComfyUI's public `comfy_quant` `nvfp4` file convention. They were checked bit for bit
+against comfy-kitchen's eager NVFP4 functions, used only as a test oracle; `tests/data/nvfp4/` holds program outputs.
 
 ## comfy-kitchen NOTICE
 

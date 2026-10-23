@@ -94,11 +94,12 @@ class Planner {
     if (r_.decode && in_.workspaces.decode == 0) throw std::invalid_argument("planner: decode requested without its workspace");
     cap_ = arena_cap(in_.budgets);
     const Budgets& b = in_.budgets;
+    system_limit_ = b.host_available == 0 ? std::numeric_limits<std::size_t>::max()
+                                          : sat_sub(b.host_private_now + b.host_available, kHostHeadroom);
     if (b.host_budget != 0) {
       host_limit_ = host_target_ = b.host_budget;
     } else {
-      host_limit_ = b.host_available == 0 ? std::numeric_limits<std::size_t>::max()
-                                          : sat_sub(b.host_private_now + b.host_available, kHostHeadroom);
+      host_limit_ = system_limit_;
       const std::size_t preset = in_.mode == Mode::kMinMemory ? kMinMemoryHostTarget
                                  : in_.mode == Mode::kBalanced ? kBalancedHostTarget
                                                                : host_limit_;
@@ -109,14 +110,21 @@ class Planner {
   // Seconds to load the DiT of `d` from the weight files: its persistent bytes, plus a pinned host copy.
   double load_seconds(const DitPlan& d) const {
     const std::size_t bytes = dit_persistent(d) + (d.source == DitSource::kHostPinned ? dit_streamed_bytes(d) : 0);
-    return static_cast<double>(bytes) / (weight_rate_gbps(false, r_.dit_weights_cached) * 1e9);
+    return static_cast<double>(bytes) / (load_rate_gbps() * 1e9);
+  }
+  // A DiT load's rate (the first load; prefer_held's reload): the page cache when the files are expected there, else the
+  // measured direct-I/O load rate (the pipeline reads a cold DiT with direct I/O), else the cold-disk rate. Parking
+  // reloads read buffered (evaluate).
+  double load_rate_gbps() const {
+    if (r_.dit_weights_cached || hw_.direct_gbps <= 0) return weight_rate_gbps(false, r_.dit_weights_cached);
+    return std::max(1e-3, std::min(hw_.direct_gbps, hw_.h2d_gbps));
   }
 
   ExecutionPlan run() {
     std::vector<Candidate> all = enumerate();
     std::vector<const Candidate*> feasible;
     for (const Candidate& c : all) {
-      if (c.device() <= cap_ && c.host_without_cache + kCacheFloor <= host_limit_) feasible.push_back(&c);
+      if (c.device() <= cap_ && c.host_without_cache + kCacheFloor <= host_limit_ && pin_room(c)) feasible.push_back(&c);
     }
     if (feasible.empty()) throw_budget_error(all);
     const Candidate* best = *std::min_element(feasible.begin(), feasible.end(),
@@ -126,6 +134,37 @@ class Planner {
 
  private:
   bool te_runs() const { return !r_.text_lengths.empty() && !r_.te_cached; }
+
+  bool pinned_te(const Candidate& c) const {
+    return c.te.run && c.te.residency == TeResidency::kHostResident && c.te.pinned;
+  }
+  std::size_t pin_margin() const { return host_pin_margin(in_.budgets.host_total); }
+  // Why kAuto does not pin the encoder in this mode on this machine (empty: it may, given the room).
+  std::string auto_pin_refusal() const {
+    if (in_.mode == Mode::kMinMemory) return "min_memory holds no copy";
+    if (in_.caps.te_quantized) return {};
+    if (in_.mode != Mode::kMaxSpeed) return "balanced keeps the bf16 encoder streamed (te_host_pin on pins it)";
+    if (in_.budgets.host_total == 0) return "machine RAM unknown";
+    if (in_.budgets.host_total < kTeBf16PinMinRam) {
+      return "the bf16 encoder is pinned only on machines with " + gib(kTeBf16PinMinRam) + " of RAM or more";
+    }
+    return {};
+  }
+  // Whether a pinned text-encoder copy may be planned (te_pin, the file comment): kOn within the host limit (the
+  // feasibility check), kAuto where its mode and the RAM allow it and the copy with the embedding cache leaves
+  // pin_margin() of the system's available memory free, even under an explicit host budget.
+  bool pin_room(const Candidate& c) const {
+    if (!pinned_te(c) || in_.caps.te_pin == TeHostPin::kOn) return true;
+    if (in_.caps.te_pin == TeHostPin::kOff || !auto_pin_refusal().empty()) return false;
+    return fits_pin_margin(c.host_without_cache + cache_bytes(c), system_limit_, in_.budgets.host_total);
+  }
+  // The host-private target a candidate is held to: balanced keeps a pinned copy it may plan (a quantized encoder under
+  // kAuto, any under kOn) above its target; an explicit host budget is the target itself.
+  std::size_t target_for(const Candidate& c) const {
+    const bool kept = in_.mode == Mode::kBalanced && in_.budgets.host_budget == 0 && pinned_te(c) &&
+                      (in_.caps.te_quantized || in_.caps.te_pin == TeHostPin::kOn);
+    return host_target_ + (kept ? s_.te_stream_bytes : 0);
+  }
 
   std::size_t dit_nonblock_bytes() const {
     return sat_sub(s_.dit_bytes, static_cast<std::size_t>(s_.dit_blocks) * s_.dit_block_bytes);
@@ -161,7 +200,10 @@ class Planner {
     // ~2 FLOPs per bf16 weight (1 param) per token.
     const double compute = static_cast<double>(s_.te_stream_bytes) * static_cast<double>(tokens) / (tflops() * 1e12);
     if (te.residency == TeResidency::kVramResident) return compute;
-    const double rate = weight_rate_gbps(te.residency == TeResidency::kHostResident, r_.weights_cached) * 1e9;
+    const double rate = (te.residency == TeResidency::kHostResident && te.pinned
+                             ? std::max(1e-3, hw_.h2d_gbps)
+                             : weight_rate_gbps(te.residency == TeResidency::kHostResident, r_.weights_cached)) *
+                        1e9;
     const double load = static_cast<double>(s_.te_stream_bytes) / rate;
     // One buffer: every layer's copy and compute in series. Two or more: copies overlap compute except for one
     // layer's worth (the first copy or the last compute).
@@ -263,6 +305,7 @@ class Planner {
     c.host_without_cache = host;
 
     c.time.text_encoder_s = te_seconds(c.te);
+    // Parking reloads read buffered (the pipeline keeps the files in the page cache for the next one).
     c.time.dit_load_s = c.parks() ? static_cast<double>(s_.dit_bytes) / (weight_rate_gbps(false, r_.dit_weights_cached) * 1e9) : 0;
     c.time.denoise_s = step_seconds(c.dit) * r_.steps;
     c.time.decode_s = decode_seconds(c.vae);
@@ -275,7 +318,12 @@ class Planner {
     } else {
       const int max_buffers = std::max(1, in_.caps.te_max_buffers);
       for (int b = 1; b <= max_buffers; ++b) tes.push_back({true, TeResidency::kStreamed, b});
-      if (in_.caps.te_host_resident) tes.push_back({true, TeResidency::kHostResident, max_buffers});
+      if (in_.caps.te_host_resident && in_.caps.te_host_pageable) {
+        tes.push_back({true, TeResidency::kHostResident, max_buffers, false});
+      }
+      if (in_.caps.te_host_resident && in_.caps.te_host_pinned && in_.caps.te_pin != TeHostPin::kOff) {
+        tes.push_back({true, TeResidency::kHostResident, max_buffers, true});
+      }
       if (in_.caps.te_vram_resident) tes.push_back({true, TeResidency::kVramResident, 0});
     }
     std::vector<VaePlan> vaes;
@@ -384,7 +432,7 @@ class Planner {
     const std::size_t preset = in_.mode == Mode::kMinMemory ? kCacheMinMemory
                                : in_.mode == Mode::kBalanced ? kCacheBalanced
                                                              : kCacheMaxSpeed;
-    return std::max(kCacheFloor, std::min(preset, sat_sub(host_target_, c.host_without_cache)));
+    return std::max(kCacheFloor, std::min(preset, sat_sub(target_for(c), c.host_without_cache)));
   }
 
   // balanced / max_speed: a DiT that fits whole stays whole (streaming only when it does not, even where streaming a
@@ -392,7 +440,7 @@ class Planner {
   // across requests), and streaming beats parking.
   using RankKey = std::tuple<bool, bool, bool, std::size_t, std::size_t, double, double>;
   RankKey rank(const Candidate& c) const {
-    const bool over_target = c.host_without_cache + cache_bytes(c) > host_target_;
+    const bool over_target = c.host_without_cache + cache_bytes(c) > target_for(c);
     const std::size_t host = c.host_without_cache + cache_bytes(c);
     if (in_.mode == Mode::kMinMemory) {
       return {over_target, false, false, c.arena, host, c.time.total_s(), 0.0};
@@ -443,8 +491,9 @@ class Planner {
         return "streamed from the weight files with " + std::to_string(t.buffers) + " device layer buffer" +
                (t.buffers == 1 ? " (synchronous)" : "s (layer k+1 copied while layer k runs)");
       case TeResidency::kHostResident:
-        return "host-resident (" + gib(s_.te_stream_bytes) + " private), streamed with " + std::to_string(t.buffers) +
-               " layer buffers";
+        return "host-resident (" + gib(s_.te_stream_bytes) + (t.pinned ? " pinned" : "") +
+               " private, kept across requests), streamed with " + std::to_string(t.buffers) + " layer buffers" +
+               (t.pinned ? " at the pinned H2D rate" : "");
       case TeResidency::kVramResident:
         return "VRAM-resident (" + gib(s_.te_stream_bytes) + ")";
     }
@@ -500,6 +549,28 @@ class Planner {
     if (best.parks()) {
       s += "\nParking is the fallback: no configuration keeping the DiT resident fits the " + gib(cap_) + " cap.";
     }
+    if (pinned_te(best)) {
+      s += "\nThe text encoder stays in RAM (pinned" + std::string(in_.caps.te_pin == TeHostPin::kOn ? ", te_host_pin on" : "") +
+           ")" + (target_for(best) > host_target_ ? " above balanced's " + gib(host_target_) + " host target" : std::string()) +
+           ": a prompt cache miss streams it at the pinned H2D rate; the system keeps " +
+           (system_limit_ == std::numeric_limits<std::size_t>::max()
+                ? std::string("an unknown amount of memory")
+                : gib(sat_sub(system_limit_, best.host_without_cache + cache_bytes(best)))) +
+           " available with it.";
+    } else if (best.te.run && best.te.residency != TeResidency::kHostResident && in_.caps.te_host_resident &&
+               in_.caps.te_host_pinned) {
+      std::string why = in_.caps.te_pin == TeHostPin::kOff ? std::string("te_host_pin off") : auto_pin_refusal();
+      if (why.empty()) {
+        for (const Candidate& c : all) {
+          if (pinned_te(c) && !pin_room(c) && c.device() <= cap_) {
+            why = "its pinned copy (" + gib(s_.te_stream_bytes) + ") would leave less than " + gib(pin_margin()) +
+                  " (max(8 GiB, 25 % of the RAM)) of the system's available memory";
+            break;
+          }
+        }
+      }
+      if (!why.empty() && in_.mode != Mode::kMinMemory) s += "\nThe text encoder is not kept in RAM: " + why + ".";
+    }
     if (best.dit.residency == DitResidency::kStreamed) {
       if (in_.mode == Mode::kMinMemory) {
         s += "\nmin_memory streams the DiT blocks to keep the device peak low.";
@@ -535,6 +606,7 @@ class Planner {
     p.arena_cap_bytes = cap_;
     p.host_private_bytes = c.host_without_cache + p.cache.host_bytes;
     p.host_target_bytes = host_target_;
+    p.host_held_target_bytes = target_for(c);
     p.host_limit_bytes = host_limit_;
     p.time = c.time;
 
@@ -592,6 +664,7 @@ class Planner {
   std::size_t cap_ = 0;
   std::size_t host_limit_ = 0;
   std::size_t host_target_ = 0;
+  std::size_t system_limit_ = 0;  // what the system allows (MemAvailable based) even under an explicit host budget
 };
 
 std::string json_string(const std::string& s) {
@@ -673,6 +746,22 @@ Mode parse_mode(std::string_view name) {
   if (name == "balanced") return Mode::kBalanced;
   if (name == "max_speed") return Mode::kMaxSpeed;
   throw std::invalid_argument("mode must be min_memory, balanced or max_speed, got \"" + std::string(name) + "\"");
+}
+
+const char* te_host_pin_name(TeHostPin p) {
+  switch (p) {
+    case TeHostPin::kAuto: return "auto";
+    case TeHostPin::kOn: return "on";
+    case TeHostPin::kOff: return "off";
+  }
+  return "?";
+}
+
+TeHostPin parse_te_host_pin(std::string_view name) {
+  if (name == "auto") return TeHostPin::kAuto;
+  if (name == "on") return TeHostPin::kOn;
+  if (name == "off") return TeHostPin::kOff;
+  throw std::invalid_argument("text-encoder pinning must be auto, on or off, got \"" + std::string(name) + "\"");
 }
 
 const char* residency_name(DitResidency r) {
@@ -1008,7 +1097,7 @@ std::string ExecutionPlan::to_json() const {
        ", \"park_for_decode\": " + b2s(dit.park_for_decode) + ", \"device_bytes\": " + std::to_string(dit.device_bytes) +
        ", \"graph_bytes\": " + std::to_string(dit.graph_bytes) + "}";
   o += ", \"text_encoder\": {\"run\": " + std::string(b2s(te.run)) + ", \"residency\": \"" + residency_name(te.residency) +
-       "\", \"buffers\": " + std::to_string(te.buffers) + "}";
+       "\", \"buffers\": " + std::to_string(te.buffers) + ", \"pinned\": " + b2s(te.pinned) + "}";
   o += ", \"vae\": {\"run\": " + std::string(b2s(vae.run)) + ", \"tiled\": " + b2s(vae.kind == VaeDecodeKind::kTiled) +
        ", \"tile\": " + std::to_string(vae.tile) + ", \"stack_bytes\": " + std::to_string(vae.stack_bytes) +
        ", \"relative_cost\": " + json_num(vae.cost) + "}";
@@ -1020,6 +1109,7 @@ std::string ExecutionPlan::to_json() const {
   o += ", \"arena_bytes\": " + std::to_string(arena_bytes) + ", \"device_peak_bytes\": " + std::to_string(device_peak_bytes) +
        ", \"arena_cap_bytes\": " + std::to_string(arena_cap_bytes) + ", \"host_private_bytes\": " +
        std::to_string(host_private_bytes) + ", \"host_target_bytes\": " + std::to_string(host_target_bytes) +
+       ", \"host_held_target_bytes\": " + std::to_string(host_held_target_bytes) +
        ", \"host_limit_bytes\": " + std::to_string(host_limit_bytes);
   o += ", \"time_s\": {\"text_encoder\": " + json_num(time.text_encoder_s) + ", \"dit_load\": " + json_num(time.dit_load_s) +
        ", \"denoise\": " + json_num(time.denoise_s) + ", \"decode\": " + json_num(time.decode_s) + ", \"total\": " +

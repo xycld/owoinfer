@@ -18,7 +18,7 @@ Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what
 |---|---|
 | Platform | Linux x86-64 and Windows x64 (MSVC), each in a `cu12` and a `cu13` flavour, as a full package and a `-system-cuda` package. CI builds, packages and runs the CPU tests of all four flavours; GPU runs are verified on Linux `cu13`. |
 | GPUs | NVIDIA compute capability 8.x and 12.x: RTX 30xx, RTX 40xx, RTX 50xx, A100/A10/A40, L4/L40, RTX PRO Blackwell |
-| Models | the official MOSS-Image Base and SFT Hugging Face folders (bf16), read in place |
+| Models | MOSS-Image Base and SFT only: the official Hugging Face folders (bf16), read in place, and fine-tunes with the same architecture; other models are refused when they load. See [Supported models](#supported-models). |
 | Component model files | a single-file DiT, text encoder or VAE next to the bundle folder: ComfyUI and community files, INT8 ConvRot and INT4 ConvRot DiT, INT8 ConvRot and W4A8 text encoder (`dit_file`, `text_encoder_file`, `vae_file`) |
 | Generation | text-to-image with the official app's parameters: prompt, negative prompt, size, steps, CFG, shift, seed, skip layers, skip-layer guidance |
 | Quality tier | `auto` (default: the fastest configuration with a quality certificate; 1.0 ships no certificates, so without one of your own the bf16 bundle runs Reference, and quantized files run their own GEMMs with exact attention, uncertified), `reference` (bf16, exact), `high` (the loaded weights plus 8-bit attention), `turbo` (an INT4 DiT file, chosen explicitly); the tier that ran is reported |
@@ -48,7 +48,7 @@ These are designed and partly built. The launcher can prepare for them now (see 
 
 **`moss-infer` only in 1.0.** These run from `moss-infer generate`, not through the C API or `moss-server`:
 - **Control LoRAs:** `--control <file>` loads a control adapter (a LoRA with a widened DiT input embedder, e.g. the MOSS-Image color / depth control) and `--control-scale S` sets its LoRA strength (default 1). Each `--control-image <kind>=<png|jpg>` gives the input of one of the adapter's kinds, and may be followed by `--control-strength X` (default 1, 0 to 10) and `--control-start X` / `--control-end X` (default 0 / 1: the share of the steps it applies to).
-- **Lossy accelerators**, off by default: `--cfg-truncation X` (0 to 1, default 1 = off) drops the negative branch from step X · steps on; `--step-cache fbcache` (default `off`) reuses DiT blocks 1..41 from the last full call while block 0's output changed by less than `--step-cache-threshold` (default 0.03). Both change the image and make the run uncertified. The tier is resolved as if they were off, so `auto` picks the same tier. The step cache's gain depends on the step count and size: at the default threshold it reused about 30 % of the DiT calls at 1024², 50 steps, and none at 768², 30 steps.
+- **Lossy accelerators**, off by default: `--cfg-truncation X` (0 to 1, default 1 = off) drops the negative branch from step X · steps on; `--step-cache fbcache` (default `off`) reuses DiT blocks 1..41 from the last full call while block 0's output changed by less than `--step-cache-threshold` (default 0.02 on the base model and 0.03 on the SFT model and its derived files; the report's `accelerators.step_cache_threshold` and `step_cache_threshold_source` say which ran). Both change the image and make the run uncertified. The tier is resolved as if they were off, so `auto` picks the same tier. The step cache's gain depends on the step count and size: at the default threshold it reused about 30 % of the DiT calls at 1024², 50 steps, and none at 768², 30 steps.
 - The report records them in `control` and `accelerators`, and `dit_stream.steps[i].cached` marks the steps that reused the cache.
 
 ### Not supported
@@ -65,6 +65,67 @@ These are designed and partly built. The launcher can prepare for them now (see 
 | An uncertified Turbo run under tier `auto` | not supported: `auto` refuses an INT4 DiT without a quality certificate (none exists yet). Choose `turbo` explicitly. |
 | Pixel data over the server protocol | not supported: the server takes image file paths |
 | Server output other than PNG | not supported |
+
+## Supported models
+
+The engine is built for one model architecture, MOSS-Image: a 5B DiT, the Qwen3.5-9B text encoder and the FLUX.2 small VAE decoder. Other models named MOSS, other sizes of MOSS-Image, and MOSS-Image files in formats not listed below do not run.
+
+**Official models.** The revisions below are the ones tested. Their weight files are byte-identical in every revision published so far (up to 2026-10-21), and in the ModelScope copies (`openmoss/MOSS-Image-Base`, `openmoss/MOSS-Image-SFT`).
+
+| Model | Hugging Face repository | Tested revision | Size |
+|---|---|---|---|
+| MOSS-Image Base | `OpenMOSS-Team/MOSS-Image-Base` | `32edbc8a53ff3117ed52af34ce27a031129f2d0e` | 27.2 GB |
+| MOSS-Image SFT | `OpenMOSS-Team/MOSS-Image-SFT` | `2c7954437269461767f533b006823e8f85973a60` | 27.2 GB |
+
+```sh
+hf download OpenMOSS-Team/MOSS-Image-Base --revision 32edbc8a53ff3117ed52af34ce27a031129f2d0e --local-dir MOSS-Image/base --exclude 'assets/*'
+hf download OpenMOSS-Team/MOSS-Image-SFT  --revision 2c7954437269461767f533b006823e8f85973a60 --local-dir MOSS-Image/sft  --exclude 'assets/*'
+```
+
+- **Fine-tunes** with the same architecture (the same config values, tensor names and shapes; class names may differ) load and run like the official folders. No quality certificate applies to them: certificates identify the official files.
+- **How the engine checks.** It identifies a model by its architecture, from configs and safetensors headers only (no hashing): the folder's `transformer/config.json`, `text_encoder/config.json` and `vae/config.json`, and the tensor names and shapes of the DiT and text-encoder files. Anything else fails the first generation with `MI_ERR_MODEL` (server: `model`), and `moss-infer index` refuses it too. The message names what was found, e.g.: `MOSS-Image/x is not a supported MOSS-Image model (found transformer num_layers 40 (MOSS-Image: 42)). Supported: OpenMOSS-Team/MOSS-Image-Base and -SFT; see docs/integration.md#supported-models`. A folder without `transformer/config.json` or `text_encoder/config.json` is reported as incomplete (`… (incomplete download, or not the model folder?)`), also `MI_ERR_MODEL`. A LoRA, control adapter or distill bundle file given as the DiT or text encoder is named as such.
+
+**Community files verified during 1.0/1.1 development.** Files loaded next to an official folder. The last column names the run:
+- **E24, E25:** the RTX 5090 runs in `docs/experiment-log.md`, on pre-release commits `211ef35` and `1b141ce` (ancestors of v1.0.0); images generated end to end.
+- **4090L:** RTX 4090 Laptop, the 1.1 development tree (2026-10-23); images generated end to end.
+- **Tests:** the GPU test suite loads the file and checks its results against reference values.
+
+The table will be verified again on the RTX 5090 before 1.1 ships. The revision is the one whose files were tested (same SHA-256); copies of the same file under another name work the same.
+
+| Repository (revision) | File | What it is | How it loads | Verified by |
+|---|---|---|---|---|
+| `Comfy-Org/MOSS-Image` (`24147db`) | `diffusion_models/moss_image_sft_int8_convrot.safetensors` | SFT DiT, INT8 ConvRot | `dit_file`, tier `high` | E25, 4090L |
+| `Comfy-Org/MOSS-Image` (`24147db`) | `text_encoders/qwen3.5_9b_int8_convrot.safetensors` | text encoder, INT8 ConvRot | `text_encoder_file` | 4090L, tests |
+| `Comfy-Org/MOSS-Image` (`24147db`) | `text_encoders/qwen3.5_9b_w4a8_gptq.safetensors` | text encoder, W4A8 GPTQ | `text_encoder_file` | 4090L, tests |
+| `Comfy-Org/MOSS-Image` (`24147db`) | `vae/flux2-vae.safetensors` | full FLUX.2 VAE (decoder and encoder) | `vae_file` | 4090L, tests |
+| `Comfy-Org/MOSS-Image` (`24147db`) | `vae/flux2-vae_small.safetensors` | FLUX.2 small VAE in fp32 (the folder's VAE is the same model rounded to bf16) | `vae_file` | tests |
+| `Comfy-Org/MOSS-Image` (`24147db`) | `loras/moss_image_color_depth_control.safetensors` | colour and depth control adapter (the same file as `darask0/MOSS-Image-color-depth-control`'s `moss-control.safetensors`) | `moss-infer --control` (CLI only in 1.0) | E24 |
+| `toxicdog/MOSS-Image-SFT-INT4-ConvRot-ComfyUI` (`220f724`) | `diffusion_models/moss_image_sft_int4_convrot.safetensors` | SFT DiT, INT4 ConvRot | `dit_file`, tier `turbo` | E25, 4090L |
+| `toxicdog/MOSS-Image-SFT-Turbo-INT8-ConvRot` (`a04afd6`) | `diffusion_models/moss_image_sft_turbo_int8_convrot.safetensors` | 8-step SFT variant, INT8 ConvRot | `dit_file`, tier `high`, 8 steps, CFG 1 | format tests only |
+| `tsolful/MOSS_Image_INT6_INT4GPTQ` (`782fa67`) | `moss_image_sft_W4A8_GPTQ.safetensors` | SFT DiT, W4A8 GPTQ | convert first: `moss-infer quantize <file> -o <out>` decodes it to INT8 ConvRot (bit-exact); then `dit_file`. As `dit_file` directly it is refused (`MI_ERR_MODEL`, "needs decoding"). | conversion: tests |
+| `lodestones/MOSS-Image-SFT-8-steps-dmd` (`f95df83`) | `time_embedding.safetensors`, `lora.safetensors`, `dataspace.safetensors` | 8-step distill bundle for SFT | `distill_dir`, 8 steps, CFG 1 | E25, tests |
+| `akhaliq/MOSS-Image-SFT-4-steps` (`2ded95c`) | `lora.safetensors` | 4-step distill LoRA for SFT | LoRA at strength 1, 4 steps, CFG 1 | E25, tests |
+| `axiomofmind/Moss-image-beauty-lora` (`967ff12`) | `pytorch_lora_weights.safetensors` | PEFT LoRA | `loras` | tests |
+| `congruency/MOSS-Image-Turbo-MFD` (`4c7e9c2`) | `MOSS-Image-SFT-Turbo-MFD-v0.1.comfy.safetensors` | kohya LoRA | `loras` | tests |
+| `comfyanonymous/MOSS_image_MAX_ULTRA_hires_lora_test` (`6784131`) | `moss_hires_lora_test_v0.1.safetensors` | LyCORIS LoHa | `loras` | tests |
+| `nynxz/MOSS-Image` (`138539a`) | `loras/moss_sft_destripe_top64_bf16.safetensors` | LoRA | `loras` | tests |
+
+Same formats, not tested: Comfy-Org's Base INT8 DiT and its bf16 DiTs, tsolful's W6A8 and Base files, `unsloth/MOSS-Image-SFT-FP8`'s `MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors` (ComfyUI INT8), `lodestones/MOSS-Image-Base-8-steps-dmd`, `darask0/MOSS-Image_4-step_adapter_lora`.
+
+**Not supported.** Messages start with the file or folder path and end with the supported-models pointer.
+
+| Model or file | What it is | What the engine says |
+|---|---|---|
+| Other OpenMOSS models: MOSS-VL, moss-video-preview, MOVA, MOSS-TTS, MOSS-Audio, moss-moon | not MOSS-Image (vision-language, video, speech and language models) | as the model folder: `… is not a supported MOSS-Image model (found <its pipeline class>)` for a diffusers folder; otherwise the incomplete-folder message |
+| `nebulette/moss-image-2b-encoder` | a Qwen3.5-2B text encoder | as `text_encoder_file`: `… is not a supported MOSS-Image text encoder (found embed_tokens.weight [248320, 2048] (MOSS-Image: [248320, 4096]), no norm.weight, 24 layers (MOSS-Image: 32))` |
+| `PotatoForge/moss-image-4b-encoder-adapter` | a projection from Qwen3.5-4B to 9B features, not a model | refused as a text encoder |
+| `chinoll/Moss-Image-Edit`, `akhaliq/MOSS-Image-Edit-HQ` and other edit adapters | image editing (a reference-image input) | 1.0 has no editing input |
+| GGUF files (`unsloth/…-GGUF`, `leejet/…-GGUF`, `realrebelai/MOSS-Image_GGUFs`, …) | llama.cpp format | `… (found a GGUF file (llama.cpp / ComfyUI-GGUF format); the engine reads safetensors files)` |
+| torchao files: `unsloth/MOSS-Image-SFT-FP8`'s `MOSS-Image-SFT-FP8.safetensors`, `MOSS-Image-SFT-INT8.safetensors` and `MOSS-Image-SFT-INT8-ConvRot.safetensors` (despite the name, not ComfyUI's INT8 ConvRot) | torchao-quantized weights | `… (found block weights stored as 'layers.0.proj.ffn_down._weight_qdata', a quantization format the engine does not read)` |
+| ComfyUI FP8 files (`fp8_scaled`, `float8_e4m3fn`) | 8-bit float weights | `… (found block weights stored as F8_E4M3 (FP8), a quantization format the engine does not read)` |
+| NVFP4 files (`BennyDaBall/MOSS-Image-SFT-NVFP4`, `WiktorMatuszek/MOSS-Image-SFT-NVFP4-*`) | 4-bit float weights | not run by this version (`MI_ERR_MODEL`); the message names the reason: on an RTX 50, `NVFP4 DiT files are not supported by this version yet; use an INT8 DiT …`; on other GPUs, `NVFP4 needs an RTX 50 GPU (compute capability 12.0); use the INT8 file …` |
+| Other quantization formats in a ComfyUI file | a `comfy_quant` format the engine does not read | `… quantization format '<name>' is not supported (see docs/integration.md#supported-models)` |
+| MLX (`mlx-community/…`, `mflux-community/…`), SDNQ (`OzzyGT/…`), DFloat11 (`mingyi456/…`), DiffSynth EntroPack, PyTorch `.bin` / `.pt` files | other runtimes' formats | not tested and not expected to load; a `.bin` / `.pt` file: `… (found a PyTorch pickle (.bin / .pt / .ckpt); the engine reads safetensors files)` |
 
 ## Choosing the integration surface
 
@@ -108,8 +169,8 @@ On top of that, the weights are read through the operating system's page cache. 
 
 | What | Size |
 |---|---|
-| MOSS-Image Base folder | 26 GB |
-| MOSS-Image SFT folder | 26 GB, or about 10 GB extra when its text encoder and VAE files are hard links to Base's (they are byte-identical) |
+| MOSS-Image Base folder | 27.2 GB |
+| MOSS-Image SFT folder | 27.2 GB, or about 10 GB extra when its text encoder and VAE files are hard links to Base's (they are byte-identical) |
 | Engine package | several hundred MB, most of it NVIDIA cuBLASLt; the `-system-cuda` archive leaves cuBLASLt out |
 
 ## Getting the binaries
@@ -199,18 +260,13 @@ Both variables choose code that the process loads and runs. Treat them like `LD_
 
 ## Model files
 
-The engine reads the official Hugging Face model folders in place, with no conversion step:
-
-```sh
-hf download OpenMOSS-Team/MOSS-Image-Base --local-dir MOSS-Image/base --exclude 'assets/*'
-hf download OpenMOSS-Team/MOSS-Image-SFT  --local-dir MOSS-Image/sft  --exclude 'assets/*'
-```
+The engine reads the official Hugging Face model folders in place, with no conversion step. [Supported models](#supported-models) lists them, with the download commands.
 
 - **The model path is the folder** that contains `text_encoder/`, `tokenizer/`, `transformer/` and `vae/`, e.g. `MOSS-Image/base`.
 - **The folder can be read-only.** The engine writes nothing into it. An optional `moss.mossidx` index, made with `moss-infer index <folder>`, makes the first load slightly faster. Without one, the engine builds the index in memory.
 - **To save disk with both models,** hard-link SFT's `text_encoder/*.safetensors` and `vae/*.safetensors` to Base's. They are byte-identical.
 - **ComfyUI and quantized files** load as component files next to the bundle folder: `dit_file` (INT8 ConvRot, INT4 ConvRot, mixed INT8/bf16 or bf16 DiT), `text_encoder_file` (INT8 ConvRot or W4A8) and `vae_file`. The tokenizer and configs still come from the folder. A file as the model path itself (`MI_MODEL_FORMAT_COMFYUI`, or a file with `MI_MODEL_FORMAT_AUTO`) returns `MI_ERR_NOT_SUPPORTED`, and the server answers `not_supported`, while `MI_CAP_COMFYUI_MODELS` is unset.
-- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 DiT runs only under `turbo`, which must be chosen explicitly: offer it for INT4 files, and only for them. A quality certificate (`<dit>.mossinfer-cert.json`, or in `<cache_dir>/quality_certs/`; 1.0 ships none) lets `auto` pick a lossy configuration; the report's `quality` object says which one ran and whether it was certified.
+- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 DiT runs only under `turbo`, which must be chosen explicitly: offer it for INT4 files, and only for them. A quality certificate lets `auto` pick a lossy configuration. Certificates are searched in `<cache_dir>/quality_certs/`, then the DiT's sidecar `<dit>.mossinfer-cert.json`, then the install tree's `share/mossinfer/quality_certs/`; the first usable one wins, and 1.0 ships none; the report's `quality` object says which one ran and whether it was certified.
 
 ## Picking the build: cu12 or cu13
 

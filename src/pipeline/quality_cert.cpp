@@ -40,6 +40,7 @@
 #include "util/json.h"
 #include "util/path.h"
 #include "util/rename_replace.h"
+#include "util/replaceable_file.h"
 #include "util/xxh64.h"
 
 // GCC's -Wdangling-reference heuristic flags every `const T& x = f(dom, where + "...")`: the DOM accessors below
@@ -69,6 +70,7 @@ constexpr std::int64_t kMaxPixels = std::int64_t{1} << 40;
 constexpr const char* kSidecarSuffix = ".mossinfer-cert.json";
 constexpr const char* kSidecarInDir = "mossinfer-cert.json";
 constexpr const char* kCacheSubdir = "quality_certs";
+constexpr const char* kInstallSubdir = "share/mossinfer/quality_certs";
 constexpr const char* kHashCacheFile = "file_hashes.json";
 constexpr std::string_view kHashCacheFormat = "mossinfer-file-hashes";
 constexpr std::int64_t kHashCacheVersion = 1;
@@ -264,17 +266,17 @@ json::Value parse_document(std::string_view text, std::size_t max_bytes) {
   }
 }
 
-// At most `limit` bytes of `path`; throws CertificateError when it cannot be read or holds more.
+// At most `limit` bytes of `path`; throws CertificateError when it cannot be read or holds more. Read through a
+// concurrent writer's rename (util/replaceable_file.h), so a replace in flight is not taken for a broken file.
 std::string read_limited(const fs::path& path, std::size_t limit) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) fail("cannot open " + util::path_utf8(path));
-  std::string text(limit + 1, '\0');
-  in.read(text.data(), static_cast<std::streamsize>(text.size()));
-  if (in.bad()) fail("read error on " + util::path_utf8(path));
-  const auto n = static_cast<std::size_t>(in.gcount());
-  if (n > limit) fail(util::path_utf8(path) + ": file too large");
-  text.resize(n);
-  return text;
+  std::string text;
+  switch (util::read_replaceable_file(path, limit, text)) {
+    case util::ReadStatus::kOk: return text;
+    case util::ReadStatus::kTooLarge: fail(util::path_utf8(path) + ": file too large");
+    case util::ReadStatus::kMissing: fail("cannot open " + util::path_utf8(path));
+    case util::ReadStatus::kError: break;
+  }
+  fail("read error on " + util::path_utf8(path));
 }
 
 ComponentIdentity component_from(const json::Value& v, const std::string& where) {
@@ -468,7 +470,8 @@ bool write_atomic(const fs::path& path, const std::string& text) {
       return false;
     }
   }
-  HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   const bool flushed = h != INVALID_HANDLE_VALUE && FlushFileBuffers(h);
   if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
   if (!flushed) {
@@ -1022,21 +1025,52 @@ fs::path certificate_sidecar(const fs::path& dit) {
   return p;
 }
 
-std::vector<fs::path> certificate_files(const fs::path& dit, const fs::path& cache_dir) {
+fs::path install_certificate_dir(const fs::path& module_dir) {
+  const fs::path dir = module_dir.lexically_normal();
+  const fs::path name = dir.has_filename() ? dir.filename() : dir.parent_path().filename();
+  if (name != "lib" && name != "lib64" && name != "bin") return {};
+  return (dir / ".." / kInstallSubdir).lexically_normal();
+}
+
+fs::path install_certificate_dir() {
+  static const fs::path dir = install_certificate_dir(util::path_from_utf8(backend::own_module_dir()));
+  return dir;
+}
+
+std::string install_certificate_note() {
+  if (!install_certificate_dir().empty()) return {};
+  const std::string module = backend::own_module_dir();
+  if (module.empty()) return "install-tree certificates not searched: the engine module's directory is unknown";
+  return "install-tree certificates not searched: the engine module (" + module + ") is not in an install prefix's lib/ or bin/";
+}
+
+std::vector<fs::path> certificate_files(const fs::path& dit, const fs::path& cache_dir, const std::vector<fs::path>& extra_dirs,
+                                        const fs::path& install_dir) {
   std::vector<fs::path> out;
-  std::error_code ec;
-  if (const fs::path side = certificate_sidecar(dit); fs::is_regular_file(side, ec)) out.push_back(side);
-  if (!cache_dir.empty()) {
-    std::vector<fs::path> cached;
-    fs::directory_iterator it(cache_dir / kCacheSubdir, ec);
+  std::set<fs::path> seen;  // weakly canonical: a directory named twice (or a cache dir also named explicitly) once
+  const auto add = [&](const fs::path& file) {
+    std::error_code ec;
+    const fs::path key = fs::weakly_canonical(file, ec);
+    if (seen.insert(ec ? file : key).second) out.push_back(file);
+  };
+  const auto add_dir = [&](const fs::path& dir) {
+    if (dir.empty()) return;
+    std::vector<fs::path> found;
+    std::error_code ec;
+    fs::directory_iterator it(dir, ec);
     for (const fs::directory_iterator end; !ec && it != end; it.increment(ec)) {
       std::error_code fec;
-      if (it->is_regular_file(fec) && it->path().extension() == ".json") cached.push_back(it->path());
+      if (it->is_regular_file(fec) && it->path().extension() == ".json") found.push_back(it->path());
     }
-    std::sort(cached.begin(), cached.end());
-    if (cached.size() > kMaxCacheFiles) cached.resize(kMaxCacheFiles);
-    out.insert(out.end(), cached.begin(), cached.end());
-  }
+    std::sort(found.begin(), found.end());
+    if (found.size() > kMaxCacheFiles) found.resize(kMaxCacheFiles);
+    for (const fs::path& f : found) add(f);
+  };
+  for (const fs::path& dir : extra_dirs) add_dir(dir);
+  if (!cache_dir.empty()) add_dir(cache_dir / kCacheSubdir);
+  std::error_code ec;
+  if (const fs::path side = certificate_sidecar(dit); fs::is_regular_file(side, ec)) add(side);
+  add_dir(install_dir);
   return out;
 }
 
@@ -1052,13 +1086,14 @@ CertificateSearch find_certificate(const ModelIdentity& model, const Certificate
 }
 
 CertificateSearch find_certificate(const fs::path& dit, const fs::path& te, const CertificateQuery& q, const fs::path& cache_dir,
-                                   std::optional<ModelIdentity>* identity) {
+                                   std::optional<ModelIdentity>* identity, const std::vector<fs::path>& extra_dirs,
+                                   const fs::path& install_dir) {
   CertificateSearch r;
   if (std::string why = uncertifiable_reason(q.config); !why.empty()) {
     r.reason = why;
     return r;
   }
-  const std::vector<fs::path> files = certificate_files(dit, cache_dir);
+  const std::vector<fs::path> files = certificate_files(dit, cache_dir, extra_dirs, install_dir);
   if (files.empty()) {
     r.reason = "no certificate";
     return r;

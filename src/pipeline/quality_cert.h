@@ -5,7 +5,9 @@
 //
 // A certificate is written by the offline certification harness after scoring the evaluation prompt set (same seed
 // against the bf16 engine, and against the official reference images) and stored as a JSON sidecar next to the DiT
-// (certificate_sidecar()) or in the engine's cache directory (<cache_dir>/quality_certs/*.json).
+// (certificate_sidecar()), in the engine's cache directory (<cache_dir>/quality_certs/*.json), in a directory the
+// caller names, or in the install tree (<prefix>/share/mossinfer/quality_certs/*.json, where packages ship them;
+// install_certificate_dir()). certificate_files() gives the search order.
 //
 // File format (version kCertificateFormatVersion), one document holding up to 64 certificates:
 //   {"format": "mossinfer-quality-certificates", "version": 2, "certificates": [
@@ -250,9 +252,29 @@ bool write_certificate_file(const std::filesystem::path& path, const std::vector
 
 // The sidecar of a DiT file "<file>.mossinfer-cert.json", or "<dir>/mossinfer-cert.json" for a directory.
 std::filesystem::path certificate_sidecar(const std::filesystem::path& dit);
-// Where to look: the sidecar, then the first 256 (by name) *.json files in <cache_dir>/quality_certs (cache_dir may be
-// empty). Only existing files are returned.
-std::vector<std::filesystem::path> certificate_files(const std::filesystem::path& dit, const std::filesystem::path& cache_dir);
+// The install tree's certificate directory, <prefix>/share/mossinfer/quality_certs (lexically normal), when the engine
+// module sits in an install prefix's lib/, lib64/ or bin/ (libmossinfer.so; mossinfer.dll or an executable that links
+// the engine statically): where packages install certificates. Empty otherwise (a module elsewhere, e.g.
+// /opt/app/libmossinfer.so, has no prefix to search: not /opt/share), and for an empty module_dir. Pure.
+std::filesystem::path install_certificate_dir(const std::filesystem::path& module_dir);
+// The same for the module this code is linked into, resolved at run time (backend::own_module_dir(): dladdr /
+// GetModuleHandleEx), so a relocated install finds its own certificates; empty when the module cannot be resolved or
+// is not in an install prefix (install_certificate_note() says which).
+std::filesystem::path install_certificate_dir();
+// Empty when install_certificate_dir() names a directory, else why the install tree is not searched (for the tier
+// report).
+std::string install_certificate_note();
+// Where to look, in this order (the first usable certificate wins, so an earlier location takes precedence for the
+// same configuration):
+//   1. each of `extra_dirs` in order (directories the caller names, e.g. PipelineOptions::certificate_dirs);
+//   2. <cache_dir>/quality_certs (cache_dir may be empty);
+//   3. the DiT's sidecar (certificate_sidecar());
+//   4. `install_dir` (by default install_certificate_dir(); empty: not searched).
+// From each directory, the first 256 (by name) regular *.json files. Only existing files are returned, each once.
+// Identity and numerics matching do not depend on where a certificate was found.
+std::vector<std::filesystem::path> certificate_files(const std::filesystem::path& dit, const std::filesystem::path& cache_dir,
+                                                     const std::vector<std::filesystem::path>& extra_dirs = {},
+                                                     const std::filesystem::path& install_dir = install_certificate_dir());
 
 struct CertificateQuery {
   CertConfig config;
@@ -279,13 +301,15 @@ struct CertificateSearch {
 CertificateSearch find_certificate(const ModelIdentity& model, const CertificateQuery& q,
                                    const std::vector<std::filesystem::path>& files);
 
-// Same, from paths: looks in certificate_files(dit, cache_dir), pre-checks every candidate on names-and-sizes
-// identities, and hashes the files (through the hash cache in cache_dir) only when a candidate survives, so the usual
-// "no certificate" costs no read. `te` is the separately loaded TE file or directory, empty when the TE is bf16 from
-// the bundle. `identity`, when given, receives the full identity whenever it was computed.
+// Same, from paths: looks in certificate_files(dit, cache_dir, extra_dirs, install_dir), pre-checks every candidate on
+// names-and-sizes identities, and hashes the files (through the hash cache in cache_dir) only when a candidate
+// survives, so the usual "no certificate" costs no read. `te` is the separately loaded TE file or directory, empty when
+// the TE is bf16 from the bundle. `identity`, when given, receives the full identity whenever it was computed.
 CertificateSearch find_certificate(const std::filesystem::path& dit, const std::filesystem::path& te,
                                    const CertificateQuery& q, const std::filesystem::path& cache_dir,
-                                   std::optional<ModelIdentity>* identity = nullptr);
+                                   std::optional<ModelIdentity>* identity = nullptr,
+                                   const std::vector<std::filesystem::path>& extra_dirs = {},
+                                   const std::filesystem::path& install_dir = install_certificate_dir());
 
 // The "quality" object of a generation report (`--json-report`): what the run used and why, in the certificate's
 // own vocabulary, so the certification harness can confirm what it certifies:

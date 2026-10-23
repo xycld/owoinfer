@@ -351,6 +351,141 @@ TEST(Planner, LearnsWeightsCachedFromTheTextEncoderStream) {
   EXPECT_EQ(plan(in).te.residency, TeResidency::kStreamed);
 }
 
+// 1.1: pinning a host-resident text encoder (Capabilities::te_pin, planner.h). kAuto pins the bf16 encoder only in
+// max_speed on machines with 48 GiB or more, and only with max(8 GiB, 25 % of the RAM) of the system's available memory
+// left; balanced keeps v1.0's choice for it. A quantized encoder follows the margin in balanced too (kept above the
+// host target). kOn pins whenever the copy fits, kOff never. The explanation says why it stays or not.
+PlanInputs pin_inputs(Mode mode, double total_gib, double available_gib, TeHostPin pin = TeHostPin::kAuto) {
+  Scenario s;
+  s.lengths = {300, 12};  // a typical prompt: the encoder pass is bound by its weight transfer
+  s.vram_free_gib = 23.0;
+  s.host_available_gib = available_gib;
+  s.hardware.h2d_gbps = 24.0;   // pinned H2D (dev box: 23.9 GB/s)
+  s.hardware.host_gbps = 12.0;  // page cache -> staging -> device
+  s.mode = mode;
+  PlanInputs in = s.inputs();
+  in.caps.te_host_resident = true;
+  in.caps.te_host_pinned = true;
+  in.caps.te_pin = pin;
+  in.budgets.host_total = gib(total_gib);
+  return in;
+}
+
+TEST(Planner, PinnedTextEncoderBf16RulesAndMargin) {
+  // An idle 32 GiB machine pins in neither mode.
+  for (const Mode mode : {Mode::kBalanced, Mode::kMaxSpeed}) {
+    const ExecutionPlan p = plan(pin_inputs(mode, 32.0, 28.0));
+    expect_consistent(p);
+    EXPECT_FALSE(p.te.residency == TeResidency::kHostResident && p.te.pinned) << mode_name(mode);
+  }
+  // 64 GiB: balanced keeps v1.0's streaming (and says why); max_speed pins (margin 16 GiB = 25 %).
+  ExecutionPlan p = plan(pin_inputs(Mode::kBalanced, 64.0, 60.0));
+  expect_consistent(p);
+  EXPECT_EQ(p.te.residency, TeResidency::kStreamed);
+  EXPECT_LE(p.host_private_bytes, gib(8.0));
+  EXPECT_NE(p.explanation.find("not kept in RAM: balanced keeps the bf16 encoder streamed"), std::string::npos) << p.explanation;
+  p = plan(pin_inputs(Mode::kMaxSpeed, 64.0, 60.0));
+  expect_consistent(p);
+  ASSERT_EQ(p.te.residency, TeResidency::kHostResident);
+  EXPECT_TRUE(p.te.pinned);
+  EXPECT_LE(p.host_private_bytes + host_pin_margin(gib(64.0)), gib(60.0) + gib(1.0)) << "the margin includes the cache";
+  EXPECT_NE(p.explanation.find("The text encoder stays in RAM (pinned)"), std::string::npos) << p.explanation;
+  EXPECT_NE(p.to_json().find("\"pinned\": true"), std::string::npos);
+  PlanInputs off = pin_inputs(Mode::kMaxSpeed, 64.0, 60.0, TeHostPin::kOff);
+  const ExecutionPlan streamed = plan(off);
+  EXPECT_EQ(streamed.te.residency, TeResidency::kStreamed) << "warm page cache: v1.0's choice";
+  EXPECT_LT(p.time.text_encoder_s, 0.6 * streamed.time.text_encoder_s) << "the pinned copy streams at twice the rate";
+  // 64 GiB but only 25 GiB available: the 16 GiB margin is not there.
+  p = plan(pin_inputs(Mode::kMaxSpeed, 64.0, 25.0));
+  EXPECT_FALSE(p.te.residency == TeResidency::kHostResident && p.te.pinned);
+  EXPECT_NE(p.explanation.find("would leave less than"), std::string::npos) << p.explanation;
+  // An explicit host budget caps but does not waive the system margin.
+  PlanInputs budget = pin_inputs(Mode::kMaxSpeed, 64.0, 25.0);
+  budget.budgets.host_budget = gib(40.0);
+  p = plan(budget);
+  EXPECT_FALSE(p.te.residency == TeResidency::kHostResident && p.te.pinned);
+}
+
+TEST(Planner, PinnedTextEncoderOnOffAndQuantized) {
+  // kOn: pinned in balanced whenever the copy fits, above the host target; kOff: never.
+  ExecutionPlan p = plan(pin_inputs(Mode::kBalanced, 32.0, 28.0, TeHostPin::kOn));
+  expect_consistent(p);
+  ASSERT_EQ(p.te.residency, TeResidency::kHostResident);
+  EXPECT_TRUE(p.te.pinned);
+  EXPECT_GT(p.host_private_bytes, p.host_target_bytes);
+  EXPECT_NE(p.explanation.find("te_host_pin on"), std::string::npos) << p.explanation;
+  p = plan(pin_inputs(Mode::kMaxSpeed, 128.0, 120.0, TeHostPin::kOff));
+  EXPECT_FALSE(p.te.residency == TeResidency::kHostResident && p.te.pinned);
+  EXPECT_NE(p.explanation.find("te_host_pin off"), std::string::npos) << p.explanation;
+
+  // A quantized encoder (pinned only, ~6.5 GB here) follows the margin in balanced too, above the target.
+  const auto quantized = [](Mode mode, double total, double available) {
+    PlanInputs in = pin_inputs(mode, total, available);
+    in.shapes.te_stream_bytes = std::size_t{6500} << 20;
+    in.shapes.te_layer_bytes = std::size_t{200} << 20;
+    in.caps.te_host_pageable = false;
+    in.caps.te_quantized = true;
+    return in;
+  };
+  p = plan(quantized(Mode::kBalanced, 64.0, 60.0));
+  expect_consistent(p);
+  ASSERT_EQ(p.te.residency, TeResidency::kHostResident);
+  EXPECT_TRUE(p.te.pinned);
+  EXPECT_NE(p.explanation.find("above balanced's"), std::string::npos) << p.explanation;
+  p = plan(quantized(Mode::kBalanced, 32.0, 12.0));  // 8 GiB margin not left
+  EXPECT_EQ(p.te.residency, TeResidency::kStreamed);
+  // min_memory never holds a copy; an embedding-cache hit plans no encoder at all.
+  PlanInputs mm = pin_inputs(Mode::kMinMemory, 128.0, 120.0, TeHostPin::kOn);
+  EXPECT_NE(plan(mm).te.residency, TeResidency::kHostResident);
+  PlanInputs hit = pin_inputs(Mode::kMaxSpeed, 128.0, 120.0);
+  hit.request.te_cached = true;
+  EXPECT_FALSE(plan(hit).te.run);
+}
+
+// A measured direct-I/O load rate prices a cold DiT load (prefer_held's reload) but not a parking reload, which reads
+// buffered.
+TEST(Planner, DirectLoadRatePricesColdLoadsNotParkingReloads) {
+  // A parking plan: its per-generation reload stays at the buffered rate (the cold disk here), direct rate or not.
+  Scenario s;
+  s.vram_free_gib = 11.5;
+  s.tiles = false;
+  s.dit_weights_cached = false;
+  PlanInputs in = s.inputs();
+  const ExecutionPlan without = plan(in);
+  ASSERT_EQ(without.dit.residency, DitResidency::kParked) << without.explanation;
+  in.hardware.direct_gbps = 10.9;
+  EXPECT_EQ(plan(in).time.dit_load_s, without.time.dit_load_s);
+  // prefer_held's reload of a cold DiT is priced at the measured direct rate (~0.9 s for 9.5 GiB, not ~5 s from disk).
+  Scenario big;
+  big.dit_weights_cached = false;
+  PlanInputs pi = big.inputs();
+  const ExecutionPlan fresh = plan(pi);
+  HeldDit held;
+  held.arena_bytes = fresh.arena_bytes;
+  held.dit.residency = DitResidency::kStreamed;
+  held.dit.resident_blocks = 41;
+  held.dit.buffers = 2;
+  const auto reload_seconds = [&](double direct) {
+    pi.hardware.direct_gbps = direct;
+    const std::string e = prefer_held(pi, plan(pi), held).explanation;
+    const std::size_t at = e.find("(~");
+    return at == std::string::npos ? -1.0 : std::stod(e.substr(at + 2));
+  };
+  const double disk = reload_seconds(0), direct = reload_seconds(10.9);
+  ASSERT_GT(disk, 0) << "prefer_held states the reload cost";
+  EXPECT_LT(direct, disk / 2);
+}
+
+// The margin rule shared with the soft unload: max(8 GiB, 25 % of the RAM).
+TEST(Planner, HostPinMargin) {
+  EXPECT_EQ(host_pin_margin(0), kHostPinMarginFloor);
+  EXPECT_EQ(host_pin_margin(gib(32.0)), kHostPinMarginFloor);
+  EXPECT_EQ(host_pin_margin(gib(64.0)), gib(16.0));
+  EXPECT_EQ(parse_te_host_pin("on"), TeHostPin::kOn);
+  EXPECT_STREQ(te_host_pin_name(TeHostPin::kAuto), "auto");
+  EXPECT_THROW(parse_te_host_pin("yes"), std::invalid_argument);
+}
+
 // The text-encoder estimate covers only the sequences the encoder runs on (embedding-cache misses).
 TEST(Planner, TextEncoderTimeCountsCacheMissesOnly) {
   Scenario s;

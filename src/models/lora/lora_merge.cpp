@@ -265,6 +265,13 @@ std::size_t PristineWeights::host_bytes() const {
   return b;
 }
 
+std::size_t PristineWeights::host_bytes(std::string_view module) const {
+  for (const auto& [m, e] : entries_) {
+    if (m == module) return e.w.size() * 2 + e.bias.size() * 2 + e.q.size() + e.scale.size() * 4;
+  }
+  return 0;
+}
+
 const PristineWeights::Entry& PristineWeights::entry(std::string_view module, bool int8) const {
   for (const auto& [m, e] : entries_) {
     if (m != module) continue;

@@ -57,7 +57,7 @@ cmake --build <build> --target mossinfer_example_c
 | `MI_ERR_NOT_SUPPORTED` | not in this build, e.g. a ComfyUI file as `model_path` (`MI_MODEL_FORMAT_COMFYUI`) |
 | `MI_ERR_BUSY` | the engine is already generating |
 | `MI_ERR_OUT_OF_MEMORY` | the request fits the device or host budgets in no mode (planner), or a host allocation failed |
-| `MI_ERR_MODEL` | model files missing, incomplete or malformed; a LoRA file that cannot be applied (with `lora_strict`, also unknown keys and lossy merges) |
+| `MI_ERR_MODEL` | model files missing, incomplete or malformed, or not a supported MOSS-Image model ([integration.md](integration.md#supported-models)); a LoRA file that cannot be applied (with `lora_strict`, also unknown keys and lossy merges) |
 | `MI_ERR_IO` | file-system error: reading weights, writing the PNG |
 | `MI_ERR_CUDA` | CUDA error or no usable device. Free the engine afterwards. Also `mi_engine_create()` when no usable cuBLASLt is found: the message lists every candidate tried and why it was rejected (see [cuBLASLt](#cublaslt)). |
 | `MI_ERR_INTERNAL` | anything else |
@@ -80,7 +80,7 @@ cmake --build <build> --target mossinfer_example_c
 ## Engine
 
 `mi_engine_create()` does three things:
-1. Checks the parameters, the model path (the four bundle folders `text_encoder`, `tokenizer`, `transformer` and `vae`), and that each given component file exists and is a regular file. This happens before CUDA is touched. The format of the component files is checked when they load, at the first `mi_generate()`, which then fails with `MI_ERR_MODEL`.
+1. Checks the parameters, the model path (the four bundle folders `text_encoder`, `tokenizer`, `transformer` and `vae`), and that each given component file exists and is a regular file. This happens before CUDA is touched. The model folder's configs, the architecture of the DiT and text-encoder files and the component files' format are checked when they load, at the first `mi_generate()`, which then fails with `MI_ERR_MODEL`. A folder or file of another model fails the same way, with a message naming what was found ([supported models](integration.md#supported-models)).
 2. Selects the device.
 3. Creates the pipeline.
 
@@ -97,7 +97,7 @@ The weights load on the first `mi_generate()`. The DiT stays resident across gen
 | `host_ram_budget_bytes` | 0 = the mode's target | cap on private host memory |
 | `cache_dir` | NULL = memory only | embedding-cache disk spill |
 | `embedding_cache` | 1 | reuse the text embeddings of repeated prompts |
-| `direct_io` | 0 | O_DIRECT weight reads |
+| `direct_io` | 0 | 1: O_DIRECT for every weight read (cold-cache behaviour). 0: the DiT load picks direct or buffered reads itself (direct where the file system supports it and the files are not already in the page cache; the report's `dit_load` says which and why) |
 | `block_path` | `DEFAULT` (fused) | DiT block implementation: `OP_BY_OP`, `FUSED` or `FUSED_GRAPHS`; all give the same image bits. `FUSED` runs op by op when the startup self-check finds the fused GEMMs not bit-identical on this GPU, and `FUSED_GRAPHS` replays CUDA graphs only when every DiT block is resident. `mi_result_block_path()` reports what ran. |
 | `dit_file` | NULL = the bundle's `transformer/` | single-file DiT: INT8 ConvRot (G = 256), INT4 ConvRot (the `TURBO` tier), mixed INT8/bf16 or bf16 safetensors in the ComfyUI layout (Comfy-Org and community files, `moss-infer quantize` output) |
 | `text_encoder_file` | NULL = the bundle's `text_encoder/` | INT8 ConvRot or W4A8 Qwen3.5 text encoder. Its embeddings are cached under its own identity. |
@@ -136,7 +136,7 @@ The loaded weights fix the GEMM precision: an INT8 DiT runs INT8 GEMMs. The tier
 | `Q8_FP8` (4) | `q8_fp8` |
 | `Q8_FP8_F32ACC` (5) | `q8_fp8_f32acc` |
 
-Certificates are looked up next to the DiT file (`<dit>.mossinfer-cert.json`) and in `<cache_dir>/quality_certs/`. A generation with LoRAs is uncertified. `mi_result_tier()` reports what ran.
+Certificates are searched in this order, and the first usable one wins: `<cache_dir>/quality_certs/`, the DiT file's sidecar (`<dit>.mossinfer-cert.json`), then the install tree's `<prefix>/share/mossinfer/quality_certs/` (found from the library's own location when it sits in the prefix's `lib/` or `bin/`). The engine also takes extra directories, searched first; they are not yet exposed in this API. A generation with LoRAs is uncertified. `mi_result_tier()` reports what ran.
 
 ## Generation
 

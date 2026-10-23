@@ -1,0 +1,200 @@
+{
+ "oracle": "comfy-kitchen dba9fac (eager, CPU); torch 2.14.1+cu130",
+ "generator": "tools/reference/gen_nvfp4_vectors.py",
+ "files": {
+  "e2m1_in": {
+   "dtype": "float32",
+   "shape": [
+    4090
+   ]
+  },
+  "e2m1_codes": {
+   "dtype": "uint8",
+   "shape": [
+    4090
+   ]
+  },
+  "e4m3_in": {
+   "dtype": "float32",
+   "shape": [
+    6505
+   ]
+  },
+  "e4m3_codes": {
+   "dtype": "uint8",
+   "shape": [
+    6505
+   ]
+  },
+  "w1_x": {
+   "dtype": "uint16",
+   "shape": [
+    300,
+    48
+   ]
+  },
+  "w1_s2": {
+   "dtype": "float32",
+   "shape": [
+    1
+   ]
+  },
+  "w1_packed": {
+   "dtype": "uint8",
+   "shape": [
+    300,
+    24
+   ]
+  },
+  "w1_sf": {
+   "dtype": "uint8",
+   "shape": [
+    384,
+    4
+   ]
+  },
+  "w1_deq_bf16": {
+   "dtype": "uint16",
+   "shape": [
+    300,
+    48
+   ]
+  },
+  "w1_deq_f32": {
+   "dtype": "float32",
+   "shape": [
+    300,
+    48
+   ]
+  },
+  "w1_s2_f32": {
+   "dtype": "float32",
+   "shape": [
+    1
+   ]
+  },
+  "w1_packed_f32": {
+   "dtype": "uint8",
+   "shape": [
+    300,
+    24
+   ]
+  },
+  "w1_sf_f32": {
+   "dtype": "uint8",
+   "shape": [
+    384,
+    4
+   ]
+  },
+  "w2_x": {
+   "dtype": "uint16",
+   "shape": [
+    128,
+    256
+   ]
+  },
+  "w2_s2": {
+   "dtype": "float32",
+   "shape": [
+    1
+   ]
+  },
+  "w2_packed": {
+   "dtype": "uint8",
+   "shape": [
+    128,
+    128
+   ]
+  },
+  "w2_sf": {
+   "dtype": "uint8",
+   "shape": [
+    128,
+    16
+   ]
+  },
+  "w2_deq_bf16": {
+   "dtype": "uint16",
+   "shape": [
+    128,
+    256
+   ]
+  },
+  "w2_deq_f32": {
+   "dtype": "float32",
+   "shape": [
+    128,
+    256
+   ]
+  },
+  "w2_s2_f32": {
+   "dtype": "float32",
+   "shape": [
+    1
+   ]
+  },
+  "w2_packed_f32": {
+   "dtype": "uint8",
+   "shape": [
+    128,
+    128
+   ]
+  },
+  "w2_sf_f32": {
+   "dtype": "uint8",
+   "shape": [
+    128,
+    16
+   ]
+  },
+  "act_x": {
+   "dtype": "uint16",
+   "shape": [
+    200,
+    96
+   ]
+  },
+  "act_packed": {
+   "dtype": "uint8",
+   "shape": [
+    200,
+    48
+   ]
+  },
+  "act_sf": {
+   "dtype": "uint8",
+   "shape": [
+    256,
+    8
+   ]
+  },
+  "act_g": {
+   "dtype": "float32",
+   "shape": [
+    200
+   ]
+  },
+  "gemm_w_packed": {
+   "dtype": "uint8",
+   "shape": [
+    64,
+    48
+   ]
+  },
+  "gemm_w_sf": {
+   "dtype": "uint8",
+   "shape": [
+    128,
+    8
+   ]
+  },
+  "gemm_acc": {
+   "dtype": "float64",
+   "shape": [
+    200,
+    64
+   ]
+  }
+ }
+}

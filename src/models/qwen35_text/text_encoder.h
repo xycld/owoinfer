@@ -43,6 +43,7 @@
 #include "models/qwen35_text/quant_text_model.h"
 #include "runtime/device_arena.h"
 #include "weights/model_index.h"
+#include "weights/upload.h"
 
 namespace mi::qwen35_text {
 
@@ -181,11 +182,19 @@ class TextEncoder {
                                                          const EncodeOptions& options = {});
 
   // Host-resident sources: loads the host copy of every layer group now (otherwise the first encode() does).
-  // No-op for kFile or when already loaded.
-  void preload_host();
+  // No-op for kFile or when already loaded. With `cancel`: checked between layer groups; once set, the readers stop,
+  // nothing is kept and Cancelled is thrown.
+  void preload_host(const std::atomic<bool>* cancel = nullptr);
   // Frees the host copy (the next encode() of a host-resident source loads it again).
   void release_host();
   std::size_t host_resident_bytes() const;  // currently held host copy
+  // The host copy, one group per decoder layer (empty until loaded). The groups share their memory with the encoder,
+  // so a caller can keep the copy past the encoder (e.g. while the arena it lives in is recreated) and hand it to the
+  // next encoder of the same model and source with adopt_host() instead of reading the weights again.
+  std::vector<weights::HostGroup> share_host() const;
+  // Takes `layers` (share_host() of an encoder of the same model, with a host source of the same memory kind) as the
+  // host copy. std::invalid_argument for a kFile source or groups that do not match the model's layers.
+  void adopt_host(std::vector<weights::HostGroup> layers);
 
   const EncoderOptions& options() const;
   const EncodeStats& last_stats() const;

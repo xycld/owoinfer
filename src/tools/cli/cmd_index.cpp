@@ -1,10 +1,12 @@
 // `moss-infer index` and `moss-infer inspect`: build / display the weight-group index of a bundle.
 #include <filesystem>
 #include <iostream>
+#include <stdexcept>
 
 #include "tools/cli/commands.h"
 #include "util/path.h"
 #include "weights/model_index.h"
+#include "weights/supported_model.h"
 
 namespace mi::cli {
 
@@ -28,6 +30,8 @@ int cmd_index(const std::vector<std::string>& args) {
     return 2;
   }
   if (out.empty()) out = bundle / "moss.mossidx";
+  if (!fs::is_directory(bundle)) throw std::invalid_argument("model bundle not found: " + util::path_utf8(bundle));
+  weights::check_supported_bundle(bundle);
   weights::ModelIndex index = weights::build_index(bundle, options);
   weights::write_index(index, out);
   std::cout << "wrote " << util::path_utf8(out) << "\n";

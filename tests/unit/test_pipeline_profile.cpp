@@ -21,6 +21,8 @@
 #include "planner/planner.h"
 #include "test_util.h"
 #include "util/json.h"
+#include "util/rename_replace.h"
+#include "util/replaceable_file.h"
 
 namespace {
 
@@ -262,6 +264,47 @@ TEST(HardwareProfile, ConcurrentWritersNeverTearTheFile) {
   for (const auto& e : fs::directory_iterator(dir.path())) entries += e.is_regular_file();
   EXPECT_EQ(entries, 1);
   EXPECT_EQ(reads, 200);
+}
+
+// The cache files' reader (util/replaceable_file.h): whole files with a size limit, and a file that writers keep
+// replacing with rename_replace reads as one of its complete versions every time (Windows: a replace in flight is
+// retried, never reported as missing or unreadable).
+TEST(ReplaceableFile, StatusesAndReadsThroughRenames) {
+  using mi::util::ReadStatus;
+  mi::testing::TempDir dir("replaceable_file");
+  const fs::path file = dir.path() / "cache.json";
+  std::string text = "stale";
+  EXPECT_EQ(mi::util::read_replaceable_file(file, 100, text), ReadStatus::kMissing);
+  EXPECT_TRUE(text.empty());
+  std::ofstream(file, std::ios::binary) << std::string(100, 'a');
+  EXPECT_EQ(mi::util::read_replaceable_file(file, 100, text), ReadStatus::kOk);
+  EXPECT_EQ(text, std::string(100, 'a'));
+  EXPECT_EQ(mi::util::read_replaceable_file(file, 99, text), ReadStatus::kTooLarge);
+  EXPECT_TRUE(text.empty());
+  std::ofstream(file, std::ios::binary | std::ios::trunc).close();
+  EXPECT_EQ(mi::util::read_replaceable_file(file, 0, text), ReadStatus::kOk);
+  EXPECT_TRUE(text.empty());
+
+  // Each version: 4000 copies of one digit (a torn or partial read would mix digits or be short).
+  std::vector<std::thread> writers;
+  for (int t = 0; t < 3; ++t) {
+    writers.emplace_back([&, t] {
+      for (int i = 0; i < 60; ++i) {
+        const fs::path tmp = dir.path() / ("cache.json.tmp." + std::to_string(t));
+        std::ofstream(tmp, std::ios::binary | std::ios::trunc) << std::string(4000, static_cast<char>('0' + (t * 3 + i) % 10));
+        std::error_code ec;
+        mi::util::rename_replace(tmp, file, ec);
+        EXPECT_FALSE(ec) << ec.message();
+      }
+    });
+  }
+  for (int i = 0; i < 300; ++i) {
+    ASSERT_EQ(mi::util::read_replaceable_file(file, 1 << 20, text), ReadStatus::kOk) << "read " << i;
+    if (text.empty()) continue;  // the initial empty version
+    ASSERT_EQ(text.size(), 4000u) << "read " << i;
+    EXPECT_EQ(text.find_first_not_of(text[0]), std::string::npos) << "read " << i << " mixes versions";
+  }
+  for (std::thread& w : writers) w.join();
 }
 
 // LOW-2: the JSON writers ignore the process locale. Under a comma-decimal locale (installed, or generated with

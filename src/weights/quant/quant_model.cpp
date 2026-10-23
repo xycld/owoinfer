@@ -16,6 +16,7 @@
 #include "util/json.h"
 #include "util/path.h"
 #include "weights/file_reader.h"
+#include "weights/quant/nvfp4_codec.h"
 #include "weights/quant/quant_codec.h"
 #include "weights/safetensors.h"
 
@@ -32,6 +33,8 @@ constexpr std::uint64_t kMaxConfigBytes = 4096;
 constexpr std::size_t kMaxConfigValues = 256;
 constexpr std::size_t kMaxQuantMetadataValues = 1'000'000;
 constexpr std::int64_t kMaxGroupSize = 4096;
+// The comfy_quant formats the reader reads; Builder::quantized has one branch per entry.
+constexpr std::string_view kFormats[] = {"int8_tensorwise", "convrot_w4a4", "asym_w4a8_int8", "w6a8_int8", "nvfp4"};
 // The only convrot_w4a4 quant_group_size comfy-kitchen @dba9fac accepts (_INT4_GROUP_SIZE).
 constexpr int kW4A4QuantGroup = 64;
 
@@ -108,6 +111,7 @@ struct Config {
   std::int64_t quant_group_size = 0;
   std::string linear_dtype;
   bool full_precision_mm = false;
+  std::set<std::string, std::less<>> present;  // the fields above that the config sets
   std::string text;  // canonical JSON text, for conflict checks
 };
 
@@ -126,12 +130,14 @@ Config parse_config(const json::Value& conf, const std::string& module) {
   c.format = f->as_string();
   auto get_bool = [&](std::string_view key, bool& out) {
     if (const json::Value* v = field(conf, key)) {
+      c.present.emplace(key);
       if (!v->is_bool()) fail("'" + module + "': config field " + std::string(key) + " is not a boolean");
       out = v->as_bool();
     }
   };
   auto get_int = [&](std::string_view key, std::int64_t& out) {
     if (const json::Value* v = field(conf, key)) {
+      c.present.emplace(key);
       if (!v->is_int() || v->as_int() < 1 || v->as_int() > kMaxGroupSize) {
         fail("'" + module + "': config field " + std::string(key) + " must be an integer in [1, 4096]");
       }
@@ -145,6 +151,7 @@ Config parse_config(const json::Value& conf, const std::string& module) {
   get_int("quant_group_size", c.quant_group_size);
   if (const json::Value* v = field(conf, "linear_dtype")) {
     if (!v->is_string()) fail("'" + module + "': config field linear_dtype is not a string");
+    c.present.emplace("linear_dtype");
     c.linear_dtype = v->as_string();
   }
   c.text = c.format + "|" + std::to_string(c.convrot) + "|" + std::to_string(c.convrot_groupsize) + "|" + std::to_string(c.group_size) +
@@ -208,6 +215,15 @@ class Builder {
     l.name = l.source_module = m;
     l.full_precision_mm = c.full_precision_mm;
     l.weight = take(m + ".weight");
+    // Before any layout check, so a format the engine does not read is named as such (not as a wrong dtype).
+    if (std::find(std::begin(kFormats), std::end(kFormats), c.format) == std::end(kFormats)) {
+      fail("'" + m + "': quantization format '" + c.format + "' is not supported (see docs/integration.md#supported-models)");
+    }
+    if (c.format == "nvfp4") {
+      nvfp4(l, c);
+      attach_bias(l);
+      return l;
+    }
     const IndexedTensor& w = l.weight;
     if (w.dtype != DType::kI8 || w.shape.size() != 2 || w.shape[0] <= 0 || w.shape[1] <= 0) {
       fail("'" + m + "': " + c.format + " weight must be I8 [N, C], got " + weights::dtype_name(w.dtype) + " " + shape_str(w.shape));
@@ -238,7 +254,7 @@ class Builder {
       l.quant_group = static_cast<int>(c.quant_group_size);
       l.scale = take(m + ".weight_scale");
       if (!per_row(*l.scale, l.n)) fail("'" + m + "': convrot_w4a4 weight_scale must be F32 [N]");
-    } else if (c.format == "asym_w4a8_int8" || c.format == "w6a8_int8") {
+    } else {  // asym_w4a8_int8 or w6a8_int8, the rest of kFormats
       const int bits = c.format == "w6a8_int8" ? 6 : 4;
       if ((cols * 8) % bits != 0) fail("'" + m + "': packed width " + std::to_string(cols) + " is not a whole number of " + std::to_string(bits) + "-bit codes");
       l.k = cols * 8 / bits;
@@ -260,16 +276,62 @@ class Builder {
       if (l.codebook && (bits == 6 || l.codebook->dtype != DType::kF32 || l.codebook->shape != std::vector<std::int64_t>{16})) {
         fail("'" + m + "': weight_codebook must be F32 [16] and only with 4-bit codes");
       }
-    } else {
-      fail("'" + m + "': unsupported quantization format '" + c.format + "'");
     }
     attach_bias(l);
     return l;
   }
 
+  // comfy_quant {"format": "nvfp4"} (ComfyUI QUANT_ALGOS["nvfp4"]): weight U8 [N, K/2], weight_scale F8_E4M3 (or U8)
+  // swizzled [round_up(N,128), round_up(K/16,4)], weight_scale_2 F32 scalar, optional input_scale.
+  void nvfp4(QuantLinear& l, const Config& c) {
+    const std::string& m = l.name;
+    const IndexedTensor& w = l.weight;
+    if (w.dtype != DType::kU8 || w.shape.size() != 2 || w.shape[0] <= 0 || w.shape[1] <= 0) {
+      fail("'" + m + "': nvfp4 weight must be U8 [N, K/2], got " + weights::dtype_name(w.dtype) + " " + shape_str(w.shape));
+    }
+    if (c.convrot) fail("'" + m + "': nvfp4 has no rotation; a convrot flag is not part of the format");
+    for (const char* key : {"convrot_groupsize", "quant_group_size", "linear_dtype"}) {
+      if (c.present.count(key) != 0) fail("'" + m + "': config field " + key + " does not belong to the nvfp4 format");
+    }
+    // ComfyUI would dequantize such a layer and run it in bf16; the engine has no such path for NVFP4.
+    if (c.full_precision_mm) fail("'" + m + "': nvfp4 with full_precision_matrix_mult is not supported");
+    if (c.present.count("group_size") != 0 && c.group_size != kNvfp4Block) {
+      fail("'" + m + "': nvfp4 group_size must be 16, got " + std::to_string(c.group_size));
+    }
+    if (!util::checked_mul(static_cast<std::uint64_t>(w.shape[1]), 2)) fail("'" + m + "': K overflows");
+    l.n = w.shape[0];
+    l.k = w.shape[1] * 2;
+    if (l.k % kNvfp4Block != 0) fail("'" + m + "': nvfp4 K=" + std::to_string(l.k) + " is not a multiple of 16");
+    l.spec = QuantSpec::nvfp4();
+    l.encoding = Encoding::kNvfp4Raw;
+    l.quant_group = kNvfp4Block;
+    l.scale = take(m + ".weight_scale");
+    const std::vector<std::int64_t> sf_shape{nvfp4_scale_rows(l.n), nvfp4_scale_cols(l.k / kNvfp4Block)};
+    if ((l.scale->dtype != DType::kF8E4M3 && l.scale->dtype != DType::kU8) || l.scale->shape != sf_shape) {
+      fail("'" + m + "': nvfp4 weight_scale must be F8_E4M3 " + shape_str(sf_shape) + " (the swizzled block scales), got " +
+           weights::dtype_name(l.scale->dtype) + " " + shape_str(l.scale->shape));
+    }
+    l.scale_2 = take(m + ".weight_scale_2");
+    if (l.scale_2->dtype != DType::kF32 || numel(*l.scale_2) != 1 || l.scale_2->shape.size() > 1) {
+      fail("'" + m + "': nvfp4 weight_scale_2 must be an F32 scalar, got " + weights::dtype_name(l.scale_2->dtype) + " " + shape_str(l.scale_2->shape));
+    }
+    l.input_scale = take_opt(m + ".input_scale");
+    if (l.input_scale && (l.input_scale->dtype != DType::kF32 || numel(*l.input_scale) != 1)) fail("'" + m + "': input_scale must be an F32 scalar");
+    if (find(m + ".pre_quant_scale") != nullptr) {
+      fail("'" + m + "': nvfp4 with pre_quant_scale (AWQ-style smoothing) is not supported; use a file without it");
+    }
+  }
+
   QuantLinear unquantized(const std::string& m) {
     QuantLinear l;
     l.name = l.source_module = m;
+    // NVFP4 tensors without a comfy_quant config: NVIDIA ModelOpt's export convention. Its defaults (low nibble
+    // first, linear [N, K/16] scales) differ from ComfyUI's and cannot be told apart by shape, so it is refused.
+    if (find(m + ".weight_scale_2") != nullptr) {
+      fail("'" + m + "' holds NVFP4 tensors (weight_scale, weight_scale_2) but no comfy_quant config: an NVIDIA ModelOpt-"
+           "convention file, whose default nibble order and scale layout differ from ComfyUI's and cannot be told apart by "
+           "shape; only ComfyUI comfy_quant nvfp4 files are supported");
+    }
     l.weight = take(m + ".weight");
     if (l.weight.dtype != DType::kBF16 || l.weight.shape.size() != 2 || l.weight.shape[0] <= 0 || l.weight.shape[1] <= 0) {
       fail("'" + m + "': unquantized GEMM weight must be BF16 [N, K], got " + weights::dtype_name(l.weight.dtype) + " " + shape_str(l.weight.shape));
@@ -301,7 +363,13 @@ class Builder {
       l.fused_slice = true;
       const std::int64_t r0 = i * rows;
       l.weight = slice_rows(f.weight, r0, rows);
-      if (f.scale && f.encoding != Encoding::kScalarScale) l.scale = slice_rows(*f.scale, r0, rows);
+      if (f.encoding == Encoding::kNvfp4Raw) {
+        // Whole 128-row tiles of the swizzled scales are contiguous [128 * cols] byte runs: rows slice as rows.
+        if (rows % 128 != 0) fail("'" + f.name + "': nvfp4 fused qkv thirds of " + std::to_string(rows) + " rows are not whole 128-row scale tiles");
+        l.scale = slice_rows(*f.scale, r0, rows);
+      } else if (f.scale && f.encoding != Encoding::kScalarScale) {
+        l.scale = slice_rows(*f.scale, r0, rows);
+      }
       if (f.s_rel) l.s_rel = slice_rows(*f.s_rel, r0, rows);
       if (f.s_channel) l.s_channel = slice_rows(*f.s_channel, r0, rows);
       if (f.bias) l.bias = slice_rows(*f.bias, r0, rows);
@@ -342,6 +410,7 @@ const char* format_name(QuantFormat f) {
     case QuantFormat::kInt8ConvRot: return "int8_convrot";
     case QuantFormat::kInt8Plain: return "int8_plain";
     case QuantFormat::kInt4ConvRot: return "int4_convrot";
+    case QuantFormat::kNvfp4: return "nvfp4";
   }
   return "?";
 }
@@ -358,6 +427,7 @@ const char* encoding_name(Encoding e) {
     case Encoding::kW4A8: return "w4a8";
     case Encoding::kW6A8: return "w6a8";
     case Encoding::kW4A4: return "w4a4";
+    case Encoding::kNvfp4Raw: return "nvfp4";
   }
   return "?";
 }
@@ -403,6 +473,10 @@ QuantModel open_quant_model_impl(const fs::path& path, std::optional<ModelKind> 
       if (!kind) kind = ModelKind::kDiT;
       dir = path / (*kind == ModelKind::kDiT ? "transformer" : "text_encoder");
       if (!fs::is_directory(dir)) fail(util::path_utf8(path) + ": bundle has no " + util::path_utf8(dir.filename()) + "/ directory");
+    }
+    if (fs::is_regular_file(dir / "hf_quant_config.json")) {
+      fail(util::path_utf8(dir) + ": hf_quant_config.json marks an NVIDIA ModelOpt export; only ComfyUI comfy_quant files are "
+           "supported");
     }
     paths = component_files(dir);
     model.base_dir = dir;
@@ -581,12 +655,13 @@ QuantWeights view(const QuantIndex& index, const weights::TensorMap& m, std::str
   auto w = m.find(mod + ".weight");
   if (w == m.end()) fail("weight '" + mod + ".weight' missing");
   const Tensor& wt = w->second;
-  const mi::DType want = spec->quantized() ? mi::DType::kI8 : mi::DType::kBF16;
+  const bool fp4 = spec->format == QuantFormat::kNvfp4;
+  const mi::DType want = fp4 ? mi::DType::kU8 : spec->quantized() ? mi::DType::kI8 : mi::DType::kBF16;
   if (wt.dtype != want || wt.rank != 2 || !wt.is_contiguous()) fail("weight '" + mod + "' must be contiguous " + dtype_name(want) + " [N, K], got " + wt.describe());
   QuantWeights v;
   v.spec = *spec;
   v.n = wt.dim(0);
-  v.k = spec->format == QuantFormat::kInt4ConvRot ? 2 * wt.dim(1) : wt.dim(1);  // packed: two values per byte
+  v.k = spec->format == QuantFormat::kInt4ConvRot || fp4 ? 2 * wt.dim(1) : wt.dim(1);  // packed: two values per byte
   v.weight = wt.data;
   v.device = wt.device;
   if (reinterpret_cast<std::uintptr_t>(v.weight) % mi::dtype_size(wt.dtype) != 0) fail("weight '" + mod + "' is not aligned in memory");
@@ -594,7 +669,25 @@ QuantWeights view(const QuantIndex& index, const weights::TensorMap& m, std::str
       (!valid_convrot_group(spec->group) || v.k % spec->group != 0)) {
     fail("'" + mod + "': bad ConvRot group");
   }
-  if (spec->quantized()) {
+  if (fp4) {
+    auto s = m.find(mod + ".weight_scale");
+    if (s == m.end()) fail("block scales '" + mod + ".weight_scale' missing");
+    const Tensor& st = s->second;
+    const std::int64_t rows = nvfp4_scale_rows(v.n), cols = nvfp4_scale_cols(v.k / kNvfp4Block);
+    if (v.k % kNvfp4Block != 0 || st.dtype != mi::DType::kU8 || st.rank != 2 || st.dim(0) != rows || st.dim(1) != cols || !st.is_contiguous()) {
+      fail("block scales '" + mod + "' must be contiguous U8 [" + std::to_string(rows) + ", " + std::to_string(cols) + "], got " + st.describe());
+    }
+    if (st.device != v.device) fail("block scales '" + mod + "' are on another device than the weight");
+    auto ts = index.tensor_scales.find(mod);
+    if (ts == index.tensor_scales.end()) fail("'" + mod + "': nvfp4 tensor scale missing from the index");
+    v.block_scale = st.ptr<const std::uint8_t>();
+    v.tensor_scale = ts->second;
+    // The sm_120a GEMMs read both operands with 128-bit TMA accesses (kernels/nvfp4/nvfp4.h).
+    if (v.k % 32 != 0) fail("'" + mod + "': nvfp4 K=" + std::to_string(v.k) + " is not a multiple of 32, which the NVFP4 GEMMs need");
+    if (reinterpret_cast<std::uintptr_t>(v.weight) % 16 != 0 || reinterpret_cast<std::uintptr_t>(v.block_scale) % 16 != 0) {
+      fail("'" + mod + "': nvfp4 weight and block scales must be 16-byte aligned in memory");
+    }
+  } else if (spec->quantized()) {
     auto s = m.find(mod + ".weight_scale");
     if (s == m.end()) fail("scale '" + mod + ".weight_scale' missing");
     const Tensor& st = s->second;
@@ -653,7 +746,22 @@ QuantIndex to_model_index(const QuantModel& model, const IndexOptions& options) 
     IndexedTensor w = l.weight;
     w.name = l.name + ".weight";
     put(std::move(w));
-    if (spec.quantized()) {
+    if (spec.format == QuantFormat::kNvfp4) {
+      const std::int64_t sfk = l.k / kNvfp4Block;
+      const std::vector<std::byte> sf = read_tensor(model, *l.scale);
+      if (const char* why = nvfp4_scales_problem(reinterpret_cast<const std::uint8_t*>(sf.data()), l.n, sfk)) {
+        fail("'" + l.name + "': nvfp4 weight_scale holds " + why);
+      }
+      const std::vector<std::byte> s2 = read_tensor(model, *l.scale_2);
+      float v;
+      std::memcpy(&v, s2.data(), sizeof v);
+      if (!valid_scales(&v, 1)) fail("'" + l.name + "': nvfp4 weight_scale_2 is not finite and > 0");
+      qi.tensor_scales.emplace(l.name, v);
+      IndexedTensor s = *l.scale;
+      s.name = l.name + ".weight_scale";
+      s.dtype = DType::kU8;  // UE4M3 bytes: the GEMMs read them as raw scale factors
+      put(std::move(s));
+    } else if (spec.quantized()) {
       IndexedTensor s = *l.scale;
       const std::vector<std::byte> bytes = read_tensor(model, s);
       std::vector<float> v(static_cast<std::size_t>(l.n));
@@ -721,6 +829,7 @@ std::vector<std::byte> read_rows(const QuantModel& model, const IndexedTensor& t
 void decode_rows(const QuantModel& model, const QuantLinear& l, std::int64_t row0, std::int64_t rows, std::int8_t* q,
                  float* scale) {
   if (!l.spec.quantized()) fail("linear '" + l.name + "' is not quantized");
+  if (l.encoding == Encoding::kNvfp4Raw) fail("linear '" + l.name + "' is nvfp4, which has no INT8 grid (dequantize it instead)");
   if (row0 < 0 || rows < 0 || row0 + rows > l.n) fail("rows out of range for '" + l.name + "'");
   if (rows == 0) return;
   const auto n_elems = static_cast<std::size_t>(rows * l.k);
@@ -734,6 +843,8 @@ void decode_rows(const QuantModel& model, const QuantLinear& l, std::int64_t row
     case Encoding::kW4A4:
       decode_int4_rows(wp, rows, l.k, q);
       break;
+    case Encoding::kNvfp4Raw:
+      break;  // refused above
     case Encoding::kW4A8:
     case Encoding::kW6A8: {
       const std::vector<std::byte> sr = read_rows(model, *l.s_rel, row0, rows);
@@ -790,10 +901,37 @@ void dequantize_linear_rows(const QuantModel& model, const QuantLinear& l, std::
     }
     return;
   }
+  if (l.encoding == Encoding::kNvfp4Raw) {
+    dequantize_nvfp4_linear_rows(model, l, row0, rows, out, nullptr);
+    return;
+  }
   std::vector<std::int8_t> q(static_cast<std::size_t>(rows * l.k));
   std::vector<float> s(static_cast<std::size_t>(rows));
   decode_rows(model, l, row0, rows, q.data(), s.data());
   dequantize_rows(q.data(), s.data(), rows, l.k, l.spec.format == QuantFormat::kInt8ConvRot ? l.spec.group : 0, out);
+}
+
+void dequantize_nvfp4_linear_rows(const QuantModel& model, const QuantLinear& l, std::int64_t row0, std::int64_t rows,
+                                  float* out, std::uint16_t* out_bf16) {
+  if (l.encoding != Encoding::kNvfp4Raw) fail("linear '" + l.name + "' is not nvfp4");
+  if (row0 < 0 || rows < 0 || row0 + rows > l.n) fail("rows out of range for '" + l.name + "'");
+  if (rows == 0) return;
+  const std::int64_t sfk = l.k / kNvfp4Block;
+  const std::vector<std::byte> w = read_rows(model, l.weight, row0, rows);
+  // The 128-row scale tiles covering the rows (each tile row is one contiguous run of the swizzled tensor).
+  const std::int64_t t0 = row0 / 128, t1 = (row0 + rows + 127) / 128;
+  const std::vector<std::byte> sf = read_rows(model, *l.scale, t0 * 128, (t1 - t0) * 128);
+  const std::vector<std::byte> s2b = read_tensor(model, *l.scale_2);
+  float s2;
+  std::memcpy(&s2, s2b.data(), sizeof s2);
+  const auto* sfp = reinterpret_cast<const std::uint8_t*>(sf.data());
+  if (!valid_scales(&s2, 1)) fail("'" + l.name + "': nvfp4 weight_scale_2 is not finite and > 0");
+  if (const char* why = nvfp4_scales_problem(sfp, std::min<std::int64_t>((t1 - t0) * 128, l.n - t0 * 128), sfk)) {
+    fail("'" + l.name + "': nvfp4 weight_scale holds " + why);
+  }
+  const auto* wp = reinterpret_cast<const std::uint8_t*>(w.data());
+  if (out != nullptr) dequantize_nvfp4_rows(wp, sfp, row0 - t0 * 128, rows, l.k, s2, out);
+  if (out_bf16 != nullptr) dequantize_nvfp4_rows_bf16(wp, sfp, row0 - t0 * 128, rows, l.k, s2, out_bf16);
 }
 
 void gather_embedding_rows_bf16(const QuantModel& model, const QuantLinear& table, std::span<const std::int64_t> ids,

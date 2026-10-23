@@ -69,6 +69,7 @@
 #include "runtime/stream_set.h"
 #include "weights/model_index.h"
 #include "weights/quant/quant_model.h"
+#include "weights/upload.h"
 
 namespace mi::moss_dit {
 
@@ -123,6 +124,7 @@ class StepCacheHook {
 struct LoadStats {
   double seconds = 0;       // wall time, disk to resident (includes the final copy-stream sync)
   std::uint64_t bytes = 0;  // payload bytes read
+  bool direct = false;      // every weight file was read with direct I/O (an open that refused it reads buffered)
 };
 
 // The cancel flag was seen while loading or between blocks (MossDit's `cancel`). A cancelled forward() leaves
@@ -219,7 +221,8 @@ class MossDit {
   // Uploads the transformer groups (globals, text_embedder and the resident blocks) of `index` into the
   // arena's persistent region and waits until they are resident; streamed blocks are validated (and copied
   // to pinned host memory for StreamSource::kHostPinned). direct_io: O_DIRECT reads (bypass the page cache)
-  // instead of buffered reads for the load. The arena and index must outlive the model. `cancel` (optional,
+  // instead of buffered reads for the load. host_files (optional, must outlive the constructor only): weight files
+  // held in host memory, read from there instead of the files (the same bytes: a soft-unloaded model's re-upload). The arena and index must outlive the model. `cancel` (optional,
   // must outlive the model) is checked before every weight group is read and between the blocks of every
   // forward(); once set, the call waits for its queued copies/kernels and throws Cancelled.
   // merges (optional, runtime LoRA, models/lora): the stack's adapters that are merged rather than side-branched
@@ -229,13 +232,13 @@ class MossDit {
   // constructor only.
   MossDit(const weights::ModelIndex& index, runtime::DeviceArena& arena, runtime::StreamSet& streams,
           bool direct_io = false, const std::atomic<bool>* cancel = nullptr, const Residency& residency = {},
-          const lora::LoraStack* merges = nullptr);
+          const lora::LoraStack* merges = nullptr, const weights::HostFiles* host_files = nullptr);
   // P6: from a single-file DiT (quant::to_model_index): every block linear checked against the spec its GEMM runs
   // (bf16, int8_convrot256 or int4_convrot256; std::runtime_error naming the linear otherwise). persistent_bytes /
   // stream_workspace_bytes take quant.index. `quant` must outlive the model.
   MossDit(const quant::QuantIndex& quant, runtime::DeviceArena& arena, runtime::StreamSet& streams,
           bool direct_io = false, const std::atomic<bool>* cancel = nullptr, const Residency& residency = {},
-          const lora::LoraStack* merges = nullptr);
+          const lora::LoraStack* merges = nullptr, const weights::HostFiles* host_files = nullptr);
   ~MossDit();
   // Whether `stack` has merged adapters on block `block` (they need the block resident or a pinned host copy).
   static bool block_has_merges(const lora::LoraStack& stack, int block);
@@ -278,7 +281,18 @@ class MossDit {
   // Only modules outside the blocks (text refiner, embedders, modulation, head: always resident) can be newly merged in
   // place; when `stack` merges a block module that is not merged yet, nothing changes and it returns false (reload the
   // model with `stack` then). Synchronizes the device; call between forwards. The stack must outlive the call only.
-  bool rebase_merges(const lora::LoraStack* stack);
+  // memo_key (optional): names `stack` with its strengths. The merged bits of the last stack given a key are kept on
+  // the host with the pristine copies they derive from (together at most kMaxMergeMemoBytes), so switching back to it
+  // later (a control adapter toggled off and on) stores them again instead of downloading and merging: the same bits.
+  bool rebase_merges(const lora::LoraStack* stack, const std::string& memo_key = {});
+  // Host bytes rebase_merges keeps beyond the merged modules' pristine copies (pristine_bytes()): the memo's merged bits
+  // and the pristine copies of modules merged by it but not by the current stack.
+  std::size_t memo_bytes() const;
+  // Frees the memo (and the pristine copies only it needed): the next switch back merges again.
+  void drop_merge_memo();
+  static constexpr std::size_t kMaxMergeMemoBytes = std::size_t{1} << 30;
+  // Test seam (internal): the memo's cap for every model of the process (default kMaxMergeMemoBytes).
+  static void set_merge_memo_cap_for_tests(std::size_t bytes);
   const lora::SideBranches* lora() const { return lora_; }
 
   // Control adapters: every following forward embeds [latents | ext->extra] with ext's weight and bias instead of the
@@ -370,7 +384,7 @@ class MossDit {
 
   MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quant, runtime::DeviceArena& arena,
           runtime::StreamSet& streams, bool direct_io, const std::atomic<bool>* cancel, const Residency& residency,
-          const lora::LoraStack* merges);
+          const lora::LoraStack* merges, const weights::HostFiles* host_files);
   void refresh_config(AttentionMode attention);  // config_ from the loaded linears, `attention` and the LoRA
   void linear(const Tensor& out, const Tensor& x, const Linear& l, cudaStream_t stream);
   void linear(const Tensor& out, const Tensor& x, const Tensor& w, cudaStream_t stream);
@@ -393,7 +407,10 @@ class MossDit {
   class MergeStaging {
    public:
     MergeStaging(const MergeTarget& t, bool download);
+    // `copy`'s bytes for target `t`; nullptr: detached (a memo entry, stored only through a copy for a live target).
+    MergeStaging(const MergeTarget* t, const MergeStaging& copy);
     MergeStaging(MergeStaging&&) noexcept = default;
+    std::size_t bytes() const { return hw_.size() + hb_.size() + hs_.size(); }
     MergeStaging(const MergeStaging&) = delete;
     MergeStaging& operator=(const MergeStaging&) = delete;
     template <typename T>
@@ -413,6 +430,9 @@ class MossDit {
                            const MergeTarget& t, MergeStaging& staging);
   std::unique_ptr<lora::PristineWeights> pristine_;
   std::vector<std::pair<std::string, MergeTarget>> merge_targets_;
+  // rebase_merges' memo: the merged bits of the stack named memo_key_, by module.
+  std::string memo_key_;
+  std::vector<std::pair<std::string, MergeStaging>> memo_;
   // `module`'s weights in `m` (w empty when absent); throws for a quantized format merges do not support.
   MergeTarget merge_target(const weights::TensorMap& m, const std::string& module) const;
   // The views of the always-resident groups (globals, text_embedder): rebase_merges' in-place merge targets.

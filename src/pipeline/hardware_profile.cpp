@@ -25,11 +25,13 @@
 #include "kernels/fused/fused_gemm.h"
 #include "util/json.h"
 #include "util/rename_replace.h"
+#include "util/replaceable_file.h"
 
 namespace mi::pipeline {
 namespace {
 
 constexpr std::int64_t kVersion = 2;
+constexpr std::size_t kMaxProfileBytes = std::size_t{1} << 20;  // a profile is a few hundred bytes
 
 // Locale-independent (std::to_chars ignores LC_NUMERIC); JSON has no inf/nan (null reads back as missing).
 std::string num(double d) {
@@ -146,12 +148,11 @@ std::string hardware_key() {
 }
 
 std::optional<StoredProfile> read_profile(const std::filesystem::path& path, const std::string& key, std::int64_t now) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) return std::nullopt;
-  std::stringstream ss;
-  ss << in.rdbuf();
+  // Read through a concurrent writer's rename (Windows: a replace in flight is retried, not taken for "no profile").
+  std::string text;
+  if (util::read_replaceable_file(path, kMaxProfileBytes, text) != util::ReadStatus::kOk) return std::nullopt;
   try {
-    const json::Value v = json::parse(ss.str(), json::ParseLimits{65536});
+    const json::Value v = json::parse(text, json::ParseLimits{65536});
     if (v.at("version").as_int() != kVersion || v.at("key").as_string() != key) return std::nullopt;
     StoredProfile p;
     p.probed_at = v.at("probed_at").as_int();
@@ -277,6 +278,18 @@ bool ProfileLearner::observe_dit_stream(double gbps) {
 
 void ProfileLearner::observe_dit_load(double gbps) {
   if (std::isfinite(gbps) && gbps > 0) dit_cached_.vote(cached_rate(gbps));
+}
+
+void ProfileLearner::observe_dit_load_rate(bool direct, double gbps) {
+  if (!std::isfinite(gbps) || gbps <= 0) return;
+  Series& s = direct ? direct_load_gbps_ : buffered_load_gbps_;
+  s.push(gbps);
+  if (direct) current_.direct_gbps = s.median();
+}
+
+double ProfileLearner::dit_load_gbps(bool direct) const {
+  const Series& s = direct ? direct_load_gbps_ : buffered_load_gbps_;
+  return s.values.empty() ? 0.0 : s.median();
 }
 
 void ProfileLearner::observe_te_stream(bool cached) { te_cached_.vote(cached); }

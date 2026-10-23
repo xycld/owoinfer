@@ -610,7 +610,7 @@ TEST(QualityCert, FindAmongFiles) {
   EXPECT_EQ(r.reason, "no certificate");
 }
 
-// The sidecar first, then the first 256 cache files by name.
+// The first 256 cache files by name, then the sidecar.
 TEST(QualityCert, CertificateFilesOrderAndCap) {
   mi::testing::TempDir dir("qcert_files");
   const fs::path dit = dir.path() / "dit.safetensors";
@@ -632,7 +632,7 @@ TEST(QualityCert, CertificateFilesOrderAndCap) {
   write_bytes(certificate_sidecar(dit), "{}");
   files = certificate_files(dit, dir.path() / "cache");
   ASSERT_EQ(files.size(), 257u);
-  EXPECT_EQ(files.front(), certificate_sidecar(dit));
+  EXPECT_EQ(files.back(), certificate_sidecar(dit));
   EXPECT_EQ(certificate_files(dit, {}).size(), 1u);
   EXPECT_EQ(certificate_files(dit, dir.path() / "nonexistent").size(), 1u);
 }

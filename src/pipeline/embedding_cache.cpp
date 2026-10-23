@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "util/rename_replace.h"
+#include "util/replaceable_file.h"
 #include "util/xxh64.h"
 #include "weights/safetensors.h"
 
@@ -281,9 +282,7 @@ std::shared_ptr<const Embedding> EmbeddingCache::read_disk(const EmbeddingKey& k
     std::lock_guard<std::mutex> lock(mu_);
     ++(stats_.*field);
   };
-  std::ifstream in;
   const auto reject = [&] {
-    in.close();  // Windows cannot delete a file that is still open
     std::error_code rm;
     fs::remove(path, rm);
     count(&EmbeddingCacheStats::disk_rejects);
@@ -295,12 +294,16 @@ std::shared_ptr<const Embedding> EmbeddingCache::read_disk(const EmbeddingKey& k
     return nullptr;
   }
   if (size < kHeaderBytes || size > kMaxFileBytes) return reject();
-  in.open(path, std::ios::binary);
-  unsigned char header[kHeaderBytes];
-  if (!in.read(reinterpret_cast<char*>(header), kHeaderBytes)) {
+  // The whole entry at once, through a concurrent writer's rename of the same key (util/replaceable_file.h): the file
+  // is closed before a reject removes it (Windows cannot delete an open file).
+  std::string bytes;
+  const util::ReadStatus status = util::read_replaceable_file(path, static_cast<std::size_t>(kMaxFileBytes), bytes);
+  if (status == util::ReadStatus::kTooLarge) return reject();
+  if (status != util::ReadStatus::kOk || bytes.size() < kHeaderBytes) {
     count(&EmbeddingCacheStats::disk_errors);
     return nullptr;
   }
+  const auto* header = reinterpret_cast<const unsigned char*>(bytes.data());
   if (std::memcmp(header, kMagic, sizeof(kMagic)) != 0) return reject();
   // Another format version (an older or newer engine sharing the directory): not ours to judge or delete.
   if (get_le<std::uint32_t>(header + 8) != kEmbeddingFileVersion) return nullptr;
@@ -311,8 +314,9 @@ std::shared_ptr<const Embedding> EmbeddingCache::read_disk(const EmbeddingKey& k
   const auto max_len = get_le<std::int32_t>(header + 24);
   const auto hidden = get_le<std::int32_t>(header + 28);
   const auto n = get_le<std::uint64_t>(header + 32);
-  // Sizes are checked against the actual file size before anything is allocated.
-  if (hidden <= 0 || n == 0 || n > size || size != kHeaderBytes + n * 4 + n * static_cast<std::uint64_t>(hidden) * 2) {
+  // Sizes are checked against the bytes read before anything is allocated.
+  const std::uint64_t read = bytes.size();
+  if (hidden <= 0 || n == 0 || n > read || read != kHeaderBytes + n * 4 + n * static_cast<std::uint64_t>(hidden) * 2) {
     return reject();
   }
   // The same file name with another key is a hash collision (or a stale file): a miss, left for insert to replace.
@@ -324,16 +328,12 @@ std::shared_ptr<const Embedding> EmbeddingCache::read_disk(const EmbeddingKey& k
   auto value = std::make_shared<Embedding>();
   value->hidden = hidden;
   value->data.resize(n * static_cast<std::size_t>(hidden));
-  if (!in.read(reinterpret_cast<char*>(tokens.data()), static_cast<std::streamsize>(n * 4)) ||
-      !in.read(reinterpret_cast<char*>(value->data.data()), static_cast<std::streamsize>(value->data.size() * 2))) {
-    count(&EmbeddingCacheStats::disk_errors);
-    return nullptr;
-  }
+  std::memcpy(tokens.data(), bytes.data() + kHeaderBytes, n * 4);
+  std::memcpy(value->data.data(), bytes.data() + kHeaderBytes + n * 4, value->data.size() * 2);
   if (payload_hash(tokens.data(), tokens.size(), value->data.data(), value->data.size()) != get_le<std::uint64_t>(header + 40)) {
     return reject();
   }
   if (tokens != key.tokens) return nullptr;
-  in.close();
   fs::last_write_time(path, fs::file_time_type::clock::now(), ec);  // disk LRU recency
   return value;
 }

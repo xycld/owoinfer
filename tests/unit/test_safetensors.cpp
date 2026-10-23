@@ -1,14 +1,27 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <thread>
+
+#ifdef __linux__
+#include <fcntl.h>
+#include <sys/vfs.h>
+#include <unistd.h>
+#endif
 
 #include "test_util.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
 #include "weights/safetensors.h"
+#include "weights/test_seams.h"
+#include "weights/upload.h"
 
 namespace {
 
@@ -446,6 +459,139 @@ TEST(FileReader, DirectReadOfPartialLastBlockStopsAtEof) {
     }
 #endif
   }
+}
+
+// An in-memory reader serves the bytes it holds exactly as the file reader serves the file (read_at, read_aligned,
+// the end of file), and is never direct.
+TEST(FileReader, InMemoryReadsMatchTheFile) {
+  TempDir dir("fr_mem");
+  const std::size_t n = 3 * kDirectAlign + 123;
+  auto path = make_pattern_file(dir, n);
+  std::shared_ptr<std::byte> mem(new std::byte[n], std::default_delete<std::byte[]>());
+  FileReader(path).read_at(0, mem.get(), n);
+  FileReader r(path, mem, n, false);
+  EXPECT_FALSE(r.direct());
+  EXPECT_FALSE(r.pinned());
+  EXPECT_EQ(r.memory(), mem.get());
+  EXPECT_EQ(r.size(), n);
+  std::vector<std::byte> buf(n);
+  r.read_at(17, buf.data(), 2 * kDirectAlign);
+  expect_pattern(buf.data(), 17, 2 * kDirectAlign);
+  AlignedBuffer slot(8 * kDirectAlign);
+  const AlignedRange range = r.read_aligned(kDirectAlign + 5, kDirectAlign + 100, slot.data(), slot.size());
+  expect_pattern(slot.data() + range.skip, kDirectAlign + 5, kDirectAlign + 100);
+  r.read_at(n - 3, buf.data(), 3);
+  expect_pattern(buf.data(), n - 3, 3);
+  EXPECT_THROW(r.read_at(n - 1, buf.data(), 2), IoError);
+  FileReader moved(std::move(r));
+  EXPECT_EQ(moved.memory(), mem.get());
+  moved.read_at(0, buf.data(), n);
+  expect_pattern(buf.data(), 0, n);
+}
+
+// Whole files read into plain host memory (the soft unload's copy) hold the files' bytes, and a ReaderCache given them
+// reads from memory.
+TEST(FileReader, HostFilesHoldTheFiles) {
+  TempDir dir("fr_hostfiles");
+  const std::size_t n = 5 * kDirectAlign + 77;
+  const auto a = make_pattern_file(dir, n);
+  for (const bool direct : {false, true}) {
+    const HostFiles hf = read_files_to_host({a, a}, /*pinned=*/false, direct, 3);
+    ASSERT_EQ(hf.files.size(), 1u) << "a path named twice is read once";
+    EXPECT_EQ(hf.bytes(), n);
+    const HostFiles::File& f = hf.files.at(a);
+    EXPECT_FALSE(f.pinned);
+    ASSERT_EQ(f.size, n);
+    expect_pattern(f.data.get(), 0, n);
+    ModelIndex index;
+    index.bundle_dir = a.parent_path();
+    index.files.push_back({mi::util::path_utf8(a.filename()), n, 0});
+    ReaderCache readers(index, false, &hf);
+    EXPECT_EQ(readers.get(0).memory(), f.data.get());
+    ReaderCache files_only(index, false);
+    EXPECT_EQ(files_only.get(0).memory(), nullptr);
+  }
+  std::atomic<bool> cancel{true};
+  EXPECT_TRUE(read_files_to_host({a}, false, false, 2, &cancel).files.empty()) << "cancelled before the first chunk";
+  EXPECT_THROW(read_files_to_host({dir.path() / "missing"}, false, false), IoError);
+}
+
+// direct_io_support always explains a "no"; RAM file systems are a "no" (O_DIRECT gains nothing there, even where
+// the kernel accepts the flag).
+TEST(FileReader, DirectIoSupportReasons) {
+  TempDir dir("fr_dsupport");
+  const auto path = make_pattern_file(dir, 4 * kDirectAlign);
+  const DirectIoSupport here = direct_io_support(path);
+  if (here.supported) {
+    EXPECT_TRUE(here.reason.empty()) << here.reason;
+  } else {
+    EXPECT_NE(here.reason.find(mi::util::path_utf8(path.filename())), std::string::npos) << here.reason;
+  }
+  const DirectIoSupport missing = direct_io_support(dir.path() / "missing.bin");
+  EXPECT_FALSE(missing.supported);
+  EXPECT_EQ(missing.reason, "missing.bin does not exist");
+#ifdef __linux__
+  if (std::filesystem::is_directory("/dev/shm")) {
+    const std::filesystem::path shm = "/dev/shm/mi_test_dsupport_" + std::to_string(MI_GETPID()) + ".bin";
+    std::ofstream(shm, std::ios::binary) << std::string(8192, 'x');
+    const DirectIoSupport ram = direct_io_support(shm);
+    std::filesystem::remove(shm);
+    EXPECT_FALSE(ram.supported);
+    EXPECT_FALSE(ram.reason.empty());
+  }
+#endif
+}
+
+// The page-cache residency probe, both queries (cachestat, and the mincore sample a kernel without cachestat gets): a
+// file just written sits in the page cache, the same file written back and dropped from it does not; a missing file,
+// or the seam's "no query", is unknown (negative). Windows has no query (negative).
+TEST(FileReader, PageCacheFraction) {
+  TempDir dir("fr_pagecache");
+  const auto path = make_pattern_file(dir, 256 * kDirectAlign + 5);
+  namespace seams = mi::weights::testing;
+  using seams::ResidencyQuery;
+  struct Restore {
+    ~Restore() { seams::force_residency_query(ResidencyQuery::kAuto); }
+  } restore;
+#ifdef __linux__
+  for (const ResidencyQuery q : {ResidencyQuery::kAuto, ResidencyQuery::kMincore}) {
+    SCOPED_TRACE(q == ResidencyQuery::kAuto ? "auto" : "mincore");
+    seams::force_residency_query(q);
+    {
+      std::ifstream warm(path, std::ios::binary);
+      std::string all((std::istreambuf_iterator<char>(warm)), std::istreambuf_iterator<char>());
+    }
+    const double cached = page_cache_fraction(path);
+    EXPECT_GE(cached, 0.9) << "a file just read is in the page cache";
+    EXPECT_LE(cached, 1.0);
+    struct statfs fsinfo {};
+    ASSERT_EQ(::statfs(path.c_str(), &fsinfo), 0);
+    const auto type = static_cast<std::uint32_t>(fsinfo.f_type);
+    if (type == kTmpfsMagic || type == kRamfsMagic) continue;  // the page cache is the storage: nothing to drop
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    ::fsync(fd);
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    ::close(fd);
+    EXPECT_LT(page_cache_fraction(path), 0.9) << "written back and dropped from the page cache";
+  }
+#else
+  EXPECT_LT(page_cache_fraction(path), 0.0);
+#endif
+#ifdef __linux__
+  // A file the process may not write (root's, for a user): mincore would claim every page resident, cachestat refuses
+  // it; both queries say "unknown".
+  if (::geteuid() != 0 && std::filesystem::is_regular_file("/etc/os-release")) {
+    for (const ResidencyQuery q : {ResidencyQuery::kAuto, ResidencyQuery::kMincore}) {
+      seams::force_residency_query(q);
+      EXPECT_LT(page_cache_fraction("/etc/os-release"), 0.0);
+    }
+  }
+#endif
+  seams::force_residency_query(ResidencyQuery::kNone);
+  EXPECT_LT(page_cache_fraction(path), 0.0);
+  seams::force_residency_query(ResidencyQuery::kAuto);
+  EXPECT_LT(page_cache_fraction(dir.path() / "missing.bin"), 0.0);
 }
 
 TEST(MappedFile, ViewMatchesFileContents) {

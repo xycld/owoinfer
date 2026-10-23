@@ -315,12 +315,14 @@ std::size_t MossDit::stream_workspace_bytes(const weights::ModelIndex& index, co
 }
 
 MossDit::MossDit(const weights::ModelIndex& index, runtime::DeviceArena& arena, runtime::StreamSet& streams,
-                 bool direct_io, const std::atomic<bool>* cancel, const Residency& residency, const lora::LoraStack* merges)
-    : MossDit(index, nullptr, arena, streams, direct_io, cancel, residency, merges) {}
+                 bool direct_io, const std::atomic<bool>* cancel, const Residency& residency, const lora::LoraStack* merges,
+                 const weights::HostFiles* host_files)
+    : MossDit(index, nullptr, arena, streams, direct_io, cancel, residency, merges, host_files) {}
 
 MossDit::MossDit(const quant::QuantIndex& quant, runtime::DeviceArena& arena, runtime::StreamSet& streams, bool direct_io,
-                 const std::atomic<bool>* cancel, const Residency& residency, const lora::LoraStack* merges)
-    : MossDit(quant.index, &quant, arena, streams, direct_io, cancel, residency, merges) {}
+                 const std::atomic<bool>* cancel, const Residency& residency, const lora::LoraStack* merges,
+                 const weights::HostFiles* host_files)
+    : MossDit(quant.index, &quant, arena, streams, direct_io, cancel, residency, merges, host_files) {}
 
 bool MossDit::block_has_merges(const lora::LoraStack& stack, int block) {
   for (const std::string& module : stack.merge_modules()) {
@@ -348,7 +350,11 @@ MossDit::MergeStaging::MergeStaging(const MergeTarget& t, bool download) : targe
   fetch(t.scale, hs_);
 }
 
+MossDit::MergeStaging::MergeStaging(const MergeTarget* t, const MergeStaging& copy)
+    : target(t), hw_(copy.hw_), hb_(copy.hb_), hs_(copy.hs_) {}
+
 void MossDit::MergeStaging::store() const {
+  if (target == nullptr) throw std::logic_error("mi::moss_dit: a detached merge staging has no target");
   bool device = false;
   const auto put = [&](const Tensor& x, const std::vector<std::byte>& host) {
     if (x.data == nullptr) return;
@@ -393,7 +399,13 @@ MossDit::MergeTarget MossDit::merge_target(const TensorMap& m, const std::string
   return t;
 }
 
-bool MossDit::rebase_merges(const lora::LoraStack* stack) {
+namespace {
+std::atomic<std::size_t> g_merge_memo_cap{MossDit::kMaxMergeMemoBytes};
+}  // namespace
+
+void MossDit::set_merge_memo_cap_for_tests(std::size_t bytes) { g_merge_memo_cap.store(bytes); }
+
+bool MossDit::rebase_merges(const lora::LoraStack* stack, const std::string& memo_key) {
   static const lora::LoraStack kNone(std::span<const lora::LoraSpec>{}, lora::moss_dit_targets());
   const lora::LoraStack& s = stack != nullptr ? *stack : kNone;
   const std::vector<std::string> want = s.merge_modules();
@@ -414,6 +426,16 @@ bool MossDit::rebase_merges(const lora::LoraStack* stack) {
   // not recoverable here: the caller discards the model). Peak host memory: the merged modules' size once more.
   std::vector<std::pair<std::string, MergeTarget>> all = merge_targets_;
   all.insert(all.end(), added.begin(), added.end());
+  const auto memo_of = [&](const std::string& module) -> const MergeStaging* {
+    for (const auto& [m, st] : memo_) {
+      if (m == module) return &st;
+    }
+    return nullptr;
+  };
+  // The memo serves a stack it was computed for when it holds every module that stack merges (the others go back to
+  // their pristine bits, computed as usual).
+  bool memo_hit = !memo_key.empty() && memo_key == memo_key_;
+  for (const std::string& module : want) memo_hit = memo_hit && memo_of(module) != nullptr;
   std::vector<std::string> new_copies;
   std::vector<MergeStaging> staged;
   staged.reserve(all.size());
@@ -430,6 +452,11 @@ bool MossDit::rebase_merges(const lora::LoraStack* stack) {
       new_copies.push_back(module);
     }
     for (const auto& [module, t] : all) {
+      const bool wanted = std::find(want.begin(), want.end(), module) != want.end();
+      if (memo_hit && wanted) {
+        staged.emplace_back(&t, *memo_of(module));
+        continue;
+      }
       staged.emplace_back(t, false);
       remerge_into(*pristine_, s, module, t, staged.back());
     }
@@ -438,17 +465,60 @@ bool MossDit::rebase_merges(const lora::LoraStack* stack) {
     throw;
   }
   for (const MergeStaging& st : staged) st.store();
+  if (!memo_key.empty() && !memo_hit) {
+    // The new stack's merged bits, when they and their pristine copies fit the cap (a stack merging more is merged again
+    // when it comes back).
+    std::size_t bytes = 0;
+    for (std::size_t i = 0; i < all.size(); ++i) {
+      if (std::find(want.begin(), want.end(), all[i].first) != want.end()) {
+        bytes += staged[i].bytes() + pristine_->host_bytes(all[i].first);
+      }
+    }
+    memo_.clear();
+    memo_key_.clear();
+    if (bytes <= g_merge_memo_cap.load()) {
+      for (std::size_t i = 0; i < all.size(); ++i) {
+        if (std::find(want.begin(), want.end(), all[i].first) != want.end()) {
+          memo_.emplace_back(all[i].first, MergeStaging(nullptr, staged[i]));  // detached: `all` is local
+        }
+      }
+      memo_key_ = memo_key;
+    }
+  }
   std::vector<std::pair<std::string, MergeTarget>> kept;
   for (const auto& [module, t] : all) {
     if (std::find(want.begin(), want.end(), module) != want.end()) {
       kept.emplace_back(module, t);
-    } else {
-      pristine_->drop(module);
+    } else if (memo_of(module) == nullptr) {
+      pristine_->drop(module);  // a module the memo merges keeps its pristine copy: the memo's switch back needs it
     }
   }
   merge_targets_ = std::move(kept);
-  if (merge_targets_.empty()) pristine_.reset();
+  if (merge_targets_.empty() && memo_.empty()) pristine_.reset();
   return true;
+}
+
+void MossDit::drop_merge_memo() {
+  if (memo_.empty()) return;
+  for (const auto& [module, st] : memo_) {
+    const bool merged =
+        std::any_of(merge_targets_.begin(), merge_targets_.end(), [&](const auto& e) { return e.first == module; });
+    if (!merged && pristine_) pristine_->drop(module);
+  }
+  memo_.clear();
+  memo_key_.clear();
+  if (merge_targets_.empty()) pristine_.reset();
+}
+
+std::size_t MossDit::memo_bytes() const {
+  std::size_t total = 0;
+  for (const auto& [module, st] : memo_) {
+    total += st.bytes();
+    const bool merged =
+        std::any_of(merge_targets_.begin(), merge_targets_.end(), [&](const auto& e) { return e.first == module; });
+    if (!merged && pristine_) total += pristine_->host_bytes(module);
+  }
+  return total;
 }
 
 void MossDit::remerge_lora(const lora::LoraStack& stack) {
@@ -474,7 +544,11 @@ std::size_t MossDit::pristine_bytes(const lora::LoraStack& stack, const quant::Q
   return total;
 }
 
-std::size_t MossDit::pristine_bytes() const { return pristine_ ? pristine_->host_bytes() : 0; }
+std::size_t MossDit::pristine_bytes() const {
+  std::size_t total = 0;
+  for (const auto& [module, t] : merge_targets_) total += pristine_ ? pristine_->host_bytes(module) : 0;
+  return total;
+}
 
 void MossDit::set_lora(const lora::SideBranches* side_branches) {
   if (side_branches != nullptr) {
@@ -510,11 +584,11 @@ void MossDit::refresh_config(AttentionMode attention) {
 
 MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quant, runtime::DeviceArena& arena,
                  runtime::StreamSet& streams, bool direct_io, const std::atomic<bool>* cancel, const Residency& residency,
-                 const lora::LoraStack* merges)
+                 const lora::LoraStack* merges, const weights::HostFiles* host_files)
     : arena_(arena), quant_(quant), config_(compute_config(quant, AttentionMode::kExact)), cancel_(cancel) {
   const auto t0 = std::chrono::steady_clock::now();
   gemm_workspace_ = arena.alloc_persistent(kernels::Gemm::kWorkspaceBytes);
-  weights::ReaderCache readers(index, direct_io);
+  weights::ReaderCache readers(index, direct_io, host_files);
   runtime::PinnedRing ring(streams.copy());
   const auto check_cancel = [&] {
     if (cancel_ != nullptr && cancel_->load()) {
@@ -611,6 +685,7 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
   }, quant, [&](const TensorMap& host) { merge(host); });
   host_bytes_ = BlockWeights::host_bytes(index, residency);
   ring.synchronize();
+  load_stats_.direct = readers.all_direct();
   for (cudaEvent_t& e : block_done_) MI_CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
   load_stats_.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }

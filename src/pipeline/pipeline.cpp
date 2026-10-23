@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -31,6 +32,7 @@
 #include "models/latent_preview/latent_preview.h"
 #include "models/moss_dit/dit_kernels.h"
 #include "models/moss_dit/moss_dit.h"
+#include "models/moss_dit/nvfp4_support.h"
 #include "models/qwen35_text/text_encoder.h"
 #include "pipeline/embedding_cache.h"
 #include "pipeline/hardware_profile.h"
@@ -42,9 +44,12 @@
 #include "runtime/stream_set.h"
 #include "tokenizer/qwen_bpe.h"
 #include "util/path.h"
+#include "util/xxh64.h"
+#include "weights/file_reader.h"
 #include "weights/model_index.h"
 #include "weights/quant/quant_model.h"
 #include "weights/safetensors.h"
+#include "weights/supported_model.h"
 #include "weights/upload.h"
 
 namespace mi::pipeline {
@@ -104,6 +109,7 @@ struct Bundle {
 
 std::unique_ptr<Bundle> open_bundle(const std::filesystem::path& dir) {
   if (!std::filesystem::is_directory(dir)) throw std::invalid_argument("model bundle not found: " + util::path_utf8(dir));
+  weights::check_supported_bundle(dir);  // plain refusal of other models, before any weight file is read
   const std::filesystem::path idx = dir / "moss.mossidx";
   weights::ModelIndex index = std::filesystem::is_regular_file(idx) ? weights::load_index(idx, dir) : weights::build_index(dir);
   auto b = std::unique_ptr<Bundle>(new Bundle{dir, std::move(index), tok::Tokenizer::load(dir / "tokenizer" / "tokenizer.json"), 0});
@@ -124,7 +130,72 @@ struct DitSource {
   // <cache_dir>/file_hashes.json by quality_cert).
   std::map<std::string, planner::CertificateAnswer> certificates;
   std::optional<ModelIdentity> identity;
+  // The weight files the DiT is read from, and whether direct I/O gains on them (weights::direct_io_support of each;
+  // the first that does not decides), checked once per source.
+  std::vector<std::filesystem::path> files;
+  mutable std::optional<weights::DirectIoSupport> direct;
+  // The model it was trained as (dit_lineage): "base", "sft" or "" (unknown).
+  std::string lineage;
 };
+
+}  // namespace
+
+std::string dit_lineage(const weights::ModelIndex& index) {
+  constexpr std::uint64_t kBase = 0x06b5ba6b83f6335cULL, kSft = 0x8b85f7f1ea6f9562ULL;
+  const weights::WeightGroup* g = index.find_group(weights::Component::kTransformer, "globals");
+  if (g == nullptr) return {};
+  for (const weights::IndexedTensor& t : g->tensors) {
+    if (t.name != "video_embedder.weight" || t.nbytes > (std::uint64_t{16} << 20)) continue;
+    try {
+      std::vector<std::byte> bytes(static_cast<std::size_t>(t.nbytes));
+      weights::FileReader(index.file_path(t.file)).read_at(t.offset, bytes.data(), bytes.size());
+      const std::uint64_t h = xxh64(bytes.data(), bytes.size());
+      return h == kBase ? "base" : h == kSft ? "sft" : "";
+    } catch (const std::exception&) {
+      return {};  // unreadable weights fail at the load, with a better error
+    }
+  }
+  return {};
+}
+
+bool merge_memo_unaffordable(const planner::ExecutionPlan& plan, std::size_t host_budget) {
+  return plan.host_private_bytes > plan.host_held_target_bytes || (host_budget != 0 && plan.host_private_bytes > host_budget);
+}
+
+DitIoDecision choose_dit_load_io(const DitIoInputs& in) {
+  if (in.forced_buffered) return {false, "buffered reads requested"};
+  if (in.forced_direct) return {true, in.support.supported ? std::string() : "direct I/O requested; " + in.support.reason};
+  if (!in.support.supported) return {false, in.support.reason};
+  if (in.parked) return {false, "a parking reload: buffered, so the page cache keeps the DiT's files for the next one"};
+  char text[200];
+  if (in.cached_fraction >= kDitCachedFraction) {
+    std::snprintf(text, sizeof(text), "%.0f%% of the DiT's files are in the page cache: buffered reads serve them from RAM",
+                  100.0 * in.cached_fraction);
+    return {false, text};
+  }
+  if (in.cached_fraction >= 0) return {true, {}};
+  // Residency unknown (Windows, or a file the process may not query): the learner's measured rates decide, else the
+  // cold default.
+  if (in.buffered_gbps > 0 && in.direct_gbps > 0 && in.buffered_gbps > in.direct_gbps) {
+    std::snprintf(text, sizeof(text), "buffered loads measured faster here (%.1f GB/s against %.1f GB/s direct)",
+                  in.buffered_gbps, in.direct_gbps);
+    return {false, text};
+  }
+  return {true, "page-cache residency unknown: direct, the cold-cache choice"};
+}
+
+namespace {
+
+// The DiT weight files of `index` (its transformer groups' files; a single file's index holds only the DiT).
+std::vector<std::filesystem::path> dit_files(const weights::ModelIndex& index) {
+  std::set<std::uint32_t> ids;
+  for (const weights::WeightGroup* g : index.groups_of(weights::Component::kTransformer)) {
+    for (const weights::IndexedTensor& t : g->tensors) ids.insert(t.file);
+  }
+  std::vector<std::filesystem::path> out;
+  for (const std::uint32_t id : ids) out.push_back(index.file_path(id));
+  return out;
+}
 
 // The enums share their order (static_asserts): planner / moss_dit / quality-certificate attention modes.
 static_assert(static_cast<int>(planner::AttentionMode::kQ8Fp8F32Acc) == static_cast<int>(moss_dit::AttentionMode::kQ8Fp8F32Acc) &&
@@ -153,7 +224,9 @@ CertConfig cert_config(planner::Precision precision, planner::AttentionMode mode
 // configuration `cfg` and the request's scope. `identity` receives the models' full identity when it was computed.
 planner::CertificateAnswer search_certificate(const std::filesystem::path& dit, const std::filesystem::path& te,
                                               const CertConfig& cfg, const std::string& gpu_arch, const GenerationScope& scope,
-                                              const std::filesystem::path& cache_dir, std::optional<ModelIdentity>& identity) {
+                                              const std::filesystem::path& cache_dir,
+                                              const std::vector<std::filesystem::path>& extra_dirs,
+                                              std::optional<ModelIdentity>& identity) {
   planner::CertificateAnswer a;
   if (const std::string why = uncertifiable_reason(cfg); !why.empty()) {
     a.reason = why;
@@ -162,11 +235,14 @@ planner::CertificateAnswer search_certificate(const std::filesystem::path& dit, 
   try {
     std::optional<ModelIdentity> id;
     const CertificateSearch found =
-        find_certificate(dit, te, CertificateQuery{cfg, gpu_arch, engine_numerics(cfg), scope}, cache_dir, &id);
+        find_certificate(dit, te, CertificateQuery{cfg, gpu_arch, engine_numerics(cfg), scope}, cache_dir, &id, extra_dirs);
     if (id) identity = std::move(id);
     a.found = found.certificate.has_value();
     a.file = a.found ? util::path_utf8(found.file) : std::string();
     a.reason = found.reason;
+    if (!a.found) {
+      if (const std::string note = install_certificate_note(); !note.empty()) a.reason += "; " + note;
+    }
   } catch (const std::exception& e) {
     a.reason = e.what();
   }
@@ -184,19 +260,45 @@ std::uint64_t weight_bytes(const std::filesystem::path& p) {
   return total;
 }
 
+// The importer's QuantError for a component file (an unknown quantization format, a layout to convert first, a
+// malformed file) as a model error (IndexError: MI_ERR_MODEL, server `model`) naming the file.
+template <class F>
+auto model_file_errors(const std::filesystem::path& file, F&& f) -> decltype(f()) {
+  try {
+    return f();
+  } catch (const quant::QuantError& e) {
+    const std::string where = util::path_utf8(file);
+    const std::string what = e.what();
+    throw weights::IndexError(what.find(where) == std::string::npos ? where + ": " + what : what);
+  }
+}
+
 std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file) {
   if (!std::filesystem::is_regular_file(file)) throw std::invalid_argument("DiT file not found: " + util::path_utf8(file));
+  weights::check_supported_dit_file(file);
   auto d = std::make_unique<DitSource>();
   d->path = file;
   d->cert_path = file;
+  quant::QuantModel model = model_file_errors(file, [&] { return quant::open_quant_model(file, quant::ModelKind::kDiT); });
+  // NVFP4 linears run only on cc 12.0 with the sm_120a kernels (user decision D1) and once the DiT has NVFP4 sites
+  // (moss_dit::kRunsNvfp4Linears); otherwise the file is refused as an unsupported model (MI_ERR_MODEL).
+  if (std::any_of(model.linears.begin(), model.linears.end(), [](const quant::QuantLinear& l) { return l.spec.format == quant::QuantFormat::kNvfp4; })) {
+    if (const std::string why = moss_dit::nvfp4_unsupported_reason(); !why.empty()) {
+      throw weights::UnsupportedModelError(util::path_utf8(file) + ": " + why);
+    }
+  }
+  const auto static_input_scales =
+      std::count_if(model.linears.begin(), model.linears.end(), [](const quant::QuantLinear& l) { return l.input_scale.has_value(); });
   // INT4 ConvRot (convrot_w4a4) linears stay packed for the INT4 GEMMs (the Turbo tier).
-  d->quant = std::make_unique<quant::QuantIndex>(
-      quant::to_model_index(quant::open_quant_model(file, quant::ModelKind::kDiT), {.native_int4 = true}));
+  d->quant = std::make_unique<quant::QuantIndex>(model_file_errors(file, [&] { return quant::to_model_index(model, {.native_int4 = true}); }));
   d->index = &d->quant->index;
   d->precision = moss_dit::has_int4_linears(d->quant.get())   ? planner::Precision::kInt4
                  : moss_dit::has_quantized_linears(d->quant.get()) ? planner::Precision::kInt8
                                                               : planner::Precision::kBf16;
   d->linears = moss_dit::describe_linears(d->quant.get());
+  if (static_input_scales > 0) {
+    d->linears += "; " + std::to_string(static_input_scales) + " linears carry a static input_scale; ignored (activations are scaled per token)";
+  }
   return d;
 }
 
@@ -211,6 +313,9 @@ struct TeSource {
   qwen35_text::Precision precision = qwen35_text::Precision::kBF16;
   std::uint64_t identity = 0;
   std::uint64_t numerics = 0;
+  // A pinned host copy of this encoder failed to allocate: no more pinning (the plans hold no pinned copy) until
+  // release_device_memory(false) or a new pipeline.
+  mutable bool pin_failed = false;
 };
 
 // Where the VAE decoder comes from (P7a): the bundle's, or a single FLUX.2 VAE file (flux2_vae::index_vae_file, e.g.
@@ -559,7 +664,11 @@ Request request_from_parameters(const json::Value& doc) {
     if (!v->is_string()) throw std::invalid_argument("step_cache must be a string.");
     r.accel.step_cache = accel::parse_step_cache(v->as_string());
   }
-  number("step_cache_threshold", r.accel.step_cache_threshold);
+  if (const json::Value* v = p.find("step_cache_threshold"); v != nullptr && !v->is_null()) {
+    double threshold = 0;
+    number("step_cache_threshold", threshold);
+    r.accel.step_cache_threshold = threshold;
+  }
   return r;
 }
 
@@ -627,7 +736,11 @@ GenerationMetadata generation_metadata(const Request& q, const Result& r) {
   if (q.accel.cfg_truncation < 1.0 && q.cfg != 1.0) m.extra.emplace_back("cfg_truncation", num(q.accel.cfg_truncation));
   if (q.accel.step_cache_on()) {
     m.extra.emplace_back("step_cache", accel::step_cache_name(q.accel.step_cache));
-    m.extra.emplace_back("step_cache_threshold", num(q.accel.step_cache_threshold));
+    // What ran: the request's threshold, or the model's default the pipeline filled in.
+    const double threshold = r.accel.step_cache_threshold > 0
+                                 ? r.accel.step_cache_threshold
+                                 : q.accel.step_cache_threshold.value_or(accel::kDefaultFbCacheThreshold);
+    m.extra.emplace_back("step_cache_threshold", num(threshold));
   }
   return m;
 }
@@ -669,6 +782,8 @@ struct Pipeline::Impl {
   std::map<std::string, std::unique_ptr<EncoderSource>> encoder_sources;
   // DiT source whose resident DiT was last dropped outside the plan's parking (its next load is a reload).
   const DitSource* dit_lost = nullptr;
+  // DiT source the plan last parked (its next load is a parking reload: buffered reads, dit_direct_io).
+  const DitSource* dit_parked = nullptr;
   // Transfer rates for the cost model and whether the weight files are page-cached: probed (or read from the cache
   // directory) at the first generate(), refined from every pass (pipeline/hardware_profile.h). Unset with
   // options.hardware.
@@ -676,6 +791,15 @@ struct Pipeline::Impl {
   std::string hw_key;  // hardware_key() of the learner's profile
   // This pipeline's fused-block self-check (from the profile, the process, or run at the first fused generate()).
   std::optional<moss_dit::FusedCheck> fused_check;
+  // Host copies kept across calls. A soft unload's copy of the DiT's weight files (release_device_memory): the next
+  // load of that source reads it instead of the files, then frees it.
+  std::optional<weights::HostFiles> dit_host;
+  const DitSource* dit_host_src = nullptr;
+  // A host-resident text encoder's copy, kept past the encoder (an arena recreation, a soft unload) while the plan keeps
+  // that source host-resident with the same memory kind: the next encoder adopts it instead of reading the weights.
+  std::vector<weights::HostGroup> te_kept;
+  const TeSource* te_kept_src = nullptr;
+  bool te_kept_pinned = false;
 
   // Per generate() call.
   MemoryStats* mem = nullptr;
@@ -729,6 +853,8 @@ struct Pipeline::Impl {
         d->index = &b.index;
         d->linears = moss_dit::describe_linears(nullptr);
       }
+      d->files = dit_files(*d->index);
+      d->lineage = dit_lineage(*d->index);
       it = dit_sources.emplace(key, std::move(d)).first;
       load_s += since(t0);
     }
@@ -746,8 +872,9 @@ struct Pipeline::Impl {
       auto t = std::make_unique<TeSource>();
       if (file) {
         if (!std::filesystem::is_regular_file(path)) throw std::invalid_argument("text encoder file not found: " + util::path_utf8(path));
+        weights::check_supported_text_encoder_file(path);
         t->path = path;
-        t->model = std::make_unique<qwen35_text::QuantTextModel>(path);
+        t->model = model_file_errors(path, [&] { return std::make_unique<qwen35_text::QuantTextModel>(path); });
         t->precision = t->model->precision();
         t->identity = text_encoder_hash(t->model->index());
       } else {
@@ -843,16 +970,58 @@ struct Pipeline::Impl {
     mem->host_private_peak = std::max(mem->host_private_peak, planner::process_host_memory().private_bytes);
   }
 
-  qwen35_text::EncoderOptions te_options(const TeSource& t, planner::TeResidency residency, int buffers) const {
+  // `pinned`: a host-resident copy is page-locked (planner::TePlan::pinned). A quantized encoder (3.9-6.9 GB) held in RAM
+  // is always pinned (Capabilities::te_host_pageable off: its cache-miss target needs the direct DMA); the bf16 one
+  // (13.8 GB) only where the plan pins it (PipelineOptions::te_host_pin, planner.h), else pageable.
+  qwen35_text::EncoderOptions te_options(const TeSource& t, planner::TeResidency residency, int buffers, bool pinned) const {
     qwen35_text::EncoderOptions o;
     o.direct_io = options.direct_io;
     o.weight_buffers = std::max(1, buffers);
-    // bf16 host-resident weights stay pageable: the whole 15 GB model is never pinned (plan step 24). A quantized
-    // encoder (3.9-6.9 GB) is pinned when held in RAM: its cache-miss target needs the direct DMA.
     const qwen35_text::WeightSource host =
-        t.model ? qwen35_text::WeightSource::kHostPinned : qwen35_text::WeightSource::kHostPageable;
+        pinned || t.model ? qwen35_text::WeightSource::kHostPinned : qwen35_text::WeightSource::kHostPageable;
     o.source = residency == planner::TeResidency::kHostResident ? host : qwen35_text::WeightSource::kFile;
     return o;
+  }
+
+  // The encoder's host copy into te_kept before the encoder is dropped (it shares the memory).
+  void keep_te_host() {
+    if (!te || te->host_resident_bytes() == 0) return;
+    te_kept = te->share_host();
+    te_kept_src = te_src;
+    te_kept_pinned = te->options().source == qwen35_text::WeightSource::kHostPinned;
+  }
+  void drop_te_host() {
+    te_kept.clear();
+    te_kept_src = nullptr;
+  }
+  // Host bytes of the text encoder's copy: the encoder's, else the kept one.
+  std::size_t te_host_bytes() const {
+    if (te) return te->host_resident_bytes();
+    std::size_t total = 0;
+    for (const weights::HostGroup& g : te_kept) total += g.storage_bytes;
+    return total;
+  }
+  std::size_t dit_host_bytes() const { return dit_host ? static_cast<std::size_t>(dit_host->bytes()) : 0; }
+  // Empty when a host copy of `bytes` the engine keeps (a soft unload's) fits: it leaves planner::host_pin_margin() of
+  // the available host memory (cgroup-aware) free and, with a host budget, stays within it; else why not.
+  std::string host_copy_room(std::uint64_t bytes) const {
+    const auto gib = [](std::uint64_t b) {
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%.1f GiB", static_cast<double>(b) / static_cast<double>(std::size_t{1} << 30));
+      return std::string(buf);
+    };
+    const std::size_t available = planner::host_available_bytes();
+    const std::size_t total = planner::host_total_bytes();
+    const std::size_t margin = planner::host_pin_margin(total);
+    if (available == 0) return "the available host memory is unknown";
+    if (!planner::fits_pin_margin(static_cast<std::size_t>(bytes), available, total)) {
+      return "its " + gib(bytes) + " would leave less than " + gib(margin) + " of the " + gib(available) + " available";
+    }
+    const std::size_t budget = options.host_ram_budget;
+    if (budget != 0 && planner::process_host_memory().private_bytes + bytes > budget) {
+      return "its " + gib(bytes) + " would exceed the " + gib(budget) + " host budget";
+    }
+    return {};
   }
   std::size_t te_workspace(const TeSource& t, std::span<const std::int64_t> lengths, const qwen35_text::EncoderOptions& o) const {
     return t.model ? qwen35_text::TextEncoder::workspace_bytes(*t.model, lengths, o)
@@ -875,6 +1044,8 @@ struct Pipeline::Impl {
   void reset_arena(std::size_t capacity, bool park = false) {
     MI_CUDA_CHECK(cudaStreamSynchronize(streams.compute()));
     if (dit && !park) dit_lost = dit_src;
+    if (dit && park) dit_parked = dit_src;
+    keep_te_host();
     te.reset();
     te_src = nullptr;
     encoder.reset();
@@ -900,6 +1071,7 @@ struct Pipeline::Impl {
       dit->set_lora(nullptr);
       dit_lost = dit_src;
     }
+    keep_te_host();
     te.reset();
     te_src = nullptr;
     encoder.reset();
@@ -1026,23 +1198,97 @@ struct Pipeline::Impl {
     if (changed) save_profile(learner->stored());
   }
 
+  // A new encoder with a host source of the kept copy's kind adopts it; any other drops the kept copy (its RAM is not
+  // planned any more).
   void ensure_te(const TeSource& t, const qwen35_text::EncoderOptions& o) {
     if (te && te_src == &t) {
       const qwen35_text::EncoderOptions& cur = te->options();
       if (cur.weight_buffers == o.weight_buffers && cur.source == o.source && cur.direct_io == o.direct_io) return;
     }
+    keep_te_host();
     te.reset();
     te = t.model ? std::make_unique<qwen35_text::TextEncoder>(*t.model, *arena, streams.compute(), o)
                  : std::make_unique<qwen35_text::TextEncoder>(*t.index, *arena, streams.compute(), o);
     te_src = &t;
+    const bool pinned = o.source == qwen35_text::WeightSource::kHostPinned;
+    if (o.source != qwen35_text::WeightSource::kFile && te_kept_src == &t && te_kept_pinned == pinned && !te_kept.empty()) {
+      te->adopt_host(te_kept);
+    } else {
+      drop_te_host();
+    }
+  }
+
+  // A host-resident encoder's copy, loaded now if it is not yet (cancellable). A pinned copy whose allocation fails
+  // (cudaHostAlloc: the OS will not lock that much) is not an error: the encoder is recreated streaming from its files,
+  // the reason goes to r.te_note, and false is returned. Throws qwen35_text::Cancelled.
+  bool load_te_host(const TeSource& t, int buffers, const std::atomic<bool>* cancel, Result& r) {
+    if (!te || te->options().source == qwen35_text::WeightSource::kFile || te->host_resident_bytes() > 0) return true;
+    try {
+      te->preload_host(cancel);
+      return true;
+    } catch (const CudaError& e) {
+      if (te->options().source != qwen35_text::WeightSource::kHostPinned) throw;
+      r.te_note = std::string("its pinned host copy could not be allocated (") + e.what() +
+                  "), so it streamed from its files; no more pinning for it until release_device_memory(false) or a restart";
+      t.pin_failed = true;
+    } catch (const std::bad_alloc&) {
+      r.te_note = "its host copy could not be allocated (out of host memory), so it streamed from its files";
+    }
+    drop_te_host();
+    ensure_te(t, te_options(t, planner::TeResidency::kStreamed, buffers, false));
+    r.plan.te.residency = planner::TeResidency::kStreamed;  // what ran
+    r.plan.te.pinned = false;
+    return false;
+  }
+
+  // Whether a load of `src` from its files uses direct I/O, with the reason in `note` (choose_dit_load_io on what this
+  // machine says now: the files' direct-I/O support, checked once per source; their page-cache residency, per load;
+  // the learner's per-mode load rates).
+  bool dit_direct_io(const DitSource& src, bool parked, std::string& note) const {
+    DitIoInputs in;
+    in.forced_direct = options.direct_io || options.dit_load_direct_io == true;
+    in.forced_buffered = !options.direct_io && options.dit_load_direct_io == false;
+    in.parked = parked;
+    if (!in.forced_buffered) {
+      if (!src.direct) {
+        src.direct = weights::DirectIoSupport{true, {}};
+        for (const std::filesystem::path& f : src.files) {
+          weights::DirectIoSupport d = weights::direct_io_support(f);
+          if (!d.supported) {
+            src.direct = std::move(d);
+            break;
+          }
+        }
+      }
+      in.support = *src.direct;
+      double cached = 0, total = 0;
+      bool known = !src.files.empty();
+      for (const std::filesystem::path& f : src.files) {
+        std::error_code ec;
+        const double bytes = static_cast<double>(std::filesystem::file_size(f, ec));
+        const double fraction = weights::page_cache_fraction(f);
+        if (ec || fraction < 0) known = false;
+        cached += bytes * std::max(0.0, fraction);
+        total += bytes;
+      }
+      in.cached_fraction = known && total > 0 ? cached / total : -1.0;
+      if (learner) {
+        in.buffered_gbps = learner->dit_load_gbps(false);
+        in.direct_gbps = learner->dit_load_gbps(true);
+      }
+    }
+    const DitIoDecision d = choose_dit_load_io(in);
+    note = d.note;
+    return d.direct;
   }
 
   // The plan counts the DiT and every resident model, so a resident DiT is never expected to be dropped here; when
   // it is (the arena found does not match the plan), the reload is reported as MemoryStats::dit_reloaded.
   // `stack_need` excludes the streamed blocks' device buffers (added here from `residency`). A loaded DiT with another
-  // residency is replaced: a planned change, not a reload.
-  void ensure_dit(const DitSource& src, const moss_dit::Residency& residency, std::size_t stack_need,
-                  const std::atomic<bool>* cancel, Timings& tm, const lora::LoraStack* merges, const std::string& merge_key) {
+  // residency is replaced: a planned change, not a reload. A soft unload's host copy of `src` is read instead of the
+  // files (then freed); `load` reports how the weights were read.
+  void ensure_dit(DitSource& src, const moss_dit::Residency& residency, std::size_t stack_need, const std::atomic<bool>* cancel,
+                  Timings& tm, DitLoadReport& load, const lora::LoraStack* merges, const std::string& merge_key) {
     stack_need += moss_dit::MossDit::stream_workspace_bytes(*src.index, residency);
     const bool same = dit && dit_src == &src && dit->residency() == residency && dit_merge_key == merge_key;
     if (same && arena->available() >= stack_need) return;
@@ -1051,11 +1297,15 @@ struct Pipeline::Impl {
     if (arena->available() < persistent + stack_need) {
       throw runtime::BudgetError(persistent + stack_need, arena->available());
     }
+    const weights::HostFiles* host = dit_host && dit_host_src == &src ? &*dit_host : nullptr;
+    std::string note;
+    const bool direct = host == nullptr && dit_direct_io(src, dit_parked == &src, note);
+    dit_parked = nullptr;
     const auto t0 = Clock::now();
     try {
       dit = src.quant
-                ? std::make_unique<moss_dit::MossDit>(*src.quant, *arena, streams, options.direct_io, cancel, residency, merges)
-                : std::make_unique<moss_dit::MossDit>(*src.index, *arena, streams, options.direct_io, cancel, residency, merges);
+                ? std::make_unique<moss_dit::MossDit>(*src.quant, *arena, streams, direct, cancel, residency, merges, host)
+                : std::make_unique<moss_dit::MossDit>(*src.index, *arena, streams, direct, cancel, residency, merges, host);
       if (time_embedding) dit->set_time_embedding(time_embedding.get());
     } catch (...) {
       // A partial load (cancelled or failed) leaves its weights in the persistent region: start over clean.
@@ -1067,7 +1317,22 @@ struct Pipeline::Impl {
     ++mem->dit_loads;
     mem->dit_reloaded = mem->dit_reloaded || dit_lost == &src;
     dit_lost = nullptr;
-    tm.dit_load_s += since(t0);
+    const double seconds = since(t0);
+    tm.dit_load_s += seconds;
+    load.source = host != nullptr ? "host_copy" : "files";
+    // What the readers did (an open that refused O_DIRECT reads buffered).
+    load.io = host != nullptr ? std::string() : dit->load_stats().direct ? "direct" : "buffered";
+    if (direct && !dit->load_stats().direct && note.empty()) note = "direct I/O was refused: the files were read buffered";
+    if (host != nullptr && residency.streamed()) {
+      note = "the streamed blocks read the weight files (the host copy serves the resident part)";
+    }
+    load.note = std::move(note);
+    load.bytes = dit->load_stats().bytes;
+    load.seconds = seconds;
+    if (host != nullptr) {
+      dit_host.reset();  // the copy served its purpose: its RAM is not planned
+      dit_host_src = nullptr;
+    }
     sample_memory();
   }
 
@@ -1111,15 +1376,17 @@ struct Pipeline::Impl {
   // Private host memory the pipeline holds itself across calls (cache contents, text-encoder rings and host copy),
   // which the planner adds on its own and must not count twice. The planner adds the text encoder's share only when
   // it runs: on a full embedding-cache hit the encoder's held memory stays in the baseline.
+  // A soft unload's DiT copy counts as held too: the call frees it when it loads the DiT, and the plan does not count it.
   std::size_t held_host_bytes(bool te_runs) const {
     std::size_t held = cache ? cache->stats().bytes : 0;
     if (dit) held += dit->host_bytes() + dit->pristine_bytes();  // rings / pinned copy, LoRA pristine weights: counted by the plan
     if (te_runs && te && te_src != nullptr) {
       qwen35_text::EncoderOptions file = te->options();
       file.source = qwen35_text::WeightSource::kFile;
-      held += te->host_resident_bytes() + te_host(*te_src, file);
+      held += te_host(*te_src, file);
     }
-    return held;
+    if (te_runs) held += te_host_bytes();  // the encoder's copy, or the one kept past it
+    return held + dit_host_bytes();
   }
 };
 
@@ -1139,7 +1406,89 @@ std::int64_t schedule_steps(const Request& req) {
 Pipeline::Pipeline(PipelineOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {}
 Pipeline::~Pipeline() = default;
 
-Result Pipeline::generate(const Request& req, const GenerateControl& control) {
+ReleaseReport Pipeline::release_device_memory(bool keep_host_copy, const std::atomic<bool>* cancel) {
+  Impl& m = *impl_;
+  ReleaseReport rep;
+  const auto t0 = Clock::now();
+  MemoryStats stats;  // the arena release samples into it
+  m.mem = &stats;
+  struct MemScope {
+    Impl& m;
+    ~MemScope() { m.mem = nullptr; }
+  } mem_scope{m};
+  // The device first: everything below is freed whatever happens to the host copy afterwards.
+  const DitSource* copy_src = keep_host_copy && m.dit ? m.dit_src : nullptr;
+  rep.vram_released = (m.arena ? m.arena->capacity() : 0) + (m.lora_sb ? m.lora_sb->device_bytes() : 0) +
+                      (m.control_emb ? m.control_emb->device_bytes() : 0);
+  m.release_arena();  // keeps a host-resident text encoder's copy (keep_te_host)
+  m.dit_lost = nullptr;  // an explicit unload: the next load is planned, not a reported reload
+  m.lora_sb.reset();
+  m.lora_stack.reset();
+  m.lora_files_key.clear();
+  m.control_emb.reset();
+  m.control_file.reset();
+  m.control_key.clear();
+  MI_CUDA_CHECK(cudaDeviceSynchronize());
+  if (!keep_host_copy) {
+    m.dit_host.reset();
+    m.dit_host_src = nullptr;
+    m.drop_te_host();
+    for (auto& [key, t] : m.te_sources) t->pin_failed = false;  // a full unload: pinning may be tried again
+  } else if (copy_src != nullptr && !(m.dit_host && m.dit_host_src == copy_src)) {
+    // The DiT's weight files into pinned RAM (the next load reads the same bytes from there) when the host has the room
+    // (Impl::host_copy_room). A failure or a cancel only means no copy: the release itself is done.
+    m.dit_host.reset();
+    m.dit_host_src = nullptr;
+    std::uint64_t bytes = 0;
+    for (const std::filesystem::path& f : copy_src->files) {
+      std::error_code ec;
+      bytes += std::filesystem::file_size(f, ec);
+    }
+    if (const std::string why = m.host_copy_room(bytes); !why.empty()) {
+      rep.note = "the DiT was not kept in RAM: " + why;
+    } else {
+      const auto t1 = Clock::now();
+      try {
+        std::string io_note;
+        const bool direct = m.dit_direct_io(*copy_src, false, io_note);
+        weights::HostFiles copy = weights::read_files_to_host(copy_src->files, true, direct, 4, cancel);
+        if (cancel != nullptr && cancel->load()) {
+          rep.note = "the DiT's host copy was cancelled";
+        } else {
+          m.dit_host = std::move(copy);
+          m.dit_host_src = copy_src;
+        }
+      } catch (const CudaError& e) {
+        rep.note = std::string("the DiT was not kept in RAM: ") + e.what();
+      } catch (const weights::IoError& e) {
+        rep.note = std::string("the DiT was not kept in RAM: ") + e.what();
+      } catch (const std::bad_alloc&) {
+        rep.note = "the DiT was not kept in RAM: out of host memory";
+      } catch (const std::exception& e) {
+        rep.note = std::string("the DiT was not kept in RAM: ") + e.what();
+      }
+      rep.host_copy_s = since(t1);
+    }
+  }
+  rep.dit_host_copy = m.dit_host.has_value();
+  rep.te_host_copy = !m.te_kept.empty();
+  rep.host_copy_bytes = m.te_host_bytes() + m.dit_host_bytes();
+  rep.seconds = since(t0);
+  return rep;
+}
+
+Result Pipeline::generate(const Request& req, const GenerateControl& control) { return run(req, control, false); }
+
+Result Pipeline::preload(const PreloadOptions& options) {
+  Request req = options.request;
+  if (tok::python_strip(req.prompt).empty()) req.prompt = "preload";  // plans for a short prompt
+  GenerateControl control;
+  control.cancel = options.cancel;
+  return run(req, control, true);
+}
+
+// generate(), or with `preload` the same up to the plan and the arena, then the loads of the models the plan keeps.
+Result Pipeline::run(const Request& req, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
   validate(req);
   Result r;
@@ -1159,6 +1508,8 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   };
   const auto finish = [&] {
     tm.total_s = since(t_total);
+    r.memory.host_copy_bytes = m.te_host_bytes() + m.dit_host_bytes();
+    r.memory.merge_memo_bytes = m.dit ? m.dit->memo_bytes() : 0;
     m.sample_memory();
     m.mem = nullptr;
     if (m.learner) m.learner->end_generation();
@@ -1189,6 +1540,10 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   r.dit_linears = src.linears;
   if (m.time_embedding) r.time_embedding = util::path_utf8(m.options.time_embedding_file);
   r.gpu_arch = current_gpu_arch();
+  if (m.dit_host && m.dit_host_src != &src) {
+    m.dit_host.reset();  // a soft unload's copy of another DiT than this request's
+    m.dit_host_src = nullptr;
+  }
   // Runtime LoRA files: the request's, then a control adapter's LoRA part (its embedder tensors are read separately).
   std::vector<lora::LoraSpec> loras = req.loras;
   const control::ControlFile* ctl = nullptr;
@@ -1272,7 +1627,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       if (it == src.certificates.end()) {
         it = src.certificates
                  .emplace(key, search_certificate(src.cert_path, te_file, cfg, r.gpu_arch, scope, m.options.cache_dir,
-                                                  src.identity))
+                                                  m.options.certificate_dirs, src.identity))
                  .first;
       }
       return it->second;
@@ -1285,12 +1640,23 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       r.tier.certificate.clear();
       r.tier.reason += "; runtime LoRAs active: uncertified (certificates cover the base model only)";
     }
+    if (req.accel.step_cache_on()) {
+      // An unset threshold takes the model's default (0.02 on the base model, told apart by its DiT's input embedder:
+      // dit_lineage; 0.03 otherwise); one the user set stands.
+      r.accel.step_cache_threshold = req.accel.step_cache_threshold.value_or(accel::default_fbcache_threshold(src.lineage));
+      r.accel.step_cache_threshold_source = accel::threshold_source(req.accel, src.lineage);
+    }
+    if (std::string w = accel::base_model_threshold_warning(req.accel, src.lineage); !w.empty()) {
+      r.accel_warnings.push_back(std::move(w));
+    }
     if (req.accel.active(req.cfg != 1.0)) {
       // P6b: certificates are measured with accelerators off (the Reference tier's exactness does not hold either). The
       // tier above was chosen without them; this is the run's one accelerator reason.
       r.tier.certified = false;
       r.tier.certificate.clear();
-      r.tier.reason += "; lossy accelerators active (" + req.accel.describe(req.cfg != 1.0) + "): this run is uncertified";
+      accel::Options ran = req.accel;
+      if (ran.step_cache_on()) ran.step_cache_threshold = r.accel.step_cache_threshold;
+      r.tier.reason += "; lossy accelerators active (" + ran.describe(req.cfg != 1.0) + "): this run is uncertified";
     }
     // The report's quality object (quality_report_json): what ran, why, and the models it ran.
     QualityReport& q = r.quality;
@@ -1330,6 +1696,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
                                       "the request's control adapter (Request::control), not as a LoRA.");
         }
       }
+      const auto t0l = Clock::now();
       lora::LoadOptions lo;
       lo.strict = m.options.lora_strict;
       lo.int8_block_gemms = src.precision != planner::Precision::kBf16;
@@ -1352,6 +1719,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       m.lora_stack = std::move(stack);
       m.lora_sb = std::move(sb);
       m.lora_files_key = files;
+      tm.lora_load_s += since(t0l);
     } else {
       bool changed = false;
       for (int i = 0; i < m.lora_stack->files(); ++i) {
@@ -1365,12 +1733,14 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
         m.lora_sb->update_strengths(*m.lora_stack);  // between forwards: nothing reads them now
         // Merged adapters: re-merged from the pristine weights kept at load, in place (no reload).
         if (m.dit && m.dit_merge_key == files && !m.lora_stack->merge_modules().empty()) {
+          const auto t0m = Clock::now();
           try {
             m.dit->remerge_lora(*m.lora_stack);
           } catch (...) {
             m.drop_dit_after_failed_merge();
             throw;
           }
+          tm.lora_merge_s += since(t0m);
         }
       }
     }
@@ -1469,12 +1839,24 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   // adapters, toggled on or off): switched in place from the pristine copies when no block module is newly merged,
   // the same bits as a reload without its cost. A failure drops the DiT (the next load starts clean).
   if (need_dit && m.dit && m.dit_src == &src && m.dit_merge_key != merge_key) {
+    const auto t0m = Clock::now();
+    // The stack and its strengths name the merged bits: switching back to them later stores the DiT's kept copy.
+    std::string memo_key;
+    if (!merge_key.empty()) {
+      memo_key = merge_key;
+      for (int i = 0; i < m.lora_stack->files(); ++i) {
+        char strength[32];
+        std::snprintf(strength, sizeof(strength), "|%a", static_cast<double>(m.lora_stack->strength(i)));
+        memo_key += strength;
+      }
+    }
     try {
-      if (m.dit->rebase_merges(merge_key.empty() ? nullptr : m.lora_stack.get())) m.dit_merge_key = merge_key;
+      if (m.dit->rebase_merges(merge_key.empty() ? nullptr : m.lora_stack.get(), memo_key)) m.dit_merge_key = merge_key;
     } catch (...) {
       m.drop_dit_after_failed_merge();
       throw;
     }
+    tm.lora_merge_s += since(t0m);
   }
   // Control images are encoded once per pass size (not without a sampling step).
   const bool ctl_encode = ctl != nullptr && !req.control.images.empty() && need_dit;
@@ -1510,7 +1892,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   std::vector<std::size_t> missing;
   for (std::size_t i = 0; i < seqs.size(); ++i) {
     keys[i] = EmbeddingKey{tes.identity, tes.numerics, req.max_sequence_length, seqs[i]};
-    if (m.cache && need_dit) embeds[i] = m.cache->find(keys[i]);
+    if (m.cache && need_dit && !preload) embeds[i] = m.cache->find(keys[i]);  // a preload plans for a new prompt
     if (embeds[i]) {
       ++r.te_cache_hits;
     } else if (need_dit) {
@@ -1630,7 +2012,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   in.request.dit_weights_cached = m.dit_weights_cached();
   in.request.vae_resident = needed_vae + held_vae > 0;
   in.workspaces.text_encoder = [&](planner::TeResidency residency, int buffers) {
-    return m.te_workspace(tes, te_lengths, m.te_options(tes, residency, buffers));
+    return m.te_workspace(tes, te_lengths, m.te_options(tes, residency, buffers, false));
   };
   // The hires fix decodes its first pass next to the resident DiT (exact tiling, never parking it), so the DiT is loaded
   // once per request: the smallest tiled decode of the first pass counts in the denoise phase, where the DiT is resident.
@@ -1668,8 +2050,16 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   // the baseline, so they count once).
   if (!merge_key.empty()) in.workspaces.host_buffers += moss_dit::MossDit::pristine_bytes(*m.lora_stack, src.quant.get());
   in.caps.te_max_buffers = 2;
-  in.caps.te_ring_bytes = Impl::te_host(tes, m.te_options(tes, planner::TeResidency::kStreamed, 2));
+  in.caps.te_ring_bytes = Impl::te_host(tes, m.te_options(tes, planner::TeResidency::kStreamed, 2, false));
   in.caps.te_host_resident = true;
+  in.caps.te_host_pinned = !tes.pin_failed;
+  in.caps.te_host_pageable = !tes.model;  // a quantized encoder held in RAM is always pinned (te_options)
+  in.caps.te_quantized = tes.model != nullptr;
+  in.caps.te_pin = m.options.te_host_pin;
+  if (tes.pin_failed) {
+    r.te_note = "pinning disabled for this text encoder after a failed pinned allocation (until "
+                "release_device_memory(false) or a restart)";
+  }
   in.caps.dit_parking = need_dit;
   in.caps.dit_streaming = need_dit;
   in.caps.dit_max_buffers = 3;
@@ -1698,8 +2088,16 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     in.workspaces.host_buffers += req.control.images.size() * (std::max(latent_bytes_of(H1, W1), latent_bytes_of(H2, W2)) +
                                                                 std::max(image_bytes_of(H1, W1), image_bytes_of(H2, W2)));
   }
-  in.budgets.host_available = planner::host_available_bytes();
   const std::size_t held_host = m.held_host_bytes(!missing.empty());
+  // Of it, what the plan counts again (and so would replace): not a soft unload's DiT copy, nor a held DiT's host
+  // memory when this request plans no DiT.
+  std::size_t counted_again = held_host - std::min(held_host, m.dit_host_bytes());
+  if (!need_dit && m.dit) counted_again -= std::min(counted_again, m.dit->host_bytes() + m.dit->pristine_bytes());
+  // What the pipeline holds and the plan counts again would be freed for it: available to the plan too (otherwise a
+  // host-resident text encoder's own copy would count against keeping it on the next request).
+  const std::size_t host_available = planner::host_available_bytes();
+  in.budgets.host_available = host_available == 0 ? 0 : host_available + counted_again;  // 0: unknown
+  in.budgets.host_total = planner::host_total_bytes();
   in.budgets.host_private_now = r.memory.host_private_start > held_host ? r.memory.host_private_start - held_host : 0;
   in.budgets.host_budget = m.options.host_ram_budget;
   in.mode = m.options.mode;
@@ -1772,6 +2170,9 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   }
   const planner::ExecutionPlan& plan = r.plan;
   if (m.cache) m.cache->set_max_bytes(plan.cache.host_bytes);
+  // A DiT's merge memo (a control adapter's switch-back bits) goes when the host is tight (merge_memo_unaffordable). It
+  // only saves a merge.
+  if (m.dit && m.dit->memo_bytes() > 0 && merge_memo_unaffordable(plan, m.options.host_ram_budget)) m.dit->drop_merge_memo();
   tm.plan_s = since(t0);
   if (control.on_plan) control.on_plan(plan);
 
@@ -1785,6 +2186,87 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   r.memory.arena_capacity = std::max(r.memory.arena_capacity, m.arena->capacity());
   m.sample_memory();
 
+  const moss_dit::Residency residency = m.dit_residency(plan.dit);
+  // Loads the DiT when it is not resident (first use, or parked / dropped since) and sets this request's options.
+  const auto prepare_dit = [&]() {
+    const int loads_before = r.memory.dit_loads;
+    try {
+      m.ensure_dit(src, residency, denoise_need, control.cancel, tm, r.dit_load, merge_key.empty() ? nullptr : m.lora_stack.get(),
+                   merge_key);
+    } catch (const moss_dit::Cancelled&) {
+      r.cancelled = true;
+      return false;
+    }
+    m.dit->set_cancel(control.cancel);
+    // A DiT read buffered from the weight files: page-cached or cold (the loader's one reader). Direct reads and a soft
+    // unload's host copy bypass the page cache, so they say nothing about it.
+    // Each mode's load rate is kept (the direct one prices cold loads; on Windows the two decide the mode).
+    const moss_dit::LoadStats& ls = m.dit->load_stats();
+    if (r.memory.dit_loads > loads_before && m.learner && r.dit_load.source == "files" && ls.seconds > 0 &&
+        ls.bytes >= (std::uint64_t{1} << 30)) {
+      const double gbps = static_cast<double>(ls.bytes) / ls.seconds / 1e9;
+      m.learner->observe_dit_load_rate(ls.direct, gbps);
+      if (!ls.direct) m.learner->observe_dit_load(gbps);
+    }
+    if (m.dit->block_path() != block_path) m.dit->set_block_path(block_path);
+    if (m.dit->attention() != attention) m.dit->set_attention(attention);
+    m.dit->set_lora(m.lora_sb.get());
+    m.dit->set_request_route(route);
+    r.block_path = block_path;
+    if (block_path == moss_dit::BlockPath::kFusedGraphs && residency.streamed()) {
+      r.block_path = moss_dit::BlockPath::kFused;  // streamed blocks wait on host-driven copies: never captured
+      if (r.block_path_note.empty()) r.block_path_note = "CUDA graphs need every DiT block resident: blocks ran fused, eagerly";
+    }
+    return true;
+  };
+
+  if (preload) {
+    // What the plan keeps across requests, in generate()'s order: a host-resident text encoder's copy (its device side
+    // is all stack), the VAE encoder of a request that starts from an image, the DiT, and the VAE decoder unless the plan
+    // parks the DiT for the decode (generate() then loads it after the denoise).
+    if (!missing.empty() && plan.te.run && plan.te.residency == planner::TeResidency::kHostResident) {
+      if (cancel_requested()) {
+        r.cancelled = true;
+        return finish();
+      }
+      const auto t0t = Clock::now();
+      m.ensure_te(tes, m.te_options(tes, plan.te.residency, plan.te.buffers, plan.te.pinned));
+      try {
+        if (!m.load_te_host(tes, plan.te.buffers, control.cancel, r)) r.plan.explanation += "\nText encoder: " + r.te_note + ".";
+      } catch (const qwen35_text::Cancelled&) {
+        r.cancelled = true;
+        tm.te_weight_load_s = since(t0t);
+        return finish();
+      }
+      tm.te_weight_load_s = since(t0t);
+      m.sample_memory();
+    }
+    if (enc_src != nullptr) {
+      if (cancel_requested()) {
+        r.cancelled = true;
+        return finish();
+      }
+      m.ensure_encoder(*enc_src, encode_need, tm);
+    }
+    if (need_dit && plan.dit.park_for_text_encoder) {
+      r.preload_note = "the DiT was not loaded: the plan parks it for the text encoder, so a generate() that encodes a "
+                       "new prompt would evict it first; it loads after the encoder";
+    } else if (need_dit) {
+      if (cancel_requested() || !prepare_dit()) {
+        r.cancelled = true;
+        return finish();
+      }
+    }
+    if (need_decoder && !plan.dit.park_for_decode) {
+      if (cancel_requested()) {
+        r.cancelled = true;
+        return finish();
+      }
+      m.ensure_vae(vs, plan.vae.stack_bytes, false, tm);
+    }
+    return finish();
+  }
+
   // 1. Text encoder for the sequences the cache did not serve; its device memory is released when it returns.
   if (!keep_going(Phase::kTextEncoder)) return finish();
   if (!missing.empty()) {
@@ -1795,11 +2277,14 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     std::vector<std::vector<std::int32_t>> todo;
     for (const std::size_t i : missing) todo.push_back(seqs[i]);
     t0 = Clock::now();
-    m.ensure_te(tes, m.te_options(tes, plan.te.residency, plan.te.buffers));
+    m.ensure_te(tes, m.te_options(tes, plan.te.residency, plan.te.buffers, plan.te.pinned));
     qwen35_text::EncodeOptions eo;
     eo.cancel = control.cancel;
     std::vector<std::vector<std::uint16_t>> out;
     try {
+      // A host-resident copy not loaded yet: loaded here, cancellable between layer groups (encode() would load it
+      // without the flag). A pinned copy that cannot be allocated falls back to streaming from the files.
+      if (!m.load_te_host(tes, plan.te.buffers, control.cancel, r)) r.plan.explanation += "\nText encoder: " + r.te_note + ".";
       out = m.te->encode_to_host(todo, eo);
     } catch (const qwen35_text::Cancelled&) {
       r.cancelled = true;
@@ -1905,33 +2390,6 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       return finish();
     }
   }
-  const moss_dit::Residency residency = m.dit_residency(plan.dit);
-  // Loads the DiT when it is not resident (first use, or parked / dropped since) and sets this request's options.
-  const auto prepare_dit = [&]() {
-    const double loaded_before = tm.dit_load_s;
-    try {
-      m.ensure_dit(src, residency, denoise_need, control.cancel, tm, merge_key.empty() ? nullptr : m.lora_stack.get(), merge_key);
-    } catch (const moss_dit::Cancelled&) {
-      r.cancelled = true;
-      return false;
-    }
-    m.dit->set_cancel(control.cancel);
-    // A DiT read from the weight files: page-cached or cold (the loader's one reader; O_DIRECT reads say nothing).
-    const moss_dit::LoadStats& ls = m.dit->load_stats();
-    if (tm.dit_load_s > loaded_before && m.learner && !m.options.direct_io && ls.seconds > 0 && ls.bytes >= (std::uint64_t{1} << 30)) {
-      m.learner->observe_dit_load(static_cast<double>(ls.bytes) / ls.seconds / 1e9);
-    }
-    if (m.dit->block_path() != block_path) m.dit->set_block_path(block_path);
-    if (m.dit->attention() != attention) m.dit->set_attention(attention);
-    m.dit->set_lora(m.lora_sb.get());
-    m.dit->set_request_route(route);
-    r.block_path = block_path;
-    if (block_path == moss_dit::BlockPath::kFusedGraphs && residency.streamed()) {
-      r.block_path = moss_dit::BlockPath::kFused;  // streamed blocks wait on host-driven copies: never captured
-      if (r.block_path_note.empty()) r.block_path_note = "CUDA graphs need every DiT block resident: blocks ran fused, eagerly";
-    }
-    return true;
-  };
   if (need_dit && !prepare_dit()) return finish();
 
   // 3. Sampling passes: the text refiner once per row, then the sampling loop at H x W over `sched`, from the seeded
@@ -2096,7 +2554,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       return !r.cancelled;
     };
     if (req.accel.step_cache_on()) {
-      step_cache.emplace(*m.arena, h, w, static_cast<int>(row_lengths.size()), req.accel.step_cache_threshold);
+      step_cache.emplace(*m.arena, h, w, static_cast<int>(row_lengths.size()), r.accel.step_cache_threshold);
       m.dit->set_step_cache(&*step_cache);
       step_cache_reset.dit = m.dit.get();
     }
@@ -2115,6 +2573,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     if (step_cache) {
       r.accel.dit_calls += step_cache->calls();
       r.accel.cached_calls += step_cache->reused();
+      r.accel.step_cache_diffs.insert(r.accel.step_cache_diffs.end(), step_cache->diffs().begin(), step_cache->diffs().end());
     }
     for (int i = 0; i < run; ++i) r.accel.cfg_truncated_steps += g.do_cfg() && !g.cfg_active(i, sched.num_steps());
     pass.steps_run = run;
@@ -2199,6 +2658,12 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     }
     if (sched2.num_steps() > 0 && !prepare_dit()) return finish();
     if (!run_pass(H2, W2, sched2, &z0_2, inpaint ? &blend_2 : nullptr, inpaint ? &mask_2 : nullptr, r.hires)) return finish();
+  }
+
+  // A step cache that never reused over a whole run: said with what it measured, so a threshold below this DiT's floor
+  // of block-0 change is not mistaken for a working cache.
+  if (!r.cancelled) {
+    if (std::string w = accel::never_engaged_warning(r.accel); !w.empty()) r.accel_warnings.push_back(std::move(w));
   }
 
   // 6. The final decode. Not after a cancel, even one seen at the last step.

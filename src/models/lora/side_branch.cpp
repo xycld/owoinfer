@@ -4,9 +4,12 @@
 #include <atomic>
 #include <cstdint>
 #include <cmath>
+#include <exception>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "kernels/lora/lora_kernels.h"
 #include "weights/quant/quant_codec.h"
@@ -163,9 +166,13 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
   buffer_ = DeviceBuffer(plan.bytes);
   std::vector<std::uint16_t> host(plan.bytes / 2, 0);  // bf16 staging of every factor (coefficients written later)
   const auto at = [&](std::size_t offset) { return host.data() + offset / 2; };
-  for (std::size_t e = 0; e < plan.sites.size(); ++e) {
+  for (const SitePlan& sp : plan.sites) {
+    if (!sp.slices.empty()) max_rank_ = std::max(max_rank_, sp.rank);
+  }
+  // One site: its entry and its own ranges of the staging buffer (the factor reads are thread-safe).
+  const auto build_site = [&](std::size_t e) {
     const SitePlan& sp = plan.sites[e];
-    if (sp.slices.empty()) continue;
+    if (sp.slices.empty()) return;
     Entry& en = entries_[e];
     en.present = true;
     SiteBranch& br = en.branch;
@@ -174,7 +181,6 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
     br.rank = sp.rank;
     br.a = view_at(buffer_.get(), sp.a_offset, DType::kBF16, {sp.rank, sp.k});
     br.coef = view_at(buffer_.get(), sp.coef_offset, DType::kF32, {sp.rank});
-    max_rank_ = std::max(max_rank_, sp.rank);
     const bool permute = static_cast<Site>(e % kSites) == Site::kUpGate;
     const auto put_a = [&](const Adapter& a, std::int64_t col0) {
       const std::vector<float> down = stack.read(a.parts[0]);  // [r, k]
@@ -222,6 +228,27 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
         en.columns.push_back({r.adapter, sl.own_col0 + r.offset, a.rank});
       }
     }
+  };
+  // Sites are independent: reading and converting the factors of a 300 MB adapter file took 0.4-0.6 s on one thread
+  // (the cost of switching a control adapter on, which builds its LoRA part's branches).
+  const std::size_t threads = std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, 16);
+  std::atomic<std::size_t> next{0};
+  std::vector<std::exception_ptr> errors(threads);
+  {
+    std::vector<std::jthread> workers;
+    for (std::size_t t = 0; t < threads; ++t) {
+      workers.emplace_back([&, t] {
+        try {
+          for (std::size_t e = next++; e < plan.sites.size(); e = next++) build_site(e);
+        } catch (...) {
+          errors[t] = std::current_exception();
+          next = plan.sites.size();
+        }
+      });
+    }
+  }
+  for (const std::exception_ptr& err : errors) {
+    if (err) std::rethrow_exception(err);
   }
   buffer_.upload(host.data(), plan.bytes);
   upload_coefs(stack);

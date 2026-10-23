@@ -49,17 +49,50 @@ std::string Options::describe(bool do_cfg) const {
   if (do_cfg && cfg_truncation < 1.0) out = "cfg_truncation " + number(cfg_truncation);
   if (step_cache_on()) {
     out += (out.empty() ? "" : ", ") + std::string("step_cache ") + step_cache_name(step_cache) + " " +
-           number(step_cache_threshold);
+           (step_cache_threshold ? number(*step_cache_threshold) : std::string("default"));
   }
   return out.empty() ? "off" : out;
+}
+
+std::string threshold_source(const Options& requested, std::string_view lineage) {
+  if (requested.step_cache_threshold) return "request";
+  return "default for the " + (lineage.empty() ? std::string("unrecognized") : std::string(lineage)) + " model";
+}
+
+std::string base_model_threshold_warning(const Options& requested, std::string_view lineage) {
+  if (!requested.step_cache_on() || lineage != "base" || !requested.step_cache_threshold ||
+      *requested.step_cache_threshold <= kBaseModelFbCacheThreshold) {
+    return {};
+  }
+  return "step cache: fbcache " + number(*requested.step_cache_threshold) +
+         " on the base model can change the composition (RTX 5090, 4 prompts: min DINOv2 0.77 at 0.03 and 0.53 at 0.05 "
+         "against the uncached image; the SFT model stays at 0.93 or above): use 0.02 or below, or the SFT model, to keep "
+         "the uncached image's layout";
+}
+
+std::string never_engaged_warning(const Stats& stats) {
+  if (stats.step_cache_threshold <= 0 || stats.cached_calls != 0) return {};
+  std::vector<double> d;
+  for (const double x : stats.step_cache_diffs) {
+    if (std::isfinite(x)) d.push_back(x);  // calls with nothing to compare with (NaN, null in the report) do not count
+  }
+  if (d.size() < 4) return {};
+  std::sort(d.begin(), d.end());
+  return "step cache: fbcache " + number(stats.step_cache_threshold) + " never engaged: block 0's relative change was at least " +
+         number(d.front()) + " (median " + number(d[d.size() / 2]) + ") over " + std::to_string(d.size()) +
+         " comparable DiT calls, so no call reused the cache";
+}
+
+double default_fbcache_threshold(std::string_view lineage) {
+  return lineage == "base" ? kBaseModelFbCacheThreshold : kDefaultFbCacheThreshold;
 }
 
 void validate(const Options& o) {
   if (!std::isfinite(o.cfg_truncation) || o.cfg_truncation < 0.0 || o.cfg_truncation > 1.0) {
     throw std::invalid_argument("cfg_truncation must be between 0 and 1 (1 = off).");
   }
-  if (o.step_cache_on() &&
-      (!std::isfinite(o.step_cache_threshold) || o.step_cache_threshold <= 0.0 || o.step_cache_threshold > 1.0)) {
+  if (o.step_cache_on() && o.step_cache_threshold &&
+      (!std::isfinite(*o.step_cache_threshold) || *o.step_cache_threshold <= 0.0 || *o.step_cache_threshold > 1.0)) {
     throw std::invalid_argument("step_cache_threshold must be greater than 0 and at most 1.");
   }
 }

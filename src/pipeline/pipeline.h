@@ -57,6 +57,7 @@
 #include "tokenizer/prompt_tokens.h"
 #include "planner/planner.h"
 #include "util/json.h"
+#include "weights/file_reader.h"
 
 namespace mi::pipeline {
 
@@ -200,7 +201,15 @@ struct PipelineOptions {
   std::size_t vram_reserve = std::size_t{384} << 20;
   // Cap on the process's private host memory (planner/host_memory.h); 0 = the mode's target.
   std::size_t host_ram_budget = 0;
-  bool direct_io = false;  // O_DIRECT weight reads (cold-cache behaviour)
+  bool direct_io = false;  // O_DIRECT for every weight read (cold-cache behaviour)
+  // The DiT's load from its weight files: unset = adaptive: direct I/O (O_DIRECT / FILE_FLAG_NO_BUFFERING; RTX 5090:
+  // 10.9 GB/s against 4.3 GB/s buffered) unless direct I/O gains nothing on the files (weights::direct_io_support:
+  // tmpfs, network file systems, btrfs compressed extents, a refused open), the load is a parking reload, or at least
+  // 90 % of the files is in the page cache already (Linux: weights::page_cache_fraction before every load; Windows: once
+  // buffered loads are measured faster than direct ones); then buffered. false = buffered; true = direct I/O (a refused
+  // open still reads buffered). direct_io implies true. Streamed DiT blocks keep reading buffered every step (the page
+  // cache serves them) unless direct_io. Result::dit_load reports what a load used and why.
+  std::optional<bool> dit_load_direct_io;
   bool embedding_cache = true;
   std::filesystem::path cache_dir;  // embedding-cache disk spill; empty = memory only
   // A held arena is recreated at the plan's size when a request needs less than this fraction of it, so a launcher
@@ -229,11 +238,17 @@ struct PipelineOptions {
   // Read when the pipeline is constructed (moss_dit::DistillError for a bad file).
   std::filesystem::path time_embedding_file;
   bool lora_strict = false;  // lora::LoadOptions::strict: unknown LoRA keys and lossy merges are errors
+  // Whether a host-resident text encoder may hold a pinned copy (planner::TeHostPin, planner.h's file comment): auto
+  // (default) where the machine clearly has the room, on whenever it fits the host limit, off never. A pinned copy
+  // whose allocation fails falls back to streaming (Result::te_note says so).
+  planner::TeHostPin te_host_pin = planner::TeHostPin::kAuto;
   // Quality tier and attention kernel (planner::resolve_tier: what each tier runs and refuses; unset attention: the
-  // tier's choice). Certificates (pipeline/quality_cert.h) are looked up next to the DiT and in
-  // <cache_dir>/quality_certs, once per configuration while the DiT source is loaded.
+  // tier's choice). Certificates (pipeline/quality_cert.h) are looked up once per configuration while the DiT source
+  // is loaded, in certificate_files()' order: each of certificate_dirs, <cache_dir>/quality_certs, the DiT's sidecar,
+  // then the install tree's <prefix>/share/mossinfer/quality_certs.
   planner::Tier tier = planner::Tier::kAuto;
   std::optional<planner::AttentionMode> attention;
+  std::vector<std::filesystem::path> certificate_dirs;  // extra certificate directories, searched first, in order
 };
 
 struct Timings {
@@ -245,6 +260,11 @@ struct Timings {
   double te_weight_wait_s = 0;  // compute stream waiting for weights
   double te_compute_s = 0;
   double dit_load_s = 0;  // 0 when the DiT was resident
+  // Runtime LoRAs and a control adapter's LoRA part (Result::loras / control): reading and parsing the adapter files
+  // and uploading the side branches (lora_load_s), and merging adapters into a loaded DiT in place: a strength change's
+  // re-merge, or a control adapter switched on or off (lora_merge_s). 0 when the stack was reused unchanged.
+  double lora_load_s = 0;
+  double lora_merge_s = 0;
   double refine_s = 0;    // text refiner, all rows
   double denoise_s = 0;
   double vae_load_s = 0;
@@ -270,6 +290,12 @@ struct MemoryStats {
   // loaded again in this call.
   bool dit_reloaded = false;
   int dit_loads = 0;  // DiT loads in the call (0 when it was resident or not needed; at most 1 unless the plan parks)
+  // Host copies the pipeline keeps across calls (Pipeline::release_device_memory, a host-resident text encoder) at the
+  // end of the call.
+  std::uint64_t host_copy_bytes = 0;
+  // Host memory the loaded DiT keeps for switching a merged adapter set back on (moss_dit::MossDit::memo_bytes: a
+  // control adapter's merged text-refiner bits and their pristine copies, at most 1 GiB), at the end of the call.
+  std::uint64_t merge_memo_bytes = 0;
   std::size_t host_private_start = 0;  // process private host memory when the call started
   std::size_t host_private_peak = 0;   // its peak, sampled at phase boundaries
 };
@@ -295,6 +321,16 @@ struct DitStreamStats {
     bool cached = false;
   };
   std::vector<Step> steps;  // per finished step
+};
+
+// How the DiT's weights were read by the last load of a call (MemoryStats::dit_loads > 0): the report's "dit_load".
+struct DitLoadReport {
+  std::string source;   // "" (no load in the call), "files", or "host_copy" (the weights a soft unload kept in RAM)
+  std::string io;       // "files": "direct" or "buffered"
+  std::string note;     // why buffered (PipelineOptions::dit_load_direct_io, or what the file system allows)
+  std::uint64_t bytes = 0;
+  double seconds = 0;
+  double gbps() const { return seconds > 0 ? static_cast<double>(bytes) / seconds / 1e9 : 0.0; }
 };
 
 // One sampling pass of an image request (the request's pass, and the hires fix's second pass).
@@ -360,6 +396,8 @@ struct Result {
   std::string time_embedding;  // PipelineOptions::time_embedding_file when a replacement step embedder ran (else empty)
   std::string te_source;     // the bundle's text_encoder directory or PipelineOptions::text_encoder_file
   std::string te_precision;  // qwen35_text::precision_name: "bf16", "int8", "w4a8"
+  std::string te_note;       // e.g. a pinned host copy that could not be allocated (the encoder streamed instead)
+  std::string preload_note;  // preload(): what it did not load and why (e.g. a DiT the plan parks for the encoder)
   std::string vae_source;    // the bundle's vae directory or PipelineOptions::vae_file
   // Runtime LoRAs: how each file was read and applied (lora::FileReport), and the losses to show the user (merged
   // adapters requantized on INT8 block GEMMs).
@@ -377,8 +415,12 @@ struct Result {
     std::string encode_schedule;  // "untiled" or the tile plans, per encode
   } control;
   DitStreamStats dit_stream;
-  // P6b: what the accelerators did (CFG-truncated steps, step-cache calls and reuses).
+  DitLoadReport dit_load;
+  // P6b: what the accelerators did (CFG-truncated steps, step-cache calls and reuses), and what the user should know
+  // about them for this model (e.g. a step-cache threshold that moves the base model's composition, or a cache that
+  // could not engage).
   accel::Stats accel;
+  std::vector<std::string> accel_warnings;
   Timings timings;
   MemoryStats memory;
 };
@@ -413,9 +455,66 @@ struct GenerateControl {
   const std::atomic<bool>* cancel = nullptr;
 };
 
+// The model a DiT was trained as, from its input embedder (video_embedder.weight, which the INT8 / INT4 ConvRot
+// conversions keep in bf16, so the quantized files of a model share it): "base" or "sft" for the official MOSS-Image
+// weights and the files derived from them, "" for anything else (or unreadable). XXH64 of the tensor's 786 KB; `index`
+// is a bundle's or a single file's (quant::to_model_index).
+std::string dit_lineage(const weights::ModelIndex& index);
+
+// How a DiT load reads its weight files (PipelineOptions::dit_load_direct_io; pure, for the pipeline and its tests).
+// forced_*: the options; support: weights::direct_io_support of the files (the first that does not gain); parked: a
+// parking reload; cached_fraction: the files' bytes in the page cache (weights::page_cache_fraction), negative when
+// unknown; *_gbps: the learner's median load rates per mode (0: none measured). The learner's buffered rate mixes warm
+// and cold loads; it only decides where residency is unknown (Windows), and there a warm buffered load beating a direct
+// one is exactly the case to switch.
+inline constexpr double kDitCachedFraction = 0.9;  // at least this much resident: buffered
+struct DitIoInputs {
+  bool forced_direct = false, forced_buffered = false;
+  weights::DirectIoSupport support{true, {}};
+  bool parked = false;
+  double cached_fraction = -1.0;
+  double buffered_gbps = 0, direct_gbps = 0;
+};
+struct DitIoDecision {
+  bool direct = true;
+  std::string note;  // why buffered, or what decided (empty for a plain direct load)
+};
+DitIoDecision choose_dit_load_io(const DitIoInputs& in);
+
+// Whether a loaded DiT's merge memo (MossDit::memo_bytes, a control adapter's switch-back bits) is dropped before this
+// plan runs: the plan's host-private estimate (which holds the memo) is over the target its configuration is held to
+// (ExecutionPlan::host_held_target_bytes), or over an explicit host budget. Pure.
+bool merge_memo_unaffordable(const planner::ExecutionPlan& plan, std::size_t host_budget);
+
 // The PNG metadata of a generation (png_writer.h generation_text_chunks): settings, the tier that ran, and the models
 // by file name (the bundle, and each separately loaded file); sha256 left empty (not computed here).
 GenerationMetadata generation_metadata(const Request& request, const Result& result);
+
+// Pipeline::preload: the request to load the models for, before the first generate().
+struct PreloadOptions {
+  // Planned as generate() plans it: the models it names (the bundle, PipelineOptions' files, its LoRAs and control
+  // adapter), its size, steps and CFG, and its prompt's token count (it sizes the text-encoder and denoise workspaces;
+  // a blank prompt plans for a short one, and the arena's slack covers a few hundred more tokens). The embedding cache
+  // is not consulted: the text encoder is planned as for a new prompt.
+  Request request;
+  // Checked between the models, per DiT weight group and between a host-resident text encoder's layer groups. A
+  // cancelled preload leaves the pipeline usable (Result::cancelled is set): the models loaded before the cancel stay;
+  // a DiT whose load was cancelled is dropped with its partial weights (the arena is recreated), and a text encoder's
+  // partial host copy is freed.
+  const std::atomic<bool>* cancel = nullptr;
+};
+
+// Pipeline::release_device_memory: what was freed and kept.
+struct ReleaseReport {
+  double seconds = 0;
+  std::size_t vram_released = 0;      // the arena's capacity plus the device memory held outside it (LoRA side branches,
+                                      // a control adapter's embedder)
+  bool dit_host_copy = false;         // the DiT's weight files are held in RAM: the next load re-uploads them from there
+  bool te_host_copy = false;          // a host-resident text encoder's copy is kept
+  std::uint64_t host_copy_bytes = 0;  // host memory the kept copies hold
+  double host_copy_s = 0;             // reading the DiT's files into RAM (part of seconds)
+  std::string note;                   // why a copy was not kept (the host budget), or empty
+};
 
 class Pipeline {
  public:
@@ -428,9 +527,33 @@ class Pipeline {
   // the request cannot fit the budgets in any mode, std::invalid_argument on an invalid request.
   Result generate(const Request& request, const GenerateControl& control = {});
 
+  // Loads what the planner keeps resident for `options.request` without generating: the arena at the plan's size, the
+  // DiT with the plan's residency (not when the plan parks it for the text encoder: the first generate() would evict it
+  // before using it; Result::preload_note says so), the VAE decoder (unless the plan parks the DiT for the decode), the
+  // VAE encoder when
+  // the request starts from an image, its LoRA side branches and control embedder, and the text encoder's host copy
+  // when the plan keeps it host-resident (a text encoder streamed from its files has nothing to keep). The same budgets
+  // and errors as generate(); a following generate() of a request like it reuses everything (MemoryStats::dit_loads
+  // == 0) and gives the same bits as without the preload. Returns the plan, the tier, the load timings and memory
+  // (steps_run 0, no image).
+  Result preload(const PreloadOptions& options);
+
+  // Soft unload: frees the arena and the device memory held outside it (every resident model, LoRA side branches, a
+  // control adapter's embedder) first, so another application can use the GPU; the next generate() plans and loads
+  // again. Then, with keep_host_copy, the weights stay in host RAM where the host has the room (the copy leaves
+  // planner::host_pin_margin() of the available memory free and fits PipelineOptions::host_ram_budget when one is
+  // set): the DiT's weight files are read into pinned memory (the next load re-uploads them from there over PCIe,
+  // bit-identical, then frees them; its streamed blocks, if any, still read the files) and a host-resident text encoder
+  // keeps its copy. A copy that does not fit, fails or is cancelled (`cancel`, checked between 64 MiB reads) is not
+  // kept, with the reason in ReleaseReport::note; the release itself always completes. Without keep_host_copy every
+  // host copy is freed too. The embedding cache stays. Not thread-safe (not during generate()).
+  ReleaseReport release_device_memory(bool keep_host_copy, const std::atomic<bool>* cancel = nullptr);
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  Result run(const Request& request, const GenerateControl& control, bool preload);
 };
+
 
 }  // namespace mi::pipeline

@@ -21,7 +21,7 @@ constexpr Command kCommands[] = {
 };
 
 void usage(std::ostream& os) {
-  os << "usage: moss-infer <command> [args]\n\ncommands:\n";
+  os << "usage: moss-infer [--version] <command> [args]\n\ncommands:\n";
   for (const auto& c : kCommands) os << "  " << c.usage << "\n";
 }
 
@@ -34,6 +34,12 @@ int mi::cli::run_main(const std::vector<std::string>& argv) {
     return argc < 2 ? 2 : 0;
   }
   const std::string& name = argv[1];
+  if (name == "--version") {
+    // moss-server's version line, without the protocol the CLI does not speak.
+    std::cout << "moss-infer " << MI_VERSION_MAJOR << "." << MI_VERSION_MINOR << "." << MI_VERSION_PATCH << " (ABI "
+              << MI_ABI_VERSION << ")\n";
+    return 0;
+  }
   std::vector<std::string> args(argv.begin() + 2, argv.end());
   for (const auto& c : kCommands) {
     if (name != c.name) continue;

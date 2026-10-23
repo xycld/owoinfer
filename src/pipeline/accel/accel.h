@@ -37,6 +37,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -53,21 +54,31 @@ const char* step_cache_name(StepCacheKind kind);
 // "off" or "fbcache"; std::invalid_argument otherwise ("teacache" names why it is not offered).
 StepCacheKind parse_step_cache(std::string_view name);
 
-// The FBCache threshold recommended for MOSS-Image, the option's default. Measured at 1024^2, 50 steps, CFG 3, 4 prompts
+// The FBCache threshold recommended for the SFT model and the files derived from it (and any model the engine cannot
+// place), the default when Options::step_cache_threshold is unset. Measured at 1024^2, 50 steps, CFG 3, 4 prompts
 // against the same seed without the cache (2026-10-22): 0.02 reuses almost nothing; 0.03 reuses 30 % of the DiT calls
 // (1.25x denoise) at mean LPIPS 0.038 (max 0.113), mean DINOv2 0.975; 0.05 / 0.08 / 0.12 reach 1.84x / 2.31x / 2.91x,
 // and the images stay coherent, but the composition can move away from the uncached image's (min DINOv2 0.43-0.67).
 inline constexpr double kDefaultFbCacheThreshold = 0.03;
+// The highest FBCache threshold that keeps the base model's composition (RTX 5090, 2026-10-23, the same 4 prompts and
+// seeds against the uncached image: base min DINOv2 0.77 at 0.03 and 0.53 at 0.05; the SFT model stays at 0.93 or
+// above at both, bf16 and INT8): the default on the base model (pipeline.h dit_lineage). A threshold the user set is
+// never changed: one above this on the base model gets a warning (Result::accel_warnings).
+inline constexpr double kBaseModelFbCacheThreshold = 0.02;
+// The default threshold for a DiT of `lineage` ("base", "sft" or "": pipeline.h dit_lineage).
+double default_fbcache_threshold(std::string_view lineage);
 
 struct Options {
   double cfg_truncation = 1.0;  // [0, 1]; 1 = off
   StepCacheKind step_cache = StepCacheKind::kOff;
-  double step_cache_threshold = kDefaultFbCacheThreshold;  // (0, 1]; used (and validated) with a step cache only
+  // (0, 1]; used (and validated) with a step cache only. Unset: the model's default (default_fbcache_threshold), which
+  // the pipeline fills in and reports (Stats::step_cache_threshold).
+  std::optional<double> step_cache_threshold;
 
   bool step_cache_on() const { return step_cache != StepCacheKind::kOff; }
   // Whether a lossy accelerator changes a run with (do_cfg) or without classifier-free guidance.
   bool active(bool do_cfg) const { return step_cache_on() || (do_cfg && cfg_truncation < 1.0); }
-  // "cfg_truncation 0.8, step_cache fbcache 0.05" (the active ones; "off" when none).
+  // "cfg_truncation 0.8, step_cache fbcache 0.05" (the active ones; "off" when none; an unset threshold: "default").
   std::string describe(bool do_cfg) const;
 };
 // Throws std::invalid_argument for a value outside its range (the threshold only when the step cache is on).
@@ -79,7 +90,22 @@ struct Stats {
   int dit_calls = 0;            // DiT calls with the step cache on
   int cached_calls = 0;         // of which reused the cache (blocks 1..41 skipped)
   std::vector<int> cached_steps;  // 1-based steps (counting on across passes) with a call that reused the cache
+  // The relative change FirstBlockCache measured at every call, both passes (NaN where a call had nothing to compare
+  // with): what the threshold was compared against.
+  std::vector<double> step_cache_diffs;
+  double step_cache_threshold = 0;  // the threshold the cache ran with (the request's, or the model's default); 0: off
+  std::string step_cache_threshold_source;  // "request", or "default for the base model" (sft, unrecognized)
 };
+
+// The report's words for where a run's threshold came from: "request", or "default for the <lineage> model"
+// ("unrecognized" for an empty lineage).
+std::string threshold_source(const Options& requested, std::string_view lineage);
+// A threshold the user set above kBaseModelFbCacheThreshold on the base model: the warning (empty otherwise; the
+// threshold stands).
+std::string base_model_threshold_warning(const Options& requested, std::string_view lineage);
+// A step cache that never reused over a whole run: the warning with what it measured (empty when it reused, was off,
+// or had fewer than 4 comparable calls: finite entries of step_cache_diffs).
+std::string never_engaged_warning(const Stats& stats);
 
 // FBCache (see above) as a moss_dit::StepCacheHook for one sampling pass at a fixed latent grid; set it on the DiT
 // (MossDit::set_step_cache) for the pass's forwards.

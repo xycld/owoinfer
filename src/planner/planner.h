@@ -12,6 +12,15 @@
 //   min_memory  smallest device peak, then smallest host private, then least time
 //   balanced    least time, then smallest device peak
 //   max_speed   least time (bigger host target and embedding cache)
+// The text encoder may be held in host RAM (host-resident): pageable (staged through the pinned rings at the page-cache
+// rate: it pays off only when the page cache is cold) or pinned (copied at the pinned H2D rate, about twice the staged
+// one: a prompt cache miss streams the 13.8 GiB bf16 encoder in ~0.3 s instead of ~0.7 s on a PCIe 5 card). Who pins
+// (Capabilities::te_pin, PipelineOptions::te_host_pin): kOff never; kOn whenever the copy fits the host limit (balanced
+// then keeps it above its host-private target); kAuto only where the copy, with the embedding cache, leaves
+// host_pin_margin(Budgets::host_total) = max(8 GiB, 25 % of the RAM) of the system's available memory free (an
+// explicit host budget caps the copy too, it does not waive the margin), and then a quantized encoder in balanced (kept
+// above the target) and max_speed, the bf16 one in max_speed alone and only on machines with kTeBf16PinMinRam or more.
+// An idle 32 GiB machine therefore never pins. The explanation says when the encoder stays in RAM and why it does not.
 // Exact-but-wasteful fallbacks rank last: in balanced and max_speed, parking the DiT (reloading 9.5 GiB per
 // generation, a disk read when the page cache cannot hold it) is chosen only when nothing else fits; min_memory parks
 // only when that lowers the device peak.
@@ -34,6 +43,7 @@
 #include <string_view>
 #include <vector>
 
+#include "planner/host_memory.h"
 #include "weights/model_index.h"
 
 namespace mi::planner {
@@ -43,6 +53,13 @@ inline constexpr std::size_t kGiB = std::size_t{1} << 30;
 
 // Arena bytes on top of the largest phase peak: alignment of the many small allocations not covered by a query.
 inline constexpr std::size_t kArenaSlack = std::size_t{64} << 20;
+// The RAM below which kAuto never pins the bf16 text encoder (13.8 GiB): with the margin of host_pin_margin(), a 48 GiB
+// machine keeps 12 GiB and more for everything else.
+inline constexpr std::size_t kTeBf16PinMinRam = std::size_t{48} << 30;
+// Who may pin a host-resident text encoder (see the file comment).
+enum class TeHostPin { kAuto, kOn, kOff };
+const char* te_host_pin_name(TeHostPin p);  // "auto", "on", "off"
+TeHostPin parse_te_host_pin(std::string_view name);  // std::invalid_argument for anything else
 
 enum class Mode { kMinMemory, kBalanced, kMaxSpeed };
 const char* mode_name(Mode mode);
@@ -137,6 +154,9 @@ struct HardwareProfile {
   double host_gbps = 8.0;     // page cache or pageable host memory -> pinned staging -> device (the readers' rate)
   double bf16_tflops = 40.0;  // sustained dense bf16 GEMM
   bool measured = false;      // the transfer rates were measured on this machine
+  // DiT loads from the weight files with direct I/O, as measured by the pipeline (0: none yet): a cold DiT load or
+  // reload (parking, prefer_held) is priced at it instead of disk_gbps. Not persisted.
+  double direct_gbps = 0;
 };
 
 // Sizes of the model's weight groups (ModelIndex group totals).
@@ -227,6 +247,13 @@ struct Capabilities {
   int te_max_buffers = 1;          // device layer buffers the streaming text encoder supports (2+: prefetch overlap)
   std::size_t te_ring_bytes = 0;   // pinned host staging of the streaming text encoder
   bool te_host_resident = false;
+  // Kinds of host-resident copy the encoder can hold (with te_host_resident): pageable (staged through the rings) and
+  // pinned (DMA'd straight from it; when, per te_pin: the file comment). te_quantized: the encoder is an INT8 / W4A8
+  // file (te_pin kAuto pins it in balanced too).
+  bool te_host_pageable = true;
+  bool te_host_pinned = false;
+  TeHostPin te_pin = TeHostPin::kAuto;
+  bool te_quantized = false;
   bool te_vram_resident = false;
   bool dit_parking = true;         // P2 stopgap: evict the DiT for the text encoder or the decode
   bool dit_streaming = false;      // P4
@@ -254,6 +281,7 @@ struct Budgets {
   std::size_t host_available = 0;     // host RAM the process can still get (Linux MemAvailable)
   std::size_t host_private_now = 0;   // the process's private memory before the generation (baseline)
   std::size_t host_budget = 0;        // explicit cap on host private memory; 0 = the mode's target
+  std::size_t host_total = 0;         // the machine's RAM (planner/host_memory.h host_total_bytes); 0 = unknown
 };
 
 struct DitPlan {
@@ -280,6 +308,7 @@ struct TePlan {
   bool run = true;  // false: embedding cache hit, the text encoder is skipped
   TeResidency residency = TeResidency::kStreamed;
   int buffers = 1;  // device layer buffers when streamed (2+: layer k+1 is copied while layer k computes)
+  bool pinned = false;  // kHostResident: the host copy is page-locked (copied at the pinned H2D rate)
 };
 
 struct VaePlan {
@@ -328,6 +357,9 @@ struct ExecutionPlan {
   std::size_t arena_cap_bytes = 0;     // the arena cap the plan was made against
   std::size_t host_private_bytes = 0;  // estimated process private memory at its peak
   std::size_t host_target_bytes = 0;   // the mode's host-private target (or the explicit budget)
+  // The target the chosen configuration was held to: host_target_bytes, plus a pinned text-encoder copy balanced keeps
+  // above it.
+  std::size_t host_held_target_bytes = 0;
   std::size_t host_limit_bytes = 0;    // hard host-private limit
   TimeEstimate time;
   std::string explanation;  // human-readable, several lines; for the launcher and the JSON report

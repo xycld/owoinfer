@@ -2,12 +2,17 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "util/path.h"
+#include "weights/test_seams.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -19,8 +24,13 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 #endif
 
@@ -62,9 +72,13 @@ AlignedRange align_range(std::uint64_t offset, std::size_t size) {
 namespace {
 HANDLE open_win(const std::filesystem::path& path, bool direct) {
   DWORD flags = FILE_FLAG_OVERLAPPED | (direct ? FILE_FLAG_NO_BUFFERING : 0);
-  // FILE_SHARE_DELETE lets the app replace or delete model files (an update) while a reader is open.
-  return CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, flags,
-                     nullptr);
+  // FILE_SHARE_DELETE lets the app replace or delete model files (an update) while a reader is open, and with
+  // FILE_SHARE_WRITE a reader never blocks a writer. The trade-off: a program writing into a weight file in place while
+  // it is read can hand the reader torn bytes (no lock stops it); the engine and its tools never write weight files in
+  // place (they write a temporary file and rename it over the old one), and a torn read fails the format checks or the
+  // quality identity rather than passing silently in most cases.
+  return CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                     OPEN_EXISTING, flags, nullptr);
 }
 }  // namespace
 
@@ -92,6 +106,7 @@ void FileReader::close() noexcept {
 }
 
 std::size_t FileReader::pread_raw(std::uint64_t offset, void* dst, std::size_t size) const {
+  if (memory_) return copy_from_memory(offset, dst, size);
   auto* out = static_cast<char*>(dst);
   std::size_t done = 0;
   // A private event per call keeps concurrent reads on one handle from waiting on each other.
@@ -126,7 +141,213 @@ std::size_t FileReader::pread_raw(std::uint64_t offset, void* dst, std::size_t s
   return done;
 }
 
+double page_cache_fraction(const std::filesystem::path&) { return -1.0; }
+
+DirectIoSupport direct_io_support(const std::filesystem::path& path) {
+  const std::string name = util::path_utf8(path.filename());
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+  if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_COMPRESSED) != 0) {
+    return {false, name + " is NTFS-compressed: unbuffered reads gain nothing"};
+  }
+  HANDLE h = open_win(path, true);
+  if (h == INVALID_HANDLE_VALUE) {
+    const int code = static_cast<int>(GetLastError());
+    if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return {false, name + " does not exist"};
+    return {false, name + ": the file system refuses unbuffered reads (" + std::system_category().message(code) + ")"};
+  }
+  CloseHandle(h);
+  return {true, {}};
+}
+
 #else
+
+namespace {
+
+constexpr long kBtrfsMagic = static_cast<long>(0x9123683e);
+// Network file systems: their O_DIRECT reads bypass the client cache but still cross the network per call.
+constexpr long kNfsMagic = 0x6969;
+constexpr long kSmbMagic = 0x517b;
+constexpr long kCifsMagic = static_cast<long>(0xff534d42);
+constexpr long kSmb2Magic = static_cast<long>(0xfe534d42);
+// Pass-through file systems (FUSE, 9p, virtiofs): O_DIRECT reaches a userspace or host server per call, no faster.
+constexpr long kFuseMagic = 0x65735546;
+constexpr long kV9fsMagic = 0x01021997;
+constexpr long kVirtiofsMagic = 0x6a656a63;
+
+// /proc/self/mountinfo escapes spaces, tabs, newlines and backslashes in paths as \ooo octal.
+std::string unescape_mount(const std::string& s) {
+  std::string out;
+  for (std::size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '\\' && i + 3 < s.size()) {
+      const std::string oct = s.substr(i + 1, 3);
+      if (oct.find_first_not_of("01234567") == std::string::npos) {
+        out += static_cast<char>(std::stoi(oct, nullptr, 8));
+        i += 3;
+        continue;
+      }
+    }
+    out += s[i];
+  }
+  return out;
+}
+
+// The per-mount and super-block options of the mount holding `file` (the longest mount point that contains its
+// canonical path), "" when unknown.
+std::string mount_options(const std::filesystem::path& file) {
+  std::error_code ec;
+  const std::string target = std::filesystem::weakly_canonical(file, ec).string();
+  if (ec) return {};
+  std::ifstream in("/proc/self/mountinfo");
+  std::string line, best_options;
+  std::size_t best = 0;
+  while (std::getline(in, line)) {
+    // id parent major:minor root mount_point mount_options [optional fields] - fstype source super_options
+    std::istringstream fields(line);
+    std::string id, parent, dev, root, point, options, field;
+    if (!(fields >> id >> parent >> dev >> root >> point >> options)) continue;
+    while (fields >> field && field != "-") {
+    }
+    std::string fstype, source, super;
+    fields >> fstype >> source >> super;
+    point = unescape_mount(point);
+    const bool contains = point == "/" || target == point ||
+                          (target.size() > point.size() && target.compare(0, point.size(), point) == 0 &&
+                           target[point.size()] == '/');
+    if (contains && point.size() >= best) {
+      best = point.size();
+      best_options = options + "," + super;
+    }
+  }
+  return best_options;
+}
+
+// Fraction of the file's bytes in compressed ("encoded") extents, from FIEMAP (after a sync, so delayed allocations are
+// mapped); negative when FIEMAP is unavailable. The scan stops once the answer to "more than kMaxCompressedFraction?"
+// is settled either way, so the returned fraction is exact only near the threshold.
+double encoded_fraction(int fd, std::uint64_t size) {
+  constexpr std::uint32_t kBatch = 512;
+  std::vector<std::uint64_t> buf((sizeof(fiemap) + kBatch * sizeof(fiemap_extent)) / sizeof(std::uint64_t) + 1);
+  auto* fm = reinterpret_cast<fiemap*>(buf.data());
+  std::uint64_t start = 0, encoded = 0, mapped = 0;
+  while (start < size) {
+    std::fill(buf.begin(), buf.end(), 0);
+    fm->fm_start = start;
+    fm->fm_length = size - start;
+    fm->fm_flags = start == 0 ? FIEMAP_FLAG_SYNC : 0;
+    fm->fm_extent_count = kBatch;
+    if (::ioctl(fd, FS_IOC_FIEMAP, fm) != 0) return -1.0;
+    if (fm->fm_mapped_extents == 0) break;
+    const fiemap_extent* last = nullptr;
+    for (std::uint32_t i = 0; i < fm->fm_mapped_extents; ++i) {
+      last = &fm->fm_extents[i];
+      mapped += last->fe_length;
+      if ((last->fe_flags & FIEMAP_EXTENT_ENCODED) != 0) encoded += last->fe_length;
+    }
+    if ((last->fe_flags & FIEMAP_EXTENT_LAST) != 0 || last->fe_logical + last->fe_length <= start) break;
+    start = last->fe_logical + last->fe_length;
+    // Settled: already over the threshold, or under it even if every byte not scanned yet were compressed.
+    const double limit = kMaxCompressedFraction * static_cast<double>(size);
+    if (static_cast<double>(encoded) > limit) return static_cast<double>(encoded) / static_cast<double>(size);
+    if (static_cast<double>(encoded + (size > start ? size - start : 0)) <= limit) break;
+  }
+  return mapped > 0 ? static_cast<double>(encoded) / static_cast<double>(mapped) : 0.0;
+}
+
+// cachestat(2) (Linux 6.5): its number is the same on every architecture (the unified syscall table).
+struct CachestatRange {
+  std::uint64_t off, len;
+};
+struct Cachestat {
+  std::uint64_t nr_cache, nr_dirty, nr_writeback, nr_evicted, nr_recently_evicted;
+};
+constexpr long kSysCachestat = 451;
+
+}  // namespace
+
+double page_cache_fraction(const std::filesystem::path& path) {
+  const testing::ResidencyQuery query = testing::residency_query();
+  if (query == testing::ResidencyQuery::kNone) return -1.0;
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1.0;
+  struct stat st {};
+  double fraction = -1.0;
+  if (::fstat(fd, &st) == 0 && st.st_size > 0) {
+    const long page = ::sysconf(_SC_PAGESIZE);
+    const auto size = static_cast<std::uint64_t>(st.st_size);
+    const std::uint64_t pages = (size + static_cast<std::uint64_t>(page) - 1) / static_cast<std::uint64_t>(page);
+    CachestatRange range{0, 0};  // len 0: to the end of the file
+    Cachestat cs{};
+    const bool cachestat = query == testing::ResidencyQuery::kAuto && ::syscall(kSysCachestat, fd, &range, &cs, 0) == 0;
+    // The kernel answers mincore truthfully only for files the caller could write (can_do_mincore: the owner, or write
+    // permission); for the others it reports every page resident, so they stay unknown. cachestat refuses those with
+    // EPERM; an EPERM on a file mincore may answer (a seccomp filter on the new syscall, most likely) falls back to it.
+    const bool may_mincore = st.st_uid == ::geteuid() || ::faccessat(AT_FDCWD, path.c_str(), W_OK, AT_EACCESS) == 0;
+    if (cachestat) {
+      fraction = std::min(1.0, static_cast<double>(cs.nr_cache) / static_cast<double>(pages));
+    } else if (may_mincore) {
+      // mincore on a sample of pages of a read-only mapping (mapping reads nothing; mincore faults nothing in).
+      void* map = ::mmap(nullptr, static_cast<std::size_t>(size), PROT_READ, MAP_SHARED, fd, 0);
+      if (map != MAP_FAILED) {
+        int resident = 0, sampled = 0;
+        for (int i = 0; i < kResidencySamples; ++i) {
+          const std::uint64_t p = pages * static_cast<std::uint64_t>(i) / kResidencySamples;
+          unsigned char vec = 0;
+          char* at = static_cast<char*>(map) + p * static_cast<std::uint64_t>(page);
+          if (::mincore(at, static_cast<std::size_t>(page), &vec) == 0) {
+            resident += vec & 1;
+            ++sampled;
+          }
+        }
+        ::munmap(map, static_cast<std::size_t>(size));
+        if (sampled > 0) fraction = static_cast<double>(resident) / sampled;
+      }
+    }
+  }
+  ::close(fd);
+  return fraction;
+}
+
+DirectIoSupport direct_io_support(const std::filesystem::path& path) {
+  const std::string name = util::path_utf8(path.filename());
+#ifndef O_DIRECT
+  return {false, "this platform has no O_DIRECT"};
+#else
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+  if (fd < 0) {
+    if (errno == ENOENT) return {false, name + " does not exist"};
+    return {false, name + ": the file system refuses O_DIRECT (" + std::system_category().message(errno) + ")"};
+  }
+  DirectIoSupport out{true, {}};
+  struct statfs fsinfo {};
+  struct stat st {};
+  if (::fstatfs(fd, &fsinfo) == 0 && ::fstat(fd, &st) == 0) {
+    const long type = static_cast<long>(fsinfo.f_type);
+    if (static_cast<std::uint32_t>(type) == kTmpfsMagic || static_cast<std::uint32_t>(type) == kRamfsMagic) {
+      out = {false, name + " is on a RAM file system (tmpfs / ramfs): direct I/O gains nothing"};
+    } else if (type == kNfsMagic || type == kSmbMagic || type == kCifsMagic || type == kSmb2Magic) {
+      out = {false, name + " is on a network file system (NFS / SMB): buffered reads keep its client cache"};
+    } else if (type == kFuseMagic || type == kV9fsMagic || type == kVirtiofsMagic) {
+      out = {false, name + " is on a pass-through file system (FUSE / 9p / virtiofs): direct I/O gains nothing"};
+    } else if (type == kBtrfsMagic) {
+      const double fraction = encoded_fraction(fd, static_cast<std::uint64_t>(st.st_size));
+      if (fraction > kMaxCompressedFraction) {
+        char pct[16];
+        std::snprintf(pct, sizeof(pct), "%.0f%%", 100.0 * fraction);
+        out = {false,
+               name + ": " + pct + " of the file is in btrfs compressed extents, which O_DIRECT reads through the page cache"};
+      } else if (fraction < 0 && mount_options(path).find("compress") != std::string::npos) {
+        out = {false, name + " is on a btrfs mount with compression: O_DIRECT reads compressed extents through the page cache"};
+      }
+    }
+  }
+  ::close(fd);
+  return out;
+#endif
+}
+
+#endif
+
+#ifndef _WIN32
 
 FileReader::FileReader(const std::filesystem::path& path, bool direct) : path_(path) {
   int flags = O_RDONLY | O_CLOEXEC;
@@ -153,6 +374,7 @@ void FileReader::close() noexcept {
 }
 
 std::size_t FileReader::pread_raw(std::uint64_t offset, void* dst, std::size_t size) const {
+  if (memory_) return copy_from_memory(offset, dst, size);
   auto* out = static_cast<char*>(dst);
   std::size_t done = 0;
   while (done < size) {
@@ -173,10 +395,27 @@ std::size_t FileReader::pread_raw(std::uint64_t offset, void* dst, std::size_t s
 
 #endif
 
+FileReader::FileReader(const std::filesystem::path& path, std::shared_ptr<const std::byte> memory, std::uint64_t size,
+                       bool pinned)
+    : path_(path), size_(size), memory_(std::move(memory)), pinned_(pinned) {
+  if (!memory_ && size_ > 0) throw IoError(util::path_utf8(path_) + ": in-memory reader without memory");
+}
+
+std::size_t FileReader::copy_from_memory(std::uint64_t offset, void* dst, std::size_t size) const {
+  if (offset >= size_) return 0;
+  const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(size, size_ - offset));
+  std::memcpy(dst, memory_.get() + offset, n);
+  return n;
+}
+
 FileReader::~FileReader() { close(); }
 
 FileReader::FileReader(FileReader&& other) noexcept
-    : path_(std::move(other.path_)), size_(other.size_), direct_(other.direct_) {
+    : path_(std::move(other.path_)),
+      size_(other.size_),
+      direct_(other.direct_),
+      memory_(std::move(other.memory_)),
+      pinned_(other.pinned_) {
 #ifdef _WIN32
   handle_ = std::exchange(other.handle_, nullptr);
 #else
@@ -190,6 +429,8 @@ FileReader& FileReader::operator=(FileReader&& other) noexcept {
     path_ = std::move(other.path_);
     size_ = other.size_;
     direct_ = other.direct_;
+    memory_ = std::move(other.memory_);
+    pinned_ = other.pinned_;
 #ifdef _WIN32
     handle_ = std::exchange(other.handle_, nullptr);
 #else
@@ -254,8 +495,8 @@ void FileReader::read_at(std::uint64_t offset, void* dst, std::size_t size) cons
 #ifdef _WIN32
 
 MappedFile::MappedFile(const std::filesystem::path& path) {
-  HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                         FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (f == INVALID_HANDLE_VALUE) fail(path, "cannot open", static_cast<int>(GetLastError()));
   LARGE_INTEGER sz;
   if (!GetFileSizeEx(f, &sz)) {

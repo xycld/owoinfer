@@ -18,6 +18,7 @@
 #include "util/json.h"
 #include "util/path.h"
 #include "util/rename_replace.h"
+#include "util/replaceable_file.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
 
@@ -49,13 +50,14 @@ std::string slurp(const fs::path& path, std::uintmax_t max_bytes) {
   if (size > max_bytes) {
     throw IndexError(path_utf8(path) + ": " + std::to_string(size) + " bytes exceeds the limit of " + std::to_string(max_bytes));
   }
-  std::ifstream in(path, std::ios::binary);
-  if (!in) throw IndexError("cannot open " + path_utf8(path));
-  std::ostringstream ss;
-  ss << in.rdbuf();
-  std::string text = ss.str();
+  // Read through a concurrent writer's rename (`moss-infer index` replaces moss.mossidx atomically).
+  std::string text;
+  const util::ReadStatus status = util::read_replaceable_file(path, static_cast<std::size_t>(max_bytes), text);
   // The file may have grown between the size check and the read.
-  if (text.size() > max_bytes) throw IndexError(path_utf8(path) + ": file grew past the limit of " + std::to_string(max_bytes) + " bytes");
+  if (status == util::ReadStatus::kTooLarge) {
+    throw IndexError(path_utf8(path) + ": file grew past the limit of " + std::to_string(max_bytes) + " bytes");
+  }
+  if (status != util::ReadStatus::kOk) throw IndexError("cannot open " + path_utf8(path));
   return text;
 }
 

@@ -3,7 +3,9 @@
 // device tensor starts on a runtime::kArenaAlign boundary.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -33,16 +35,41 @@ using TensorMap = std::map<std::string, Tensor>;
 // kernels for (bool, 16/32/64-bit unsigned, f64, ...).
 mi::DType to_engine_dtype(weights::DType t);
 
-// Lazily opened FileReaders for the files of one ModelIndex. Thread-safe; the index must outlive it.
+// Whole weight files held in host memory, by path (ModelIndex::file_path): e.g. a soft-unloaded model's weights
+// (pipeline.h Pipeline::release_device_memory), so that the next load re-uploads them from RAM. A ReaderCache given one
+// serves those files from memory: the bytes the files held when they were read, in the same order, so the load is
+// bit-identical. Copies share the memory.
+struct HostFiles {
+  struct File {
+    std::shared_ptr<const std::byte> data;
+    std::uint64_t size = 0;
+    bool pinned = false;  // page-locked: uploads DMA straight from it (PinnedRing)
+  };
+  std::map<std::filesystem::path, File> files;
+  std::uint64_t bytes() const;
+};
+
+// Reads `paths` whole into host memory: pinned (cudaHostAlloc) when `pinned`, else page-aligned heap; each file in
+// chunks spread over `threads` reader threads, with direct I/O when `direct` (FileReader falls back where refused).
+// Checks `cancel` between chunks (returns an empty HostFiles when it is set). Throws IoError, CudaError, bad_alloc.
+HostFiles read_files_to_host(const std::vector<std::filesystem::path>& paths, bool pinned, bool direct, int threads = 4,
+                             const std::atomic<bool>* cancel = nullptr);
+
+// Lazily opened FileReaders for the files of one ModelIndex. Thread-safe; the index must outlive it. Files that `host`
+// holds are read from it (in-memory FileReaders); `host` must outlive the cache.
 class ReaderCache {
  public:
-  explicit ReaderCache(const ModelIndex& index, bool direct = true) : index_(index), direct_(direct) {}
+  explicit ReaderCache(const ModelIndex& index, bool direct = true, const HostFiles* host = nullptr)
+      : index_(index), direct_(direct), host_(host) {}
   const FileReader& get(std::uint32_t file_id);
   const ModelIndex& index() const { return index_; }
+  // Whether every reader opened so far reads with direct I/O (FileReader::direct(); false when none was opened).
+  bool all_direct();
 
  private:
   const ModelIndex& index_;
   bool direct_;
+  const HostFiles* host_;
   std::mutex mu_;
   std::map<std::uint32_t, std::unique_ptr<FileReader>> readers_;
 };

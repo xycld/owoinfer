@@ -503,6 +503,10 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   // Specs.
   auto spec_of = [&](const QuantLinear& l) -> QuantSpec {
     const bool keep = std::any_of(options.keep_bf16.begin(), options.keep_bf16.end(), [&](const std::string& p) { return glob_match(p, l.name); });
+    if (l.spec.format == QuantFormat::kNvfp4) {
+      fail("'" + l.name + "' is stored as nvfp4; converting NVFP4 to INT8 would compound two roundings (convert from the bf16 "
+           "weights instead)");
+    }
     if (l.spec.quantized()) {
       if (keep) fail("--keep-bf16 matches '" + l.name + "', which the input stores quantized (the bf16 weights are gone)");
       if (loras.count(l.name)) fail("a LoRA targets '" + l.name + "', which the input stores quantized; merge into the bf16 weights instead");

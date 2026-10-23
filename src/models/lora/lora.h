@@ -222,6 +222,7 @@ class PristineWeights {
   bool has(std::string_view module) const;
   void drop(std::string_view module);  // forgets `module`'s copy (no-op when not kept)
   std::size_t host_bytes() const;
+  std::size_t host_bytes(std::string_view module) const;  // `module`'s copy (0 when not kept)
   // dst = merge(pristine) for `stack`'s current strengths; returns the adapters merged. Throws LoraError for a module
   // not kept (or kept in the other format) or a size mismatch; on a merge error dst must be discarded (see above).
   int remerge_bf16(const LoraStack& stack, std::string_view module, std::uint16_t* dst, std::uint16_t* dst_bias = nullptr,

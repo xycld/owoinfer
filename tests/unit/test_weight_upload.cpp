@@ -152,6 +152,29 @@ TEST(WeightUploadSynthetic, HostLoadPlainAndPinned) {
   }
 }
 
+// A soft unload's host copy (pipeline.h release_device_memory): the files read whole into pinned or plain memory serve
+// the same uploads, the pinned copy by DMA straight from it (PinnedRing::copy_pieces), the plain one through the slots.
+TEST(WeightUploadSynthetic, UploadFromHostFiles) {
+  for (const bool pinned : {false, true}) {
+    SCOPED_TRACE(pinned);
+    Synthetic s;
+    const HostFiles hf = read_files_to_host({s.index.file_path(0)}, pinned, false);
+    ReaderCache readers(s.index, false, &hf);
+    ASSERT_NE(readers.get(0).memory(), nullptr);
+    EXPECT_EQ(readers.get(0).pinned(), pinned);
+    StreamSet ss;
+    PinnedRing ring(ss.copy(), 3, 64 * 1024);
+    DeviceArena arena(8 * kMiB);
+    const mi::runtime::RingStats before = ring.stats();
+    TensorMap m = upload_group(readers, s.group, arena, ring);
+    ring.synchronize();  // also covers the slot-less copies of a pinned copy
+    s.expect_bytes(m, true);
+    EXPECT_EQ(ring.stats().bytes - before.bytes, s.group.total_bytes);
+    HostGroup g = load_group_to_host(readers, s.group, HostMemory::kPlain);
+    s.expect_bytes(g.tensors, false);
+  }
+}
+
 TEST(WeightUploadSynthetic, VerifyGroup) {
   Synthetic s;
   EXPECT_TRUE(verify_group(s.index, s.group));

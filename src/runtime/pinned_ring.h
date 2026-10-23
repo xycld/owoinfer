@@ -59,7 +59,8 @@ class PinnedRing {
   void copy_range(const weights::FileReader& file, std::uint64_t file_offset, std::size_t size, void* dst);
 
   // Streams several ranges of one file. Pieces must be sorted by file_offset and not overlap; small
-  // neighbours are served by one disk read and several device copies out of the same slot.
+  // neighbours are served by one disk read and several device copies out of the same slot. An in-memory reader with
+  // page-locked contents (FileReader::pinned()) is copied from directly, without the slots.
   void copy_pieces(const weights::FileReader& file, std::span<const Piece> pieces);
 
   // Stages `size` bytes of host memory through the slots to `dst`: for sources already in pageable RAM,
@@ -77,6 +78,8 @@ class PinnedRing {
   };
   Slot& next_slot();
   void mark_enqueued(Slot& s);
+  // Device copies straight out of a pinned in-memory reader, fenced by one slot's event (synchronize() covers them).
+  void copy_pinned(const weights::FileReader& file, std::span<const Piece> pieces);
 
   cudaStream_t copy_stream_;
   std::size_t slot_bytes_;
