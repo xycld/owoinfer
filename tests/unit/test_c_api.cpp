@@ -2434,6 +2434,28 @@ TEST(CApi, ReleaseInfo) {
   EXPECT_EQ(std::string(info.note).substr(509), "\xc3\xa4");
   rr.note.clear();
   EXPECT_STREQ(mi::api::to_release_info(rr).note, "");
+  // Cancelled before it started (Pipeline::release_device_memory's documented report): mi_engine_release() maps it to
+  // MI_CANCELLED. A cancelled host copy, or the same note after something was released, is not that case.
+  bool cancelled = true;
+  (void)mi::api::to_release_info(rr, &cancelled);
+  EXPECT_FALSE(cancelled);
+  mi::pipeline::ReleaseReport early;
+  early.note = "cancelled before it started";
+  early.dit_host_copy = true;
+  early.host_copy_bytes = 123;
+  info = mi::api::to_release_info(early, &cancelled);
+  EXPECT_TRUE(cancelled);
+  EXPECT_EQ(info.vram_released_bytes, 0u);
+  EXPECT_EQ(info.dit_host_copy, 1);  // the copies already held, as they are
+  EXPECT_EQ(info.host_copy_bytes, 123u);
+  EXPECT_STREQ(info.note, "cancelled before it started");
+  early.note = "the DiT's host copy was cancelled";
+  (void)mi::api::to_release_info(early, &cancelled);
+  EXPECT_FALSE(cancelled);
+  early.note = "cancelled before it started";
+  early.vram_released = 1;
+  (void)mi::api::to_release_info(early, &cancelled);
+  EXPECT_FALSE(cancelled);
 }
 
 // ---------------------------------------------------------------- GPU
@@ -3306,23 +3328,51 @@ class GpuCApiPreload : public ::testing::Test {
 
 struct PreloadEvents {
   int progress = 0, plans = 0;
-  mi_phase phase = MI_PHASE_MAX_ENUM;
+  std::vector<int> order;  // -1 for the plan, else the progress phase, in arrival order
   mi_engine* cancel_engine = nullptr;  // cancelled from the progress callback when set
 };
 
 void on_preload_progress(const mi_progress* p, void* user) {
   auto& ev = *static_cast<PreloadEvents*>(user);
   ++ev.progress;
-  ev.phase = p->phase;
+  ev.order.push_back(p->phase);
+  EXPECT_EQ(p->step, 0);
+  EXPECT_EQ(p->total_steps, 0);
+  EXPECT_GE(p->elapsed_seconds, 0.0);
   if (ev.cancel_engine != nullptr) {
     EXPECT_EQ(mi_cancel(ev.cancel_engine), MI_OK);
   }
 }
 
 void on_preload_plan(const char* explanation, const char* plan_json, void* user) {
-  ++static_cast<PreloadEvents*>(user)->plans;
+  auto& ev = *static_cast<PreloadEvents*>(user);
+  ++ev.plans;
+  ev.order.push_back(-1);
   EXPECT_GT(std::strlen(explanation), 0u);
   EXPECT_NO_THROW(mi::json::parse(plan_json)) << plan_json;
+}
+
+// The preload's callbacks of a txt2img request: the plan first, then the load steps in the pipeline's order, a
+// host-resident text encoder's copy (TEXT_ENCODER) before the DiT (DIT_LOAD, unless the plan leaves it to the
+// generation) and the VAE decoder (DECODE) after it; never DENOISE.
+void expect_preload_order(const PreloadEvents& ev, bool dit_loaded) {
+  ASSERT_FALSE(ev.order.empty());
+  EXPECT_EQ(ev.order.front(), -1) << "the plan comes before the first load step";
+  std::string seq;
+  int rank = -1;
+  bool dit = false;
+  for (std::size_t i = 1; i < ev.order.size(); ++i) {
+    const int ph = ev.order[i];
+    seq += std::to_string(ph) + " ";
+    EXPECT_NE(ph, -1) << "one plan";
+    EXPECT_NE(ph, MI_PHASE_DENOISE);
+    const int r = ph == MI_PHASE_TEXT_ENCODER ? 0 : ph == MI_PHASE_DIT_LOAD ? 1 : 2;  // no init image: DECODE is the decoder
+    EXPECT_GT(r, rank) << "phases out of order: " << seq;
+    rank = r;
+    dit = dit || ph == MI_PHASE_DIT_LOAD;
+  }
+  EXPECT_EQ(dit, dit_loaded) << seq;
+  std::printf("[c_api] preload callbacks: plan, then phases %s\n", seq.c_str());
 }
 
 // A preload loads what the generation needs: the generate that follows loads no DiT and gives the bits of a fresh
@@ -3338,9 +3388,9 @@ TEST_F(GpuCApiPreload, PreloadThenGenerate) {
   mi_result* r = nullptr;
   ASSERT_EQ(mi_engine_preload(e, &p, &r), MI_OK) << last_error();
   ASSERT_NE(r, nullptr);
-  EXPECT_EQ(ev.progress, 1);
-  EXPECT_EQ(ev.phase, MI_PHASE_DIT_LOAD);
   EXPECT_EQ(ev.plans, 1);
+  EXPECT_GE(ev.progress, 1);
+  expect_preload_order(ev, std::strlen(mi_result_text(r, MI_TEXT_PRELOAD_NOTE)) == 0);
   EXPECT_EQ(mi_result_cancelled(r), 0);
   EXPECT_EQ(mi_result_steps_run(r), 0);
   EXPECT_EQ(mi_result_rgb(r, nullptr), nullptr);
@@ -3470,14 +3520,17 @@ TEST_F(GpuCApiPreload, CancelDuringPreload) {
   mi_engine* e = create();
   ASSERT_NE(e, nullptr);
   PreloadEvents ev;
-  ev.cancel_engine = e;  // cancelled from its start callback: before any model loads
+  ev.cancel_engine = e;  // cancelled from the first load step's callback: before that step loads anything
   mi_gen_params p = request();
   p.progress_callback = on_preload_progress;
+  p.plan_callback = on_preload_plan;
   p.user_data = &ev;
   mi_result* r = nullptr;
   ASSERT_EQ(mi_engine_preload(e, &p, &r), MI_CANCELLED) << last_error();
   ASSERT_NE(r, nullptr);
   EXPECT_EQ(mi_result_cancelled(r), 1);
+  EXPECT_EQ(ev.plans, 1);
+  EXPECT_EQ(ev.progress, 1) << "the cancel in the first step's callback stops the preload there";
   mi_memory_stats m{};
   m.struct_size = sizeof m;
   ASSERT_EQ(mi_result_memory(r, &m), MI_OK);
@@ -3494,6 +3547,63 @@ TEST_F(GpuCApiPreload, CancelDuringPreload) {
   std::printf("[c_api] preload cancelled after 300 ms: %s\n", mi_status_string(status));
   const Generated g = generate(e);
   EXPECT_FALSE(g.rgb.empty());
+  mi_engine_free(e);
+}
+
+// A release whose cancel is set before it starts releases nothing: the next generation needs no DiT load and gives the
+// same bits. Through the adapter (mi_engine_release() clears the flag when it marks the engine busy, so only a cancel
+// landing between that and the pipeline's check reaches this case; the second part races one from another thread).
+TEST_F(GpuCApiPreload, ReleaseCancelledBeforeItStarts) {
+  mi_engine_params ep = engine_defaults();
+  ep.model_path = model_.c_str();
+  std::atomic<bool> go{false}, stop{true};
+  {
+    mi::api::PipelineAdapter a(ep);
+    const mi_gen_params g = request();
+    const mi::api::Generation first = a.generate(g, go);
+    ASSERT_FALSE(first.rgb.empty());
+    bool cancelled = false;
+    mi_release_info info = a.release(true, stop, &cancelled);
+    EXPECT_TRUE(cancelled);
+    EXPECT_EQ(info.vram_released_bytes, 0u);
+    EXPECT_EQ(info.dit_host_copy, 0);
+    EXPECT_STREQ(info.note, "cancelled before it started");
+    const mi::api::Generation again = a.generate(g, go);
+    EXPECT_EQ(again.memory.dit_loads, 0) << "the DiT stayed resident";
+    EXPECT_EQ(again.dit_load.source, MI_DIT_LOAD_SOURCE_NONE);
+    EXPECT_TRUE(again.rgb == first.rgb);
+    info = a.release(false, go, &cancelled);
+    EXPECT_FALSE(cancelled);
+    EXPECT_GT(info.vram_released_bytes, 0u);
+  }
+
+  // mi_engine_release() with mi_cancel() spinning on another thread: MI_CANCELLED when the cancel lands before the
+  // pipeline starts releasing (VRAM kept: the next generate loads no DiT), MI_OK otherwise. A few tries; a miss is no
+  // failure, the mapping is covered above and by CApi.ReleaseInfo.
+  mi_engine* e = create();
+  ASSERT_NE(e, nullptr);
+  bool seen = false;
+  for (int attempt = 0; attempt < 4 && !seen; ++attempt) {
+    ASSERT_FALSE(generate(e).rgb.empty());  // the DiT resident
+    std::atomic<bool> done{false};
+    std::thread canceller([&] {
+      while (!done.load()) (void)mi_cancel(e);
+    });
+    mi_release_info info{};
+    info.struct_size = sizeof info;
+    const mi_status s = mi_engine_release(e, 0, &info);
+    done.store(true);
+    canceller.join();
+    ASSERT_TRUE(s == MI_OK || s == MI_CANCELLED) << mi_status_string(s) << ": " << last_error();
+    if (s == MI_CANCELLED) {
+      seen = true;
+      EXPECT_EQ(info.vram_released_bytes, 0u);
+      EXPECT_STREQ(info.note, "cancelled before it started");
+      const Generated g = generate(e);
+      EXPECT_EQ(g.memory.dit_loads, 0);
+    }
+  }
+  std::printf("[c_api] mi_engine_release with a racing cancel: %s\n", seen ? "MI_CANCELLED seen" : "never cancelled early");
   mi_engine_free(e);
 }
 

@@ -308,13 +308,14 @@ Loads what the engine keeps resident for a request, without generating (`mi_engi
 
 The params are `generate`'s without `output`, `preview_output`, `preview_every`, `save_metadata` and `include_prompts` (those are rejected as unknown). `prompt` is optional: an absent or blank prompt plans for a short one, and a long prompt sizes the workspaces for its length. The other params drive the plan: size, steps, CFG, `loras`, `control`, `init_image`, `hires`, the accelerators. They are validated as for `generate`, before the server's state.
 
-Like `generate`, it answers at once with `{"accepted": true}`, then sends events with its `id`: one `progress` (`phase` `"dit_load"`, `step` 0) when it starts, one `plan` when the loads are done, and `done`. `busy` and `cancel` work as for `generate`; a cancel stops it between models and DiT weight groups, and the engine keeps what was loaded before it.
+Like `generate`, it answers at once with `{"accepted": true}`, then sends events with its `id`: one `plan` after planning and before any load, then a `progress` (`step` 0, `total_steps` 0) before each load step, also for a model already resident (`text_encoder` before a host-resident text encoder's copy, `decode` before each VAE: an `init_image` request's encoder, then the decoder, `dit_load` before the DiT; never `denoise`), and `done`. `busy` and `cancel` work as for `generate`; a cancel stops it between models and DiT weight groups, and the engine keeps what was loaded before it.
 
 ```
 >> {"id": "p1", "method": "preload", "params": {"width": 1024, "height": 1024, "steps": 30}}
 << {"id": "p1", "result": {"accepted": true}}
-<< {"event": "progress", "id": "p1", "phase": "dit_load", "step": 0, "total_steps": 0, "step_seconds": 0, "elapsed_seconds": 0.0}
 << {"event": "plan", "id": "p1", "explanation": "Mode balanced ...", "plan": {...}}
+<< {"event": "progress", "id": "p1", "phase": "dit_load", "step": 0, "total_steps": 0, "step_seconds": 0, "elapsed_seconds": 0.1}
+<< {"event": "progress", "id": "p1", "phase": "decode", "step": 0, "total_steps": 0, "step_seconds": 0, "elapsed_seconds": 2.1}
 << {"event": "done", "id": "p1", "status": "ok", "report": {...}, "preload_note": "", "dit_load": {"source": "files", "io": "direct", "bytes": 10000000000, "seconds": 2.0, "note": ""}, "certified": true, "warnings": []}
 ```
 
@@ -329,15 +330,16 @@ A soft unload (`mi_engine_release()`): frees the engine's device memory so that 
 
 Params: `keep_host_copy` (bool, default true). With true, the DiT's weights are read into RAM where the host has the room, and its next load uploads them from there (the report's `dit_load.source` `"host_copy"`); a host-resident text encoder keeps its copy. With false, every host copy is freed too.
 
-The response comes when the release ends. Reading the DiT into RAM takes seconds (it reads the DiT's weight files), so the release runs on the worker like a job: requests sent meanwhile are answered first, `status` reports `"releasing"`, and `cancel` (with or without the release's `id`) stops the DiT's host copy, whenever it arrives: before the copy's first read or between its 64 MiB reads. The release itself always completes: it frees the device memory, keeps a host-resident text encoder's copy and frees nothing else; the interrupted DiT copy is not kept, and `note` says so. A copy that finished before the cancel reached it is kept. The values in the examples of this section are illustrative.
+The response comes when the release ends. Reading the DiT into RAM takes seconds (it reads the DiT's weight files), so the release runs on the worker like a job: requests sent meanwhile are answered first, `status` reports `"releasing"`, and `cancel` (with or without the release's `id`) stops it. A cancel that lands before the release frees anything stops it whole: `cancelled` is true, nothing is released (`vram_released_bytes` 0; the engine keeps its device memory and the next `generate` loads nothing), and `note` is `"cancelled before it started"`. Later, it stops the DiT's host copy (before its first read or between its 64 MiB reads): the release completes (`cancelled` false), frees the device memory, keeps a host-resident text encoder's copy and frees nothing else; the interrupted DiT copy is not kept, and `note` says so. A copy that finished before the cancel reached it is kept. The values in the examples of this section are illustrative.
 
 ```
 >> {"id": "r1", "method": "release", "params": {"keep_host_copy": true}}
-<< {"id": "r1", "result": {"seconds": 5.0, "vram_released_bytes": 11000000000, "host_copy_bytes": 10000000000, "host_copy_seconds": 5.0, "dit_host_copy": true, "te_host_copy": false, "note": ""}}
+<< {"id": "r1", "result": {"cancelled": false, "seconds": 5.0, "vram_released_bytes": 11000000000, "host_copy_bytes": 10000000000, "host_copy_seconds": 5.0, "dit_host_copy": true, "te_host_copy": false, "note": ""}}
 ```
 
 | Result field | Meaning |
 |---|---|
+| `cancelled` | true: a cancel stopped the release before it freed anything (the other fields: nothing released, the copies already held) |
 | `seconds` | the whole release, `host_copy_seconds` included |
 | `vram_released_bytes` | device memory freed: the arena and what the engine held outside it |
 | `host_copy_bytes` | host RAM the kept copies hold |
@@ -352,7 +354,7 @@ The response comes when the release ends. Reading the DiT into RAM takes seconds
 
 Params: `id` (optional). The id of the job to cancel (a `generate`, `preload` or `release`); it is ignored unless it matches the running one.
 
-A generation stops within one text-encoder layer, DiT block or decode band, and then sends `done` with `"status": "cancelled"`. A preload stops between models and weight groups (`done` with `"cancelled"`). A release stops the DiT's host copy (the text encoder's copy stays) and answers as usual. A cancel never carries over to the next job.
+A generation stops within one text-encoder layer, DiT block or decode band, and then sends `done` with `"status": "cancelled"`. A preload stops between models and weight groups (`done` with `"cancelled"`). A release stops before it frees anything (`"cancelled": true`), or stops the DiT's host copy (the text encoder's copy stays), and answers as usual. A cancel never carries over to the next job.
 
 ```
 >> {"id": 4, "method": "cancel", "params": {"id": "g2"}}

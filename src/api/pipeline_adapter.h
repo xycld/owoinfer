@@ -108,10 +108,12 @@ class PipelineAdapter {
 
   // Not thread-safe (one job at a time); `cancel` is polled throughout.
   Generation generate(const mi_gen_params& params, const std::atomic<bool>& cancel);
-  // Pipeline::preload of `params` (prompt optional); progress is called once at the start, plan once at the end.
+  // Pipeline::preload of `params` (prompt optional): the plan callback once after planning, before any load; a progress
+  // callback (step 0) before each load step, in the pipeline's order (PreloadOptions::on_phase).
   Generation preload(const mi_gen_params& params, const std::atomic<bool>& cancel);
-  // Pipeline::release_device_memory; never cancelled as a whole (`cancel` stops the host copy only).
-  mi_release_info release(bool keep_host_copy, const std::atomic<bool>& cancel);
+  // Pipeline::release_device_memory. `cancel` already set on entry: nothing is released and *cancelled is set (the
+  // report as to_release_info()); set during the host copy: the copy stops, the release completes.
+  mi_release_info release(bool keep_host_copy, const std::atomic<bool>& cancel, bool* cancelled = nullptr);
 
  private:
   struct Impl;
@@ -125,7 +127,9 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
 
 // A release report in C-API terms, the note cut at 511 bytes on a UTF-8 boundary. Called by release(); public for the
 // CPU tests.
-mi_release_info to_release_info(const pipeline::ReleaseReport& report);
+// `cancelled` (optional) receives whether the release was cancelled before it started (it released nothing:
+// Pipeline::release_device_memory's documented note "cancelled before it started").
+mi_release_info to_release_info(const pipeline::ReleaseReport& report, bool* cancelled = nullptr);
 
 // A result holding `generation`, as mi_generate() returns it (release it with mi_result_free()). Defined in c_api.cpp;
 // public for the CPU tests of the result accessors.

@@ -333,7 +333,7 @@ A launcher that shares the GPU with other tabs or applications keeps the engine 
 3. **When the user comes back:** `generate` as usual, or `preload` first to pay the reload before the click. The DiT loads from the host copy over PCIe (the report's `dit_load.source` `"host_copy"`) and gives the same image bits.
 4. **To give the RAM back as well:** `release` with `keep_host_copy` false. `unload` frees everything, the in-memory embedding cache included (its spill in `cache_dir` stays), and needs a new `load`.
 
-A `release` that keeps a host copy reads the DiT's files into RAM and takes seconds; it is answered when it ends, and a `cancel` meanwhile stops the copy (the VRAM is freed either way). The library has the same calls: `mi_engine_preload()` and `mi_engine_release()`, on the generation thread, with `mi_cancel()` from any thread.
+A `release` that keeps a host copy reads the DiT's files into RAM and takes seconds; it is answered when it ends, and a `cancel` meanwhile stops the copy (the VRAM is freed), or the whole release when it lands before anything was freed (the response's `cancelled`: the engine keeps its VRAM). The library has the same calls: `mi_engine_preload()` and `mi_engine_release()`, on the generation thread, with `mi_cancel()` from any thread.
 
 **Errors.**
 - **Request errors** arrive as `{"error": {"code", "message"}}`.

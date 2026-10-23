@@ -88,7 +88,8 @@ MOSSINFER_API int32_t mi_abi_version(void);
 
 typedef enum mi_status {
   MI_OK = 0,
-  MI_CANCELLED = 1,                /* mi_generate(), mi_engine_preload(): stopped by mi_cancel(); a result is returned */
+  MI_CANCELLED = 1,                /* stopped by mi_cancel(): a generation or preload (a result is returned), or a release
+                                    * before it freed anything */
   MI_ERR_INVALID_ARGUMENT = -1,    /* NULL handle or pointer, value out of range, invalid request */
   MI_ERR_ABI_MISMATCH = -2,        /* struct_size this library does not know */
   MI_ERR_NOT_SUPPORTED = -3,       /* feature not in this build (e.g. ComfyUI single-file checkpoints) */
@@ -262,8 +263,10 @@ typedef enum mi_precision {
  * blocks (a DiT that does not fit the device) read buffered every step unless direct_io. */
 typedef enum mi_direct_io {
   /* Adaptive (default): direct I/O, unless it gains nothing on the files (tmpfs, network file systems, compressed
-   * extents, a refused open), the load is a parking reload, or most of the files is in the page cache already (Linux:
-   * probed before every load; Windows: once buffered loads measure faster); then buffered. */
+   * extents, a refused open); buffered for a parking reload. With most of the files in the page cache already (Linux:
+   * probed before every load; Windows: once buffered loads measure faster), the mode this machine measured faster from
+   * the cache (each is tried once while its rate is unknown; the rates are kept in the hardware profile under
+   * cache_dir). */
   MI_DIRECT_IO_AUTO = 0,
   MI_DIRECT_IO_BUFFERED = 1, /* buffered reads (the page cache) */
   MI_DIRECT_IO_DIRECT = 2,   /* direct I/O (O_DIRECT / FILE_FLAG_NO_BUFFERING); a refused open still reads buffered */
@@ -341,8 +344,9 @@ MOSSINFER_API mi_status mi_engine_create(const mi_engine_params* params, mi_engi
 MOSSINFER_API void mi_engine_free(mi_engine* engine);
 
 /* Requests the generation running on `engine` to stop. It stops within one text-encoder layer, DiT block or decode
- * band, and mi_generate() returns MI_CANCELLED. It also stops a running mi_engine_preload() (MI_CANCELLED) and the host
- * copy of a running mi_engine_release(). No effect when nothing runs (a cancel never carries over to the next job).
+ * band, and mi_generate() returns MI_CANCELLED. It also stops a running mi_engine_preload() (MI_CANCELLED) and a running
+ * mi_engine_release(): before it frees anything (MI_CANCELLED), else its host copy. No effect when nothing runs (a cancel
+ * never carries over to the next job).
  * Thread-safe. */
 MOSSINFER_API mi_status mi_cancel(mi_engine* engine);
 
@@ -618,8 +622,12 @@ MOSSINFER_API mi_status mi_generate(mi_engine* engine, const mi_gen_params* para
  * (mi_memory_stats.dit_loads 0) and gives the same image bits as without the preload.
  * It occupies the engine like a generation: MI_ERR_BUSY while a job runs, and mi_cancel() stops it between models and
  * weight groups (MI_CANCELLED with a result; the engine stays usable and keeps what was loaded before the cancel).
- * params' callbacks run on this thread: progress once at the start (MI_PHASE_DIT_LOAD, step 0) and the plan once the
- * loads are done (the engine plans and loads in one call); there is no preview. `out_result` may be NULL; else it
+ * params' callbacks run on this thread: the plan once, after planning and before any load; then a progress (step 0,
+ * total_steps 0) before each load step, also for a model already resident, in this order: MI_PHASE_TEXT_ENCODER before
+ * a host-resident text encoder's copy, MI_PHASE_DECODE before each VAE (twice for a request with an init image: its
+ * encoder, then the decoder), MI_PHASE_DIT_LOAD before the DiT. A step the plan skips reports nothing; MI_PHASE_DENOISE
+ * never comes, and there is no preview. A mi_cancel() from a callback stops the preload at once. `out_result` may be
+ * NULL; else it
  * receives the preload's result on MI_OK and MI_CANCELLED (release it with mi_result_free()): the plan, the tier, the
  * timings, the memory, mi_result_dit_load() and MI_TEXT_PRELOAD_NOTE; no image, steps_run 0. */
 MOSSINFER_API mi_status mi_engine_preload(mi_engine* engine, const mi_gen_params* params, mi_result** out_result);
@@ -642,11 +650,15 @@ typedef struct mi_release_info {
  * room (a margin of the available memory stays free; within host_ram_budget_bytes when set): the DiT's weight files are
  * read into pinned memory (seconds; its next load uploads them from there, bit-identical, then frees them) and a
  * host-resident text encoder keeps its copy. With 0 every host copy is freed too. The embedding cache stays either way.
- * mi_cancel() from another thread stops the DiT's host copy (between 64 MiB reads): the release still completes, keeps a
- * host-resident text encoder's copy and frees nothing else. `out` (may be NULL) receives what was kept, and why not.
- * Returns MI_OK, unless: MI_ERR_INVALID_ARGUMENT for a NULL engine, MI_ERR_ABI_MISMATCH for an unknown out->struct_size,
- * MI_ERR_BUSY while a generation, a preload or another release runs (all three before anything is freed), and
- * MI_ERR_CUDA when the device fails (free the engine then). */
+ * mi_cancel() from another thread:
+ * - before the release starts freeing (it landed between this call's start and the pipeline's): nothing is released,
+ *   MI_CANCELLED, `out` with vram_released_bytes 0, the host copies already held and note "cancelled before it started";
+ * - during the DiT's host copy (between 64 MiB reads): the copy stops; the release still completes (MI_OK), keeps a
+ *   host-resident text encoder's copy, frees nothing else, and the note says the copy was cancelled.
+ * `out` (may be NULL) receives what was released and kept, and why not. Returns MI_OK or MI_CANCELLED (above), else:
+ * MI_ERR_INVALID_ARGUMENT for a NULL engine, MI_ERR_ABI_MISMATCH for an unknown out->struct_size, MI_ERR_BUSY while a
+ * generation, a preload or another release runs (all three before anything is freed), and MI_ERR_CUDA when the device
+ * fails (free the engine then). */
 MOSSINFER_API mi_status mi_engine_release(mi_engine* engine, int32_t keep_host_copy, mi_release_info* out);
 
 /* ------------------------------------------------------------------------------------------------ results */
