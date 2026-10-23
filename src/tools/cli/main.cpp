@@ -1,20 +1,9 @@
 #include <exception>
 #include <iostream>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "tools/cli/commands.h"
-
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#endif
 
 namespace {
 
@@ -36,8 +25,9 @@ void usage(std::ostream& os) {
   for (const auto& c : kCommands) os << "  " << c.usage << "\n";
 }
 
-// `argv` as UTF-8 strings, program name first.
-int run(const std::vector<std::string>& argv) {
+}  // namespace
+
+int mi::cli::run_main(const std::vector<std::string>& argv) {
   const std::size_t argc = argv.size();
   if (argc < 2 || argv[1] == "-h" || argv[1] == "--help") {
     usage(argc < 2 ? std::cerr : std::cout);
@@ -59,22 +49,7 @@ int run(const std::vector<std::string>& argv) {
   return 2;
 }
 
-}  // namespace
-
-#ifdef _WIN32
-// char** argv is in the ANSI code page on Windows and loses characters outside it; take the
-// UTF-16 command line and convert, so commands see UTF-8 like on Linux.
-int wmain(int argc, wchar_t** argv) {
-  std::vector<std::string> utf8;
-  for (int i = 0; i < argc; ++i) {
-    const int n = WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, nullptr, 0, nullptr, nullptr);
-    std::string s(n > 0 ? static_cast<std::size_t>(n) : 1, '\0');
-    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, s.data(), n, nullptr, nullptr);
-    s.pop_back();  // the converted terminator
-    utf8.push_back(std::move(s));
-  }
-  return run(utf8);
+// Declared in commands.h: internal to moss-infer, not part of the C API, may change without notice.
+int mi_internal_cli_main(int argc, char** argv) {
+  return mi::cli::run_main(std::vector<std::string>(argv, argv + argc));
 }
-#else
-int main(int argc, char** argv) { return run(std::vector<std::string>(argv, argv + argc)); }
-#endif

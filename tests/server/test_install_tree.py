@@ -94,6 +94,23 @@ def hello(prefix, **env_vars):
     return answer["result"]
 
 
+def cli_help(prefix):
+    """The tree's moss-infer starts and prints its usage. Linux: when it links libmossinfer (MOSSINFER_CLI_SHARED, the
+    release presets), it resolves the tree's copy, never the build tree's."""
+    exe = os.path.abspath(os.path.join(prefix, "bin", "moss-infer" + (".exe" if os.name == "nt" else "")))
+    if not os.path.isfile(exe):
+        return
+    env = clean_environment()
+    cwd = os.path.dirname(os.path.abspath(prefix))  # never the build tree
+    p = subprocess.run([exe, "--help"], capture_output=True, text=True, env=env, cwd=cwd, timeout=TIMEOUT)
+    check(p.returncode == 0 and "usage: moss-infer" in p.stdout, f"{prefix}: moss-infer --help ({p.returncode} {p.stderr!r})")
+    if sys.platform.startswith("linux"):
+        ldd = subprocess.run(["ldd", exe], capture_output=True, text=True, env=env, cwd=cwd).stdout
+        engine = [l.split("=>")[1].split()[0] for l in ldd.splitlines() if "libmossinfer" in l and "=>" in l]
+        if engine:
+            check(inside(engine[0], prefix), f"{prefix}: moss-infer links the tree's libmossinfer ({engine[0]})")
+
+
 def inside(path, prefix):
     path, prefix = os.path.normcase(os.path.realpath(path)), os.path.normcase(os.path.realpath(prefix))
     try:
@@ -175,8 +192,12 @@ def main():
         lt = hello(slim, MOSSINFER_CUDA_LIBS="sometimes")["probe"]["cublaslt"]
         check(lt["source"] == "" and "MOSSINFER_CUDA_LIBS=sometimes" in lt["error"], f"slim, bad policy: {lt}")
 
+    cli_help(full)
+    if slim_runs:
+        cli_help(slim)
+
     if args.check_package:
-        major = ["--cuda-major", args.cuda_major] if args.cuda_major else []
+        major =["--cuda-major", args.cuda_major] if args.cuda_major else []
         for prefix, extra in ((full, major), (slim, ["--system-cuda"])):
             p = subprocess.run([sys.executable, args.check_package, "--prefix", prefix] + extra, capture_output=True,
                                text=True)

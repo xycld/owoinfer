@@ -5,6 +5,13 @@
 # Preprocessor contract with include/mossinfer/mossinfer.h: the library build defines MOSSINFER_SHARED and
 # MOSSINFER_BUILD (dllexport on Windows); consumers of MossInfer::mossinfer get MOSSINFER_SHARED (dllimport).
 option(MOSSINFER_SHARED "Build the shared library libmossinfer.so / mossinfer.dll (exports only mi_* symbols)" OFF)
+# Release packages: moss-infer runs the engine in libmossinfer instead of carrying its own copy. The CLI is compiled
+# into the library, which then exports its entry point mi_internal_cli_main besides the C API (CMakeLists.txt). OFF
+# (dev, tests, gates) keeps the statically linked moss-infer.
+option(MOSSINFER_CLI_SHARED "Compile the moss-infer CLI into libmossinfer and link moss-infer against it (needs MOSSINFER_SHARED)" OFF)
+if(MOSSINFER_CLI_SHARED AND NOT MOSSINFER_SHARED)
+  message(FATAL_ERROR "MOSSINFER_CLI_SHARED=ON links moss-infer against libmossinfer: it needs MOSSINFER_SHARED=ON")
+endif()
 option(MOSSINFER_STATIC_CUDART "Link the CUDA runtime statically (no cudart library to redistribute)" OFF)
 option(MOSSINFER_BUNDLE_CUDA_LIBS "Install the CUDA libraries the binaries load (cuBLASLt, shared cudart)" ON)
 option(MOSSINFER_FETCH_GTEST "Download GoogleTest instead of using an installed one (CI)" OFF)
@@ -103,6 +110,8 @@ if(MOSSINFER_SHARED)
   if(NOT WIN32)
     # The version script is the guarantee: statically linked code (cudart_static, CUTLASS templates, libstdc++
     # inlines) cannot leak symbols even where it ignores -fvisibility. -z defs: no unresolved symbols at load time.
+    # mi_* is the C API plus, with MOSSINFER_CLI_SHARED, moss-infer's entry mi_internal_cli_main (check_package.py
+    # checks the exact list).
     set(_mi_map ${CMAKE_CURRENT_BINARY_DIR}/mossinfer.map)
     file(CONFIGURE OUTPUT ${_mi_map} CONTENT "{\n  global: mi_*;\n  local: *;\n};\n")
     target_link_options(mossinfer PRIVATE "LINKER:--version-script=${_mi_map}")
@@ -158,9 +167,10 @@ function(_mi_install_executables)
     if(TARGET ${t})
       list(APPEND _targets ${t})
       # RUNPATH $ORIGIN/../lib only where lib/ holds a load-time dependency: libmossinfer (moss-server in the shared
-      # build) or a shared cudart. An executable that links the core statically and cudart statically gets none: its
-      # RUNPATH would steer the cuBLASLt loader's plain-name search for a system copy to the bundled one, past the
-      # ld.so cache (src/backend/cuda_libs.h).
+      # build, moss-infer with MOSSINFER_CLI_SHARED) or a shared cudart. An executable that links the core statically
+      # and cudart statically gets none: its RUNPATH would steer the cuBLASLt loader's plain-name search for a system
+      # copy to the bundled one, past the ld.so cache (src/backend/cuda_libs.h). One that links libmossinfer is safe:
+      # the search runs in the library, whose own RUNPATH counts.
       get_target_property(_links ${t} LINK_LIBRARIES)
       if(NOT WIN32 AND (NOT MOSSINFER_STATIC_CUDART OR (TARGET mossinfer AND "mossinfer" IN_LIST _links)))
         set_property(TARGET ${t} PROPERTY INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
