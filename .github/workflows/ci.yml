@@ -7,12 +7,19 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      recache:
+        description: Recompile everything and overwrite the sccache entries (measures a cold build)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# A pull request's newer push cancels its older run. Everything else is grouped per commit and never cancelled: the
+# release gate needs a completed ci run for every main commit.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -20,3 +27,4 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       retention-days: 7
+      sccache-recache: ${{ inputs.recache == true }}
