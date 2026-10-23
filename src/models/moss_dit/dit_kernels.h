@@ -14,6 +14,9 @@ namespace mi::moss_dit {
 // hidden_states.flatten(2).transpose(1, 2).to(bf16): latents fp32 [C, h, w] (contiguous) -> tokens
 // bf16 [h*w, C] (contiguous), round to nearest even.
 void latent_to_tokens(const Tensor& latents, const Tensor& tokens, cudaStream_t stream);
+// The same into columns [col0, col0 + C) of tokens bf16 [h*w, C_total] (contiguous): one part of a channel
+// concatenation (control adapters' widened input embedder).
+void latent_to_tokens(const Tensor& latents, const Tensor& tokens, std::int64_t col0, cudaStream_t stream);
 
 // x.transpose(1, 2).reshape(C, h, w).float(): tokens bf16 [h*w, C] (contiguous) -> fp32 [C, h, w] (contiguous).
 void tokens_to_latent(const Tensor& tokens, const Tensor& latents, cudaStream_t stream);

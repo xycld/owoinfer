@@ -101,6 +101,25 @@ struct Row {
 // stream has not necessarily finished; synchronize before reading.
 using BlockHook = std::function<void(int block, const Tensor& x)>;
 
+// Step caching (P6b, e.g. the first-block cache of pipeline/accel), around the block loop of every forward() while set
+// (MossDit::set_step_cache). x: every row's residual stream as BlockHook's; rows: the forward's rows; offsets:
+// token_offsets() of them (row r's video tokens are x[offsets[r], offsets[r] + video)). before_blocks runs before block
+// 0, after_first_block after it: returning true reuses the hook's cache, so blocks 1..kLayers-1 do not run for any row
+// in this forward (nor are their streamed weights waited for: the streaming pass is ended there), and after_blocks
+// (reused = true) must then write every row's final video tokens into x; otherwise all blocks run and after_blocks
+// (reused = false) sees their result. Any of them may synchronize `stream`; each runs outside CUDA graphs. Without a
+// hook a forward is unchanged.
+class StepCacheHook {
+ public:
+  virtual ~StepCacheHook() = default;
+  virtual void before_blocks(const Tensor& x, std::span<const Row> rows, std::span<const std::int64_t> offsets,
+                             std::int64_t video, cudaStream_t stream) = 0;
+  virtual bool after_first_block(const Tensor& x, std::span<const Row> rows, std::span<const std::int64_t> offsets,
+                                 std::int64_t video, cudaStream_t stream) = 0;
+  virtual void after_blocks(const Tensor& x, std::span<const Row> rows, std::span<const std::int64_t> offsets,
+                            std::int64_t video, bool reused, cudaStream_t stream) = 0;
+};
+
 struct LoadStats {
   double seconds = 0;       // wall time, disk to resident (includes the final copy-stream sync)
   std::uint64_t bytes = 0;  // payload bytes read
@@ -165,6 +184,22 @@ double int4_gemm_fraction(const quant::QuantIndex* quant);
 void check_lora_merges(const lora::LoraStack& stack, const quant::QuantIndex* quant);
 double int4_side_branch_fraction(const quant::QuantIndex* quant, const lora::SideBranches& sb);
 std::vector<std::string> shadowed_by_time_embedding(const lora::LoraStack& stack);
+
+// Control adapters (models/control): a replacement video embedder over the channel concatenation [latents | extra]
+// (MossDit::set_input_extension).
+struct InputExtension {
+  Tensor weight;  // CUDA bf16 [kDim, kLatentChannels + C], C > 0
+  Tensor bias;    // CUDA bf16 [kDim]
+  Tensor extra;   // CUDA fp32 [C, h, w], contiguous: on the forward's latent grid, the same for every row
+};
+
+// The video embedding of a forward (P:247-248): tokens = [latents | extra] flattened to bf16 [h*w, C_in] (each fp32
+// value rounded once: the reference's .to(bf16) of the concatenated latents), then out = tokens · weightᵀ + bias with
+// gemm (bf16 in, fp32 accumulation, bf16 out [h*w, kDim]). extra null (and weight [kDim, kLatentChannels]): the plain
+// embedder, the ops the DiT always ran. tokens: CUDA scratch of at least h*w*C_in bf16 values.
+void embed_video(kernels::Gemm& gemm, void* gemm_workspace, std::size_t gemm_workspace_bytes, const Tensor& latents,
+                 const Tensor* extra, void* tokens, const Tensor& weight, const Tensor& bias, const Tensor& out,
+                 cudaStream_t stream);
 
 class MossDit {
  public:
@@ -237,7 +272,22 @@ class MossDit {
   // with): re-merges every merged module from the pristine weights kept at load, into the device weights and the
   // pinned host copies of streamed blocks. Synchronizes the device; call between forwards.
   void remerge_lora(const lora::LoraStack& stack);
+  // Switches the merged adapters to those of `stack` (nullptr: none) without reloading: every module merged now is
+  // merged again from its pristine copy (its pristine bits when `stack` does not merge it, the copy then dropped), and a
+  // module `stack` merges that is not merged yet is kept and merged in place, the same bits as a load with `stack`.
+  // Only modules outside the blocks (text refiner, embedders, modulation, head: always resident) can be newly merged in
+  // place; when `stack` merges a block module that is not merged yet, nothing changes and it returns false (reload the
+  // model with `stack` then). Synchronizes the device; call between forwards. The stack must outlive the call only.
+  bool rebase_merges(const lora::LoraStack* stack);
   const lora::SideBranches* lora() const { return lora_; }
+
+  // Control adapters: every following forward embeds [latents | ext->extra] with ext's weight and bias instead of the
+  // loaded video embedder (nullptr: the loaded one again, the forward bit-identical to never setting one). `ext` and
+  // its tensors must outlive their use; set between forwards. Throws std::invalid_argument for a weight other than
+  // bf16 [kDim, kLatentChannels + C] with C > 0, or a bias other than bf16 [kDim]; forward() checks extra against its
+  // latent grid. The tokens of the concatenation fit the forward's existing activations (no extra workspace).
+  void set_input_extension(const InputExtension* ext);
+  const InputExtension* input_extension() const { return input_ext_; }
 
   // Pins the fused route of every following forward (a request's snapshot, which sized its workspace); nullopt: each
   // forward takes its own snapshot (the default).
@@ -246,6 +296,10 @@ class MossDit {
   // Replaces the cancel flag (nullptr: none). While a flag is set, forward() keeps the host at most one block
   // ahead of the GPU, so a cancel lands within about one block.
   void set_cancel(const std::atomic<bool>* cancel) { cancel_ = cancel; }
+
+  // Step caching (P6b; nullptr: none, the default). The hook must outlive its use; set between forwards.
+  void set_step_cache(StepCacheHook* hook) { step_cache_ = hook; }
+  StepCacheHook* step_cache() const { return step_cache_; }
 
   const LoadStats& load_stats() const { return load_stats_; }
   const Residency& residency() const { return blocks_->residency(); }
@@ -328,32 +382,46 @@ class MossDit {
   Int4Route int4_route_ = Int4Route::kAuto;
   std::optional<FusedRouteSnapshot> request_route_;
   const lora::SideBranches* lora_ = nullptr;
+  const InputExtension* input_ext_ = nullptr;
   // Runtime-LoRA merges: the pristine weights of the merged modules and where each module's merged weights live.
   struct MergeTarget {
     Tensor w, bias, scale;  // bias / scale empty when absent / bf16
     int group = 0;          // INT8 ConvRot group; 0: bf16
   };
+  // A host copy of a merge target's weights, owned (also for a pinned host target, so nothing changes until store()):
+  // read from the target (download) or only allocated (a re-merge overwrites every byte from the pristine copy).
   class MergeStaging {
    public:
-    explicit MergeStaging(const MergeTarget& t);
+    MergeStaging(const MergeTarget& t, bool download);
+    MergeStaging(MergeStaging&&) noexcept = default;
+    MergeStaging(const MergeStaging&) = delete;
+    MergeStaging& operator=(const MergeStaging&) = delete;
     template <typename T>
-    T* w() const { return static_cast<T*>(w_); }
-    std::uint16_t* bias() const { return static_cast<std::uint16_t*>(bias_); }
-    float* scale() const { return static_cast<float*>(scale_); }
-    void store() const;  // device targets: upload the staging copy
+    T* w() const { return reinterpret_cast<T*>(const_cast<std::byte*>(hw_.data())); }
+    std::uint16_t* bias() const { return hb_.empty() ? nullptr : reinterpret_cast<std::uint16_t*>(const_cast<std::byte*>(hb_.data())); }
+    float* scale() const { return hs_.empty() ? nullptr : reinterpret_cast<float*>(const_cast<std::byte*>(hs_.data())); }
+    // Writes the copy into the target: device targets uploaded and synchronized (visible to every stream on return),
+    // host targets copied.
+    void store() const;
 
    private:
-    const MergeTarget& target;
+    const MergeTarget* target;
     std::vector<std::byte> hw_, hb_, hs_;
-    void *w_ = nullptr, *bias_ = nullptr, *scale_ = nullptr;
   };
-  void remerge_into(const lora::LoraStack& stack, const std::string& module, const MergeTarget& t, MergeStaging& staging) const;
+  // staging = merge(pristine copy of `module`) for `stack`'s strengths, from `pristine` (host math only).
+  static void remerge_into(const lora::PristineWeights& pristine, const lora::LoraStack& stack, const std::string& module,
+                           const MergeTarget& t, MergeStaging& staging);
   std::unique_ptr<lora::PristineWeights> pristine_;
   std::vector<std::pair<std::string, MergeTarget>> merge_targets_;
+  // `module`'s weights in `m` (w empty when absent); throws for a quantized format merges do not support.
+  MergeTarget merge_target(const weights::TensorMap& m, const std::string& module) const;
+  // The views of the always-resident groups (globals, text_embedder): rebase_merges' in-place merge targets.
+  weights::TensorMap resident_views_;
   kernels::Gemm gemm_;
   void* gemm_workspace_ = nullptr;
   LoadStats load_stats_;
   const std::atomic<bool>* cancel_ = nullptr;
+  StepCacheHook* step_cache_ = nullptr;
   cudaEvent_t block_done_[2] = {nullptr, nullptr};  // blocks k - 2 and k - 1 of a forward (cancel throttle)
 
   Linear video_embedder_, time_in_, time_out_, block_modulation_, head_modulation_, text_proj_;

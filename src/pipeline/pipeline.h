@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "models/lora/side_branch.h"
+#include "pipeline/accel/accel.h"
 #include "pipeline/pipeline_image.h"
 #include "pipeline/png_writer.h"
 #include "pipeline/quality_cert.h"
@@ -139,6 +140,30 @@ struct Request {
     bool enabled() const { return width > 0 || height > 0; }
   } hires;
   bool decode = true;  // false: stop after sampling (final latents only)
+  // Control adapter (roadmap P8, models/control: format and semantics): a file pairing a LoRA with a widened DiT input
+  // embedder, and its conditioning images. The embedder replaces the DiT's while the adapter is set (never scaled);
+  // the file's LoRA joins the runtime LoRA stack after `loras` with lora_strength. Each image is brought to the pass's
+  // size by `resize` (as init_image), VAE-encoded (posterior mean) once per pass size, multiplied by its strength and
+  // fed as its kind's control latent (clean, the same for every CFG row) on the steps i of a pass with
+  // start <= i / steps < end; a kind without an image, or outside its window, gets the zero latent (no control).
+  // Works with every tier, streaming, sampler, img2img / inpainting and the hires fix (the images are encoded again at
+  // the hires size). Results are uncertified, like any LoRA.
+  struct ControlImage {
+    std::string kind;                    // one of the adapter's kinds (its control_channels, e.g. "color", "depth")
+    std::shared_ptr<const Image> image;  // RGB, or grayscale (replicated to RGB: a depth map, near = white)
+    double strength = 1.0;               // [0, 10]: multiplies the control latent (0 = no control)
+    double start = 0.0, end = 1.0;       // 0 <= start <= end <= 1
+  };
+  struct Control {
+    std::filesystem::path adapter;  // empty: none
+    float lora_strength = 1.0f;     // the file's LoRA part (finite)
+    std::vector<ControlImage> images;
+    bool enabled() const { return !adapter.empty(); }
+  } control;
+  // P6b opt-in accelerators (pipeline/accel/accel.h): CFG truncation and step caching, lossy and off by default. The
+  // tier is resolved as without them (tier auto picks what it would pick anyway); any of them active then makes the run
+  // uncertified. They apply to each sampling pass (a hires fix's too).
+  accel::Options accel;
 };
 
 // Throws std::invalid_argument with the official app's wording where it has one.
@@ -265,6 +290,9 @@ struct DitStreamStats {
   struct Step {
     double gbps = 0, hidden = 0, stall_s = 0;
     int stalls = 0;
+    // A call of this step reused the P6b step cache: the streaming pass ended after block 0 and its copies are not
+    // counted (all zero when every call of the step reused it).
+    bool cached = false;
   };
   std::vector<Step> steps;  // per finished step
 };
@@ -338,7 +366,19 @@ struct Result {
   std::vector<lora::FileReport> loras;
   std::vector<std::string> lora_warnings;
   std::vector<std::string> lora_notes;  // how files were read (e.g. the metadata alpha applied)
+  // The control adapter (Request::control; adapter empty: none): its file, kinds in channel order, how its LoRA part was
+  // read (not in `loras`), and the encodes of its images.
+  struct ControlReport {
+    std::string adapter;
+    std::vector<std::string> kinds;
+    std::string base_model;  // the file's metadata, informational
+    lora::FileReport lora;
+    int encodes = 0;
+    std::string encode_schedule;  // "untiled" or the tile plans, per encode
+  } control;
   DitStreamStats dit_stream;
+  // P6b: what the accelerators did (CFG-truncated steps, step-cache calls and reuses).
+  accel::Stats accel;
   Timings timings;
   MemoryStats memory;
 };

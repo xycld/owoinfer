@@ -330,46 +330,135 @@ bool MossDit::block_has_merges(const lora::LoraStack& stack, int block) {
   return false;
 }
 
-// A merged module's weights as uploaded (device) or held (pinned host copy of a streamed block), and a host staging
-// copy of them (device targets; host targets are edited in place).
-MossDit::MergeStaging::MergeStaging(const MergeTarget& t) : target(t) {
-  const auto fetch = [&](const Tensor& x, std::vector<std::byte>& host) -> void* {
-    if (x.data == nullptr) return nullptr;
-    if (x.device != Device::kCUDA) return x.data;
+// A merged module's weights as uploaded (device) or held (pinned host copy of a streamed block): an owned host copy.
+MossDit::MergeStaging::MergeStaging(const MergeTarget& t, bool download) : target(&t) {
+  const auto fetch = [&](const Tensor& x, std::vector<std::byte>& host) {
+    if (x.data == nullptr) return;
     host.resize(x.nbytes());
-    MI_CUDA_CHECK(cudaMemcpy(host.data(), x.data, x.nbytes(), cudaMemcpyDeviceToHost));
-    return host.data();
+    if (!download) return;
+    if (x.device == Device::kCUDA) {
+      // Device-to-pageable copies return once complete; callers have synchronized the device (or the load's ring).
+      MI_CUDA_CHECK(cudaMemcpy(host.data(), x.data, x.nbytes(), cudaMemcpyDeviceToHost));
+    } else {
+      std::memcpy(host.data(), x.data, x.nbytes());
+    }
   };
-  w_ = fetch(t.w, hw_);
-  bias_ = fetch(t.bias, hb_);
-  scale_ = fetch(t.scale, hs_);
+  fetch(t.w, hw_);
+  fetch(t.bias, hb_);
+  fetch(t.scale, hs_);
 }
 
 void MossDit::MergeStaging::store() const {
-  const auto put = [](const Tensor& x, const std::vector<std::byte>& host) {
-    if (x.data != nullptr && x.device == Device::kCUDA) MI_CUDA_CHECK(cudaMemcpy(x.data, host.data(), x.nbytes(), cudaMemcpyHostToDevice));
+  bool device = false;
+  const auto put = [&](const Tensor& x, const std::vector<std::byte>& host) {
+    if (x.data == nullptr) return;
+    if (x.device == Device::kCUDA) {
+      MI_CUDA_CHECK(cudaMemcpy(x.data, host.data(), x.nbytes(), cudaMemcpyHostToDevice));
+      device = true;
+    } else {
+      std::memcpy(x.data, host.data(), x.nbytes());
+    }
   };
-  put(target.w, hw_);
-  put(target.bias, hb_);
-  put(target.scale, hs_);
+  put(target->w, hw_);
+  put(target->bias, hb_);
+  put(target->scale, hs_);
+  // A pageable host-to-device cudaMemcpy may return before its DMA lands, and the engine's non-blocking streams do not
+  // order after the legacy stream: wait for the copies here.
+  if (device) MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
 }
 
-void MossDit::remerge_into(const lora::LoraStack& stack, const std::string& module, const MergeTarget& t,
-                           MergeStaging& staging) const {
+void MossDit::remerge_into(const lora::PristineWeights& pristine, const lora::LoraStack& stack, const std::string& module,
+                           const MergeTarget& t, MergeStaging& staging) {
   if (t.group == 0) {
-    pristine_->remerge_bf16(stack, module, staging.w<std::uint16_t>(), staging.bias());
+    pristine.remerge_bf16(stack, module, staging.w<std::uint16_t>(), staging.bias());
   } else {
-    pristine_->remerge_int8(stack, module, staging.w<std::int8_t>(), staging.scale());
+    pristine.remerge_int8(stack, module, staging.w<std::int8_t>(), staging.scale());
   }
-  staging.store();
+}
+
+MossDit::MergeTarget MossDit::merge_target(const TensorMap& m, const std::string& module) const {
+  MergeTarget t;
+  const auto w = m.find(module + ".weight");
+  if (w == m.end()) return t;
+  t.w = w->second;
+  if (t.w.dtype == DType::kBF16) {
+    const auto b = m.find(module + ".bias");
+    if (b != m.end() && b->second.dtype == DType::kBF16) t.bias = b->second;
+  } else {
+    t.scale = m.at(module + ".weight_scale");
+    const quant::QuantSpec* spec = quant_ != nullptr ? quant_->find_spec(module) : nullptr;
+    if (spec == nullptr || spec->format != quant::QuantFormat::kInt8ConvRot) throw std::runtime_error(int4_merge_message(module));
+    t.group = spec->group;
+  }
+  return t;
+}
+
+bool MossDit::rebase_merges(const lora::LoraStack* stack) {
+  static const lora::LoraStack kNone(std::span<const lora::LoraSpec>{}, lora::moss_dit_targets());
+  const lora::LoraStack& s = stack != nullptr ? *stack : kNone;
+  const std::vector<std::string> want = s.merge_modules();
+  const auto merged = [&](const std::string& module) {
+    return std::any_of(merge_targets_.begin(), merge_targets_.end(), [&](const auto& e) { return e.first == module; });
+  };
+  std::vector<std::pair<std::string, MergeTarget>> added;
+  for (const std::string& module : want) {
+    if (merged(module)) continue;
+    const MergeTarget t = merge_target(resident_views_, module);
+    if (t.w.data == nullptr) return false;  // a block module: only a load can merge it
+    added.emplace_back(module, t);
+  }
+  MI_CUDA_CHECK(cudaDeviceSynchronize());  // no forward may read the weights while they change
+  // Transactional: the pristine copies of the new modules and every module's new bits are computed into owned host
+  // buffers first; a failure there (a non-finite merge, a bad factor, out of memory) drops the new copies and leaves the
+  // model and merge_targets_ as they were. Only then are the buffers written in (a CUDA error during those copies is
+  // not recoverable here: the caller discards the model). Peak host memory: the merged modules' size once more.
+  std::vector<std::pair<std::string, MergeTarget>> all = merge_targets_;
+  all.insert(all.end(), added.begin(), added.end());
+  std::vector<std::string> new_copies;
+  std::vector<MergeStaging> staged;
+  staged.reserve(all.size());
+  try {
+    for (const auto& [module, t] : added) {
+      if (!pristine_) pristine_ = std::make_unique<lora::PristineWeights>();
+      if (pristine_->has(module)) continue;
+      const MergeStaging loaded(t, true);  // never merged: the loaded bits
+      if (t.group == 0) {
+        pristine_->keep_bf16(module, loaded.w<std::uint16_t>(), t.w.dim(0), t.w.dim(1), loaded.bias());
+      } else {
+        pristine_->keep_int8(module, loaded.w<std::int8_t>(), loaded.scale(), t.w.dim(0), t.w.dim(1), t.group);
+      }
+      new_copies.push_back(module);
+    }
+    for (const auto& [module, t] : all) {
+      staged.emplace_back(t, false);
+      remerge_into(*pristine_, s, module, t, staged.back());
+    }
+  } catch (...) {
+    for (const std::string& module : new_copies) pristine_->drop(module);
+    throw;
+  }
+  for (const MergeStaging& st : staged) st.store();
+  std::vector<std::pair<std::string, MergeTarget>> kept;
+  for (const auto& [module, t] : all) {
+    if (std::find(want.begin(), want.end(), module) != want.end()) {
+      kept.emplace_back(module, t);
+    } else {
+      pristine_->drop(module);
+    }
+  }
+  merge_targets_ = std::move(kept);
+  if (merge_targets_.empty()) pristine_.reset();
+  return true;
 }
 
 void MossDit::remerge_lora(const lora::LoraStack& stack) {
   if (merge_targets_.empty()) return;
   MI_CUDA_CHECK(cudaDeviceSynchronize());  // no forward may read the weights while they change
+  // Module by module (a failure leaves earlier modules re-merged: the caller discards the model then).
   for (const auto& [module, t] : merge_targets_) {
-    MergeStaging staging(t);
-    remerge_into(stack, module, t, staging);
+    MergeStaging staging(t, false);
+    remerge_into(*pristine_, stack, module, t, staging);
+    staging.store();
   }
 }
 
@@ -439,31 +528,20 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
   const auto merge = [&](const TensorMap& m) {
     if (merges == nullptr) return;
     for (const std::string& module : merges->merge_modules()) {
-      const auto w = m.find(module + ".weight");
-      if (w == m.end()) continue;
-      MergeTarget t;
-      t.w = w->second;
-      if (t.w.dtype == DType::kBF16) {
-        const auto b = m.find(module + ".bias");
-        if (b != m.end() && b->second.dtype == DType::kBF16) t.bias = b->second;
-      } else {
-        t.scale = m.at(module + ".weight_scale");
-        const quant::QuantSpec* spec = quant != nullptr ? quant->find_spec(module) : nullptr;
-        if (spec == nullptr || spec->format != quant::QuantFormat::kInt8ConvRot) {
-          throw std::runtime_error(int4_merge_message(module));
-        }
-        t.group = spec->group;
-      }
+      const MergeTarget t = merge_target(m, module);
+      if (t.w.data == nullptr) continue;
       if (!pristine_) pristine_ = std::make_unique<lora::PristineWeights>();
-      MergeStaging staging(t);
-      if (!pristine_->has(module)) {
+      const bool keep = !pristine_->has(module);
+      MergeStaging staging(t, keep);
+      if (keep) {
         if (t.group == 0) {
           pristine_->keep_bf16(module, staging.w<std::uint16_t>(), t.w.dim(0), t.w.dim(1), staging.bias());
         } else {
           pristine_->keep_int8(module, staging.w<std::int8_t>(), staging.scale(), t.w.dim(0), t.w.dim(1), t.group);
         }
       }
-      remerge_into(*merges, module, t, staging);
+      remerge_into(*pristine_, *merges, module, t, staging);
+      staging.store();
       merge_targets_.emplace_back(module, t);
     }
   };
@@ -488,6 +566,7 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
   }
 
   const TensorMap glob = upload(*find_group(index, "globals"));
+  resident_views_ = glob;
   video_embedder_ = {take(glob, "video_embedder.weight", {kDim, kLatentChannels}), take(glob, "video_embedder.bias", {kDim})};
   time_in_ = {take(glob, "time_embedding.0.weight", {kDim, kFreqDim}), take(glob, "time_embedding.0.bias", {kDim})};
   time_out_ = {take(glob, "time_embedding.2.weight", {kDim, kDim}), take(glob, "time_embedding.2.bias", {kDim})};
@@ -507,6 +586,7 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
     }
     WeightGroup ordered = with_front(g, {front[0], front[1], front[2], front[3], front[4], front[5], front[6], front[7]});
     const TensorMap m = upload(ordered);
+    resident_views_.insert(m.begin(), m.end());
     text_proj_ = {take(m, "text_embedder.proj.weight", {kDim, kTextDim}), take(m, "text_embedder.proj.bias", {kDim})};
     for (int i = 0; i < 2; ++i) {
       const std::string p = "text_embedder.blocks." + std::to_string(i) + ".";
@@ -721,6 +801,38 @@ std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, st
   return plan.total();
 }
 
+void embed_video(kernels::Gemm& gemm, void* gemm_workspace, std::size_t gemm_workspace_bytes, const Tensor& latents,
+                 const Tensor* extra, void* tokens, const Tensor& weight, const Tensor& bias, const Tensor& out,
+                 cudaStream_t stream) {
+  const std::int64_t hw = latents.dim(1) * latents.dim(2);
+  if (extra == nullptr) {
+    const Tensor t = Tensor::view(tokens, DType::kBF16, Device::kCUDA, {hw, kLatentChannels});
+    latent_to_tokens(latents, t, stream);
+    gemm.linear(out, t, weight, bias.data != nullptr ? &bias : nullptr, gemm_workspace, gemm_workspace_bytes, stream);
+    return;
+  }
+  const std::int64_t cin = kLatentChannels + extra->dim(0);
+  if (weight.rank != 2 || weight.dim(1) != cin) fail("embed_video: weight must be [N, " + std::to_string(cin) + "], got " + weight.describe());
+  const Tensor t = Tensor::view(tokens, DType::kBF16, Device::kCUDA, {hw, cin});
+  latent_to_tokens(latents, t, 0, stream);
+  latent_to_tokens(*extra, t, kLatentChannels, stream);
+  gemm.linear(out, t, weight, bias.data != nullptr ? &bias : nullptr, gemm_workspace, gemm_workspace_bytes, stream);
+}
+
+void MossDit::set_input_extension(const InputExtension* ext) {
+  if (ext != nullptr) {
+    check_device(ext->weight, DType::kBF16, "input extension weight");
+    check_device(ext->bias, DType::kBF16, "input extension bias");
+    if (ext->weight.rank != 2 || ext->weight.dim(0) != kDim || ext->weight.dim(1) <= kLatentChannels || !ext->weight.is_contiguous()) {
+      fail("input extension weight must be a contiguous [3072, 128 + C] with C > 0, got " + ext->weight.describe());
+    }
+    if (ext->bias.rank != 1 || ext->bias.dim(0) != kDim) fail("input extension bias must be [3072], got " + ext->bias.describe());
+    // The widened tokens use the big activation buffer: at most kFusedBigCols columns per token.
+    if (ext->weight.dim(1) > kFusedBigCols) fail("input extension: too many input channels");
+  }
+  input_ext_ = ext;
+}
+
 void MossDit::run_block(const Block& b, const Activations& a, const Run& run, cudaStream_t stream) {
   // _Block.forward (P:138-148) on tokens [t0, t1); mod chunks (P:139): shift_a, scale_a, gate_a, shift_f, scale_f, gate_f.
   const Tensor& mod = a.mod;
@@ -847,9 +959,20 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
 
   // Per-row RoPE tables (P:250, text length differs per row) and the joint inputs [video_r | text_r] (P:247-252).
   // The video embedding is the same for every row: computed once, copied to the other rows.
-  const Tensor tokens = Tensor::view(a.big.data, DType::kBF16, Device::kCUDA, {hw, kLatentChannels});
-  latent_to_tokens(latents, tokens, stream);
-  linear(a.x.slice0(0, hw), tokens, video_embedder_, stream);
+  if (input_ext_ != nullptr) {
+    const Tensor& e = input_ext_->extra;
+    check_device(e, DType::kF32, "input extension extra");
+    if (e.rank != 3 || e.dim(0) != input_ext_->weight.dim(1) - kLatentChannels || e.dim(1) != height || e.dim(2) != width ||
+        !e.is_contiguous()) {
+      fail("input extension extra must be a contiguous [" + std::to_string(input_ext_->weight.dim(1) - kLatentChannels) + ", " +
+           std::to_string(height) + ", " + std::to_string(width) + "], got " + e.describe());
+    }
+  }
+  // The tokens live in the big buffer ([total, >= kFusedBigCols] bf16, idle until the first block), also when widened.
+  embed_video(gemm_, gemm_workspace_, kernels::Gemm::kWorkspaceBytes, latents,
+              input_ext_ != nullptr ? &input_ext_->extra : nullptr, a.big.data,
+              input_ext_ != nullptr ? input_ext_->weight : video_embedder_.w,
+              input_ext_ != nullptr ? input_ext_->bias : video_embedder_.bias, a.x.slice0(0, hw), stream);
   const std::size_t row_bytes = kDim * sizeof(std::uint16_t);
   for (std::size_t r = 0; r < rows.size(); ++r) {
     kernels::moss_rope_table(a.rope.slice0(off[r], off[r + 1]), static_cast<int>(height), static_cast<int>(width),
@@ -908,7 +1031,10 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     last_step_hash_ = h;
   }
 
-  for (int bi = 0; bi < kLayers; ++bi) {
+  // Step caching (StepCacheHook): a reuse after block 0 ends the loop and the streaming pass there.
+  if (step_cache_ != nullptr) step_cache_->before_blocks(a.x, rows, off, hw, stream);
+  bool reused = false;
+  for (int bi = 0; bi < kLayers && !reused; ++bi) {
     if (cancel_ != nullptr) {
       // Issue block bi only once block bi - 2 has finished: at most one block is queued ahead of the running one.
       if (bi >= 2) MI_CUDA_CHECK(cudaEventSynchronize(block_done_[bi % 2]));
@@ -929,8 +1055,14 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     weights.release(bi);
     if (hook) hook(bi, a.x);
     if (cancel_ != nullptr) MI_CUDA_CHECK(cudaEventRecord(block_done_[bi % 2], stream));
+    if (bi == 0 && step_cache_ != nullptr) reused = step_cache_->after_first_block(a.x, rows, off, hw, stream);
   }
-  weights.finish();
+  if (reused) {
+    weights.stop_early();  // stops the readers, waits for their copies (the lookahead is not used), rethrows their error
+  } else {
+    weights.finish();
+  }
+  if (step_cache_ != nullptr) step_cache_->after_blocks(a.x, rows, off, hw, reused, stream);
 
   // Head (P:256-259): final norm with head modulation (shift = head[0], scale = head[1]), linear, transpose.
   const Tensor proj = Tensor::view(a.big.data, DType::kBF16, Device::kCUDA, {hw, kLatentChannels});

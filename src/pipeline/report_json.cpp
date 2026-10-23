@@ -109,6 +109,9 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
     << ", \"noise_layout\": \"" << noise_layout_name(q.noise_layout) << "\", \"noise_source\": \""
     << noise_source_name(q.noise_source) << "\", \"eta\": " << num(q.eta) << ", \"s_noise\": " << num(q.s_noise)
     << ", \"dataspace\": " << json_escape(util::path_utf8(q.dataspace_path));
+  // P6b accelerators as requested.
+  o << ", \"cfg_truncation\": " << num(q.accel.cfg_truncation) << ", \"step_cache\": \""
+    << accel::step_cache_name(q.accel.step_cache) << "\", \"step_cache_threshold\": " << num(q.accel.step_cache_threshold);
   // img2img / inpainting / hires fix (P7b): the images by name and size (their pixels are not reported).
   const auto image = [&](const std::shared_ptr<const Image>& p) {
     if (p == nullptr) return std::string("null");
@@ -162,6 +165,12 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
     << ", \"hires\": " << (q.hires.enabled() ? pass(r.hires) : std::string("null")) << "},\n";
   o << " \"dit_blocks\": {\"path\": \"" << moss_dit::block_path_name(r.block_path) << "\", \"note\": "
     << json_escape(r.block_path_note) << "},\n";
+  // P6b: the lossy accelerators that ran (an active one makes the run uncertified) and what they skipped.
+  const accel::Stats& ac = r.accel;
+  o << " \"accelerators\": {\"lossy\": " << tf(q.accel.active(q.cfg != 1.0)) << ", \"active\": "
+    << json_escape(q.accel.describe(q.cfg != 1.0)) << ", \"cfg_truncated_steps\": " << ac.cfg_truncated_steps
+    << ", \"step_cache_calls\": " << ac.dit_calls << ", \"step_cache_reused\": " << ac.cached_calls
+    << ", \"cached_steps\": " << json_layers(ac.cached_steps) << "},\n";
   // P6: the quality object in the certificates' vocabulary (pipeline/quality_cert.h: tier, config, engine numerics, GPU
   // class, reason, certificate, models), filled by generate(), and where each model came from.
   const planner::TierDecision& td = r.tier;
@@ -189,6 +198,25 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
       << strings(f.notes) << "}";
   }
   o << "], \"lora_warnings\": " << strings(r.lora_warnings) << ", \"lora_notes\": " << strings(r.lora_notes) << ",\n";
+  // Control adapter (roadmap P8): the file, its kinds, the conditioning images as requested, its LoRA part as read and
+  // the encodes; null without one.
+  o << " \"control\": ";
+  if (q.control.enabled()) {
+    const lora::FileReport& f = r.control.lora;
+    o << "{\"adapter\": " << json_escape(util::path_utf8(q.control.adapter)) << ", \"lora_strength\": " << num(q.control.lora_strength)
+      << ", \"kinds\": " << strings(r.control.kinds) << ", \"base_model\": " << json_escape(r.control.base_model) << ", \"inputs\": [";
+    for (std::size_t i = 0; i < q.control.images.size(); ++i) {
+      const Request::ControlImage& c = q.control.images[i];
+      o << (i ? ", " : "") << "{\"kind\": " << json_escape(c.kind) << ", \"image\": " << image(c.image) << ", \"strength\": "
+        << num(c.strength) << ", \"start\": " << num(c.start) << ", \"end\": " << num(c.end) << "}";
+    }
+    o << "], \"lora\": {\"file\": " << json_escape(f.file) << ", \"adapters\": " << f.adapters << ", \"side_branch\": "
+      << f.side_branch << ", \"merged\": " << f.merged << ", \"unknown\": " << strings(f.unknown) << ", \"warnings\": "
+      << strings(f.warnings) << ", \"notes\": " << strings(f.notes) << "}, \"encodes\": " << r.control.encodes
+      << ", \"encode_schedule\": " << json_escape(r.control.encode_schedule) << "},\n";
+  } else {
+    o << "null,\n";
+  }
   o << " \"plan\": " << r.plan.to_json() << ",\n";
   o << " \"embedding_cache\": {\"hits\": " << r.te_cache_hits << ", \"te_skipped\": " << tf(r.te_skipped) << "},\n";
   // What ran (it may differ from plan.vae: the decode takes the fastest schedule the arena it finds leaves room for).
@@ -223,7 +251,7 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
   for (std::size_t i = 0; i < ds.steps.size(); ++i) {
     const auto& st = ds.steps[i];
     o << (i ? ", " : "") << "{\"h2d_gbps\": " << num(st.gbps) << ", \"hidden\": " << num(st.hidden) << ", \"stall_s\": "
-      << num(st.stall_s) << ", \"stalls\": " << st.stalls << "}";
+      << num(st.stall_s) << ", \"stalls\": " << st.stalls << ", \"cached\": " << tf(st.cached) << "}";
   }
   o << "]}";
   parts.tail = o.str();

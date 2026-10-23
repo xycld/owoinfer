@@ -31,6 +31,10 @@ bool Guidance::slg_active(int step, int num_steps) const {
   return slg_layers.any() && slg_scale > 0 && skip_active(step, num_steps);
 }
 
+bool Guidance::cfg_active(int step, int num_steps) const {
+  return do_cfg() && (cfg_truncation >= 1.0 || static_cast<double>(step) / static_cast<double>(num_steps) < cfg_truncation);
+}
+
 std::vector<std::int64_t> denoise_row_lengths(std::int64_t cond_tokens, std::int64_t uncond_tokens, const Guidance& guidance) {
   std::vector<std::int64_t> lengths = {cond_tokens};
   if (guidance.do_cfg()) lengths.push_back(uncond_tokens);
@@ -82,23 +86,25 @@ int denoise(moss_dit::MossDit& dit, runtime::DeviceArena& arena, const Tensor& c
 
   const ModelFn model = [&](const Tensor& x, const ModelCall& call, const Tensor& out, cudaStream_t s) {
     const bool skip = guidance.skip_active(call.step, num_steps);
+    // CFG truncation: past it the cond row runs alone (cfg_active is do_cfg when it is off).
+    const bool cfg = guidance.cfg_active(call.step, num_steps);
     moss_dit::Row rows[3];
     Tensor outs[3];
     int n = 0;
     rows[n] = {cond_text, {}};
     outs[n++] = v_cond;
-    if (do_cfg) {
+    if (cfg) {
       rows[n] = {uncond_text, skip ? guidance.uncond_skip : moss_dit::SkipSet{}};
       outs[n++] = v_uncond;
     }
-    const bool slg = slg_enabled && skip;
+    const bool slg = slg_enabled && skip && cfg == do_cfg;
     if (slg) {
       rows[n] = {cond_text, guidance.slg_layers};
       outs[n++] = v_slg;
     }
     dit.forward(x, call.timestep, std::span<const moss_dit::Row>(rows, n), std::span<const Tensor>(outs, n), s);
 
-    guide_prediction(driver.prediction(), x, call.sigma, v_cond, v_uncond, v_slg, do_cfg, static_cast<float>(guidance.cfg),
+    guide_prediction(driver.prediction(), x, call.sigma, v_cond, v_uncond, v_slg, cfg, static_cast<float>(guidance.cfg),
                      slg, static_cast<float>(guidance.slg_scale), out, s);
   };
 

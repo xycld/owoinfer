@@ -41,10 +41,15 @@ struct Guidance {
   double slg_scale = 0.0;
   double slg_start = 0.0;          // both skips active for slg_start <= i / num_steps < slg_stop
   double slg_stop = 1.0;
+  // CFG truncation (P6b, pipeline/accel/accel.h; lossy): the steps with step / num_steps >= cfg_truncation run the cond
+  // row alone (no uncond and no SLG row) and sample with the cond prediction. 1 = off.
+  double cfg_truncation = 1.0;
 
   bool do_cfg() const { return cfg != 1.0; }
   bool skip_active(int step, int num_steps) const;
   bool slg_active(int step, int num_steps) const;
+  // Guidance runs at this step: CFG on and the step before the truncation point.
+  bool cfg_active(int step, int num_steps) const;
 };
 
 // Progress of the sampling loop, after each finished step.

@@ -222,6 +222,10 @@ class BlockWeights {
     void release(int block);
     // Joins the readers (rethrowing a reader's error) and records the end of the block loop.
     void finish();
+    // Instead of finish(), before the last block (a step-cache reuse, moss_dit.h StepCacheHook): stops the readers,
+    // waits for their queued copies and kernels, and rethrows a reader's error recorded before the readers are joined.
+    // The pass's transfers are not added to the streaming stats.
+    void stop_early();
 
    private:
     void abort() noexcept;

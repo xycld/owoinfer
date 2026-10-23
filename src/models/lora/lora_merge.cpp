@@ -255,6 +255,10 @@ bool PristineWeights::has(std::string_view module) const {
   return std::any_of(entries_.begin(), entries_.end(), [&](const auto& e) { return e.first == module; });
 }
 
+void PristineWeights::drop(std::string_view module) {
+  std::erase_if(entries_, [&](const auto& e) { return e.first == module; });
+}
+
 std::size_t PristineWeights::host_bytes() const {
   std::size_t b = 0;
   for (const auto& [m, e] : entries_) b += e.w.size() * 2 + e.bias.size() * 2 + e.q.size() + e.scale.size() * 4;

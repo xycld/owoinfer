@@ -636,6 +636,20 @@ void BlockWeights::Pass::release(int block) {
   w_.sync_->set_released(j + 1);
 }
 
+void BlockWeights::Pass::stop_early() {
+  if (finished_) return;
+  std::exception_ptr e;
+  if (w_.residency_.streamed() && w_.sync_) {
+    w_.sync_->stop();
+    for (std::thread& t : threads_) t.join();
+    threads_.clear();
+    std::lock_guard<std::mutex> lock(w_.sync_->mu);
+    e = w_.sync_->error;
+  }
+  abort();
+  if (e) std::rethrow_exception(e);
+}
+
 void BlockWeights::Pass::finish() {
   if (!w_.residency_.streamed()) {
     finished_ = true;

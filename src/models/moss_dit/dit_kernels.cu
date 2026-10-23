@@ -15,9 +15,10 @@ namespace {
 constexpr int kTile = 32;
 constexpr int kRowsPerThread = 4;  // block = kTile x (kTile / kRowsPerThread) threads
 
-// out[c][r] = convert(in[r][c]) for an in matrix of rows x cols (row-major), through a padded shared tile.
+// out[c * ld + r] = convert(in[r][c]) for an in matrix of rows x cols (row-major; ld = rows: the plain transpose), through
+// a padded shared tile.
 template <typename In, typename Out>
-__global__ void transpose_kernel(const In* in, Out* out, std::int64_t rows, std::int64_t cols) {
+__global__ void transpose_kernel(const In* in, Out* out, std::int64_t rows, std::int64_t cols, std::int64_t ld) {
   __shared__ float tile[kTile][kTile + 1];
   const std::int64_t r0 = static_cast<std::int64_t>(blockIdx.y) * kTile;
   const std::int64_t c0 = static_cast<std::int64_t>(blockIdx.x) * kTile;
@@ -37,9 +38,9 @@ __global__ void transpose_kernel(const In* in, Out* out, std::int64_t rows, std:
     const std::int64_t c = c0 + i, r = r0 + tx;
     if (r < rows && c < cols) {
       if constexpr (std::is_same_v<Out, float>) {
-        out[c * rows + r] = tile[tx][i];
+        out[c * ld + r] = tile[tx][i];
       } else {
-        out[c * rows + r] = __float2bfloat16_rn(tile[tx][i]);
+        out[c * ld + r] = __float2bfloat16_rn(tile[tx][i]);
       }
     }
   }
@@ -121,10 +122,10 @@ void check(bool ok, const char* op, const std::string& msg) {
 }
 
 template <typename In, typename Out>
-void launch(const In* in, Out* out, std::int64_t rows, std::int64_t cols, cudaStream_t stream) {
+void launch(const In* in, Out* out, std::int64_t rows, std::int64_t cols, cudaStream_t stream, std::int64_t ld = -1) {
   if (rows == 0 || cols == 0) return;
   const dim3 grid(static_cast<unsigned>((cols + kTile - 1) / kTile), static_cast<unsigned>((rows + kTile - 1) / kTile));
-  transpose_kernel<In, Out><<<grid, dim3(kTile, kTile / kRowsPerThread), 0, stream>>>(in, out, rows, cols);
+  transpose_kernel<In, Out><<<grid, dim3(kTile, kTile / kRowsPerThread), 0, stream>>>(in, out, rows, cols, ld < 0 ? rows : ld);
   MI_CUDA_CHECK_LAUNCH();
 }
 
@@ -139,6 +140,17 @@ void latent_to_tokens(const Tensor& latents, const Tensor& tokens, cudaStream_t 
             tokens.dim(0) == hw && tokens.dim(1) == c,
         op, "tokens must be a contiguous CUDA bf16 [h*w, C], got " + tokens.describe());
   launch(latents.ptr<const float>(), tokens.ptr<__nv_bfloat16>(), c, hw, stream);
+}
+
+void latent_to_tokens(const Tensor& latents, const Tensor& tokens, std::int64_t col0, cudaStream_t stream) {
+  constexpr const char* op = "latent_to_tokens";
+  check(latents.device == Device::kCUDA && latents.dtype == DType::kF32 && latents.rank == 3 && latents.is_contiguous(),
+        op, "latents must be a contiguous CUDA f32 [C, h, w], got " + latents.describe());
+  const std::int64_t c = latents.dim(0), hw = latents.dim(1) * latents.dim(2);
+  check(tokens.device == Device::kCUDA && tokens.dtype == DType::kBF16 && tokens.rank == 2 && tokens.is_contiguous() &&
+            tokens.dim(0) == hw && col0 >= 0 && col0 + c <= tokens.dim(1),
+        op, "tokens must be a contiguous CUDA bf16 [h*w, >= col0 + C], got " + tokens.describe());
+  launch(latents.ptr<const float>(), tokens.ptr<__nv_bfloat16>() + col0, c, hw, stream, tokens.dim(1));
 }
 
 void tokens_to_latent(const Tensor& tokens, const Tensor& latents, cudaStream_t stream) {

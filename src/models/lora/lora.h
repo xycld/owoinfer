@@ -118,6 +118,9 @@ struct Adapter {
 struct LoraSpec {
   std::filesystem::path path;
   float strength = 1.0f;
+  // Tensors of the file that another component reads (a control adapter's replacement input embedder,
+  // models/control): neither applied nor reported unknown, but noted in FileReport::notes.
+  std::vector<std::string> consumed = {};
 };
 
 struct FileReport {
@@ -217,6 +220,7 @@ class PristineWeights {
   void keep_int8(const std::string& module, const std::int8_t* q, const float* scale, std::int64_t n, std::int64_t k,
                  int group);
   bool has(std::string_view module) const;
+  void drop(std::string_view module);  // forgets `module`'s copy (no-op when not kept)
   std::size_t host_bytes() const;
   // dst = merge(pristine) for `stack`'s current strengths; returns the adapters merged. Throws LoraError for a module
   // not kept (or kept in the other format) or a size mismatch; on a merge error dst must be discarded (see above).

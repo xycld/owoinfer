@@ -26,6 +26,7 @@
 #include "mossinfer/mossinfer.h"
 #include "models/flux2_vae/flux2_vae.h"
 #include "models/flux2_vae/vae_file.h"
+#include "models/control/control.h"
 #include "models/flux2_vae_encoder/flux2_vae_encoder.h"
 #include "models/latent_preview/latent_preview.h"
 #include "models/moss_dit/dit_kernels.h"
@@ -444,6 +445,24 @@ void validate(const Request& r) {
   if (r.sampler == SamplerKind::kDataSpace && r.dataspace_path.empty()) {
     throw std::invalid_argument("The dataspace sampler needs its parameter file (dataspace_path).");
   }
+  // Control adapter (the kinds are checked against the file in generate()).
+  if (!r.control.enabled() && !r.control.images.empty()) throw std::invalid_argument("Control images need a control adapter.");
+  if (r.control.enabled() && !std::isfinite(r.control.lora_strength)) throw std::invalid_argument("The control adapter's LoRA strength must be finite.");
+  for (std::size_t i = 0; i < r.control.images.size(); ++i) {
+    const Request::ControlImage& c = r.control.images[i];
+    if (c.kind.empty()) throw std::invalid_argument("A control image needs its kind (e.g. color, depth).");
+    for (std::size_t j = 0; j < i; ++j) {
+      if (r.control.images[j].kind == c.kind) throw std::invalid_argument("Two control images of kind \"" + c.kind + "\".");
+    }
+    const std::string what = "The " + c.kind + " control image";
+    if (c.image == nullptr) throw std::invalid_argument(what + " is missing.");
+    check_image(*c.image, c.image->channels == 1 ? 1 : 3, what.c_str());
+    if (!std::isfinite(c.strength) || c.strength < 0 || c.strength > 10) {
+      throw std::invalid_argument(what + ": the strength must be between 0 and 10.");
+    }
+    if (!(0 <= c.start && c.start <= c.end && c.end <= 1)) throw std::invalid_argument(what + ": require 0 <= start <= end <= 1.");
+  }
+  accel::validate(r.accel);
 }
 
 std::size_t vram_option_bytes(double amount, double unit_bytes, std::string_view what) {
@@ -534,6 +553,13 @@ Request request_from_parameters(const json::Value& doc) {
   }
   number("hires_strength", r.hires.strength);
   integer("hires_steps", r.hires.steps);
+  // P6b accelerators (engine keys).
+  number("cfg_truncation", r.accel.cfg_truncation);
+  if (const json::Value* v = p.find("step_cache"); v != nullptr && !v->is_null()) {
+    if (!v->is_string()) throw std::invalid_argument("step_cache must be a string.");
+    r.accel.step_cache = accel::parse_step_cache(v->as_string());
+  }
+  number("step_cache_threshold", r.accel.step_cache_threshold);
   return r;
 }
 
@@ -588,6 +614,21 @@ GenerationMetadata generation_metadata(const Request& q, const Result& r) {
     m.extra.emplace_back("hires_upscaler", "lanczos");
     if (!image_used) m.extra.emplace_back("resize", resize_mode_name(q.resize));
   }
+  if (q.control.enabled()) {
+    m.extra.emplace_back("control", name(util::path_utf8(q.control.adapter)));
+    m.extra.emplace_back("control_lora_strength", num(q.control.lora_strength));
+    for (const Request::ControlImage& c : q.control.images) {
+      m.extra.emplace_back("control_" + c.kind, image_label(*c.image) + " strength " + num(c.strength) + " steps " +
+                                                    num(c.start) + "-" + num(c.end));
+    }
+    if (!q.control.images.empty() && !image_used && !q.hires.enabled()) m.extra.emplace_back("resize", resize_mode_name(q.resize));
+  }
+  // P6b accelerators that changed the image.
+  if (q.accel.cfg_truncation < 1.0 && q.cfg != 1.0) m.extra.emplace_back("cfg_truncation", num(q.accel.cfg_truncation));
+  if (q.accel.step_cache_on()) {
+    m.extra.emplace_back("step_cache", accel::step_cache_name(q.accel.step_cache));
+    m.extra.emplace_back("step_cache_threshold", num(q.accel.step_cache_threshold));
+  }
   return m;
 }
 
@@ -613,6 +654,12 @@ struct Pipeline::Impl {
   std::unique_ptr<lora::SideBranches> lora_sb;
   std::string lora_files_key;
   std::string dit_merge_key;
+  // Control adapter: its file (header facts) and replacement embedder on the device (outside the arena, kept while the
+  // file stays the same), and the DiT input extension a pass points at its control latents.
+  std::unique_ptr<control::ControlFile> control_file;
+  std::unique_ptr<control::DeviceEmbedder> control_emb;
+  std::string control_key;
+  moss_dit::InputExtension control_ext;
   std::unique_ptr<flux2_vae::Flux2VaeDecoder> vae;
   const VaeSource* vae_src = nullptr;
   std::map<std::string, std::unique_ptr<VaeSource>> vae_sources;
@@ -813,6 +860,14 @@ struct Pipeline::Impl {
   }
   static std::size_t te_host(const TeSource& t, const qwen35_text::EncoderOptions& o) {
     return t.model ? qwen35_text::TextEncoder::host_bytes(*t.model, o) : qwen35_text::TextEncoder::host_bytes(*t.index, o);
+  }
+
+  // A failed in-place re-merge (remerge_lora / rebase_merges) leaves the loaded DiT's merged weights unknown: drop it
+  // (reported as a reload when the next request loads it) and forget its merge key, so nothing runs on those weights.
+  void drop_dit_after_failed_merge() {
+    if (dit) dit->set_lora(nullptr);
+    if (arena) reset_arena(arena->capacity());
+    dit_merge_key.clear();
   }
 
   // Drops every resident model and recreates the arena with `capacity` bytes (all stack phases must have ended).
@@ -1116,6 +1171,8 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       if (m.dit) {
         m.dit->set_cancel(nullptr);
         m.dit->set_request_route(std::nullopt);
+        m.dit->set_input_extension(nullptr);  // a pass's control latents live on its stack
+        m.dit->set_step_cache(nullptr);       // a pass's step cache too (run_pass also clears it)
       }
       if (m.vae) m.vae->set_cancel(nullptr);
     }
@@ -1132,7 +1189,62 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   r.dit_linears = src.linears;
   if (m.time_embedding) r.time_embedding = util::path_utf8(m.options.time_embedding_file);
   r.gpu_arch = current_gpu_arch();
-  const bool lora_requested = !req.loras.empty();
+  // Runtime LoRA files: the request's, then a control adapter's LoRA part (its embedder tensors are read separately).
+  std::vector<lora::LoraSpec> loras = req.loras;
+  const control::ControlFile* ctl = nullptr;
+  if (req.control.enabled()) {
+    // The request's kinds against the file's, before anything is read, uploaded or released.
+    const auto check_kinds = [&](const control::ControlFile& f) {
+      for (const Request::ControlImage& c : req.control.images) {
+        if (f.kind_index(c.kind) < 0) {
+          std::string kinds;
+          for (const std::string& k : f.kinds) kinds += (kinds.empty() ? "" : ", ") + k;
+          throw std::invalid_argument("The control adapter has no \"" + c.kind + "\" input (its inputs: " + kinds + ").");
+        }
+      }
+    };
+    const std::string key = util::path_utf8(std::filesystem::weakly_canonical(req.control.adapter));
+    if (!m.control_file || m.control_key != key) {
+      if (!std::filesystem::is_regular_file(req.control.adapter)) {
+        throw std::invalid_argument("control adapter not found: " + util::path_utf8(req.control.adapter));
+      }
+      const auto t0c = Clock::now();
+      auto f = std::make_unique<control::ControlFile>(control::open_control_file(req.control.adapter));
+      check_kinds(*f);
+      const control::EmbedderWeights ew = control::read_embedder(*f);
+      // Outside the arena, as the LoRA side branches: make room when a held arena leaves too little free memory.
+      const std::size_t bytes = control::DeviceEmbedder::device_bytes(ew.out_features, ew.in_features);
+      if (m.dit) m.dit->set_input_extension(nullptr);
+      m.control_emb.reset();
+      if (m.arena && runtime::DeviceArena::free_device_bytes() < bytes + m.options.vram_reserve) m.release_arena();
+      std::unique_ptr<control::DeviceEmbedder> e;
+      try {
+        e = std::make_unique<control::DeviceEmbedder>(ew);
+      } catch (const CudaError&) {
+        if (!m.arena) throw;
+        m.release_arena();
+        e = std::make_unique<control::DeviceEmbedder>(ew);
+      }
+      m.control_file = std::move(f);
+      m.control_emb = std::move(e);
+      m.control_key = key;
+      tm.index_load_s += since(t0c);
+    }
+    ctl = m.control_file.get();
+    check_kinds(*ctl);
+    m.control_ext.weight = m.control_emb->weight();
+    m.control_ext.bias = m.control_emb->bias();
+    loras.push_back({req.control.adapter, req.control.lora_strength, ctl->consumed()});
+    r.control.adapter = util::path_utf8(req.control.adapter);
+    r.control.kinds = ctl->kinds;
+    r.control.base_model = ctl->base_model;
+  } else {
+    if (m.dit) m.dit->set_input_extension(nullptr);
+    m.control_emb.reset();
+    m.control_file.reset();
+    m.control_key.clear();
+  }
+  const bool lora_requested = !loras.empty();
   {
     // Quality tier from what is loaded, before anything heavy (its refusals throw std::invalid_argument here, ahead of
     // the LoRA files too). Certificates (pipeline/quality_cert.h) are searched for the lossy configurations of this DiT,
@@ -1148,6 +1260,8 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     scope.accelerators = req.scheduler != SchedulerKind::kMoss || req.flow_multiplier != 1.0 || req.eta != 1.0 ||
                          req.s_noise != 1.0 || req.noise_source != NoiseSource::kPhilox ||
                          req.noise_layout != NoiseLayout::kOfficial || req.init_image != nullptr || req.hires.enabled();
+    // The P6b accelerators are an explicit speed opt-in: the tier is resolved as if they were off (they never make auto
+    // pick a slower tier or refuse), and the run is marked uncertified below.
     const auto lookup = [&](planner::Precision precision, planner::AttentionMode mode) {
       const CertConfig cfg = cert_config(precision, mode, tes.precision, lora_requested);
       if (lora_requested) return planner::CertificateAnswer{false, "", uncertifiable_reason(cfg)};
@@ -1170,6 +1284,13 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       r.tier.certified = false;
       r.tier.certificate.clear();
       r.tier.reason += "; runtime LoRAs active: uncertified (certificates cover the base model only)";
+    }
+    if (req.accel.active(req.cfg != 1.0)) {
+      // P6b: certificates are measured with accelerators off (the Reference tier's exactness does not hold either). The
+      // tier above was chosen without them; this is the run's one accelerator reason.
+      r.tier.certified = false;
+      r.tier.certificate.clear();
+      r.tier.reason += "; lossy accelerators active (" + req.accel.describe(req.cfg != 1.0) + "): this run is uncertified";
     }
     // The report's quality object (quality_report_json): what ran, why, and the models it ran.
     QualityReport& q = r.quality;
@@ -1197,12 +1318,22 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     m.lora_files_key.clear();
   } else {
     std::string files = util::path_utf8(src.path) + (m.options.lora_strict ? "|strict" : "");
-    for (const lora::LoraSpec& l : req.loras) files += "|" + util::path_utf8(std::filesystem::weakly_canonical(l.path));
+    // The control adapter's entry is tagged: the same file as a plain LoRA is another stack (and is refused below).
+    for (std::size_t i = 0; i < loras.size(); ++i) {
+      files += (ctl != nullptr && i + 1 == loras.size() ? "|control:" : "|") +
+               util::path_utf8(std::filesystem::weakly_canonical(loras[i].path));
+    }
     if (!m.lora_stack || files != m.lora_files_key) {
+      for (const lora::LoraSpec& l : req.loras) {
+        if (control::is_control_file(l.path)) {
+          throw std::invalid_argument(util::path_utf8(l.path) + " is a control adapter (a widened DiT input embedder): pass it as "
+                                      "the request's control adapter (Request::control), not as a LoRA.");
+        }
+      }
       lora::LoadOptions lo;
       lo.strict = m.options.lora_strict;
       lo.int8_block_gemms = src.precision != planner::Precision::kBf16;
-      auto stack = std::make_unique<lora::LoraStack>(req.loras, lora::moss_dit_targets(), lo);
+      auto stack = std::make_unique<lora::LoraStack>(loras, lora::moss_dit_targets(), lo);
       moss_dit::check_lora_merges(*stack, src.quant.get());  // before anything is released or loaded
       // The side branches live outside the arena: make room first when a held arena leaves too little free memory
       // (the arena is recreated at the plan's size below), and retry once if the allocation still fails.
@@ -1224,7 +1355,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     } else {
       bool changed = false;
       for (int i = 0; i < m.lora_stack->files(); ++i) {
-        const float strength = req.loras[static_cast<std::size_t>(i)].strength;
+        const float strength = loras[static_cast<std::size_t>(i)].strength;
         if (m.lora_stack->strength(i) != strength) {
           m.lora_stack->set_strength(i, strength);
           changed = true;
@@ -1233,14 +1364,32 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       if (changed) {
         m.lora_sb->update_strengths(*m.lora_stack);  // between forwards: nothing reads them now
         // Merged adapters: re-merged from the pristine weights kept at load, in place (no reload).
-        if (m.dit && m.dit_merge_key == files && !m.lora_stack->merge_modules().empty()) m.dit->remerge_lora(*m.lora_stack);
+        if (m.dit && m.dit_merge_key == files && !m.lora_stack->merge_modules().empty()) {
+          try {
+            m.dit->remerge_lora(*m.lora_stack);
+          } catch (...) {
+            m.drop_dit_after_failed_merge();
+            throw;
+          }
+        }
       }
     }
     if (!m.lora_stack->merge_modules().empty()) merge_key = files;
     r.loras = m.lora_stack->reports();
+    if (ctl != nullptr) {
+      // The control adapter's LoRA part is the stack's last file: reported with the control (its notes and warnings
+      // too), not in `loras`.
+      r.control.lora = r.loras.back();
+      r.loras.pop_back();
+    }
     for (const lora::FileReport& f : r.loras) {
       for (const std::string& w : f.warnings) r.lora_warnings.push_back(f.file + ": " + w);
       for (const std::string& n : f.notes) r.lora_notes.push_back(f.file + ": " + n);
+    }
+    if (ctl != nullptr) {
+      for (const std::string& mod : m.lora_stack->merge_modules()) {
+        if (mod == "video_embedder") r.lora_warnings.push_back("video_embedder: LoRA delta replaced by the control adapter's embedder");
+      }
     }
     if (m.time_embedding) {
       for (const std::string& w : moss_dit::shadowed_by_time_embedding(*m.lora_stack)) r.lora_warnings.push_back(w);
@@ -1259,6 +1408,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   g.slg_scale = req.slg_scale;
   g.slg_start = req.slg_start;
   g.slg_stop = req.slg_stop;
+  g.cfg_truncation = req.accel.cfg_truncation;
   // Schedule (pipeline/samplers): the official one for kMoss, the scheduler's otherwise; the dataspace sampler's from its
   // step codes.
   const FlowSampling flow{req.shift, req.flow_multiplier};
@@ -1315,7 +1465,20 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     r.hires.strength = req.hires.strength;
   }
   const bool need_dit = sched1.num_steps() > 0 || (hires && sched2.num_steps() > 0);
-  const bool need_encoder = img2img || hires;
+  // A loaded DiT whose merged adapters differ from this request's (e.g. a control adapter, with its merged text-refiner
+  // adapters, toggled on or off): switched in place from the pristine copies when no block module is newly merged,
+  // the same bits as a reload without its cost. A failure drops the DiT (the next load starts clean).
+  if (need_dit && m.dit && m.dit_src == &src && m.dit_merge_key != merge_key) {
+    try {
+      if (m.dit->rebase_merges(merge_key.empty() ? nullptr : m.lora_stack.get())) m.dit_merge_key = merge_key;
+    } catch (...) {
+      m.drop_dit_after_failed_merge();
+      throw;
+    }
+  }
+  // Control images are encoded once per pass size (not without a sampling step).
+  const bool ctl_encode = ctl != nullptr && !req.control.images.empty() && need_dit;
+  const bool need_encoder = img2img || hires || ctl_encode;
   const EncoderSource* enc_src = need_encoder ? &m.encoder_source(b, tm.index_load_s) : nullptr;
   if (enc_src != nullptr) r.vae_encoder_source = util::path_utf8(enc_src->file);
   r.height = H1;
@@ -1389,12 +1552,20 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   const auto denoise_need_of = [&](int H, int W, bool from_image) {
     const std::int64_t lh = H / 16, lw = W / 16;
     const std::size_t lat = latent_bytes_of(H, W);
-    const std::size_t loop_buffers = denoise_loop_bytes(lh, lw, sc, su, g, req.sampler);
+    // P6b step cache: its residual buffers sit below the forwards on the stack, for every distinct row of the loop.
+    const std::size_t loop_buffers =
+        denoise_loop_bytes(lh, lw, sc, su, g, req.sampler) +
+        (req.accel.step_cache_on()
+             ? accel::FirstBlockCache::workspace_bytes(lh, lw, static_cast<int>(row_lengths.size()))
+             : 0);
     const std::size_t forward_bytes = moss_dit::MossDit::workspace_bytes(lh, lw, row_lengths, block_path, dit_config, &route);
+    // A control adapter's input latents [G * 128, h, w] (moss_dit::InputExtension::extra), next to the latents.
+    const std::size_t control_bytes = ctl != nullptr ? static_cast<std::size_t>(ctl->groups()) * lat : 0;
     // A latent preview: the previous latents, the x0 estimate, the preview's scratch and its RGB image.
     const std::size_t preview_bytes =
         control.on_preview ? 2 * lat + align_up(latent_preview::workspace_bytes(lh, lw)) + align_up(image_bytes_of(H, W)) : 0;
-    return refined_bytes + std::max(refine_need, lat + preview_bytes + std::max(loop_buffers + forward_bytes, from_image ? lat : 0));
+    return refined_bytes +
+           std::max(refine_need, lat + control_bytes + preview_bytes + std::max(loop_buffers + forward_bytes, from_image ? lat : 0));
   };
   std::size_t denoise_need = 0;
   if (sched1.num_steps() > 0) denoise_need = denoise_need_of(H1, W1, img2img);
@@ -1405,7 +1576,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   const auto encode_need_of = [&](int H, int W) {
     return latent_bytes_of(H, W) + flux2_vae_encoder::Flux2VaeEncoder::plan_min_memory(H, W).workspace_bytes;
   };
-  if (img2img) encode_need = encode_need_of(H1, W1);
+  if (img2img || (ctl_encode && sched1.num_steps() > 0)) encode_need = encode_need_of(H1, W1);
   if (hires) encode_need = std::max(encode_need, encode_need_of(H2, W2));
   // The decodes that run: the hires fix's first pass (for the upscale) and the final one; the plan sizes the larger.
   int dec_h = 0, dec_w = 0;
@@ -1521,6 +1692,12 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
   in.budgets.vram_budget = m.options.vram_budget;
   // The LoRA side branches hold device memory outside the arena, as the context does: it counts against the budget.
   if (m.lora_sb) in.budgets.context_bytes += m.lora_sb->device_bytes();
+  if (m.control_emb) in.budgets.context_bytes += m.control_emb->device_bytes();
+  if (ctl_encode) {
+    // Control images: per kind its sized RGB copy and encoded latent (at the larger pass size).
+    in.workspaces.host_buffers += req.control.images.size() * (std::max(latent_bytes_of(H1, W1), latent_bytes_of(H2, W2)) +
+                                                                std::max(image_bytes_of(H1, W1), image_bytes_of(H2, W2)));
+  }
   in.budgets.host_available = planner::host_available_bytes();
   const std::size_t held_host = m.held_host_bytes(!missing.empty());
   in.budgets.host_private_now = r.memory.host_private_start > held_host ? r.memory.host_private_start - held_host : 0;
@@ -1583,6 +1760,15 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
               "needed: the DiT is loaded once)";
     }
     r.plan.explanation += "\nImage: " + what + "; VAE encoder from " + r.vae_encoder_source + ".";
+  }
+  if (ctl != nullptr) {
+    std::string inputs;
+    for (const Request::ControlImage& c : req.control.images) {
+      inputs += (inputs.empty() ? "" : ", ") + c.kind + " (strength " + json_number(c.strength) + ", steps " +
+                json_number(c.start) + "-" + json_number(c.end) + ")";
+    }
+    r.plan.explanation += "\nControl adapter " + r.control.adapter + " (LoRA strength " + json_number(req.control.lora_strength) +
+                          "): " + (inputs.empty() ? std::string("no images (zero control latents)") : inputs) + ".";
   }
   const planner::ExecutionPlan& plan = r.plan;
   if (m.cache) m.cache->set_max_bytes(plan.cache.host_bytes);
@@ -1685,6 +1871,40 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       return finish();
     }
   }
+  // Control images at a pass size: per kind of the adapter its encoded latent times its strength (empty: no image).
+  std::vector<std::vector<float>> ctl_lat;
+  const auto encode_controls = [&](int H, int W) {
+    ctl_lat.assign(static_cast<std::size_t>(ctl->groups()), {});
+    for (const Request::ControlImage& c : req.control.images) {
+      Image im = sized(*c.image, H, W);
+      if (im.channels == 1) {
+        // A grayscale map replicated to RGB (PIL convert("RGB")), after the resize: PIL's Lanczos filters each channel
+        // alone, so this gives the bytes of resizing the replicated image.
+        const auto ti = Clock::now();
+        std::vector<std::uint8_t> rgb(im.pixels.size() * 3);
+        for (std::size_t i = 0; i < im.pixels.size(); ++i) rgb[3 * i] = rgb[3 * i + 1] = rgb[3 * i + 2] = im.pixels[i];
+        im.pixels = std::move(rgb);
+        im.channels = 3;
+        tm.image_ops_s += since(ti);
+      }
+      PassReport enc;
+      std::vector<float> z = encode_image(im, enc);
+      if (c.strength != 1.0) {
+        const float s = static_cast<float>(c.strength);
+        for (float& v : z) v *= s;
+      }
+      ctl_lat[static_cast<std::size_t>(ctl->kind_index(c.kind))] = std::move(z);
+      ++r.control.encodes;
+      r.control.encode_schedule += (r.control.encode_schedule.empty() ? "" : "; ") + enc.encode_schedule;
+    }
+  };
+  if (ctl_encode && sched1.num_steps() > 0) {
+    encode_controls(H1, W1);
+    if (cancel_requested()) {
+      r.cancelled = true;
+      return finish();
+    }
+  }
   const moss_dit::Residency residency = m.dit_residency(plan.dit);
   // Loads the DiT when it is not resident (first use, or parked / dropped since) and sets this request's options.
   const auto prepare_dit = [&]() {
@@ -1773,6 +1993,24 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       MI_CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     if (control.on_preview) MI_CUDA_CHECK(cudaMemcpyAsync(prev.data, latents.data, latents.nbytes(), cudaMemcpyDeviceToDevice, stream));
+    // Control adapter: its input latents for this pass (zeros for kinds without an image or outside their window),
+    // rewritten between steps when a window opens or closes. The DiT points at them until the pass ends (CancelScope
+    // clears the pointer on every exit).
+    Tensor ctl_extra;
+    std::optional<control::PassInputs> ctl_in;
+    if (ctl != nullptr) {
+      ctl_extra = m.arena->alloc_tensor(DType::kF32, {ctl->groups() * control::kGroupChannels, h, w});
+      ctl_in.emplace(ctl->groups(), h, w);
+      for (const Request::ControlImage& c : req.control.images) {
+        const int gi = ctl->kind_index(c.kind);
+        ctl_in->set(gi, std::move(ctl_lat[static_cast<std::size_t>(gi)]), c.start, c.end);  // re-encoded for a later pass
+      }
+      ctl_in->apply(ctl_extra, 0, sched.num_steps(), stream);
+      m.control_ext.extra = ctl_extra;
+      m.dit->set_input_extension(&m.control_ext);
+    } else {
+      m.dit->set_input_extension(nullptr);
+    }
     MI_CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Streaming diagnostics per step: the provider's running totals (read after the step's synchronization), added to
@@ -1789,8 +2027,27 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     moss_dit::StreamStats seen;
     std::vector<float> blend_host(lmask != nullptr ? noise.size() : 0);
     int finished = 0;
+    // P6b step cache (FBCache) for this pass: its buffers are taken right before sampling (planned in denoise_need_of);
+    // the hook is removed from the DiT however the pass ends.
+    std::optional<accel::FirstBlockCache> step_cache;
+    int cached_seen = 0;
+    struct StepCacheReset {
+      moss_dit::MossDit* dit = nullptr;
+      ~StepCacheReset() {
+        if (dit != nullptr) dit->set_step_cache(nullptr);
+      }
+    } step_cache_reset;
     const StepCallback on_step = [&](const StepInfo& info) {
       finished = info.step;
+      if (ctl_in && info.step < sched.num_steps() && ctl_in->apply(ctl_extra, info.step, sched.num_steps(), stream) > 0 &&
+          step_cache) {
+        step_cache->invalidate();  // a control window opened or closed: the DiT's input changed, the next call runs in full
+      }
+      const bool step_cached = step_cache && step_cache->reused() > cached_seen;
+      if (step_cached) {
+        r.accel.cached_steps.push_back(steps_done + info.step);
+        cached_seen = step_cache->reused();
+      }
       if (lmask != nullptr) {
         // Inpainting: the kept region back on the init image's trajectory at the next step's sigma (0 after the last).
         const auto tb = Clock::now();
@@ -1809,6 +2066,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
         st.stall_s = total.stall_s - seen.stall_s;
         st.hidden = copy_s > 0 ? std::max(0.0, 1.0 - st.stall_s / copy_s) : 0.0;
         st.stalls = total.stalls - seen.stalls;
+        st.cached = step_cached;
         ds.steps.push_back(st);
         seen = total;
         ds.bytes = before.bytes + total.bytes;
@@ -1837,6 +2095,11 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       if (cancel_requested()) r.cancelled = true;
       return !r.cancelled;
     };
+    if (req.accel.step_cache_on()) {
+      step_cache.emplace(*m.arena, h, w, static_cast<int>(row_lengths.size()), req.accel.step_cache_threshold);
+      m.dit->set_step_cache(&*step_cache);
+      step_cache_reset.dit = m.dit.get();
+    }
     const auto ts = Clock::now();
     int run = 0;
     try {
@@ -1848,6 +2111,12 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       run = finished;
     }
     tm.denoise_s += since(ts);
+    if (ctl_in) m.dit->set_input_extension(nullptr);
+    if (step_cache) {
+      r.accel.dit_calls += step_cache->calls();
+      r.accel.cached_calls += step_cache->reused();
+    }
+    for (int i = 0; i < run; ++i) r.accel.cfg_truncated_steps += g.do_cfg() && !g.cfg_active(i, sched.num_steps());
     pass.steps_run = run;
     steps_done += run;
     r.steps_run = steps_done;
@@ -1899,7 +2168,8 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     return finish();
   }
   // Compute and streaming rates from a single pass at one size (a hires fix's passes mix sizes).
-  if (!hires && sched1.num_steps() > 0) m.learn_from_denoise(r);
+  // Not from accelerated steps (P6b: cached / truncated steps are no measure of the DiT's rate).
+  if (!hires && sched1.num_steps() > 0 && !req.accel.active(g.do_cfg())) m.learn_from_denoise(r);
 
   // 5. Hires fix: decode the first pass, upscale it in pixel space, encode it at the target size, and refine it there.
   if (hires) {
@@ -1922,6 +2192,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
       blend_2 = encode_image(sized(*req.init_image, H2, W2), r.hires);
       mask_2 = sized_mask(H2, W2);
     }
+    if (ctl_encode && sched2.num_steps() > 0) encode_controls(H2, W2);
     if (cancel_requested()) {
       r.cancelled = true;
       return finish();

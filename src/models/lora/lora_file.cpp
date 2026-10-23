@@ -255,7 +255,12 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
     // Group tensors by (resolved) module name.
     std::map<std::string, ModuleParts> mods;   // canonical module or alias name -> parts
     std::map<std::string, std::string> source_of;  // canonical -> name as written
+    int consumed = 0;
     for (const weights::TensorInfo& t : f.st.tensors()) {
+      if (std::find(spec.consumed.begin(), spec.consumed.end(), t.name) != spec.consumed.end()) {
+        ++consumed;
+        continue;
+      }
       const SuffixRule* rule = nullptr;
       for (const SuffixRule& r : kSuffixes) {
         if (t.name.size() > r.suffix.size() && std::string_view(t.name).ends_with(r.suffix) &&
@@ -472,6 +477,7 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
     if (options.strict && !rep.warnings.empty()) {
       fail(util::path_utf8(spec.path) + ": " + std::to_string(rep.warnings.size()) + " warnings, first: " + rep.warnings.front());
     }
+    if (consumed > 0) rep.notes.push_back(std::to_string(consumed) + " tensors read outside the LoRA stack (LoraSpec::consumed)");
     if (meta_alpha_used > 0) {
       char buf[64];
       std::snprintf(buf, sizeof buf, "%.9g", *meta_alpha);

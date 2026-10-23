@@ -51,6 +51,9 @@ constexpr const char* kUsage =
     "                           [--lora-strict] [--distill <dir>] [--time-embedding <file>] [--quiet]\n"
     "                           [--init-image <png|jpg> [--strength X] [--mask <png|jpg>] [--resize crop|fit|stretch]]\n"
     "                           [--hires <W>x<H>|<scale> [--hires-strength X] [--hires-steps N]]\n"
+    "                           [--cfg-truncation X] [--step-cache off|fbcache] [--step-cache-threshold X]\n"
+    "                           [--control <file> [--control-scale S] [--control-image <kind>=<png|jpg>\n"
+    "                            [--control-strength X] [--control-start X] [--control-end X]]...]\n"
     "Flags override values read from --params. At least one of -o / --latent-out is required;\n"
     "without -o the VAE decode is skipped. --vram-budget caps the process's GPU memory (CUDA context included).\n"
     "Each --then-prompt generates one more image in the same engine session (same settings, warm models and\n"
@@ -80,7 +83,19 @@ constexpr const char* kUsage =
     "--distill <dir> applies a distill bundle (lodestones' data-space DMD repos): its time_embedding.safetensors (as\n"
     "--time-embedding), lora.safetensors (as --lora, strength 1; a following --lora-scale sets it) and\n"
     "dataspace.safetensors (--sampler dataspace --dataspace <file>), with --cfg 1 and --steps = the file's step codes\n"
-    "unless given. --time-embedding replaces the DiT's step embedder and modulation biases, computed in fp32.\n";
+    "unless given. --time-embedding replaces the DiT's step embedder and modulation biases, computed in fp32.\n"
+    "Lossy accelerators (off by default; a run with any of them is uncertified): --cfg-truncation X (0..1, default 1 =\n"
+    "off) drops the negative branch for the steps from X * steps on, counting the steps each pass runs (img2img and the\n"
+    "hires pass: their strength-cropped steps); multistep samplers carry one guided step into the first unguided one.\n"
+    "--step-cache fbcache reuses the DiT's blocks 1..41 from the last full DiT call while block 0's output residual changed\n"
+    "by less than --step-cache-threshold (default 0.03, relative L1; 0.05-0.08 are faster but may change the\n"
+    "composition). --params may carry \"cfg_truncation\", \"step_cache\" and \"step_cache_threshold\".\n"
+    "--control loads a control adapter (a LoRA with a widened DiT input embedder, e.g. the MOSS-Image color/depth\n"
+    "control); --control-scale sets its LoRA strength (default 1). Each --control-image gives one input of the\n"
+    "adapter's kinds (e.g. color=map.png, depth=depth.png: near = white), brought to the output size with --resize and\n"
+    "VAE-encoded; the following --control-strength (default 1, 0..10) scales it and --control-start / --control-end\n"
+    "(default 0 / 1) limit it to the steps i with start <= i / steps < end (e.g. 0.5 for 3D-render inputs). A kind\n"
+    "without an image gets no control.\n";
 
 std::atomic<bool> g_cancel{false};
 // First Ctrl-C: cancel (within a text-encoder layer, DiT block or decode band). A second one terminates (default action restored).
@@ -232,6 +247,7 @@ int cmd_generate(const std::vector<std::string>& args) {
   std::vector<std::string> then_prompts;
   bool have_prompt = false, quiet = false, size_given = false;
   fs::path init_image, mask;
+  std::vector<fs::path> control_images;  // per --control-image, in order
   std::optional<double> strength;
   std::string hires;
   bool distill = false, distill_dataspace = false;
@@ -310,6 +326,21 @@ int cmd_generate(const std::vector<std::string>& args) {
         req.loras.back().strength = static_cast<float>(to_double(f, v));
       }
       else if (f == "--lora-strict") options.lora_strict = true;
+      else if (f == "--control") req.control.adapter = path_from_utf8(v);
+      else if (f == "--control-scale") req.control.lora_strength = static_cast<float>(to_double(f, v));
+      else if (f == "--control-image") {
+        const std::size_t eq = v.find('=');
+        if (eq == std::string::npos || eq == 0 || eq + 1 == v.size()) throw std::invalid_argument("--control-image: expected <kind>=<png|jpg>");
+        pipeline::Request::ControlImage c;
+        c.kind = v.substr(0, eq);
+        req.control.images.push_back(c);
+        control_images.push_back(path_from_utf8(v.substr(eq + 1)));
+      }
+      else if (f == "--control-strength" || f == "--control-start" || f == "--control-end") {
+        if (req.control.images.empty()) throw std::invalid_argument(f + " must follow a --control-image");
+        pipeline::Request::ControlImage& c = req.control.images.back();
+        (f == "--control-strength" ? c.strength : f == "--control-start" ? c.start : c.end) = to_double(f, v);
+      }
       else if (f == "--time-embedding") options.time_embedding_file = path_from_utf8(v);
       else if (f == "--distill") {
         moss_dit::DistillBundle b;
@@ -352,6 +383,9 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--hires") hires = v;
       else if (f == "--hires-strength") req.hires.strength = to_double(f, v);
       else if (f == "--hires-steps") req.hires.steps = to_int32(f, v);
+      else if (f == "--cfg-truncation") req.accel.cfg_truncation = to_double(f, v);
+      else if (f == "--step-cache") req.accel.step_cache = pipeline::accel::parse_step_cache(v);
+      else if (f == "--step-cache-threshold") req.accel.step_cache_threshold = to_double(f, v);
       else if (f == "--quiet") quiet = true;
       else throw std::invalid_argument("unknown flag " + f);
     }
@@ -362,13 +396,20 @@ int cmd_generate(const std::vector<std::string>& args) {
     std::cerr << "moss-infer generate: numeric flag out of range\n" << kUsage;
     return 2;
   }
+  const auto given = [&](const char* flag) {
+    return std::any_of(flags.begin(), flags.end(), [&](const auto& fv) { return fv.first == flag; });
+  };
   if (distill) {
     // The bundle's defaults where the command line does not set them: no CFG, the trained number of steps.
-    const auto given = [&](const char* flag) {
-      return std::any_of(flags.begin(), flags.end(), [&](const auto& fv) { return fv.first == flag; });
-    };
     if (!given("--cfg") && !in_params("cfg")) req.cfg = 1.0;
     if (!given("--steps") && !in_params("steps") && distill_steps > 0) req.steps = distill_steps;
+  }
+  // Accelerator settings that do nothing (from flags or --params, after the distill defaults).
+  if ((given("--step-cache-threshold") || in_params("step_cache_threshold")) && !req.accel.step_cache_on()) {
+    std::fprintf(stderr, "warning: the step-cache threshold has no effect without --step-cache fbcache\n");
+  }
+  if (req.accel.cfg_truncation < 1.0 && req.cfg == 1.0) {
+    std::fprintf(stderr, "warning: CFG truncation has no effect without CFG (cfg 1)\n");
   }
   if ((params.empty() && !have_prompt) || req.model.empty() || (out_png.empty() && out_latent.empty())) {
     std::cerr << kUsage;
@@ -409,6 +450,9 @@ int cmd_generate(const std::vector<std::string>& args) {
       req.mask = std::make_shared<const pipeline::Image>(pipeline::load_image(mask, 1));
     }
     if (!hires.empty()) parse_hires(hires, req);
+    for (std::size_t i = 0; i < control_images.size(); ++i) {
+      req.control.images[i].image = std::make_shared<const pipeline::Image>(pipeline::load_image(control_images[i], 3));
+    }
   } catch (const std::invalid_argument& e) {
     std::cerr << "moss-infer generate: " << e.what() << "\n" << kUsage;
     return 2;
@@ -460,6 +504,15 @@ int cmd_generate(const std::vector<std::string>& args) {
       pipeline::write_png_rgb8(png, r.rgb, r.width, r.height, text);
     }
     for (const std::string& w : r.lora_warnings) std::fprintf(stderr, "warning: LoRA %s\n", w.c_str());
+    if (!r.control.adapter.empty() && !quiet) {
+      std::fprintf(stderr, "control: %s (%d LoRA adapters: %d side branch, %d merged), %d image(s) encoded\n",
+                   r.control.lora.file.c_str(), r.control.lora.adapters, r.control.lora.side_branch, r.control.lora.merged,
+                   r.control.encodes);
+    }
+    if (q.accel.active(q.cfg != 1.0)) {
+      std::fprintf(stderr, "warning: lossy accelerators (%s), uncertified: CFG truncated on %d steps, step cache reused %d of %d DiT calls\n",
+                   q.accel.describe(q.cfg != 1.0).c_str(), r.accel.cfg_truncated_steps, r.accel.cached_calls, r.accel.dit_calls);
+    }
     if (!r.image_note.empty()) std::fprintf(stderr, "note: %s\n", r.image_note.c_str());
     for (const auto* t : {&r.cond_token_report, &r.uncond_token_report}) {
       if (t->truncated) {
