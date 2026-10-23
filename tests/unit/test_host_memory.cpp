@@ -19,6 +19,9 @@ using mi::planner::cgroup_memory;
 
 constexpr std::size_t kGiB = std::size_t{1} << 30;
 
+// cgroup_memory() reads cgroups on Linux only (planner/host_memory.h: never limited elsewhere); the Windows build has
+// no parser for these fixture trees to test.
+#ifndef _WIN32
 void put(const fs::path& file, const std::string& text) {
   fs::create_directories(file.parent_path());
   std::ofstream(file, std::ios::binary) << text;
@@ -141,6 +144,8 @@ TEST(HostMemoryCgroup, MountWhoseRootHoldsTheCgroupWins) {
   ASSERT_TRUE(j.limited);
   EXPECT_EQ(j.limit, 2 * kGiB) << "the job's own limit, below the 4 GiB at the mount point";
 }
+
+#endif  // _WIN32
 
 TEST(HostMemoryCgroup, PinMarginRule) {
   using mi::planner::fits_pin_margin;
