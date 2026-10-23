@@ -33,6 +33,8 @@
 #include "kernels/basic/elementwise.h"
 #include "kernels/fused/fused_gemm.h"
 #include "kernels/quant/quant.h"
+#include "kernels/quant/w4a8_decode.h"
+#include "kernels/quant4/quant4.h"
 #include "models/qwen35_text/text_encoder.h"
 #include "util/json.h"
 #include "util/path.h"
@@ -717,9 +719,11 @@ EngineNumerics engine_numerics(const CertConfig& c) {
   EngineNumerics n{{"elementwise", kernels::kElementwiseNumericsVersion},
                    {"fused_gemm", kernels::fused::kFusedGemmVersion},
                    {"te", qwen35_text::kNumericsVersion}};
-  if (c.dit == DitPrecision::kInt8ConvRot || c.te == TePrecision::kInt8ConvRot) {
+  if (c.dit == DitPrecision::kInt8ConvRot || c.te == TePrecision::kInt8ConvRot || c.te == TePrecision::kW4A8) {
     n.emplace_back("int8", kernels::quant::kInt8NumericsVersion);
   }
+  if (c.dit == DitPrecision::kW4A4) n.emplace_back("w4a4", kernels::quant4::kInt4NumericsVersion);
+  if (c.te == TePrecision::kW4A8) n.emplace_back("te_w4a8", kernels::quant::kGroupedDecodeVersion);
   if (c.attention != AttentionMode::kExact) n.emplace_back("attention_q8", attention_q8::kNumericsVersion);
   std::sort(n.begin(), n.end());
   return n;
@@ -727,8 +731,6 @@ EngineNumerics engine_numerics(const CertConfig& c) {
 
 std::string uncertifiable_reason(const CertConfig& c) {
   if (c.lora) return "runtime LoRAs are never certified";
-  if (c.dit == DitPrecision::kW4A4) return "the W4A4 DiT path has no numerics version yet (not certifiable)";
-  if (c.te == TePrecision::kW4A8) return "the W4A8 text-encoder path has no numerics version yet (not certifiable)";
   return {};
 }
 

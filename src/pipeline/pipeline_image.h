@@ -13,11 +13,23 @@
 #include <memory>
 #include <filesystem>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace mi::pipeline {
+
+// load_image failures: the file could not be read (missing, not a regular file, too large, I/O error) vs. its bytes are
+// not an acceptable image (undecodable, over the size bounds).
+class ImageReadError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+class ImageFormatError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
 
 // Input image bounds (init images, masks, image files): any size up to this side, this many pixels and (files) bytes.
 inline constexpr int kMaxInputSide = 16384;
@@ -87,10 +99,11 @@ int strength_start_step(int num_steps, double strength);
 // Reads a PNG or JPEG file (the vendored stb_image decoder) as RGB (channels 3: gray expanded, alpha dropped, 16-bit
 // samples reduced to 8) or grayscale (channels 1: PIL's convert("L") of the RGB image). A JPEG's EXIF orientation is
 // applied (PIL ImageOps.exif_transpose, as diffusers.utils.load_image does). `name` is set to the file's base name.
-// Throws std::runtime_error on a missing or non-regular file, a file over kMaxImageFileBytes, an undecodable one, or an
-// image over kMaxInputSide on a side or kMaxInputPixels.
+// Throws ImageReadError on a missing or non-regular file, a file over kMaxImageFileBytes or an I/O error, and
+// ImageFormatError on an undecodable image or one over kMaxInputSide on a side or kMaxInputPixels (both are
+// std::runtime_errors).
 Image load_image(const std::filesystem::path& file, int channels = 3);
-// The same from an in-memory PNG / JPEG file.
+// The same from an in-memory PNG / JPEG file (ImageFormatError for a file over kMaxImageFileBytes too).
 Image decode_image(std::span<const std::uint8_t> file, int channels = 3);
 
 }  // namespace mi::pipeline

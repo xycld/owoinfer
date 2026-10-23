@@ -235,9 +235,20 @@ TEST(QualityCert, NumericsDependOnTheConfiguration) {
     for (std::size_t i = 1; i < n.size(); ++i) EXPECT_LT(n[i - 1].first, n[i].first);
     EXPECT_EQ(uncertifiable_reason(c), "");
   }
-  // Paths without a numerics version, and runtime LoRAs, cannot carry a certificate.
-  EXPECT_NE(uncertifiable_reason({DitPrecision::kW4A4, AttentionMode::kExact, TePrecision::kBf16, false}), "");
-  EXPECT_NE(uncertifiable_reason({DitPrecision::kInt8ConvRot, AttentionMode::kExact, TePrecision::kW4A8, false}), "");
+  // INT4 paths carry their own numerics keys and are certifiable; runtime LoRAs are not.
+  const CertConfig int4{DitPrecision::kW4A4, AttentionMode::kExact, TePrecision::kBf16, false};
+  const CertConfig w4a8{DitPrecision::kInt8ConvRot, AttentionMode::kExact, TePrecision::kW4A8, false};
+  EXPECT_NE(engine_numerics(int4), engine_numerics(ref));
+  EXPECT_TRUE(has_key(engine_numerics(int4), "w4a4"));
+  EXPECT_FALSE(has_key(engine_numerics(int4), "te_w4a8"));
+  EXPECT_TRUE(has_key(engine_numerics(w4a8), "te_w4a8"));
+  EXPECT_TRUE(has_key(engine_numerics(w4a8), "int8"));
+  EXPECT_FALSE(has_key(engine_numerics(w4a8), "w4a4"));
+  for (const CertConfig& c : {int4, w4a8}) {
+    const EngineNumerics n = engine_numerics(c);
+    for (std::size_t i = 1; i < n.size(); ++i) EXPECT_LT(n[i - 1].first, n[i].first);
+    EXPECT_EQ(uncertifiable_reason(c), "");
+  }
   EXPECT_NE(uncertifiable_reason({DitPrecision::kInt8ConvRot, AttentionMode::kExact, TePrecision::kBf16, true}), "");
 }
 

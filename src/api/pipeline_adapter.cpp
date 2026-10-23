@@ -297,8 +297,8 @@ ImageInput check_image(const mi_image* px, const char* path, int channels, bool 
   return in;
 }
 
-// The image of a checked input: the pixels copied or the file decoded (a file that cannot be decoded is an argument
-// error), a BINARY01 mask scaled to 0 / 255.
+// The image of a checked input: the pixels copied or the file decoded (an unreadable file is an I/O error, one that cannot be
+// decoded an argument error), a BINARY01 mask scaled to 0 / 255.
 std::shared_ptr<const pipeline::Image> load_input(const ImageInput& in, int channels, bool binary01, const std::string& n) {
   if (!in.given()) return nullptr;
   pipeline::Image im;
@@ -311,8 +311,10 @@ std::shared_ptr<const pipeline::Image> load_input(const ImageInput& in, int chan
   } else {
     try {
       im = pipeline::load_image(in.file, channels);
-    } catch (const std::runtime_error& e) {
-      throw std::invalid_argument(n + "_path: " + e.what());  // unreadable, undecodable, too large
+    } catch (const pipeline::ImageReadError& e) {
+      throw pipeline::ImageReadError(n + "_path: " + e.what());  // unreadable file: MI_ERR_IO (c_api.cpp guarded)
+    } catch (const pipeline::ImageFormatError& e) {
+      throw std::invalid_argument(n + "_path: " + e.what());  // undecodable, too large
     }
   }
   if (binary01) {

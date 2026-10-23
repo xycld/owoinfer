@@ -19,6 +19,7 @@
 #include "api/pipeline_adapter.h"
 #include "backend/probe.h"
 #include "core/cuda_check.h"
+#include "pipeline/pipeline_image.h"
 #include "planner/planner.h"
 #include "runtime/device_arena.h"
 #include "util/json.h"
@@ -316,6 +317,8 @@ mi_status guarded(F&& body) noexcept {
   } catch (const mi::json::ParseError& e) {
     return fail(MI_ERR_MODEL, e.what());
   } catch (const mi::weights::IoError& e) {
+    return fail(MI_ERR_IO, e.what());
+  } catch (const mi::pipeline::ImageReadError& e) {
     return fail(MI_ERR_IO, e.what());
   } catch (const std::filesystem::filesystem_error& e) {
     return fail(MI_ERR_IO, e.what());

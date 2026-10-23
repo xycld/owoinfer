@@ -262,6 +262,20 @@
   {
    "config": {
     "dit_precision": "bf16",
+    "attention": "exact",
+    "te_precision": "w4a8"
+   },
+   "numerics": {
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "int8": 1,
+    "te": 1,
+    "te_w4a8": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "bf16",
     "attention": "q8_fp8",
     "te_precision": "bf16"
    },
@@ -288,6 +302,21 @@
   },
   {
    "config": {
+    "dit_precision": "bf16",
+    "attention": "q8_fp8",
+    "te_precision": "w4a8"
+   },
+   "numerics": {
+    "attention_q8": 1,
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "int8": 1,
+    "te": 1,
+    "te_w4a8": 1
+   }
+  },
+  {
+   "config": {
     "dit_precision": "int8_convrot",
     "attention": "exact",
     "te_precision": "bf16"
@@ -310,6 +339,20 @@
     "fused_gemm": 1,
     "int8": 1,
     "te": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "int8_convrot",
+    "attention": "exact",
+    "te_precision": "w4a8"
+   },
+   "numerics": {
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "int8": 1,
+    "te": 1,
+    "te_w4a8": 1
    }
   },
   {
@@ -338,6 +381,108 @@
     "fused_gemm": 1,
     "int8": 1,
     "te": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "int8_convrot",
+    "attention": "q8_fp8",
+    "te_precision": "w4a8"
+   },
+   "numerics": {
+    "attention_q8": 1,
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "int8": 1,
+    "te": 1,
+    "te_w4a8": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "w4a4",
+    "attention": "exact",
+    "te_precision": "bf16"
+   },
+   "numerics": {
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "te": 1,
+    "w4a4": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "w4a4",
+    "attention": "exact",
+    "te_precision": "int8_convrot"
+   },
+   "numerics": {
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "int8": 1,
+    "te": 1,
+    "w4a4": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "w4a4",
+    "attention": "exact",
+    "te_precision": "w4a8"
+   },
+   "numerics": {
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "int8": 1,
+    "te": 1,
+    "te_w4a8": 1,
+    "w4a4": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "w4a4",
+    "attention": "q8_fp8",
+    "te_precision": "bf16"
+   },
+   "numerics": {
+    "attention_q8": 1,
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "te": 1,
+    "w4a4": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "w4a4",
+    "attention": "q8_fp8",
+    "te_precision": "int8_convrot"
+   },
+   "numerics": {
+    "attention_q8": 1,
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "int8": 1,
+    "te": 1,
+    "w4a4": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "w4a4",
+    "attention": "q8_fp8",
+    "te_precision": "w4a8"
+   },
+   "numerics": {
+    "attention_q8": 1,
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "int8": 1,
+    "te": 1,
+    "te_w4a8": 1,
+    "w4a4": 1
    }
   }
  ],

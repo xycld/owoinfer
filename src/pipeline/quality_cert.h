@@ -104,14 +104,14 @@ QualityTier tier_of(const CertConfig& c);
 //   "elementwise" kernels::kElementwiseNumericsVersion, "fused_gemm" kernels::fused::kFusedGemmVersion and "te"
 //     qwen35_text::kNumericsVersion: always (every configuration runs the bf16 elementwise ops, the bf16 GEMM routing
 //     of the layers kept in bf16, and the text encoder's own op order);
-//   "int8" kernels::quant::kInt8NumericsVersion: when the DiT or the TE is INT8 ConvRot;
+//   "int8" kernels::quant::kInt8NumericsVersion: when the DiT or the TE is INT8 ConvRot or the TE is W4A8 (its
+//     activations are INT8);
+//   "w4a4" kernels::quant4::kInt4NumericsVersion: when the DiT is W4A4;
+//   "te_w4a8" kernels::quant::kGroupedDecodeVersion: when the TE is W4A8;
 //   "attention_q8" attention_q8::kNumericsVersion: when the attention is not exact.
-// Reserved, not yet emitted: "w4a4" (W4A4 DiT) and "te_w4a8" (W4A8 TE). Those paths have no numerics version yet, so
-// certifiable() is false for them and no certificate can be usable; add the key here with the path's version.
 using EngineNumerics = std::vector<std::pair<std::string, std::uint64_t>>;
 EngineNumerics engine_numerics(const CertConfig& c);
-// Empty when the configuration can carry a certificate, else why not (runtime LoRA, a path without a numerics
-// version).
+// Empty when the configuration can carry a certificate, else why not (runtime LoRA).
 std::string uncertifiable_reason(const CertConfig& c);
 
 // "sm_<major><minor>": the GPU class certificates are measured on (one kernel image and numerics per class).

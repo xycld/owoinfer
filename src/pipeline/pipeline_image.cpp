@@ -417,23 +417,23 @@ int strength_start_step(int num_steps, double strength) {
 Image decode_image(std::span<const std::uint8_t> file, int channels) {
   if (channels != 1 && channels != 3) throw std::invalid_argument("decode_image: channels must be 1 or 3");
   if (file.size() > kMaxImageFileBytes) {
-    throw std::runtime_error("image file larger than " + std::to_string(kMaxImageFileBytes >> 20) + " MiB");
+    throw ImageFormatError("image file larger than " + std::to_string(kMaxImageFileBytes >> 20) + " MiB");
   }
   const int size = static_cast<int>(file.size());
   // The header first: a hostile size is refused before any pixel memory is allocated.
   int w = 0, h = 0, n = 0;
   if (stbi_info_from_memory(file.data(), size, &w, &h, &n) == 0) {
-    throw std::runtime_error(std::string("cannot decode the image (PNG or JPEG expected): ") + stbi_failure_reason());
+    throw ImageFormatError(std::string("cannot decode the image (PNG or JPEG expected): ") + stbi_failure_reason());
   }
   if (w <= 0 || h <= 0 || w > kMaxInputSide || h > kMaxInputSide || std::int64_t{w} * h > kMaxInputPixels) {
-    throw std::runtime_error("image is " + std::to_string(w) + "x" + std::to_string(h) + ": at most " +
+    throw ImageFormatError("image is " + std::to_string(w) + "x" + std::to_string(h) + ": at most " +
                              std::to_string(kMaxInputSide) + " pixels on a side and " + std::to_string(kMaxInputPixels / 1000000) +
                              " megapixels");
   }
   int dw = 0, dh = 0;
   const std::unique_ptr<stbi_uc, void (*)(void*)> px(stbi_load_from_memory(file.data(), size, &dw, &dh, &n, 3), stbi_image_free);
-  if (px == nullptr) throw std::runtime_error(std::string("cannot decode the image (PNG or JPEG expected): ") + stbi_failure_reason());
-  if (dw != w || dh != h) throw std::runtime_error("image decode: the size changed between the header and the pixels");
+  if (px == nullptr) throw ImageFormatError(std::string("cannot decode the image (PNG or JPEG expected): ") + stbi_failure_reason());
+  if (dw != w || dh != h) throw ImageFormatError("image decode: the size changed between the header and the pixels");
   Image rgb;
   rgb.width = w;
   rgb.height = h;
@@ -447,9 +447,9 @@ Image decode_image(std::span<const std::uint8_t> file, int channels) {
 
 Image load_image(const std::filesystem::path& file, int channels) {
   std::error_code ec;
-  if (!std::filesystem::is_regular_file(file, ec)) throw std::runtime_error(util::path_utf8(file) + ": not a readable image file");
+  if (!std::filesystem::is_regular_file(file, ec)) throw ImageReadError(util::path_utf8(file) + ": not a readable image file");
   std::ifstream in(file, std::ios::binary);
-  if (!in) throw std::runtime_error("cannot read " + util::path_utf8(file));
+  if (!in) throw ImageReadError("cannot read " + util::path_utf8(file));
   // Bounded read: never more than the cap plus one chunk, whatever the file claims or becomes.
   std::vector<std::uint8_t> bytes;
   constexpr std::size_t kChunk = std::size_t{1} << 20;
@@ -459,15 +459,15 @@ Image load_image(const std::filesystem::path& file, int channels) {
     in.read(reinterpret_cast<char*>(bytes.data() + at), static_cast<std::streamsize>(kChunk));
     bytes.resize(at + static_cast<std::size_t>(in.gcount()));
     if (bytes.size() > kMaxImageFileBytes) {
-      throw std::runtime_error(util::path_utf8(file) + ": image file larger than " + std::to_string(kMaxImageFileBytes >> 20) + " MiB");
+      throw ImageReadError(util::path_utf8(file) + ": image file larger than " + std::to_string(kMaxImageFileBytes >> 20) + " MiB");
     }
   }
-  if (in.bad()) throw std::runtime_error("cannot read " + util::path_utf8(file));
+  if (in.bad()) throw ImageReadError("cannot read " + util::path_utf8(file));
   Image im;
   try {
     im = decode_image(bytes, channels);
-  } catch (const std::runtime_error& e) {
-    throw std::runtime_error(util::path_utf8(file) + ": " + e.what());
+  } catch (const ImageFormatError& e) {
+    throw ImageFormatError(util::path_utf8(file) + ": " + e.what());
   }
   im.name = util::path_utf8(file.filename());
   return im;

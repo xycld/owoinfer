@@ -226,8 +226,8 @@ TEST(PipelineImage, DecodesPngsAndRejectsGarbage) {
   // RGB -> L with PIL's integer formula.
   EXPECT_EQ(mismatches(mi::pipeline::decode_image(png, 1), load_npy_image("gray_as_l_from_rgb")), 0);
   const std::vector<std::uint8_t> junk = {0x89, 'P', 'N', 'G', 1, 2, 3};
-  EXPECT_THROW(mi::pipeline::decode_image(junk), std::runtime_error);
-  EXPECT_THROW(mi::pipeline::load_image(data_dir() / "missing.png"), std::runtime_error);
+  EXPECT_THROW(mi::pipeline::decode_image(junk), mi::pipeline::ImageFormatError);
+  EXPECT_THROW(mi::pipeline::load_image(data_dir() / "missing.png"), mi::pipeline::ImageReadError);
   EXPECT_THROW(mi::pipeline::decode_image(png, 2), std::invalid_argument);
 }
 
@@ -482,7 +482,7 @@ TEST(PipelineImage, DecodeSurvivesMutatedFiles) {
     EXPECT_THROW(mi::pipeline::decode_image(f), std::runtime_error) << w << "x" << h;
   }
   // Files: a directory and an oversized file are refused without reading them whole.
-  EXPECT_THROW(mi::pipeline::load_image(data_dir()), std::runtime_error);
+  EXPECT_THROW(mi::pipeline::load_image(data_dir()), mi::pipeline::ImageReadError);
   const std::vector<std::uint8_t> big(mi::pipeline::kMaxImageFileBytes + 1, 0);
   EXPECT_THROW(mi::pipeline::decode_image(big), std::runtime_error);
 }
