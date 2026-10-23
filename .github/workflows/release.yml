@@ -1,10 +1,23 @@
-# Tag v<MAJOR>.<MINOR>.<PATCH>: build and check all four flavours (build.yml), then publish their archives (the full
-# package and the -system-cuda variant of each) and a SHA256SUMS file as a GitHub release. The tag must equal the MI_VERSION_* of include/mossinfer/mossinfer.h.
+# Tag vX.Y.Z (a release) or vX.Y.Z-rcN, N >= 1 (a release candidate, published as a pre-release that does not become
+# "latest"): build and check all four flavours (build.yml), then publish their archives (the full package and the
+# -system-cuda variant of each) and a SHA256SUMS file as a GitHub release. X.Y.Z must equal the MI_VERSION_* of
+# include/mossinfer/mossinfer.h (.github/scripts/release_version.py), and the tagged commit must be on main with a
+# successful ci run (.github/scripts/release_gate.sh).
+# Dry run: Actions > release > Run workflow on main or on a tag (gh workflow run release.yml -r <branch-or-tag>) does
+# all of the above except creating the release, and uploads the would-be release assets as the release-dry-run
+# artifact. A dispatch with dry_run unticked is refused: only a tag push publishes. The dispatch ref is the run's own
+# ref (not an input) because build.yml checks out the run's commit.
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Dry run (build and check, upload the would-be assets, no release). Must stay ticked.
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -12,20 +25,39 @@ permissions:
 jobs:
   version:
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      is_rc: ${{ steps.version.outputs.is_rc }}
+      archive_version: ${{ steps.version.outputs.archive_version }}
     steps:
+      - name: Dispatches are dry runs only
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+        run: |
+          echo "::error::A dispatched release run must be a dry run. Publish by pushing a vX.Y.Z or vX.Y.Z-rcN tag."
+          exit 1
+      # All history (commits only, no trees or blobs beyond the checkout) for the merge-base check against main.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: tree:0
       - name: Tag matches the header version
+        id: version
         shell: bash
         run: |
-          v=$(python3 - <<'EOF'
-          import re
-          text = open("include/mossinfer/mossinfer.h", encoding="utf-8").read()
-          parts = [re.search(rf"^#define MI_VERSION_{p} +(\d+)", text, re.M).group(1) for p in ("MAJOR", "MINOR", "PATCH")]
-          print(".".join(parts))
-          EOF
-          )
-          echo "header version $v, tag $GITHUB_REF_NAME"
-          test "v$v" = "$GITHUB_REF_NAME"
+          python3 .github/scripts/release_version.py --self-test
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then tag=(--tag "$GITHUB_REF_NAME"); else tag=(); fi
+          python3 .github/scripts/release_version.py "${tag[@]}" | tee -a "$GITHUB_OUTPUT"
+      - name: Commit on main with a green ci run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags --filter=tree:0 origin +refs/heads/main:refs/remotes/origin/main
+          bash .github/scripts/release_gate.sh "$GITHUB_SHA" origin/main "$GITHUB_REPOSITORY"
 
   build:
     needs: version
@@ -34,10 +66,12 @@ jobs:
       retention-days: 30
 
   publish:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    env:
+      ARCHIVE_VERSION: ${{ needs.version.outputs.archive_version }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -51,12 +85,13 @@ jobs:
           n=0
           for full in mossinfer-*.zip mossinfer-*.tar.gz; do
             [ -f "$full" ] || continue
+            case "$full" in "mossinfer-$ARCHIVE_VERSION-"*) ;; *) echo "$full is not version $ARCHIVE_VERSION"; exit 1 ;; esac
             case "$full" in *-system-cuda.*) continue ;; esac
             case "$full" in *.tar.gz) ext="tar.gz"; base="${full%.tar.gz}" ;; *) ext="zip"; base="${full%.zip}" ;; esac
             test -f "$base-system-cuda.$ext" || { echo "missing $base-system-cuda.$ext"; exit 1; }
             n=$((n + 1))
           done
-          echo "$n full archives, each with its -system-cuda variant"
+          echo "$n full archives, each with its -system-cuda variant, all version $ARCHIVE_VERSION"
           test "$n" -gt 0
       - name: SHA256SUMS
         shell: bash
@@ -66,7 +101,37 @@ jobs:
           sha256sum mossinfer-*.zip mossinfer-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
           ls -l
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      # Release candidates: the archives keep the header's X.Y.Z (CPack names them, the binaries report it), so an
+      # rc's assets are named mossinfer-X.Y.Z-... like the final release's; the release body says so.
+      - name: Release body
+        shell: bash
+        env:
+          IS_RC: ${{ needs.version.outputs.is_rc }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          : > RELEASE_BODY.md
+          if [ "$IS_RC" = "true" ]; then
+            echo "Release candidate $TAG of $VERSION. The archives and the binaries in them carry version $VERSION," \
+              "so the archive names have no -rc suffix; SHA256SUMS lists them under those names." > RELEASE_BODY.md
+          fi
+          echo "tag $TAG, pre-release $IS_RC, body before the generated notes:"
+          cat RELEASE_BODY.md
+      - name: Would-be release assets (dry run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dry-run
+          path: |
+            dist/mossinfer-*.zip
+            dist/mossinfer-*.tar.gz
+            dist/SHA256SUMS
+            RELEASE_BODY.md
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             dist/mossinfer-*.zip
@@ -74,3 +139,6 @@ jobs:
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           generate_release_notes: true
+          body_path: RELEASE_BODY.md
+          prerelease: ${{ needs.version.outputs.is_rc }}
+          make_latest: ${{ needs.version.outputs.is_rc == 'true' && 'false' || 'true' }}
