@@ -11,6 +11,10 @@ on:
         description: Days to keep the uploaded packages
         type: number
         default: 7
+      sccache-recache:
+        description: Compile every translation unit and overwrite its sccache entry (SCCACHE_RECACHE), for a cold-build time
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -36,6 +40,39 @@ jobs:
             flavour: cuda12
           - cuda: "13.3.1"
             flavour: cuda13
+          # CUDA components: only what the build includes or links (nvcc, cudart, cuBLAS(Lt), the curand_kernel.h
+          # headers, CCCL), plus the documentation component, which carries the EULA.txt the package ships. `nvcc` is
+          # the compiler version the toolkit step asserts.
+          # Linux: NVIDIA's apt repository, every package pinned to the version in the release the flavour names (the
+          # newest can be a later hotfix: libcublas-12-8 12.8.5.5, where 12.8.1 has 12.8.4.1); the toolkit step
+          # asserts each installed version.
+          - os: ubuntu-22.04
+            cuda: "12.8.1"
+            nvcc: "12.8.93"
+            apt: >-
+              cuda-nvcc-12-8=12.8.93-1 cuda-nvvm-12-8=12.8.93-1 cuda-crt-12-8=12.8.93-1
+              cuda-cudart-12-8=12.8.90-1 cuda-cudart-dev-12-8=12.8.90-1 cuda-cccl-12-8=12.8.90-1
+              cuda-documentation-12-8=12.8.90-1 libcurand-12-8=10.3.9.90-1 libcurand-dev-12-8=10.3.9.90-1
+              libcublas-12-8=12.8.4.1-1 libcublas-dev-12-8=12.8.4.1-1
+          - os: ubuntu-22.04
+            cuda: "13.3.1"
+            nvcc: "13.3.73"
+            apt: >-
+              cuda-nvcc-13-3=13.3.73-1 libnvvm-13-3=13.3.73-1 cuda-crt-13-3=13.3.73-1
+              libnvptxcompiler-13-3=13.3.73-1 cuda-cudart-13-3=13.3.29-1 cuda-cudart-dev-13-3=13.3.29-1
+              cuda-culibos-dev-13-3=13.3.33-1 cccl-13-3=13.3.3.4.1-1 cuda-documentation-13-3=13.3.73-1
+              libcurand-13-3=10.4.3.29-1 libcurand-dev-13-3=10.4.3.29-1 libcublas-13-3=13.6.0.2-1
+              libcublas-dev-13-3=13.6.0.2-1
+          # Windows: Jimver/cuda-toolkit's network installer, which installs the release's own components. CUDA 13
+          # split crt and nvvm (cicc) out of nvcc.
+          - os: windows-2022
+            cuda: "12.8.1"
+            nvcc: "12.8.93"
+            sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand_dev", "thrust", "documentation"]'
+          - os: windows-2022
+            cuda: "13.3.1"
+            nvcc: "13.3.73"
+            sub-packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "curand_dev", "thrust", "documentation"]'
     env:
       preset: ${{ matrix.platform }}-${{ matrix.flavour }}
       SCCACHE_GHA_ENABLED: "true"
@@ -49,12 +86,6 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Free disk space (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
 
       - name: Host compiler (Linux)
         if: runner.os == 'Linux'
@@ -75,23 +106,106 @@ jobs:
         with:
           arch: x64
 
+      # Windows: the installed toolkit (0.5-0.6 GB compressed) is cached, keyed by the release, the install method
+      # (bump `v1` when it changes) and the component list. It is saved only after the toolkit step has checked it;
+      # restoring takes about 10 s, the network installer 35-65 s. Linux is not cached: apt installs it in 1-1.5 min,
+      # and its 2-2.6 GB (mostly cuBLAS static libraries) would take about 1 GB per flavour of the repository's 10 GB
+      # cache, which sccache needs.
+      - name: CUDA toolkit directory
+        id: cuda-dir
+        run: |
+          v="${{ matrix.cuda }}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "dir=C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v${v%.*}" >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=/usr/local/cuda-${v%.*}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cuda-cache
+        if: runner.os == 'Windows'
+        with:
+          path: ${{ steps.cuda-dir.outputs.dir }}
+          key: cuda-${{ matrix.os }}-${{ matrix.cuda }}-v1-${{ join(fromJSON(matrix.sub-packages), '-') }}
+
       - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
-        id: cuda
+        if: runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true'
         with:
           cuda: ${{ matrix.cuda }}
-          method: local
-          linux-local-args: '["--toolkit"]'
+          method: network
+          sub-packages: ${{ matrix.sub-packages }}
           use-github-cache: false
           log-file-suffix: ${{ matrix.os }}-${{ matrix.cuda }}.txt
 
-      - name: CUDA DLL directory (Windows)
-        if: runner.os == 'Windows'
+      - name: CUDA packages (Linux)
+        if: runner.os == 'Linux'
         run: |
-          # CUDA 13 keeps its DLLs in bin/x64. The engine finds cuBLASLt through CUDA_PATH, never PATH
-          # (src/backend/cuda_libs.h); PATH is for other tools that look for the toolkit's DLLs.
-          cuda_path="$(cygpath -u "$CUDA_PATH")"
-          if [ -d "$cuda_path/bin/x64" ]; then cygpath -w "$cuda_path/bin/x64" >> "$GITHUB_PATH"; fi
-          nvcc --version
+          repo="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu$(lsb_release -sr | tr -d .)/x86_64"
+          wget -q -O "$RUNNER_TEMP/cuda-keyring.deb" "$repo/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+          sudo apt-get clean
+
+      - name: CUDA environment
+        # What Jimver/cuda-toolkit exports after an install: for the Linux packages and a restored Windows toolkit.
+        if: runner.os == 'Linux' || steps.cuda-cache.outputs.cache-hit == 'true'
+        run: |
+          dir='${{ steps.cuda-dir.outputs.dir }}'
+          v="${{ matrix.cuda }}"
+          mm="${v%.*}"
+          var="CUDA_PATH_V${mm/./_}"
+          { echo "CUDA_PATH=$dir"; echo "$var=$dir"; echo "CUDA_PATH_VX_Y=$var"; } >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "$dir\\bin" >> "$GITHUB_PATH"
+          else
+            echo "$dir/bin" >> "$GITHUB_PATH"
+            echo "LD_LIBRARY_PATH=$dir/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          fi
+
+      - name: CUDA toolkit
+        # The toolkit is the one the flavour names and has what the build and the package need; on Windows this is
+        # also the gate for saving it to the cache.
+        run: |
+          cuda_path="$CUDA_PATH"
+          v="${{ matrix.cuda }}"
+          major="${v%%.*}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # CUDA 13 keeps its DLLs in bin/x64. The engine finds cuBLASLt through CUDA_PATH, never PATH
+            # (src/backend/cuda_libs.h); PATH is for other tools that look for the toolkit's DLLs.
+            cuda_path="$(cygpath -u "$CUDA_PATH")"
+            if [ -d "$cuda_path/bin/x64" ]; then cygpath -w "$cuda_path/bin/x64" >> "$GITHUB_PATH"; fi
+            need="bin/nvcc.exe nvvm/bin/cicc.exe lib/x64/cudart_static.lib"
+            cublaslt="bin/cublasLt64_$major.dll"
+            [ -e "$cuda_path/$cublaslt" ] || cublaslt="bin/x64/cublasLt64_$major.dll"
+          else
+            need="bin/nvcc nvvm/bin/cicc lib64/libcudart_static.a"
+            cublaslt="lib64/libcublasLt.so.$major"
+            for pkg in ${{ matrix.apt }}; do
+              have="$(dpkg-query -W -f='${Version}' "${pkg%%=*}")"
+              if [ "$have" != "${pkg#*=}" ]; then echo "::error::${pkg%%=*} $have installed, ${pkg#*=} expected"; exit 1; fi
+            done
+          fi
+          for f in $need "$cublaslt" EULA.txt include/curand_kernel.h; do
+            if [ ! -e "$cuda_path/$f" ]; then echo "::error::$f missing from the CUDA toolkit"; exit 1; fi
+          done
+          version="$(nvcc --version)"
+          echo "$version"
+          if ! grep -qxE ".*, V${{ matrix.nvcc }}" <<< "$version"; then
+            echo "::error::nvcc is not V${{ matrix.nvcc }}"
+            exit 1
+          fi
+          du -sh "$cuda_path"
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ steps.cuda-dir.outputs.dir }}
+          key: ${{ steps.cuda-cache.outputs.cache-primary-key }}
+
+      - name: Force sccache recompiles
+        if: inputs.sccache-recache
+        run: echo "SCCACHE_RECACHE=1" >> "$GITHUB_ENV"
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
@@ -158,6 +272,7 @@ jobs:
             esac
           done
           sccache --show-stats
+          df -h / .
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
