@@ -37,6 +37,7 @@ int main(void) {
   check("sizeof(mi_mask_encoding)", sizeof(mi_mask_encoding), 4);
   check("sizeof(mi_resize_mode)", sizeof(mi_resize_mode), 4);
   check("sizeof(mi_image_mode)", sizeof(mi_image_mode), 4);
+  check("sizeof(mi_step_cache)", sizeof(mi_step_cache), 4);
 
   SIZE(mi_device_info, 592);
   FIELD(mi_device_info, struct_size, 0);
@@ -103,7 +104,7 @@ int main(void) {
   FIELD(mi_progress, step_seconds, 24);
   FIELD(mi_progress, elapsed_seconds, 32);
 
-  SIZE(mi_gen_params, 320);
+  SIZE(mi_gen_params, 376);
   FIELD(mi_gen_params, struct_size, 0);
   FIELD(mi_gen_params, prompt, 8);
   FIELD(mi_gen_params, negative_prompt, 16);
@@ -153,7 +154,23 @@ int main(void) {
   FIELD(mi_gen_params, hires_strength, 296);
   FIELD(mi_gen_params, hires_steps, 304);
   FIELD(mi_gen_params, _reserved3, 308);
-  FIELD(mi_gen_params, distill_dir, 312);
+  FIELD(mi_gen_params, distill_dir, 312); /* the 1.0.0 layout ends here (320 bytes) */
+  FIELD(mi_gen_params, control_adapter, 320);
+  FIELD(mi_gen_params, control_lora_strength, 328);
+  FIELD(mi_gen_params, control_images, 336);
+  FIELD(mi_gen_params, control_images_count, 344);
+  FIELD(mi_gen_params, cfg_truncation, 352);
+  FIELD(mi_gen_params, step_cache, 360);
+  FIELD(mi_gen_params, _reserved4, 364);
+  FIELD(mi_gen_params, step_cache_threshold, 368);
+
+  SIZE(mi_control_image, 48); /* array element without struct_size: frozen */
+  FIELD(mi_control_image, kind, 0);
+  FIELD(mi_control_image, image, 8);
+  FIELD(mi_control_image, image_path, 16);
+  FIELD(mi_control_image, strength, 24);
+  FIELD(mi_control_image, start, 32);
+  FIELD(mi_control_image, end, 40);
 
   SIZE(mi_lora, 16); /* array element without struct_size: frozen */
   FIELD(mi_lora, path, 0);
@@ -206,14 +223,16 @@ int main(void) {
   FIELD(mi_dit_stream_stats, hidden_fraction, 56);
   FIELD(mi_dit_stream_stats, source, 64);
 
-  SIZE(mi_tier_info, 32);
+  SIZE(mi_tier_info, 40);
   FIELD(mi_tier_info, struct_size, 0);
   FIELD(mi_tier_info, requested, 8);
   FIELD(mi_tier_info, effective, 12);
   FIELD(mi_tier_info, attention, 16);
   FIELD(mi_tier_info, certified, 20);
   FIELD(mi_tier_info, dit_precision, 24);
-  FIELD(mi_tier_info, text_encoder_precision, 28);
+  FIELD(mi_tier_info, text_encoder_precision, 28); /* the 1.0.0 layout ends here (32 bytes) */
+  FIELD(mi_tier_info, run_certified, 32);
+  FIELD(mi_tier_info, _reserved0, 36);
 
   SIZE(mi_prompt_tokens, 32);
   FIELD(mi_prompt_tokens, struct_size, 0);
@@ -251,6 +270,26 @@ int main(void) {
   FIELD(mi_image_info, _reserved0, 60);
   FIELD(mi_image_info, first_strength, 64);
   FIELD(mi_image_info, hires_strength, 72);
+
+  SIZE(mi_control_info, 48);
+  FIELD(mi_control_info, struct_size, 0);
+  FIELD(mi_control_info, active, 8);
+  FIELD(mi_control_info, kinds_count, 12);
+  FIELD(mi_control_info, encodes, 16);
+  FIELD(mi_control_info, lora_adapters, 20);
+  FIELD(mi_control_info, lora_side_branch, 24);
+  FIELD(mi_control_info, lora_merged, 28);
+  FIELD(mi_control_info, lora_unknown_keys, 32);
+  FIELD(mi_control_info, lora_warnings, 36);
+  FIELD(mi_control_info, lora_notes, 40);
+  FIELD(mi_control_info, _reserved0, 44);
+
+  SIZE(mi_accel_info, 24);
+  FIELD(mi_accel_info, struct_size, 0);
+  FIELD(mi_accel_info, cfg_truncated_steps, 8);
+  FIELD(mi_accel_info, dit_calls, 12);
+  FIELD(mi_accel_info, cached_calls, 16);
+  FIELD(mi_accel_info, lossy, 20);
 
   printf("%s: C struct layouts %s the frozen ABI %d table\n", failures ? "FAIL" : "ok",
          failures ? "differ from" : "match", MI_ABI_VERSION);

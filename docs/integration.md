@@ -25,6 +25,8 @@ Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what
 | Image input | img2img (an init image and a denoise strength) and inpainting (a mask), with crop / fit / stretch resizing; pixels (library) or PNG / JPEG files (both surfaces) |
 | Hires fix | a second pass at a larger size from the first pass upscaled, with its own strength and steps |
 | Distill bundles | few-step distilled checkpoints shipped as a bundle folder (time embedding, LoRA, data-space sampler parameters), applied per engine and per generation |
+| Control adapters | a control adapter file (a LoRA with a widened DiT input embedder, e.g. the MOSS-Image color / depth control) with one conditioning image per kind, each with a strength and a step window; pixels (library) or PNG / JPEG files (both surfaces). Lossy and opt-in: a run with one is uncertified. |
+| Lossy accelerators | CFG truncation and a step cache (First-Block Cache), off by default. Lossy and opt-in: they change the image, and a run with either is uncertified. |
 | Attention mode | exact (FlashAttention-2) or one of four 8-bit modes, as an override of the tier's choice |
 | LoRAs | a list of files with strengths per generation, applied at run time: kohya, PEFT / diffusers, LyCORIS LoHa and LoKr, and full deltas; per-file reports and warnings |
 | Samplers and schedulers | 9 samplers (Euler, AB2, Euler ancestral, Heun, DPM++ 2M, DPM++ 2M SDE, ER-SDE, RES multistep, data-space), 7 schedulers, noise layout and source, eta, s_noise, flow multiplier |
@@ -37,6 +39,13 @@ Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what
 | System CUDA reuse | a compatible cuBLASLt from the user's CUDA install, used by the `-system-cuda` package or on request (`MOSSINFER_CUDA_LIBS=system`); the probe reports which copy runs (verified on Linux; see [CUDA libraries](#cuda-libraries)) |
 | Output | PNG file (both surfaces), or RGB8 in memory (library), plus a JSON report per image |
 
+### Control adapters and accelerators
+
+They run on all three surfaces: `mi_gen_params` (`MI_CAP_CONTROL`, `MI_CAP_ACCEL`; [c-api.md](c-api.md#control-adapters)), `generate`'s `control`, `cfg_truncation`, `step_cache` and `step_cache_threshold` ([server-protocol.md](server-protocol.md#generate)), and `moss-infer generate`. All of them are lossy and opt-in, and a run with any of them is uncertified:
+- **Control adapters:** a control adapter file (`--control <file>`) and its LoRA strength (`--control-scale S`, default 1). Each conditioning image (`--control-image <kind>=<png|jpg>`) gives the input of one of the adapter's kinds, with a strength (`--control-strength X`, default 1, 0 to 10) and a step window (`--control-start X` / `--control-end X`, default 0 / 1: the share of the steps it applies to). A kind without an image gets no control. Like any LoRA, the adapter makes the run uncertified.
+- **Lossy accelerators**, off by default: CFG truncation (`--cfg-truncation X`, 0 to 1, default 1 = off) drops the negative branch from step X · steps on; the step cache (`--step-cache fbcache`, default `off`) reuses DiT blocks 1..41 from the last full call while block 0's output changed by less than the threshold (`--step-cache-threshold`; default 0.02 on the base model and 0.03 on the SFT model and its derived files, and the report's `accelerators.step_cache_threshold` and `step_cache_threshold_source` say which ran). Both change the image and make the run uncertified. The tier is resolved as if they were off, so `auto` picks the same tier. The step cache's gain depends on the model, precision, step count and size: on an RTX 5090 at 1024², 50 steps, threshold 0.03 reused 27–30 % of the DiT calls with bf16 and INT8, and none with INT4 Turbo (its own rounding noise keeps block 0's change above the threshold; the report warns when the cache never engaged).
+- The report records them in `control` and `accelerators`, and `dit_stream.steps[i].cached` marks the steps that reused the cache. The server adds a `done.warnings` line for the accelerators. Show the run's certified status from `mi_tier_info.run_certified` (server: `done.certified`); `mi_tier_info.certified` is about the tier and stays 1 on Reference.
+
 ### Planned: integrate now, enabled later
 
 These are designed and partly built. The launcher can prepare for them now (see [Preparing for planned features](#preparing-for-planned-features)).
@@ -44,12 +53,6 @@ These are designed and partly built. The launcher can prepare for them now (see 
 | Feature | State | How the launcher prepares |
 |---|---|---|
 | System CUDA reuse on Windows | the search paths are written (`CUDA_PATH`, `CUDA_PATH_V<major>_*`), not yet verified on Windows | the same logic as on Linux: read `probe.cublaslt` |
-| Control LoRAs and the lossy accelerators (CFG truncation, step cache) | `moss-infer` only in 1.0 (below); the C API and `moss-server` get them in 1.1 | nothing yet; enable them when `mi_capabilities()` or `hello`'s `capabilities` announce them |
-
-**`moss-infer` only in 1.0.** These run from `moss-infer generate`, not through the C API or `moss-server`:
-- **Control LoRAs:** `--control <file>` loads a control adapter (a LoRA with a widened DiT input embedder, e.g. the MOSS-Image color / depth control) and `--control-scale S` sets its LoRA strength (default 1). Each `--control-image <kind>=<png|jpg>` gives the input of one of the adapter's kinds, and may be followed by `--control-strength X` (default 1, 0 to 10) and `--control-start X` / `--control-end X` (default 0 / 1: the share of the steps it applies to).
-- **Lossy accelerators**, off by default: `--cfg-truncation X` (0 to 1, default 1 = off) drops the negative branch from step X · steps on; `--step-cache fbcache` (default `off`) reuses DiT blocks 1..41 from the last full call while block 0's output changed by less than `--step-cache-threshold` (default 0.02 on the base model and 0.03 on the SFT model and its derived files; the report's `accelerators.step_cache_threshold` and `step_cache_threshold_source` say which ran). Both change the image and make the run uncertified. The tier is resolved as if they were off, so `auto` picks the same tier. The step cache's gain depends on the step count and size: at the default threshold it reused about 30 % of the DiT calls at 1024², 50 steps, and none at 768², 30 steps.
-- The report records them in `control` and `accelerators`, and `dit_stream.steps[i].cached` marks the steps that reused the cache.
 
 ### Not supported
 
@@ -331,7 +334,7 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 - **`not_supported`:** a feature that this build does not enable, e.g. a ComfyUI file as the model path.
 - **`invalid_argument` in `done`:** a tier combination the engine refuses, e.g. `reference` with an INT8 `dit_file`. The message names the conflict.
 
-**Images from untrusted sources.** moss-server decodes `init_image` and `mask` files in-process with stb_image, which is hardened (at most 64 MiB per file, 16384 pixels per side and 64,000,000 pixels, checked before any pixel allocation) but not memory-safe. When the images come from a network, web uploads or other users' files, decode them in the launcher with a memory-safe decoder and pass pixels through the C API (`mi_gen_params.init_image` / `mask`), or run moss-server sandboxed. Files the user created or trusts are the case the server's file input is meant for; downloads are untrusted.
+**Images from untrusted sources.** moss-server decodes `init_image`, `mask` and `control` image files in-process with stb_image, which is hardened (at most 64 MiB per file, 16384 pixels per side and 64,000,000 pixels, checked before any pixel allocation) but not memory-safe. When the images come from a network, web uploads or other users' files, decode them in the launcher with a memory-safe decoder and pass pixels through the C API (`mi_gen_params.init_image` / `mask`, `mi_control_image.image`), or run moss-server sandboxed. Files the user created or trusts are the case the server's file input is meant for; downloads are untrusted.
 
 **Paths.** The server trusts its input: it reads and writes exactly the paths it is given. The launcher must choose `output` and `cache_dir` itself, or validate them, and must not forward raw paths from untrusted sources (see "Security" in [server-protocol.md](server-protocol.md)).
 
@@ -371,7 +374,7 @@ Bindings in other languages can follow the frozen struct layouts in [c-api.md](c
 | GPU | `device_index` / `device` | From `hello`'s device list. Supported devices only. |
 | Model | `model_path` / `model` | The Base or SFT folder. |
 | Model files | `dit_file`, `text_encoder_file`, `vae_file` | Optional file pickers next to the model folder, empty by default (the folder's own components). Offer them when `MI_CAP_MODEL_FILES` / `model_files` is set. |
-| Quality tier | `tier`: `auto` / `reference` / `high` / `turbo` | Default **Auto**. Show the tier that ran (`mi_result_tier()`, or the report's `quality` and `models`), and mark uncertified lossy runs. Offer `turbo` only when the DiT file is INT4, and select it for such a file: `auto` refuses an uncertified INT4 DiT. |
+| Quality tier | `tier`: `auto` / `reference` / `high` / `turbo` | Default **Auto**. Show the tier that ran (`mi_result_tier()`, or the report's `quality` and `models`), and mark uncertified runs from `run_certified` (server: `done.certified`, the report's `models.dit.certified`). `mi_tier_info.certified` is about the tier: it stays 1 on Reference even with LoRAs, a control adapter or accelerators. Offer `turbo` only when the DiT file is INT4, and select it for such a file: `auto` refuses an uncertified INT4 DiT. |
 | Distill bundle | `distill_dir` / `distill` (engine) | An optional folder picker. Set the same bundle on the engine and on each generation (the engine takes its time embedding). Leave steps, CFG and the sampler unset to get the bundle's. |
 | Attention | `attention`: `default` / `exact` / `q8_fp8` / ... | An advanced setting, default `default` (the tier's choice). |
 | LoRA strictness | `lora_strict` | Off. Turn it on only for workflows where a partly applied LoRA must fail instead of warn. |
@@ -393,6 +396,9 @@ Width and height must be multiples of 16, at most 4096 per side, and at most 4.2
 | Init image | `init_image` (pixels) or `init_image_path` / `init_image` (path) | An optional image picker with a denoise strength slider, pre-filled with `MI_DEFAULT_DENOISE_STRENGTH` (0.75, what an unset strength resolves to; 1 without a mask ignores the image). The output size stays `width` × `height` and the image is resized to it (crop by default): set the size from the image to keep its aspect ratio. `moss-infer` does that itself; the C API and the server do not. |
 | Inpainting mask | `mask` / `mask_path` / `mask`, `mask_encoding` | A mask painter next to the init image. Pass 0/1 masks with `binary01`, 0/255 masks with `u8`. |
 | Hires fix | `hires_width`, `hires_height`, `hires_strength`, `hires_steps` / `hires` | Off by default; a target size (or a scale rounded to multiples of 16) with a strength (default 0.45). |
+| Control adapter and images | `control_adapter`, `control_lora_strength`, `control_images` (`{kind, image or image_path, strength, start, end}` each, at most 16) / `control` | An advanced setting, off by default: an adapter file picker, then one image picker per kind the adapter has (`MI_TEXT_CONTROL_KINDS` / the report's `control.kinds` after a first run), each with a strength slider (default 1) and a step window (default 0 to 1). The images are resized to the output size like an init image. Mark the result uncertified from `run_certified` / `done.certified`. |
+| CFG truncation | `cfg_truncation` | An advanced setting, default 1 (off). Lossy: mark the result uncertified from `run_certified` / `done.certified`. No effect at CFG 1 (the server's `done.warnings` says so). |
+| Step cache | `step_cache` (`off` / `fbcache`), `step_cache_threshold` | An advanced setting, default off; the threshold left unset (0 in the C API, absent on the server) takes the engine's per-model default (0.02 base, 0.03 SFT and derived files). Higher thresholds are faster and change the image more. Lossy: mark the result uncertified from `run_certified` / `done.certified` (`mi_accel_info.lossy` and the report's `accelerators.lossy` say an accelerator was requested). |
 | Preview | `preview_callback` + `preview_interval` / `preview_output` + `preview_every` | On. Every step is fine for small images; use about 5 for large ones, because each preview is a full-size device-to-host copy plus (server) a PNG write, on the generating thread while the GPU waits. The preview is coarse (no VAE). On Windows, do not keep the server's preview file open: the server renames each new preview over it, a held file makes that fail, and the server then logs a warning and goes on. |
 
 Leave `block_path`, `direct_io`, `noise_layout`, `flow_multiplier` and the skip-layer guidance fields (`slg_*`) at their defaults unless you have a reason to change them. `block_path` changes speed only, never the image.
@@ -417,6 +423,8 @@ Features are announced by a capability bit. Check `mi_capabilities()`, or `capab
 | Hires fix | `MI_CAP_HIRES` (0x80) | `"hires"` | set | the hires fix |
 | Distill bundles | `MI_CAP_DISTILL` (0x100) | `"distill"` | set | `distill_dir` / `distill`, `time_embedding_file` |
 | System CUDA reuse | `MI_CAP_SYSTEM_CUDA` (0x200) | `"system_cuda"` | set | `mi_probe_info.cublaslt_*` / `probe.cublaslt`; `MOSSINFER_CUDA_LIBS`, `MOSSINFER_CUBLASLT` |
+| Control adapters | `MI_CAP_CONTROL` (0x400) | `"control"` | set | `control_adapter`, `control_lora_strength`, `control_images` / `control` |
+| Lossy accelerators | `MI_CAP_ACCEL` (0x800) | `"accel"` | set | `cfg_truncation`, `step_cache`, `step_cache_threshold` |
 
 Future features will arrive the same way: **new trailing struct fields, new enum values and new capability bits** in the C API, and **new optional parameters** for the server. Leaving them unset keeps today's behaviour. A program built against an older header keeps working with a newer library, because the library accepts every older struct size (see [Versioning](#versioning)).
 
@@ -429,9 +437,9 @@ Every result carries a JSON report: `mi_result_report_json()`, or `done.report` 
 - the execution plan: what was resident, and the memory per phase;
 - timings per phase, and VRAM and RAM peaks;
 - model streaming statistics and the hardware profile;
-- the control adapter and the accelerators (`control`, `accelerators`), which only `moss-infer` sets in 1.0.
+- the control adapter and the accelerators (`control`, `accelerators`).
 
-The library also has accessors for the parts a launcher shows: `mi_result_tier()`, `mi_result_text()`, `mi_result_prompt_tokens()`, `mi_result_lora()` and `mi_result_message()` (see [c-api.md](c-api.md#results)).
+The library also has accessors for the parts a launcher shows: `mi_result_tier()`, `mi_result_text()`, `mi_result_prompt_tokens()`, `mi_result_lora()`, `mi_result_message()`, `mi_result_control()` and `mi_result_accel()` (see [c-api.md](c-api.md#results)).
 
 Attach it to bug reports, together with the server's stderr log and `hello`'s `probe`.
 

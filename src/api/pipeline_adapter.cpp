@@ -17,6 +17,7 @@
 #include "backend/cuda_driver.h"
 #include "backend/cuda_libs.h"
 #include "core/cuda_check.h"
+#include "models/control/control.h"
 #include "models/lora/lora.h"
 #include "models/moss_dit/distill.h"
 #include "models/moss_dit/moss_dit.h"
@@ -467,6 +468,59 @@ pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embe
   q.hires.strength = p.hires_strength;
   q.hires.steps = p.hires_steps;
 
+  // Control adapter: the file must exist; its format and kinds are the pipeline's to check (generate()).
+  if (given(p.control_adapter)) q.control.adapter = existing_file(p.control_adapter, "control_adapter");
+  if (!std::isfinite(p.control_lora_strength) || std::fabs(p.control_lora_strength) > FLT_MAX) {
+    throw std::invalid_argument("control_lora_strength must be a finite number.");  // Control::lora_strength is a float
+  }
+  q.control.lora_strength = static_cast<float>(p.control_lora_strength);
+  if (p.control_images_count > 0 && p.control_images == nullptr) {
+    throw std::invalid_argument("control_images: NULL array with a nonzero count.");
+  }
+  if (p.control_images_count > kMaxControlImages) {
+    throw std::invalid_argument("control_images: at most " + std::to_string(kMaxControlImages) + " entries (got " +
+                                std::to_string(p.control_images_count) + ").");
+  }
+  if (p.control_images_count > 0 && !q.control.enabled()) {
+    throw std::invalid_argument("control_images need a control_adapter.");
+  }
+  for (std::size_t i = 0; i < p.control_images_count; ++i) {
+    const mi_control_image& c = p.control_images[i];
+    const std::string name = "control_images[" + std::to_string(i) + "]";
+    if (!given(c.kind)) throw std::invalid_argument(name + ".kind is required (one of the adapter's, e.g. depth).");
+    if (c.image == nullptr && !given(c.image_path)) throw std::invalid_argument(name + " needs an image or an image_path.");
+    if (c.image != nullptr && c.image->channels != 1 && c.image->channels != 3) {
+      throw std::invalid_argument(name + ".image.channels must be 3 (RGB) or 1 (grayscale), not " +
+                                  std::to_string(c.image->channels) + ".");
+    }
+    if (!std::isfinite(c.strength) || c.strength < 0 || c.strength > 10) {
+      throw std::invalid_argument(name + ".strength must be between 0 and 10.");
+    }
+    if (!(0 <= c.start && c.start <= c.end && c.end <= 1)) throw std::invalid_argument(name + ": require 0 <= start <= end <= 1.");
+    // A file is read as RGB (a grayscale file replicated, as `moss-infer generate --control-image`); pixels as given.
+    const int channels = c.image != nullptr ? c.image->channels : 3;
+    const ImageInput in = check_image(c.image, c.image_path, channels, false, name + ".image");
+    pipeline::Request::ControlImage ci;
+    ci.kind = c.kind;
+    ci.image = load_images ? load_input(in, channels, false, name + ".image") : stand_in(channels);
+    ci.strength = c.strength;
+    ci.start = c.start;
+    ci.end = c.end;
+    q.control.images.push_back(std::move(ci));
+  }
+
+  // The lossy accelerators (pipeline/accel/accel.h): a threshold of 0 is the recommended one.
+  q.accel.cfg_truncation = p.cfg_truncation;
+  switch (p.step_cache) {
+    case MI_STEP_CACHE_OFF: q.accel.step_cache = pipeline::accel::StepCacheKind::kOff; break;
+    case MI_STEP_CACHE_FBCACHE: q.accel.step_cache = pipeline::accel::StepCacheKind::kFbCache; break;
+    default: unknown("step_cache", static_cast<int>(p.step_cache));
+  }
+  if (!std::isfinite(p.step_cache_threshold) || p.step_cache_threshold < 0 || p.step_cache_threshold > 1) {
+    throw std::invalid_argument("step_cache_threshold must be 0 (the default) or greater than 0 and at most 1.");
+  }
+  q.accel.step_cache_threshold = p.step_cache_threshold > 0 ? p.step_cache_threshold : pipeline::accel::kDefaultFbCacheThreshold;
+
   if (distill_dataspace && (init.given() || q.hires.enabled())) {
     throw std::invalid_argument("distill_dir selected the bundle's dataspace sampler, which cannot start from an image "
                                 "(init_image, hires_width / hires_height); set sampler to use another sampler.");
@@ -614,6 +668,7 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
   g.tier.attention = from_attention(td.attention);
   // Reference needs no certificate: certified, also for the default decision of a generation cancelled before it.
   g.tier.certified = td.certified || td.effective == planner::Tier::kReference ? 1 : 0;
+  g.tier.run_certified = td.certified ? 1 : 0;  // the run's, as the report's models.dit.certified
   g.tier.dit_precision = td.precision == planner::Precision::kInt4   ? MI_PRECISION_W4A4
                          : td.precision == planner::Precision::kInt8 ? MI_PRECISION_INT8
                                                                      : MI_PRECISION_BF16;
@@ -641,6 +696,33 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
   }
   g.lora_warnings = r.lora_warnings;
   g.lora_notes = r.lora_notes;
+
+  const pipeline::Result::ControlReport& c = r.control;
+  g.control.struct_size = sizeof g.control;
+  g.control.active = c.adapter.empty() ? 0 : 1;
+  g.control.kinds_count = count32(c.kinds.size());
+  g.control.encodes = c.encodes;
+  g.control.lora_adapters = c.lora.adapters;
+  g.control.lora_side_branch = c.lora.side_branch;
+  g.control.lora_merged = c.lora.merged;
+  g.control.lora_unknown_keys = count32(c.lora.unknown.size());
+  g.control.lora_warnings = count32(c.lora.warnings.size());
+  g.control.lora_notes = count32(c.lora.notes.size());
+  g.control_adapter = c.adapter;
+  for (const std::string& k : c.kinds) g.control_kinds += (g.control_kinds.empty() ? "" : ",") + k;
+  g.control_base_model = c.base_model;
+  g.control_encode_schedule = c.encode_schedule;
+  g.control_warnings = c.lora.warnings;
+  g.control_notes = c.lora.notes;
+
+  const pipeline::accel::Stats& a = r.accel;
+  g.accel.struct_size = sizeof g.accel;
+  g.accel.cfg_truncated_steps = a.cfg_truncated_steps;
+  g.accel.dit_calls = a.dit_calls;
+  g.accel.cached_calls = a.cached_calls;
+  g.accel.lossy = q.accel.active(q.cfg != 1.0) ? 1 : 0;
+  g.accelerators = q.accel.describe(q.cfg != 1.0);
+  g.cached_steps.assign(a.cached_steps.begin(), a.cached_steps.end());
   return g;
 }
 
@@ -740,6 +822,8 @@ Generation PipelineAdapter::generate(const mi_gen_params& params, const std::ato
     throw ModelError(e.what());  // a LoRA file that cannot be applied (or, strict, an unknown key or a lossy merge)
   } catch (const pipeline::DataspaceError& e) {
     throw ModelError(e.what());  // a dataspace file that changed since to_request read it
+  } catch (const control::ControlError& e) {
+    throw ModelError(e.what());  // control_adapter is not a control adapter (no widened embedder, bad kinds metadata)
   }
   return to_generation(q, r, params.include_prompts != 0);
 }

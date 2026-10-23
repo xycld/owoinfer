@@ -54,7 +54,7 @@ static_assert(sizeof(mi_status) == 4 && sizeof(mi_mode) == 4 && sizeof(mi_model_
               sizeof(mi_attention) == 4 && sizeof(mi_precision) == 4 && sizeof(mi_scheduler) == 4 &&
               sizeof(mi_noise_layout) == 4 && sizeof(mi_noise_source) == 4 && sizeof(mi_result_text_kind) == 4 &&
               sizeof(mi_message_kind) == 4 && sizeof(mi_mask_encoding) == 4 && sizeof(mi_resize_mode) == 4 &&
-              sizeof(mi_image_mode) == 4,
+              sizeof(mi_image_mode) == 4 && sizeof(mi_step_cache) == 4,
               "C API enums are 32-bit");
 #define MI_LAYOUT(type, field, offset) static_assert(offsetof(type, field) == (offset), #type "." #field)
 static_assert(sizeof(mi_device_info) == 592);
@@ -118,7 +118,7 @@ MI_LAYOUT(mi_progress, total_steps, 16);
 MI_LAYOUT(mi_progress, _reserved0, 20);
 MI_LAYOUT(mi_progress, step_seconds, 24);
 MI_LAYOUT(mi_progress, elapsed_seconds, 32);
-static_assert(sizeof(mi_gen_params) == 320);
+static_assert(sizeof(mi_gen_params) == 376);
 MI_LAYOUT(mi_gen_params, struct_size, 0);
 MI_LAYOUT(mi_gen_params, prompt, 8);
 MI_LAYOUT(mi_gen_params, negative_prompt, 16);
@@ -168,7 +168,22 @@ MI_LAYOUT(mi_gen_params, hires_height, 292);
 MI_LAYOUT(mi_gen_params, hires_strength, 296);
 MI_LAYOUT(mi_gen_params, hires_steps, 304);
 MI_LAYOUT(mi_gen_params, _reserved3, 308);
-MI_LAYOUT(mi_gen_params, distill_dir, 312);
+MI_LAYOUT(mi_gen_params, distill_dir, 312);  // the 1.0.0 layout ends here (320 bytes)
+MI_LAYOUT(mi_gen_params, control_adapter, 320);
+MI_LAYOUT(mi_gen_params, control_lora_strength, 328);
+MI_LAYOUT(mi_gen_params, control_images, 336);
+MI_LAYOUT(mi_gen_params, control_images_count, 344);
+MI_LAYOUT(mi_gen_params, cfg_truncation, 352);
+MI_LAYOUT(mi_gen_params, step_cache, 360);
+MI_LAYOUT(mi_gen_params, _reserved4, 364);
+MI_LAYOUT(mi_gen_params, step_cache_threshold, 368);
+static_assert(sizeof(mi_control_image) == 48);  // array element: no struct_size, frozen
+MI_LAYOUT(mi_control_image, kind, 0);
+MI_LAYOUT(mi_control_image, image, 8);
+MI_LAYOUT(mi_control_image, image_path, 16);
+MI_LAYOUT(mi_control_image, strength, 24);
+MI_LAYOUT(mi_control_image, start, 32);
+MI_LAYOUT(mi_control_image, end, 40);
 static_assert(sizeof(mi_lora) == 16);  // array element: no struct_size, frozen
 MI_LAYOUT(mi_lora, path, 0);
 MI_LAYOUT(mi_lora, strength, 8);
@@ -215,14 +230,16 @@ MI_LAYOUT(mi_dit_stream_stats, stall_seconds, 40);
 MI_LAYOUT(mi_dit_stream_stats, h2d_gbps, 48);
 MI_LAYOUT(mi_dit_stream_stats, hidden_fraction, 56);
 MI_LAYOUT(mi_dit_stream_stats, source, 64);
-static_assert(sizeof(mi_tier_info) == 32);
+static_assert(sizeof(mi_tier_info) == 40);
 MI_LAYOUT(mi_tier_info, struct_size, 0);
 MI_LAYOUT(mi_tier_info, requested, 8);
 MI_LAYOUT(mi_tier_info, effective, 12);
 MI_LAYOUT(mi_tier_info, attention, 16);
 MI_LAYOUT(mi_tier_info, certified, 20);
 MI_LAYOUT(mi_tier_info, dit_precision, 24);
-MI_LAYOUT(mi_tier_info, text_encoder_precision, 28);
+MI_LAYOUT(mi_tier_info, text_encoder_precision, 28);  // the 1.0.0 layout ends here (32 bytes)
+MI_LAYOUT(mi_tier_info, run_certified, 32);
+MI_LAYOUT(mi_tier_info, _reserved0, 36);
 static_assert(sizeof(mi_prompt_tokens) == 32);
 MI_LAYOUT(mi_prompt_tokens, struct_size, 0);
 MI_LAYOUT(mi_prompt_tokens, total_tokens, 8);
@@ -257,6 +274,24 @@ MI_LAYOUT(mi_image_info, hires_steps_run, 56);
 MI_LAYOUT(mi_image_info, _reserved0, 60);
 MI_LAYOUT(mi_image_info, first_strength, 64);
 MI_LAYOUT(mi_image_info, hires_strength, 72);
+static_assert(sizeof(mi_control_info) == 48);
+MI_LAYOUT(mi_control_info, struct_size, 0);
+MI_LAYOUT(mi_control_info, active, 8);
+MI_LAYOUT(mi_control_info, kinds_count, 12);
+MI_LAYOUT(mi_control_info, encodes, 16);
+MI_LAYOUT(mi_control_info, lora_adapters, 20);
+MI_LAYOUT(mi_control_info, lora_side_branch, 24);
+MI_LAYOUT(mi_control_info, lora_merged, 28);
+MI_LAYOUT(mi_control_info, lora_unknown_keys, 32);
+MI_LAYOUT(mi_control_info, lora_warnings, 36);
+MI_LAYOUT(mi_control_info, lora_notes, 40);
+MI_LAYOUT(mi_control_info, _reserved0, 44);
+static_assert(sizeof(mi_accel_info) == 24);
+MI_LAYOUT(mi_accel_info, struct_size, 0);
+MI_LAYOUT(mi_accel_info, cfg_truncated_steps, 8);
+MI_LAYOUT(mi_accel_info, dit_calls, 12);
+MI_LAYOUT(mi_accel_info, cached_calls, 16);
+MI_LAYOUT(mi_accel_info, lossy, 20);
 #undef MI_LAYOUT
 
 // Every size a versioned input struct has had: the 0.1 layout, then today's. A struct of an older size is read as
@@ -264,13 +299,17 @@ MI_LAYOUT(mi_image_info, hires_strength, 72);
 constexpr std::size_t kEngineParamsSizes[] = {offsetof(mi_engine_params, dit_file),
                                                offsetof(mi_engine_params, time_embedding_file), sizeof(mi_engine_params)};
 constexpr std::size_t kGenParamsSizes[] = {offsetof(mi_gen_params, scheduler), offsetof(mi_gen_params, init_image),
-                                            sizeof(mi_gen_params)};
+                                            offsetof(mi_gen_params, control_adapter), sizeof(mi_gen_params)};
 // Output structs that grew: mi_timings (0.1.0: 104 bytes), mi_probe_info (0.2.0: 576 bytes).
 constexpr std::size_t kTimingsSizes[] = {offsetof(mi_timings, vae_encoder_load_s), sizeof(mi_timings)};
 constexpr std::size_t kProbeInfoSizes[] = {offsetof(mi_probe_info, cublaslt_source), sizeof(mi_probe_info)};
+// mi_tier_info (1.0.0: 32 bytes, before run_certified).
+constexpr std::size_t kTierInfoSizes[] = {offsetof(mi_tier_info, run_certified), sizeof(mi_tier_info)};
+static_assert(kTierInfoSizes[0] == 32, "the 1.0.0 mi_tier_info");
 static_assert(kEngineParamsSizes[0] == 80 && kGenParamsSizes[0] == 168 && kTimingsSizes[0] == 104, "the 0.1.0 layouts");
 static_assert(kProbeInfoSizes[0] == 576, "the 0.2.0 mi_probe_info");
 static_assert(kEngineParamsSizes[1] == 120 && kGenParamsSizes[1] == 240, "the first 0.2.0 layouts");
+static_assert(kGenParamsSizes[2] == 320, "the 1.0.0 mi_gen_params");
 
 thread_local std::string t_last_error;
 // Set instead of t_last_error when copying a message failed (no memory): mi_last_error_message() must stay valid.
@@ -361,6 +400,7 @@ void check_reserved(const mi_gen_params& p) {
   check_reserved(p._reserved1, "mi_gen_params._reserved1");
   check_reserved(p._reserved2, "mi_gen_params._reserved2");
   check_reserved(p._reserved3, "mi_gen_params._reserved3");
+  check_reserved(p._reserved4, "mi_gen_params._reserved4");
 }
 
 // Versioned structs: `known` lists every size the struct has had (ABI 1: it only grows at the end).
@@ -421,11 +461,15 @@ mi_gen_params gen_params_defaults(std::size_t size = sizeof(mi_gen_params)) {
   p.hires_strength = 0.45;
   p.mask_encoding = MI_MASK_U8;
   p.resize = MI_RESIZE_CROP;
+  // No control adapter, the accelerators off (step_cache_threshold 0: the recommended one).
+  p.control_lora_strength = 1.0;
+  p.cfg_truncation = 1.0;
+  p.step_cache = MI_STEP_CACHE_OFF;
   // A 0.1.0 program (168 bytes) wrote PNGs without metadata: it keeps doing so.
   if (size <= offsetof(mi_gen_params, scheduler)) p.save_metadata = p.include_prompts = 0;
-  // The current layout leaves the context-dependent fields unset (mossinfer.h, "Unset markers"); the older ones
-  // keep their explicit 50 steps and CFG 3.
-  if (size == sizeof p) {
+  // The 1.0.0 layout and later leave the context-dependent fields unset (mossinfer.h, "Unset markers"); the older
+  // ones keep their explicit 50 steps and CFG 3.
+  if (size >= offsetof(mi_gen_params, control_adapter)) {
     p.steps = 0;
     p.cfg = -1.0;
   }
@@ -485,6 +529,8 @@ const std::vector<std::string>* messages(const mi::api::Generation& g, mi_messag
   switch (kind) {
     case MI_MESSAGE_LORA_WARNING: return &g.lora_warnings;
     case MI_MESSAGE_LORA_NOTE: return &g.lora_notes;
+    case MI_MESSAGE_CONTROL_WARNING: return &g.control_warnings;
+    case MI_MESSAGE_CONTROL_NOTE: return &g.control_notes;
     case MI_MESSAGE_MAX_ENUM: break;
   }
   return nullptr;
@@ -508,6 +554,12 @@ std::string flavour_string(mi::backend::Flavour f) {
 }
 
 }  // namespace
+
+mi_result* mi::api::new_result(Generation generation) {
+  auto result = std::make_unique<mi_result>();
+  result->generation = std::move(generation);
+  return result.release();
+}
 
 extern "C" {
 
@@ -545,7 +597,7 @@ const char* mi_last_error_message(void) {
 
 uint32_t mi_capabilities(void) {
   return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS | MI_CAP_IMAGE_INPUT | MI_CAP_HIRES |
-         MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA;
+         MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL | MI_CAP_ACCEL;
 }
 
 mi_status mi_probe(mi_probe_info* info) {
@@ -820,7 +872,9 @@ mi_status mi_result_image(const mi_result* result, mi_image_info* out) {
 mi_status mi_result_tier(const mi_result* result, mi_tier_info* out) {
   return guarded([&] {
     require(out, "out");
-    check_size(out->struct_size, sizeof(mi_tier_info), "mi_tier_info");
+    std::size_t size = 0;
+    std::memcpy(&size, out, sizeof size);  // a 1.0.0 (32-byte) mi_tier_info is accepted
+    check_size(size, kTierInfoSizes, "mi_tier_info");
     require(result, "result");
     write_output(out, result->generation.tier);
     return MI_OK;
@@ -839,10 +893,48 @@ const char* mi_result_text(const mi_result* result, mi_result_text_kind kind) {
       case MI_TEXT_QUALITY_JSON: return g.quality_json.c_str();
       case MI_TEXT_IMAGE_NOTE: return g.image_note.c_str();
       case MI_TEXT_TIME_EMBEDDING: return g.time_embedding.c_str();
+      case MI_TEXT_CONTROL_ADAPTER: return g.control_adapter.c_str();
+      case MI_TEXT_CONTROL_KINDS: return g.control_kinds.c_str();
+      case MI_TEXT_CONTROL_BASE_MODEL: return g.control_base_model.c_str();
+      case MI_TEXT_CONTROL_ENCODE_SCHEDULE: return g.control_encode_schedule.c_str();
+      case MI_TEXT_ACCELERATORS: return g.accelerators.c_str();
       case MI_TEXT_MAX_ENUM: break;
     }
     set_error("mi_result_text: unknown kind.");
     return nullptr;
+  });
+}
+
+mi_status mi_result_control(const mi_result* result, mi_control_info* out) {
+  return guarded([&] {
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_control_info), "mi_control_info");
+    require(result, "result");
+    write_output(out, result->generation.control);
+    return MI_OK;
+  });
+}
+
+mi_status mi_result_accel(const mi_result* result, mi_accel_info* out) {
+  return guarded([&] {
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_accel_info), "mi_accel_info");
+    require(result, "result");
+    write_output(out, result->generation.accel);
+    return MI_OK;
+  });
+}
+
+const int32_t* mi_result_accel_cached_steps(const mi_result* result, size_t* count) {
+  if (count == nullptr) {
+    set_error("count is NULL.");
+    return nullptr;
+  }
+  *count = 0;
+  return get(result, static_cast<const int32_t*>(nullptr), [&](const mi::api::Generation& g) -> const int32_t* {
+    if (g.cached_steps.empty()) return nullptr;
+    *count = g.cached_steps.size();
+    return g.cached_steps.data();
   });
 }
 

@@ -87,13 +87,16 @@ TEST(CApi, VersionAndAbi) {
   EXPECT_EQ(mi_abi_version(), MI_ABI_VERSION);
   // P6: preview, component files, LoRA, tiers and the extended samplers; a ComfyUI file as model_path is not.
   EXPECT_EQ(mi_capabilities(), MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS |
-                                  MI_CAP_IMAGE_INPUT | MI_CAP_HIRES | MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA);
+                                  MI_CAP_IMAGE_INPUT | MI_CAP_HIRES | MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL |
+                                  MI_CAP_ACCEL);
   EXPECT_EQ(mi_capabilities() & MI_CAP_COMFYUI_MODELS, 0u);
   EXPECT_EQ(MI_CAP_PREVIEW | MI_CAP_COMFYUI_MODELS | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS, 0x3fu);
   EXPECT_EQ(MI_CAP_IMAGE_INPUT, 0x40u);
   EXPECT_EQ(MI_CAP_HIRES, 0x80u);
   EXPECT_EQ(MI_CAP_DISTILL, 0x100u);
   EXPECT_EQ(MI_CAP_SYSTEM_CUDA, 0x200u);
+  EXPECT_EQ(MI_CAP_CONTROL, 0x400u);
+  EXPECT_EQ(MI_CAP_ACCEL, 0x800u);
   EXPECT_STREQ(mi_status_string(MI_OK), "MI_OK");
   EXPECT_STREQ(mi_status_string(MI_CANCELLED), "MI_CANCELLED");
   EXPECT_STREQ(mi_status_string(MI_ERR_BUSY), "MI_ERR_BUSY");
@@ -159,6 +162,17 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_EQ(g.hires_steps, q.hires.steps);
   EXPECT_EQ(g._reserved3, 0);
   EXPECT_EQ(g.distill_dir, nullptr);
+  // Control adapter and accelerators: none, off.
+  EXPECT_EQ(g.control_adapter, nullptr);
+  EXPECT_FALSE(q.control.enabled());
+  EXPECT_EQ(g.control_lora_strength, q.control.lora_strength);
+  EXPECT_EQ(g.control_images, nullptr);
+  EXPECT_EQ(g.control_images_count, q.control.images.size());
+  EXPECT_EQ(g.cfg_truncation, q.accel.cfg_truncation);
+  EXPECT_EQ(g.step_cache, MI_STEP_CACHE_OFF);
+  EXPECT_EQ(q.accel.step_cache, mi::pipeline::accel::StepCacheKind::kOff);
+  EXPECT_EQ(g._reserved4, 0);
+  EXPECT_EQ(g.step_cache_threshold, 0.0);  // unset: Options::step_cache_threshold
 
   const mi_engine_params e = engine_defaults();
   const mi::pipeline::PipelineOptions o;
@@ -208,6 +222,12 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_EQ(r.init_image, nullptr);
   EXPECT_EQ(r.mask, nullptr);
   EXPECT_FALSE(r.hires.enabled());
+  EXPECT_FALSE(r.control.enabled());
+  EXPECT_EQ(r.control.lora_strength, q.control.lora_strength);
+  EXPECT_TRUE(r.control.images.empty());
+  EXPECT_EQ(r.accel.cfg_truncation, q.accel.cfg_truncation);
+  EXPECT_EQ(r.accel.step_cache, q.accel.step_cache);
+  EXPECT_EQ(r.accel.step_cache_threshold, q.accel.step_cache_threshold);
   const mi::pipeline::PipelineOptions ro = mi::api::to_options(e);
   EXPECT_EQ(ro.tier, o.tier);
   EXPECT_EQ(ro.attention, o.attention);
@@ -307,6 +327,8 @@ TEST(CApi, OldStructSizes) {
   ASSERT_EQ(mi_gen_params_init(&g, kGen01), MI_OK) << last_error();
   EXPECT_EQ(g.struct_size, kGen01);
   EXPECT_EQ(g.width, 1024);
+  EXPECT_EQ(g.steps, 50);  // explicit, not the unset markers of the current size
+  EXPECT_EQ(g.cfg, 3.0);
   EXPECT_EQ(g.user_data, nullptr);
   const auto* bytes = reinterpret_cast<const unsigned char*>(&g);
   for (std::size_t i = kGen01; i < sizeof g; ++i) ASSERT_EQ(bytes[i], 0x5a) << "byte " << i << " written";
@@ -328,7 +350,7 @@ TEST(CApi, OldStructSizes) {
   for (const std::size_t bad : {kGen01 - 8, kGen01 + 8, sizeof g - 8}) {
     g.struct_size = bad;
     EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_ABI_MISMATCH) << bad;
-    EXPECT_NE(last_error().find("168, 240 or 320"), std::string::npos) << last_error();
+    EXPECT_NE(last_error().find("168, 240, 320 or 376"), std::string::npos) << last_error();
   }
 
   mi_engine_params e;
@@ -778,6 +800,34 @@ TEST(CApi, NullHandlesAndPointers) {
   EXPECT_EQ(mi_result_image(nullptr, nullptr), MI_ERR_INVALID_ARGUMENT);
   EXPECT_EQ(mi_result_text(nullptr, MI_TEXT_IMAGE_NOTE), nullptr);
   EXPECT_EQ(mi_result_text(nullptr, MI_TEXT_TIME_EMBEDDING), nullptr);
+  // Control adapter and accelerators.
+  mi_control_info control{};
+  control.struct_size = sizeof control;
+  EXPECT_EQ(mi_result_control(nullptr, &control), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("result is NULL"), std::string::npos) << last_error();
+  EXPECT_EQ(mi_result_control(nullptr, nullptr), MI_ERR_INVALID_ARGUMENT);
+  control.struct_size = sizeof control - 8;
+  EXPECT_EQ(mi_result_control(nullptr, &control), MI_ERR_ABI_MISMATCH);
+  EXPECT_NE(last_error().find("mi_control_info.struct_size"), std::string::npos) << last_error();
+  mi_accel_info accel{};
+  accel.struct_size = sizeof accel;
+  EXPECT_EQ(mi_result_accel(nullptr, &accel), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_result_accel(nullptr, nullptr), MI_ERR_INVALID_ARGUMENT);
+  accel.struct_size = sizeof accel + 8;
+  EXPECT_EQ(mi_result_accel(nullptr, &accel), MI_ERR_ABI_MISMATCH);
+  EXPECT_NE(last_error().find("mi_accel_info.struct_size"), std::string::npos) << last_error();
+  std::size_t count = 5;
+  EXPECT_EQ(mi_result_accel_cached_steps(nullptr, &count), nullptr);
+  EXPECT_EQ(count, 0u);
+  EXPECT_NE(last_error().find("result is NULL"), std::string::npos) << last_error();
+  EXPECT_EQ(mi_result_accel_cached_steps(nullptr, nullptr), nullptr);
+  EXPECT_NE(last_error().find("count is NULL"), std::string::npos) << last_error();
+  for (const mi_result_text_kind kind : {MI_TEXT_CONTROL_ADAPTER, MI_TEXT_CONTROL_KINDS, MI_TEXT_CONTROL_BASE_MODEL,
+                                         MI_TEXT_CONTROL_ENCODE_SCHEDULE, MI_TEXT_ACCELERATORS}) {
+    EXPECT_EQ(mi_result_text(nullptr, kind), nullptr) << kind;
+  }
+  EXPECT_EQ(mi_result_message_count(nullptr, MI_MESSAGE_CONTROL_WARNING), 0);
+  EXPECT_EQ(mi_result_message(nullptr, MI_MESSAGE_CONTROL_NOTE, 0), nullptr);
 }
 
 // Invalid requests fail with the pipeline's (the official app's) wording, without an engine.
@@ -1607,6 +1657,398 @@ TEST(CApi, ImageResultFromAPipelineResult) {
   EXPECT_EQ(tg.image.first_strength, 1.0);
 }
 
+// Control adapters and the accelerators (MI_CAP_CONTROL, MI_CAP_ACCEL): mapped into pipeline::Request, every argument
+// checked without a GPU; validation neither copies nor decodes the control images. The adapter's format and kinds are
+// mi_generate()'s (the pipeline's), so a stand-in file passes here.
+TEST(CApi, ControlAndAccelerators) {
+  mi::testing::TempDir dir("c_api_control");
+  const std::string adapter = mi::util::path_utf8(dir.path() / "control.safetensors");
+  std::ofstream(dir.path() / "control.safetensors") << "not read before mi_generate()";
+  std::vector<std::uint8_t> rgb(32 * 16 * 3), depth(32 * 16);
+  for (std::size_t i = 0; i < rgb.size(); ++i) rgb[i] = static_cast<std::uint8_t>(i * 5);
+  for (std::size_t i = 0; i < depth.size(); ++i) depth[i] = static_cast<std::uint8_t>(i);
+  const std::string png = mi::util::path_utf8(dir.path() / "color.png");
+  ASSERT_EQ(mi_write_png(png.c_str(), rgb.data(), 32, 16), MI_OK) << last_error();
+  const std::string garbage = mi::util::path_utf8(dir.path() / "garbage.png");
+  std::ofstream(dir.path() / "garbage.png") << "not an image";
+  const mi_image depth_px = rgb_image(depth, 32, 16, 1);
+
+  mi_control_image images[2] = {};
+  images[0].kind = "depth";
+  images[0].image = &depth_px;
+  images[0].strength = 0.75;
+  images[0].start = 0.0;
+  images[0].end = 0.5;
+  images[1].kind = "color";
+  images[1].image_path = png.c_str();
+  images[1].strength = 2.0;
+  images[1].start = 0.25;
+  images[1].end = 1.0;
+  mi_gen_params p = gen_defaults();
+  p.prompt = "a cat";
+  p.control_adapter = adapter.c_str();
+  p.control_lora_strength = 0.5;
+  p.control_images = images;
+  p.control_images_count = 2;
+  p.cfg_truncation = 0.6;
+  p.step_cache = MI_STEP_CACHE_FBCACHE;
+  ASSERT_EQ(mi_gen_params_validate(&p), MI_OK) << last_error();
+  mi::pipeline::Request q = mi::api::to_request(p);
+  EXPECT_TRUE(q.control.enabled());
+  EXPECT_EQ(mi::util::path_utf8(q.control.adapter), adapter);
+  EXPECT_EQ(q.control.lora_strength, 0.5f);
+  ASSERT_EQ(q.control.images.size(), 2u);
+  EXPECT_EQ(q.control.images[0].kind, "depth");
+  ASSERT_NE(q.control.images[0].image, nullptr);
+  EXPECT_EQ(q.control.images[0].image->channels, 1);  // grayscale pixels as given (the pipeline replicates them)
+  EXPECT_EQ(q.control.images[0].image->pixels, depth);
+  EXPECT_NE(q.control.images[0].image->pixels.data(), depth.data());
+  EXPECT_EQ(q.control.images[0].strength, 0.75);
+  EXPECT_EQ(q.control.images[0].start, 0.0);
+  EXPECT_EQ(q.control.images[0].end, 0.5);
+  EXPECT_EQ(q.control.images[1].kind, "color");
+  ASSERT_NE(q.control.images[1].image, nullptr);
+  EXPECT_EQ(q.control.images[1].image->channels, 3);  // a file is read as RGB
+  EXPECT_EQ(q.control.images[1].image->width, 32);
+  EXPECT_EQ(q.control.images[1].image->pixels, rgb);
+  EXPECT_EQ(q.control.images[1].strength, 2.0);
+  EXPECT_EQ(q.control.images[1].start, 0.25);
+  EXPECT_EQ(q.accel.cfg_truncation, 0.6);
+  EXPECT_EQ(q.accel.step_cache, mi::pipeline::accel::StepCacheKind::kFbCache);
+  EXPECT_EQ(q.accel.step_cache_threshold, mi::pipeline::accel::kDefaultFbCacheThreshold);  // 0: the recommended one
+  p.step_cache_threshold = 0.2;
+  EXPECT_EQ(mi::api::to_request(p).accel.step_cache_threshold, 0.2);
+  // Validation loads nothing: 1x1 stand-ins, and an undecodable file passes until mi_generate() decodes it.
+  q = mi::api::to_request(p, nullptr, false);
+  ASSERT_EQ(q.control.images.size(), 2u);
+  EXPECT_EQ(q.control.images[0].image->width, 1);
+  EXPECT_EQ(q.control.images[0].image->channels, 1);
+  EXPECT_EQ(q.control.images[1].image->width, 1);
+  images[1].image_path = garbage.c_str();
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_OK) << last_error();
+  EXPECT_THROW(mi::api::to_request(p), std::invalid_argument);
+  images[1].image_path = png.c_str();
+  // An adapter without images is valid (every kind gets no control); a threshold without the step cache is ignored.
+  p.control_images_count = 0;
+  p.step_cache = MI_STEP_CACHE_OFF;
+  p.step_cache_threshold = 0.5;
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_OK) << last_error();
+  EXPECT_FALSE(mi::api::to_request(p).accel.step_cache_on());
+
+  // Every rejection, with the C fields' names.
+  struct Case {
+    const char* what;
+    std::function<void(mi_gen_params&, mi_control_image*)> edit;
+    const char* message;
+  };
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  static const std::string missing = "/nonexistent/control.safetensors";
+  const std::vector<Case> cases = {
+      {"images without an adapter", [](mi_gen_params& g, mi_control_image*) { g.control_adapter = nullptr; },
+       "control_images need a control_adapter"},
+      {"empty adapter path", [](mi_gen_params& g, mi_control_image*) { g.control_adapter = ""; },
+       "control_images need a control_adapter"},
+      {"missing adapter", [](mi_gen_params& g, mi_control_image*) { g.control_adapter = missing.c_str(); },
+       "control_adapter: file not found"},
+      {"NULL array", [](mi_gen_params& g, mi_control_image*) { g.control_images = nullptr; }, "control_images: NULL array"},
+      {"too many", [](mi_gen_params& g, mi_control_image*) { g.control_images_count = 17; }, "at most 16 entries"},
+      {"no kind", [](mi_gen_params&, mi_control_image* c) { c[1].kind = nullptr; }, "control_images[1].kind is required"},
+      {"empty kind", [](mi_gen_params&, mi_control_image* c) { c[0].kind = ""; }, "control_images[0].kind is required"},
+      {"duplicate kind", [](mi_gen_params&, mi_control_image* c) { c[1].kind = "depth"; }, "Two control images of kind"},
+      {"both image and path", [&](mi_gen_params&, mi_control_image* c) { c[1].image = &depth_px; }, "are both set"},
+      {"neither image nor path", [](mi_gen_params&, mi_control_image* c) { c[1].image_path = ""; },
+       "control_images[1] needs an image or an image_path"},
+      {"missing image file", [](mi_gen_params&, mi_control_image* c) { c[1].image_path = "/nonexistent/x.png"; },
+       "control_images[1].image_path: file not found"},
+      {"4 channels", [](mi_gen_params&, mi_control_image* c) { const_cast<mi_image*>(c[0].image)->channels = 4; },
+       "3 (RGB) or 1 (grayscale), not 4"},
+      {"bad image size", [](mi_gen_params&, mi_control_image* c) { const_cast<mi_image*>(c[0].image)->width = 0; },
+       "control_images[0].image is 0x16"},
+      {"negative strength", [](mi_gen_params&, mi_control_image* c) { c[0].strength = -0.1; }, "strength must be between 0 and 10"},
+      {"strength above 10", [](mi_gen_params&, mi_control_image* c) { c[0].strength = 10.5; }, "control_images[0].strength"},
+      {"NaN strength", [&](mi_gen_params&, mi_control_image* c) { c[1].strength = nan; }, "control_images[1].strength"},
+      {"start > end", [](mi_gen_params&, mi_control_image* c) { c[0].start = 0.6; }, "require 0 <= start <= end <= 1"},
+      {"end > 1", [](mi_gen_params&, mi_control_image* c) { c[1].end = 1.5; }, "require 0 <= start <= end <= 1"},
+      {"start < 0", [](mi_gen_params&, mi_control_image* c) { c[0].start = -0.5; }, "require 0 <= start <= end <= 1"},
+      {"NaN end", [&](mi_gen_params&, mi_control_image* c) { c[0].end = nan; }, "require 0 <= start <= end <= 1"},
+      {"infinite LoRA strength", [&](mi_gen_params& g, mi_control_image*) { g.control_lora_strength = inf; },
+       "control_lora_strength must be a finite number"},
+      {"LoRA strength beyond a float", [](mi_gen_params& g, mi_control_image*) { g.control_lora_strength = 1e300; },
+       "control_lora_strength must be a finite number"},
+      {"cfg_truncation below 0", [](mi_gen_params& g, mi_control_image*) { g.cfg_truncation = -0.1; },
+       "cfg_truncation must be between 0 and 1"},
+      {"cfg_truncation above 1", [](mi_gen_params& g, mi_control_image*) { g.cfg_truncation = 1.5; },
+       "cfg_truncation must be between 0 and 1"},
+      {"NaN cfg_truncation", [&](mi_gen_params& g, mi_control_image*) { g.cfg_truncation = nan; },
+       "cfg_truncation must be between 0 and 1"},
+      {"unknown step_cache", [](mi_gen_params& g, mi_control_image*) { g.step_cache = static_cast<mi_step_cache>(2); },
+       "step_cache: unknown value 2"},
+      {"MAX_ENUM step_cache", [](mi_gen_params& g, mi_control_image*) { g.step_cache = MI_STEP_CACHE_MAX_ENUM; },
+       "step_cache: unknown value 2147483647"},
+      {"negative threshold", [](mi_gen_params& g, mi_control_image*) { g.step_cache_threshold = -0.01; },
+       "step_cache_threshold must be 0 (the default) or greater than 0 and at most 1"},
+      {"threshold above 1", [](mi_gen_params& g, mi_control_image*) { g.step_cache_threshold = 1.01; }, "step_cache_threshold"},
+      {"NaN threshold", [&](mi_gen_params& g, mi_control_image*) { g.step_cache_threshold = nan; }, "step_cache_threshold"},
+      {"nonzero _reserved4", [](mi_gen_params& g, mi_control_image*) { g._reserved4 = 1; }, "mi_gen_params._reserved4"},
+  };
+  for (const Case& c : cases) {
+    mi_image px = depth_px;
+    mi_control_image ims[2] = {images[0], images[1]};
+    ims[0].image = &px;
+    mi_gen_params g = p;
+    g.control_images = ims;
+    g.control_images_count = 2;
+    g.step_cache = MI_STEP_CACHE_FBCACHE;
+    g.step_cache_threshold = 0;
+    c.edit(g, ims);
+    EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_INVALID_ARGUMENT) << c.what;
+    EXPECT_NE(last_error().find(c.message), std::string::npos) << c.what << ": " << last_error();
+  }
+}
+
+// The 1.0.0 mi_gen_params (320 bytes) is accepted: init fills only that prefix, with the unset markers of the current
+// size; the library reads only the prefix (no control adapter, the accelerators off).
+TEST(CApi, Gen100StructSize) {
+  constexpr std::size_t kGen100 = 320;
+  mi_gen_params g;
+  std::memset(&g, 0x5a, sizeof g);
+  ASSERT_EQ(mi_gen_params_init(&g, kGen100), MI_OK) << last_error();
+  EXPECT_EQ(g.struct_size, kGen100);
+  EXPECT_EQ(g.steps, 0);     // unset, as at the current size
+  EXPECT_EQ(g.cfg, -1.0);
+  EXPECT_EQ(g.denoise_strength, -1.0);
+  EXPECT_EQ(g.save_metadata, 1);
+  EXPECT_EQ(g.distill_dir, nullptr);
+  const auto* bytes = reinterpret_cast<const unsigned char*>(&g);
+  for (std::size_t i = kGen100; i < sizeof g; ++i) ASSERT_EQ(bytes[i], 0x5a) << "byte " << i << " written";
+  // The tail (garbage control pointers and enum, a nonzero _reserved4) is never read.
+  g.prompt = "a cat";
+  EXPECT_EQ(mi_gen_params_validate(&g), MI_OK) << last_error();
+  g.width = 1000;
+  EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_INVALID_ARGUMENT);  // the prefix is still checked
+  g.width = 1024;
+  g.struct_size = sizeof g;
+  EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("_reserved4"), std::string::npos) << last_error();
+  // The current size's init: the control and accelerator defaults.
+  std::memset(&g, 0x5a, sizeof g);
+  ASSERT_EQ(mi_gen_params_init(&g, sizeof g), MI_OK);
+  EXPECT_EQ(g.control_adapter, nullptr);
+  EXPECT_EQ(g.control_lora_strength, 1.0);
+  EXPECT_EQ(g.control_images_count, 0u);
+  EXPECT_EQ(g.cfg_truncation, 1.0);
+  EXPECT_EQ(g.step_cache, MI_STEP_CACHE_OFF);
+  EXPECT_EQ(g._reserved4, 0);
+  EXPECT_EQ(g.step_cache_threshold, 0.0);
+}
+
+// mi_result_control / mi_result_accel / mi_result_accel_cached_steps and the control texts and messages, from a
+// synthetic pipeline result.
+TEST(CApi, ControlAndAcceleratorResults) {
+  mi::pipeline::Request q;
+  q.model = "/models/MOSS-Image/base";
+  q.prompt = "a cat";
+  q.cfg = 3.0;
+  q.control.adapter = "/ctl/moss_image_color_depth_control.safetensors";
+  q.control.lora_strength = 0.8f;
+  mi::pipeline::Image depth;
+  depth.width = depth.height = 4;
+  depth.channels = 1;
+  depth.pixels.assign(16, 9);
+  mi::pipeline::Request::ControlImage ci;
+  ci.kind = "depth";
+  ci.image = std::make_shared<const mi::pipeline::Image>(depth);
+  ci.end = 0.5;
+  q.control.images = {ci};
+  q.accel.cfg_truncation = 0.5;
+  q.accel.step_cache = mi::pipeline::accel::StepCacheKind::kFbCache;
+  q.accel.step_cache_threshold = 0.05;
+  mi::pipeline::Result r;
+  r.width = r.height = 16;
+  r.rgb.assign(16 * 16 * 3, 1);
+  r.control.adapter = mi::util::path_utf8(q.control.adapter);
+  r.control.kinds = {"color", "depth"};
+  r.control.base_model = "moss-image-sft";
+  r.control.lora.file = r.control.adapter;
+  r.control.lora.adapters = 120;
+  r.control.lora.side_branch = 100;
+  r.control.lora.merged = 20;
+  r.control.lora.unknown = {"x: y"};
+  r.control.lora.warnings = {"blocks.3.attn.qkv: requantized"};
+  r.control.lora.notes = {"rank 64", "alpha from the metadata"};
+  r.control.encodes = 2;
+  r.control.encode_schedule = "untiled";
+  r.accel.cfg_truncated_steps = 3;
+  r.accel.dit_calls = 6;
+  r.accel.cached_calls = 2;
+  r.accel.cached_steps = {4, 6};
+  r.lora_warnings = {"video_embedder: LoRA delta replaced by the control adapter's embedder"};
+
+  mi_result* res = mi::api::new_result(mi::api::to_generation(q, r, true));
+  mi_control_info c;
+  std::memset(&c, 0xff, sizeof c);
+  c.struct_size = sizeof c;
+  ASSERT_EQ(mi_result_control(res, &c), MI_OK) << last_error();
+  EXPECT_EQ(c.struct_size, sizeof c);
+  EXPECT_EQ(c.active, 1);
+  EXPECT_EQ(c.kinds_count, 2);
+  EXPECT_EQ(c.encodes, 2);
+  EXPECT_EQ(c.lora_adapters, 120);
+  EXPECT_EQ(c.lora_side_branch, 100);
+  EXPECT_EQ(c.lora_merged, 20);
+  EXPECT_EQ(c.lora_unknown_keys, 1);
+  EXPECT_EQ(c.lora_warnings, 1);
+  EXPECT_EQ(c.lora_notes, 2);
+  EXPECT_EQ(c._reserved0, 0);  // output padding is zeroed
+  c.struct_size = sizeof c - 4;
+  EXPECT_EQ(mi_result_control(res, &c), MI_ERR_ABI_MISMATCH);
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_CONTROL_ADAPTER), "/ctl/moss_image_color_depth_control.safetensors");
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_CONTROL_KINDS), "color,depth");
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_CONTROL_BASE_MODEL), "moss-image-sft");
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_CONTROL_ENCODE_SCHEDULE), "untiled");
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_ACCELERATORS), "cfg_truncation 0.5, step_cache fbcache 0.05");
+  ASSERT_EQ(mi_result_message_count(res, MI_MESSAGE_CONTROL_WARNING), 1);
+  EXPECT_STREQ(mi_result_message(res, MI_MESSAGE_CONTROL_WARNING, 0), "blocks.3.attn.qkv: requantized");
+  ASSERT_EQ(mi_result_message_count(res, MI_MESSAGE_CONTROL_NOTE), 2);
+  EXPECT_STREQ(mi_result_message(res, MI_MESSAGE_CONTROL_NOTE, 1), "alpha from the metadata");
+  EXPECT_EQ(mi_result_message(res, MI_MESSAGE_CONTROL_NOTE, 2), nullptr);
+  EXPECT_EQ(mi_result_message_count(res, MI_MESSAGE_LORA_WARNING), 1);  // the pipeline's own, unchanged
+  EXPECT_EQ(mi_result_lora_count(res), 0);  // the adapter's LoRA part is not one of the runtime LoRAs
+  mi_accel_info a;
+  std::memset(&a, 0xff, sizeof a);
+  a.struct_size = sizeof a;
+  ASSERT_EQ(mi_result_accel(res, &a), MI_OK) << last_error();
+  EXPECT_EQ(a.struct_size, sizeof a);
+  EXPECT_EQ(a.cfg_truncated_steps, 3);
+  EXPECT_EQ(a.dit_calls, 6);
+  EXPECT_EQ(a.cached_calls, 2);
+  EXPECT_EQ(a.lossy, 1);
+  a.struct_size = 16;
+  EXPECT_EQ(mi_result_accel(res, &a), MI_ERR_ABI_MISMATCH);
+  EXPECT_NE(last_error().find("accepts 24"), std::string::npos) << last_error();
+  std::size_t count = 0;
+  const int32_t* steps = mi_result_accel_cached_steps(res, &count);
+  ASSERT_EQ(count, 2u);
+  ASSERT_NE(steps, nullptr);
+  EXPECT_EQ(steps[0], 4);
+  EXPECT_EQ(steps[1], 6);
+  EXPECT_EQ(mi_result_accel_cached_steps(res, nullptr), nullptr);
+  // The report carries both, as the CLI's.
+  const mi::json::Value doc = mi::json::parse(mi_result_report_json(res));
+  EXPECT_EQ(doc.at("control").at("kinds").as_array().size(), 2u);
+  EXPECT_EQ(doc.at("accelerators").at("lossy").as_bool(), true);
+  mi_result_free(res);
+
+  // Neither: all zero, "" and "off"; no cached steps.
+  mi::pipeline::Request plain;
+  plain.prompt = "a cat";
+  mi::pipeline::Result pr;
+  res = mi::api::new_result(mi::api::to_generation(plain, pr, true));
+  std::memset(&c, 0xff, sizeof c);
+  c.struct_size = sizeof c;
+  ASSERT_EQ(mi_result_control(res, &c), MI_OK);
+  EXPECT_EQ(c.active, 0);
+  EXPECT_EQ(c.kinds_count, 0);
+  EXPECT_EQ(c.encodes, 0);
+  EXPECT_EQ(c.lora_adapters, 0);
+  EXPECT_EQ(c._reserved0, 0);
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_CONTROL_ADAPTER), "");
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_CONTROL_KINDS), "");
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_ACCELERATORS), "off");
+  EXPECT_EQ(mi_result_message_count(res, MI_MESSAGE_CONTROL_WARNING), 0);
+  std::memset(&a, 0xff, sizeof a);
+  a.struct_size = sizeof a;
+  ASSERT_EQ(mi_result_accel(res, &a), MI_OK);
+  EXPECT_EQ(a.cfg_truncated_steps, 0);
+  EXPECT_EQ(a.dit_calls, 0);
+  EXPECT_EQ(a.cached_calls, 0);
+  EXPECT_EQ(a.lossy, 0);
+  count = 9;
+  EXPECT_EQ(mi_result_accel_cached_steps(res, &count), nullptr);
+  EXPECT_EQ(count, 0u);
+  // CFG truncation without CFG changes nothing: not lossy.
+  plain.cfg = 1.0;
+  plain.accel.cfg_truncation = 0.5;
+  mi_result_free(res);
+  res = mi::api::new_result(mi::api::to_generation(plain, pr, true));
+  ASSERT_EQ(mi_result_accel(res, &a), MI_OK);
+  EXPECT_EQ(a.lossy, 0);
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_ACCELERATORS), "off");
+  mi_result_free(res);
+}
+
+// mi_tier_info.certified is about the tier (1 on REFERENCE, whatever else ran); run_certified is the run's, the
+// report's models.dit.certified. The 1.0.0 size (32 bytes) gets its 32 bytes.
+TEST(CApi, TierRunCertified) {
+  const auto tier_of = [](const mi::pipeline::Request& q, mi::pipeline::Result r) {
+    mi_result* res = mi::api::new_result(mi::api::to_generation(q, r, true));
+    mi_tier_info t;
+    std::memset(&t, 0xff, sizeof t);
+    t.struct_size = sizeof t;
+    EXPECT_EQ(mi_result_tier(res, &t), MI_OK) << last_error();
+    const mi::json::Value doc = mi::json::parse(mi_result_report_json(res));
+    EXPECT_EQ(doc.at("models").at("dit").at("certified").as_bool(), t.run_certified == 1);
+    EXPECT_EQ(t._reserved0, 0);
+    mi_result_free(res);
+    return t;
+  };
+  mi::pipeline::Request q;
+  q.prompt = "a cat";
+  // REFERENCE with a LoRA: the pipeline marks the run uncertified.
+  q.loras = {{"/loras/style.safetensors", 1.0f}};
+  mi::pipeline::Result r;
+  r.tier.requested = mi::planner::Tier::kAuto;
+  r.tier.effective = mi::planner::Tier::kReference;
+  r.tier.attention = mi::planner::AttentionMode::kExact;
+  r.tier.certified = false;
+  r.tier.reason = "auto: Reference; runtime LoRAs active: uncertified (certificates cover the base model only)";
+  mi::lora::FileReport f;
+  f.file = "/loras/style.safetensors";
+  r.loras = {f};
+  mi_tier_info t = tier_of(q, r);
+  EXPECT_EQ(t.effective, MI_TIER_REFERENCE);
+  EXPECT_EQ(t.certified, 1);
+  EXPECT_EQ(t.run_certified, 0);
+  // HIGH, certified, nothing else: both 1.
+  mi::pipeline::Request plain;
+  plain.prompt = "a cat";
+  mi::pipeline::Result h;
+  h.tier.effective = mi::planner::Tier::kHigh;
+  h.tier.precision = mi::planner::Precision::kInt8;
+  h.tier.attention = mi::planner::AttentionMode::kQ8Fp8;
+  h.tier.certified = true;
+  h.tier.certificate = "/models/moss_int8.mossinfer-cert.json";
+  t = tier_of(plain, h);
+  EXPECT_EQ(t.effective, MI_TIER_HIGH);
+  EXPECT_EQ(t.certified, 1);
+  EXPECT_EQ(t.run_certified, 1);
+  // REFERENCE, nothing else: both 1. HIGH uncertified (e.g. accelerators): both 0.
+  mi::pipeline::Result ref;
+  ref.tier.effective = mi::planner::Tier::kReference;
+  ref.tier.certified = true;
+  t = tier_of(plain, ref);
+  EXPECT_EQ(t.certified, 1);
+  EXPECT_EQ(t.run_certified, 1);
+  h.tier.certified = false;
+  t = tier_of(plain, h);
+  EXPECT_EQ(t.certified, 0);
+  EXPECT_EQ(t.run_certified, 0);
+  // The 1.0.0 mi_tier_info: 32 bytes written, run_certified untouched; any other size is a mismatch.
+  mi_result* res = mi::api::new_result(mi::api::to_generation(plain, ref, true));
+  alignas(mi_tier_info) unsigned char buf[sizeof(mi_tier_info)];
+  std::memset(buf, 0x5a, sizeof buf);
+  const std::size_t old = 32;
+  std::memcpy(buf, &old, sizeof old);
+  ASSERT_EQ(mi_result_tier(res, reinterpret_cast<mi_tier_info*>(buf)), MI_OK) << last_error();
+  for (std::size_t i = old; i < sizeof buf; ++i) ASSERT_EQ(buf[i], 0x5a) << "byte " << i << " written";
+  mi_tier_info bad{};
+  bad.struct_size = 36;
+  EXPECT_EQ(mi_result_tier(res, &bad), MI_ERR_ABI_MISMATCH);
+  EXPECT_NE(last_error().find("32 or 40"), std::string::npos) << last_error();
+  mi_result_free(res);
+}
+
 // ---------------------------------------------------------------- GPU
 
 // mi_probe_device measures free memory without leaving a CUDA context behind (no engine in this suite).
@@ -1903,6 +2345,7 @@ TEST_F(GpuCApi, SamplerPreviewMetadataAndTier) {
   if (tier.effective == MI_TIER_REFERENCE) {
     EXPECT_EQ(tier.attention, MI_ATTENTION_EXACT);
     EXPECT_EQ(tier.certified, 1);
+    EXPECT_EQ(tier.run_certified, 1);  // no LoRA, control adapter or accelerator
   }
   const char* reason = mi_result_text(r, MI_TEXT_TIER_REASON);
   ASSERT_NE(reason, nullptr);
@@ -2141,6 +2584,104 @@ TEST_F(GpuCApi, DistillTimeEmbeddingNeedsTheEngine) {
   EXPECT_EQ(mi_generate(engine_, &p, &r), MI_ERR_INVALID_ARGUMENT);
   EXPECT_NE(last_error().find("mi_engine_params.distill_dir"), std::string::npos) << last_error();
   EXPECT_EQ(r, nullptr);
+}
+
+// The MOSS-Image color/depth control adapter (ComfyUI's repackaging of darask0/MOSS-Image-color-depth-control).
+fs::path control_adapter_file() { return community_models() / "comfy-org" / "moss_image_color_depth_control.safetensors"; }
+
+// A control adapter through the C API: a depth-like grayscale image from pixels, its report and texts.
+TEST_F(GpuCApi, ControlAdapterDepth) {
+  if (!fs::is_regular_file(control_adapter_file())) {
+    GTEST_SKIP() << "no control adapter (" << mi::util::path_utf8(control_adapter_file()) << "; set MOSS_COMMUNITY_MODELS)";
+  }
+  const std::string adapter = mi::util::path_utf8(control_adapter_file());
+  // Near = white: a bright disc in front of a darker ramp.
+  std::vector<std::uint8_t> depth(256 * 256);
+  for (int y = 0; y < 256; ++y) {
+    for (int x = 0; x < 256; ++x) {
+      const int dx = x - 128, dy = y - 150;
+      depth[static_cast<std::size_t>(y) * 256 + x] =
+          static_cast<std::uint8_t>(dx * dx + dy * dy < 70 * 70 ? 230 : 40 + y / 4);
+    }
+  }
+  const mi_image depth_px = rgb_image(depth, 256, 256, 1);
+  mi_control_image image{};
+  image.kind = "depth";
+  image.image = &depth_px;
+  image.strength = 1.0;
+  image.end = 1.0;
+  mi_gen_params p = small_request(3);
+  p.control_adapter = adapter.c_str();
+  p.control_images = &image;
+  p.control_images_count = 1;
+  mi_result* r = nullptr;
+  ASSERT_EQ(mi_generate(engine_, &p, &r), MI_OK) << last_error();
+  mi_control_info info{};
+  info.struct_size = sizeof info;
+  ASSERT_EQ(mi_result_control(r, &info), MI_OK) << last_error();
+  EXPECT_EQ(info.active, 1);
+  EXPECT_GE(info.kinds_count, 1);
+  EXPECT_GT(info.encodes, 0);
+  EXPECT_GT(info.lora_adapters, 0);
+  EXPECT_NE(std::string(mi_result_text(r, MI_TEXT_CONTROL_KINDS)).find("depth"), std::string::npos);
+  EXPECT_EQ(std::string(mi_result_text(r, MI_TEXT_CONTROL_ADAPTER)), adapter);
+  EXPECT_EQ(mi_result_lora_count(r), 0);  // the adapter's LoRA part is reported with the control
+  // A control adapter is a LoRA: the run is uncertified (mi_tier_info.certified describes the tier: 1 on Reference).
+  const mi::json::Value doc = mi::json::parse(mi_result_report_json(r));
+  EXPECT_FALSE(doc.at("models").at("dit").at("certified").as_bool());
+  mi_tier_info tier{};
+  tier.struct_size = sizeof tier;
+  ASSERT_EQ(mi_result_tier(r, &tier), MI_OK);
+  EXPECT_EQ(tier.run_certified, 0);
+  EXPECT_NE(std::string(mi_result_text(r, MI_TEXT_TIER_REASON)).find("uncertified"), std::string::npos);
+  std::size_t bytes = 0;
+  EXPECT_NE(mi_result_rgb(r, &bytes), nullptr);
+  EXPECT_EQ(bytes, std::size_t{256 * 256 * 3});
+  std::printf("[c_api] control: kinds %s, %d encodes (%s), LoRA %d adapters (%d side branch, %d merged), base_model %s\n",
+              mi_result_text(r, MI_TEXT_CONTROL_KINDS), info.encodes, mi_result_text(r, MI_TEXT_CONTROL_ENCODE_SCHEDULE),
+              info.lora_adapters, info.lora_side_branch, info.lora_merged, mi_result_text(r, MI_TEXT_CONTROL_BASE_MODEL));
+  mi_result_free(r);
+  // A kind the adapter does not have is refused by mi_generate() (validation cannot know the adapter's kinds).
+  image.kind = "canny";
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_OK) << last_error();
+  EXPECT_EQ(mi_generate(engine_, &p, &r), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("has no \"canny\" input"), std::string::npos) << last_error();
+  EXPECT_EQ(r, nullptr);
+}
+
+// CFG truncation and the FBCache step cache with a permissive threshold: what they skipped, and uncertified.
+TEST_F(GpuCApi, Accelerators) {
+  mi_gen_params p = small_request(6);
+  p.cfg = 3.0;
+  p.cfg_truncation = 0.5;
+  p.step_cache = MI_STEP_CACHE_FBCACHE;
+  p.step_cache_threshold = 0.5;
+  mi_result* r = nullptr;
+  ASSERT_EQ(mi_generate(engine_, &p, &r), MI_OK) << last_error();
+  mi_accel_info a{};
+  a.struct_size = sizeof a;
+  ASSERT_EQ(mi_result_accel(r, &a), MI_OK) << last_error();
+  EXPECT_GT(a.cfg_truncated_steps, 0);
+  EXPECT_GT(a.dit_calls, 0);
+  EXPECT_LE(a.cached_calls, a.dit_calls);
+  EXPECT_EQ(a.lossy, 1);
+  std::size_t count = 0;
+  const int32_t* steps = mi_result_accel_cached_steps(r, &count);
+  EXPECT_EQ(count == 0, steps == nullptr);
+  EXPECT_LE(count, static_cast<std::size_t>(a.cached_calls));
+  const mi::json::Value doc = mi::json::parse(mi_result_report_json(r));
+  EXPECT_FALSE(doc.at("models").at("dit").at("certified").as_bool());
+  EXPECT_TRUE(doc.at("accelerators").at("lossy").as_bool());
+  mi_tier_info tier{};
+  tier.struct_size = sizeof tier;
+  ASSERT_EQ(mi_result_tier(r, &tier), MI_OK);
+  EXPECT_EQ(tier.run_certified, 0);
+  EXPECT_NE(std::string(mi_result_text(r, MI_TEXT_TIER_REASON)).find("lossy accelerators"), std::string::npos);
+  std::string list;
+  for (std::size_t i = 0; i < count; ++i) list += (i ? "," : "") + std::to_string(steps[i]);
+  std::printf("[c_api] accel (%s): CFG truncated on %d steps, step cache reused %d of %d DiT calls (steps %s)\n",
+              mi_result_text(r, MI_TEXT_ACCELERATORS), a.cfg_truncated_steps, a.cached_calls, a.dit_calls, list.c_str());
+  mi_result_free(r);
 }
 
 // One engine of its own per test (other models): created, used once and freed.

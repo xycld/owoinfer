@@ -13,6 +13,7 @@
 
 #include "../../tools/server/json_out.h"
 #include "../../tools/server/names.h"
+#include "pipeline/accel/accel.h"
 #include "pipeline/pipeline_image.h"
 #include "pipeline/report_json.h"
 #include "pipeline/samplers/initial_noise.h"
@@ -150,6 +151,13 @@ TEST(ServerJson, EnumNamesAreThePipelines) {
   EXPECT_EQ(i, 3);
   i = 0;
   for (const auto& n : mi::server::kMaskEncodingNames) EXPECT_EQ(static_cast<int>(n.value), i++);  // the server's own names
+  EXPECT_EQ(i, 2);
+  i = 0;
+  for (const auto& n : mi::server::kStepCacheNames) {
+    EXPECT_EQ(static_cast<int>(n.value), i++);
+    EXPECT_EQ(static_cast<int>(p::accel::parse_step_cache(n.name)), static_cast<int>(n.value)) << n.name;
+    EXPECT_EQ(p::accel::step_cache_name(p::accel::parse_step_cache(n.name)), n.name);
+  }
   EXPECT_EQ(i, 2);
 }
 

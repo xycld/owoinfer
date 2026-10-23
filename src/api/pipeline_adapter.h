@@ -34,6 +34,8 @@ struct ModelError : std::runtime_error {
 
 // At most this many runtime LoRAs per generation.
 inline constexpr std::size_t kMaxLoras = 64;
+// At most this many control images per generation (one per kind; the published adapters have two).
+inline constexpr std::size_t kMaxControlImages = 16;
 
 // One finished generate() call, in C-API terms.
 struct Generation {
@@ -61,10 +63,18 @@ struct Generation {
   std::vector<std::string> lora_warnings, lora_notes;
   mi_image_info image{};
   std::string image_note, time_embedding;  // mi_result_text() kinds
+  mi_control_info control{};
+  // mi_result_text() kinds (control_kinds comma-separated), and the control LoRA part's messages.
+  std::string control_adapter, control_kinds, control_base_model, control_encode_schedule;
+  std::vector<std::string> control_warnings, control_notes;
+  mi_accel_info accel{};
+  std::string accelerators;               // MI_TEXT_ACCELERATORS
+  std::vector<std::int32_t> cached_steps;  // mi_result_accel_cached_steps()
 };
 
 // The pipeline request of `params` (a full-size struct): the unset markers resolved (mossinfer.h), a distill bundle
-// expanded, image inputs copied or decoded, a dataspace sampler's file read and the steps checked against it. Throws
+// expanded, image inputs (control images included) copied or decoded, a dataspace sampler's file read and the steps
+// checked against it, the control adapter's file and the accelerators checked (its kinds are generate()'s). Throws
 // std::invalid_argument (the pipeline's wording) when it is not valid, including LoRA, dataspace and image files that do not exist; ModelError for a malformed distill bundle or its
 // dataspace file. `distill_time_embedding` (optional) receives the bundle's time embedding (empty: none) for the
 // engine's check. CPU only; `model` is left empty.
@@ -98,6 +108,10 @@ class PipelineAdapter {
 // q.save_metadata; without the prompts unless include_prompts) and every accessor's data. Called by generate(); public
 // for the CPU tests.
 Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool include_prompts);
+
+// A result holding `generation`, as mi_generate() returns it (release it with mi_result_free()). Defined in c_api.cpp;
+// public for the CPU tests of the result accessors.
+mi_result* new_result(Generation generation);
 
 // The `moss-infer generate --json-report` document of `generation`, with `image_path_utf8` as its "image".
 std::string report_json(const Generation& generation, const std::string& image_path_utf8);
