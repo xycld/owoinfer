@@ -170,7 +170,7 @@ unset(_mi_file)
 set(MOSSINFER_QUALITY_CERTS_DIR ${CMAKE_SOURCE_DIR}/data/quality_certs CACHE PATH
     "Directory whose *.mossinfer-cert.json files are installed to share/mossinfer/quality_certs")
 install(CODE "
-  set(_mi_certs \"${MOSSINFER_QUALITY_CERTS_DIR}\")
+  set(_mi_certs [==[${MOSSINFER_QUALITY_CERTS_DIR}]==])
   if(DEFINED ENV{MOSSINFER_QUALITY_CERTS_SOURCE})
     file(TO_CMAKE_PATH \"\$ENV{MOSSINFER_QUALITY_CERTS_SOURCE}\" _mi_certs)
   endif()
