@@ -141,12 +141,23 @@ foreach(fragment IN LISTS MOSSINFER_CMAKE_FRAGMENTS)
   include(${fragment})
 endforeach()
 
-# Command-line tool: src/tools/cli/*.cpp
+# Command-line tool: src/tools/cli/*.cpp, plus its process entry src/tools/moss_infer/main.cpp (argv -> UTF-8).
 file(GLOB MOSSINFER_CLI_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/tools/cli/*.cpp)
 # The CLI links against every module, so it is only built in full (unfiltered) builds.
 if(MOSSINFER_CLI_SOURCES AND NOT MOSSINFER_ONLY)
-  add_executable(moss-infer ${MOSSINFER_CLI_SOURCES})
-  target_link_libraries(moss-infer PRIVATE mossinfer_core)
+  if(MOSSINFER_CLI_SHARED)
+    # Release packages (cmake/modules/packaging.cmake): the CLI is compiled into libmossinfer like the core (hidden
+    # visibility, dllexport for its one export mi_internal_cli_main), and moss-infer is only the entry linking it.
+    target_sources(mossinfer PRIVATE ${MOSSINFER_CLI_SOURCES})
+    target_compile_definitions(mossinfer PRIVATE MOSSINFER_SHARED MOSSINFER_BUILD)
+    target_compile_options(mossinfer PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${MOSSINFER_WARN}>)
+    add_executable(moss-infer ${CMAKE_SOURCE_DIR}/src/tools/moss_infer/main.cpp)
+    target_include_directories(moss-infer PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(moss-infer PRIVATE mossinfer)
+  else()
+    add_executable(moss-infer ${MOSSINFER_CLI_SOURCES} ${CMAKE_SOURCE_DIR}/src/tools/moss_infer/main.cpp)
+    target_link_libraries(moss-infer PRIVATE mossinfer_core)
+  endif()
   target_compile_options(moss-infer PRIVATE ${MOSSINFER_WARN})
 endif()
 

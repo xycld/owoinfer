@@ -136,8 +136,8 @@ cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-
 | Path | What |
 |---|---|
 | `bin/moss-server` (`moss-server.exe`) | the sidecar |
-| `bin/moss-infer` | command-line tool for debugging and for converting models. The launcher doesn't need it, and it carries its own copy of the engine. |
-| `lib/libmossinfer.so.1` (Windows: `bin/mossinfer.dll` + `lib/mossinfer.lib`) | the engine and the C API. It exports only `mi_*` functions. |
+| `bin/moss-infer` | command-line tool for debugging and for converting models. The launcher doesn't need it. It runs the engine in `libmossinfer` and no longer carries its own copy of the engine. |
+| `lib/libmossinfer.so.1` (Windows: `bin/mossinfer.dll` + `lib/mossinfer.lib`) | the engine, the C API and the `moss-infer` commands. It exports the C API functions and `mi_internal_cli_main`, `moss-infer`'s entry point, which is not part of the C API. |
 | `lib/libcublasLt.so.<major>` (Windows: `bin/cublasLt64_<major>.dll`) | NVIDIA cuBLASLt, redistributed under the CUDA EULA; full package only |
 | Windows: `bin/vcruntime140*.dll`, `bin/msvcp140.dll` | the MSVC runtime, so users need no Visual C++ Redistributable |
 | `include/mossinfer/mossinfer.h` | the C API header |
@@ -151,7 +151,7 @@ cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-
 - **Which to offer:** the launcher decides from the probe. Run the probe of any installed copy with `MOSSINFER_CUDA_LIBS=system` (`hello`'s `probe.cublaslt`, or `mi_probe()`): when `source` is `"system"`, the machine has a compatible copy and the `-system-cuda` archive works there; otherwise offer the full one. A launcher that installs once for many machines ships the full archive.
 
 **Ship the tree as it is.**
-- `moss-server` finds `libmossinfer` relative to itself (RUNPATH `$ORIGIN/../lib`). On Windows, all DLLs sit in `bin/`.
+- `moss-server` and `moss-infer` find `libmossinfer` relative to themselves (RUNPATH `$ORIGIN/../lib`), so keep `lib/` with `bin/`. On Windows, all DLLs sit in `bin/`.
 - `libmossinfer` has no load-time dependency on cuBLASLt: it loads cuBLASLt at run time (a system copy, or the bundled one next to it by absolute path).
 - The full package needs no CUDA toolkit and no environment variables.
 - The CUDA runtime is linked statically on every OS, and libstdc++ is linked statically on Linux.
@@ -172,9 +172,9 @@ A copy that fails a check is skipped, and the next location is tried.
 | | Linux | Windows |
 |---|---|---|
 | System | `libcublasLt.so.<major>` through the dynamic loader (`LD_LIBRARY_PATH`, the `ld.so` cache), then by absolute path: `lib64/` and `targets/<arch>-linux/lib/` under `$CUDA_PATH`, `$CUDA_HOME`, `/usr/local/cuda-<major>` and `/usr/local/cuda`, then `/opt/cuda/lib64`, `/usr/lib/<arch>-linux-gnu`, `/usr/lib64` and `/usr/lib` (distribution packages). Relative `CUDA_PATH` / `CUDA_HOME` values are ignored. | `bin\x64\cublasLt64_<major>.dll` and `bin\cublasLt64_<major>.dll` under `%CUDA_PATH%`, then under every `%CUDA_PATH_V<major>_<minor>%` (newest first). Never the bare DLL name: the application directory would come first. |
-| Bundled | next to `libmossinfer` (`lib/`); for an executable that links the engine statically (`moss-infer`), also `../lib` | next to `mossinfer.dll` (`bin/`) |
+| Bundled | next to `libmossinfer` (`lib/`); for an executable that links the engine statically (`moss-infer` in a development build), also `../lib` | next to `mossinfer.dll` (`bin/`) |
 
-A system search that ends at the bundled file does not count as a system copy. The soname search uses the RUNPATH of the module that asks, so it reaches the bundled file first when that module's RUNPATH points at the package's `lib/`: `libmossinfer` and `moss-infer` in a build with a shared cudart (the dev preset; release builds link cudart statically and give them no such RUNPATH), or a directory on `LD_LIBRARY_PATH`. The loader then rejects that file and goes on with the absolute paths, which is why the distribution directories are listed there too.
+A system search that ends at the bundled file does not count as a system copy. The soname search uses the RUNPATH of the module that asks, so it reaches the bundled file first when that module's RUNPATH, or a directory on `LD_LIBRARY_PATH`, points at the package's `lib/`. The module that asks is `libmossinfer`, or the statically linked `moss-infer` of a development build, and only a build with a shared cudart (the dev preset) gives them such a RUNPATH. Release builds link cudart statically: `libmossinfer` has no RUNPATH, and their `moss-infer` has one only to find `libmossinfer`, which runs the search. The loader then rejects that file and goes on with the absolute paths, which is why the distribution directories are listed there too.
 
 **Environment variables:**
 

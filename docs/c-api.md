@@ -476,7 +476,7 @@ History, all with `MI_ABI_VERSION` 1:
 | `MOSSINFER_SHARED` + `MOSSINFER_BUILD` | building the shared library: `dllexport` |
 | neither | static linking |
 
-On ELF platforms `MOSSINFER_API` is always `visibility("default")`. The shared library compiles the core with hidden visibility and a version script (`mi_*` only).
+On ELF platforms `MOSSINFER_API` is always `visibility("default")`. The shared library compiles the core with hidden visibility and a version script (`mi_*` only). Besides the C API it exports one internal symbol, `mi_internal_cli_main`: release packages compile the `moss-infer` commands into the library, and this is the entry point of `bin/moss-infer`. It is internal to `moss-infer`, not part of the C API, and may change without notice. `check_package.py` checks that the export list is exactly these names.
 
 ## Implementation
 
