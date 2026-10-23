@@ -289,10 +289,14 @@ Flux2VaeDecoder::Flux2VaeDecoder(const weights::ModelIndex& index, runtime::Devi
     if (!taken.count(name)) throw std::runtime_error("mi::flux2_vae: unexpected tensor '" + name + "' in the decoder group");
 
   convs = {&post_quant_conv_, &conv_in_, &conv_out_};
-  for (Resnet& r : mid_resnets_) convs.insert(convs.end(), {&r.conv1, &r.conv2});
+  for (Resnet& r : mid_resnets_) {
+    convs.push_back(&r.conv1);
+    convs.push_back(&r.conv2);
+  }
   for (UpBlock& u : up_) {
     for (Resnet& r : u.resnets) {
-      convs.insert(convs.end(), {&r.conv1, &r.conv2});
+      convs.push_back(&r.conv1);  // push_back, not insert({...}): GCC 13 -O3 flags a false stringop-overflow
+      convs.push_back(&r.conv2);
       if (r.shortcut.w.data != nullptr) convs.push_back(&r.shortcut);
     }
     if (u.upsampler.w.data != nullptr) convs.push_back(&u.upsampler);
