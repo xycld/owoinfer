@@ -34,30 +34,31 @@ float f32(double d) { return static_cast<float>(d); }
 //   d_2m = m (b - m) x / ((a + 2m - 1)(a + 2m)),  d_2m+1 = -(a + m)(a + b + m) x / ((a + 2m)(a + 2m + 1)),
 // which converges fast for x < (a + 1) / (a + b + 2); above that the symmetry I_x(a, b) = 1 - I_(1-x)(b, a)
 // (DLMF 8.17.4) is used. The fraction is evaluated with the modified Lentz algorithm (W. J. Lentz, Appl. Opt. 15
-// (1976) 668; I. J. Thompson and A. R. Barnett, J. Comput. Phys. 64 (1986) 490). long double keeps the bisection in
-// beta_quantile() well inside double resolution.
+// (1976) 668; I. J. Thompson and A. R. Barnett, J. Comput. Phys. 64 (1986) 490). Everything is double (double is
+// 64-bit on MSVC, 80-bit on x86 GCC): the beta scheduler's indices are decided by beta_quantile_index(), which does not
+// depend on the last bits of I_x.
 
 // d_j of DLMF 8.17.22, j >= 1.
-long double dlmf_beta_numerator(int j, long double x, long double a, long double b) {
-  const long double m = j / 2;
+double dlmf_beta_numerator(int j, double x, double a, double b) {
+  const double m = j / 2;
   if (j % 2 == 0) return m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m));
   return -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1));
 }
 
 // 1 + d_1 / (1 + d_2 / (1 + ...)) by modified Lentz: f_j = f_(j-1) C_j D_j with C_j = 1 + d_j / C_(j-1) and
 // D_j = 1 / (1 + d_j D_(j-1)), from f_0 = C_0 = 1 and D_0 = 0; a vanishing C_j or 1 / D_j is replaced by a tiny value.
-long double beta_fraction_lentz(long double x, long double a, long double b) {
-  const long double tiny = std::numeric_limits<long double>::min();
-  const long double tol = 4 * std::numeric_limits<long double>::epsilon();
-  long double f = 1, c = 1, d = 0;
+double beta_fraction_lentz(double x, double a, double b) {
+  const double tiny = std::numeric_limits<double>::min();
+  const double tol = 4 * std::numeric_limits<double>::epsilon();
+  double f = 1, c = 1, d = 0;
   for (int j = 1; j <= 200000; ++j) {
-    const long double dj = dlmf_beta_numerator(j, x, a, b);
-    long double den = 1 + dj * d;
+    const double dj = dlmf_beta_numerator(j, x, a, b);
+    double den = 1 + dj * d;
     if (std::fabs(den) < tiny) den = tiny;
     d = 1 / den;
     c = 1 + dj / c;
     if (std::fabs(c) < tiny) c = tiny;
-    const long double ratio = c * d;
+    const double ratio = c * d;
     f *= ratio;
     if (std::fabs(ratio - 1) < tol) break;
   }
@@ -65,14 +66,14 @@ long double beta_fraction_lentz(long double x, long double a, long double b) {
 }
 
 // I_x(a, b) by the fraction, for x in (0, 1) below the switch point.
-long double incbeta_below_switch(long double x, long double a, long double b) {
-  const long double log_beta = std::lgamma(a) + std::lgamma(b) - std::lgamma(a + b);
-  const long double prefactor = std::exp(a * std::log(x) + b * std::log1p(-x) - log_beta);  // x^a (1-x)^b / B(a, b)
+double incbeta_below_switch(double x, double a, double b) {
+  const double log_beta = std::lgamma(a) + std::lgamma(b) - std::lgamma(a + b);
+  const double prefactor = std::exp(a * std::log(x) + b * std::log1p(-x) - log_beta);  // x^a (1-x)^b / B(a, b)
   return prefactor / (a * beta_fraction_lentz(x, a, b));
 }
 
 // I_x(a, b) for x in [0, 1].
-long double regularized_incomplete_beta(long double x, long double a, long double b) {
+double regularized_incomplete_beta(double x, double a, double b) {
   if (x <= 0) return 0;
   if (x >= 1) return 1;
   if (x < (a + 1) / (a + b + 2)) return incbeta_below_switch(x, a, b);
@@ -209,16 +210,33 @@ double beta_quantile(double p, double a, double b) {
   if (!(p >= 0.0 && p <= 1.0) || !(a > 0) || !(b > 0)) throw std::invalid_argument("beta_quantile: bad arguments");
   if (p == 0.0) return 0.0;
   if (p == 1.0) return 1.0;
-  // I_x(a, b) increases with x: bisect [0, 1] until the bracket no longer splits in long double.
-  const long double target = p;
-  long double lo = 0, hi = 1;
+  // I_x(a, b) increases with x: bisect [0, 1] until the bracket no longer splits.
+  double lo = 0, hi = 1;
   for (int iter = 0; iter < 200; ++iter) {
-    const long double mid = (lo + hi) / 2;
+    const double mid = (lo + hi) / 2;
     if (!(lo < mid && mid < hi)) break;
-    (regularized_incomplete_beta(mid, a, b) < target ? lo : hi) = mid;
+    (regularized_incomplete_beta(mid, a, b) < p ? lo : hi) = mid;
   }
-  return static_cast<double>((lo + hi) / 2);
+  return (lo + hi) / 2;
 }
+
+namespace {
+
+// rint(beta_quantile(p, a, b) * total), half to even (numpy's rint of scipy's ppf), identical on every platform. The
+// double quantile is good to a few ulp, which decides the index except where q * total lies next to a half-integer
+// k + 1/2. There the index comes from the side of the boundary x = (k + 1/2) / total the quantile is on, by I_x
+// against p; I_x and p equal to 1e-12 is a tie (the median of a symmetric distribution: p = 1/2, a == b, q = 1/2
+// exactly), rounded to even.
+double beta_quantile_index(double p, double a, double b, double total) {
+  const double scaled = beta_quantile(p, a, b) * total;
+  const double k = std::floor(scaled);
+  if (std::fabs(scaled - k - 0.5) > 1e-9) return std::nearbyint(scaled);
+  const double above = p - regularized_incomplete_beta((k + 0.5) / total, a, b);  // > 0: the quantile is above
+  if (std::fabs(above) <= 1e-12) return std::fmod(k, 2.0) == 0.0 ? k : k + 1;
+  return above > 0 ? k + 1 : k;
+}
+
+}  // namespace
 
 std::vector<float> compute_sigmas(SchedulerKind kind, int steps, const FlowSampling& fs, double denoise) {
   if (steps < 1) throw std::invalid_argument("compute_sigmas: steps must be >= 1");
@@ -284,7 +302,7 @@ std::vector<float> compute_sigmas(SchedulerKind kind, int steps, const FlowSampl
       const auto total = static_cast<double>(table.size() - 1);
       double last = -1;
       for (int i = 0; i < steps; ++i) {
-        const double t = std::nearbyint(beta_quantile(1.0 - static_cast<double>(i) * step, alpha, beta) * total);
+        const double t = beta_quantile_index(1.0 - static_cast<double>(i) * step, alpha, beta, total);
         if (t != last) s.push_back(table[static_cast<std::size_t>(t)]);
         last = t;
       }

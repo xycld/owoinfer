@@ -13,6 +13,7 @@
 #include <system_error>
 
 #include "util/path.h"
+#include "util/rename_replace.h"
 
 namespace mi::pipeline {
 namespace {
@@ -288,7 +289,7 @@ void write_png_rgb8(const std::filesystem::path& path, std::span<const std::uint
     }
   }
   std::error_code ec;
-  std::filesystem::rename(tmp, path, ec);
+  util::rename_replace(tmp, path, ec);
   if (ec) {
     std::error_code ignored;
     std::filesystem::remove(tmp, ignored);
