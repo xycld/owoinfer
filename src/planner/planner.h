@@ -238,6 +238,9 @@ struct Capabilities {
   // Streamed blocks may come from the weight files (false: only from a pinned host copy, e.g. blocks that carry merged
   // runtime-LoRA weights, which the files do not hold).
   bool dit_file_source = true;
+  // The GPU runs INT4 tensor-core MMA natively (moss_dit::int4_mma_native: compute capability 8.x). Without it the INT4
+  // linears run the INT8 GEMMs on unpacked operands, and are costed at that speed.
+  bool int4_mma_native = true;
 };
 
 struct Budgets {

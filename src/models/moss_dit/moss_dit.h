@@ -134,8 +134,14 @@ struct ComputeConfig {
   AttentionMode attention = AttentionMode::kExact;
   std::int64_t lora_rank = 0;  // runtime LoRA side branches' max_rank (0: none): the t buffers of a forward
   bool int4 = false;           // some block linear is INT4 (with LoRA side branches: the int4_unpack buffer)
+  bool int4_via_int8 = false;  // int4: every INT4 linear runs the INT8 GEMMs on unpacked operands (the same bits)
   bool operator==(const ComputeConfig&) const = default;
 };
+
+// How INT4 linears run (dit_block_quant.h): kAuto = natively where the GPU has INT4 MMA (int4_mma_native()), else
+// through the INT8 GEMMs on unpacked operands; kNative / kViaInt8 force one (both give the same bits; kNative on a GPU
+// without INT4 MMA runs ptxas's emulation, A/B measurements only).
+enum class Int4Route { kAuto, kNative, kViaInt8 };
 
 // The precision of the block linears of a DiT index: "bf16" (quant == nullptr: the bundle, or every linear bf16),
 // "int8_convrot256" (all INT8), "int4_convrot256" (all INT4) or "mixed (N int4_convrot256, M bf16)".
@@ -169,7 +175,11 @@ class MossDit {
   // Stack bytes forward() adds to workspace_bytes() for streamed blocks (the device block buffers; 0 if none).
   static std::size_t stream_workspace_bytes(const weights::ModelIndex& index, const Residency& residency);
   // The config a model loaded from `quant` (nullptr: the bf16 bundle) runs with attention mode `attention`.
-  static ComputeConfig compute_config(const quant::QuantIndex* quant, AttentionMode attention);
+  static ComputeConfig compute_config(const quant::QuantIndex* quant, AttentionMode attention,
+                                      Int4Route int4_route = Int4Route::kAuto);
+  // The INT4 route of the following forwards (default kAuto); the forward stack follows compute_config().
+  void set_int4_route(Int4Route route);
+  Int4Route int4_route() const { return int4_route_; }
 
   // Uploads the transformer groups (globals, text_embedder and the resident blocks) of `index` into the
   // arena's persistent region and waits until they are resident; streamed blocks are validated (and copied
@@ -315,6 +325,7 @@ class MossDit {
   runtime::DeviceArena& arena_;
   const quant::QuantIndex* quant_ = nullptr;
   ComputeConfig config_;
+  Int4Route int4_route_ = Int4Route::kAuto;
   std::optional<FusedRouteSnapshot> request_route_;
   const lora::SideBranches* lora_ = nullptr;
   // Runtime-LoRA merges: the pristine weights of the merged modules and where each module's merged weights live.

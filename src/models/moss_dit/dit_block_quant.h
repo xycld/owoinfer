@@ -17,6 +17,8 @@
 //   Runtime LoRA (P6 step 42): an active side-branch site adds Δ = Σ s_i B_i (A_i x) inside its GEMM (kernels/lora).
 //   An INT4 site runs the INT8 LoRA GEMM on its operands unpacked to INT8 (unpack_int4): the int32 dot products and
 //   the epilogue are the INT4 GEMM's, so the base result is bit for bit the plain INT4 one (at INT8 GEMM speed).
+//   On GPUs without INT4 MMA (int4_mma_native(); QuantBlockBuffers::int4_via_int8) every INT4 site runs that way,
+//   with the plain INT8 GEMMs: the same bits as the INT4 GEMMs, at the INT8 rate.
 //   Attention: exact (attention::flash_fwd) or 8-bit (attention_q8, any of its variants; SageAttention2++ by default).
 // The INT8 path's numerics are those of comfy-kitchen's int8_linear with ConvRot (see kernels/quant/quant.h): the
 // rotation in the CUDA kernel's fp32 order, the bf16-rounded rotated row, per-token absmax/127 scales, round half to
@@ -68,10 +70,19 @@ struct QuantBlockBuffers {
   Tensor lora_t;
   void* lora_workspace = nullptr;
   std::size_t lora_workspace_bytes = 0;
-  // An INT4 linear with an active LoRA site: its weight unpacked to INT8, kInt4UnpackBytes, 16-byte aligned.
+  // INT4 linears through the INT8 GEMMs on their operands unpacked to INT8 (bit for bit the INT4 GEMMs' results): every
+  // INT4 linear when int4_via_int8 (GPUs without INT4 MMA, int4_mma_native()), else those with an active LoRA site.
+  // Their weight is unpacked here: kInt4UnpackBytes, 16-byte aligned.
+  bool int4_via_int8 = false;
   void* int4_unpack = nullptr;
   std::size_t int4_unpack_bytes = 0;
 };
+
+// Whether INT4 tensor-core MMA (mma.sync .s4, the kernels/quant4 GEMMs) runs natively: compute capability 8.x (Ampere,
+// Ada). Hopper (sm_90) and Blackwell (sm_100, sm_120) have no INT4 tensor-core path and ptxas emulates it (sm_120,
+// measured: 91.7 TOPS INT4 against 620-640 TOPS INT8), so the INT4 linears run the INT8 GEMMs there.
+bool int4_mma_native(int major, int minor);
+bool int4_mma_native();  // the current device (true when it cannot be queried)
 
 // Bytes of the largest block weight unpacked to INT8 (ffn_up_gate, [2 * 8192, 3072]).
 inline constexpr std::size_t kInt4UnpackBytes = std::size_t{2} * 8192 * 3072;

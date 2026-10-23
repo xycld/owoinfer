@@ -102,6 +102,20 @@ bool bf16_up_gate_runs_op_by_op(const BlockTensors& w, const FusedRoute& route, 
 
 }  // namespace
 
+bool int4_mma_native(int major, int minor) {
+  static_cast<void>(minor);
+  return major == 8;
+}
+
+bool int4_mma_native() {
+  int device = 0, major = 0, minor = 0;
+  if (cudaGetDevice(&device) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+    return true;
+  }
+  return int4_mma_native(major, minor);
+}
+
 const char* attention_mode_name(AttentionMode m) {
   switch (m) {
     case AttentionMode::kExact: return "exact";
@@ -172,11 +186,17 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
        qa.lora_t.dim(1) < qa.lora->max_rank() || qa.lora_workspace_bytes < lora::t_workspace_bytes(l, qa.lora->max_rank()))) {
     throw std::invalid_argument("mi::moss_dit::run_block_quant: LoRA buffers do not match the side branches");
   }
-  const bool unpack = (s_qkv != nullptr && !w.qkv4.empty()) || (s_o != nullptr && !w.o4.empty()) ||
-                      (s_up != nullptr && !w.up_gate4.empty()) || (s_down != nullptr && !w.down4.empty());
+  // INT4 sites that run the INT8 GEMMs on unpacked operands: every INT4 site on a GPU without INT4 MMA
+  // (qa.int4_via_int8), else those with a LoRA side branch.
+  const bool via = qa.int4_via_int8;
+  const bool u_qkv = via || s_qkv != nullptr, u_o = via || s_o != nullptr, u_up = via || s_up != nullptr,
+             u_down = via || s_down != nullptr;
+  const bool unpack = (u_qkv && (!w.qkv4.empty() || !w.qkv4_part[0].empty() || !w.qkv4_part[1].empty() ||
+                                 !w.qkv4_part[2].empty())) ||
+                      (u_o && !w.o4.empty()) || (u_up && !w.up_gate4.empty()) || (u_down && !w.down4.empty());
   if (unpack && (qa.int4_unpack == nullptr || qa.int4_unpack_bytes < kInt4UnpackBytes)) {
-    throw std::invalid_argument("mi::moss_dit::run_block_quant: an INT4 linear with a LoRA side branch needs the "
-                                "int4_unpack buffer (kInt4UnpackBytes)");
+    throw std::invalid_argument("mi::moss_dit::run_block_quant: an INT4 linear run through the INT8 GEMMs (LoRA side "
+                                "branch, or int4_via_int8) needs the int4_unpack buffer (kInt4UnpackBytes)");
   }
   // t of a site for its bf16 input `in` (rows of this run): the LoRA GEMM's operand.
   const auto prepare = [&](const lora::SiteBranch& sb, const Tensor& in) {
@@ -220,7 +240,7 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     qkv_gemm.gemm->linear(out, in, weight, nullptr, qkv_gemm.workspace, qkv_gemm.workspace_bytes, stream);
   };
   const auto u8 = [](std::int8_t* p) { return reinterpret_cast<std::uint8_t*>(p); };
-  // INT8 operands of an INT4 linear for the LoRA GEMMs: its packed input `xq4` (row stride k / 2) unpacked to `xq8`
+  // INT8 operands of an INT4 linear for the INT8 GEMMs: its packed input `xq4` (row stride k / 2) unpacked to `xq8`
   // (row stride k) and its weight unpacked into the int4_unpack buffer.
   const auto unpacked = [&](const std::int8_t* xq4, std::int8_t* xq8, const Int4Linear& lin) {
     const std::int64_t k = lin.k(), n = lin.w.dim(0);
@@ -244,6 +264,10 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     kq4::convrot_quantize_int4(bf(y), kD, u8(xq_qkv + m * kD), kD / 2, scale, m, static_cast<int>(kD), stream);
     const kq::Int8Operands op = unpacked(xq_qkv + m * kD, xq_qkv, w.qkv4);
     kl::int8_gemm_lora(op, nullptr, prepare(*s_qkv, y), bf_mut(qkv), 3 * kD, stream);
+  } else if (!w.qkv4.empty() && via) {
+    kq4::rms_norm_modulate_convrot_quantize_int4(bf(x), kD, bf(w.norm1), bf(vec(a.mod, 1)), bf(vec(a.mod, 0)),
+                                                 u8(xq_qkv + m * kD), kD / 2, scale, m, static_cast<int>(kD), stream);
+    kq::int8_gemm(unpacked(xq_qkv + m * kD, xq_qkv, w.qkv4), nullptr, bf_mut(qkv), 3 * kD, stream);
   } else if (!w.qkv4.empty()) {
     kq4::rms_norm_modulate_convrot_quantize_int4(bf(x), kD, bf(w.norm1), bf(vec(a.mod, 1)), bf(vec(a.mod, 0)), u8(xq_qkv),
                                                  kD / 2, scale, m, static_cast<int>(kD), stream);
@@ -288,11 +312,14 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
         }
       }
       if (any_int4) {
-        kq4::convrot_quantize_int4(bf(y), kD, u8(xq_qkv), kD / 2, scale, m, static_cast<int>(kD), stream);
+        std::int8_t* const xq4 = via ? xq_qkv + m * kD : xq_qkv;
+        kq4::convrot_quantize_int4(bf(y), kD, u8(xq4), kD / 2, scale, m, static_cast<int>(kD), stream);
         for (int i = 0; i < 3; ++i) {
-          if (!w.qkv4_part[i].empty()) {
-            kq4::int4_gemm(operands4(u8(xq_qkv), kD / 2, scale, w.qkv4_part[i], m), nullptr, bf_mut(part(i)), 3 * kD,
-                           stream);
+          if (w.qkv4_part[i].empty()) continue;
+          if (via) {
+            kq::int8_gemm(unpacked(xq4, xq_qkv, w.qkv4_part[i]), nullptr, bf_mut(part(i)), 3 * kD, stream);
+          } else {
+            kq4::int4_gemm(operands4(u8(xq4), kD / 2, scale, w.qkv4_part[i], m), nullptr, bf_mut(part(i)), 3 * kD, stream);
           }
         }
       }
@@ -312,10 +339,12 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   if (!w.o4.empty()) {
     kl::LoraSlices lo;
     if (s_o != nullptr) lo = prepare(*s_o, attn);  // t from the bf16 input, before it is rotated
-    std::int8_t* const xq4 = s_o != nullptr ? xq_y + m * kD : xq_y;
+    std::int8_t* const xq4 = u_o ? xq_y + m * kD : xq_y;
     kq4::convrot_quantize_int4(bf(attn), kD, u8(xq4), kD / 2, scale, m, static_cast<int>(kD), stream);
     if (s_o != nullptr) {
       kl::int8_gemm_gated_residual_lora(unpacked(xq4, xq_y, w.o4), nullptr, bf(vec(a.mod, 2)), lo, bf_mut(x), kD, stream);
+    } else if (via) {
+      kq::int8_gemm_gated_residual(unpacked(xq4, xq_y, w.o4), nullptr, bf(vec(a.mod, 2)), bf_mut(x), kD, stream);
     } else {
       kq4::int4_gemm_gated_residual(operands4(u8(xq4), kD / 2, scale, w.o4, m), nullptr, bf(vec(a.mod, 2)), bf_mut(x), kD,
                                     stream);
@@ -348,6 +377,12 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     kq4::convrot_quantize_int4(bf(y), kD, u8(xq_qkv + m * kD), kD / 2, scale, m, static_cast<int>(kD), stream);
     const kq::Int8Operands op = unpacked(xq_qkv + m * kD, xq_qkv, w.up_gate4);
     kl::int8_gemm_situ_glu_lora(op, prepare(*s_up, y), bf_mut(ffn), kF, stream);
+  } else if (!w.up_gate4.empty() && via) {
+    // The attention output's columns are free: packed input after its INT8 copy, as with a side branch.
+    ffn = rows_of(a.big, 0, l, kF, run.t0, run.t1);
+    kq4::rms_norm_modulate_convrot_quantize_int4(bf(x), kD, bf(w.norm2), bf(vec(a.mod, 4)), bf(vec(a.mod, 3)),
+                                                 u8(xq_qkv + m * kD), kD / 2, scale, m, static_cast<int>(kD), stream);
+    kq::int8_gemm_situ_glu(unpacked(xq_qkv + m * kD, xq_qkv, w.up_gate4), bf_mut(ffn), kF, stream);
   } else if (!w.up_gate4.empty()) {
     ffn = rows_of(a.big, 0, l, kF, run.t0, run.t1);
     kq4::rms_norm_modulate_convrot_quantize_int4(bf(x), kD, bf(w.norm2), bf(vec(a.mod, 4)), bf(vec(a.mod, 3)), u8(xq_y),
@@ -390,10 +425,12 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   if (!w.down4.empty()) {
     kl::LoraSlices ld;
     if (s_down != nullptr) ld = prepare(*s_down, ffn);
-    std::int8_t* const xq4 = s_down != nullptr ? static_cast<std::int8_t*>(a.y.data) + run.t0 * (kF / 2) : xq;
+    std::int8_t* const xq4 = u_down ? static_cast<std::int8_t*>(a.y.data) + run.t0 * (kF / 2) : xq;
     kq4::convrot_quantize_int4(bf(ffn), kF, u8(xq4), kF / 2, scale, m, static_cast<int>(kF), stream);
     if (s_down != nullptr) {
       kl::int8_gemm_gated_residual_lora(unpacked(xq4, xq, w.down4), nullptr, bf(vec(a.mod, 5)), ld, bf_mut(x), kD, stream);
+    } else if (via) {
+      kq::int8_gemm_gated_residual(unpacked(xq4, xq, w.down4), nullptr, bf(vec(a.mod, 5)), bf_mut(x), kD, stream);
     } else {
       kq4::int4_gemm_gated_residual(operands4(u8(xq4), kF / 2, scale, w.down4, m), nullptr, bf(vec(a.mod, 5)), bf_mut(x),
                                     kD, stream);

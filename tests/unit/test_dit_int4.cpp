@@ -312,27 +312,33 @@ TEST(DitInt4Index, LoraOnInt4File) {
   fs::remove_all(dir, ec);
 }
 
+// Both kernels: 16-byte vectors (cols % 32 == 0, 16-byte strides) and the scalar fallback (odd strides).
 TEST(DitInt4Kernels, UnpackMatchesHost) {
-  constexpr std::int64_t kRows = 37, kCols = 512, kLdIn = 272, kLdOut = 528;
-  std::vector<std::uint8_t> in(static_cast<std::size_t>(kRows * kLdIn));
-  std::mt19937 rng(7);
-  for (auto& b : in) b = static_cast<std::uint8_t>(rng());
-  mi::DeviceBuffer din(in.size()), dout(static_cast<std::size_t>(kRows * kLdOut));
-  din.upload(in.data(), in.size());
-  MI_CUDA_CHECK(cudaMemset(dout.get(), 0x55, dout.size()));
-  md::unpack_int4(din.get(), kLdIn, dout.get(), kLdOut, kRows, kCols, nullptr);
-  std::vector<std::int8_t> out(dout.size());
-  MI_CUDA_CHECK(cudaMemcpy(out.data(), dout.get(), out.size(), cudaMemcpyDeviceToHost));
-  for (std::int64_t r = 0; r < kRows; ++r) {
-    for (std::int64_t c = 0; c < kLdOut; ++c) {
-      const auto got = out[static_cast<std::size_t>(r * kLdOut + c)];
-      if (c >= kCols) {
-        ASSERT_EQ(static_cast<std::uint8_t>(got), 0x55) << "wrote past cols";
-        continue;
+  const struct {
+    std::int64_t cols, ld_in, ld_out;
+  } cases[] = {{512, 272, 528}, {510, 263, 517}};
+  constexpr std::int64_t kRows = 37;
+  for (const auto& cs : cases) {
+    std::vector<std::uint8_t> in(static_cast<std::size_t>(kRows * cs.ld_in));
+    std::mt19937 rng(7);
+    for (auto& b : in) b = static_cast<std::uint8_t>(rng());
+    mi::DeviceBuffer din(in.size()), dout(static_cast<std::size_t>(kRows * cs.ld_out));
+    din.upload(in.data(), in.size());
+    MI_CUDA_CHECK(cudaMemset(dout.get(), 0x55, dout.size()));
+    md::unpack_int4(din.get(), cs.ld_in, dout.get(), cs.ld_out, kRows, cs.cols, nullptr);
+    std::vector<std::int8_t> out(dout.size());
+    MI_CUDA_CHECK(cudaMemcpy(out.data(), dout.get(), out.size(), cudaMemcpyDeviceToHost));
+    for (std::int64_t r = 0; r < kRows; ++r) {
+      for (std::int64_t c = 0; c < cs.ld_out; ++c) {
+        const auto got = out[static_cast<std::size_t>(r * cs.ld_out + c)];
+        if (c >= cs.cols) {
+          ASSERT_EQ(static_cast<std::uint8_t>(got), 0x55) << "wrote past cols " << cs.cols;
+          continue;
+        }
+        const int byte = in[static_cast<std::size_t>(r * cs.ld_in + c / 2)];
+        const int nib = c % 2 == 0 ? byte & 0xF : byte >> 4;
+        ASSERT_EQ(got, nib >= 8 ? nib - 16 : nib) << r << "," << c << " (cols " << cs.cols << ")";
       }
-      const int byte = in[static_cast<std::size_t>(r * kLdIn + c / 2)];
-      const int nib = c % 2 == 0 ? byte & 0xF : byte >> 4;
-      ASSERT_EQ(got, nib >= 8 ? nib - 16 : nib) << r << "," << c;
     }
   }
 }
@@ -390,8 +396,9 @@ class DitInt4Block : public ::testing::Test {
     md::BlockRun run;
     md::QuantBlockBuffers qa;
     mi::kernels::Gemm gemm;
+    // via: every INT4 linear through the INT8 GEMMs on unpacked operands (QuantBlockBuffers::int4_via_int8).
     Run(const std::vector<std::uint16_t>& xv, std::span<const std::int64_t> text, cudaStream_t s,
-        const mi::lora::SideBranches* lora = nullptr) {
+        const mi::lora::SideBranches* lora = nullptr, bool via = false) {
       const std::int64_t hw = kGridH * kGridW;
       std::vector<std::int32_t> cu_h{0};
       int max_len = 0;
@@ -429,14 +436,17 @@ class DitInt4Block : public ::testing::Test {
       if (lora != nullptr) {
         lora_t = std::make_unique<DevTensor>(DType::kBF16, std::initializer_list<std::int64_t>{l, lora->max_rank()});
         lora_ws = mi::DeviceBuffer(mi::lora::t_workspace_bytes(l, lora->max_rank()));
-        unpack = mi::DeviceBuffer(md::kInt4UnpackBytes);
         qa.lora = lora;
         qa.lora_t = lora_t->t;
         qa.lora_workspace = lora_ws.get();
         qa.lora_workspace_bytes = lora_ws.size();
+      }
+      if (lora != nullptr || via) {
+        unpack = mi::DeviceBuffer(md::kInt4UnpackBytes);
         qa.int4_unpack = unpack.get();
         qa.int4_unpack_bytes = unpack.size();
       }
+      qa.int4_via_int8 = via;
     }
     md::QkvGemm qkv_gemm() { return {&gemm, gemm_ws.get(), gemm_ws.size()}; }
     void reset(const std::vector<std::uint16_t>& xv) { x->buf.upload(xv.data(), xv.size() * 2); }
@@ -444,8 +454,8 @@ class DitInt4Block : public ::testing::Test {
 
   std::vector<std::uint16_t> run_block(const md::BlockTensors& w, const std::vector<std::uint16_t>& xv,
                                        std::span<const std::int64_t> text, md::AttentionMode mode = md::AttentionMode::kExact,
-                                       const mi::lora::SideBranches* lora = nullptr) {
-    Run r(xv, text, stream(), lora);
+                                       const mi::lora::SideBranches* lora = nullptr, bool via = false) {
+    Run r(xv, text, stream(), lora, via);
     md::run_block_quant(w, r.qa, r.run, r.qkv_gemm(), fused_route_, mode, stream(), kBlock);
     MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
     return download<std::uint16_t>(r.x->t);
@@ -578,6 +588,64 @@ TEST_F(DitInt4Block, TightFusedBigBuffer) {
   MI_CUDA_CHECK(cudaMemcpy(after.data(), static_cast<std::uint16_t*>(big.get()) + l * md::kFusedBigCols, kGuard * 2,
                            cudaMemcpyDeviceToHost));
   EXPECT_EQ(after, sentinel);
+}
+
+// GPUs without INT4 MMA run every INT4 linear through the INT8 GEMMs on unpacked operands: forced here, it gives the
+// native INT4 path's bits exactly, for every site, the split QKV of a mixed block, 8-bit attention, a side branch and
+// a `big` sized as forward() sizes it.
+TEST_F(DitInt4Block, ViaInt8EqualsNativeInt4) {
+  EXPECT_EQ(md::int4_mma_native(8, 9), true);
+  EXPECT_EQ(md::int4_mma_native(8, 0), true);
+  EXPECT_EQ(md::int4_mma_native(9, 0), false);
+  EXPECT_EQ(md::int4_mma_native(10, 0), false);
+  EXPECT_EQ(md::int4_mma_native(12, 0), false);
+  const auto xv = load_u16("all_int4_x");
+  for (const md::AttentionMode mode : {md::AttentionMode::kExact, md::AttentionMode::kQ8Fp8}) {
+    if (!md::attention_supported(mode)) continue;
+    EXPECT_EQ(run_block(w4_, xv, kText, mode, nullptr, true), run_block(w4_, xv, kText, mode)) << md::attention_mode_name(mode);
+  }
+  // Split QKV: q INT4, k INT8, v bf16; o bf16; up_gate INT4; down INT8.
+  md::BlockTensors w = w4_;
+  const auto rows = [](const Tensor& t, std::int64_t r0, std::int64_t r1) { return t.slice0(r0, r1); };
+  w.qkv4 = {};
+  w.qkv_split = true;
+  w.qkv4_part[0] = {rows(w4_.qkv4.w, 0, kDim), rows(w4_.qkv4.scale, 0, kDim)};
+  w.qkv8_part[1] = {rows(w8_.qkv8.w, kDim, 2 * kDim), rows(w8_.qkv8.scale, kDim, 2 * kDim)};
+  w.qkv_part[2] = rows(w16_.qkv, 2 * kDim, 3 * kDim);
+  w.o4 = {};
+  w.o = w16_.o;
+  w.down4 = {};
+  w.down8 = w8_.down8;
+  const auto mx = load_u16("mixed_x");
+  const std::span<const std::int64_t> one(kText, 1);
+  EXPECT_EQ(run_block(w, mx, one, md::AttentionMode::kExact, nullptr, true), run_block(w, mx, one));
+  // With a side branch on every site.
+  const mi::lora::LoraSpec spec{data_dir() / "lora_block5.safetensors", 1.0f};
+  mi::lora::LoraStack stack(std::span<const mi::lora::LoraSpec>(&spec, 1), mi::lora::moss_dit_targets());
+  mi::lora::SideBranches sb(stack);
+  EXPECT_EQ(run_block(w4_, xv, kText, md::AttentionMode::kExact, &sb, true),
+            run_block(w4_, xv, kText, md::AttentionMode::kExact, &sb));
+  // `big` of kFusedBigCols per token, a guard after it.
+  Run tight(xv, kText, stream(), nullptr, true);
+  const std::int64_t l = tight.l;
+  constexpr std::int64_t kGuard = 4096;
+  mi::DeviceBuffer big(static_cast<std::size_t>(l * md::kFusedBigCols + kGuard) * 2);
+  const std::vector<std::uint16_t> sentinel(static_cast<std::size_t>(kGuard), 0x7F81);
+  MI_CUDA_CHECK(cudaMemcpy(static_cast<std::uint16_t*>(big.get()) + l * md::kFusedBigCols, sentinel.data(), kGuard * 2,
+                           cudaMemcpyHostToDevice));
+  tight.qa.f.big = Tensor::view(big.get(), DType::kBF16, mi::Device::kCUDA, {l, md::kFusedBigCols});
+  md::run_block_quant(w4_, tight.qa, tight.run, tight.qkv_gemm(), fused_route_, md::AttentionMode::kExact, stream());
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  EXPECT_EQ(download<std::uint16_t>(tight.x->t), run_block(w4_, xv, kText));
+  std::vector<std::uint16_t> after(static_cast<std::size_t>(kGuard));
+  MI_CUDA_CHECK(cudaMemcpy(after.data(), static_cast<std::uint16_t*>(big.get()) + l * md::kFusedBigCols, kGuard * 2,
+                           cudaMemcpyDeviceToHost));
+  EXPECT_EQ(after, sentinel);
+  // Without the unpack buffer: refused before any launch.
+  Run bare(xv, kText, stream(), nullptr, true);
+  bare.qa.int4_unpack = nullptr;
+  EXPECT_THROW(md::run_block_quant(w4_, bare.qa, bare.run, bare.qkv_gemm(), fused_route_, md::AttentionMode::kExact, stream()),
+               std::invalid_argument);
 }
 
 // A kohya LoRA with B = 0 on every GEMM of block kBlock (rank 16): an active side branch adding exact zeros.
@@ -744,10 +812,13 @@ class DitInt4Model : public ::testing::Test {
       bf16_v_ = io.forward(bf16, rows, c.timestep, s);
     }
     quant_ = std::make_unique<mi::quant::QuantIndex>(int4_index());
+    // Every attention mode and INT4 route the tests switch to (the via-INT8 route adds the unpack buffer).
     work_ = std::max({md::MossDit::workspace_bytes(c.h, c.w, lengths, md::BlockPath::kFusedGraphs,
-                                                   md::MossDit::compute_config(quant_.get(), md::AttentionMode::kQ8Fp8), nullptr),
+                                                   md::MossDit::compute_config(quant_.get(), md::AttentionMode::kQ8Fp8,
+                                                                               md::Int4Route::kViaInt8), nullptr),
                       md::MossDit::workspace_bytes(c.h, c.w, lengths, md::BlockPath::kFusedGraphs,
-                                                   md::MossDit::compute_config(quant_.get(), md::AttentionMode::kExact), nullptr),
+                                                   md::MossDit::compute_config(quant_.get(), md::AttentionMode::kExact,
+                                                                               md::Int4Route::kViaInt8), nullptr),
                       md::MossDit::encode_text_workspace_bytes(std::max(c.s_cond, c.s_uncond))});
     persistent_ = md::MossDit::persistent_bytes(quant_->index);
     arena_ = std::make_unique<mi::runtime::DeviceArena>(persistent_ + work_);
@@ -768,6 +839,7 @@ class DitInt4Model : public ::testing::Test {
     if (!model_) GTEST_SKIP() << "INT4 DiT file, SFT bundle or goldens absent";
     model_->set_block_path(md::BlockPath::kFused);
     model_->set_attention(md::AttentionMode::kExact);
+    model_->set_int4_route(md::Int4Route::kAuto);
   }
   cudaStream_t stream() const { return streams_->compute(); }
   std::vector<md::Row> cfg_rows() const { return {{io_->cond->t, {}}, {io_->uncond->t, case_->uncond_skip}}; }
@@ -806,6 +878,36 @@ TEST_F(DitInt4Model, StepVelocityVsBf16Engine) {
     EXPECT_GE(c0, 0.95);
     EXPECT_GE(c1, 0.95);
   }
+}
+
+// The model's INT4 route: through the INT8 GEMMs equals native INT4 bit for bit (eager and CUDA graphs), and the
+// forward stack follows the route (the unpack buffer).
+TEST_F(DitInt4Model, Int4RouteViaInt8EqualsNative) {
+  const auto rows = cfg_rows();
+  const GoldenCase& c = *case_;
+  const std::int64_t lengths[] = {c.s_cond, c.s_uncond};
+  for (const md::AttentionMode mode : {md::AttentionMode::kExact, md::AttentionMode::kQ8Fp8}) {
+    model_->set_attention(mode);
+    model_->set_int4_route(md::Int4Route::kNative);
+    EXPECT_FALSE(model_->compute_config().int4_via_int8);
+    const std::size_t native_ws = md::MossDit::workspace_bytes(c.h, c.w, lengths, md::BlockPath::kFused, model_->compute_config(), nullptr);
+    const auto native = io_->forward(*model_, rows, case_->timestep, stream());
+    model_->set_int4_route(md::Int4Route::kViaInt8);
+    EXPECT_TRUE(model_->compute_config().int4_via_int8);
+    EXPECT_EQ(md::MossDit::workspace_bytes(c.h, c.w, lengths, md::BlockPath::kFused, model_->compute_config(), nullptr),
+              native_ws + mi::runtime::align_up(md::kInt4UnpackBytes));
+    const auto via = io_->forward(*model_, rows, case_->timestep, stream());
+    model_->set_block_path(md::BlockPath::kFusedGraphs);
+    std::vector<std::vector<float>> graphs;
+    for (int i = 0; i < 3; ++i) graphs = io_->forward(*model_, rows, case_->timestep, stream());
+    model_->set_block_path(md::BlockPath::kFused);
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+      EXPECT_EQ(differing(via[r], native[r]), 0u) << md::attention_mode_name(mode) << " row " << r;
+      EXPECT_EQ(differing(graphs[r], native[r]), 0u) << md::attention_mode_name(mode) << " graphs row " << r;
+    }
+  }
+  model_->set_int4_route(md::Int4Route::kAuto);
+  EXPECT_EQ(model_->compute_config().int4_via_int8, !md::int4_mma_native());
 }
 
 TEST_F(DitInt4Model, VarlenBatchBitExactPerRow) {
@@ -925,17 +1027,18 @@ TEST(DitInt4Speed, Step1024) {
   const std::size_t free = mi::runtime::DeviceArena::free_device_bytes() - (std::size_t{512} << 20);
   // Each model alone in its own arena; attention modes interleaved per model.
   const auto measure = [&](const mi::quant::QuantIndex* qi, const mi::weights::ModelIndex& index,
-                           std::span<const md::AttentionMode> modes) {
+                           std::span<const md::AttentionMode> modes, md::Int4Route route = md::Int4Route::kAuto) {
     std::size_t work = 0;
     for (const md::AttentionMode a : modes) {
       work = std::max(work, md::MossDit::workspace_bytes(c.h, c.w, lengths, md::BlockPath::kFused,
-                                                         md::MossDit::compute_config(qi, a), nullptr));
+                                                         md::MossDit::compute_config(qi, a, route), nullptr));
     }
     std::vector<double> med(modes.size(), -1.0);
     if (md::MossDit::persistent_bytes(index) + work > free) return med;
     mi::runtime::DeviceArena arena(md::MossDit::persistent_bytes(index) + work);
     std::unique_ptr<md::MossDit> m = qi != nullptr ? std::make_unique<md::MossDit>(*qi, arena, streams)
                                                    : std::make_unique<md::MossDit>(index, arena, streams);
+    m->set_int4_route(route);
     std::vector<std::vector<double>> t(modes.size());
     for (int i = 0; i < 9; ++i) {
       for (std::size_t j = 0; j < modes.size(); ++j) {
@@ -954,10 +1057,14 @@ TEST(DitInt4Speed, Step1024) {
   const mi::weights::ModelIndex bundle = mi::weights::load_index(sft_dir() / "moss.mossidx", sft_dir());
   const auto t16 = measure(nullptr, bundle, exact);
   const auto t8 = measure(&q8, q8.index, both);
-  const auto t4 = measure(&q4, q4.index, both);
-  std::printf("[dit_int4 speed, dev] 1024^2 CFG step (282+10 tokens): bf16 fused %.3f s; INT8 + exact %.3f s, + q8_fp8 "
-              "%.3f s; INT4 + exact %.3f s, + q8_fp8 %.3f s (INT4 vs INT8 exact %.2fx, vs bf16 %.2fx)\n",
-              t16[0], t8[0], t8[1], t4[0], t4[1], t8[0] / t4[0], t16[0] > 0 ? t16[0] / t4[0] : 0.0);
+  const auto t4 = measure(&q4, q4.index, both, md::Int4Route::kNative);
+  const auto t4v = measure(&q4, q4.index, both, md::Int4Route::kViaInt8);
+  std::printf("[dit_int4 speed, dev] 1024^2 CFG step (282+10 tokens), INT4 MMA native on this GPU: %s\n"
+              "  bf16 fused %.3f s; INT8 + exact %.3f s, + q8_fp8 %.3f s; INT4 native + exact %.3f s, + q8_fp8 %.3f s; "
+              "INT4 via INT8 + exact %.3f s, + q8_fp8 %.3f s (INT4 native vs INT8 exact %.2fx, vs bf16 %.2fx)\n",
+              md::int4_mma_native() ? "yes" : "no", t16[0], t8[0], t8[1], t4[0], t4[1], t4v[0], t4v[1], t8[0] / t4[0],
+              t16[0] > 0 ? t16[0] / t4[0] : 0.0);
+  RecordProperty("int4_via_int8_exact_step_s", std::to_string(t4v[0]));
   RecordProperty("int4_exact_step_s", std::to_string(t4[0]));
   RecordProperty("int4_q8_step_s", std::to_string(t4[1]));
   RecordProperty("int8_exact_step_s", std::to_string(t8[0]));

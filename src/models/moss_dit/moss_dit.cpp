@@ -270,11 +270,12 @@ std::vector<std::string> shadowed_by_time_embedding(const lora::LoraStack& stack
   return out;
 }
 
-ComputeConfig MossDit::compute_config(const quant::QuantIndex* quant, AttentionMode attention) {
+ComputeConfig MossDit::compute_config(const quant::QuantIndex* quant, AttentionMode attention, Int4Route int4_route) {
   ComputeConfig c;
   c.attention = attention;
   c.quantized = has_quantized_linears(quant) || attention != AttentionMode::kExact;
   c.int4 = has_int4_linears(quant);
+  c.int4_via_int8 = c.int4 && (int4_route == Int4Route::kViaInt8 || (int4_route == Int4Route::kAuto && !int4_mma_native()));
   c.bf16_up_gate = quant == nullptr;
   if (quant != nullptr) {
     for (const auto& [module, spec] : quant->specs) {
@@ -405,8 +406,13 @@ void MossDit::set_lora(const lora::SideBranches* side_branches) {
   refresh_config(config_.attention);
 }
 
+void MossDit::set_int4_route(Int4Route route) {
+  int4_route_ = route;
+  refresh_config(config_.attention);
+}
+
 void MossDit::refresh_config(AttentionMode attention) {
-  config_ = compute_config(quant_, attention);
+  config_ = compute_config(quant_, attention, int4_route_);
   if (lora_ != nullptr && lora_->any_active()) {
     config_.quantized = true;
     config_.lora_rank = lora_->max_rank();
@@ -708,8 +714,8 @@ std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, st
     if (config.lora_rank > 0) {
       plan.tensor(DType::kBF16, {total, config.lora_rank});
       plan.bytes(lora::t_workspace_bytes(total, config.lora_rank));
-      if (config.int4) plan.bytes(kInt4UnpackBytes);
     }
+    if (config.int4 && (config.lora_rank > 0 || config.int4_via_int8)) plan.bytes(kInt4UnpackBytes);
   }
   TimeScratch{plan};
   return plan.total();
@@ -788,10 +794,11 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
       qa.lora_t = plan.tensor(DType::kBF16, {total, config_.lora_rank});
       qa.lora_workspace_bytes = lora::t_workspace_bytes(total, config_.lora_rank);
       qa.lora_workspace = plan.bytes(qa.lora_workspace_bytes);
-      if (config_.int4) {
-        qa.int4_unpack_bytes = kInt4UnpackBytes;
-        qa.int4_unpack = plan.bytes(kInt4UnpackBytes);
-      }
+    }
+    qa.int4_via_int8 = config_.int4_via_int8;
+    if (config_.int4 && (config_.lora_rank > 0 || config_.int4_via_int8)) {
+      qa.int4_unpack_bytes = kInt4UnpackBytes;
+      qa.int4_unpack = plan.bytes(kInt4UnpackBytes);
     }
   }
   // Streamed blocks: device buffers after the activations; the first copies overlap the setup below.
@@ -893,6 +900,7 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     }
     // The block variant, and the LoRA side branches' generation (their set of active sites changes the kernels).
     key.variant = quantized ? 1 + static_cast<std::uint64_t>(config_.attention) : 0;
+    if (config_.int4_via_int8) key.variant |= std::uint64_t{1} << 7;
     if (qa.lora != nullptr) key.variant |= qa.lora->generation() << 8;
     key.route_generation = route.generation;
     const std::uint64_t h = key.hash();

@@ -1508,6 +1508,7 @@ Result Pipeline::generate(const Request& req, const GenerateControl& control) {
     in.caps.dit_ring_bytes = moss_dit::BlockWeights::host_bytes(*src.index, file);
   }
   in.caps.dit_host_pinned = true;
+  in.caps.int4_mma_native = moss_dit::int4_mma_native();
   if (m.lora_stack) {
     for (int bi = 0; bi < moss_dit::kLayers; ++bi) {
       if (moss_dit::MossDit::block_has_merges(*m.lora_stack, bi)) in.caps.dit_file_source = false;

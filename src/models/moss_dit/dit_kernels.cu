@@ -85,6 +85,33 @@ __global__ void linear_fp32_row_kernel(const __nv_bfloat16* w, const float* x, c
   if (lane == 0) out[row] = __float2bfloat16_rn(acc + bias[row]);
 }
 
+// 16 input bytes (32 values) per thread: one 16-byte load, two 16-byte stores. Each 32-bit word of 8 nibbles becomes 8
+// sign-extended bytes.
+__device__ __forceinline__ uint2 unpack8(std::uint32_t w) {
+  std::uint32_t lo = 0, hi = 0;
+  for (int i = 0; i < 4; ++i) {
+    const std::uint32_t b = (w >> (8 * i)) & 0xFFu;
+    const std::uint32_t l = static_cast<std::uint32_t>(static_cast<std::uint8_t>(static_cast<std::int32_t>(b << 28) >> 28));
+    const std::uint32_t h = static_cast<std::uint32_t>(static_cast<std::uint8_t>(static_cast<std::int32_t>(b << 24) >> 28));
+    const std::uint32_t pair = l | (h << 8);
+    if (i < 2) lo |= pair << (16 * i);
+    else hi |= pair << (16 * (i - 2));
+  }
+  return make_uint2(lo, hi);
+}
+
+__global__ void unpack_int4_vec_kernel(const std::uint8_t* in, std::int64_t ld_in, std::int8_t* out, std::int64_t ld_out,
+                                       std::int64_t rows, std::int64_t chunks) {
+  const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= rows * chunks) return;
+  const std::int64_t r = i / chunks, c = i % chunks;
+  const uint4 v = *reinterpret_cast<const uint4*>(in + r * ld_in + 16 * c);
+  const uint2 a = unpack8(v.x), b = unpack8(v.y), d = unpack8(v.z), e = unpack8(v.w);
+  uint4* o = reinterpret_cast<uint4*>(out + r * ld_out + 32 * c);
+  o[0] = make_uint4(a.x, a.y, b.x, b.y);
+  o[1] = make_uint4(d.x, d.y, e.x, e.y);
+}
+
 __global__ void write_params_kernel(std::uint32_t* dst, Params p, int n) {
   for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) dst[i] = p.words[i];
 }
@@ -141,6 +168,14 @@ void unpack_int4(const void* in, std::int64_t ld_in, void* out, std::int64_t ld_
         "unpack_int4", "needs even cols, ld_in >= cols / 2 and ld_out >= cols");
   const std::int64_t n = rows * (cols / 2);
   if (n == 0) return;
+  const auto a16 = [](const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16 == 0; };
+  if (cols % 32 == 0 && ld_in % 16 == 0 && ld_out % 16 == 0 && a16(in) && a16(out)) {
+    const std::int64_t chunks = cols / 32, threads = rows * chunks;
+    unpack_int4_vec_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(
+        static_cast<const std::uint8_t*>(in), ld_in, static_cast<std::int8_t*>(out), ld_out, rows, chunks);
+    MI_CUDA_CHECK_LAUNCH();
+    return;
+  }
   unpack_int4_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(
       static_cast<const std::uint8_t*>(in), ld_in, static_cast<std::int8_t*>(out), ld_out, rows, cols / 2);
   MI_CUDA_CHECK_LAUNCH();

@@ -45,6 +45,11 @@ constexpr double kInt8GemmSpeedup = 2.7;
 // process): bf16 1.38 s, INT8 + exact 0.71 s, INT4 + exact 0.55 s, INT4 + q8_fp8 0.40 s; with the same attention split,
 // the INT4 GEMMs run 3.8x (exact) to 4.3x (q8) the bf16 ones, about 1.55x the INT8 ones.
 constexpr double kInt4GemmSpeedup = 4.0;
+// INT4 linears on a GPU without INT4 MMA (sm_90+) run the INT8 GEMMs on operands unpacked every forward (moss_dit):
+// the INT8 speedup less the unpack traffic, ~2 % of the step (2026-10-23, 1024^2 CFG step, 282 + 10 tokens: RTX 5090
+// INT8 + exact 0.224 s vs INT4 via INT8 0.229 s, INT4 on ptxas's emulated INT4 MMA 1.029 s; RTX 4090 Laptop INT8
+// 0.654 s vs INT4 via INT8 0.668 s).
+constexpr double kInt4ViaInt8Speedup = 2.6;
 constexpr double kQ8Fp8AttentionSpeedup = 1.9;
 constexpr double kQ8Fp16AttentionSpeedup = 1.5;
 constexpr double kQ8F32AccAttentionSpeedup = 1.3;
@@ -179,7 +184,8 @@ class Planner {
       const double f8 = std::clamp(s_.dit_int8_fraction, 0.0, 1.0 - f4);
       const double gemm = s_.dit_precision != Precision::kBf16
                               ? 2.0 * static_cast<double>(s_.dit_params) * l *
-                                    ((1.0 - f8 - f4) + f8 / kInt8GemmSpeedup + f4 / kInt4GemmSpeedup)
+                                    ((1.0 - f8 - f4) + f8 / kInt8GemmSpeedup +
+                                     f4 / (in_.caps.int4_mma_native ? kInt4GemmSpeedup : kInt4ViaInt8Speedup))
                               : static_cast<double>(s_.dit_bytes) * l;
       const double attention = 4.0 * l * l * dim * s_.dit_blocks;
       const double attention_speedup = in_.attention == AttentionMode::kExact    ? 1.0
@@ -396,7 +402,8 @@ class Planner {
   }
 
   std::string precision_text() const {
-    std::string t = s_.dit_precision == Precision::kInt4   ? "INT4 ConvRot"
+    std::string t = s_.dit_precision == Precision::kInt4
+                        ? (in_.caps.int4_mma_native ? "INT4 ConvRot" : "INT4 ConvRot (on the INT8 GEMMs: no INT4 MMA on this GPU)")
                     : s_.dit_precision == Precision::kInt8 ? "INT8 ConvRot"
                                                            : "bf16";
     return is_q8(in_.attention) ? t + " + 8-bit attention (" + attention_name(in_.attention) + ")" : t;

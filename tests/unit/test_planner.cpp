@@ -956,6 +956,12 @@ TEST(Planner, Int4DitStreamsLessAndCostsLeast) {
   in.shapes.dit_int8_fraction = 1.0;
   EXPECT_DOUBLE_EQ(plan(in).dit.compute_s, int4.dit.compute_s);
   EXPECT_STREQ(precision_name(Precision::kInt4), "int4");
+  // A GPU without INT4 MMA runs the INT4 linears on the INT8 GEMMs: costed at (slightly below) INT8 speed, said so.
+  in.caps.int4_mma_native = false;
+  const ExecutionPlan emulated = plan(in);
+  EXPECT_GE(emulated.dit.compute_s, int8.dit.compute_s);
+  EXPECT_LT(emulated.dit.compute_s, int8.dit.compute_s * 1.1);
+  EXPECT_NE(emulated.explanation.find("on the INT8 GEMMs"), std::string::npos) << emulated.explanation;
 }
 
 TEST(Planner, TurboTier) {
