@@ -824,9 +824,10 @@ mi_status mi_engine_release(mi_engine* engine, int32_t keep_host_copy, mi_releas
     require(engine, "engine");
     if (out != nullptr) check_size(out->struct_size, sizeof(mi_release_info), "mi_release_info");
     const BusyGuard busy(*engine);
-    const mi_release_info info = engine->adapter->release(keep_host_copy != 0, engine->cancel);
+    bool cancelled = false;
+    const mi_release_info info = engine->adapter->release(keep_host_copy != 0, engine->cancel, &cancelled);
     if (out != nullptr) write_output(out, info);
-    return MI_OK;
+    return cancelled ? MI_CANCELLED : MI_OK;  // cancelled before it started: nothing was released
   });
 }
 

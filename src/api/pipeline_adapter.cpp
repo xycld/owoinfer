@@ -918,23 +918,32 @@ Generation PipelineAdapter::preload(const mi_gen_params& params, const std::atom
   options.cancel = &cancel;
   const backend::ScopedCurrentContext restore;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
-  // Pipeline::preload plans and loads in one call, without phase hooks: one progress at the start (it also lets a
-  // caller land a cancel issued just before this call), the plan at the end.
-  progress(params, t0, MI_PHASE_DIT_LOAD, 0, 0, 0.0);
-  pipeline::Result r = model_errors([&] { return impl_->pipe->preload(options); });
-  if (params.plan_callback != nullptr && !r.plan.explanation.empty()) {
-    params.plan_callback(r.plan.explanation.c_str(), r.plan.to_json().c_str(), params.user_data);
+  // The plan once, before any load; a progress (step 0, no sampling steps) before each load step, resident models
+  // included: kTextEncoder (a host-resident text encoder's copy), kDecode (each VAE: an image request's encoder, then the
+  // decoder) and kDitLoad. Returning false cancels, as the cancel flag does (a callback's mi_cancel() lands at once).
+  if (params.plan_callback != nullptr) {
+    options.on_plan = [&](const planner::ExecutionPlan& plan) {
+      params.plan_callback(plan.explanation.c_str(), plan.to_json().c_str(), params.user_data);
+    };
   }
+  options.on_phase = [&](pipeline::Phase phase) {
+    progress(params, t0, to_phase(phase), 0, 0, 0.0);
+    return !cancel.load();
+  };
+  pipeline::Result r = model_errors([&] { return impl_->pipe->preload(options); });
   return to_generation(q, r, false);
 }
 
-mi_release_info PipelineAdapter::release(bool keep_host_copy, const std::atomic<bool>& cancel) {
+mi_release_info PipelineAdapter::release(bool keep_host_copy, const std::atomic<bool>& cancel, bool* cancelled) {
   const backend::ScopedCurrentContext restore;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
-  return to_release_info(impl_->pipe->release_device_memory(keep_host_copy, &cancel));
+  return to_release_info(impl_->pipe->release_device_memory(keep_host_copy, &cancel), cancelled);
 }
 
-mi_release_info to_release_info(const pipeline::ReleaseReport& rr) {
+mi_release_info to_release_info(const pipeline::ReleaseReport& rr, bool* cancelled) {
+  // The pipeline's documented report of a release whose cancel was set on entry: nothing released, and this note
+  // (pipeline.h Pipeline::release_device_memory; ReleaseReport has no flag of its own).
+  if (cancelled != nullptr) *cancelled = rr.note == "cancelled before it started" && rr.vram_released == 0;
   mi_release_info out{};
   out.struct_size = sizeof out;
   out.seconds = rr.seconds;

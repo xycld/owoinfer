@@ -1026,8 +1026,9 @@ class Server {
            ",\"seconds\":" + num(d.seconds) + ",\"note\":" + str(mi_result_text(r, MI_TEXT_DIT_LOAD_NOTE)) + "}";
   }
 
-  // release: the response, sent when the release ends. A cancel stops the DiT's host copy (between 64 MiB reads); the
-  // release still frees the device memory, keeps a host-resident text encoder's copy and frees nothing else.
+  // release: the response, sent when the release ends. A cancel that lands before the release frees anything stops it
+  // whole ("cancelled": true, nothing released); one during the DiT's host copy stops the copy (between 64 MiB reads),
+  // and the release still frees the device memory, keeps a host-resident text encoder's copy and frees nothing else.
   // mi_cancel() only stops a running job, and a release has no callback in which a cancel issued before
   // mi_engine_release() marked the engine busy could land (as on_progress does for generate and preload). A relay thread
   // sleeps until request_cancel() wakes it, then repeats mi_cancel() every 10 ms until the release ends, so a cancel
@@ -1065,8 +1066,10 @@ class Server {
     relay_cv_.notify_all();
     if (relay.joinable()) relay.join();
     std::string line = "{\"id\":" + job.id;
-    if (s == MI_OK) {
-      line += ",\"result\":{\"seconds\":" + num(info.seconds) + ",\"vram_released_bytes\":" +
+    if (s == MI_OK || s == MI_CANCELLED) {
+      // cancelled: the cancel landed before the release freed anything (the engine still holds its device memory).
+      line += ",\"result\":{\"cancelled\":" + std::string(tf(s == MI_CANCELLED)) + ",\"seconds\":" + num(info.seconds) +
+              ",\"vram_released_bytes\":" +
               std::to_string(info.vram_released_bytes) + ",\"host_copy_bytes\":" + std::to_string(info.host_copy_bytes) +
               ",\"host_copy_seconds\":" + num(info.host_copy_seconds) + ",\"dit_host_copy\":" + tf(info.dit_host_copy) +
               ",\"te_host_copy\":" + tf(info.te_host_copy) + ",\"note\":" + str(info.note) + "}}";

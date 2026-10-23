@@ -821,15 +821,26 @@ class GpuProtocolTest(ProtocolTestBase):
             self.assertEqual(done["dit_load"]["source"], "files")
             self.assertIn(done["dit_load"]["io"], ("direct", "buffered"))
         self.assertIsInstance(done["warnings"], list)
-        mine = [e for e in events if e.get("id") == "p1"]
-        self.assertEqual([e["event"] for e in mine if e["event"] in ("plan", "progress")][:2], ["progress", "plan"])
+        # The plan before the first load step, then a progress (step 0) per load step, in order; never denoise.
+        mine = [e for e in events if e.get("id") == "p1" and e["event"] in ("plan", "progress")]
+        self.assertEqual(mine[0]["event"], "plan", mine)
+        self.assertEqual([e["event"] for e in mine].count("plan"), 1)
+        phases = [e["phase"] for e in mine[1:]]
+        rank = {"text_encoder": 0, "dit_load": 1, "decode": 2}  # a txt2img request: decode is the VAE decoder
+        self.assertTrue(phases, mine)
+        self.assertEqual([rank[p] for p in phases], sorted(rank[p] for p in phases), phases)
+        self.assertEqual(len(set(phases)), len(phases), phases)
+        self.assertTrue(all(e["step"] == 0 and e["total_steps"] == 0 for e in mine[1:]), mine)
+        if not done["preload_note"]:
+            self.assertIn("dit_load", phases)
         self.assertEqual(self.server.call("status")["result"]["state"], "idle")
         # release with the host copy: answered when it ends, with the stats.
         rid = self.server.send("release", {"keep_host_copy": True}, id="r1")
         r = self.server.response(rid, events=events, timeout=GPU_TIMEOUT)
         stats = r["result"]
-        self.assertEqual(set(stats), {"seconds", "vram_released_bytes", "host_copy_bytes", "host_copy_seconds",
-                                      "dit_host_copy", "te_host_copy", "note"})
+        self.assertEqual(set(stats), {"cancelled", "seconds", "vram_released_bytes", "host_copy_bytes",
+                                      "host_copy_seconds", "dit_host_copy", "te_host_copy", "note"})
+        self.assertIs(stats["cancelled"], False)
         self.assertGreater(stats["vram_released_bytes"], 0)
         print("release:", stats, file=sys.stderr)
         self.assertEqual(self.server.call("status")["result"]["state"], "idle")  # the engine stays
@@ -847,8 +858,9 @@ class GpuProtocolTest(ProtocolTestBase):
             self.assertIn("not kept in RAM", stats["note"], stats)
             print("NOTE: no DiT host copy on this machine now (%s); the host-copy load is not checked" % stats["note"],
                   file=sys.stderr)
-        # A cancel sent right behind a release{keep_host_copy: true}: whenever it lands, it stops at most the DiT's
-        # copy. The release still answers, keeps the text encoder's copy and frees nothing else.
+        # A cancel sent right behind a release{keep_host_copy: true}. Landing before the release frees anything, it
+        # stops it whole ("cancelled": true, nothing released); later, it stops at most the DiT's copy, and the release
+        # still frees the device memory, keeps the text encoder's copy and frees nothing else.
         self.server.send("release", {"keep_host_copy": True}, id="r2")
         self.server.send("cancel", {"id": "r2"}, id="c2")
         answers = {}
@@ -862,19 +874,25 @@ class GpuProtocolTest(ProtocolTestBase):
         # The cancel found the release running or already done (False: it had ended), and the DiT copy was either
         # interrupted (no copy, the note says so) or finished before the cancel reached it.
         self.assertIn(answers["c2"]["result"]["cancelling"], (True, False))
-        if got["dit_host_copy"]:
+        if got["cancelled"]:
+            self.assertEqual(got["vram_released_bytes"], 0, got)
+            self.assertEqual(got["note"], "cancelled before it started", got)
+        elif got["dit_host_copy"]:
             self.assertEqual(got["note"], "", got)
         else:
             # Interrupted, or (the host's free memory changes) no room for the copy at all.
             self.assertTrue("cancelled" in got["note"] or "not kept in RAM" in got["note"], got)
+        if not got["cancelled"]:
+            self.assertGreater(got["vram_released_bytes"], 0)
         self.assertEqual(got["te_host_copy"], stats["te_host_copy"], got)  # the text encoder's copy is never dropped
-        self.assertGreater(got["vram_released_bytes"], 0)
-        # The cancel does not carry over: the next generate runs every step.
+        # The cancel does not carry over: the next generate runs every step (with no DiT load after an early cancel).
         gid = self.server.send("generate", dict(request, output=out), id="g2")
         self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
         done = self.wait_done(gid, events)
         self.assertEqual(done["status"], "ok", done)
         self.assertEqual(done["report"]["steps_run"], 2)
+        if got["cancelled"]:
+            self.assertIsNone(done["report"]["dit_load"]["source"], done["report"]["dit_load"])
         self.assertEqual(self.server.call("unload")["result"], {"unloaded": True})
 
     def test_generate_256_two_steps(self):
