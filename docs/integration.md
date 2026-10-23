@@ -175,7 +175,7 @@ On top of that, the weights are read through the operating system's page cache. 
 
 ## Getting the binaries
 
-**From a release.** CI builds two archives per OS and flavour: `mossinfer-<version>-<os>-cu<12|13>-<arch>.zip` (the full package) and `mossinfer-<version>-<os>-cu<12|13>-<arch>-system-cuda.zip` (the same without cuBLASLt); Linux also gets `.tar.gz` of both. A GitHub release attaches the archives with one `SHA256SUMS` file. See [Package contents](#package-contents).
+**From a release.** CI builds two archives per OS and flavour: `mossinfer-<version>-<os>-cu<12|13>-<arch>.zip` (the full package) and `mossinfer-<version>-<os>-cu<12|13>-<arch>-system-cuda.zip` (the same without cuBLASLt); Linux also gets `.tar.gz` of both. A GitHub release attaches the archives with one `SHA256SUMS` file. Release candidates (tags `vX.Y.Z-rcN`) are GitHub pre-releases; their archives and binaries carry the plain `X.Y.Z` version. See [Package contents](#package-contents).
 
 **From source** (Linux shown):
 
