@@ -1,6 +1,6 @@
 {
  "format": "mossinfer-quality-certificates",
- "version": 2,
+ "version": 3,
  "certificates": [
   {
    "tier": "high",
@@ -64,49 +64,70 @@
      "pass": true
     },
     {
-     "name": "same_seed.lpips_max",
-     "value": 0.131,
+     "name": "same_seed.drift_count",
+     "value": 1.0,
      "op": "<=",
-     "threshold": 0.25,
+     "threshold": 3.0,
      "pass": true
     },
     {
-     "name": "same_seed.dino_mean",
-     "value": 0.9731,
+     "name": "same_seed.lpips_max",
+     "value": 0.301,
+     "op": "<=",
+     "threshold": 0.45,
+     "pass": true
+    },
+    {
+     "name": "same_seed.dino_min",
+     "value": 0.9312,
      "op": ">=",
      "threshold": 0.9,
      "pass": true
     },
     {
-     "name": "same_seed.ocr_delta",
+     "name": "same_seed.ocr_sim_delta",
      "value": -0.0125,
      "op": ">=",
      "threshold": -0.05,
      "pass": true
     },
     {
-     "name": "reference.lpips_mean",
-     "value": 0.0655,
+     "name": "reference.lpips_excess",
+     "value": 0.0081,
      "op": "<=",
-     "threshold": 0.132,
+     "threshold": 0.07295743698768394,
      "pass": true
     },
     {
-     "name": "reference.lpips_paired_max",
-     "value": 0.0402,
+     "name": "reference.lpips_excess_kth",
+     "value": 0.0873,
      "op": "<=",
-     "threshold": 0.08800000000000001,
+     "threshold": 0.138,
      "pass": true
     },
     {
-     "name": "reference.dino_mean",
+     "name": "reference.lpips_excess_top",
+     "value": 0.1915,
+     "op": "<=",
+     "threshold": 0.375,
+     "pass": true
+    },
+    {
+     "name": "reference.dino_min",
      "value": 0.9502,
      "op": ">=",
-     "threshold": 0.8875,
+     "threshold": 0.9,
      "pass": true
     },
     {
-     "name": "reference.ocr_delta",
+     "name": "reference.drift_count",
+     "value": 0.0,
+     "op": "<=",
+     "threshold": 3.0,
+     "pass": true
+    },
+    {
+     "name": "reference.ocr_sim_delta",
      "value": 0.003,
      "op": ">=",
      "threshold": -0.075,
@@ -117,10 +138,12 @@
    "info": {
     "same_seed.ocr_prompts": 13.0,
     "reference.ocr_prompts": 13.0,
+    "official_images": 23.0,
+    "drift_lpips": 0.25,
     "noise.bf16_vs_official.lpips_mean": 0.0461,
     "noise.bf16_repeat.lpips_mean": 0.0
    },
-   "tool": "certify.py 2"
+   "tool": "certify.py 3"
   }
  ]
 }

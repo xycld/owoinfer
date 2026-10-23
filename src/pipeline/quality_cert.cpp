@@ -670,7 +670,7 @@ std::string mismatch(const Certificate& c, const ModelIdentity& model, const Cer
   }
   for (const Gate& g : c.gates) {
     const std::size_t dot = g.name.find('.');
-    if (dot == std::string::npos || g.name.substr(dot) != ".ocr_delta") continue;
+    if (dot == std::string::npos || g.name.substr(dot) != ".ocr_sim_delta") continue;
     const std::string key = g.name.substr(0, dot) + ".ocr_prompts";
     const auto it = std::find_if(c.info.begin(), c.info.end(), [&](const auto& e) { return e.first == key; });
     if (it == c.info.end() || it->second < kMinOcrPrompts) return "too few text prompts behind gate '" + g.name + "'";
@@ -870,24 +870,47 @@ ComponentIdentity identify_component(const fs::path& path, bool hash, const fs::
   return c;
 }
 
-std::vector<GateSpec> required_gates(QualityTier t, bool reference_ocr_gateable) {
+double reference_drift_max(int official_images) {
+  return std::min(3.0, std::max(1.0, std::floor(3.0 * official_images / kCertPrompts + 0.5)));
+}
+
+std::vector<GateSpec> required_gates(QualityTier t, bool reference_ocr_gateable, int official_images) {
+  // Gate schema 3; the limits come from measured noise (quality_cert.h). The certification harness writes the same
+  // table, and test_quality_cert's HarnessFixture compares the two bit for bit (same operation order).
+  constexpr double kDriftMax = 3;          // drifted prompts (same-seed LPIPS above kDriftLpips) allowed in 23
+  constexpr double kLpipsCap = 0.45;       // same-seed per-prompt cap: beyond it a difference is not plausible drift
+  constexpr double kExcessClip = 0.092;    // largest |paired excess| of a noise-equivalent render; k x this per image
+  constexpr double kExcessRms = 0.0367;    // RMS paired excess of a noise-equivalent render
+  constexpr double kDriftRate = 4.0 / 92;  // measured same-seed drift rate of lossy High configurations
   const double k = t == QualityTier::kReference ? 1.0 : t == QualityTier::kHigh ? 1.5 : 3.0;
   const double ocr = t == QualityTier::kReference ? -0.05 : t == QualityTier::kHigh ? -0.075 : -0.10;
+  // Per-prompt DINO floor: the same subject; Turbo, judged against the official images only, AC21's 1 - 0.075 x 3.
+  const double dino_floor = t == QualityTier::kTurbo ? 0.775 : 0.90;
+  const double n = std::max(1, official_images);
+  // The tier's tolerance (AC21's official-image mean allowance 0.088 k beyond the Reference tier's 0.088), plus three
+  // standard errors of a noise-equivalent mean excess over n images, plus drift's expected share.
+  const double tolerance = 0.088 * (k - 1.0);
+  const double excess = tolerance + 3.0 * kExcessRms / std::sqrt(n) + kDriftRate * k * kExcessClip;
   // Every tier: the Reference tier rendered every prompt twice bit-identically on the certifying machine.
   std::vector<GateSpec> out{{"determinism.mismatches", GateOp::kLe, 0.0}};
-  if (t != QualityTier::kTurbo) {
+  if (t != QualityTier::kTurbo) {  // Turbo is not a same-image tier
     out.insert(out.end(), {{"same_seed.lpips_mean", GateOp::kLe, 0.12},
-                           {"same_seed.lpips_max", GateOp::kLe, 0.25},
-                           {"same_seed.dino_mean", GateOp::kGe, 0.90},
-                           {"same_seed.ocr_delta", GateOp::kGe, -0.05}});
+                           {"same_seed.drift_count", GateOp::kLe, kDriftMax},
+                           {"same_seed.lpips_max", GateOp::kLe, kLpipsCap},
+                           {"same_seed.dino_min", GateOp::kGe, dino_floor},
+                           {"same_seed.ocr_sim_delta", GateOp::kGe, -0.05}});
   }
-  out.push_back({"reference.lpips_mean", GateOp::kLe, 0.088 * k});
-  out.push_back({"reference.lpips_paired_max", GateOp::kLe, 0.088 * k / 1.5});
-  out.push_back({"reference.dino_mean", GateOp::kGe, 1.0 - 0.075 * k});
+  out.insert(out.end(), {{"reference.lpips_excess", GateOp::kLe, excess},
+                         {"reference.lpips_excess_kth", GateOp::kLe, k * kExcessClip},
+                         {"reference.lpips_excess_top", GateOp::kLe, std::min(kDriftLpips * k, kLpipsCap)},
+                         {"reference.dino_min", GateOp::kGe, dino_floor}});
+  // AC6's mean DINO limit; only the Reference tier's lies above the per-prompt floor.
+  if (1.0 - 0.075 * k > dino_floor) out.push_back({"reference.dino_mean", GateOp::kGe, 1.0 - 0.075 * k});
+  out.push_back({"reference.drift_count", GateOp::kLe, reference_drift_max(official_images)});
   if (reference_ocr_gateable) {
-    out.push_back({"reference.ocr_delta", GateOp::kGe, ocr});
+    out.push_back({"reference.ocr_sim_delta", GateOp::kGe, ocr});
   } else if (t == QualityTier::kTurbo) {
-    out.push_back({"same_seed.ocr_delta", GateOp::kGe, ocr});
+    out.push_back({"same_seed.ocr_sim_delta", GateOp::kGe, ocr});
   }
   return out;
 }
@@ -947,9 +970,24 @@ std::string validate_certificate(const Certificate& c) {
     if (!is_key_name(k) || !std::isfinite(v)) return "bad info entry '" + k + "'";
     if (!info.insert(k).second) return "duplicate info entry '" + k + "'";
   }
-  for (const char* key : {"same_seed.ocr_prompts", "reference.ocr_prompts"}) {
+  for (const char* key : {"same_seed.ocr_prompts", "reference.ocr_prompts", "official_images"}) {
     const double* v = info_value(c, key);
     if (v == nullptr || *v < 0 || *v > kMaxPrompts || *v != std::floor(*v)) return std::string("info needs a count '") + key + "'";
+  }
+  const double official_images = *info_value(c, "official_images");
+  if (official_images < 1 || official_images > c.prompts) return "info 'official_images' must lie in 1..prompts";
+  // The certification sets: every base prompt has an official image; SFT has the AC6 set's 5 or all 23.
+  if (c.prompt_set_sha256 == kCertPromptSetSha256Base && official_images != kCertPrompts) {
+    return "info 'official_images' must be 23 for the base certification set";
+  }
+  if (c.prompt_set_sha256 == kCertPromptSetSha256Sft && official_images != 5 && official_images != kCertPrompts) {
+    return "info 'official_images' must be 5 or 23 for the SFT certification set";
+  }
+  if (*info_value(c, "reference.ocr_prompts") > official_images) {
+    return "info 'reference.ocr_prompts' exceeds 'official_images'";
+  }
+  if (const double* d = info_value(c, "drift_lpips"); d == nullptr || *d != kDriftLpips) {
+    return "info 'drift_lpips' must be the engine's drift threshold " + num(kDriftLpips);
   }
   if (c.gates.empty() || c.gates.size() > kMaxEntries) return "bad gate count";
   bool all = true;
@@ -958,19 +996,34 @@ std::string validate_certificate(const Certificate& c) {
     if (!is_key_name(g.name)) return "bad gate name '" + g.name + "'";
     if (!names.insert(g.name).second) return "duplicate gate '" + g.name + "'";
     if (!std::isfinite(g.value) || !std::isfinite(g.threshold)) return "gate '" + g.name + "' is not finite";
+    if (g.name.ends_with(".drift_count") && (g.value < 0 || g.value != std::floor(g.value))) {
+      return "gate '" + g.name + "' must count whole prompts";
+    }
     const bool pass = g.op == GateOp::kLe ? g.value <= g.threshold : g.value >= g.threshold;
     if (pass != g.pass) return "gate '" + g.name + "': the pass flag disagrees with its value and threshold";
     all = all && pass;
   }
   const bool ocr_gateable = *info_value(c, "reference.ocr_prompts") >= kMinOcrPrompts;
-  for (const GateSpec& spec : required_gates(c.tier, ocr_gateable)) {
+  for (const GateSpec& spec : required_gates(c.tier, ocr_gateable, static_cast<int>(official_images))) {
     const auto it = std::find_if(c.gates.begin(), c.gates.end(), [&](const Gate& g) { return g.name == spec.name; });
     if (it == c.gates.end()) return "missing the required gate '" + std::string(spec.name) + "'";
-    // A small tolerance for limits like 0.088 * 1.5 written by another program in decimal.
+    // A small tolerance for limits like 0.03 * 1.5 written by another program in decimal.
     constexpr double kTol = 1e-12;
     const bool strict_enough = it->op == spec.op &&
                                (spec.op == GateOp::kLe ? it->threshold <= spec.limit + kTol : it->threshold >= spec.limit - kTol);
     if (!strict_enough) return "gate '" + std::string(spec.name) + "' is looser than the tier requires";
+  }
+  // A drifted official image is a drifted prompt: the reference count cannot exceed the official images or the
+  // same-seed count.
+  const auto gate_value = [&](std::string_view name) -> const double* {
+    const auto it = std::find_if(c.gates.begin(), c.gates.end(), [&](const Gate& g) { return g.name == name; });
+    return it == c.gates.end() ? nullptr : &it->value;
+  };
+  if (const double* ref = gate_value("reference.drift_count")) {
+    const double* same = gate_value("same_seed.drift_count");
+    if (*ref > official_images || (same != nullptr && *ref > *same)) {
+      return "gate 'reference.drift_count' exceeds the official images or the same-seed drift count";
+    }
   }
   if (c.passed != all) return "'passed' disagrees with the gates";
   if (c.tool.size() > kMaxToolBytes) return "tool too long";
@@ -982,8 +1035,13 @@ std::vector<Certificate> parse_certificates(std::string_view text) {
   const json::Object& o = object(doc, "document");
   only_keys(o, {"format", "version", "certificates"}, "document");
   if (string_of(required(o, "format", "document"), "format") != kCertificateFormat) fail("not a certificate file");
-  if (int_of(required(o, "version", "document"), INT64_MIN, INT64_MAX, "version") != kCertificateFormatVersion) {
-    fail("unsupported certificate format version");
+  if (const std::int64_t version = int_of(required(o, "version", "document"), INT64_MIN, INT64_MAX, "version");
+      version != kCertificateFormatVersion) {
+    if (version >= 1 && version < kCertificateFormatVersion) {
+      fail("certificate made with an older gate schema (version " + std::to_string(version) + "; this engine reads version " +
+           std::to_string(kCertificateFormatVersion) + "): re-certify the configuration");
+    }
+    fail("unsupported certificate format version " + std::to_string(version));
   }
   const json::Array& certs = array_of(required(o, "certificates", "document"), kMaxCertificates, "certificates");
   std::vector<Certificate> out;

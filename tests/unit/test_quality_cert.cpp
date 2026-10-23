@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <clocale>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -53,15 +54,16 @@ ComponentIdentity one_file(std::string name, std::uint64_t size, std::uint64_t h
 }
 
 // The gates of `tier`, each passing comfortably (or the first one failing).
-std::vector<Gate> gates_for(QualityTier tier, bool fail_first = false, bool gateable = true) {
+std::vector<Gate> gates_for(QualityTier tier, bool fail_first = false, bool gateable = true, int official_images = kCertPrompts) {
   std::vector<Gate> out;
-  for (const GateSpec& s : required_gates(tier, gateable)) {
+  for (const GateSpec& s : required_gates(tier, gateable, official_images)) {
     Gate g;
     g.name = std::string(s.name);
     g.op = s.op;
     g.threshold = s.limit;
     g.value = s.op == GateOp::kLe ? s.limit * 0.5 : (s.limit > 0 ? s.limit + 0.5 * (1 - s.limit) : s.limit * 0.5);
-    if (fail_first && out.empty()) g.value = s.op == GateOp::kLe ? s.limit + 0.01 : s.limit - 0.01;
+    if (g.name.ends_with(".drift_count")) g.value = std::floor(g.value);  // whole prompts
+    if (fail_first && out.empty()) g.value = s.op == GateOp::kLe ? s.limit + 1 : s.limit - 0.01;
     g.pass = s.op == GateOp::kLe ? g.value <= g.threshold : g.value >= g.threshold;
     out.push_back(g);
   }
@@ -87,9 +89,9 @@ Certificate sample() {
   c.gates = gates_for(QualityTier::kHigh);
   c.gates[1].value = 1.0 / 30.0;  // same_seed.lpips_mean; not exactly representable in decimal: must round-trip
   c.passed = true;
-  c.info = {{"same_seed.ocr_prompts", 13}, {"reference.ocr_prompts", 13}, {"noise.bf16_vs_official.lpips_mean", 0.1 + 0.2},
-            {"tiny", 1e-300}, {"neg", -2.5}};
-  c.tool = "certify.py 2 \"quoted\" \xE2\x9C\x93";
+  c.info = {{"same_seed.ocr_prompts", 13}, {"reference.ocr_prompts", 13}, {"official_images", 23}, {"drift_lpips", kDriftLpips},
+            {"noise.bf16_vs_official.lpips_mean", 0.1 + 0.2}, {"tiny", 1e-300}, {"neg", -2.5}};
+  c.tool = "certify.py 3 \"quoted\" \xE2\x9C\x93";
   return c;
 }
 
@@ -173,17 +175,28 @@ TEST(QualityCert, TokensAndTiers) {
   EXPECT_EQ(gpu_arch_class(12, 0), "sm_120");
 }
 
-// Every tier's limits (AC21, the tier table, and the paired / worst-case gates), with and without official OCR.
+// Every tier's limits (gate schema 3: AC21's tier table plus the drift counts, caps and floors), with and without
+// official OCR, for 23 and 5 official images.
 TEST(QualityCert, GateTables) {
-  const auto limits = [](QualityTier t, bool g) {
+  const auto limits = [](QualityTier t, bool g, int n) {
     std::vector<std::pair<std::string, double>> out;
-    for (const GateSpec& s : required_gates(t, g)) out.emplace_back(std::string(s.name), s.limit);
+    for (const GateSpec& s : required_gates(t, g, n)) out.emplace_back(std::string(s.name), s.limit);
     return out;
   };
   using L = std::vector<std::pair<std::string, double>>;
   const L det = {{"determinism.mismatches", 0.0}};
-  const L same_seed = {{"determinism.mismatches", 0.0}, {"same_seed.lpips_mean", 0.12}, {"same_seed.lpips_max", 0.25}, {"same_seed.dino_mean", 0.90},
-                       {"same_seed.ocr_delta", -0.05}};
+  const L same_seed = {{"determinism.mismatches", 0.0}, {"same_seed.lpips_mean", 0.12}, {"same_seed.drift_count", 3.0},
+                       {"same_seed.lpips_max", 0.45},     {"same_seed.dino_min", 0.90},   {"same_seed.ocr_sim_delta", -0.05}};
+  // T = 0.088 (k - 1): the tier's tolerance, independent of n; then the noise bound and drift's share.
+  const auto reference = [](double k, int n) {
+    L out{{"reference.lpips_excess", 0.088 * (k - 1) + 3 * 0.0367 / std::sqrt(n) + 4.0 / 92 * k * 0.092},
+          {"reference.lpips_excess_kth", 0.092 * k},
+          {"reference.lpips_excess_top", std::min(0.25 * k, 0.45)},
+          {"reference.dino_min", k == 3.0 ? 0.775 : 0.90}};
+    if (k == 1.0) out.emplace_back("reference.dino_mean", 0.925);  // the other tiers' mean limits lie at or below the floor
+    out.emplace_back("reference.drift_count", n == 23 ? 3.0 : 1.0);
+    return out;
+  };
   const auto with = [](L a, const L& b) {
     a.insert(a.end(), b.begin(), b.end());
     return a;
@@ -195,21 +208,28 @@ TEST(QualityCert, GateTables) {
       EXPECT_NEAR(got[i].second, want[i].second, 1e-12) << got[i].first;
     }
   };
-  near(limits(QualityTier::kReference, true), with(same_seed, {{"reference.lpips_mean", 0.088},
-                                                               {"reference.lpips_paired_max", 0.088 / 1.5},
-                                                               {"reference.dino_mean", 0.925},
-                                                               {"reference.ocr_delta", -0.05}}));
-  near(limits(QualityTier::kHigh, true), with(same_seed, {{"reference.lpips_mean", 0.132},
-                                                          {"reference.lpips_paired_max", 0.088},
-                                                          {"reference.dino_mean", 0.8875},
-                                                          {"reference.ocr_delta", -0.075}}));
-  near(limits(QualityTier::kHigh, false), with(same_seed, {{"reference.lpips_mean", 0.132},
-                                                           {"reference.lpips_paired_max", 0.088},
-                                                           {"reference.dino_mean", 0.8875}}));
-  near(limits(QualityTier::kTurbo, true), with(det, {{"reference.lpips_mean", 0.264}, {"reference.lpips_paired_max", 0.176},
-                                           {"reference.dino_mean", 0.775}, {"reference.ocr_delta", -0.10}}));
-  near(limits(QualityTier::kTurbo, false), with(det, {{"reference.lpips_mean", 0.264}, {"reference.lpips_paired_max", 0.176},
-                                            {"reference.dino_mean", 0.775}, {"same_seed.ocr_delta", -0.10}}));
+  for (const int n : {23, 5}) {
+    near(limits(QualityTier::kReference, true, n), with(with(same_seed, reference(1.0, n)), {{"reference.ocr_sim_delta", -0.05}}));
+    near(limits(QualityTier::kReference, false, n), with(same_seed, reference(1.0, n)));
+    near(limits(QualityTier::kHigh, true, n), with(with(same_seed, reference(1.5, n)), {{"reference.ocr_sim_delta", -0.075}}));
+    near(limits(QualityTier::kHigh, false, n), with(same_seed, reference(1.5, n)));
+    near(limits(QualityTier::kTurbo, true, n), with(with(det, reference(3.0, n)), {{"reference.ocr_sim_delta", -0.10}}));
+    near(limits(QualityTier::kTurbo, false, n), with(with(det, reference(3.0, n)), {{"same_seed.ocr_sim_delta", -0.10}}));
+  }
+  EXPECT_NEAR(required_gates(QualityTier::kHigh, true, 5)[6].limit, 0.0992, 1e-4);   // High, SFT: the excess mean
+  EXPECT_NEAR(required_gates(QualityTier::kHigh, true, 23)[6].limit, 0.0730, 1e-4);  // High, base
+  // The tier's tolerance does not depend on n: High minus Reference at the same n is 0.044 plus drift's larger share.
+  for (const int n : {3, 5, 23}) {
+    EXPECT_NEAR(required_gates(QualityTier::kHigh, true, n)[6].limit - required_gates(QualityTier::kReference, true, n)[6].limit,
+                0.044 + 4.0 / 92 * 0.5 * 0.092, 1e-12)
+        << n;
+  }
+  L defaults;  // the default: every prompt has an official image
+  for (const GateSpec& g : required_gates(QualityTier::kHigh)) defaults.emplace_back(std::string(g.name), g.limit);
+  EXPECT_EQ(defaults, limits(QualityTier::kHigh, true, kCertPrompts));
+  for (const auto& [n, want] : std::vector<std::pair<int, double>>{{1, 1}, {3, 1}, {5, 1}, {12, 2}, {23, 3}}) {
+    EXPECT_EQ(reference_drift_max(n), want) << n;
+  }
   for (const QualityTier t : {QualityTier::kReference, QualityTier::kHigh, QualityTier::kTurbo}) {
     for (const bool g : {true, false}) EXPECT_EQ(required_gates(t, g).front().name, "determinism.mismatches");
   }
@@ -277,8 +297,8 @@ TEST(QualityCert, RoundTripText) {
   ref.prompt_set_sha256 = std::string(64, '0');
   ref.scope = CertScope{1048576, {"ab2", "euler"}, 50, 50, false};
   ref.date = "2026-01-01T00:00:00Z";
-  ref.gates = gates_for(QualityTier::kReference, true, false);
-  ref.info = {{"same_seed.ocr_prompts", 2}, {"reference.ocr_prompts", 2}};
+  ref.gates = gates_for(QualityTier::kReference, true, false, 3);
+  ref.info = {{"same_seed.ocr_prompts", 2}, {"reference.ocr_prompts", 2}, {"official_images", 3}, {"drift_lpips", kDriftLpips}};
   ref.passed = false;
   EXPECT_EQ(validate_certificate(ref), "");
 
@@ -334,9 +354,9 @@ TEST(QualityCert, RejectsCorruptAndInconsistentDocuments) {
                               "\"xxh64\": \"0123456789abcdef\"}, {\"name\": \"te-00002.safetensors\", \"size\": 1, "
                               "\"xxh64\": \"0000000000000000\"}]}";
   const std::vector<Case> cases = {
-      {"version", "\"version\": 2", "\"version\": 1"},
+      {"version", "\"version\": 3", "\"version\": 4"},
       {"format", "mossinfer-quality-certificates", "mossinfer-quality-certificate"},
-      {"unknown top key", "\"version\": 2", "\"version\": 2, \"extra\": 0"},
+      {"unknown top key", "\"version\": 3", "\"version\": 3, \"extra\": 0"},
       {"unknown cert key", "\"passed\": true", "\"passed\": true, \"extra\": 1"},
       {"duplicate key", "\"passed\": true", "\"passed\": true, \"passed\": true"},
       {"duplicate config key", "\"lora\": \"none\"", "\"lora\": \"none\", \"lora\": \"none\""},
@@ -374,8 +394,16 @@ TEST(QualityCert, RejectsCorruptAndInconsistentDocuments) {
       {"gate value overflow", "\"value\": 0.03333333333333333", "\"value\": 1e999"},
       {"pass flag", "\"threshold\": 0.12, \"pass\": true", "\"threshold\": 0.12, \"pass\": false"},
       {"looser threshold", "\"threshold\": 0.12,", "\"threshold\": 0.2,"},
-      {"looser max", "\"threshold\": 0.25,", "\"threshold\": 0.3,"},
+      {"looser max", "\"threshold\": 0.45,", "\"threshold\": 0.5,"},
       {"looser dino", "\"threshold\": 0.9,", "\"threshold\": 0.8,"},
+      {"looser drift count", "\"threshold\": 3,", "\"threshold\": 4,"},
+      {"fractional drift count", "\"value\": 1, \"op\": \"<=\", \"threshold\": 3,", "\"value\": 1.5, \"op\": \"<=\", \"threshold\": 3,"},
+      {"official images missing", "\"official_images\": 23, ", ""},
+      {"official images zero", "\"official_images\": 23", "\"official_images\": 0"},
+      {"official images above prompts", "\"official_images\": 23", "\"official_images\": 24"},
+      {"official images fractional", "\"official_images\": 23", "\"official_images\": 4.5"},
+      {"drift threshold missing", "\"drift_lpips\": 0.25, ", ""},
+      {"other drift threshold", "\"drift_lpips\": 0.25", "\"drift_lpips\": 0.3"},
       {"wrong op for gate", "\"op\": \"<=\", \"threshold\": 0.12", "\"op\": \">=\", \"threshold\": 0.12"},
       {"passed", "\"passed\": true", "\"passed\": false"},
       {"info missing", "\"info\": {", "\"infos\": {"},
@@ -400,6 +428,103 @@ TEST(QualityCert, RejectsCorruptAndInconsistentDocuments) {
     Certificate c = sample();
     std::erase_if(c.gates, [&](const Gate& g) { return g.name == spec.name; });
     EXPECT_NE(validate_certificate(c).find("missing the required gate"), std::string::npos) << spec.name;
+  }
+  // A looser threshold than the tier allows, for every required gate of every tier (the same_seed.* and reference.*
+  // twins alike), over 23 and over 5 official images.
+  for (const QualityTier t : {QualityTier::kReference, QualityTier::kHigh, QualityTier::kTurbo}) {
+    for (const int n : {23, 5}) {
+      Certificate c = sample();
+      c.tier = t;
+      c.config = t == QualityTier::kReference ? CertConfig{}
+               : t == QualityTier::kTurbo     ? CertConfig{DitPrecision::kW4A4, AttentionMode::kExact, TePrecision::kBf16, false}
+                                              : c.config;
+      if (c.config.te == TePrecision::kBf16) c.model.te.reset();
+      c.numerics = engine_numerics(c.config);
+      set_info(c, "official_images", n);
+      if (n == 5) {  // the SFT set: 2 official text prompts, so no reference OCR gate
+        c.prompt_set_sha256 = std::string(kCertPromptSetSha256Sft);
+        set_info(c, "reference.ocr_prompts", 2);
+      }
+      c.gates.clear();
+      for (const GateSpec& spec : required_gates(t, n == 23, n)) {
+        const double v = spec.name.ends_with(".drift_count") ? 0.0 : spec.op == GateOp::kLe ? spec.limit * 0.5 : spec.limit + 0.01;
+        c.gates.push_back(Gate{std::string(spec.name), v, spec.op, spec.limit, true});
+      }
+      ASSERT_EQ(validate_certificate(c), "") << cert_token(t) << " " << n;
+      for (std::size_t i = 0; i < c.gates.size(); ++i) {
+        Certificate loose = c;
+        Gate& g = loose.gates[i];
+        g.threshold = g.op == GateOp::kLe ? g.threshold + (g.name.ends_with(".drift_count") ? 1 : 0.001) : g.threshold - 0.001;
+        EXPECT_EQ(validate_certificate(loose), "gate '" + g.name + "' is looser than the tier requires") << cert_token(t) << " " << n;
+      }
+    }
+  }
+  // The SFT set (5 official images) allows one drifted official image, not the 3 of 23.
+  {
+    Certificate c = sample();
+    c.prompt_set_sha256 = std::string(kCertPromptSetSha256Sft);
+    set_info(c, "official_images", 5);
+    set_info(c, "reference.ocr_prompts", 2);
+    c.gates = gates_for(QualityTier::kHigh, false, false);  // thresholds for 23 official images
+    EXPECT_EQ(validate_certificate(c), "gate 'reference.drift_count' is looser than the tier requires");
+    c.gates.clear();
+    for (const GateSpec& spec : required_gates(QualityTier::kHigh, false, 5)) {
+      Gate g{std::string(spec.name), spec.op == GateOp::kLe ? spec.limit * 0.5 : 0.95, spec.op, spec.limit, true};
+      if (g.name.ends_with(".drift_count")) g.value = std::floor(g.value);
+      if (g.name == "same_seed.ocr_sim_delta" || g.name == "reference.ocr_sim_delta") g.value = 0;
+      c.gates.push_back(g);
+    }
+    ASSERT_EQ(validate_certificate(c), "");
+    const auto drift = std::find_if(c.gates.begin(), c.gates.end(), [](const Gate& g) { return g.name == "reference.drift_count"; });
+    ASSERT_NE(drift, c.gates.end());
+    EXPECT_EQ(drift->threshold, 1.0);
+    drift->threshold = 3;
+    EXPECT_EQ(validate_certificate(c), "gate 'reference.drift_count' is looser than the tier requires");
+  }
+  // Consistency of the official-image count with the prompt set, the OCR count and the drift counts.
+  {
+    const auto with_info = [](std::string_view sha, double official, double ref_ocr) {
+      Certificate c = sample();
+      c.prompt_set_sha256 = std::string(sha);
+      set_info(c, "official_images", official);
+      set_info(c, "reference.ocr_prompts", ref_ocr);
+      c.gates = gates_for(QualityTier::kHigh, false, ref_ocr >= kMinOcrPrompts, static_cast<int>(official));
+      return validate_certificate(c);
+    };
+    EXPECT_EQ(with_info(kCertPromptSetSha256Base, 23, 13), "");
+    EXPECT_EQ(with_info(kCertPromptSetSha256Base, 5, 2), "info 'official_images' must be 23 for the base certification set");
+    EXPECT_EQ(with_info(kCertPromptSetSha256Sft, 5, 2), "");
+    EXPECT_EQ(with_info(kCertPromptSetSha256Sft, 23, 13), "");
+    EXPECT_EQ(with_info(kCertPromptSetSha256Sft, 7, 2), "info 'official_images' must be 5 or 23 for the SFT certification set");
+    EXPECT_EQ(with_info(std::string(64, 'a'), 7, 2), "") << "another set (never usable) is not constrained";
+    EXPECT_EQ(with_info(kCertPromptSetSha256Sft, 5, 6), "info 'reference.ocr_prompts' exceeds 'official_images'");
+    const auto set_gate = [](Certificate& c, std::string_view name, double v) {
+      for (Gate& g : c.gates) {
+        if (g.name == name) {
+          g.value = v;
+          g.pass = g.op == GateOp::kLe ? v <= g.threshold : v >= g.threshold;
+        }
+      }
+      c.passed = std::all_of(c.gates.begin(), c.gates.end(), [](const Gate& g) { return g.pass; });
+    };
+    Certificate c = sample();
+    set_gate(c, "same_seed.drift_count", 0);
+    set_gate(c, "reference.drift_count", 1);
+    EXPECT_EQ(validate_certificate(c), "gate 'reference.drift_count' exceeds the official images or the same-seed drift count");
+    set_gate(c, "same_seed.drift_count", 2);
+    EXPECT_EQ(validate_certificate(c), "");
+    Certificate few = sample();  // a development set with 1 official image: at most 1 drifted official image
+    few.prompt_set_sha256 = std::string(64, 'a');
+    set_info(few, "official_images", 1);
+    set_info(few, "reference.ocr_prompts", 0);
+    few.gates = gates_for(QualityTier::kHigh, false, false, 1);
+    set_gate(few, "same_seed.drift_count", 3);
+    set_gate(few, "reference.drift_count", 1);
+    EXPECT_EQ(validate_certificate(few), "");
+    for (Gate& g : few.gates) {
+      if (g.name == "reference.drift_count") g.threshold = 2, g.value = 2, g.pass = true;  // looser and above 1 image
+    }
+    EXPECT_NE(validate_certificate(few), "");
   }
   // Every tier requires the determinism gate, and a non-reproducible Reference tier fails the certificate.
   for (const QualityTier t : {QualityTier::kReference, QualityTier::kHigh, QualityTier::kTurbo}) {
@@ -428,28 +553,28 @@ TEST(QualityCert, RejectsCorruptAndInconsistentDocuments) {
   // The official OCR gate may only be dropped when its comparison has too few text prompts.
   {
     Certificate c = sample();
-    std::erase_if(c.gates, [](const Gate& g) { return g.name == "reference.ocr_delta"; });
+    std::erase_if(c.gates, [](const Gate& g) { return g.name == "reference.ocr_sim_delta"; });
     EXPECT_NE(validate_certificate(c), "");
     set_info(c, "reference.ocr_prompts", kMinOcrPrompts - 1);
     EXPECT_EQ(validate_certificate(c), "");
-    Certificate t;  // turbo then needs same_seed.ocr_delta
+    Certificate t;  // turbo then needs same_seed.ocr_sim_delta
     t = sample();
     t.config.dit = DitPrecision::kW4A4;
     t.tier = QualityTier::kTurbo;
     t.gates = gates_for(QualityTier::kTurbo, false, false);
     set_info(t, "reference.ocr_prompts", 2);
     EXPECT_EQ(validate_certificate(t), "");
-    std::erase_if(t.gates, [](const Gate& g) { return g.name == "same_seed.ocr_delta"; });
+    std::erase_if(t.gates, [](const Gate& g) { return g.name == "same_seed.ocr_sim_delta"; });
     EXPECT_NE(validate_certificate(t), "");
   }
   // Truncated at every 37th length, garbage, wrong shapes, nesting bombs, oversize.
   for (std::size_t n = 0; n < good.size() - 2; n += 37) EXPECT_THROW(parse_certificates(good.substr(0, n)), CertificateError) << n;
   for (const std::string& bad : {std::string(""), std::string("\xff\xfe{"), std::string("[]"), std::string("null"),
-                                 std::string("{\"format\": \"mossinfer-quality-certificates\", \"version\": 2}"),
+                                 std::string("{\"format\": \"mossinfer-quality-certificates\", \"version\": 3}"),
                                  std::string(300, '[') + std::string(300, ']')}) {
     EXPECT_THROW(parse_certificates(bad), CertificateError);
   }
-  std::string big = "{\"format\": \"mossinfer-quality-certificates\", \"version\": 2, \"certificates\": [], \"pad\": \"";
+  std::string big = "{\"format\": \"mossinfer-quality-certificates\", \"version\": 3, \"certificates\": [], \"pad\": \"";
   big += std::string(kMaxCertificateFileBytes, 'x') + "\"}";
   EXPECT_THROW(parse_certificates(big), CertificateError);
   mi::testing::TempDir dir("qcert_rejects");
@@ -464,10 +589,47 @@ TEST(QualityCert, RejectsCorruptAndInconsistentDocuments) {
     EXPECT_EQ(std::string(e.what()).find("too large"), std::string::npos) << e.what();
   }
   // More certificates than the cap.
-  std::string many = "{\"format\": \"mossinfer-quality-certificates\", \"version\": 2, \"certificates\": [";
+  std::string many = "{\"format\": \"mossinfer-quality-certificates\", \"version\": 3, \"certificates\": [";
   const std::string one = good.substr(good.find('[') + 1, good.rfind(']') - good.find('[') - 1);
   for (int i = 0; i < 65; ++i) many += (i == 0 ? "" : ",") + one;
   EXPECT_THROW(parse_certificates(many + "]}"), CertificateError);
+}
+
+// Certificates of an older gate schema (format versions 1 and 2: worst-single-prompt and exact-match OCR gates) are
+// refused with a reason that says so, also in find_certificate's reason for the tier report; a newer version is
+// unsupported.
+TEST(QualityCert, OlderGateSchemaIsRefused) {
+  const std::string good = certificates_json({sample()});
+  ASSERT_NE(good.find("\"version\": 3,"), std::string::npos);
+  for (const char* v : {"1", "2"}) {
+    std::string text = good;
+    replace_once(text, "\"version\": 3,", std::string("\"version\": ") + v + ",");
+    try {
+      parse_certificates(text);
+      ADD_FAILURE() << "version " << v << " accepted";
+    } catch (const CertificateError& e) {
+      EXPECT_EQ(std::string(e.what()), std::string("certificate made with an older gate schema (version ") + v +
+                                           "; this engine reads version 3): re-certify the configuration");
+    }
+  }
+  for (const char* v : {"4", "0", "-1"}) {  // newer, or never a version
+    std::string text = good;
+    replace_once(text, "\"version\": 3,", std::string("\"version\": ") + v + ",");
+    try {
+      parse_certificates(text);
+      ADD_FAILURE() << "version " << v << " accepted";
+    } catch (const CertificateError& e) {
+      EXPECT_EQ(std::string(e.what()), std::string("unsupported certificate format version ") + v);
+    }
+  }
+  mi::testing::TempDir dir("qcert_old_schema");
+  std::string old = good;
+  replace_once(old, "\"version\": 3,", "\"version\": 2,");
+  write_bytes(dir.path() / "old.json", old);
+  const Certificate c = sample();
+  const CertificateSearch r = find_certificate(identity_of(c), query_of(c), {dir.path() / "old.json"});
+  EXPECT_FALSE(r.certificate.has_value());
+  EXPECT_NE(r.reason.find("old.json: rejected (certificate made with an older gate schema"), std::string::npos) << r.reason;
 }
 
 // Random byte mutations of a valid document: each is either rejected with CertificateError or still a valid document
@@ -824,11 +986,16 @@ TEST(QualityCert, HarnessFixture) {
 
   // tables.json: the harness's gate limits, numerics keys and prompt-set constants.
   const mi::json::Value t = mi::json::parse(read_text(kData / "tables.json"));
-  for (const auto& [tier_name, list] : t.at("gates").as_object()) {
+  EXPECT_EQ(t.at("drift_lpips").as_double(), kDriftLpips);
+  EXPECT_EQ(t.at("gates").as_object().size(), 18u);
+  for (const auto& [tier_name, list] : t.at("gates").as_object()) {  // "<tier>[.no_reference_ocr].n<official images>"
     const std::size_t dot = tier_name.find('.');
     const auto tier = parse_quality_tier(tier_name.substr(0, dot));
     ASSERT_TRUE(tier.has_value()) << tier_name;
-    const std::vector<GateSpec> mine = required_gates(*tier, dot == std::string::npos);
+    const std::size_t n_at = tier_name.rfind(".n");
+    ASSERT_NE(n_at, std::string::npos) << tier_name;
+    const std::vector<GateSpec> mine = required_gates(*tier, tier_name.find(".no_reference_ocr") == std::string::npos,
+                                                      std::stoi(tier_name.substr(n_at + 2)));
     ASSERT_EQ(mine.size(), list.as_array().size()) << tier_name;
     for (std::size_t i = 0; i < mine.size(); ++i) {
       const mi::json::Array& g = list.as_array()[i].as_array();

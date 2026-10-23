@@ -1,6 +1,6 @@
 {
  "gates": {
-  "reference": [
+  "reference.n23": [
    [
     "determinism.mismatches",
     "<=",
@@ -12,29 +12,44 @@
     0.12
    ],
    [
-    "same_seed.lpips_max",
+    "same_seed.drift_count",
     "<=",
-    0.25
+    3.0
    ],
    [
-    "same_seed.dino_mean",
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
     ">=",
     0.9
    ],
    [
-    "same_seed.ocr_delta",
+    "same_seed.ocr_sim_delta",
     ">=",
     -0.05
    ],
    [
-    "reference.lpips_mean",
+    "reference.lpips_excess",
     "<=",
-    0.088
+    0.026957436987683936
    ],
    [
-    "reference.lpips_paired_max",
+    "reference.lpips_excess_kth",
     "<=",
-    0.058666666666666666
+    0.092
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.25
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.9
    ],
    [
     "reference.dino_mean",
@@ -42,12 +57,17 @@
     0.925
    ],
    [
-    "reference.ocr_delta",
+    "reference.drift_count",
+    "<=",
+    3.0
+   ],
+   [
+    "reference.ocr_sim_delta",
     ">=",
     -0.05
    ]
   ],
-  "reference.no_reference_ocr": [
+  "reference.n5": [
    [
     "determinism.mismatches",
     "<=",
@@ -59,37 +79,62 @@
     0.12
    ],
    [
-    "same_seed.lpips_max",
+    "same_seed.drift_count",
     "<=",
-    0.25
+    3.0
    ],
    [
-    "same_seed.dino_mean",
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
     ">=",
     0.9
    ],
    [
-    "same_seed.ocr_delta",
+    "same_seed.ocr_sim_delta",
     ">=",
     -0.05
    ],
    [
-    "reference.lpips_mean",
+    "reference.lpips_excess",
     "<=",
-    0.088
+    0.05323821686454537
    ],
    [
-    "reference.lpips_paired_max",
+    "reference.lpips_excess_kth",
     "<=",
-    0.058666666666666666
+    0.092
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.25
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.9
    ],
    [
     "reference.dino_mean",
     ">=",
     0.925
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    1.0
+   ],
+   [
+    "reference.ocr_sim_delta",
+    ">=",
+    -0.05
    ]
   ],
-  "high": [
+  "reference.n3": [
    [
     "determinism.mismatches",
     "<=",
@@ -101,42 +146,310 @@
     0.12
    ],
    [
-    "same_seed.lpips_max",
+    "same_seed.drift_count",
     "<=",
-    0.25
+    3.0
    ],
    [
-    "same_seed.dino_mean",
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
     ">=",
     0.9
    ],
    [
-    "same_seed.ocr_delta",
+    "same_seed.ocr_sim_delta",
     ">=",
     -0.05
    ],
    [
-    "reference.lpips_mean",
+    "reference.lpips_excess",
     "<=",
-    0.132
+    0.0675662646377778
    ],
    [
-    "reference.lpips_paired_max",
+    "reference.lpips_excess_kth",
     "<=",
-    0.08800000000000001
+    0.092
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.25
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.9
    ],
    [
     "reference.dino_mean",
     ">=",
-    0.8875
+    0.925
    ],
    [
-    "reference.ocr_delta",
+    "reference.drift_count",
+    "<=",
+    1.0
+   ],
+   [
+    "reference.ocr_sim_delta",
+    ">=",
+    -0.05
+   ]
+  ],
+  "reference.no_reference_ocr.n23": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "same_seed.lpips_mean",
+    "<=",
+    0.12
+   ],
+   [
+    "same_seed.drift_count",
+    "<=",
+    3.0
+   ],
+   [
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "same_seed.ocr_sim_delta",
+    ">=",
+    -0.05
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.026957436987683936
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.092
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.25
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "reference.dino_mean",
+    ">=",
+    0.925
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    3.0
+   ]
+  ],
+  "reference.no_reference_ocr.n5": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "same_seed.lpips_mean",
+    "<=",
+    0.12
+   ],
+   [
+    "same_seed.drift_count",
+    "<=",
+    3.0
+   ],
+   [
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "same_seed.ocr_sim_delta",
+    ">=",
+    -0.05
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.05323821686454537
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.092
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.25
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "reference.dino_mean",
+    ">=",
+    0.925
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    1.0
+   ]
+  ],
+  "reference.no_reference_ocr.n3": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "same_seed.lpips_mean",
+    "<=",
+    0.12
+   ],
+   [
+    "same_seed.drift_count",
+    "<=",
+    3.0
+   ],
+   [
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "same_seed.ocr_sim_delta",
+    ">=",
+    -0.05
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.0675662646377778
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.092
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.25
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "reference.dino_mean",
+    ">=",
+    0.925
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    1.0
+   ]
+  ],
+  "high.n23": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "same_seed.lpips_mean",
+    "<=",
+    0.12
+   ],
+   [
+    "same_seed.drift_count",
+    "<=",
+    3.0
+   ],
+   [
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "same_seed.ocr_sim_delta",
+    ">=",
+    -0.05
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.07295743698768394
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.138
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.375
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    3.0
+   ],
+   [
+    "reference.ocr_sim_delta",
     ">=",
     -0.075
    ]
   ],
-  "high.no_reference_ocr": [
+  "high.n5": [
    [
     "determinism.mismatches",
     "<=",
@@ -148,91 +461,513 @@
     0.12
    ],
    [
-    "same_seed.lpips_max",
+    "same_seed.drift_count",
     "<=",
-    0.25
+    3.0
    ],
    [
-    "same_seed.dino_mean",
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
     ">=",
     0.9
    ],
    [
-    "same_seed.ocr_delta",
+    "same_seed.ocr_sim_delta",
     ">=",
     -0.05
    ],
    [
-    "reference.lpips_mean",
+    "reference.lpips_excess",
     "<=",
-    0.132
+    0.09923821686454537
    ],
    [
-    "reference.lpips_paired_max",
+    "reference.lpips_excess_kth",
     "<=",
-    0.08800000000000001
+    0.138
    ],
    [
-    "reference.dino_mean",
+    "reference.lpips_excess_top",
+    "<=",
+    0.375
+   ],
+   [
+    "reference.dino_min",
     ">=",
-    0.8875
+    0.9
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    1.0
+   ],
+   [
+    "reference.ocr_sim_delta",
+    ">=",
+    -0.075
    ]
   ],
-  "turbo": [
+  "high.n3": [
    [
     "determinism.mismatches",
     "<=",
     0.0
    ],
    [
-    "reference.lpips_mean",
+    "same_seed.lpips_mean",
     "<=",
-    0.264
+    0.12
    ],
    [
-    "reference.lpips_paired_max",
+    "same_seed.drift_count",
     "<=",
-    0.17600000000000002
+    3.0
    ],
    [
-    "reference.dino_mean",
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "same_seed.ocr_sim_delta",
+    ">=",
+    -0.05
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.1135662646377778
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.138
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.375
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    1.0
+   ],
+   [
+    "reference.ocr_sim_delta",
+    ">=",
+    -0.075
+   ]
+  ],
+  "high.no_reference_ocr.n23": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "same_seed.lpips_mean",
+    "<=",
+    0.12
+   ],
+   [
+    "same_seed.drift_count",
+    "<=",
+    3.0
+   ],
+   [
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "same_seed.ocr_sim_delta",
+    ">=",
+    -0.05
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.07295743698768394
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.138
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.375
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    3.0
+   ]
+  ],
+  "high.no_reference_ocr.n5": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "same_seed.lpips_mean",
+    "<=",
+    0.12
+   ],
+   [
+    "same_seed.drift_count",
+    "<=",
+    3.0
+   ],
+   [
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "same_seed.ocr_sim_delta",
+    ">=",
+    -0.05
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.09923821686454537
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.138
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.375
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    1.0
+   ]
+  ],
+  "high.no_reference_ocr.n3": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "same_seed.lpips_mean",
+    "<=",
+    0.12
+   ],
+   [
+    "same_seed.drift_count",
+    "<=",
+    3.0
+   ],
+   [
+    "same_seed.lpips_max",
+    "<=",
+    0.45
+   ],
+   [
+    "same_seed.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "same_seed.ocr_sim_delta",
+    ">=",
+    -0.05
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.1135662646377778
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.138
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.375
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.9
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    1.0
+   ]
+  ],
+  "turbo.n23": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.21095743698768393
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.276
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.45
+   ],
+   [
+    "reference.dino_min",
     ">=",
     0.775
    ],
    [
-    "reference.ocr_delta",
+    "reference.drift_count",
+    "<=",
+    3.0
+   ],
+   [
+    "reference.ocr_sim_delta",
     ">=",
     -0.1
    ]
   ],
-  "turbo.no_reference_ocr": [
+  "turbo.n5": [
    [
     "determinism.mismatches",
     "<=",
     0.0
    ],
    [
-    "reference.lpips_mean",
+    "reference.lpips_excess",
     "<=",
-    0.264
+    0.23723821686454538
    ],
    [
-    "reference.lpips_paired_max",
+    "reference.lpips_excess_kth",
     "<=",
-    0.17600000000000002
+    0.276
    ],
    [
-    "reference.dino_mean",
+    "reference.lpips_excess_top",
+    "<=",
+    0.45
+   ],
+   [
+    "reference.dino_min",
     ">=",
     0.775
    ],
    [
-    "same_seed.ocr_delta",
+    "reference.drift_count",
+    "<=",
+    1.0
+   ],
+   [
+    "reference.ocr_sim_delta",
+    ">=",
+    -0.1
+   ]
+  ],
+  "turbo.n3": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.2515662646377778
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.276
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.45
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.775
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    1.0
+   ],
+   [
+    "reference.ocr_sim_delta",
+    ">=",
+    -0.1
+   ]
+  ],
+  "turbo.no_reference_ocr.n23": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.21095743698768393
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.276
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.45
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.775
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    3.0
+   ],
+   [
+    "same_seed.ocr_sim_delta",
+    ">=",
+    -0.1
+   ]
+  ],
+  "turbo.no_reference_ocr.n5": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.23723821686454538
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.276
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.45
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.775
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    1.0
+   ],
+   [
+    "same_seed.ocr_sim_delta",
+    ">=",
+    -0.1
+   ]
+  ],
+  "turbo.no_reference_ocr.n3": [
+   [
+    "determinism.mismatches",
+    "<=",
+    0.0
+   ],
+   [
+    "reference.lpips_excess",
+    "<=",
+    0.2515662646377778
+   ],
+   [
+    "reference.lpips_excess_kth",
+    "<=",
+    0.276
+   ],
+   [
+    "reference.lpips_excess_top",
+    "<=",
+    0.45
+   ],
+   [
+    "reference.dino_min",
+    ">=",
+    0.775
+   ],
+   [
+    "reference.drift_count",
+    "<=",
+    1.0
+   ],
+   [
+    "same_seed.ocr_sim_delta",
     ">=",
     -0.1
    ]
   ]
  },
+ "drift_lpips": 0.25,
  "numerics": [
   {
    "config": {

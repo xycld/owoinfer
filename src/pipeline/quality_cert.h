@@ -9,8 +9,9 @@
 // caller names, or in the install tree (<prefix>/share/mossinfer/quality_certs/*.json, where packages ship them;
 // install_certificate_dir()). certificate_files() gives the search order.
 //
-// File format (version kCertificateFormatVersion), one document holding up to 64 certificates:
-//   {"format": "mossinfer-quality-certificates", "version": 2, "certificates": [
+// File format (version kCertificateFormatVersion, which is also the gate schema), one document holding up to 64
+// certificates:
+//   {"format": "mossinfer-quality-certificates", "version": 3, "certificates": [
 //     {"tier": "high",
 //      "model": {"dit": {"files": [{"name": "x.safetensors", "size": 123, "xxh64": "0123456789abcdef"}]},
 //                "te": null},                     // the TE file(s), required exactly when te_precision != bf16
@@ -23,7 +24,7 @@
 //      "gates": [{"name": "same_seed.lpips_mean", "value": 0.031, "op": "<=", "threshold": 0.12, "pass": true}, ...],
 //      "passed": true,
 //      "info": {"same_seed.ocr_prompts": 13, "reference.ocr_prompts": 13, ...},  // required keys + informational
-//      "tool": "certify.py 2"}                                                   // optional, informational
+//      "tool": "certify.py 3"}                                                   // optional, informational
 //   ]}
 // Hashes are 16 lowercase hex digits (JSON numbers cannot hold 64 bits); sizes are integers; other numbers are
 // written in shortest round-trip form with std::to_chars, so reading and writing never depend on the process locale.
@@ -32,7 +33,8 @@
 // every string against its grammar and every number for range, and validates the semantics (validate_certificate):
 // the tier must be the one the configuration belongs to, every gate the tier requires (required_gates) must be present
 // with a threshold at least as strict as the tier's limit, every stored pass flag must agree with its value and
-// threshold, and "passed" must be the conjunction of the gates. Any violation rejects the whole document.
+// threshold, and "passed" must be the conjunction of the gates. Any violation rejects the whole document. A document of
+// an older version was gated by an older gate schema and is refused as "certificate made with an older gate schema".
 #pragma once
 
 #include <cstdint>
@@ -46,7 +48,9 @@
 
 namespace mi::pipeline {
 
-inline constexpr int kCertificateFormatVersion = 2;
+// Version 3 is gate schema 3 (required_gates): drift-robust gates. Versions 1 and 2 are refused with a reason that
+// names the older gate schema; they must be re-certified.
+inline constexpr int kCertificateFormatVersion = 3;
 inline constexpr std::string_view kCertificateFormat = "mossinfer-quality-certificates";
 // The evaluation set Auto accepts: the AC6 quality test set (20 official assets with their own parameters, 5 SFT
 // prompts, 3 golden prompts; 28 jobs) run on the one model the certified DiT belongs to. The 5 SFT jobs reuse asset
@@ -173,28 +177,56 @@ struct GateSpec {
   double limit;  // the loosest threshold the tier allows
 };
 
-// The gates a tier requires. Two comparisons, both over the whole prompt set:
-//   same_seed: the configuration against the bf16 engine, same seeds;
-//   reference: the configuration against the official (torch) reference images.
-// Metrics: lpips_mean / dino_mean (means over the images), lpips_max (worst image), lpips_paired_max
-// (max over images of LPIPS(test, official) - LPIPS(bf16 engine, official): how much farther from the official image
-// than the bf16 engine's own image any one image moved), ocr_delta (mean over the text-rendering prompts of the OCR
-// exact-match rate of the prompt's target strings, minus the baseline's rate).
+// A prompt has drifted when its same-seed LPIPS against the bf16 engine exceeds this: a different, equally valid
+// composition on a chaotic prompt, which our engine and PyTorch both show between GPUs. Drift is decided once, from the
+// same-seed comparison, and carried to the prompt's reference row. Certificates record it (info "drift_lpips"), and
+// one measured with another threshold is invalid.
+inline constexpr double kDriftLpips = 0.25;
+
+// Drifted official images a certificate may have among `official_images`: 3 of 23, scaled down, at least 1 (SFT: 5
+// official images, 1).
+double reference_drift_max(int official_images);
+
+// The gates a tier requires (gate schema 3), for a reference comparison over `official_images` official images (the
+// certificate's info "official_images"). Two comparisons:
+//   same_seed: the configuration against the bf16 engine, same seeds, every prompt;
+//   reference: the configuration against the official (torch) images, the prompts that have one; the paired excess
+//     of a prompt is LPIPS(test_i, official_i) - LPIPS(bf16_i, official_i), both rendered on the certifying GPU.
+// Every statistic is monotone (a worse prompt never helps a gate). k = 1 / 1.5 / 3 for reference / high / turbo,
+// n = official_images, m = reference_drift_max(n):
+//   same_seed.lpips_mean   mean LPIPS with each prompt clipped at kDriftLpips (drift is judged by the count and cap);
+//   same_seed.lpips_max    the largest LPIPS; same_seed.drift_count  prompts above kDriftLpips (whole number);
+//   same_seed.dino_min     the lowest DINOv2 cosine over every prompt;
+//   reference.lpips_excess the mean paired excess, each prompt clipped at +-0.092 k (0.092: the largest noise excess);
+//   reference.lpips_excess_kth  the (m+1)-th largest paired excess; reference.lpips_excess_top  the largest;
+//   reference.dino_min     the lowest DINO against the official image, each credited where the bf16 engine's own
+//                          image is far from it: a prompt passes when dino(test, O) >= min(floor, dino(bf16, O) - 0.076);
+//   reference.drift_count  official prompts that drifted (same seed);
+//   *.ocr_sim_delta        mean over the text-rendering prompts of the character similarity of the OCR text to the
+//                          prompt's target text, minus the baseline's.
+// Limits:
 //   every tier: determinism.mismatches <= 0 (the harness renders every Reference-tier prompt twice and counts the
 //     prompts whose final latents or PNGs differ: a machine where the Reference tier is not bit-reproducible certifies
 //     nothing);
-//   reference tier (k = 1), high (k = 1.5):
-//     same_seed.lpips_mean <= 0.12, same_seed.lpips_max <= 0.25, same_seed.dino_mean >= 0.90,
-//     same_seed.ocr_delta >= -0.05;
-//     reference.lpips_mean <= 0.088 k, reference.dino_mean >= 1 - 0.075 k (AC6's per-image limits scaled as
-//     distances), reference.lpips_paired_max <= 0.088 k / 1.5 (k x P0's torch kernel-swap LPIPS floor 0.0587),
-//     reference.ocr_delta >= -0.05 (reference tier) / -0.075 (high);
-//   turbo (k = 3): reference.lpips_mean <= 0.264, reference.dino_mean >= 0.775, reference.lpips_paired_max <= 0.176,
-//     reference.ocr_delta >= -0.10.
+//   reference tier and high (Turbo is not a same-image tier): same_seed.lpips_mean <= 0.12,
+//     same_seed.drift_count <= 3, same_seed.lpips_max <= 0.45, same_seed.dino_min >= 0.90,
+//     same_seed.ocr_sim_delta >= -0.05;
+//   every tier: reference.lpips_excess <= T + 3 x 0.0367 / sqrt(n) + 4/92 x 0.092 k, with the tier's tolerance
+//     T = 0.088 (k - 1) (AC21's official-image mean allowance beyond the Reference tier's; 0 / 0.044 / 0.176) and
+//     three standard errors of a noise-equivalent mean plus drift's expected share;
+//     reference.lpips_excess_kth <= 0.092 k; reference.lpips_excess_top <= min(0.25 k, 0.45);
+//     reference.dino_min >= 0.90 (turbo: 0.775); reference.drift_count <= m;
+//     reference.ocr_sim_delta >= -0.05 / -0.075 / -0.10;
+//   reference tier only: reference.dino_mean >= 0.925 (AC6; the other tiers' mean limits lie at or below the floor).
+// The limits come from measured noise: PyTorch against itself under a kernel swap and across GPUs, our bf16 engine
+// against the official images and across GPUs, and the lossy configurations' drift rate on sm_120; the certification
+// harness records the measurements.
 // When the official comparison has fewer than kMinOcrPrompts text prompts (`reference_ocr_gateable` false),
-// reference.ocr_delta is not required; OCR is then gated same seed only (turbo: same_seed.ocr_delta >= -0.10).
+// reference.ocr_sim_delta is not required; OCR is then gated same seed only (turbo: same_seed.ocr_sim_delta >= -0.10).
+// validate_certificate also requires official_images = 23 for the base certification set and 5 or 23 for SFT,
+// reference.ocr_prompts <= official_images, and reference.drift_count <= min(official_images, same_seed.drift_count).
 // Extra gates may be stored; they must pass too.
-std::vector<GateSpec> required_gates(QualityTier t, bool reference_ocr_gateable = true);
+std::vector<GateSpec> required_gates(QualityTier t, bool reference_ocr_gateable = true, int official_images = kCertPrompts);
 
 // What a certificate's measurements covered. A request outside it falls back to Reference (scope_mismatch).
 struct CertScope {
@@ -231,7 +263,9 @@ struct Certificate {
   std::string date;               // UTC, "YYYY-MM-DDTHH:MM:SSZ"
   std::vector<Gate> gates;
   bool passed = false;
-  // Required: "same_seed.ocr_prompts" and "reference.ocr_prompts" (text-rendering prompts in each comparison).
+  // Required: "same_seed.ocr_prompts" and "reference.ocr_prompts" (text-rendering prompts in each comparison),
+  // "official_images" (official images compared, 1..prompts; base set 23, SFT set 5 or 23; sets the reference limits)
+  // and "drift_lpips" (the drift threshold, kDriftLpips).
   // Informational: noise-floor baselines, worst cases, standard errors and confidence intervals, ungated metrics.
   std::vector<std::pair<std::string, double>> info;
   std::string tool;  // informational
