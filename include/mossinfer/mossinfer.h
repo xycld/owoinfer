@@ -116,6 +116,10 @@ MOSSINFER_API const char* mi_last_error_message(void);
 #define MI_CAP_IMAGE_INPUT 0x40u   /* img2img and inpainting: mi_gen_params.init_image / mask, mi_result_image() */
 #define MI_CAP_HIRES 0x80u         /* the hires fix: mi_gen_params.hires_* */
 #define MI_CAP_DISTILL 0x100u      /* distill bundles and time embeddings: distill_dir, time_embedding_file */
+/* cuBLASLt is loaded at run time: the bundled copy by default, a compatible system copy (a CUDA install) in a package
+ * without one or with MOSSINFER_CUDA_LIBS=system (also MOSSINFER_CUBLASLT; docs/integration.md), and
+ * mi_probe_info.cublaslt_* reports the copy. */
+#define MI_CAP_SYSTEM_CUDA 0x200u
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -152,10 +156,18 @@ typedef struct mi_probe_info {
   char recommended_flavour[16];
   char message[512];             /* human-readable summary */
   int32_t _reserved0;
+  /* Fields after the 576-byte layout (MI_CAP_SYSTEM_CUDA): the cuBLASLt copy the engine uses, searched for (and
+   * loaded, without a CUDA context) by the first mi_probe() or mi_engine_create() of the process. */
+  char cublaslt_source[16];      /* "system", "bundled" or "env" (MOSSINFER_CUBLASLT); "" when no copy is usable */
+  int32_t cublaslt_version;      /* cublasLtGetVersion() of that copy, e.g. 130800 for 13.8.0; 0 when none */
+  int32_t _reserved1;
+  char cublaslt_path[512];       /* UTF-8; "" when none, or when the path does not fit (cublaslt_error says so) */
+  char cublaslt_error[512];      /* why no copy is usable (every candidate tried, cut at 511 bytes); "" when one is */
 } mi_probe_info;
 
-/* Fills `info` (struct_size set by the caller). Works without a GPU: a machine without driver or device returns MI_OK
- * with device_count == 0 and the reason in `message`. Creates no CUDA context. */
+/* Fills `info` (struct_size set by the caller: the current size or the 576-byte one). Works without a GPU: a machine
+ * without driver or device returns MI_OK with device_count == 0 and the reason in `message`, and a machine without a
+ * usable cuBLASLt returns MI_OK with cublaslt_source "" and the reason in cublaslt_error. Creates no CUDA context. */
 MOSSINFER_API mi_status mi_probe(mi_probe_info* info);
 /* Fills `info` (struct_size set by the caller) for device `index` in [0, device_count); any other index fails with
  * MI_ERR_INVALID_ARGUMENT before any free-memory query. Only device `index` has its free memory measured: from NVML
@@ -270,9 +282,10 @@ typedef struct mi_engine_params {
 MOSSINFER_API mi_status mi_engine_params_init(mi_engine_params* params, size_t struct_size);
 
 /* Creates an engine on `params->device_index`. Checks the parameters, the model path and that the component files exist
- * (their format is checked when they load, at the first mi_generate(): MI_ERR_MODEL) and initializes CUDA; the
- * weights load on the first mi_generate() (and stay resident as the plan allows). The strings are copied. The calling
- * thread's current CUDA context is restored before returning (also by mi_generate()). */
+ * (their format is checked when they load, at the first mi_generate(): MI_ERR_MODEL), loads cuBLASLt (no usable
+ * copy: MI_ERR_CUDA, the message lists every candidate tried) and initializes CUDA; the weights load on the first
+ * mi_generate() (and stay resident as the plan allows). The strings are copied. The calling thread's current CUDA
+ * context is restored before returning (also by mi_generate()). */
 MOSSINFER_API mi_status mi_engine_create(const mi_engine_params* params, mi_engine** out_engine);
 /* Releases the engine and its device memory. NULL is a no-op. Never fails and never throws: a CUDA error while
  * releasing is ignored, and mi_last_error_message() is left unchanged. */

@@ -24,6 +24,7 @@
    },
    "numerics": {
     "attention_q8": 1,
+    "cublaslt": 130800,
     "elementwise": 1,
     "fused_gemm": 1,
     "int8": 1,

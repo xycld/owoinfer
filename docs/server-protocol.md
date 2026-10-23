@@ -83,10 +83,13 @@ Params (all optional):
 ```
 >> {"id": 1, "method": "hello", "params": {"client": "launcher", "protocol_version": 1}}
 << {"id": 1, "result": {"protocol_version": 1, "server": "moss-server", "version": "0.2.0", "abi_version": 1,
-    "capabilities": {"preview": true, "comfyui_models": false, "model_files": true, "lora": true, "tiers": true, "samplers": true},
+    "capabilities": {"preview": true, "comfyui_models": false, "model_files": true, "lora": true, "tiers": true,
+                     "samplers": true, "image_input": true, "hires": true, "distill": true, "system_cuda": true},
     "probe": {"driver_cuda_version": 13040, "runtime_cuda_version": 13040, "driver_compatible": true,
               "device_count": 1, "supported_device_count": 1, "build_flavour": "cu13", "recommended_flavour": "cu13",
-              "message": "recommended flavour cu13 (the driver supports CUDA 13.4)"}}}
+              "message": "recommended flavour cu13 (the driver supports CUDA 13.4)",
+              "cublaslt": {"source": "bundled", "version": 130800,
+                           "path": "/opt/mossinfer/lib/libcublasLt.so.13", "error": ""}}}}
 ```
 
 With `"devices": true`, `probe.devices` is a list of objects with these fields:
@@ -95,6 +98,14 @@ With `"devices": true`, `probe.devices` is a list of objects with these fields:
 - `supported`, `unsupported_reason`
 
 `hello` works without a GPU or driver; the reason is then in `message`.
+
+`probe.cublaslt` is the cuBLASLt copy the engine uses (`mi_probe_info.cublaslt_*`, docs/c-api.md):
+- `source`: `"system"`, `"bundled"` or `"env"`; `""` when no copy is usable
+- `version`: `cublasLtGetVersion()` of that copy, e.g. 130800 for 13.8.0; 0 when none
+- `path`: the file loaded, with symbolic links resolved; `""` when none (or too long for the C field, with a note in `error`)
+- `error`: why no copy is usable (every candidate tried); `""` when one is. `load` then fails with `cuda` and the same message.
+
+The server's environment steers the search: `MOSSINFER_CUDA_LIBS` (`auto`: the bundled copy, then a system one; `system`; `bundled`) and `MOSSINFER_CUBLASLT` (docs/integration.md, "CUDA libraries"). Set them when starting the process. To learn whether the machine has a compatible system copy, start the server with `MOSSINFER_CUDA_LIBS=system` and read `probe.cublaslt`.
 
 `capabilities` mirrors the C API's `mi_capabilities()` bits. A launcher enables a feature's UI only when its capability is true.
 
@@ -109,6 +120,7 @@ With `"devices": true`, `probe.devices` is a list of objects with these fields:
 | `image_input` | `MI_CAP_IMAGE_INPUT` | true | `generate`'s `init_image`, `mask`, `mask_encoding`, `resize`, `denoise_strength` |
 | `hires` | `MI_CAP_HIRES` | true | `generate`'s `hires` |
 | `distill` | `MI_CAP_DISTILL` | true | `load`'s `time_embedding_file` and `distill`, `generate`'s `distill` |
+| `system_cuda` | `MI_CAP_SYSTEM_CUDA` | true | `probe.cublaslt`; cuBLASLt loaded at run time: the bundled copy, else (or with `MOSSINFER_CUDA_LIBS=system`) a compatible system copy |
 
 ### `load`
 
@@ -319,10 +331,11 @@ send({"id": 3, "method": "shutdown"})
 | ctest name | Label | What it runs |
 |---|---|---|
 | `server_protocol` | `cpu` | No GPU or weights needed (details below) |
+| `package_install_tree` | `cpu` | `tests/server/test_install_tree.py`: installs the build twice (full, and `--component Unspecified` without CUDA libraries), asks each tree's `hello` which cuBLASLt it uses under `MOSSINFER_CUDA_LIBS` `auto` / `system` / `bundled` and `MOSSINFER_CUBLASLT` (a bundled copy found, a system copy outside the tree, clean errors for a missing copy or file and a bad policy), and runs `check_package.py` on both trees |
 | `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params`; a 256² img2img from a PNG path (4 steps at strength 0.5: 2 run, `total_steps` 2) and the strength-1 note in `done.warnings` |
 
 `server_protocol` covers:
-- `hello` (the capabilities included), `status`, and idle `cancel` / `unload`
+- `hello` (the capabilities and `probe.cublaslt` included), `status`, and idle `cancel` / `unload`
 - malformed input of every kind, unknown methods and params (an unknown or non-string `block_path` included), and NUL in strings
 - `load` errors mapped from engine statuses
 - the P6 `load` params: bad `tier` / `attention` names (`"q8"` and `"auto"` included) and types, every valid name, missing component files

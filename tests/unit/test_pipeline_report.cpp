@@ -4,11 +4,13 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <locale>
 #include <string>
 #include <vector>
 
+#include "backend/cuda_libs.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/report_json.h"
 #include "util/json.h"
@@ -104,6 +106,17 @@ TEST(PipelineReport, FieldsAreValidJsonWithEveryKey) {
   EXPECT_EQ(q.at("reason").as_string(), "High tier: test");
   EXPECT_TRUE(q.at("certificate").is_null());
   EXPECT_NE(q.at("numerics").find("elementwise"), nullptr);
+  // The cuBLASLt copy the process uses, next to the numerics it is part of (images stay traceable to it).
+  const mi::backend::CublasLtStatus lt = mi::backend::cublaslt_status();
+  ASSERT_NE(q.find("cublaslt"), nullptr);
+  EXPECT_EQ(static_cast<std::uint64_t>(q.at("numerics").at("cublaslt").as_int()), lt.ok ? lt.info.version : 0u);
+  if (lt.ok) {
+    EXPECT_EQ(q.at("cublaslt").at("source").as_string(), lt.info.source);
+    EXPECT_EQ(static_cast<std::uint64_t>(q.at("cublaslt").at("version").as_int()), lt.info.version);
+    EXPECT_EQ(q.at("cublaslt").at("path").as_string(), lt.info.path);
+  } else {
+    EXPECT_TRUE(q.at("cublaslt").is_null());
+  }
   EXPECT_EQ(q.at("config").at("te_precision").as_string(), "w4a8");
   EXPECT_EQ(doc.at("models").at("dit").at("source").as_string(), "/m/dit.safetensors");
   EXPECT_EQ(doc.at("models").at("dit").at("linears").as_string(), "int8_convrot256");

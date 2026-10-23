@@ -7,11 +7,16 @@
         900 MB for CUDA 12 packages, whose bundled cuBLASLt alone is ~752 MB (CUDA 12.8)
   LIC   the project's LICENSE, NOTICE and THIRD_PARTY_NOTICES.md at the root and in share/doc/mossinfer/
   CRT   Windows: the MSVC runtime (vcruntime140, msvcp140 and every other one the binaries import) ships in bin/
+  LT    cuBLASLt is loaded at run time through the engine's shim (src/backend/cublaslt_shim.cpp), never linked: no
+        shipped binary has a DT_NEEDED / import-table entry for it or imports a cublasLt* symbol (readelf -d, nm -D
+        --undefined-only / dumpbin /dependents, /imports). The full package bundles it (with the CUDA EULA); the
+        --system-cuda variant ships no CUDA library at all and needs no EULA
   find_package: optionally builds and runs examples/consumer-cmake against the tree, with the CUDA toolkit removed
         from PATH / LD_LIBRARY_PATH so that only the package's own libraries can satisfy it
 
 Usage:
-  check_package.py --prefix <install dir> [--consumer <source dir>] [--consumer-build <dir>] [--run-consumer]
+  check_package.py --prefix <install dir> [--system-cuda] [--consumer <source dir>] [--consumer-build <dir>]
+                   [--run-consumer]
   check_package.py --archive <mossinfer-*.zip|.tar.gz> [...same options]
 Only the standard library; Windows needs dumpbin on PATH (a VS developer prompt).
 """
@@ -32,6 +37,10 @@ TOTAL_LIMIT = 800 * MB
 TOTAL_LIMIT_CUDA12 = 900 * MB
 CUBLASLT_12 = re.compile(r"^(libcublasLt\.so\.12|cublasLt64_12\.dll)", re.IGNORECASE)
 FORBIDDEN = re.compile(r"torch|c10|python", re.IGNORECASE)
+CUBLASLT_FILE = re.compile(r"^(libcublasLt\.so|cublasLt64_)", re.IGNORECASE)
+# The CUDA toolkit libraries a package may bundle (the system-CUDA variant ships none of them).
+CUDA_LIB_FILE = re.compile(r"^(lib)?(cublas|cudart)", re.IGNORECASE)
+CUBLASLT_DEP = re.compile(r"cublasLt", re.IGNORECASE)
 IS_WINDOWS = os.name == "nt"
 
 
@@ -83,6 +92,22 @@ def dependencies(path):
     except subprocess.CalledProcessError:
         resolved = []
     return needed + resolved
+
+
+def direct_dependencies(path):
+    """The binary's own DT_NEEDED / import-table entries (not what they load in turn)."""
+    if IS_WINDOWS:
+        return dependencies(path)
+    return re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", run(["readelf", "-d", path]))
+
+
+def imported_symbols(path):
+    if IS_WINDOWS:
+        # Rows under each DLL: "  hint  name" (or "Ordinal n"); the DLL lines end in .dll.
+        text = run(["dumpbin", "/nologo", "/imports", path])
+        return [m.group(1) for m in re.finditer(r"^\s+[0-9A-F]+\s+(\w+)\s*$", text, re.MULTILINE)]
+    text = run(["nm", "-D", "--undefined-only", path])
+    return [l.split()[-1].split("@")[0] for l in text.splitlines() if l.strip()]
 
 
 def exported_symbols(lib):
@@ -146,6 +171,9 @@ def main():
     ap.add_argument("--consumer", help="examples/consumer-cmake source dir to build against the tree")
     ap.add_argument("--consumer-build", default=None)
     ap.add_argument("--run-consumer", action="store_true", help="also run it (needs no GPU)")
+    ap.add_argument("--system-cuda", action="store_true",
+                    help="the system-CUDA variant: no CUDA library in the tree, so no CUDA EULA either")
+    ap.add_argument("--cuda-major", help="the flavour's CUDA major (default: from the -cu<N>- in the package name)")
     args = ap.parse_args()
 
     tmp = None
@@ -192,12 +220,47 @@ def main():
             if not present:
                 failures.append(f"LIC: {rel} missing (Apache-2.0 requires it in every distribution)")
     third_party = os.path.join("share", "doc", "mossinfer", "third_party")
-    for rel in ("cutlass/LICENSE.txt", "flash-attention/LICENSE", "sageattention/LICENSE", "cuda/EULA.txt"):
+    for rel in ("cutlass/LICENSE.txt", "flash-attention/LICENSE", "sageattention/LICENSE") + \
+            (() if args.system_cuda else ("cuda/EULA.txt",)):
         rel = os.path.join(third_party, *rel.split("/"))
         present = os.path.isfile(os.path.join(prefix, rel))
         print(f"LIC {rel}: {'ok' if present else 'MISSING'}")
         if not present:
             failures.append(f"LIC: {rel} missing (a bundled component's licence must ship with it)")
+
+    # LT: every cuBLASLt call goes through the engine's shim; the library itself only in the full package.
+    files = [os.path.join(r, n) for r, _, names in os.walk(prefix) for n in names]
+    cuda_files = sorted(os.path.relpath(f, prefix) for f in files if CUDA_LIB_FILE.match(os.path.basename(f)))
+    cublaslt_files = [f for f in cuda_files if CUBLASLT_FILE.match(os.path.basename(f))]
+    eula = os.path.join("share", "doc", "mossinfer", "third_party", "cuda", "EULA.txt")
+    if args.system_cuda:
+        print(f"LT system-CUDA variant: {len(cuda_files)} CUDA library files" + (f" {cuda_files}" if cuda_files else ""))
+        if cuda_files:
+            failures.append(f"LT: the system-CUDA variant ships CUDA libraries {cuda_files}")
+        if os.path.exists(os.path.join(prefix, eula)):
+            failures.append(f"LT: the system-CUDA variant must not ship {eula} (it redistributes no CUDA library)")
+    else:
+        # Exactly the file the loader opens: lib/libcublasLt.so.<major> (Windows: bin/cublasLt64_<major>.dll), with
+        # the flavour's major when the package name tells it (…-cu13-…).
+        major = args.cuda_major or (re.search(r"-cu(\d+)-", os.path.basename(os.path.normpath(args.archive or prefix)))
+                                    or [None, r"\d+"])[1]
+        want = re.compile(rf"^bin[\\/]cublasLt64_{major}\.dll$" if IS_WINDOWS else rf"^lib/libcublasLt\.so\.{major}$",
+                          re.IGNORECASE)
+        ok = len(cublaslt_files) == 1 and want.match(cublaslt_files[0])
+        print(f"LT bundled cuBLASLt: {cublaslt_files or 'MISSING'}" + ("" if ok else f" (want exactly {want.pattern})"))
+        if not ok:
+            failures.append(f"LT: the full package must bundle exactly {want.pattern}, has {cublaslt_files}")
+    for b in bins:
+        if CUDA_LIB_FILE.match(os.path.basename(b)):
+            continue  # NVIDIA's own libraries
+        rel = os.path.relpath(b, prefix)
+        needed = [d for d in direct_dependencies(b) if CUBLASLT_DEP.search(os.path.basename(d))]
+        imported = sorted({sym for sym in imported_symbols(b) if sym.startswith("cublasLt")})
+        print(f"LT {rel}: " + ("ok" if not needed and not imported else f"links cuBLASLt {needed} {imported[:10]}"))
+        if needed:
+            failures.append(f"LT: {rel} has a load-time dependency on {needed} (cuBLASLt must go through the shim)")
+        if imported:
+            failures.append(f"LT: {rel} imports {imported[:10]} directly (add them to src/backend/cublaslt_shim.cpp)")
 
     if IS_WINDOWS:
         bin_dir = os.path.join(prefix, "bin")

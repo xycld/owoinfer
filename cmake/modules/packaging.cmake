@@ -92,8 +92,14 @@ if(MOSSINFER_SHARED)
     SOVERSION ${MOSSINFER_ABI_VERSION}
     LINKER_LANGUAGE CXX
     CXX_VISIBILITY_PRESET hidden
-    VISIBILITY_INLINES_HIDDEN ON
-    INSTALL_RPATH "$ORIGIN")  # the bundled CUDA libraries sit next to it
+    VISIBILITY_INLINES_HIDDEN ON)
+  # No $ORIGIN: cuBLASLt is loaded at run time (src/backend/cuda_libs.h), the bundled copy by absolute path, and a
+  # RUNPATH would let the plain-name search for a system copy find the bundled one. Only a shared cudart (a
+  # MOSSINFER_STATIC_CUDART=OFF build; the release presets link it statically) is a load-time dependency that the
+  # bundled copy next to the library must satisfy; there the loader recognises the bundled cuBLASLt by its path.
+  if(NOT MOSSINFER_STATIC_CUDART)
+    set_property(TARGET mossinfer PROPERTY INSTALL_RPATH "$ORIGIN")
+  endif()
   if(NOT WIN32)
     # The version script is the guarantee: statically linked code (cudart_static, CUTLASS templates, libstdc++
     # inlines) cannot leak symbols even where it ignores -fvisibility. -z defs: no unresolved symbols at load time.
@@ -151,11 +157,17 @@ function(_mi_install_executables)
   foreach(t IN ITEMS moss-infer moss-server)
     if(TARGET ${t})
       list(APPEND _targets ${t})
-      if(NOT WIN32)
+      # RUNPATH $ORIGIN/../lib only where lib/ holds a load-time dependency: libmossinfer (moss-server in the shared
+      # build) or a shared cudart. An executable that links the core statically and cudart statically gets none: its
+      # RUNPATH would steer the cuBLASLt loader's plain-name search for a system copy to the bundled one, past the
+      # ld.so cache (src/backend/cuda_libs.h).
+      get_target_property(_links ${t} LINK_LIBRARIES)
+      if(NOT WIN32 AND (NOT MOSSINFER_STATIC_CUDART OR (TARGET mossinfer AND "mossinfer" IN_LIST _links)))
         set_property(TARGET ${t} PROPERTY INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
       endif()
     endif()
   endforeach()
+  unset(_links)
   if(MOSSINFER_STATIC_LIBSTDCXX AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT WIN32)
     foreach(t IN LISTS _targets ITEMS mossinfer)
       if(TARGET ${t})
@@ -167,29 +179,58 @@ function(_mi_install_executables)
     install(TARGETS ${_targets} RUNTIME_DEPENDENCY_SET mossinfer_cuda_deps RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   endif()
   if(MOSSINFER_BUNDLE_CUDA_LIBS AND (_targets OR TARGET mossinfer))
+    # Install component `cuda`: the bundled CUDA libraries and their EULA. The full install (and the CPack archive)
+    # has every component; `cmake --install <build> --component Unspecified` is the system-CUDA variant without them.
+    # That variant is a release-preset product (MOSSINFER_STATIC_CUDART): with a shared cudart it needs one installed.
     # Only the CUDA toolkit's own redistributables (CUDA EULA Attachment A); never the driver (libcuda / nvcuda).
+    # cuBLASLt is not a link dependency (the engine loads it at run time, src/backend/cuda_libs.h): its file is
+    # installed by name, under the soname the loader opens (libcublasLt.so.<major> / cublasLt64_<major>.dll).
+    if(WIN32)
+      find_file(_mi_cublaslt cublasLt64_${CUDAToolkit_VERSION_MAJOR}.dll NO_CACHE NO_DEFAULT_PATH
+                PATHS ${CUDAToolkit_BIN_DIR}/x64 ${CUDAToolkit_BIN_DIR})
+      set(_mi_cublaslt_dest ${CMAKE_INSTALL_BINDIR})
+    else()
+      find_file(_mi_cublaslt libcublasLt.so.${CUDAToolkit_VERSION_MAJOR} NO_CACHE NO_DEFAULT_PATH
+                PATHS ${CUDAToolkit_LIBRARY_DIR})
+      set(_mi_cublaslt_dest ${CMAKE_INSTALL_LIBDIR})
+    endif()
+    if(_mi_cublaslt)
+      # Linux: the file the toolkit's soname link points to, installed under the soname (one regular file, which
+      # every archive format keeps as it is).
+      get_filename_component(_mi_cublaslt_name ${_mi_cublaslt} NAME)
+      file(REAL_PATH ${_mi_cublaslt} _mi_cublaslt)
+      install(PROGRAMS ${_mi_cublaslt} DESTINATION ${_mi_cublaslt_dest} RENAME ${_mi_cublaslt_name} COMPONENT cuda)
+      unset(_mi_cublaslt_name)
+    else()
+      install(CODE "message(FATAL_ERROR \"cuBLASLt (libcublasLt.so.${CUDAToolkit_VERSION_MAJOR} / \
+cublasLt64_${CUDAToolkit_VERSION_MAJOR}.dll) not found under ${CUDAToolkit_LIBRARY_DIR} or ${CUDAToolkit_BIN_DIR}: \
+MOSSINFER_BUNDLE_CUDA_LIBS bundles it\")" COMPONENT cuda)
+    endif()
+    unset(_mi_cublaslt)
+    unset(_mi_cublaslt_dest)
+    # A shared cudart (MOSSINFER_STATIC_CUDART=OFF) is a link dependency: found among the binaries' dependencies.
     install(RUNTIME_DEPENDENCY_SET mossinfer_cuda_deps
       # Spelled case-insensitively: Windows reports DLL names in either case.
-      PRE_INCLUDE_REGEXES "[cC][uU][bB][lL][aA][sS]" "[cC][uU][dD][aA][rR][tT]"
+      PRE_INCLUDE_REGEXES "[cC][uU][dD][aA][rR][tT]"
       PRE_EXCLUDE_REGEXES ".*"
-      POST_INCLUDE_REGEXES "[cC][uU][bB][lL][aA][sS][^/\\\\]*$" "[cC][uU][dD][aA][rR][tT][^/\\\\]*$"
+      POST_INCLUDE_REGEXES "[cC][uU][dD][aA][rR][tT][^/\\\\]*$"
       POST_EXCLUDE_REGEXES ".*"
       DIRECTORIES ${CUDAToolkit_LIBRARY_DIR} ${CUDAToolkit_BIN_DIR} ${CUDAToolkit_BIN_DIR}/x64
-      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT cuda
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT cuda)
     # Redistributing cuBLASLt is allowed only together with the CUDA EULA. A missing EULA stops the install (not the
     # configuration: plain builds that are never installed stay unaffected).
     set(_eula_found OFF)
     foreach(eula IN ITEMS ${CUDAToolkit_LIBRARY_ROOT}/EULA.txt ${CUDAToolkit_BIN_DIR}/../EULA.txt)
       if(EXISTS ${eula})
-        install(FILES ${eula} DESTINATION ${MOSSINFER_INSTALL_DOCDIR}/third_party/cuda)
+        install(FILES ${eula} DESTINATION ${MOSSINFER_INSTALL_DOCDIR}/third_party/cuda COMPONENT cuda)
         set(_eula_found ON)
         break()
       endif()
     endforeach()
     if(NOT _eula_found)
       install(CODE "message(FATAL_ERROR \"CUDA EULA.txt not found under ${CUDAToolkit_LIBRARY_ROOT} or ${CUDAToolkit_BIN_DIR}/..: \
-the bundled CUDA libraries (MOSSINFER_BUNDLE_CUDA_LIBS) may only be redistributed with it\")")
+the bundled CUDA libraries (MOSSINFER_BUNDLE_CUDA_LIBS) may only be redistributed with it\")" COMPONENT cuda)
     endif()
   endif()
   # MSVC: the C++ runtime the binaries are linked against (/MD: vcruntime140, msvcp140, ...), next to them in bin/,
@@ -198,6 +239,22 @@ the bundled CUDA libraries (MOSSINFER_BUNDLE_CUDA_LIBS) may only be redistribute
     set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION ${CMAKE_INSTALL_BINDIR})
     set(CMAKE_INSTALL_UCRT_LIBRARIES OFF)
     include(InstallRequiredSystemLibraries)
+  endif()
+  # Both install variants of this build (full and `--component Unspecified`), each tree's moss-server asked which
+  # cuBLASLt copy it uses, and check_package.py on both. Needs no GPU; writes the trees under the build directory.
+  if(MOSSINFER_TESTS AND MOSSINFER_BUNDLE_CUDA_LIBS AND TARGET mossinfer AND TARGET moss-server AND
+     TARGET Python3::Interpreter)
+    # The system-CUDA variant is a release-preset product (static cudart); a shared-cudart build's slim tree also
+    # needs a system cudart, which the test tolerates (--shared-cudart).
+    set(_mi_cudart_flag "")
+    if(NOT MOSSINFER_STATIC_CUDART)
+      set(_mi_cudart_flag --shared-cudart)
+    endif()
+    add_test(NAME package_install_tree COMMAND Python3::Interpreter -I ${CMAKE_SOURCE_DIR}/tests/server/test_install_tree.py
+             --build ${CMAKE_BINARY_DIR} --work ${CMAKE_BINARY_DIR}/install_tree_test --cmake ${CMAKE_COMMAND}
+             --check-package ${CMAKE_SOURCE_DIR}/.github/scripts/check_package.py
+             --cuda-major ${CUDAToolkit_VERSION_MAJOR} ${_mi_cudart_flag})
+    set_tests_properties(package_install_tree PROPERTIES LABELS cpu TIMEOUT 600)
   endif()
 endfunction()
 cmake_language(DEFER CALL _mi_install_executables)

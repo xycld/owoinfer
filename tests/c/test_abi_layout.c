@@ -52,7 +52,7 @@ int main(void) {
   FIELD(mi_device_info, unsupported_reason, 332);
   FIELD(mi_device_info, _reserved1, 588);
 
-  SIZE(mi_probe_info, 576);
+  SIZE(mi_probe_info, 1624);
   FIELD(mi_probe_info, struct_size, 0);
   FIELD(mi_probe_info, driver_cuda_version, 8);
   FIELD(mi_probe_info, runtime_cuda_version, 12);
@@ -62,7 +62,12 @@ int main(void) {
   FIELD(mi_probe_info, build_flavour, 28);
   FIELD(mi_probe_info, recommended_flavour, 44);
   FIELD(mi_probe_info, message, 60);
-  FIELD(mi_probe_info, _reserved0, 572);
+  FIELD(mi_probe_info, _reserved0, 572); /* the 0.2.0 layout ends here (576 bytes) */
+  FIELD(mi_probe_info, cublaslt_source, 576);
+  FIELD(mi_probe_info, cublaslt_version, 592);
+  FIELD(mi_probe_info, _reserved1, 596);
+  FIELD(mi_probe_info, cublaslt_path, 600);
+  FIELD(mi_probe_info, cublaslt_error, 1112);
 
   SIZE(mi_engine_params, 136);
   FIELD(mi_engine_params, struct_size, 0);
