@@ -160,6 +160,29 @@ install(FILES ${CMAKE_SOURCE_DIR}/third_party/sageattention/LICENSE ${CMAKE_SOUR
         DESTINATION ${MOSSINFER_INSTALL_DOCDIR}/third_party/sageattention)
 unset(_mi_file)
 
+# Quality certificates: every *.mossinfer-cert.json of the source tree's data/quality_certs/ (none yet: the directory may
+# be missing) goes to share/mossinfer/quality_certs/, the directory the engine searches last
+# (src/pipeline/quality_cert.cpp install_certificate_dir: <the libmossinfer / executable directory>/../share/mossinfer/
+# quality_certs, for a lib/, lib64/ or bin/ directory). The default component, so both the full package and the
+# system-CUDA variant (`--component Unspecified`) carry them. The files are listed when installing, so new certificates
+# need no reconfigure. MOSSINFER_QUALITY_CERTS_SOURCE in the install's environment names another source directory
+# (a packager's own certificates; tests/server/test_install_tree.py).
+set(MOSSINFER_QUALITY_CERTS_DIR ${CMAKE_SOURCE_DIR}/data/quality_certs CACHE PATH
+    "Directory whose *.mossinfer-cert.json files are installed to share/mossinfer/quality_certs")
+install(CODE "
+  set(_mi_certs \"${MOSSINFER_QUALITY_CERTS_DIR}\")
+  if(DEFINED ENV{MOSSINFER_QUALITY_CERTS_SOURCE})
+    file(TO_CMAKE_PATH \"\$ENV{MOSSINFER_QUALITY_CERTS_SOURCE}\" _mi_certs)
+  endif()
+  if(IS_DIRECTORY \"\${_mi_certs}\")
+    file(GLOB _mi_cert_files LIST_DIRECTORIES false \"\${_mi_certs}/*.mossinfer-cert.json\")
+    if(_mi_cert_files)
+      list(SORT _mi_cert_files)
+      file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/share/mossinfer/quality_certs\" TYPE FILE FILES \${_mi_cert_files})
+    endif()
+  endif()
+")
+
 # Executables are defined after the fragments (moss-infer in CMakeLists.txt, moss-server in server.cmake), so their
 # install rules run at the end of the directory.
 function(_mi_install_executables)

@@ -237,7 +237,9 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertEqual(res["capabilities"], {"preview": True, "comfyui_models": False, "model_files": True,
                                                "lora": True, "tiers": True, "samplers": True,
                                                "image_input": True, "hires": True, "distill": True,
-                                               "system_cuda": True, "control": True, "accel": True})
+                                               "system_cuda": True, "control": True, "accel": True,
+                                               "preload": True, "release": True, "certificate_dirs": True,
+                                               "te_host_pin": True})
         probe = res["probe"]
         self.assertGreaterEqual(probe["device_count"], probe["supported_device_count"])
         self.assertIn(probe["recommended_flavour"], ("cu12", "cu13", ""))
@@ -569,6 +571,79 @@ class CpuProtocolTest(ProtocolTestBase):
         for i, params in enumerate(ok):
             self.assertError(self.server.call("generate", params, id="ok%d" % i), "no_engine", "ok%d" % i)
 
+    def test_load_params_11(self):
+        missing = os.path.join(self.tmp, "missing")
+        bundle = self.fake_bundle()
+        certs = os.path.join(self.tmp, "certs")
+        bad = [({"certificate_dirs": certs}, '"certificate_dirs" must be an array'),
+               ({"certificate_dirs": [certs, ""]}, '"certificate_dirs[1]" must be a non-empty path'),
+               ({"certificate_dirs": [5]}, '"certificate_dirs[0]" must be a non-empty path'),
+               ({"certificate_dirs": ["a\u0000b"]}, '"certificate_dirs[0]" must be a non-empty path without NUL'),
+               ({"dit_direct_io": "on"}, '"dit_direct_io" must be "auto", "buffered" or "direct"'),
+               ({"dit_direct_io": True}, '"dit_direct_io" must be a string'),
+               ({"te_host_pin": "pinned"}, '"te_host_pin" must be "auto", "on" or "off"'),
+               ({"te_host_pin": 1}, '"te_host_pin" must be a string')]
+        for i, (params, message) in enumerate(bad):
+            r = self.server.call("load", dict(params, model=missing), id=i)
+            self.assertError(r, "invalid_params", i)
+            self.assertIn(message, r["error"]["message"])
+        # Every valid value passes the server and reaches the engine's own checks (here: the missing bundle); an
+        # absent or null parameter is the default.
+        for i, extra in enumerate(({"certificate_dirs": []}, {"certificate_dirs": [certs, missing]},
+                                   {"certificate_dirs": None}, {"dit_direct_io": "auto"}, {"dit_direct_io": "buffered"},
+                                   {"dit_direct_io": "direct", "direct_io": True}, {"te_host_pin": "auto"},
+                                   {"te_host_pin": "on"}, {"te_host_pin": "off"}, {"dit_direct_io": None})):
+            r = self.server.call("load", dict(extra, model=missing), id="ok%d" % i)
+            self.assertError(r, "invalid_argument", "ok%d" % i)
+            self.assertIn("not found", r["error"]["message"])
+        # The engine counts the directories (at most 16; a missing one is searched as empty), before CUDA.
+        r = self.server.call("load", {"model": bundle, "certificate_dirs": [certs] * 17}, id="many")
+        self.assertError(r, "invalid_argument", "many")
+        self.assertIn("certificate_dirs: at most 16 entries (got 17)", r["error"]["message"])
+        r = self.server.call("load", {"model": bundle, "certificate_dirs": [certs] * 16, "dit_direct_io": "buffered",
+                                      "te_host_pin": "off", "vram_budget_bytes": 1000}, id="16")
+        self.assertError(r, "invalid_argument", "16")
+        self.assertIn("vram_budget_bytes", r["error"]["message"])
+        self.assertEqual(self.server.call("status")["result"], {"state": "unloaded"})
+
+    def test_preload_and_release_params(self):
+        lora = os.path.join(self.tmp, "style.safetensors")
+        with open(lora, "wb") as f:
+            f.write(b"read by preload, not by the pre-check")
+        out = os.path.join(self.tmp, "x.png")
+        # preload takes generate's request without the output, the preview and the PNG metadata.
+        for i, key in enumerate(("output", "preview_output", "preview_every", "save_metadata", "include_prompts",
+                                 "frobnicate")):
+            r = self.server.call("preload", {key: out if "output" in key else True}, id="u%d" % i)
+            self.assertError(r, "invalid_params", "u%d" % i)
+            self.assertIn('unknown parameter "%s"' % key, r["error"]["message"])
+        # The request is checked like generate's, before the server's state.
+        bad = [({"width": 1000}, "multiples of 16"), ({"sampler": "euler_a"}, "sampler"), ({"steps": 0}, "steps"),
+               ({"loras": [{"path": os.path.join(self.tmp, "none.safetensors")}]}, "file not found"),
+               ({"step_cache_threshold": 0}, "step_cache_threshold"), ({"prompt": 5}, '"prompt" must be a string'),
+               ({"control": {"adapter": os.path.join(self.tmp, "none.safetensors")}}, "control.adapter")]
+        for i, (params, message) in enumerate(bad):
+            r = self.server.call("preload", params, id="b%d" % i)
+            self.assertError(r, "invalid_params", "b%d" % i)
+            self.assertIn(message, r["error"]["message"])
+        # No prompt, a blank one, or a full request: valid, then no engine.
+        for i, params in enumerate((None, {}, {"prompt": ""}, {"prompt": "  "}, {"prompt": "a cat", "width": 512,
+                                    "height": 768, "steps": 8, "cfg": 1, "loras": [{"path": lora, "strength": 0.5}],
+                                    "step_cache": "fbcache"})):
+            self.assertError(self.server.call("preload", params, id="p%d" % i), "no_engine", "p%d" % i)
+        # generate still requires its prompt (through the engine's own check).
+        r = self.server.call("generate", {"output": out}, id="g")
+        self.assertError(r, "invalid_params", "g")
+        self.assertIn("Enter a prompt.", r["error"]["message"])
+        # release: keep_host_copy is a boolean (default true); nothing else.
+        for i, params in enumerate(({"keep_host_copy": 1}, {"keep_host_copy": "yes"}, {"keep": True})):
+            self.assertError(self.server.call("release", params, id="r%d" % i), "invalid_params", "r%d" % i)
+        for i, params in enumerate((None, {}, {"keep_host_copy": True}, {"keep_host_copy": False},
+                                    {"keep_host_copy": None})):
+            self.assertError(self.server.call("release", params, id="n%d" % i), "no_engine", "n%d" % i)
+        self.assertEqual(self.server.call("status")["result"], {"state": "unloaded"})
+        self.assertEqual(self.server.call("cancel")["result"], {"cancelling": False})
+
     def test_load_errors_are_engine_statuses(self):
         missing = os.path.join(self.tmp, "missing")
         r = self.server.call("load", {"model": missing}, id="a")
@@ -727,6 +802,58 @@ class GpuProtocolTest(ProtocolTestBase):
             events.append(msg)
             if msg["event"] == "done" and msg["id"] == gen_id:
                 return msg
+
+    def test_preload_release_generate(self):
+        self.load_base()
+        events = []
+        request = {"prompt": "a red apple on a wooden table", "width": 256, "height": 256, "steps": 2, "seed": 5}
+        # preload: async like generate, with a plan, a progress and a done carrying dit_load and preload_note.
+        pid = self.server.send("preload", request, id="p1")
+        self.assertEqual(self.server.response(pid, events=events)["result"], {"accepted": True})
+        busy = self.server.send("release", {}, id="busy")
+        self.assertError(self.server.response(busy, events=events), "busy", "busy")
+        done = self.wait_done(pid, events)
+        self.assertEqual(done["status"], "ok", done)
+        self.assertIn("preload_note", done)
+        self.assertEqual(set(done["dit_load"]), {"source", "io", "bytes", "seconds", "note"})
+        self.assertEqual(done["dit_load"]["source"], done["report"]["dit_load"]["source"])
+        if not done["preload_note"]:
+            self.assertEqual(done["dit_load"]["source"], "files")
+            self.assertIn(done["dit_load"]["io"], ("direct", "buffered"))
+        self.assertIsInstance(done["warnings"], list)
+        mine = [e for e in events if e.get("id") == "p1"]
+        self.assertEqual([e["event"] for e in mine if e["event"] in ("plan", "progress")][:2], ["progress", "plan"])
+        self.assertEqual(self.server.call("status")["result"]["state"], "idle")
+        # release with the host copy: answered when it ends, with the stats.
+        rid = self.server.send("release", {"keep_host_copy": True}, id="r1")
+        r = self.server.response(rid, events=events, timeout=GPU_TIMEOUT)
+        stats = r["result"]
+        self.assertEqual(set(stats), {"seconds", "vram_released_bytes", "host_copy_bytes", "host_copy_seconds",
+                                      "dit_host_copy", "te_host_copy", "note"})
+        self.assertGreater(stats["vram_released_bytes"], 0)
+        print("release:", stats, file=sys.stderr)
+        self.assertEqual(self.server.call("status")["result"]["state"], "idle")  # the engine stays
+        # generate: the DiT comes back from the host copy.
+        out = os.path.join(self.tmp, "after_release.png")
+        gid = self.server.send("generate", dict(request, output=out), id="g1")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "ok", done)
+        self.assertEqual(done["report"]["dit_load"]["source"], "host_copy" if stats["dit_host_copy"] else "files")
+        self.assertTrue(stats["dit_host_copy"], stats)
+        # A cancel during a release interrupts its host copy; the release still answers.
+        rid = self.server.send("release", {"keep_host_copy": True}, id="r2")
+        cid = self.server.send("cancel", {"id": "r2"}, id="c2")
+        answers = {}
+        while len(answers) < 2:
+            m = self.server.read(GPU_TIMEOUT)
+            if "event" not in m:
+                answers[m["id"]] = m
+        self.assertIn("result", answers["r2"], answers)
+        self.assertIn(answers["c2"]["result"]["cancelling"], (True, False))  # False: the release had ended already
+        if answers["c2"]["result"]["cancelling"]:
+            self.assertFalse(answers["r2"]["result"]["dit_host_copy"], answers)
+        self.assertEqual(self.server.call("unload")["result"], {"unloaded": True})
 
     def test_generate_256_two_steps(self):
         base = self.load_base()

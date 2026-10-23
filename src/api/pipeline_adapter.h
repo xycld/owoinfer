@@ -19,6 +19,7 @@ namespace mi::pipeline {
 struct Request;
 struct Result;
 struct PipelineOptions;
+struct ReleaseReport;
 }  // namespace mi::pipeline
 
 namespace mi::api {
@@ -36,6 +37,8 @@ struct ModelError : std::runtime_error {
 inline constexpr std::size_t kMaxLoras = 64;
 // At most this many control images per generation (one per kind; the published adapters have two).
 inline constexpr std::size_t kMaxControlImages = 16;
+// At most this many extra certificate directories per engine (mi_engine_params.certificate_dirs).
+inline constexpr std::size_t kMaxCertificateDirs = 16;
 
 // One finished generate() call, in C-API terms.
 struct Generation {
@@ -70,6 +73,11 @@ struct Generation {
   mi_accel_info accel{};
   std::string accelerators;               // MI_TEXT_ACCELERATORS
   std::vector<std::int32_t> cached_steps;  // mi_result_accel_cached_steps()
+  std::vector<double> step_cache_diffs;    // mi_result_accel_step_cache_diffs()
+  std::vector<std::string> accel_warnings;  // MI_MESSAGE_ACCEL_WARNING
+  mi_dit_load_info dit_load{};
+  // mi_result_text() kinds.
+  std::string dit_load_note, te_note, preload_note, step_cache_threshold_source;
 };
 
 // The pipeline request of `params` (a full-size struct): the unset markers resolved (mossinfer.h), a distill bundle
@@ -80,8 +88,10 @@ struct Generation {
 // engine's check. CPU only; `model` is left empty.
 // load_images false (mi_gen_params_validate): image inputs are checked (sizes, channels, file existence and size) but
 // neither copied nor decoded; 1x1 stand-ins take their place.
+// preload true (mi_engine_preload): a NULL or blank prompt is allowed (the request keeps it blank; Pipeline::preload
+// plans for a short prompt); everything else is checked as for a generation.
 pipeline::Request to_request(const mi_gen_params& params, std::filesystem::path* distill_time_embedding = nullptr,
-                             bool load_images = true);
+                             bool load_images = true, bool preload = false);
 // Throws std::invalid_argument when `params` (a full-size struct) is not a valid request. CPU only.
 void validate(const mi_gen_params& params);
 // The pipeline options of `params` (a full-size struct). Throws std::invalid_argument on an unknown enum value, a size
@@ -96,8 +106,12 @@ class PipelineAdapter {
   PipelineAdapter(const PipelineAdapter&) = delete;
   PipelineAdapter& operator=(const PipelineAdapter&) = delete;
 
-  // Not thread-safe (one generation at a time); `cancel` is polled throughout.
+  // Not thread-safe (one job at a time); `cancel` is polled throughout.
   Generation generate(const mi_gen_params& params, const std::atomic<bool>& cancel);
+  // Pipeline::preload of `params` (prompt optional); progress is called once at the start, plan once at the end.
+  Generation preload(const mi_gen_params& params, const std::atomic<bool>& cancel);
+  // Pipeline::release_device_memory; never cancelled as a whole (`cancel` stops the host copy only).
+  mi_release_info release(bool keep_host_copy, const std::atomic<bool>& cancel);
 
  private:
   struct Impl;
@@ -108,6 +122,10 @@ class PipelineAdapter {
 // q.save_metadata; without the prompts unless include_prompts) and every accessor's data. Called by generate(); public
 // for the CPU tests.
 Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool include_prompts);
+
+// A release report in C-API terms, the note cut at 511 bytes on a UTF-8 boundary. Called by release(); public for the
+// CPU tests.
+mi_release_info to_release_info(const pipeline::ReleaseReport& report);
 
 // A result holding `generation`, as mi_generate() returns it (release it with mi_result_free()). Defined in c_api.cpp;
 // public for the CPU tests of the result accessors.

@@ -31,10 +31,124 @@ def check(cond, what):
         failures.append(what)
 
 
-def install(cmake, build, prefix, component=None):
+def install(cmake, build, prefix, component=None, certs=None):
+    """certs: the certificate source directory (packaging.cmake's MOSSINFER_QUALITY_CERTS_SOURCE); None: the build's."""
     shutil.rmtree(prefix, ignore_errors=True)
     cmd = [cmake, "--install", build, "--prefix", prefix] + (["--component", component] if component else [])
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+    env = {k: v for k, v in os.environ.items() if k != "MOSSINFER_QUALITY_CERTS_SOURCE"}
+    if certs is not None:
+        env["MOSSINFER_QUALITY_CERTS_SOURCE"] = certs
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, env=env)
+
+
+CERT_DIR = os.path.join("share", "mossinfer", "quality_certs")
+FAKE_CERT = "test-only.mossinfer-cert.json"
+
+
+def fake_cert_source(work):
+    """A certificate source directory with one syntactically valid (and matching nothing) certificate, plus a file
+    that must not be installed."""
+    src = os.path.join(work, "cert_source")
+    shutil.rmtree(src, ignore_errors=True)
+    os.makedirs(src)
+    with open(os.path.join(src, FAKE_CERT), "w", encoding="utf-8") as f:
+        json.dump({"schema": "mossinfer.quality_cert/test", "note": "install-tree test only; certifies nothing"}, f)
+    with open(os.path.join(src, "README.md"), "w", encoding="utf-8") as f:
+        f.write("not a certificate\n")
+    return src
+
+
+def source_certs(build):
+    """The *.mossinfer-cert.json files of the build's certificate directory (packaging.cmake), possibly none."""
+    src = None
+    with open(os.path.join(build, "CMakeCache.txt"), encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith("MOSSINFER_QUALITY_CERTS_DIR:"):
+                src = line.split("=", 1)[1].strip()
+    if not src or not os.path.isdir(src):
+        return []
+    return sorted(n for n in os.listdir(src) if n.endswith(".mossinfer-cert.json"))
+
+
+def installed_certs(prefix):
+    d = os.path.join(prefix, CERT_DIR)
+    return sorted(os.listdir(d)) if os.path.isdir(d) else None
+
+
+def check_package_run(script, prefix, extra):
+    p = subprocess.run([sys.executable, script, "--prefix", prefix] + extra, capture_output=True, text=True)
+    return p.returncode, p.stdout, p.stderr
+
+
+def check_certificates(args, full, slim):
+    """Packaging of share/mossinfer/quality_certs: the full tree got the fake source's certificate only, the slim
+    tree the build's own (none yet: no directory at all), and check_package.py lists them and refuses strangers."""
+    got = installed_certs(full)
+    check(got == [FAKE_CERT], f"full: {CERT_DIR} holds exactly the source's certificate ({got})")
+    own = source_certs(args.build)
+    got = installed_certs(slim)
+    check(got == (own or None), f"slim: {CERT_DIR} holds the build's certificates {own} ({got})")
+    if not args.check_package:
+        return
+    major = ["--cuda-major", args.cuda_major] if args.cuda_major else []
+    rc, out, err = check_package_run(args.check_package, full, major)
+    rel = os.path.join(CERT_DIR, FAKE_CERT)
+    check(rc == 0 and f"CERT {rel}: ok" in out and f"CERT {CERT_DIR}: 1 certificate(s)" in out,
+          f"check_package.py lists the certificate: {err.strip()}")
+    cert_dir = os.path.join(full, CERT_DIR)
+    for name, body, want in (("notes.txt", "x", "is not a .mossinfer-cert.json file"),
+                             ("broken.mossinfer-cert.json", "{not json", "is not valid JSON")):
+        path = os.path.join(cert_dir, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        try:
+            rc, out, err = check_package_run(args.check_package, full, major)
+        finally:
+            os.remove(path)
+        check(rc != 0 and want in err, f"check_package.py refuses {name} ({rc}: {err.strip()[-200:]})")
+
+
+def gpu_certificate_search(full, weights):
+    """GPU (MOSSINFER_GPU_TESTS=1): the installed engine searches the tree's certificate directory. A 256^2, 2-step
+    generation on the High tier (which needs a certificate) names the fake certificate in its quality reason; the fake
+    one certifies nothing."""
+    base = os.path.join(weights, "base")
+    if not os.path.isdir(os.path.join(base, "transformer")):
+        print(f"SKIP GPU certificate search: no base bundle under {weights}")
+        return
+    exe = os.path.abspath(os.path.join(full, "bin", "moss-server" + (".exe" if os.name == "nt" else "")))
+    out_png = os.path.join(os.path.dirname(os.path.abspath(full)), "cert_search.png")
+    p = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                         env=clean_environment(), cwd=os.path.dirname(os.path.abspath(full)))
+    try:
+        for req in ({"id": 1, "method": "load", "params": {"model": base, "tier": "high"}},
+                    {"id": 2, "method": "generate", "params": {"prompt": "a red apple", "width": 256, "height": 256,
+                                                               "steps": 2, "output": out_png}}):
+            p.stdin.write(json.dumps(req) + "\n")
+        p.stdin.flush()
+        done = None
+        for line in p.stdout:
+            msg = json.loads(line)
+            if msg.get("id") in (1, 2) and "error" in msg:
+                raise SystemExit(f"GPU certificate search: {msg}")
+            if msg.get("event") == "done":
+                done = msg
+                break
+        p.stdin.write('{"id": 3, "method": "shutdown"}\n')
+        p.stdin.flush()
+        p.communicate(timeout=TIMEOUT)
+    except Exception:
+        p.kill()
+        p.wait()
+        raise
+    check(done is not None and done.get("status") == "ok", f"GPU: the installed server generated ({done and done.get('status')})")
+    if done is None or done.get("status") != "ok":
+        return
+    reason = done["report"]["quality"].get("reason", "")
+    print(f"GPU quality reason: {reason}", flush=True)
+    check(FAKE_CERT in reason and "install-tree certificates not searched" not in reason,
+          "GPU: the install tree's certificate directory was searched (the reason names the fake certificate)")
+    check(done.get("certified") is False, "GPU: the fake certificate certifies nothing")
 
 
 def clean_environment():
@@ -131,7 +245,9 @@ def main():
     args.work = os.path.abspath(args.work)
     full = os.path.join(args.work, "full")
     slim = os.path.join(args.work, "slim")
-    install(args.cmake, args.build, full)
+    # The full tree with a fake certificate source, the slim one with the build's own (no directory yet: the install
+    # must not fail on it).
+    install(args.cmake, args.build, full, certs=fake_cert_source(args.work))
     install(args.cmake, args.build, slim, "Unspecified")
 
     # What this machine offers outside any package: the system-CUDA tree's own search.
@@ -203,6 +319,14 @@ def main():
                                text=True)
             sys.stdout.write(p.stdout)
             check(p.returncode == 0, f"check_package.py {' '.join(extra)} {prefix}: {p.stderr.strip()}")
+
+    check_certificates(args, full, slim)
+    # The certificates are in the default component: the system-CUDA variant carries them too.
+    install(args.cmake, args.build, slim, "Unspecified", certs=fake_cert_source(args.work))
+    got = installed_certs(slim)
+    check(got == [FAKE_CERT], f"slim with the fake source: {CERT_DIR} holds the certificate ({got})")
+    if os.environ.get("MOSSINFER_GPU_TESTS", "0") == "1":
+        gpu_certificate_search(full, os.environ.get("MOSS_WEIGHTS") or "/workspace/Models/MOSS-Image")
 
     if failures:
         print(f"{len(failures)} check(s) failed", file=sys.stderr)
