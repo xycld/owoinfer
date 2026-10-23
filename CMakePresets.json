@@ -57,6 +57,18 @@
       }
     },
     {
+      "name": "dev-sccache",
+      "displayName": "Dev box with sccache",
+      "inherits": "dev",
+      "description": "The dev preset with sccache as the C, C++ and CUDA compiler launcher, in its own build directory. Needs sccache 0.18 or newer on PATH (0.16 fails on nvcc 13.4). C++ module scanning is off: sccache does not cache -fmodules-ts compiles, and the project has no modules.",
+      "cacheVariables": {
+        "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
+        "CMAKE_C_COMPILER_LAUNCHER": "sccache",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "sccache",
+        "CMAKE_CUDA_COMPILER_LAUNCHER": "sccache"
+      }
+    },
+    {
       "name": "linux-cuda13",
       "displayName": "Linux release, CUDA 13.x (driver >= 580)",
       "inherits": [ "release-base", "linux" ],
@@ -83,6 +95,7 @@
   ],
   "buildPresets": [
     { "name": "dev", "configurePreset": "dev" },
+    { "name": "dev-sccache", "configurePreset": "dev-sccache" },
     { "name": "linux-cuda13", "configurePreset": "linux-cuda13" },
     { "name": "linux-cuda12", "configurePreset": "linux-cuda12" },
     { "name": "windows-msvc-cuda13", "configurePreset": "windows-msvc-cuda13" },
@@ -96,6 +109,7 @@
       "execution": { "noTestsAction": "error" }
     },
     { "name": "dev", "inherits": "test-base", "configurePreset": "dev" },
+    { "name": "dev-sccache", "inherits": "test-base", "configurePreset": "dev-sccache" },
     { "name": "linux-cuda13", "inherits": "test-base", "configurePreset": "linux-cuda13" },
     {
       "name": "linux-cuda12",
