@@ -13,6 +13,7 @@
 
 #include "../../tools/server/json_out.h"
 #include "../../tools/server/names.h"
+#include "pipeline/pipeline_image.h"
 #include "pipeline/report_json.h"
 #include "pipeline/samplers/initial_noise.h"
 #include "pipeline/samplers/sampler_driver.h"
@@ -140,6 +141,16 @@ TEST(ServerJson, EnumNamesAreThePipelines) {
     EXPECT_EQ(mi::planner::attention_name(mi::planner::parse_attention(n.name)), n.name);
   }
   EXPECT_EQ(i, 6);
+  i = 0;
+  for (const auto& n : mi::server::kResizeNames) {
+    EXPECT_EQ(static_cast<int>(n.value), i++);
+    EXPECT_EQ(static_cast<int>(p::parse_resize_mode(n.name)), static_cast<int>(n.value)) << n.name;
+    EXPECT_EQ(p::resize_mode_name(p::parse_resize_mode(n.name)), n.name);
+  }
+  EXPECT_EQ(i, 3);
+  i = 0;
+  for (const auto& n : mi::server::kMaskEncodingNames) EXPECT_EQ(static_cast<int>(n.value), i++);  // the server's own names
+  EXPECT_EQ(i, 2);
 }
 
 // The report of a done event: a NULL from mi_result_report_json() becomes JSON null instead of a crash.

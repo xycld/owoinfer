@@ -71,6 +71,11 @@ extern "C" {
 /* Incremented on every incompatible change of an existing function, struct field or enum value. */
 #define MI_ABI_VERSION 1
 
+/* What the unset markers of mi_gen_params resolve to (see "Unset markers" below), for a UI to pre-fill its fields. */
+#define MI_DEFAULT_STEPS 50
+#define MI_DEFAULT_CFG 3.0
+#define MI_DEFAULT_DENOISE_STRENGTH 0.75 /* with an init image (img2img, inpainting); 1.0 without one */
+
 /* "MAJOR.MINOR.PATCH" of the library actually loaded (static storage). */
 MOSSINFER_API const char* mi_version(void);
 /* MI_ABI_VERSION of the library actually loaded. A consumer compiled against another value must not use it. */
@@ -108,6 +113,9 @@ MOSSINFER_API const char* mi_last_error_message(void);
 #define MI_CAP_LORA 0x8u           /* mi_gen_params.loras, mi_engine_params.lora_strict, mi_result_lora() */
 #define MI_CAP_TIERS 0x10u         /* mi_engine_params.tier / attention, mi_result_tier() */
 #define MI_CAP_SAMPLERS 0x20u      /* the samplers after MI_SAMPLER_AB2, the schedulers and the noise options */
+#define MI_CAP_IMAGE_INPUT 0x40u   /* img2img and inpainting: mi_gen_params.init_image / mask, mi_result_image() */
+#define MI_CAP_HIRES 0x80u         /* the hires fix: mi_gen_params.hires_* */
+#define MI_CAP_DISTILL 0x100u      /* distill bundles and time embeddings: distill_dir, time_embedding_file */
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -190,10 +198,12 @@ typedef enum mi_block_path {
 /* Quality tier (MI_CAP_TIERS). The weights fix the GEMM precision (an INT8 DiT runs INT8 GEMMs); the tier decides the
  * attention kernel. A refused combination fails mi_generate() with MI_ERR_INVALID_ARGUMENT, naming the conflict. */
 typedef enum mi_tier {
-  MI_TIER_AUTO = 0,      /* the fastest certified configuration of the loaded models; else Reference for a bf16 DiT */
+  /* The fastest certified configuration of the loaded models; else Reference for a bf16 DiT. Refuses an INT4 DiT
+   * without a certificate (choose MI_TIER_TURBO explicitly). */
+  MI_TIER_AUTO = 0,
   MI_TIER_REFERENCE = 1, /* bf16 DiT and text encoder, exact attention; refused for quantized files */
   MI_TIER_HIGH = 2,      /* the loaded DiT's precision plus 8-bit attention (Q8_FP8 unless `attention` says otherwise) */
-  MI_TIER_TURBO = 3,     /* reserved: refused by this build */
+  MI_TIER_TURBO = 3,     /* an INT4 DiT file: INT4 GEMMs plus 8-bit attention; refused for any other DiT */
   MI_TIER_MAX_ENUM = 0x7fffffff
 } mi_tier;
 
@@ -213,7 +223,7 @@ typedef enum mi_precision {
   MI_PRECISION_BF16 = 0, /* the bundle, or a bf16 single file */
   MI_PRECISION_INT8 = 1, /* INT8 ConvRot (a DiT with any INT8 linear counts as INT8) */
   MI_PRECISION_W4A8 = 2, /* 4-bit weights, 8-bit activations (text encoder files) */
-  MI_PRECISION_W4A4 = 3, /* 4-bit weights and activations (reserved) */
+  MI_PRECISION_W4A4 = 3, /* 4-bit weights and activations: an INT4 DiT (the Turbo tier) */
   MI_PRECISION_MAX_ENUM = 0x7fffffff
 } mi_precision;
 
@@ -245,10 +255,18 @@ typedef struct mi_engine_params {
   mi_attention attention;          /* default MI_ATTENTION_DEFAULT */
   int32_t lora_strict;             /* unknown LoRA keys and lossy merges fail the generation (MI_ERR_MODEL); default 0 */
   int32_t _reserved2;              /* must be 0 */
+  /* Fields after the 120-byte layout (MI_CAP_DISTILL). A step-embedder replacement is per engine: */
+  /* a time_embedding.safetensors (replacement step embedder and modulation biases, computed in fp32) applied to the
+   * loaded DiT. UTF-8; NULL or "" = none. The file must exist. */
+  const char* time_embedding_file;
+  /* A distill bundle directory (time_embedding / lora / dataspace .safetensors). The engine takes its time embedding
+   * (as time_embedding_file; both set with different files is MI_ERR_INVALID_ARGUMENT); mi_gen_params.distill_dir
+   * takes the rest per generation. NULL or "" = none. */
+  const char* distill_dir;
 } mi_engine_params;
 
 /* Fills the first `struct_size` bytes of `params` with the defaults. struct_size is sizeof(mi_engine_params) of the
- * caller's header: 120, or 80 for a program built against the 0.1.0 header. */
+ * caller's header: 136, 120 (an earlier 0.2.0 header) or 80 (0.1.0). */
 MOSSINFER_API mi_status mi_engine_params_init(mi_engine_params* params, size_t struct_size);
 
 /* Creates an engine on `params->device_index`. Checks the parameters, the model path and that the component files exist
@@ -316,6 +334,32 @@ typedef struct mi_lora {
   double strength;   /* finite; 1 = as trained */
 } mi_lora;
 
+/* An 8-bit image in memory (MI_CAP_IMAGE_INPUT), row-major and tightly packed: [height][width][channels]. A fixed
+ * 24-byte layout without struct_size. The pixels are read (copied) during mi_gen_params_validate() / mi_generate()
+ * only; the caller may free them when the call returns. */
+typedef struct mi_image {
+  const uint8_t* pixels;
+  int32_t width;     /* 1..16384 */
+  int32_t height;    /* 1..16384, width * height <= 64,000,000 */
+  int32_t channels;  /* 3 (RGB) for an init image, 1 for a mask */
+  int32_t _reserved0; /* must be 0 */
+} mi_image;
+
+/* How mask values are read (mi_gen_params.mask / mask_path). */
+typedef enum mi_mask_encoding {
+  MI_MASK_U8 = 0,       /* 0..255 as given: >= 128 regenerates, < 128 keeps (default) */
+  MI_MASK_BINARY01 = 1, /* every value 0 (keep) or 1 (regenerate), scaled to 0 / 255; any other value is rejected */
+  MI_MASK_ENCODING_MAX_ENUM = 0x7fffffff
+} mi_mask_encoding;
+
+/* How an init image (and its mask) is brought to the request size (and a hires fix's first pass to its target). */
+typedef enum mi_resize_mode {
+  MI_RESIZE_CROP = 0,    /* cover the target keeping the aspect ratio, center-crop (default) */
+  MI_RESIZE_FIT = 1,     /* fit inside keeping the aspect ratio, fill the bands from the edge rows / columns */
+  MI_RESIZE_STRETCH = 2, /* scale each axis independently */
+  MI_RESIZE_MAX_ENUM = 0x7fffffff
+} mi_resize_mode;
+
 typedef enum mi_phase {
   MI_PHASE_TEXT_ENCODER = 0, /* entered even on a full embedding-cache hit */
   MI_PHASE_DIT_LOAD = 1,     /* entered even when the DiT is resident */
@@ -351,9 +395,9 @@ typedef struct mi_gen_params {
   const char* negative_prompt;     /* NULL = "" */
   int32_t width;                   /* positive multiple of 16, <= 4096, width * height <= 4.2 MP; default 1024 */
   int32_t height;                  /* default 1024 */
-  int32_t steps;                   /* 1..10000; default 50 */
+  int32_t steps;                   /* 1..10000, or 0 = unset (default; see "Unset markers") */
   int32_t _reserved0;              /* must be 0 */
-  double cfg;                      /* guidance scale >= 0; 1 disables the negative branch; default 3.0 */
+  double cfg;                      /* guidance scale >= 0 (1 disables the negative branch), or negative = unset (default) */
   double shift;                    /* schedule shift > 0; default 5.0 */
   int64_t seed;                    /* 0..2^53-1, or -1 for random (the seed used is in the result); default 42 */
   /* DiT blocks skipped in the negative branch, unique, in [0, 42). Default {22} (count 1, library-owned storage);
@@ -393,14 +437,53 @@ typedef struct mi_gen_params {
   size_t loras_count;
   int32_t include_prompts;          /* the metadata includes the prompt and negative prompt; default 1 (168 bytes: 0) */
   int32_t _reserved2;               /* must be 0 */
+  /* Fields after the 240-byte layout. Image input (MI_CAP_IMAGE_INPUT): img2img with an init image, inpainting with a
+   * mask as well. Each image comes as pixels or as a PNG / JPEG file, at most one of the two (both: invalid). Files are
+   * decoded in the library by a decoder that is not memory-safe: decode untrusted images yourself and pass pixels. */
+  const mi_image* init_image;       /* RGB (3 channels); NULL = none */
+  const char* init_image_path;      /* UTF-8; NULL or "" = none */
+  const mi_image* mask;             /* 1 channel, the init image's size; needs an init image. NULL = none */
+  const char* mask_path;            /* read as grayscale; NULL or "" = none */
+  mi_mask_encoding mask_encoding;   /* default MI_MASK_U8; applies to both mask and mask_path */
+  mi_resize_mode resize;            /* default MI_RESIZE_CROP */
+  /* [0, 1]: the share of the schedule run from the init image (0: its VAE round trip; 1 without a mask: txt2img, the
+   * image is not used, MI_TEXT_IMAGE_NOTE says so), or negative = unset (default). Below 1 needs an init image. */
+  double denoise_strength;
+  /* Hires fix (MI_CAP_HIRES): a second pass at hires_width x hires_height (multiples of 16, <= 4096, <= 4.2 MP) from
+   * the first pass upscaled; 0 x 0 = off (default). */
+  int32_t hires_width;
+  int32_t hires_height;
+  double hires_strength;            /* [0, 1]; default 0.45 */
+  int32_t hires_steps;              /* 0..10000; 0 (default) = `steps` */
+  int32_t _reserved3;               /* must be 0 */
+  /* A distill bundle directory (MI_CAP_DISTILL), expanded like `moss-infer generate --distill`: its lora.safetensors
+   * appended to `loras` at strength 1; its dataspace.safetensors as sampler DATASPACE + dataspace_path when the
+   * sampler is unset (EULER with no dataspace_path); cfg 1 when cfg is unset (< 0); steps = its step count when steps
+   * is unset (0). A bundle with a time_embedding.safetensors needs that file on the engine (mi_engine_params
+   * distill_dir or time_embedding_file), else mi_generate() fails with MI_ERR_INVALID_ARGUMENT. NULL or "" = none. */
+  const char* distill_dir;
 } mi_gen_params;
 
 /* Fills the first `struct_size` bytes of `params` with the defaults. struct_size is sizeof(mi_gen_params) of the
- * caller's header: 240, or 168 for a program built against the 0.1.0 header
- * (whose generations then keep the 0.1.0 behaviour: save_metadata and include_prompts are 0). */
+ * caller's header: 320, 240 (an earlier 0.2.0 header), or 168 for a program built against the 0.1.0 header
+ * (whose generations then keep the 0.1.0 behaviour: save_metadata and include_prompts are 0).
+ *
+ * Unset markers. At the current size, init leaves the context-dependent fields unset, and each resolves when the
+ * request is checked:
+ *   steps 0                  -> the dataspace file's step count with the DATASPACE sampler (a distill bundle's), else
+ *                               MI_DEFAULT_STEPS (50). Negative is invalid.
+ *   cfg negative (finite)    -> 1.0 with distill_dir, else MI_DEFAULT_CFG (3.0). NaN and infinities are invalid.
+ *   denoise_strength negative (finite) -> MI_DEFAULT_DENOISE_STRENGTH (0.75) with an init image, else 1.0. NaN and
+ *                               infinities are invalid; a value >= 0 must be in [0, 1].
+ *   sampler EULER with no dataspace_path -> a distill bundle's dataspace sampler (EULER cannot be forced with such a
+ *                               bundle; any other sampler can).
+ * The older sizes keep their init values: steps 50 and cfg 3.0 (168 and 240 bytes; a strength there resolves to 1.0:
+ * they cannot carry an init image). */
 MOSSINFER_API mi_status mi_gen_params_init(mi_gen_params* params, size_t struct_size);
-/* Checks `params` the way mi_generate() does, without an engine or GPU, the existence of the LoRA and dataspace files
- * included. MI_ERR_INVALID_ARGUMENT names the problem. */
+/* Checks `params` the way mi_generate() does, without an engine or GPU: the existence of the LoRA and dataspace files,
+ * the image inputs (files are decoded) and the distill bundle (opened, its dataspace file read) included. Only the
+ * match of a distill bundle's time embedding with the engine's is left to mi_generate(). MI_ERR_INVALID_ARGUMENT
+ * names the problem; a malformed distill bundle or dataspace file is MI_ERR_MODEL. */
 MOSSINFER_API mi_status mi_gen_params_validate(const mi_gen_params* params);
 
 /* Runs one generation to completion. Returns MI_OK with the image, or MI_CANCELLED after mi_cancel() (the result then
@@ -425,6 +508,10 @@ typedef struct mi_timings {
   double dit_load_s;     /* 0 when the DiT was resident */
   double refine_s;
   double vae_load_s;
+  /* Fields after the 104-byte layout: image input and the hires fix (not part of load_s). */
+  double vae_encoder_load_s;
+  double image_encode_s;  /* every VAE encode (the init image, the hires fix's upscaled first pass) */
+  double image_ops_s;     /* host-side image work: resizes, the hires upscale, mask preparation, inpainting blends */
 } mi_timings;
 
 typedef struct mi_memory_stats {
@@ -507,10 +594,44 @@ typedef enum mi_result_text_kind {
   MI_TEXT_TEXT_ENCODER_SOURCE = 4, /* the bundle's text_encoder folder, or text_encoder_file */
   MI_TEXT_VAE_SOURCE = 5,          /* the bundle's vae folder, or vae_file */
   MI_TEXT_QUALITY_JSON = 6,        /* the report's "quality" object, as JSON */
+  MI_TEXT_IMAGE_NOTE = 7,          /* a remark on the image input, e.g. why an init image was not used; "" for none */
+  MI_TEXT_TIME_EMBEDDING = 8,      /* the replacement step embedder that ran (time_embedding_file); "" for none */
   MI_TEXT_MAX_ENUM = 0x7fffffff
 } mi_result_text_kind;
 /* Owned by the result; "" when empty (e.g. cancelled early). NULL for a NULL result or an unknown kind. */
 MOSSINFER_API const char* mi_result_text(const mi_result* result, mi_result_text_kind kind);
+
+/* What the image input ran (MI_CAP_IMAGE_INPUT, MI_CAP_HIRES). */
+typedef enum mi_image_mode {
+  MI_IMAGE_MODE_TXT2IMG = 0, /* also an init image at denoise_strength 1 without a mask (MI_TEXT_IMAGE_NOTE says so) */
+  MI_IMAGE_MODE_IMG2IMG = 1,
+  MI_IMAGE_MODE_INPAINT = 2,
+  MI_IMAGE_MODE_MAX_ENUM = 0x7fffffff
+} mi_image_mode;
+
+/* The sampling passes of a generation: the request's pass, and the hires fix's second pass. A pass's steps:
+ * *_steps_scheduled = the pass's schedule after snapping minus *_start_step (the steps its strength skips). */
+typedef struct mi_image_info {
+  size_t struct_size;
+  mi_image_mode mode;
+  int32_t hires_ran;              /* the hires pass was reached (not cancelled before it) */
+  int32_t first_width;            /* the request's size */
+  int32_t first_height;
+  int32_t first_steps_scheduled;
+  int32_t first_start_step;       /* 0 for txt2img */
+  int32_t first_steps_run;
+  int32_t first_encoded;          /* an image was VAE-encoded for the first pass (img2img start or inpainting blend) */
+  int32_t hires_width;            /* 0 without the hires fix */
+  int32_t hires_height;
+  int32_t hires_steps_scheduled;
+  int32_t hires_start_step;
+  int32_t hires_steps_run;
+  int32_t _reserved0;
+  double first_strength;          /* the denoise strength of each pass (1 for txt2img) */
+  double hires_strength;
+} mi_image_info;
+/* `out` has struct_size set by the caller. */
+MOSSINFER_API mi_status mi_result_image(const mi_result* result, mi_image_info* out);
 
 /* Token counts of one prompt as the text encoder saw it (chat template included). */
 typedef struct mi_prompt_tokens {

@@ -19,9 +19,12 @@ Version 0.2.0 (ABI 1, server protocol 1). This is a pre-release: see [Versioning
 | Platform | Linux x86-64 with the `cu13` build (CUDA 13) |
 | GPUs | NVIDIA compute capability 8.x and 12.x: RTX 30xx, RTX 40xx, RTX 50xx, A100/A10/A40, L4/L40, RTX PRO Blackwell |
 | Models | the official MOSS-Image Base and SFT Hugging Face folders (bf16), read in place |
-| Component model files | a single-file DiT, text encoder or VAE next to the bundle folder: ComfyUI and community files, INT8 ConvRot DiT and text encoder, W4A8 text encoder (`dit_file`, `text_encoder_file`, `vae_file`) |
+| Component model files | a single-file DiT, text encoder or VAE next to the bundle folder: ComfyUI and community files, INT8 ConvRot and INT4 ConvRot DiT, INT8 ConvRot and W4A8 text encoder (`dit_file`, `text_encoder_file`, `vae_file`) |
 | Generation | text-to-image with the official app's parameters: prompt, negative prompt, size, steps, CFG, shift, seed, skip layers, skip-layer guidance |
-| Quality tier | `auto` (default: the fastest configuration with a quality certificate, else exact), `reference` (bf16, exact), `high` (the loaded weights plus 8-bit attention); the tier that ran is reported |
+| Quality tier | `auto` (default: the fastest configuration with a quality certificate, else exact), `reference` (bf16, exact), `high` (the loaded weights plus 8-bit attention), `turbo` (an INT4 DiT file, chosen explicitly); the tier that ran is reported |
+| Image input | img2img (an init image and a denoise strength) and inpainting (a mask), with crop / fit / stretch resizing; pixels (library) or PNG / JPEG files (both surfaces) |
+| Hires fix | a second pass at a larger size from the first pass upscaled, with its own strength and steps |
+| Distill bundles | few-step distilled checkpoints shipped as a bundle folder (time embedding, LoRA, data-space sampler parameters), applied per engine and per generation |
 | Attention mode | exact (FlashAttention-2) or one of four 8-bit modes, as an override of the tier's choice |
 | LoRAs | a list of files with strengths per generation, applied at run time; per-file reports and warnings |
 | Samplers and schedulers | 9 samplers (Euler, AB2, Euler ancestral, Heun, DPM++ 2M, DPM++ 2M SDE, ER-SDE, RES multistep, data-space), 7 schedulers, noise layout and source, eta, s_noise, flow multiplier |
@@ -42,9 +45,6 @@ These are designed and partly built. The launcher can prepare for them now (see 
 | Windows x64 (MSVC) builds, both flavours | code written, never compiled; first build comes with CI | ship the same integration code; budget time for fixes on the first Windows build |
 | `cu12` builds (Linux and Windows) | written, never compiled | include the flavour choice (see [Picking the build](#picking-the-build-cu12-or-cu13)) |
 | Release archives | the CI workflows exist but have not run yet | build from source until then (see [Getting the binaries](#getting-the-binaries)) |
-| Image-to-image | planned; not in the API yet | plan an init image and a denoise strength per generation |
-| High-resolution fix | planned; not in the API yet | plan a second-pass (upscale) setting |
-| Inpainting | planned; not in the API yet | plan a mask input next to the init image |
 
 ### Not supported
 
@@ -57,7 +57,8 @@ These are designed and partly built. The launcher can prepare for them now (see 
 | One generation split across several GPUs | not supported. One engine per GPU is the intended pattern (not yet tested on multi-GPU machines). |
 | Several generations at once on one engine | not supported: queue them in the launcher |
 | A ComfyUI checkpoint or models folder as the model path | not supported: the model path is a bundle folder; ComfyUI files load as component files |
-| INT4 "Turbo" tier | not supported; under evaluation (`turbo` is refused) |
+| An uncertified Turbo run under tier `auto` | not supported: `auto` refuses an INT4 DiT without a quality certificate (none exists yet). Choose `turbo` explicitly. |
+| Pixel data over the server protocol | not supported: the server takes image file paths |
 | Server output other than PNG | not supported |
 
 ## Choosing the integration surface
@@ -155,7 +156,7 @@ hf download OpenMOSS-Team/MOSS-Image-SFT  --local-dir MOSS-Image/sft  --exclude 
 - **The folder can be read-only.** The engine writes nothing into it. An optional `moss.mossidx` index, made with `moss-infer index <folder>`, makes the first load slightly faster. Without one, the engine builds the index in memory.
 - **To save disk with both models,** hard-link SFT's `text_encoder/*.safetensors` and `vae/*.safetensors` to Base's. They are byte-identical.
 - **ComfyUI and quantized files** load as component files next to the bundle folder: `dit_file` (INT8 ConvRot, mixed INT8/bf16 or bf16 DiT), `text_encoder_file` (INT8 ConvRot or W4A8) and `vae_file`. The tokenizer and configs still come from the folder. A file as the model path itself (`MI_MODEL_FORMAT_COMFYUI`, or a file with `MI_MODEL_FORMAT_AUTO`) returns `MI_ERR_NOT_SUPPORTED`, and the server answers `not_supported`, while `MI_CAP_COMFYUI_MODELS` is unset.
-- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. A quality certificate (`<dit>.mossinfer-cert.json`, or in `<cache_dir>/quality_certs/`) lets `auto` pick a lossy configuration; the report's `quality` object says which one ran and whether it was certified.
+- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 DiT runs only under `turbo`, which must be chosen explicitly: offer it for INT4 files, and only for them. A quality certificate (`<dit>.mossinfer-cert.json`, or in `<cache_dir>/quality_certs/`) lets `auto` pick a lossy configuration; the report's `quality` object says which one ran and whether it was certified.
 
 ## Picking the build: cu12 or cu13
 
@@ -220,6 +221,8 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 - **`not_supported`:** a feature that this build does not enable, e.g. a ComfyUI file as the model path.
 - **`invalid_argument` in `done`:** a tier combination the engine refuses, e.g. `reference` with an INT8 `dit_file`. The message names the conflict.
 
+**Images from untrusted sources.** moss-server decodes `init_image` and `mask` files in-process with stb_image, which is hardened (at most 64 MiB per file, 16384 pixels per side and 64,000,000 pixels, checked before any pixel allocation) but not memory-safe. When the images come from a network, web uploads or other users' files, decode them in the launcher with a memory-safe decoder and pass pixels through the C API (`mi_gen_params.init_image` / `mask`), or run moss-server sandboxed. Files the user created or trusts are the case the server's file input is meant for; downloads are untrusted.
+
 **Paths.** The server trusts its input: it reads and writes exactly the paths it is given. The launcher must choose `output` and `cache_dir` itself, or validate them, and must not forward raw paths from untrusted sources (see "Security" in [server-protocol.md](server-protocol.md)).
 
 ## Using the library directly
@@ -258,12 +261,13 @@ Bindings in other languages can follow the frozen struct layouts in [c-api.md](c
 | GPU | `device_index` / `device` | From `hello`'s device list. Supported devices only. |
 | Model | `model_path` / `model` | The Base or SFT folder. |
 | Model files | `dit_file`, `text_encoder_file`, `vae_file` | Optional file pickers next to the model folder, empty by default (the folder's own components). Offer them when `MI_CAP_MODEL_FILES` / `model_files` is set. |
-| Quality tier | `tier`: `auto` / `reference` / `high` | Default **Auto**. Show the tier that ran (`mi_result_tier()`, or the report's `quality` and `models`), and mark uncertified lossy runs. Leave `turbo` out: this build refuses it. |
+| Quality tier | `tier`: `auto` / `reference` / `high` / `turbo` | Default **Auto**. Show the tier that ran (`mi_result_tier()`, or the report's `quality` and `models`), and mark uncertified lossy runs. Offer `turbo` only when the DiT file is INT4, and select it for such a file: `auto` refuses an uncertified INT4 DiT. |
+| Distill bundle | `distill_dir` / `distill` (engine) | An optional folder picker. Set the same bundle on the engine and on each generation (the engine takes its time embedding). Leave steps, CFG and the sampler unset to get the bundle's. |
 | Attention | `attention`: `default` / `exact` / `q8_fp8` / ... | An advanced setting, default `default` (the tier's choice). |
 | LoRA strictness | `lora_strict` | Off. Turn it on only for workflows where a partly applied LoRA must fail instead of warn. |
 
 **Per-image settings** (`generate` / `mi_gen_params`) mirror the official app's `parameters.json`, and so do the defaults:
-- 1024×1024, 50 steps, CFG 3.0, shift 5.0;
+- 1024×1024, 50 steps, CFG 3.0, shift 5.0 (steps and CFG are left unset by `mi_gen_params_init()` and an absent server field, and resolve to these unless a distill bundle applies: see [c-api.md](c-api.md#unset-markers));
 - seed 42 (`-1` = random; the seed used is in the report);
 - the negative branch skips DiT block 22;
 - Euler sampler, `moss` scheduler.
@@ -276,6 +280,9 @@ Width and height must be multiples of 16, at most 4096 per side, and at most 4.2
 | Sampler and scheduler | `sampler`, `scheduler` | Default Euler + `moss` (the official result). List all names; group the stochastic samplers' `eta` and `s_noise`, and `noise_source`, as advanced options. The `dataspace` sampler needs its parameters file (`dataspace`). |
 | Embed settings | `save_metadata` | On by default (`mi_gen_params_init(p, sizeof *p)`; a program built against the 0.1.0 header gets no metadata). |
 | Include prompts | `include_prompts` | On by default. Offer it as a privacy option for images that will be shared. |
+| Init image | `init_image` (pixels) or `init_image_path` / `init_image` (path) | An optional image picker with a denoise strength slider, pre-filled with `MI_DEFAULT_DENOISE_STRENGTH` (0.75, what an unset strength resolves to; 1 without a mask ignores the image). The output size stays `width` × `height` and the image is resized to it (crop by default): set the size from the image to keep its aspect ratio. `moss-infer` does that itself; the C API and the server do not. |
+| Inpainting mask | `mask` / `mask_path` / `mask`, `mask_encoding` | A mask painter next to the init image. Pass 0/1 masks with `binary01`, 0/255 masks with `u8`. |
+| Hires fix | `hires_width`, `hires_height`, `hires_strength`, `hires_steps` / `hires` | Off by default; a target size (or a scale rounded to multiples of 16) with a strength (default 0.45). |
 | Preview | `preview_callback` + `preview_interval` / `preview_output` + `preview_every` | On. Every step is fine for small images; use about 5 for large ones, because each preview is a full-size device-to-host copy plus (server) a PNG write, on the generating thread while the GPU waits. The preview is coarse (no VAE). On Windows, do not keep the server's preview file open: the server renames each new preview over it, a held file makes that fail, and the server then logs a warning and goes on. |
 
 Leave `block_path`, `direct_io`, `noise_layout`, `flow_multiplier` and the skip-layer guidance fields (`slg_*`) at their defaults unless you have a reason to change them. `block_path` changes speed only, never the image.
@@ -296,8 +303,11 @@ Features are announced by a capability bit. Check `mi_capabilities()`, or `capab
 | LoRAs | `MI_CAP_LORA` (0x8) | `"lora"` | set | `loras`, `lora_strict` |
 | Tiers and attention | `MI_CAP_TIERS` (0x10) | `"tiers"` | set | `tier`, `attention` |
 | Samplers and schedulers | `MI_CAP_SAMPLERS` (0x20) | `"samplers"` | set | the samplers after AB2, `scheduler`, the noise options |
+| Image input | `MI_CAP_IMAGE_INPUT` (0x40) | `"image_input"` | set | img2img and inpainting |
+| Hires fix | `MI_CAP_HIRES` (0x80) | `"hires"` | set | the hires fix |
+| Distill bundles | `MI_CAP_DISTILL` (0x100) | `"distill"` | set | `distill_dir` / `distill`, `time_embedding_file` |
 
-The planned features (image-to-image, high-resolution fix, inpainting) will arrive the same way: **new trailing struct fields, new enum values and new capability bits** in the C API, and **new optional parameters** for the server. Leaving them unset keeps today's behaviour. A program built against an older header keeps working with a newer library, because the library accepts every older struct size (see [Versioning](#versioning)). Build the settings UI so that an init image, a denoise strength and a mask can slot in without a redesign.
+Future features will arrive the same way: **new trailing struct fields, new enum values and new capability bits** in the C API, and **new optional parameters** for the server. Leaving them unset keeps today's behaviour. A program built against an older header keeps working with a newer library, because the library accepts every older struct size (see [Versioning](#versioning)).
 
 ## Reports and diagnostics
 
@@ -323,7 +333,7 @@ Attach it to bug reports, together with the server's stderr log and `hello`'s `p
   - The server's `hello` reports its `protocol_version` (1).
 - **Additive changes keep ABI 1:** new functions, new fields at the end of structs, new enum values, new optional server parameters and events.
   - A newer library accepts structs from programs built against an older header: their `struct_size` is smaller, the library reads only those bytes, and the missing fields take their defaults. It writes only `struct_size` bytes of output structs.
-  - This is implemented: 0.2.0 accepts the 0.1.0 sizes of `mi_engine_params` (80 bytes) and `mi_gen_params` (168 bytes) as well as its own (120 and 240). Any other size returns `MI_ERR_ABI_MISMATCH`. A 0.1.0 program keeps the 0.1.0 behaviour: its PNGs carry no metadata. See [c-api.md](c-api.md#struct-sizes).
+  - This is implemented: 0.2.0 accepts the 0.1.0 sizes of `mi_engine_params` (80 bytes) and `mi_gen_params` (168 bytes) as well as its own (136 and 320, and 120 and 240 from an earlier 0.2.0 header). Any other size returns `MI_ERR_ABI_MISMATCH`. A 0.1.0 program keeps the 0.1.0 behaviour: its PNGs carry no metadata. See [c-api.md](c-api.md#struct-sizes).
 - **Incompatible changes raise `MI_ABI_VERSION`.** On Linux the shared library's SONAME follows the ABI (`libmossinfer.so.1`).
 - **Before 1.0, pin the launcher to an exact engine release,** and rebuild it against each new header. A minor release may still raise the ABI.
   - **Run time and build time differ.** At run time, the 0.2 library accepts programs built against the 0.1 header (same ABI, older struct sizes). At build time, the CMake package (`SameMinorVersion`) satisfies only the matching `MAJOR.MINOR`: `find_package(MossInfer 0.1)` does not find 0.2.0. Update the requested version when you move to a new header.

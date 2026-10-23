@@ -17,8 +17,10 @@
 #include "backend/cuda_driver.h"
 #include "core/cuda_check.h"
 #include "models/lora/lora.h"
+#include "models/moss_dit/distill.h"
 #include "models/moss_dit/moss_dit.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/pipeline_image.h"
 #include "pipeline/png_writer.h"
 #include "pipeline/quality_cert.h"
 #include "pipeline/report_json.h"
@@ -232,17 +234,134 @@ mi_prompt_tokens to_tokens(const tok::PromptTokenReport& t) {
   return out;
 }
 
+bool given(const char* utf8) { return utf8 != nullptr && *utf8 != '\0'; }
+
+// A distill bundle directory: DistillError (a bundle without any of its files, an unreadable entry) is a model error;
+// a path that is not a directory is an argument error.
+moss_dit::DistillBundle distill_bundle(const char* utf8, const std::string& name) {
+  const fs::path dir = util::path_from_utf8(utf8);
+  std::error_code ec;
+  if (!fs::is_directory(dir, ec)) throw std::invalid_argument(name + ": not a directory: " + utf8);
+  try {
+    return moss_dit::open_distill_bundle(dir);
+  } catch (const moss_dit::DistillError& e) {
+    throw ModelError(name + ": " + e.what());
+  }
+}
+
+// An image input of a request, checked without copying or decoding anything: pixels (sizes, channels, a BINARY01
+// mask's values) or a file (an existing regular file within kMaxImageFileBytes). At most one of the two.
+struct ImageInput {
+  const mi_image* pixels = nullptr;
+  fs::path file;
+  bool given() const { return pixels != nullptr || !file.empty(); }
+};
+
+[[noreturn]] void not_binary01(const std::string& n, std::size_t i, int v) {
+  throw std::invalid_argument(n + ": with MI_MASK_BINARY01 every value must be 0 or 1 (pixel " + std::to_string(i) +
+                              " is " + std::to_string(v) + ").");
+}
+
+ImageInput check_image(const mi_image* px, const char* path, int channels, bool binary01, const std::string& n) {
+  if (px != nullptr && given(path)) throw std::invalid_argument(n + " and " + n + "_path are both set; pass the image one way.");
+  ImageInput in;
+  if (px != nullptr) {
+    if (px->pixels == nullptr) throw std::invalid_argument(n + ".pixels is NULL.");
+    if (px->_reserved0 != 0) throw std::invalid_argument(n + "._reserved0 must be 0.");
+    if (px->channels != channels) {
+      throw std::invalid_argument(n + ".channels must be " + std::to_string(channels) +
+                                  (channels == 3 ? " (RGB)" : " (grayscale)") + ", not " + std::to_string(px->channels) + ".");
+    }
+    if (px->width < 1 || px->height < 1 || px->width > pipeline::kMaxInputSide || px->height > pipeline::kMaxInputSide ||
+        std::int64_t{px->width} * px->height > pipeline::kMaxInputPixels) {
+      throw std::invalid_argument(n + " is " + std::to_string(px->width) + "x" + std::to_string(px->height) +
+                                  "; each side must be 1 to " + std::to_string(pipeline::kMaxInputSide) + " and the image at most " +
+                                  std::to_string(pipeline::kMaxInputPixels) + " pixels.");
+    }
+    if (binary01) {
+      const std::size_t bytes = static_cast<std::size_t>(px->width) * static_cast<std::size_t>(px->height) * channels;
+      for (std::size_t i = 0; i < bytes; ++i) {
+        if (px->pixels[i] > 1) not_binary01(n, i, px->pixels[i]);
+      }
+    }
+    in.pixels = px;
+  } else if (given(path)) {
+    in.file = existing_file(path, n + "_path");
+    std::error_code ec;
+    const std::uintmax_t size = fs::file_size(in.file, ec);
+    if (!ec && size > pipeline::kMaxImageFileBytes) {
+      throw std::invalid_argument(n + "_path: the file is " + std::to_string(size) + " bytes; at most " +
+                                  std::to_string(pipeline::kMaxImageFileBytes) + " are read.");
+    }
+  }
+  return in;
+}
+
+// The image of a checked input: the pixels copied or the file decoded (a file that cannot be decoded is an argument
+// error), a BINARY01 mask scaled to 0 / 255.
+std::shared_ptr<const pipeline::Image> load_input(const ImageInput& in, int channels, bool binary01, const std::string& n) {
+  if (!in.given()) return nullptr;
+  pipeline::Image im;
+  if (in.pixels != nullptr) {
+    im.width = in.pixels->width;
+    im.height = in.pixels->height;
+    im.channels = channels;
+    const std::size_t bytes = static_cast<std::size_t>(im.width) * static_cast<std::size_t>(im.height) * channels;
+    im.pixels.assign(in.pixels->pixels, in.pixels->pixels + bytes);
+  } else {
+    try {
+      im = pipeline::load_image(in.file, channels);
+    } catch (const std::runtime_error& e) {
+      throw std::invalid_argument(n + "_path: " + e.what());  // unreadable, undecodable, too large
+    }
+  }
+  if (binary01) {
+    for (std::size_t i = 0; i < im.pixels.size(); ++i) {
+      if (im.pixels[i] > 1) not_binary01(n, i, im.pixels[i]);
+      im.pixels[i] = static_cast<std::uint8_t>(im.pixels[i] * 255);
+    }
+  }
+  return std::make_shared<const pipeline::Image>(std::move(im));
+}
+
+// A 1x1 stand-in that lets pipeline::validate check a request whose images are not loaded (mi_gen_params_validate).
+std::shared_ptr<const pipeline::Image> stand_in(int channels) {
+  pipeline::Image im;
+  im.width = im.height = 1;
+  im.channels = channels;
+  im.pixels.assign(static_cast<std::size_t>(channels), 0);
+  return std::make_shared<const pipeline::Image>(std::move(im));
+}
+
+pipeline::ResizeMode to_resize(mi_resize_mode m) {
+  switch (m) {
+    case MI_RESIZE_CROP: return pipeline::ResizeMode::kCrop;
+    case MI_RESIZE_FIT: return pipeline::ResizeMode::kFit;
+    case MI_RESIZE_STRETCH: return pipeline::ResizeMode::kStretch;
+    case MI_RESIZE_MAX_ENUM: break;
+  }
+  unknown("resize", static_cast<int>(m));
+}
+
+mi_image_mode to_image_mode(const std::string& mode) {
+  if (mode == "img2img") return MI_IMAGE_MODE_IMG2IMG;
+  if (mode == "inpaint") return MI_IMAGE_MODE_INPAINT;
+  return MI_IMAGE_MODE_TXT2IMG;
+}
+
 }  // namespace
 
-pipeline::Request to_request(const mi_gen_params& p) {
+pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embedding, bool load_images) {
   if (p.prompt == nullptr) throw std::invalid_argument("Enter a prompt.");
+  // A distill bundle supplies what the caller left unset (cmd_generate's --distill).
+  std::optional<moss_dit::DistillBundle> distill;
+  if (given(p.distill_dir)) distill = distill_bundle(p.distill_dir, "distill_dir");
+  if (distill_time_embedding != nullptr) *distill_time_embedding = distill ? distill->time_embedding : fs::path();
   pipeline::Request q;
   q.prompt = p.prompt;
   q.negative_prompt = p.negative_prompt != nullptr ? p.negative_prompt : "";
   q.width = p.width;
   q.height = p.height;
-  q.steps = p.steps;
-  q.cfg = p.cfg;
   q.shift = p.shift;
   q.seed = p.seed;
   q.uncond_skip_layers = layer_list(p.uncond_skip_layers, p.uncond_skip_layers_count, "uncond_skip_layers");
@@ -259,12 +378,15 @@ pipeline::Request to_request(const mi_gen_params& p) {
   q.eta = p.eta;
   q.s_noise = p.s_noise;
   q.save_metadata = p.save_metadata != 0;
-  if (p.dataspace_path != nullptr && *p.dataspace_path != '\0') q.dataspace_path = util::path_from_utf8(p.dataspace_path);
+  if (given(p.dataspace_path)) q.dataspace_path = util::path_from_utf8(p.dataspace_path);
   if (p.loras_count > 0 && p.loras == nullptr) throw std::invalid_argument("loras: NULL array with a nonzero count.");
-  if (p.loras_count > kMaxLoras) {
-    throw std::invalid_argument("loras: at most " + std::to_string(kMaxLoras) + " entries (got " +
-                                std::to_string(p.loras_count) + ").");
-  }
+  const auto check_lora_count = [](std::size_t n, const char* what) {
+    if (n > kMaxLoras) {
+      throw std::invalid_argument(std::string("loras: at most ") + std::to_string(kMaxLoras) + " entries" + what + " (got " +
+                                  std::to_string(n) + ").");
+    }
+  };
+  check_lora_count(p.loras_count, "");
   for (std::size_t i = 0; i < p.loras_count; ++i) {
     const mi_lora& l = p.loras[i];
     const std::string name = "loras[" + std::to_string(i) + "]";
@@ -276,12 +398,85 @@ pipeline::Request to_request(const mi_gen_params& p) {
     q.loras.push_back({existing_file(l.path, name + ".path"), static_cast<float>(l.strength)});
   }
   if (p.preview_interval < 1) throw std::invalid_argument("preview_interval must be at least 1.");
+
+  // The distill bundle: its LoRA, and its dataspace file for the sampler when that is unset (EULER without a dataspace
+  // file) and for an explicit DATASPACE without one.
+  bool distill_dataspace = false;
+  if (distill) {
+    if (!distill->lora.empty()) q.loras.push_back({distill->lora, 1.0f});
+    check_lora_count(q.loras.size(), ", the distill bundle's included");
+    if (!distill->dataspace.empty() && p.sampler == MI_SAMPLER_EULER && q.dataspace_path.empty()) {
+      q.sampler = pipeline::SamplerKind::kDataSpace;
+      distill_dataspace = true;
+    }
+    if (!distill->dataspace.empty() && q.sampler == pipeline::SamplerKind::kDataSpace && q.dataspace_path.empty()) {
+      q.dataspace_path = distill->dataspace;
+    }
+  }
+  // The dataspace sampler's file, read whenever it runs: its step codes bound the steps.
+  std::optional<std::size_t> step_codes;
+  if (q.sampler == pipeline::SamplerKind::kDataSpace && !q.dataspace_path.empty()) {
+    const fs::path file = existing_file(util::path_utf8(q.dataspace_path).c_str(), "dataspace_path");
+    try {
+      step_codes = pipeline::load_dataspace(util::path_utf8(file)).step_codes.size();
+    } catch (const pipeline::DataspaceError& e) {
+      throw ModelError(std::string(distill_dataspace ? "distill_dir: " : "dataspace_path: ") + e.what());
+    }
+  }
+
+  // The unset markers (mossinfer.h): steps 0, a negative cfg, a negative denoise strength.
+  if (p.steps < 0) throw std::invalid_argument("Steps must be positive (0 means unset).");
+  q.steps = p.steps != 0 ? p.steps : step_codes ? static_cast<int>(*step_codes) : MI_DEFAULT_STEPS;
+  if (!std::isfinite(p.cfg)) throw std::invalid_argument("CFG must be a finite number (a negative value means unset).");
+  q.cfg = p.cfg >= 0 ? p.cfg : distill ? 1.0 : MI_DEFAULT_CFG;
+  if (!std::isfinite(p.denoise_strength)) {
+    throw std::invalid_argument("Denoise strength must be a finite number (a negative value means unset).");
+  }
+
+  // Image input and the hires fix.
+  q.resize = to_resize(p.resize);
+  if (p.mask_encoding != MI_MASK_U8 && p.mask_encoding != MI_MASK_BINARY01) {
+    unknown("mask_encoding", static_cast<int>(p.mask_encoding));
+  }
+  const bool binary01 = p.mask_encoding == MI_MASK_BINARY01;
+  const ImageInput init = check_image(p.init_image, p.init_image_path, 3, false, "init_image");
+  const ImageInput mask = check_image(p.mask, p.mask_path, 1, binary01, "mask");
+  q.denoise_strength = p.denoise_strength >= 0 ? p.denoise_strength : init.given() ? MI_DEFAULT_DENOISE_STRENGTH : 1.0;
+  if (load_images) {
+    q.init_image = load_input(init, 3, false, "init_image");
+    q.mask = load_input(mask, 1, binary01, "mask");
+  } else {
+    // Not loaded: 1x1 stand-ins for the pipeline's checks, and its size rule for two pixel images here.
+    if (init.given()) q.init_image = stand_in(3);
+    if (mask.given()) q.mask = stand_in(1);
+    if (init.pixels != nullptr && mask.pixels != nullptr &&
+        (init.pixels->width != mask.pixels->width || init.pixels->height != mask.pixels->height)) {
+      throw std::invalid_argument("The inpainting mask must have the init image's size (" + std::to_string(init.pixels->width) +
+                                  "x" + std::to_string(init.pixels->height) + "), not " + std::to_string(mask.pixels->width) +
+                                  "x" + std::to_string(mask.pixels->height) + ".");
+    }
+  }
+  if (p.hires_width < 0 || p.hires_height < 0) {
+    throw std::invalid_argument("Hires fix: hires_width and hires_height must be 0 (off) or positive multiples of 16.");
+  }
+  q.hires.width = p.hires_width;
+  q.hires.height = p.hires_height;
+  q.hires.strength = p.hires_strength;
+  q.hires.steps = p.hires_steps;
+
+  if (distill_dataspace && (init.given() || q.hires.enabled())) {
+    throw std::invalid_argument("distill_dir selected the bundle's dataspace sampler, which cannot start from an image "
+                                "(init_image, hires_width / hires_height); set sampler to use another sampler.");
+  }
   pipeline::validate(q);
-  if (q.sampler == pipeline::SamplerKind::kDataSpace) existing_file(p.dataspace_path, "dataspace_path");
+  if (step_codes && static_cast<std::size_t>(q.steps) > *step_codes) {
+    throw std::invalid_argument("The dataspace sampler runs 1 to " + std::to_string(*step_codes) + " steps (its file has " +
+                                std::to_string(*step_codes) + " step codes), not " + std::to_string(q.steps) + ".");
+  }
   return q;
 }
 
-void validate(const mi_gen_params& params) { to_request(params); }
+void validate(const mi_gen_params& params) { to_request(params, nullptr, false); }
 
 pipeline::PipelineOptions to_options(const mi_engine_params& p) {
   pipeline::PipelineOptions o;
@@ -313,6 +508,20 @@ pipeline::PipelineOptions to_options(const mi_engine_params& p) {
   o.tier = to_tier(p.tier);
   o.attention = to_attention(p.attention);
   o.lora_strict = p.lora_strict != 0;
+  // The step-embedder replacement is per engine: given directly, or a distill bundle's.
+  o.time_embedding_file = component(p.time_embedding_file, "time_embedding_file");
+  if (given(p.distill_dir)) {
+    const moss_dit::DistillBundle b = distill_bundle(p.distill_dir, "distill_dir");
+    if (!b.time_embedding.empty()) {
+      std::error_code ec;
+      if (!o.time_embedding_file.empty() && !fs::equivalent(o.time_embedding_file, b.time_embedding, ec)) {
+        throw std::invalid_argument("time_embedding_file and distill_dir name different time embeddings (" +
+                                    util::path_utf8(o.time_embedding_file) + ", " + util::path_utf8(b.time_embedding) +
+                                    "); set one of them.");
+      }
+      o.time_embedding_file = b.time_embedding;
+    }
+  }
   return o;
 }
 
@@ -346,6 +555,29 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
   g.timings.dit_load_s = t.dit_load_s;
   g.timings.refine_s = t.refine_s;
   g.timings.vae_load_s = t.vae_load_s;
+  g.timings.vae_encoder_load_s = t.vae_encoder_load_s;
+  g.timings.image_encode_s = t.encode_s;
+  g.timings.image_ops_s = t.image_ops_s;
+  g.image.struct_size = sizeof g.image;
+  g.image.mode = to_image_mode(r.image_mode);
+  g.image.hires_ran = r.hires.ran ? 1 : 0;
+  g.image.first_width = r.first_pass.width;
+  g.image.first_height = r.first_pass.height;
+  g.image.first_steps_scheduled = std::max(0, r.first_pass.schedule_steps - r.first_pass.start_step);
+  g.image.first_start_step = r.first_pass.start_step;
+  g.image.first_steps_run = r.first_pass.steps_run;
+  g.image.first_encoded = r.first_pass.encoded ? 1 : 0;
+  g.image.first_strength = r.first_pass.strength;
+  if (q.hires.enabled()) {
+    g.image.hires_width = r.hires.ran ? r.hires.width : q.hires.width;
+    g.image.hires_height = r.hires.ran ? r.hires.height : q.hires.height;
+    g.image.hires_steps_scheduled = std::max(0, r.hires.schedule_steps - r.hires.start_step);
+    g.image.hires_start_step = r.hires.start_step;
+    g.image.hires_steps_run = r.hires.steps_run;
+    g.image.hires_strength = r.hires.ran ? r.hires.strength : q.hires.strength;
+  }
+  g.image_note = r.image_note;
+  g.time_embedding = r.time_embedding;
   const pipeline::MemoryStats& m = r.memory;
   g.memory.struct_size = sizeof g.memory;
   g.memory.arena_capacity_bytes = m.arena_capacity;
@@ -379,7 +611,9 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
   g.tier.attention = from_attention(td.attention);
   // Reference needs no certificate: certified, also for the default decision of a generation cancelled before it.
   g.tier.certified = td.certified || td.effective == planner::Tier::kReference ? 1 : 0;
-  g.tier.dit_precision = td.precision == planner::Precision::kInt8 ? MI_PRECISION_INT8 : MI_PRECISION_BF16;
+  g.tier.dit_precision = td.precision == planner::Precision::kInt4   ? MI_PRECISION_W4A4
+                         : td.precision == planner::Precision::kInt8 ? MI_PRECISION_INT8
+                                                                     : MI_PRECISION_BF16;
   g.tier.text_encoder_precision = te_precision(r.te_precision);
   g.tier_reason = td.reason;
   g.certificate = td.certificate;
@@ -409,6 +643,7 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
 
 struct PipelineAdapter::Impl {
   fs::path model;
+  fs::path time_embedding;  // PipelineOptions::time_embedding_file
   int device = 0;
   std::unique_ptr<pipeline::Pipeline> pipe;
 };
@@ -416,6 +651,7 @@ struct PipelineAdapter::Impl {
 PipelineAdapter::PipelineAdapter(const mi_engine_params& params) : impl_(std::make_unique<Impl>()) {
   impl_->model = model_dir(params);
   const pipeline::PipelineOptions options = to_options(params);
+  impl_->time_embedding = options.time_embedding_file;
   const backend::ScopedCurrentContext restore;  // the caller's CUDA context is current again on return
   int count = 0;
   MI_CUDA_CHECK(cudaGetDeviceCount(&count));
@@ -425,7 +661,11 @@ PipelineAdapter::PipelineAdapter(const mi_engine_params& params) : impl_(std::ma
   }
   impl_->device = params.device_index;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
-  impl_->pipe = std::make_unique<pipeline::Pipeline>(options);
+  try {
+    impl_->pipe = std::make_unique<pipeline::Pipeline>(options);
+  } catch (const moss_dit::DistillError& e) {
+    throw ModelError(e.what());
+  }
 }
 
 // Must not throw (mi_engine_free() has no way to report it): only CUDA C calls whose errors are ignored, and the
@@ -439,15 +679,22 @@ PipelineAdapter::~PipelineAdapter() {
 
 Generation PipelineAdapter::generate(const mi_gen_params& params, const std::atomic<bool>& cancel) {
   const auto t0 = Clock::now();
-  pipeline::Request q = to_request(params);
+  fs::path distill_te;
+  pipeline::Request q = to_request(params, &distill_te, true);
   q.model = impl_->model;
+  // A distill bundle's step embedder is the engine's (PipelineOptions): the request's bundle must use the same one.
+  if (!distill_te.empty()) {
+    std::error_code ec;
+    if (impl_->time_embedding.empty() || !fs::equivalent(impl_->time_embedding, distill_te, ec)) {
+      throw std::invalid_argument("distill_dir has a time embedding (" + util::path_utf8(distill_te) +
+                                  ") that this engine does not use; set the bundle as mi_engine_params.distill_dir "
+                                  "(or its file as time_embedding_file) when creating the engine.");
+    }
+  }
   // The CUDA device is per host thread; the caller's thread may not be the one that created the engine.
   const backend::ScopedCurrentContext restore;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
-  // The pipeline's schedule length (pipeline.cpp): the dataspace sampler runs one step per requested step.
-  const int total_steps = q.sampler == pipeline::SamplerKind::kDataSpace
-                              ? q.steps
-                              : pipeline::make_schedule(q.scheduler, q.steps, {q.shift, q.flow_multiplier}).num_steps();
+  const int total_steps = static_cast<int>(pipeline::schedule_steps(q));  // both passes, after the strengths
   const auto elapsed = [&] { return std::chrono::duration<double>(Clock::now() - t0).count(); };
   const auto report = [&](mi_phase phase, int step, int total, double step_s) {
     if (params.progress_callback == nullptr) return;
@@ -487,6 +734,8 @@ Generation PipelineAdapter::generate(const mi_gen_params& params, const std::ato
     r = impl_->pipe->generate(q, control);
   } catch (const lora::LoraError& e) {
     throw ModelError(e.what());  // a LoRA file that cannot be applied (or, strict, an unknown key or a lossy merge)
+  } catch (const pipeline::DataspaceError& e) {
+    throw ModelError(e.what());  // a dataspace file that changed since to_request read it
   }
   return to_generation(q, r, params.include_prompts != 0);
 }

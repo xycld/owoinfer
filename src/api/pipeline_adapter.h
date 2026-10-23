@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -58,11 +59,19 @@ struct Generation {
   std::vector<mi_lora_report> loras;
   std::vector<std::string> lora_files;
   std::vector<std::string> lora_warnings, lora_notes;
+  mi_image_info image{};
+  std::string image_note, time_embedding;  // mi_result_text() kinds
 };
 
-// The pipeline request of `params` (a full-size struct). Throws std::invalid_argument (the pipeline's wording) when it
-// is not valid, including LoRA and dataspace files that do not exist. CPU only; `model` is left empty.
-pipeline::Request to_request(const mi_gen_params& params);
+// The pipeline request of `params` (a full-size struct): the unset markers resolved (mossinfer.h), a distill bundle
+// expanded, image inputs copied or decoded, a dataspace sampler's file read and the steps checked against it. Throws
+// std::invalid_argument (the pipeline's wording) when it is not valid, including LoRA, dataspace and image files that do not exist; ModelError for a malformed distill bundle or its
+// dataspace file. `distill_time_embedding` (optional) receives the bundle's time embedding (empty: none) for the
+// engine's check. CPU only; `model` is left empty.
+// load_images false (mi_gen_params_validate): image inputs are checked (sizes, channels, file existence and size) but
+// neither copied nor decoded; 1x1 stand-ins take their place.
+pipeline::Request to_request(const mi_gen_params& params, std::filesystem::path* distill_time_embedding = nullptr,
+                             bool load_images = true);
 // Throws std::invalid_argument when `params` (a full-size struct) is not a valid request. CPU only.
 void validate(const mi_gen_params& params);
 // The pipeline options of `params` (a full-size struct). Throws std::invalid_argument on an unknown enum value, a size

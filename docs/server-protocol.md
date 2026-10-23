@@ -26,9 +26,12 @@ If `<pid>` is not running at startup, the server exits with status 1. A malforme
 
 The server trusts its launcher completely: whoever writes to its stdin has the server's file-system rights. The protocol is a local pipe between a launcher and the child it spawned, not an interface for untrusted input.
 - **No network surface.** The server opens no socket and listens on no port. Its only input is stdin.
-- **Paths are used as given.** `generate`'s `output` and `preview_output` are written wherever they point, and an existing file there is overwritten (atomically: a temporary file renamed over it). `load`'s `model`, `dit_file`, `text_encoder_file`, `vae_file` and `cache_dir`, and `generate`'s `loras` paths and `dataspace`, are read, and the cache directory is written to. The server does not confine any path to a directory, resolve symlinks, or check ownership.
+- **Paths are used as given.** `generate`'s `output` and `preview_output` are written wherever they point, and an existing file there is overwritten (atomically: a temporary file renamed over it). `load`'s `model`, `dit_file`, `text_encoder_file`, `vae_file`, `time_embedding_file`, `distill` and `cache_dir`, and `generate`'s `loras` paths, `dataspace`, `init_image`, `mask` and `distill`, are read, and the cache directory is written to. The server does not confine any path to a directory, resolve symlinks, or check ownership.
 - **The launcher validates paths.** A launcher that takes any of these paths from a user, a web page, a workflow file or another program must check them first. For example, it can confine outputs to its own output directory, reject `..` components and symlinks it did not create, and refuse to overwrite files it does not own.
 - **Run it as the user.** Run the server with the launcher's own (unprivileged) rights, never elevated.
+- **Images are decoded in-process.** `generate`'s `init_image` and `mask` are PNG / JPEG files that moss-server decodes itself, with the vendored stb_image decoder. That decoder is hardened (at most 64 MiB per file, at most 16384 pixels per side and 64,000,000 pixels in all, checked from the header before any pixel allocation; fuzzed), but it is not memory-safe: a crafted file can exploit it.
+  - The server takes image paths only, never pixel data over the protocol.
+  - A launcher that takes images from an untrusted source (a network, web uploads, files from other users) must decode them itself with a memory-safe decoder and use the C API's pixel input (`mi_gen_params.init_image` / `mask`, [c-api.md](c-api.md#image-input)), or run moss-server sandboxed (no network, no access beyond its input and output directories).
 
 ## Framing
 
@@ -103,6 +106,9 @@ With `"devices": true`, `probe.devices` is a list of objects with these fields:
 | `lora` | `MI_CAP_LORA` | true | `generate`'s `loras`, `load`'s `lora_strict` |
 | `tiers` | `MI_CAP_TIERS` | true | `load`'s `tier` and `attention` |
 | `samplers` | `MI_CAP_SAMPLERS` | true | the samplers after `ab2`, `scheduler`, `noise_layout`, `noise_source`, `flow_multiplier`, `eta`, `s_noise`, `dataspace` |
+| `image_input` | `MI_CAP_IMAGE_INPUT` | true | `generate`'s `init_image`, `mask`, `mask_encoding`, `resize`, `denoise_strength` |
+| `hires` | `MI_CAP_HIRES` | true | `generate`'s `hires` |
+| `distill` | `MI_CAP_DISTILL` | true | `load`'s `time_embedding_file` and `distill`, `generate`'s `distill` |
 
 ### `load`
 
@@ -123,9 +129,11 @@ Creates the engine. A loaded engine is released first, because two engines would
 | `dit_file` | string | `""` (the bundle's `transformer/`) | single-file DiT: INT8 ConvRot, mixed INT8/bf16 or bf16, ComfyUI layout |
 | `text_encoder_file` | string | `""` (the bundle's `text_encoder/`) | INT8 ConvRot or W4A8 text encoder |
 | `vae_file` | string | `""` (the bundle's `vae/`) | single FLUX.2 VAE file |
-| `tier` | string | `"auto"` | `"auto"`, `"reference"`, `"high"`, `"turbo"` (refused at generate time by this build) |
+| `tier` | string | `"auto"` | `"auto"`, `"reference"`, `"high"`, `"turbo"`. `turbo` runs an INT4 `dit_file` and is refused for any other DiT; `auto` refuses an INT4 DiT without a quality certificate, so choose `turbo` for INT4 files. |
 | `attention` | string | `"default"` (the tier's choice) | `"default"`, `"exact"`, `"q8_fp16"`, `"q8_fp16_f32acc"`, `"q8_fp8"`, `"q8_fp8_f32acc"` |
 | `lora_strict` | bool | false | unknown LoRA keys and lossy merges fail the generation (`model`) instead of being reported |
+| `time_embedding_file` | string | none | a step-embedder replacement (`time_embedding.safetensors`) applied to the loaded DiT |
+| `distill` | string | none | a distill bundle directory: the engine takes its time embedding. Send the same bundle as `generate`'s `distill` to use the rest. |
 
 `tier` and `attention` take exactly the pipeline's spellings (`tier_name()`, `attention_name()`), plus `"default"` for an unset attention. The CLI's alias `q8` (= `q8_fp8`) is not accepted. The tokenizer and configs always come from `model`, which stays a bundle directory. A component file that does not exist fails `load` with `invalid_argument`, naming the parameter; a malformed one fails the first `generate` with `model`. The tiers are described in [c-api.md](c-api.md#tier-and-attention): a combination the tier refuses (e.g. `"reference"` with an INT8 `dit_file`) is accepted by `generate` and then ends in `done` with `"status": "error"` and the code `invalid_argument`. After a run, the report's `quality` and `models` objects say what ran.
 
@@ -149,8 +157,8 @@ The params are those of `parameters.json`, plus `output`:
 | `prompt` | string, required | |
 | `negative_prompt` | string | `""` |
 | `width`, `height` | integer | 1024. Multiples of 16, at most 4096 per side and 4.2 MP in total. |
-| `steps` | integer | 50 |
-| `cfg` | number | 3.0 |
+| `steps` | integer ≥ 1 | absent = unset, resolved as the dataspace file's step count with the `dataspace` sampler (e.g. the `distill` bundle's), else 50. With the `dataspace` sampler it must not exceed the file's step codes. |
+| `cfg` | number ≥ 0 | absent = unset, resolved as 1.0 with `distill`, else 3.0 |
 | `shift` | number | 5.0 |
 | `seed` | integer or null | 42. `-1` or `null` means random; the seed used is in the report. |
 | `uncond_skip_layers` | integer array or `"22, 24"` string or null | `[22]`. `[]`, `""` or `null` means none. |
@@ -170,12 +178,19 @@ The params are those of `parameters.json`, plus `output`:
 | `include_prompts` | bool | true: the metadata includes the prompt and negative prompt |
 | `preview_output` | string | none. A PNG path that the server rewrites with a latent preview during sampling (see the `preview` event). |
 | `preview_every` | integer ≥ 1 | 1: steps between previews (the last step always gets one). Only valid together with `preview_output`. Use about 5 for large images (see the `preview` event). |
+| `init_image` | string | none. img2img: a PNG or JPEG file (decoded by the server, see [Security](#security)), brought to `width` × `height` by `resize`. |
+| `mask` | string | none. Inpainting: a PNG or JPEG file, read as grayscale, the init image's size. White (≥ 128) regenerates, black keeps. Needs `init_image`. |
+| `mask_encoding` | string | `"u8"` (values as given), or `"binary01"` (every value 0 or 1, scaled to 0 / 255; any other value is rejected) |
+| `denoise_strength` | number in [0, 1] | absent = unset, resolved as 0.75 with `init_image`, else 1.0. The share of the schedule run from `init_image`; below 1 needs `init_image`. An explicit 1 without a mask ignores the image (`done.warnings` says so). |
+| `resize` | string | `"crop"`, or `"fit"`, `"stretch"` (the pipeline's `resize_mode_name()` spellings) |
+| `hires` | object | none. The hires fix: `{"width": int, "height": int, "strength": number, "steps": int}`. `width` and `height` are required and positive (multiples of 16, at most 4096 per side and 4.2 MP); `strength` defaults to 0.45, `steps` to 0 (= `steps`). Other or repeated members are rejected. |
+| `distill` | string | none. A distill bundle directory: its LoRA is appended at strength 1, its dataspace sampler and step count and CFG 1 apply when `sampler`, `steps` and `cfg` are absent (`"euler"` counts as absent and cannot be forced with a dataspace bundle; any other sampler can). A bundle with a time embedding needs the same bundle in `load`'s `distill` (or its file in `time_embedding_file`); otherwise the generation ends in `done` with `invalid_argument`. |
 
 `save_metadata` and `include_prompts` default to true for every client. The server has not been released before 0.2.0, so no client depends on the C API's 0.1.0 behaviour (no metadata), which only a program built against the 0.1.0 header keeps ([c-api.md](c-api.md#struct-sizes)).
 
 The names are the pipeline's own spellings (`sampler_name()`, `scheduler_name()`, `noise_layout_name()`, `noise_source_name()`). The server maps them to the C API's enum values through its own table (`tools/server/names.h`), which a `cpu` test checks against the pipeline.
 
-The request is validated before it is accepted, so an invalid request gets an `invalid_params` error and no events. Validation comes before the server's state: an invalid request gets `invalid_params` even without an engine or while a generation runs. It includes the existence of the LoRA and dataspace files.
+Paths (`init_image`, `mask`, `distill`, and `load`'s `time_embedding_file` and `distill`) must be non-empty. The request is validated before it is accepted, so an invalid request gets an `invalid_params` error and no events. Image files are checked then for existence and size only; the worker decodes them once, during the generation, so an undecodable image (or a `binary01` mask file with other values) ends in `done` with `"status": "error"` and the code `invalid_argument`. Error messages in responses and in `done` name the protocol's parameters, not the C API's fields. Validation comes before the server's state: an invalid request gets `invalid_params` even without an engine or while a generation runs. It includes the existence of the LoRA and dataspace files.
 
 ```
 >> {"id": "bad", "method": "generate", "params": {"prompt": "x", "width": 1000, "output": "x.png"}}
@@ -235,6 +250,7 @@ The fields of `done` depend on `status`:
 `warnings` is always present: an array of strings for the launcher to show, empty when there is nothing to say.
 - One entry per LoRA warning, `"LoRA <module>: <reason>"` (e.g. an adapter requantized on INT8 GEMMs).
 - `"prompt truncated to K of N tokens (D dropped; max_sequence_length M)"`, and the same for the `"negative prompt"`, when the text encoder cut the end of a prompt.
+- `"image input: <note>"` when the image input has a remark, e.g. an init image not used at strength 1 without a mask.
 
 `report` is the same document as `moss-infer generate --json-report`, or `null` in the rare case that the library could not render it (`mi_result_report_json()` returned NULL, e.g. out of host memory):
 - `request`, `seed_used`, `steps_scheduled`, `steps_run`, `cancelled`, `cond_tokens`, `uncond_tokens`
@@ -303,13 +319,14 @@ send({"id": 3, "method": "shutdown"})
 | ctest name | Label | What it runs |
 |---|---|---|
 | `server_protocol` | `cpu` | No GPU or weights needed (details below) |
-| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params` |
+| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params`; a 256² img2img from a PNG path (4 steps at strength 0.5: 2 run, `total_steps` 2) and the strength-1 note in `done.warnings` |
 
 `server_protocol` covers:
 - `hello` (the capabilities included), `status`, and idle `cancel` / `unload`
 - malformed input of every kind, unknown methods and params (an unknown or non-string `block_path` included), and NUL in strings
 - `load` errors mapped from engine statuses
 - the P6 `load` params: bad `tier` / `attention` names (`"q8"` and `"auto"` included) and types, every valid name, missing component files
+- the image, hires and distill params: bad paths, types and names, a mask without an init image, a `binary01` mask with other values, bad `hires` shapes (not an object, a missing, unknown or repeated member, a non-integer size, not multiples of 16, a bad strength), a missing `distill` directory, the bundle's dataspace sampler with an image; messages name the protocol's parameters (`init_image`, `mask`, `distill`, `hires`), never the C fields; `load`'s `time_embedding_file` and `distill` errors; every valid combination reaches `no_engine`
 - the P6 `generate` params, checked without an engine: bad enum names and types, bad numbers, the `dataspace` sampler without or with a missing file (the message names `dataspace`), repeated members in `params` and in a `loras` entry, bad `loras` shapes (not an array, a string element, no or empty `path`, unknown members, a bad `strength`, a missing file), `preview_every` without `preview_output`, and every valid name
 - `shutdown`, end of input, and `--version` / usage errors
 - stdout set up with stderr sent to a file, to `DEVNULL`, merged into stdout, or closed. On Linux, `/proc` shows exactly one fd on the protocol pipe, at 3 or higher, close-on-exec.
