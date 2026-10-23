@@ -302,7 +302,7 @@ MI_LAYOUT(mi_accel_info, struct_size, 0);
 MI_LAYOUT(mi_accel_info, cfg_truncated_steps, 8);
 MI_LAYOUT(mi_accel_info, dit_calls, 12);
 MI_LAYOUT(mi_accel_info, cached_calls, 16);
-MI_LAYOUT(mi_accel_info, lossy, 20);  // the 1.0.0 layout ends here (24 bytes)
+MI_LAYOUT(mi_accel_info, lossy, 20);  // an earlier 1.1.0 header's layout ends here (24 bytes)
 MI_LAYOUT(mi_accel_info, step_cache_threshold, 24);
 static_assert(sizeof(mi_release_info) == 560);
 MI_LAYOUT(mi_release_info, struct_size, 0);

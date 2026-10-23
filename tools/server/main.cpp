@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1024,15 +1025,32 @@ class Server {
            ",\"seconds\":" + num(d.seconds) + ",\"note\":" + str(mi_result_text(r, MI_TEXT_DIT_LOAD_NOTE)) + "}";
   }
 
-  // release: the response, sent when the release ends. A cancel issued before mi_engine_release() marks the engine busy
-  // cannot reach it (mi_cancel() only stops a running job): it is honoured here by keeping no host copy, which is what an
-  // interrupted copy leaves.
+  // release: the response, sent when the release ends. mi_cancel() only stops a running job, and a release has no
+  // callback in which a cancel issued before mi_engine_release() marked the engine busy could land (as on_progress does
+  // for generate and preload): a relay thread repeats mi_cancel() while the release runs once job.cancel is set. A
+  // cancel seen before the call keeps no host copy at all, which is what an interrupted copy leaves.
   void run_release(Work& w) {
     Job& job = *w.job;
     mi_release_info info{};
     info.struct_size = sizeof info;
     const bool keep = w.keep_host_copy && !job.cancel.load();
+    std::atomic<bool> finished{false};
+    std::thread relay;
+    if (keep) {
+      try {
+        relay = std::thread([&] {
+          while (!finished.load()) {
+            if (job.cancel.load()) mi_cancel(engine_);  // a no-op until the release marks the engine busy
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+        });
+      } catch (const std::system_error&) {
+        // No thread: a cancel still reaches a release already running (request_cancel()'s own mi_cancel()).
+      }
+    }
     const mi_status s = mi_engine_release(engine_, keep ? 1 : 0, &info);
+    finished.store(true);
+    if (relay.joinable()) relay.join();
     std::string line = "{\"id\":" + job.id;
     if (s == MI_OK) {
       line += ",\"result\":{\"seconds\":" + num(info.seconds) + ",\"vram_released_bytes\":" +
