@@ -84,7 +84,7 @@ cmake --build <build> --target mossinfer_example_c
 2. Selects the device.
 3. Creates the pipeline.
 
-The weights load on the first `mi_generate()`. The DiT stays resident across generations when the plan allows it, so the first call pays the load (about 7 s from a warm page cache on an RTX 4090 Laptop) and later ones do not.
+The weights load on the first `mi_generate()`. The DiT stays resident across generations when the plan allows it, so the first call pays the load (several seconds, depending on storage and the page cache) and later ones do not.
 
 | `mi_engine_params` field | Default | Meaning |
 |---|---|---|
@@ -99,7 +99,7 @@ The weights load on the first `mi_generate()`. The DiT stays resident across gen
 | `embedding_cache` | 1 | reuse the text embeddings of repeated prompts |
 | `direct_io` | 0 | O_DIRECT weight reads |
 | `block_path` | `DEFAULT` (fused) | DiT block implementation: `OP_BY_OP`, `FUSED` or `FUSED_GRAPHS`; all give the same image bits. `FUSED` runs op by op when the startup self-check finds the fused GEMMs not bit-identical on this GPU, and `FUSED_GRAPHS` replays CUDA graphs only when every DiT block is resident. `mi_result_block_path()` reports what ran. |
-| `dit_file` | NULL = the bundle's `transformer/` | single-file DiT: INT8 ConvRot (G = 256), mixed INT8/bf16 or bf16 safetensors in the ComfyUI layout (Comfy-Org and community files, `moss-infer quantize` output) |
+| `dit_file` | NULL = the bundle's `transformer/` | single-file DiT: INT8 ConvRot (G = 256), INT4 ConvRot (the `TURBO` tier), mixed INT8/bf16 or bf16 safetensors in the ComfyUI layout (Comfy-Org and community files, `moss-infer quantize` output) |
 | `text_encoder_file` | NULL = the bundle's `text_encoder/` | INT8 ConvRot or W4A8 Qwen3.5 text encoder. Its embeddings are cached under its own identity. |
 | `vae_file` | NULL = the bundle's `vae/` | single FLUX.2 VAE file, decoded with the bundle's latent statistics |
 | `tier` | `AUTO` | quality tier, see below |
@@ -120,12 +120,12 @@ The loaded weights fix the GEMM precision: an INT8 DiT runs INT8 GEMMs. The tier
 
 | `mi_tier` | Runs |
 |---|---|
-| `AUTO` (0) | with `attention` set: that configuration. Otherwise the fastest lossy configuration of the loaded DiT that has a quality certificate. Without one: Reference for a bf16 DiT; INT8 GEMMs with exact attention, uncertified, for an INT8 DiT. An INT4 DiT without a certificate is refused (`MI_ERR_INVALID_ARGUMENT`, with the pipeline's message): choose `TURBO` explicitly. |
+| `AUTO` (0) | with `attention` set: that configuration. Otherwise the fastest lossy configuration of the loaded DiT that has a quality certificate. Without one: Reference for a bf16 DiT and text encoder; the loaded GEMMs with exact attention, uncertified, for an INT8 DiT or a quantized text encoder. An INT4 DiT without a certificate is refused (`MI_ERR_INVALID_ARGUMENT`, with the pipeline's message): choose `TURBO` explicitly. |
 | `REFERENCE` (1) | bf16 DiT and text encoder, exact attention. Refused for quantized files and for an 8-bit `attention`. |
 | `HIGH` (2) | the loaded DiT's precision plus 8-bit attention (`Q8_FP8` unless `attention` says otherwise), certified or not. Refused for a bf16 DiT with exact attention. |
 | `TURBO` (3) | an INT4 DiT file (`dit_file`): INT4 GEMMs plus 8-bit attention, as for `HIGH`. Runs certified or not (reported uncertified without a certificate). Refused for any other DiT. |
 
-Offer `TURBO` for INT4 DiT files only, as an explicit choice: this build has no certificate for the INT4 path, so `AUTO` refuses such a file.
+1.0 ships no quality certificates: without one of your own, `AUTO` runs Reference for the bf16 bundle and refuses an INT4 file. Offer `TURBO` for INT4 DiT files only, as an explicit choice.
 
 | `mi_attention` | Pipeline name |
 |---|---|
@@ -288,7 +288,7 @@ Validation, in `mi_gen_params_validate()` and `mi_generate()`:
 - every `path` is non-empty and names an existing regular file;
 - every `strength` is finite and within the range of a float.
 
-Low-rank adapters on the block GEMMs run as side branches, so a strength change between generations is instant. The others are merged into the DiT when it loads. A file with no applicable key fails the generation with `MI_ERR_MODEL`. Unknown keys and lossy merges (adapters requantized on INT8 GEMMs) are reported as warnings, or fail with `MI_ERR_MODEL` when `lora_strict` is set. `mi_result_lora()` and `mi_result_message()` report them.
+The files are safetensors in the training tools' formats: kohya and PEFT / diffusers low-rank adapters, LyCORIS LoHa and LoKr, and full deltas (`.diff`, `.diff_b`). Low-rank adapters on the block GEMMs run as side branches, so a strength change between generations is instant. The others are merged into the DiT when it loads. A file with no applicable key fails the generation with `MI_ERR_MODEL`. Unknown keys and lossy merges (adapters requantized on INT8 GEMMs) are reported as warnings, or fail with `MI_ERR_MODEL` when `lora_strict` is set. `mi_result_lora()` and `mi_result_message()` report them.
 
 ### Callbacks
 
@@ -303,7 +303,7 @@ Low-rank adapters on the block GEMMs run as side branches, so a strength change 
 
 ### PNG metadata
 
-With `save_metadata` set (the default of a 240-byte struct), `mi_save_png()` writes two text chunks after `IHDR`, the same ones as `moss-infer generate`:
+With `save_metadata` set (the default of 240- and 320-byte structs), `mi_save_png()` writes two text chunks after `IHDR`, the same ones as `moss-infer generate`:
 
 | Keyword | Chunk | Content |
 |---|---|---|
@@ -359,7 +359,7 @@ Strings returned by accessors are owned by the result. They stay valid until `mi
 
 `mi_write_png(path, rgb, width, height)` writes RGB8 `[height][width][3]` as a PNG without metadata, atomically. It needs no result and is meant for previews. A NULL or empty path, NULL `rgb`, or a width or height outside [1, 16384] is `MI_ERR_INVALID_ARGUMENT`; a write failure is `MI_ERR_IO`.
 
-The JSON report carries all of this as well: `quality`, `models` (sources, linears, tiers, text-encoder precision, time embedding), `loras`, `lora_warnings`, `lora_notes`, `tokens` and `img2img` (mode, note, VAE encoder, both passes).
+The JSON report carries all of this as well: `quality`, `models` (sources, linears, tiers, text-encoder precision, time embedding), `loras`, `lora_warnings`, `lora_notes`, `tokens` and `img2img` (mode, note, VAE encoder, both passes). Its `control` (`null`) and `accelerators` (inactive) objects are set only by `moss-infer` in 1.0: the C API gets control LoRAs and the accelerators in 1.1.
 
 ## Capabilities
 
@@ -466,6 +466,7 @@ History, all with `MI_ABI_VERSION` 1:
 - 0.2.0: `mi_engine_params` grew to 120 bytes and `mi_gen_params` to 240, as trailing fields. The 0.1.0 sizes, 80 and 168 bytes, stay accepted ([Struct sizes](#struct-sizes)). `mi_lora`, `mi_tier_info`, `mi_prompt_tokens` and `mi_lora_report` were added, and `mi_sampler` gained values 2–8.
 - 0.2.0, image input: `steps` 0, a negative `cfg` and a negative `denoise_strength` became the unset markers, and `mi_gen_params_init()` at 320 bytes sets them. `mi_engine_params` grew to 136 bytes, `mi_gen_params` to 320 and `mi_timings` to 128, as trailing fields; the 120-, 240- and 104-byte layouts stay accepted. `mi_image` and `mi_image_info` were added.
 - 0.2.0, system CUDA: `mi_probe_info` grew to 1624 bytes (the cuBLASLt fields), as trailing fields; the 576-byte layout stays accepted. `MI_CAP_SYSTEM_CUDA` was added.
+- 1.0.0: first stable release. No layout or behaviour change from 0.2.0; the CMake package now requires the same MAJOR version (`SameMajorVersion`).
 
 ## Symbol visibility
 

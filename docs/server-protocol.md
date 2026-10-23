@@ -8,7 +8,7 @@
 ```
 moss-server                     # speak the protocol on stdin/stdout
 moss-server --parent-pid <pid>  # the same, and exit when process <pid> (the launcher) exits
-moss-server --version           # "moss-server 0.2.0 (protocol 1, ABI 1)"
+moss-server --version           # "moss-server 1.0.0 (protocol 1, ABI 1)"
 ```
 
 ### `--parent-pid`
@@ -82,7 +82,7 @@ Params (all optional):
 
 ```
 >> {"id": 1, "method": "hello", "params": {"client": "launcher", "protocol_version": 1}}
-<< {"id": 1, "result": {"protocol_version": 1, "server": "moss-server", "version": "0.2.0", "abi_version": 1,
+<< {"id": 1, "result": {"protocol_version": 1, "server": "moss-server", "version": "1.0.0", "abi_version": 1,
     "capabilities": {"preview": true, "comfyui_models": false, "model_files": true, "lora": true, "tiers": true,
                      "samplers": true, "image_input": true, "hires": true, "distill": true, "system_cuda": true},
     "probe": {"driver_cuda_version": 13040, "runtime_cuda_version": 13040, "driver_compatible": true,
@@ -138,7 +138,7 @@ Creates the engine. A loaded engine is released first, because two engines would
 | `embedding_cache` | bool | true | |
 | `direct_io` | bool | false | |
 | `block_path` | string | `"default"` (fused) | DiT block implementation: `"default"`, `"op_by_op"`, `"fused"`, `"fused_graphs"`. All give the same image; the path that ran is the report's `dit_blocks.path`. |
-| `dit_file` | string | `""` (the bundle's `transformer/`) | single-file DiT: INT8 ConvRot, mixed INT8/bf16 or bf16, ComfyUI layout |
+| `dit_file` | string | `""` (the bundle's `transformer/`) | single-file DiT: INT8 ConvRot, INT4 ConvRot (`turbo`), mixed INT8/bf16 or bf16, ComfyUI layout |
 | `text_encoder_file` | string | `""` (the bundle's `text_encoder/`) | INT8 ConvRot or W4A8 text encoder |
 | `vae_file` | string | `""` (the bundle's `vae/`) | single FLUX.2 VAE file |
 | `tier` | string | `"auto"` | `"auto"`, `"reference"`, `"high"`, `"turbo"`. `turbo` runs an INT4 `dit_file` and is refused for any other DiT; `auto` refuses an INT4 DiT without a quality certificate, so choose `turbo` for INT4 files. |
@@ -267,12 +267,14 @@ The fields of `done` depend on `status`:
 `report` is the same document as `moss-infer generate --json-report`, or `null` in the rare case that the library could not render it (`mi_result_report_json()` returned NULL, e.g. out of host memory):
 - `request`, `seed_used`, `steps_scheduled`, `steps_run`, `cancelled`, `cond_tokens`, `uncond_tokens`
 - `image`, `latents` (always `""` here), `mode`, `plan`, `embedding_cache`, `decode`
+- `img2img`: the image mode and note, the VAE encoder, and both passes (`first_pass`, `hires`)
 - `dit_blocks` (`path` that ran, `note` saying why it differs from the requested one, or `""`)
 - `timings_s`, `memory_gib`, `host_memory_gib`, `hardware`
-- `dit_stream`: DiT block streaming (`streamed`, `resident_blocks`, `buffers`, `source`, `bytes`, `copy_s`, `stall_s`, `stalls`, `h2d_gbps`, `hidden`, and per-step `steps`)
+- `dit_stream`: DiT block streaming (`streamed`, `resident_blocks`, `buffers`, `source`, `bytes`, `copy_s`, `stall_s`, `stalls`, `h2d_gbps`, `hidden`, and per-step `steps`, each with `cached`)
 - `tokens`: per prompt, `total`, `kept`, `template`, `prompt`, `dropped`, `max_length`, `truncated`
 - `quality` (tier, configuration, certificate, GPU class) and `models` (DiT, text encoder and VAE sources, DiT linears, requested and effective tier, certified, text-encoder precision)
 - `loras` (per file: adapters, side branch, merged, unknown keys, strength), `lora_warnings`, `lora_notes`
+- `control` and `accelerators`: always `null` and inactive here, because only `moss-infer` sets control LoRAs and the accelerators in 1.0 (the server gets them in 1.1)
 
 The server is idle again by the time `done` is written, so the next `generate` can follow it immediately.
 

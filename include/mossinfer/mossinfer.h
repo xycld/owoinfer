@@ -65,8 +65,8 @@ extern "C" {
 
 /* ------------------------------------------------------------------------------------------------ version */
 
-#define MI_VERSION_MAJOR 0
-#define MI_VERSION_MINOR 2
+#define MI_VERSION_MAJOR 1
+#define MI_VERSION_MINOR 0
 #define MI_VERSION_PATCH 0
 /* Incremented on every incompatible change of an existing function, struct field or enum value. */
 #define MI_ABI_VERSION 1

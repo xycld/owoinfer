@@ -8,7 +8,7 @@ The reference documents are:
 
 This page does not repeat them. It explains how the pieces fit together, and which choices the launcher has to make.
 
-Version 0.2.0 (ABI 1, server protocol 1). This is a pre-release: see [Versioning](#versioning).
+Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what stays compatible.
 
 ## Support status
 
@@ -16,25 +16,25 @@ Version 0.2.0 (ABI 1, server protocol 1). This is a pre-release: see [Versioning
 
 | Area | What works |
 |---|---|
-| Platform | Linux x86-64 with the `cu13` build (CUDA 13) |
+| Platform | Linux x86-64 and Windows x64 (MSVC), each in a `cu12` and a `cu13` flavour, as a full package and a `-system-cuda` package. CI builds, packages and runs the CPU tests of all four flavours; GPU runs are verified on Linux `cu13`. |
 | GPUs | NVIDIA compute capability 8.x and 12.x: RTX 30xx, RTX 40xx, RTX 50xx, A100/A10/A40, L4/L40, RTX PRO Blackwell |
 | Models | the official MOSS-Image Base and SFT Hugging Face folders (bf16), read in place |
 | Component model files | a single-file DiT, text encoder or VAE next to the bundle folder: ComfyUI and community files, INT8 ConvRot and INT4 ConvRot DiT, INT8 ConvRot and W4A8 text encoder (`dit_file`, `text_encoder_file`, `vae_file`) |
 | Generation | text-to-image with the official app's parameters: prompt, negative prompt, size, steps, CFG, shift, seed, skip layers, skip-layer guidance |
-| Quality tier | `auto` (default: the fastest configuration with a quality certificate, else exact), `reference` (bf16, exact), `high` (the loaded weights plus 8-bit attention), `turbo` (an INT4 DiT file, chosen explicitly); the tier that ran is reported |
+| Quality tier | `auto` (default: the fastest configuration with a quality certificate; 1.0 ships no certificates, so without one of your own the bf16 bundle runs Reference, and quantized files run their own GEMMs with exact attention, uncertified), `reference` (bf16, exact), `high` (the loaded weights plus 8-bit attention), `turbo` (an INT4 DiT file, chosen explicitly); the tier that ran is reported |
 | Image input | img2img (an init image and a denoise strength) and inpainting (a mask), with crop / fit / stretch resizing; pixels (library) or PNG / JPEG files (both surfaces) |
 | Hires fix | a second pass at a larger size from the first pass upscaled, with its own strength and steps |
 | Distill bundles | few-step distilled checkpoints shipped as a bundle folder (time embedding, LoRA, data-space sampler parameters), applied per engine and per generation |
 | Attention mode | exact (FlashAttention-2) or one of four 8-bit modes, as an override of the tier's choice |
-| LoRAs | a list of files with strengths per generation, applied at run time; per-file reports and warnings |
+| LoRAs | a list of files with strengths per generation, applied at run time: kohya, PEFT / diffusers, LyCORIS LoHa and LoKr, and full deltas; per-file reports and warnings |
 | Samplers and schedulers | 9 samplers (Euler, AB2, Euler ancestral, Heun, DPM++ 2M, DPM++ 2M SDE, ER-SDE, RES multistep, data-space), 7 schedulers, noise layout and source, eta, s_noise, flow multiplier |
 | Preview | a latent preview image during sampling, every N steps (library: a callback with RGB8; server: a PNG rewritten in place and a `preview` event) |
 | PNG metadata | the generation settings embedded in the PNG (`generation` record, schema `mossinfer.generation/1`, plus `parameters`), the prompts optional |
 | Prompt token report | token counts per prompt and a truncation warning |
-| Memory modes | `min_memory`, `balanced`, `max_speed`, plus explicit VRAM and RAM budgets. The engine plans against the VRAM that is actually free and streams the model when it doesn't fit. |
+| Memory modes | `min_memory`, `balanced`, `max_speed`, plus explicit VRAM and RAM budgets and a VRAM reserve. The engine plans against the VRAM that is actually free and streams the model when it doesn't fit. |
 | Integration surfaces | the C library (`libmossinfer`) and the sidecar process (`moss-server`), with the same features |
 | Run-time control | progress, cancel from any thread, one generation at a time per engine, device probe and build recommendation |
-| System CUDA reuse | a compatible cuBLASLt from the user's CUDA install, used by the `-system-cuda` package or on request (`MOSSINFER_CUDA_LIBS=system`); the probe reports which copy runs (Linux; see [CUDA libraries](#cuda-libraries)) |
+| System CUDA reuse | a compatible cuBLASLt from the user's CUDA install, used by the `-system-cuda` package or on request (`MOSSINFER_CUDA_LIBS=system`); the probe reports which copy runs (verified on Linux; see [CUDA libraries](#cuda-libraries)) |
 | Output | PNG file (both surfaces), or RGB8 in memory (library), plus a JSON report per image |
 
 ### Planned: integrate now, enabled later
@@ -43,10 +43,13 @@ These are designed and partly built. The launcher can prepare for them now (see 
 
 | Feature | State | How the launcher prepares |
 |---|---|---|
-| Windows x64 (MSVC) builds, both flavours | code written, never compiled; first build comes with CI | ship the same integration code; budget time for fixes on the first Windows build |
-| `cu12` builds (Linux and Windows) | written, never compiled | include the flavour choice (see [Picking the build](#picking-the-build-cu12-or-cu13)) |
-| Release archives | the CI workflows exist but have not run yet | build from source until then (see [Getting the binaries](#getting-the-binaries)) |
 | System CUDA reuse on Windows | the search paths are written (`CUDA_PATH`, `CUDA_PATH_V<major>_*`), not yet verified on Windows | the same logic as on Linux: read `probe.cublaslt` |
+| Control LoRAs and the lossy accelerators (CFG truncation, step cache) | `moss-infer` only in 1.0 (below); the C API and `moss-server` get them in 1.1 | nothing yet; enable them when `mi_capabilities()` or `hello`'s `capabilities` announce them |
+
+**`moss-infer` only in 1.0.** These run from `moss-infer generate`, not through the C API or `moss-server`:
+- **Control LoRAs:** `--control <file>` loads a control adapter (a LoRA with a widened DiT input embedder, e.g. the MOSS-Image color / depth control) and `--control-scale S` sets its LoRA strength (default 1). Each `--control-image <kind>=<png|jpg>` gives the input of one of the adapter's kinds, and may be followed by `--control-strength X` (default 1, 0 to 10) and `--control-start X` / `--control-end X` (default 0 / 1: the share of the steps it applies to).
+- **Lossy accelerators**, off by default: `--cfg-truncation X` (0 to 1, default 1 = off) drops the negative branch from step X · steps on; `--step-cache fbcache` (default `off`) reuses DiT blocks 1..41 from the last full call while block 0's output changed by less than `--step-cache-threshold` (default 0.03). Both change the image and make the run uncertified. The tier is resolved as if they were off, so `auto` picks the same tier. The step cache's gain depends on the step count and size: at the default threshold it reused about 30 % of the DiT calls at 1024², 50 steps, and none at 768², 30 steps.
+- The report records them in `control` and `accelerators`, and `dit_stream.steps[i].cached` marks the steps that reused the cache.
 
 ### Not supported
 
@@ -111,9 +114,9 @@ On top of that, the weights are read through the operating system's page cache. 
 
 ## Getting the binaries
 
-**From a release (planned).** CI builds two archives per OS and flavour: `mossinfer-<version>-<os>-cu<12|13>-<arch>.zip` (the full package) and `mossinfer-<version>-<os>-cu<12|13>-<arch>-system-cuda.zip` (the same without cuBLASLt); Linux also gets `.tar.gz` of both. A GitHub release attaches the archives with one `SHA256SUMS` file. See [Package contents](#package-contents).
+**From a release.** CI builds two archives per OS and flavour: `mossinfer-<version>-<os>-cu<12|13>-<arch>.zip` (the full package) and `mossinfer-<version>-<os>-cu<12|13>-<arch>-system-cuda.zip` (the same without cuBLASLt); Linux also gets `.tar.gz` of both. A GitHub release attaches the archives with one `SHA256SUMS` file. See [Package contents](#package-contents).
 
-**From source, Linux, until then:**
+**From source** (Linux shown):
 
 ```sh
 # CUDA 13.x toolkit, CMake >= 3.28, Ninja, GCC >= 12, GoogleTest
@@ -122,11 +125,11 @@ cmake --build --preset linux-cuda13 -j8
 CUDA_VISIBLE_DEVICES="" ctest --preset linux-cuda13 -L '^cpu$'
 cmake --install build-linux-cuda13                # -> build-linux-cuda13/install
 cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-cuda13/install-system-cuda
-(cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-0.2.0-linux-cu13-x86_64.{tar.gz,zip}
+(cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-1.0.0-linux-cu13-x86_64.{tar.gz,zip}
 ```
 
 - **glibc:** the archive needs the glibc of the machine that built it, or a newer one. Build on the oldest distribution you want to support. CI uses Ubuntu 22.04, which gives glibc 2.35. A build from a rolling distribution such as Arch will not start on Ubuntu LTS.
-- **Other presets:** `linux-cuda12`, `windows-msvc-cuda13` and `windows-msvc-cuda12`. The Windows presets run from a Visual Studio 2022 x64 developer prompt. None of these has been built yet (see [Support status](#support-status)).
+- **Other presets:** `linux-cuda12`, `windows-msvc-cuda13` and `windows-msvc-cuda12`. The Windows presets run from a Visual Studio 2022 x64 developer prompt.
 
 ### Package contents
 
@@ -142,7 +145,7 @@ cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-
 | `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`, `share/doc/mossinfer/` | licences (see [Licensing](#licensing-and-redistribution)) |
 
 **Two variants per flavour.**
-- **Full** (`mossinfer-…-cu13-x86_64.zip`): bundles cuBLASLt and the CUDA EULA. It runs on any machine with a suitable driver, and uses its own cuBLASLt by default (`auto`, see [CUDA libraries](#cuda-libraries)): results are reproducible across machines, and the quality certificates of the release (the certified tiers) apply.
+- **Full** (`mossinfer-…-cu13-x86_64.zip`): bundles cuBLASLt and the CUDA EULA. It runs on any machine with a suitable driver, and uses its own cuBLASLt by default (`auto`, see [CUDA libraries](#cuda-libraries)): results are reproducible across machines, and quality certificates measured with that cuBLASLt apply.
 - **System CUDA** (`mossinfer-…-cu13-x86_64-system-cuda.zip`): the same files without cuBLASLt and the EULA, several hundred MB smaller. It runs only where a compatible cuBLASLt is installed. It is made from the release presets, which link the CUDA runtime statically; a tree installed the same way from a build with a shared cudart (the dev preset) also needs a system cudart.
 - **Users with a CUDA toolkit** can use its cuBLASLt instead in two ways: download the smaller `-system-cuda` archive, or keep the full one and set `MOSSINFER_CUDA_LIBS=system`. A system copy of another cuBLASLt version can change result bits, and certificates measured with the bundled copy do not apply to it (see Reproducibility below).
 - **Which to offer:** the launcher decides from the probe. Run the probe of any installed copy with `MOSSINFER_CUDA_LIBS=system` (`hello`'s `probe.cublaslt`, or `mi_probe()`): when `source` is `"system"`, the machine has a compatible copy and the `-system-cuda` archive works there; otherwise offer the full one. A launcher that installs once for many machines ships the full archive.
@@ -206,8 +209,8 @@ hf download OpenMOSS-Team/MOSS-Image-SFT  --local-dir MOSS-Image/sft  --exclude 
 - **The model path is the folder** that contains `text_encoder/`, `tokenizer/`, `transformer/` and `vae/`, e.g. `MOSS-Image/base`.
 - **The folder can be read-only.** The engine writes nothing into it. An optional `moss.mossidx` index, made with `moss-infer index <folder>`, makes the first load slightly faster. Without one, the engine builds the index in memory.
 - **To save disk with both models,** hard-link SFT's `text_encoder/*.safetensors` and `vae/*.safetensors` to Base's. They are byte-identical.
-- **ComfyUI and quantized files** load as component files next to the bundle folder: `dit_file` (INT8 ConvRot, mixed INT8/bf16 or bf16 DiT), `text_encoder_file` (INT8 ConvRot or W4A8) and `vae_file`. The tokenizer and configs still come from the folder. A file as the model path itself (`MI_MODEL_FORMAT_COMFYUI`, or a file with `MI_MODEL_FORMAT_AUTO`) returns `MI_ERR_NOT_SUPPORTED`, and the server answers `not_supported`, while `MI_CAP_COMFYUI_MODELS` is unset.
-- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 DiT runs only under `turbo`, which must be chosen explicitly: offer it for INT4 files, and only for them. A quality certificate (`<dit>.mossinfer-cert.json`, or in `<cache_dir>/quality_certs/`) lets `auto` pick a lossy configuration; the report's `quality` object says which one ran and whether it was certified.
+- **ComfyUI and quantized files** load as component files next to the bundle folder: `dit_file` (INT8 ConvRot, INT4 ConvRot, mixed INT8/bf16 or bf16 DiT), `text_encoder_file` (INT8 ConvRot or W4A8) and `vae_file`. The tokenizer and configs still come from the folder. A file as the model path itself (`MI_MODEL_FORMAT_COMFYUI`, or a file with `MI_MODEL_FORMAT_AUTO`) returns `MI_ERR_NOT_SUPPORTED`, and the server answers `not_supported`, while `MI_CAP_COMFYUI_MODELS` is unset.
+- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 DiT runs only under `turbo`, which must be chosen explicitly: offer it for INT4 files, and only for them. A quality certificate (`<dit>.mossinfer-cert.json`, or in `<cache_dir>/quality_certs/`; 1.0 ships none) lets `auto` pick a lossy configuration; the report's `quality` object says which one ran and whether it was certified.
 
 ## Picking the build: cu12 or cu13
 
@@ -281,7 +284,7 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 With CMake:
 
 ```cmake
-find_package(MossInfer 0.2 REQUIRED CONFIG)   # CMAKE_PREFIX_PATH=<unpacked package>
+find_package(MossInfer 1.0 REQUIRED CONFIG)   # CMAKE_PREFIX_PATH=<unpacked package>
 target_link_libraries(launcher PRIVATE MossInfer::mossinfer)
 ```
 
@@ -369,7 +372,8 @@ Every result carries a JSON report: `mi_result_report_json()`, or `done.report` 
 - the prompt token counts, and the LoRA reports, warnings and notes;
 - the execution plan: what was resident, and the memory per phase;
 - timings per phase, and VRAM and RAM peaks;
-- model streaming statistics and the hardware profile.
+- model streaming statistics and the hardware profile;
+- the control adapter and the accelerators (`control`, `accelerators`), which only `moss-infer` sets in 1.0.
 
 The library also has accessors for the parts a launcher shows: `mi_result_tier()`, `mi_result_text()`, `mi_result_prompt_tokens()`, `mi_result_lora()` and `mi_result_message()` (see [c-api.md](c-api.md#results)).
 
@@ -380,15 +384,15 @@ Attach it to bug reports, together with the server's stderr log and `hello`'s `p
 ## Versioning
 
 - **Version numbers.**
-  - `mi_version()` returns the release version (`0.2.0`).
+  - `mi_version()` returns the release version (`1.0.0`).
   - `mi_abi_version()` and `MI_ABI_VERSION` give the binary interface version (1).
   - The server's `hello` reports its `protocol_version` (1).
 - **Additive changes keep ABI 1:** new functions, new fields at the end of structs, new enum values, new optional server parameters and events.
   - A newer library accepts structs from programs built against an older header: their `struct_size` is smaller, the library reads only those bytes, and the missing fields take their defaults. It writes only `struct_size` bytes of output structs.
-  - This is implemented: 0.2.0 accepts the 0.1.0 sizes of `mi_engine_params` (80 bytes) and `mi_gen_params` (168 bytes) as well as its own (136 and 320, and 120 and 240 from an earlier 0.2.0 header). Any other size returns `MI_ERR_ABI_MISMATCH`. A 0.1.0 program keeps the 0.1.0 behaviour: its PNGs carry no metadata. See [c-api.md](c-api.md#struct-sizes).
+  - This is implemented: 1.0.0 accepts the 0.1.0 sizes of `mi_engine_params` (80 bytes) and `mi_gen_params` (168 bytes) as well as its own (136 and 320, and 120 and 240 from an earlier 0.2.0 header). Any other size returns `MI_ERR_ABI_MISMATCH`. A 0.1.0 program keeps the 0.1.0 behaviour: its PNGs carry no metadata. See [c-api.md](c-api.md#struct-sizes).
 - **Incompatible changes raise `MI_ABI_VERSION`.** On Linux the shared library's SONAME follows the ABI (`libmossinfer.so.1`).
-- **Before 1.0, pin the launcher to an exact engine release,** and rebuild it against each new header. A minor release may still raise the ABI.
-  - **Run time and build time differ.** At run time, the 0.2 library accepts programs built against the 0.1 header (same ABI, older struct sizes). At build time, the CMake package (`SameMinorVersion`) satisfies only the matching `MAJOR.MINOR`: `find_package(MossInfer 0.1)` does not find 0.2.0. Update the requested version when you move to a new header.
+- **From 1.0, releases with the same MAJOR version are source and binary compatible.** A launcher built against a 1.x header runs with any later 1.y library: additions arrive as new functions, enum values and trailing struct fields (versioned by `struct_size`). Only a new MAJOR version may raise the ABI.
+  - **Build time:** the CMake package (`SameMajorVersion`) satisfies a request from any release with the same MAJOR and at least the requested version: `find_package(MossInfer 1.0)` finds every 1.x, but not 2.0. Request the oldest 1.x whose header has what you use.
 - **Server clients:** unknown parameters are rejected with `invalid_params`, so a typo never goes unnoticed. Send only parameters that the server's version documents. Ignore unknown fields in responses and events, because new ones will appear.
 
 ## Licensing and redistribution

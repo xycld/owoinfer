@@ -124,9 +124,10 @@ if(MOSSINFER_SHARED)
   configure_package_config_file(${CMAKE_SOURCE_DIR}/cmake/MossInferConfig.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/MossInferConfig.cmake INSTALL_DESTINATION ${MOSSINFER_INSTALL_CMAKEDIR}
     PATH_VARS CMAKE_INSTALL_BINDIR)
-  # 0.x: minor releases may change the ABI (MI_ABI_VERSION), so only the same MAJOR.MINOR satisfies a request.
+  # From 1.0, releases with the same MAJOR are source and binary compatible (additions are trailing struct fields,
+  # versioned by struct_size), so any 1.x at or above the requested version satisfies a request.
   write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/MossInferConfigVersion.cmake
-    VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion)
+    VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
   install(FILES ${CMAKE_CURRENT_BINARY_DIR}/MossInferConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/MossInferConfigVersion.cmake
           DESTINATION ${MOSSINFER_INSTALL_CMAKEDIR})
 endif()
