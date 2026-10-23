@@ -6,13 +6,15 @@
 // CUTLASS v4.7.1 examples/79_blackwell_geforce_gemm/79a_blackwell_geforce_nvfp4_bf16_gemm.cu (Copyright (c) 2025 -
 // 2026 NVIDIA CORPORATION & AFFILIATES, BSD-3-Clause; see THIRD_PARTY_NOTICES.md). Changes: our Sm90 EVT epilogue
 // (per-row x scale, per-tensor w scale, optional bias) in place of the linear combination, no source C, and no
-// workspace (graph-capturable).
+// workspace (graph-capturable), and the kernel is launched through gemm_kernel below instead of
+// GemmUniversalAdapter's cutlass::device_kernel.
 #pragma once
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 #include "core/cuda_check.h"
@@ -75,6 +77,28 @@ struct GemmType {
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
 
+// The kernel's parameter, Kernel::Params, as bytes. Params holds TMA descriptors (CUtensorMap), which CUDA 13 declares
+// alignas(128), and MSVC x64 rejects a by-value parameter aligned that much (C2719) in the host launch stub nvcc
+// generates for cutlass::device_kernel<Kernel>(Params). Only the device pass gives this type Params' alignment; the
+// host pass (the stub) sees a plain byte array of the same size, which a launch copies byte for byte either way. One
+// parameter at offset 0 with Params' size and alignment: the device code is cutlass::device_kernel's.
+template <class Kernel>
+struct KernelParams {
+#if defined(__CUDA_ARCH__)
+  alignas(typename Kernel::Params)
+#endif
+      unsigned char bytes[sizeof(typename Kernel::Params)];
+};
+
+template <class Kernel>
+__global__ void __launch_bounds__(Kernel::MaxThreadsPerBlock, Kernel::MinBlocksPerMultiprocessor)
+    gemm_kernel(CUTLASS_GRID_CONSTANT const KernelParams<Kernel> params) {
+  extern __shared__ char smem[];
+  Kernel op;
+  op(*reinterpret_cast<const typename Kernel::Params*>(params.bytes), smem);
+  cutlass::arch::synclog_print();
+}
+
 inline void check_status(cutlass::Status status, const char* op, const char* stage) {
   if (status != cutlass::Status::kSuccess) {
     kernels::detail::fail(op, std::string("CUTLASS ") + stage + " failed: " + cutlassGetStatusString(status));
@@ -86,6 +110,7 @@ void launch(const char* op, const Nvfp4Operands& a, const __nv_bfloat16* bias, _
             int sm_count, cudaStream_t stream) {
   using T = GemmType<Tile>;
   using Gemm = typename T::Gemm;
+  using Kernel = typename T::Kernel;
   using Mainloop = typename T::Mainloop;
   using Sf = typename Mainloop::Sm1xxBlkScaledConfig;
   using Data = typename ElementAB::DataType;
@@ -115,18 +140,26 @@ void launch(const char* op, const Nvfp4Operands& a, const __nv_bfloat16* bias, _
   MI_CUDA_CHECK(cudaGetDevice(&args.hw_info.device_id));
   args.hw_info.sm_count = sm_count;
 
-  Gemm gemm;
   check_status(Gemm::can_implement(args), op, "can_implement");
   if (Gemm::get_workspace_size(args) != 0) check_status(cutlass::Status::kErrorWorkspaceNull, op, "workspace");
-  check_status(gemm.initialize(args, nullptr, stream), op, "initialize");
-  check_status(gemm.run(stream), op, "run");
+  // GemmUniversalAdapter::initialize() and run() for this kernel (static 1x1x1 cluster, no PDL: a plain launch).
+  check_status(Kernel::initialize_workspace(args, nullptr, stream), op, "initialize");
+  const typename Kernel::Params params = Kernel::to_underlying_arguments(args, nullptr);
+  static_assert(sizeof(KernelParams<Kernel>) == sizeof(params));
+  KernelParams<Kernel> kernel_params;
+  std::memcpy(kernel_params.bytes, &params, sizeof(params));
+  constexpr int smem = Kernel::SharedStorageSize;
+  if constexpr (smem >= (48 << 10)) {
+    MI_CUDA_CHECK(cudaFuncSetAttribute(gemm_kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+  }
+  gemm_kernel<Kernel><<<Kernel::get_grid_shape(params), Kernel::get_block_shape(), smem, stream>>>(kernel_params);
   MI_CUDA_CHECK_LAUNCH();
 }
 
 template <class Tile>
 cudaError_t probe() {
   cudaFuncAttributes attr{};
-  const cudaError_t err = cudaFuncGetAttributes(&attr, cutlass::device_kernel<typename GemmType<Tile>::Kernel>);
+  const cudaError_t err = cudaFuncGetAttributes(&attr, gemm_kernel<typename GemmType<Tile>::Kernel>);
   if (err != cudaSuccess) (void)cudaGetLastError();  // not sticky; leave no error behind for the next check
   return err;
 }
