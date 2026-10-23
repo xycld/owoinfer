@@ -79,6 +79,20 @@ inline constexpr Name<mi_attention> kAttentionNames[] = {
     {"q8_fp8_f32acc", MI_ATTENTION_Q8_FP8_F32ACC},
 };
 
+// The server's own spellings of mi_direct_io (the pipeline has an optional bool: unset, false, true).
+inline constexpr Name<mi_direct_io> kDitDirectIoNames[] = {
+    {"auto", MI_DIRECT_IO_AUTO},
+    {"buffered", MI_DIRECT_IO_BUFFERED},
+    {"direct", MI_DIRECT_IO_DIRECT},
+};
+
+// planner::te_host_pin_name()'s spellings.
+inline constexpr Name<mi_te_host_pin> kTeHostPinNames[] = {
+    {"auto", MI_TE_HOST_PIN_AUTO},
+    {"on", MI_TE_HOST_PIN_ON},
+    {"off", MI_TE_HOST_PIN_OFF},
+};
+
 // accel::step_cache_name()'s spellings.
 inline constexpr Name<mi_step_cache> kStepCacheNames[] = {
     {"off", MI_STEP_CACHE_OFF},
