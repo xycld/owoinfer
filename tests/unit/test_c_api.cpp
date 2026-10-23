@@ -625,6 +625,7 @@ TEST(CApi, WritePng) {
   ASSERT_EQ(mi_write_png(path.c_str(), rgb.data(), 3, 2), MI_OK) << last_error();
   std::ifstream in(path, std::ios::binary);
   const std::vector<std::uint8_t> png((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  in.close();  // Windows: the rewrites below cannot replace a file that is still open
   ASSERT_GE(png.size(), 33u);
   EXPECT_EQ(std::memcmp(png.data(), "\x89PNG\r\n\x1a\n", 8), 0);
   const auto be32 = [&](std::size_t at) {

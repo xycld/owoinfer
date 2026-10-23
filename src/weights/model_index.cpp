@@ -17,6 +17,7 @@
 #include "util/file_time.h"
 #include "util/json.h"
 #include "util/path.h"
+#include "util/rename_replace.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
 
@@ -509,7 +510,9 @@ void write_index(const ModelIndex& index, const fs::path& path) {
     out.flush();
     if (!out) throw IndexError("cannot write " + path_utf8(tmp));
   }
-  fs::rename(tmp, path);
+  std::error_code ec;
+  util::rename_replace(tmp, path, ec);
+  if (ec) throw fs::filesystem_error("cannot rename", tmp, path, ec);
 }
 
 ModelIndex load_index(const fs::path& path, const fs::path& bundle_dir) {

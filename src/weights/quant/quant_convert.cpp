@@ -20,6 +20,7 @@
 #include "util/checked_math.h"
 #include "util/json.h"
 #include "util/path.h"
+#include "util/rename_replace.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
 #include "weights/model_index.h"
@@ -77,7 +78,9 @@ class PartialFile {
   }
   const fs::path& path() const { return path_; }
   void commit(const fs::path& final_path) {
-    fs::rename(path_, final_path);
+    std::error_code ec;
+    util::rename_replace(path_, final_path, ec);
+    if (ec) throw fs::filesystem_error("cannot rename", path_, final_path, ec);
     committed_ = true;
   }
 
