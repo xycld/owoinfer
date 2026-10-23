@@ -840,19 +840,41 @@ class GpuProtocolTest(ProtocolTestBase):
         done = self.wait_done(gid, events)
         self.assertEqual(done["status"], "ok", done)
         self.assertEqual(done["report"]["dit_load"]["source"], "host_copy" if stats["dit_host_copy"] else "files")
-        self.assertTrue(stats["dit_host_copy"], stats)
-        # A cancel during a release interrupts its host copy; the release still answers.
-        rid = self.server.send("release", {"keep_host_copy": True}, id="r2")
-        cid = self.server.send("cancel", {"id": "r2"}, id="c2")
+        # The host's room decides whether a copy is kept: without it the release says why, and the cancel below can
+        # only find that the copy does not fit.
+        no_room = not stats["dit_host_copy"]
+        if no_room:
+            self.assertIn("not kept in RAM", stats["note"], stats)
+            print("NOTE: no DiT host copy on this machine now (%s); the host-copy load is not checked" % stats["note"],
+                  file=sys.stderr)
+        # A cancel sent right behind a release{keep_host_copy: true}: whenever it lands, it stops at most the DiT's
+        # copy. The release still answers, keeps the text encoder's copy and frees nothing else.
+        self.server.send("release", {"keep_host_copy": True}, id="r2")
+        self.server.send("cancel", {"id": "r2"}, id="c2")
         answers = {}
         while len(answers) < 2:
             m = self.server.read(GPU_TIMEOUT)
             if "event" not in m:
                 answers[m["id"]] = m
         self.assertIn("result", answers["r2"], answers)
-        self.assertIn(answers["c2"]["result"]["cancelling"], (True, False))  # False: the release had ended already
-        if answers["c2"]["result"]["cancelling"]:
-            self.assertFalse(answers["r2"]["result"]["dit_host_copy"], answers)
+        got = answers["r2"]["result"]
+        print("release + cancel:", answers["c2"]["result"], got, file=sys.stderr)
+        # The cancel found the release running or already done (False: it had ended), and the DiT copy was either
+        # interrupted (no copy, the note says so) or finished before the cancel reached it.
+        self.assertIn(answers["c2"]["result"]["cancelling"], (True, False))
+        if got["dit_host_copy"]:
+            self.assertEqual(got["note"], "", got)
+        else:
+            # Interrupted, or (the host's free memory changes) no room for the copy at all.
+            self.assertTrue("cancelled" in got["note"] or "not kept in RAM" in got["note"], got)
+        self.assertEqual(got["te_host_copy"], stats["te_host_copy"], got)  # the text encoder's copy is never dropped
+        self.assertGreater(got["vram_released_bytes"], 0)
+        # The cancel does not carry over: the next generate runs every step.
+        gid = self.server.send("generate", dict(request, output=out), id="g2")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "ok", done)
+        self.assertEqual(done["report"]["steps_run"], 2)
         self.assertEqual(self.server.call("unload")["result"], {"unloaded": True})
 
     def test_generate_256_two_steps(self):

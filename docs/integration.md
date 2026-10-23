@@ -35,7 +35,7 @@ Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what
 | Prompt token report | token counts per prompt and a truncation warning |
 | Memory modes | `min_memory`, `balanced`, `max_speed`, plus explicit VRAM and RAM budgets and a VRAM reserve. The engine plans against the VRAM that is actually free and streams the model when it doesn't fit. |
 | Integration surfaces | the C library (`libmossinfer`) and the sidecar process (`moss-server`), with the same features |
-| Run-time control | progress, cancel from any thread, one generation at a time per engine, device probe and build recommendation |
+| Run-time control | progress, cancel from any thread, one job (generation, preload or release) at a time per engine, device probe and build recommendation |
 | Preload | load the models for a request before the first generation (`mi_engine_preload()`, server `preload`), so the first image starts sampling at once; the next generation of a like request loads nothing and gives the same bits |
 | Soft unload | free the VRAM and keep the engine (`mi_engine_release()`, server `release`), optionally with the DiT kept in RAM for a fast reload over PCIe (`keep_host_copy`); the embedding cache survives it. See [Fast switching](#fast-switching). |
 | Certificate directories | extra quality-certificate directories per engine (`certificate_dirs`), searched before the cache folder, the DiT's sidecar and the package's `share/mossinfer/quality_certs/`, where packages install their certificates |

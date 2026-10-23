@@ -906,6 +906,10 @@ Generation PipelineAdapter::preload(const mi_gen_params& params, const std::atom
   const auto t0 = Clock::now();
   fs::path distill_te;
   pipeline::PreloadOptions options;
+  // The images are decoded (load_images true) although the plan needs no pixels: its residencies and workspaces follow
+  // the request's size and which images it has, but the plan's explanation names the init image's own size (a 1x1
+  // stand-in would show there), and a file that cannot be decoded fails the preload as it would the generation instead
+  // of passing it. One decode is small next to the model loads.
   options.request = to_request(params, &distill_te, true, true);
   pipeline::Request& q = options.request;
   q.model = impl_->model;

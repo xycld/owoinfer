@@ -3360,6 +3360,10 @@ TEST_F(GpuCApiPreload, PreloadThenGenerate) {
     EXPECT_EQ(d.source, MI_DIT_LOAD_SOURCE_FILES);
     EXPECT_NE(d.io, MI_LOAD_IO_NONE);
     EXPECT_GT(d.bytes, 0u);
+  } else {
+    std::printf("[c_api] SKIPPED checks: the preload left the DiT to the generation (\"%s\"): its dit_loads 1 / source "
+                "FILES, and the generation's dit_loads 0 / source NONE, are not checked\n",
+                note.c_str());
   }
   mi_result_free(r);
   // out_result NULL is allowed: a second preload of the same request finds everything loaded.
@@ -3412,7 +3416,12 @@ TEST_F(GpuCApiPreload, ReleaseThenGenerate) {
     EXPECT_EQ(from_copy.dit_load.source, MI_DIT_LOAD_SOURCE_HOST_COPY);
     EXPECT_EQ(from_copy.dit_load.io, MI_LOAD_IO_NONE);
   } else {
-    ADD_FAILURE() << "no DiT host copy was kept on this machine: " << info.note;
+    // The host's free memory decides; the release says why it kept nothing.
+    EXPECT_NE(std::string(info.note).find("not kept in RAM"), std::string::npos) << info.note;
+    EXPECT_EQ(from_copy.dit_load.source, MI_DIT_LOAD_SOURCE_FILES);
+    std::printf("[c_api] SKIPPED checks: no DiT host copy on this machine now (\"%s\"): the host-copy load is not "
+                "checked\n",
+                info.note);
   }
 
   info.struct_size = sizeof info;
