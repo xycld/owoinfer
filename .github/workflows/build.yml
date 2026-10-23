@@ -67,9 +67,6 @@ jobs:
       CMAKE_CUDA_COMPILER_LAUNCHER: sccache
       # Hosted runners: 4 cores, 16 GB RAM; the FlashAttention / CUTLASS translation units need ~4 GB each.
       CMAKE_BUILD_PARALLEL_LEVEL: "3"
-      # DIAGNOSTIC (one run): sccache server log, summarised after the stats.
-      SCCACHE_LOG: debug
-      SCCACHE_ERROR_LOG: ${{ github.workspace }}/sccache-debug.log
     defaults:
       run:
         shell: bash
@@ -226,20 +223,6 @@ jobs:
             esac
           done
           sccache --show-stats
-          # DIAGNOSTIC (one run): what sccache did not cache, and its errors.
-          (
-            log=sccache-debug.log
-            ls -l "$log"
-            grep -E 'compile result: ' "$log" | sed -E 's/.*compile result: //' | sort | uniq -c
-            grep -iE 'not cacheable|error|fail' "$log" | sed -E 's/^\[[^]]*\] *//' | cut -c1-400 | sort | uniq -c \
-              | sort -rn | head -60
-            grep -E 'compile result: (not cacheable|cache error|error)' "$log" | grep -oE '\[[^]]+\]: compile result' \
-              | grep -vE '\.cu\.(o|obj)\]' | sed -E 's/: compile result//' | sort -u | while read -r obj; do
-                echo "== $obj"
-                grep -F "$obj: get_cached_or_compile" "$log" | head -1 | cut -c1-2500
-                grep -F "$obj" "$log" | grep -iE 'error|not cacheable|cannot|unsupported' | cut -c1-600 | head -5
-              done
-          ) || true
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
