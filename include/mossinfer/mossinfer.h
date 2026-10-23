@@ -650,9 +650,10 @@ typedef struct mi_release_info {
  * room (a margin of the available memory stays free; within host_ram_budget_bytes when set): the DiT's weight files are
  * read into pinned memory (seconds; its next load uploads them from there, bit-identical, then frees them) and a
  * host-resident text encoder keeps its copy. With 0 every host copy is freed too. The embedding cache stays either way.
- * mi_cancel() from another thread:
- * - before the release starts freeing (it landed between this call's start and the pipeline's): nothing is released,
- *   MI_CANCELLED, `out` with vram_released_bytes 0, the host copies already held and note "cancelled before it started";
+ * mi_cancel() from another thread, during this call (one sent before the call has no effect: like every job, the
+ * release clears the cancel flag when it marks the engine busy):
+ * - landing after the call started and before it frees anything: nothing is released, MI_CANCELLED, `out` with
+ *   vram_released_bytes 0, the host copies already held and note "cancelled before it started";
  * - during the DiT's host copy (between 64 MiB reads): the copy stops; the release still completes (MI_OK), keeps a
  *   host-resident text encoder's copy, frees nothing else, and the note says the copy was cancelled.
  * `out` (may be NULL) receives what was released and kept, and why not. Returns MI_OK or MI_CANCELLED (above), else:

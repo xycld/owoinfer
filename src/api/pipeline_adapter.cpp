@@ -941,9 +941,7 @@ mi_release_info PipelineAdapter::release(bool keep_host_copy, const std::atomic<
 }
 
 mi_release_info to_release_info(const pipeline::ReleaseReport& rr, bool* cancelled) {
-  // The pipeline's documented report of a release whose cancel was set on entry: nothing released, and this note
-  // (pipeline.h Pipeline::release_device_memory; ReleaseReport has no flag of its own).
-  if (cancelled != nullptr) *cancelled = rr.note == "cancelled before it started" && rr.vram_released == 0;
+  if (cancelled != nullptr) *cancelled = rr.cancelled;  // the cancel was set on entry: nothing was released
   mi_release_info out{};
   out.struct_size = sizeof out;
   out.seconds = rr.seconds;

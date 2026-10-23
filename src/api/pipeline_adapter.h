@@ -127,8 +127,8 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
 
 // A release report in C-API terms, the note cut at 511 bytes on a UTF-8 boundary. Called by release(); public for the
 // CPU tests.
-// `cancelled` (optional) receives whether the release was cancelled before it started (it released nothing:
-// Pipeline::release_device_memory's documented note "cancelled before it started").
+// `cancelled` (optional) receives ReleaseReport::cancelled: the release was cancelled before it started and released
+// nothing.
 mi_release_info to_release_info(const pipeline::ReleaseReport& report, bool* cancelled = nullptr);
 
 // A result holding `generation`, as mi_generate() returns it (release it with mi_result_free()). Defined in c_api.cpp;

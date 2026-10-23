@@ -2434,12 +2434,13 @@ TEST(CApi, ReleaseInfo) {
   EXPECT_EQ(std::string(info.note).substr(509), "\xc3\xa4");
   rr.note.clear();
   EXPECT_STREQ(mi::api::to_release_info(rr).note, "");
-  // Cancelled before it started (Pipeline::release_device_memory's documented report): mi_engine_release() maps it to
-  // MI_CANCELLED. A cancelled host copy, or the same note after something was released, is not that case.
+  // Cancelled before it started (ReleaseReport::cancelled): mi_engine_release() maps it to MI_CANCELLED. A cancelled
+  // host copy (a note, no flag) is not that case.
   bool cancelled = true;
   (void)mi::api::to_release_info(rr, &cancelled);
   EXPECT_FALSE(cancelled);
   mi::pipeline::ReleaseReport early;
+  early.cancelled = true;
   early.note = "cancelled before it started";
   early.dit_host_copy = true;
   early.host_copy_bytes = 123;
@@ -2449,12 +2450,10 @@ TEST(CApi, ReleaseInfo) {
   EXPECT_EQ(info.dit_host_copy, 1);  // the copies already held, as they are
   EXPECT_EQ(info.host_copy_bytes, 123u);
   EXPECT_STREQ(info.note, "cancelled before it started");
-  early.note = "the DiT's host copy was cancelled";
-  (void)mi::api::to_release_info(early, &cancelled);
-  EXPECT_FALSE(cancelled);
-  early.note = "cancelled before it started";
-  early.vram_released = 1;
-  (void)mi::api::to_release_info(early, &cancelled);
+  mi::pipeline::ReleaseReport copy_cancelled;
+  copy_cancelled.vram_released = 1;
+  copy_cancelled.note = "the DiT's host copy was cancelled";
+  (void)mi::api::to_release_info(copy_cancelled, &cancelled);
   EXPECT_FALSE(cancelled);
 }
 
