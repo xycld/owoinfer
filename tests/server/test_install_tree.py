@@ -37,26 +37,69 @@ def install(cmake, build, prefix, component=None):
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
 
 
+def clean_environment():
+    """The test's environment without anything that could point the installed binaries back at the build tree. An
+    LD_LIBRARY_PATH with an empty entry (CI's "/usr/local/cuda-13.3/lib64:") searches the working directory, which
+    under ctest is the build tree: the installed moss-server would load the build tree's libmossinfer."""
+    drop = ("MOSSINFER_CUDA_LIBS", "MOSSINFER_CUBLASLT", "LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT")
+    return {k: v for k, v in os.environ.items() if k not in drop}
+
+
+def loaded_engine(pid):
+    """Linux: the libmossinfer file the process mapped (None elsewhere or when unreadable)."""
+    try:
+        with open(f"/proc/{pid}/maps") as f:
+            for line in f:
+                parts = line.split(maxsplit=5)  # address perms offset dev inode [path]
+                path = parts[5].strip() if len(parts) == 6 else ""
+                if os.path.basename(path).startswith("libmossinfer.so"):
+                    return path
+    except OSError:
+        pass
+    return None
+
+
 def hello(prefix, **env_vars):
-    exe = os.path.join(prefix, "bin", "moss-server" + (".exe" if os.name == "nt" else ""))
-    env = {k: v for k, v in os.environ.items() if k not in ("MOSSINFER_CUDA_LIBS", "MOSSINFER_CUBLASLT")}
+    exe = os.path.abspath(os.path.join(prefix, "bin", "moss-server" + (".exe" if os.name == "nt" else "")))
+    env = clean_environment()
     env.update(env_vars)
-    p = subprocess.run([exe], input='{"id": 1, "method": "hello", "params": {"protocol_version": 1}}\n',
-                       capture_output=True, text=True, env=env, timeout=TIMEOUT)
-    for line in p.stdout.splitlines():
-        msg = json.loads(line)
-        if msg.get("id") == 1:
-            if "result" not in msg:
-                raise SystemExit(f"hello failed: {msg}")
-            if p.returncode != 0:
-                raise SystemExit(f"moss-server exited with {p.returncode}: {p.stderr}")
-            return msg["result"]
-    raise SystemExit(f"no hello answer (exit {p.returncode}): {p.stdout!r} {p.stderr!r}")
+    p = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         env=env, cwd=os.path.dirname(os.path.abspath(prefix)))  # never the build tree
+    try:
+        p.stdin.write('{"id": 1, "method": "hello", "params": {"protocol_version": 1}}\n')
+        p.stdin.flush()
+        answer = None
+        for line in p.stdout:
+            msg = json.loads(line)
+            if msg.get("id") == 1:
+                answer = msg
+                break
+        engine = loaded_engine(p.pid)  # while the process is alive
+        # communicate() closes stdin (the server then exits); closing it here first trips Python 3.13
+        out, err = p.communicate(timeout=TIMEOUT)
+    except Exception:
+        p.kill()
+        p.wait()
+        raise
+    if answer is None:
+        raise SystemExit(f"no hello answer (exit {p.returncode}): {out!r} {err!r}")
+    if "result" not in answer:
+        raise SystemExit(f"hello failed: {answer}")
+    if p.returncode != 0:
+        raise SystemExit(f"moss-server exited with {p.returncode}: {err}")
+    if os.name == "posix" and sys.platform.startswith("linux"):
+        # The installed binary must run the installed engine, never the build tree's.
+        if engine is None or not inside(engine, prefix):
+            raise SystemExit(f"{exe} loaded the engine {engine}, not the one in {prefix}")
+    return answer["result"]
 
 
 def inside(path, prefix):
-    path, prefix = os.path.realpath(path), os.path.realpath(prefix)
-    return os.path.commonpath([path, prefix]) == prefix
+    path, prefix = os.path.normcase(os.path.realpath(path)), os.path.normcase(os.path.realpath(prefix))
+    try:
+        return os.path.commonpath([path, prefix]) == prefix
+    except ValueError:  # Windows: different drives
+        return False
 
 
 def main():
@@ -68,6 +111,7 @@ def main():
     ap.add_argument("--cuda-major", help="passed to check_package.py")
     ap.add_argument("--shared-cudart", action="store_true", help="a MOSSINFER_STATIC_CUDART=OFF build (dev preset)")
     args = ap.parse_args()
+    args.work = os.path.abspath(args.work)
     full = os.path.join(args.work, "full")
     slim = os.path.join(args.work, "slim")
     install(args.cmake, args.build, full)

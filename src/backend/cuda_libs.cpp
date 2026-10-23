@@ -1,6 +1,6 @@
 #include "backend/cuda_libs.h"
 
-#include <cublas_api.h>
+#include <cublasLt.h>  // never cublas_api.h directly: CUDA 12 requires CUBLASAPI, which cublasLt.h defines
 
 #include <algorithm>
 #include <array>

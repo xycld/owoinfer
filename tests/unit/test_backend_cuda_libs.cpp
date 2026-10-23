@@ -163,20 +163,30 @@ TEST(CudaLibs, WindowsCandidates) {
             (std::vector<Candidate>{{"E:\\lt\\cublasLt64_13.dll", "env"}}));
 }
 
+// This platform's library file name, and an absolute path to it in a directory that does not exist.
+std::string lib_name() {
+  return mi::backend::current_os() == LibOs::kWindows ? "cublasLt64_" + std::to_string(CUBLAS_VER_MAJOR) + ".dll"
+                                                      : "libcublasLt.so." + std::to_string(CUBLAS_VER_MAJOR);
+}
+std::string missing_file() {
+  return (mi::backend::current_os() == LibOs::kWindows ? "C:\\nonexistent\\dir\\" : "/nonexistent/dir/") + lib_name();
+}
+
 TEST(CudaLibs, EnvOverrideToAMissingFileListsWhyItFailed) {
+  const std::string file = missing_file();
   Environment env = clean_environment();
-  env.emplace_back("MOSSINFER_CUBLASLT", "/nonexistent/dir/libcublasLt.so.13");
+  env.emplace_back("MOSSINFER_CUBLASLT", file);
   const mi::backend::CublasLtStatus s = mi::backend::find_cublaslt(CudaLibPolicy::kSystem, env);
   EXPECT_FALSE(s.ok);
-  EXPECT_NE(s.error.find("MOSSINFER_CUBLASLT=/nonexistent/dir/libcublasLt.so.13"), std::string::npos) << s.error;
-  EXPECT_NE(s.error.find("missing (1): /nonexistent/dir/libcublasLt.so.13 (env)"), std::string::npos) << s.error;
+  EXPECT_NE(s.error.find("MOSSINFER_CUBLASLT=" + file), std::string::npos) << s.error;
+  EXPECT_NE(s.error.find("missing (1): " + file + " (env)"), std::string::npos) << s.error;
   EXPECT_EQ(s.error.find("(system)"), std::string::npos) << "the override is the only candidate: " << s.error;
   // A relative override is refused: it names one file, never a search.
   Environment relative = clean_environment();
-  relative.emplace_back("MOSSINFER_CUBLASLT", "libcublasLt.so.13");
+  relative.emplace_back("MOSSINFER_CUBLASLT", lib_name());
   const mi::backend::CublasLtStatus r = mi::backend::find_cublaslt(CudaLibPolicy::kAuto, relative);
   EXPECT_FALSE(r.ok);
-  EXPECT_NE(r.error.find("libcublasLt.so.13 (env): not an absolute path"), std::string::npos) << r.error;
+  EXPECT_NE(r.error.find(lib_name() + " (env): not an absolute path"), std::string::npos) << r.error;
 }
 
 TEST(CudaLibs, BundledSearchFromTheBuildTree) {
@@ -198,7 +208,7 @@ TEST(CudaLibs, BundledSearchFromTheBuildTree) {
 TEST(CudaLibs, NotACublasLtLibraryIsRejected) {
   // A file that is no library at all.
   mi::testing::TempDir dir("cuda_libs_not_a_library");
-  const fs::path text = dir.path() / "libcublasLt.so.13";
+  const fs::path text = dir.path() / lib_name();
   std::ofstream(text) << "not a library\n";
   Environment env = clean_environment();
   env.emplace_back("MOSSINFER_CUBLASLT", mi::util::path_utf8(fs::absolute(text)));
@@ -304,8 +314,8 @@ TEST(CudaLibs, SystemSearchOnThisMachine) {
   EXPECT_TRUE(mi::backend::cublaslt_compatible(s.info.version, CUBLAS_VERSION)) << s.info.version;
   // The dev box: CUDA in /opt/cuda, in the ld.so cache, and nothing on LD_LIBRARY_PATH.
   const fs::path dev = "/opt/cuda/lib64/libcublasLt.so." + std::to_string(CUBLAS_VER_MAJOR);
-  const char* ld_path = std::getenv("LD_LIBRARY_PATH");
-  if (fs::exists(dev) && (ld_path == nullptr || *ld_path == '\0')) {
+  const bool ld_path = !mi::backend::env_value(mi::backend::process_environment(), "LD_LIBRARY_PATH", LibOs::kLinux).empty();
+  if (mi::backend::current_os() == LibOs::kLinux && fs::exists(dev) && !ld_path) {
     EXPECT_EQ(fs::path(s.info.path), fs::canonical(dev));
   }
 }

@@ -6,6 +6,9 @@
  *   MI_FAKE_MAJOR  the next major version
  *   MI_FAKE_NOSYM  the build's version, without cublasLtMatmulAlgoConfigGetAttribute
  * Only the symbols matter: nothing calls the stubs. */
+/* CUBLAS_VERSION without cublasLt.h's declarations, which these stubs would contradict. CUDA 12's cublas_api.h refuses
+ * to be included unless CUBLASAPI is defined; cublasLt.h defines it empty in the same way before including it. */
+#define CUBLASAPI
 #include <cublas_api.h>
 
 #include <stddef.h>
