@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -1025,40 +1026,50 @@ class Server {
            ",\"seconds\":" + num(d.seconds) + ",\"note\":" + str(mi_result_text(r, MI_TEXT_DIT_LOAD_NOTE)) + "}";
   }
 
-  // release: the response, sent when the release ends. mi_cancel() only stops a running job, and a release has no
-  // callback in which a cancel issued before mi_engine_release() marked the engine busy could land (as on_progress does
-  // for generate and preload): a relay thread repeats mi_cancel() while the release runs once job.cancel is set. A
-  // cancel seen before the call keeps no host copy at all, which is what an interrupted copy leaves.
+  // release: the response, sent when the release ends. A cancel stops the DiT's host copy (between 64 MiB reads); the
+  // release still frees the device memory, keeps a host-resident text encoder's copy and frees nothing else.
+  // mi_cancel() only stops a running job, and a release has no callback in which a cancel issued before
+  // mi_engine_release() marked the engine busy could land (as on_progress does for generate and preload). A relay thread
+  // sleeps until request_cancel() wakes it, then repeats mi_cancel() every 10 ms until the release ends, so a cancel
+  // lands at the latest before the copy's first read.
   void run_release(Work& w) {
     Job& job = *w.job;
     mi_release_info info{};
     info.struct_size = sizeof info;
-    const bool keep = w.keep_host_copy && !job.cancel.load();
-    std::atomic<bool> finished{false};
+    {
+      const std::lock_guard<std::mutex> lock(relay_mu_);
+      relay_finished_ = false;
+    }
     std::thread relay;
-    if (keep) {
+    if (w.keep_host_copy) {
       try {
-        relay = std::thread([&] {
-          while (!finished.load()) {
-            if (job.cancel.load()) mi_cancel(engine_);  // a no-op until the release marks the engine busy
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        relay = std::thread([this, &job] {
+          std::unique_lock<std::mutex> lock(relay_mu_);
+          relay_cv_.wait(lock, [&] { return relay_finished_ || job.cancel.load(); });
+          while (!relay_finished_) {
+            lock.unlock();
+            mi_cancel(engine_);  // a no-op until the release marks the engine busy
+            lock.lock();
+            relay_cv_.wait_for(lock, std::chrono::milliseconds(10), [&] { return relay_finished_; });
           }
         });
       } catch (const std::system_error&) {
         // No thread: a cancel still reaches a release already running (request_cancel()'s own mi_cancel()).
       }
     }
-    const mi_status s = mi_engine_release(engine_, keep ? 1 : 0, &info);
-    finished.store(true);
+    const mi_status s = mi_engine_release(engine_, w.keep_host_copy ? 1 : 0, &info);
+    {
+      const std::lock_guard<std::mutex> lock(relay_mu_);
+      relay_finished_ = true;
+    }
+    relay_cv_.notify_all();
     if (relay.joinable()) relay.join();
     std::string line = "{\"id\":" + job.id;
     if (s == MI_OK) {
       line += ",\"result\":{\"seconds\":" + num(info.seconds) + ",\"vram_released_bytes\":" +
               std::to_string(info.vram_released_bytes) + ",\"host_copy_bytes\":" + std::to_string(info.host_copy_bytes) +
               ",\"host_copy_seconds\":" + num(info.host_copy_seconds) + ",\"dit_host_copy\":" + tf(info.dit_host_copy) +
-              ",\"te_host_copy\":" + tf(info.te_host_copy) + ",\"note\":" +
-              str(w.keep_host_copy && !keep && info.note[0] == '\0' ? "host copy cancelled before it started" : info.note) +
-              "}}";
+              ",\"te_host_copy\":" + tf(info.te_host_copy) + ",\"note\":" + str(info.note) + "}}";
     } else {
       line += ",\"error\":" + error_json(status_code(s), protocol_names(mi_last_error_message())) + "}";
     }
@@ -1110,6 +1121,10 @@ class Server {
     if (!generating()) return;
     job_->cancel.store(true);
     mi_cancel(engine_);
+    {
+      const std::lock_guard<std::mutex> lock(relay_mu_);  // a release's relay sees the flag, or is woken
+    }
+    relay_cv_.notify_all();
   }
 
   void join_worker() {
@@ -1123,6 +1138,10 @@ class Server {
   std::unique_ptr<Job> job_;
   std::thread worker_;
   std::atomic<bool> running_{false};
+  // A release's cancel relay (run_release): woken by request_cancel() and by the release's end.
+  std::mutex relay_mu_;
+  std::condition_variable relay_cv_;
+  bool relay_finished_ = false;  // guarded by relay_mu_ while a relay runs
 };
 
 // fds 0-2 must exist before anything else is opened. A launcher that started the server with one of them closed would

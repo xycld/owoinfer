@@ -166,16 +166,29 @@ unset(_mi_file)
 # quality_certs, for a lib/, lib64/ or bin/ directory). The default component, so both the full package and the
 # system-CUDA variant (`--component Unspecified`) carry them. The files are listed when installing, so new certificates
 # need no reconfigure. MOSSINFER_QUALITY_CERTS_SOURCE in the install's environment names another source directory
-# (a packager's own certificates; tests/server/test_install_tree.py).
+# (a packager's own certificates; tests/server/test_install_tree.py): one path, never split into a list (on Windows its
+# backslashes become slashes). Symbolic links are skipped with a warning: a package carries regular files only
+# (check_package.py fails on a link there).
 set(MOSSINFER_QUALITY_CERTS_DIR ${CMAKE_SOURCE_DIR}/data/quality_certs CACHE PATH
     "Directory whose *.mossinfer-cert.json files are installed to share/mossinfer/quality_certs")
 install(CODE "
   set(_mi_certs [==[${MOSSINFER_QUALITY_CERTS_DIR}]==])
   if(DEFINED ENV{MOSSINFER_QUALITY_CERTS_SOURCE})
-    file(TO_CMAKE_PATH \"\$ENV{MOSSINFER_QUALITY_CERTS_SOURCE}\" _mi_certs)
+    set(_mi_certs \"\$ENV{MOSSINFER_QUALITY_CERTS_SOURCE}\")
+    if(CMAKE_HOST_WIN32)
+      string(REPLACE \"\\\\\" \"/\" _mi_certs \"\${_mi_certs}\")
+    endif()
   endif()
   if(IS_DIRECTORY \"\${_mi_certs}\")
-    file(GLOB _mi_cert_files LIST_DIRECTORIES false \"\${_mi_certs}/*.mossinfer-cert.json\")
+    file(GLOB _mi_found LIST_DIRECTORIES false \"\${_mi_certs}/*.mossinfer-cert.json\")
+    set(_mi_cert_files \"\")
+    foreach(_mi_f IN LISTS _mi_found)
+      if(IS_SYMLINK \"\${_mi_f}\")
+        message(WARNING \"quality certificate \${_mi_f} not installed: a symbolic link (a package carries regular files)\")
+      else()
+        list(APPEND _mi_cert_files \"\${_mi_f}\")
+      endif()
+    endforeach()
     if(_mi_cert_files)
       list(SORT _mi_cert_files)
       file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/share/mossinfer/quality_certs\" TYPE FILE FILES \${_mi_cert_files})

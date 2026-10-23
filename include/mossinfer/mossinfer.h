@@ -598,7 +598,8 @@ MOSSINFER_API mi_status mi_gen_params_init(mi_gen_params* params, size_t struct_
  * file read) included. Image inputs are checked (sizes, channels, file existence and size) but neither copied nor
  * decoded. Left to mi_generate(): the match of a distill bundle's time embedding with the engine's, and the control
  * adapter's format and kinds. MI_ERR_INVALID_ARGUMENT names the problem; a malformed distill bundle or dataspace file
- * is MI_ERR_MODEL. */
+ * is MI_ERR_MODEL. It checks a generation's request, which needs a prompt: to check a mi_engine_preload() request
+ * without one, validate a copy with a stand-in prompt (e.g. "preload"). */
 MOSSINFER_API mi_status mi_gen_params_validate(const mi_gen_params* params);
 
 /* Runs one generation to completion. Returns MI_OK with the image, or MI_CANCELLED after mi_cancel() (the result then
@@ -641,9 +642,11 @@ typedef struct mi_release_info {
  * room (a margin of the available memory stays free; within host_ram_budget_bytes when set): the DiT's weight files are
  * read into pinned memory (seconds; its next load uploads them from there, bit-identical, then frees them) and a
  * host-resident text encoder keeps its copy. With 0 every host copy is freed too. The embedding cache stays either way.
- * MI_ERR_BUSY while a generation or preload runs. mi_cancel() from another thread interrupts the host copy (between
- * 64 MiB reads); the release itself always completes and returns MI_OK, with what was kept (and why not) in `out`,
- * which may be NULL. */
+ * mi_cancel() from another thread stops the DiT's host copy (between 64 MiB reads): the release still completes, keeps a
+ * host-resident text encoder's copy and frees nothing else. `out` (may be NULL) receives what was kept, and why not.
+ * Returns MI_OK, unless: MI_ERR_INVALID_ARGUMENT for a NULL engine, MI_ERR_ABI_MISMATCH for an unknown out->struct_size,
+ * MI_ERR_BUSY while a generation, a preload or another release runs (all three before anything is freed), and
+ * MI_ERR_CUDA when the device fails (free the engine then). */
 MOSSINFER_API mi_status mi_engine_release(mi_engine* engine, int32_t keep_host_copy, mi_release_info* out);
 
 /* ------------------------------------------------------------------------------------------------ results */

@@ -55,6 +55,8 @@ def fake_cert_source(work):
         json.dump({"schema": "mossinfer.quality_cert/test", "note": "install-tree test only; certifies nothing"}, f)
     with open(os.path.join(src, "README.md"), "w", encoding="utf-8") as f:
         f.write("not a certificate\n")
+    if os.name == "posix":  # a symbolic link is skipped (packaging.cmake)
+        os.symlink(FAKE_CERT, os.path.join(src, "link.mossinfer-cert.json"))
     return src
 
 
@@ -106,6 +108,14 @@ def check_certificates(args, full, slim):
         finally:
             os.remove(path)
         check(rc != 0 and want in err, f"check_package.py refuses {name} ({rc}: {err.strip()[-200:]})")
+    if os.name == "posix":
+        link = os.path.join(cert_dir, "link.mossinfer-cert.json")
+        os.symlink(FAKE_CERT, link)
+        try:
+            rc, out, err = check_package_run(args.check_package, full, major)
+        finally:
+            os.remove(link)
+        check(rc != 0 and "is a symbolic link" in err, f"check_package.py refuses a symbolic link ({rc}: {err.strip()[-200:]})")
 
 
 def gpu_certificate_search(full, weights):

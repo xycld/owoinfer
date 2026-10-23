@@ -303,7 +303,7 @@ int main(void) {
   FIELD(mi_accel_info, cfg_truncated_steps, 8);
   FIELD(mi_accel_info, dit_calls, 12);
   FIELD(mi_accel_info, cached_calls, 16);
-  FIELD(mi_accel_info, lossy, 20); /* the 1.0.0 layout ends here (24 bytes) */
+  FIELD(mi_accel_info, lossy, 20); /* an earlier 1.1.0 header's layout ends here (24 bytes) */
   FIELD(mi_accel_info, step_cache_threshold, 24);
 
   SIZE(mi_release_info, 560);

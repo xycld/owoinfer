@@ -313,9 +313,9 @@ Like `generate`, it answers at once with `{"accepted": true}`, then sends events
 ```
 >> {"id": "p1", "method": "preload", "params": {"width": 1024, "height": 1024, "steps": 30}}
 << {"id": "p1", "result": {"accepted": true}}
-<< {"event": "progress", "id": "p1", "phase": "dit_load", "step": 0, "total_steps": 0, "step_seconds": 0, "elapsed_seconds": 0.00012}
+<< {"event": "progress", "id": "p1", "phase": "dit_load", "step": 0, "total_steps": 0, "step_seconds": 0, "elapsed_seconds": 0.0}
 << {"event": "plan", "id": "p1", "explanation": "Mode balanced ...", "plan": {...}}
-<< {"event": "done", "id": "p1", "status": "ok", "report": {...}, "preload_note": "", "dit_load": {"source": "files", "io": "direct", "bytes": 10164664216, "seconds": 1.9, "note": ""}, "certified": true, "warnings": []}
+<< {"event": "done", "id": "p1", "status": "ok", "report": {...}, "preload_note": "", "dit_load": {"source": "files", "io": "direct", "bytes": 10000000000, "seconds": 2.0, "note": ""}, "certified": true, "warnings": []}
 ```
 
 `done` has `status` `"ok"` (with `report`), `"cancelled"` (with `steps_run` 0 and `report`) or `"error"` (with `error`). With a result it also carries, at the top level:
@@ -329,11 +329,11 @@ A soft unload (`mi_engine_release()`): frees the engine's device memory so that 
 
 Params: `keep_host_copy` (bool, default true). With true, the DiT's weights are read into RAM where the host has the room, and its next load uploads them from there (the report's `dit_load.source` `"host_copy"`); a host-resident text encoder keeps its copy. With false, every host copy is freed too.
 
-The response comes when the release ends. Reading the DiT into RAM takes seconds (it reads the DiT's weight files), so the release runs on the worker like a job: requests sent meanwhile are answered first, `status` reports `"releasing"`, and `cancel` (with or without the release's `id`) interrupts the host copy. The release itself always completes; an interrupted copy is not kept, and `note` says why.
+The response comes when the release ends. Reading the DiT into RAM takes seconds (it reads the DiT's weight files), so the release runs on the worker like a job: requests sent meanwhile are answered first, `status` reports `"releasing"`, and `cancel` (with or without the release's `id`) stops the DiT's host copy, whenever it arrives: before the copy's first read or between its 64 MiB reads. The release itself always completes: it frees the device memory, keeps a host-resident text encoder's copy and frees nothing else; the interrupted DiT copy is not kept, and `note` says so. A copy that finished before the cancel reached it is kept. The values in the examples of this section are illustrative.
 
 ```
 >> {"id": "r1", "method": "release", "params": {"keep_host_copy": true}}
-<< {"id": "r1", "result": {"seconds": 5.6, "vram_released_bytes": 11288483072, "host_copy_bytes": 10164664216, "host_copy_seconds": 5.59, "dit_host_copy": true, "te_host_copy": false, "note": ""}}
+<< {"id": "r1", "result": {"seconds": 5.0, "vram_released_bytes": 11000000000, "host_copy_bytes": 10000000000, "host_copy_seconds": 5.0, "dit_host_copy": true, "te_host_copy": false, "note": ""}}
 ```
 
 | Result field | Meaning |
@@ -352,7 +352,7 @@ The response comes when the release ends. Reading the DiT into RAM takes seconds
 
 Params: `id` (optional). The id of the job to cancel (a `generate`, `preload` or `release`); it is ignored unless it matches the running one.
 
-A generation stops within one text-encoder layer, DiT block or decode band, and then sends `done` with `"status": "cancelled"`. A preload stops between models and weight groups (`done` with `"cancelled"`). A release stops its host copy and answers as usual. A cancel never carries over to the next job.
+A generation stops within one text-encoder layer, DiT block or decode band, and then sends `done` with `"status": "cancelled"`. A preload stops between models and weight groups (`done` with `"cancelled"`). A release stops the DiT's host copy (the text encoder's copy stays) and answers as usual. A cancel never carries over to the next job.
 
 ```
 >> {"id": 4, "method": "cancel", "params": {"id": "g2"}}
@@ -404,7 +404,7 @@ send({"id": 3, "method": "shutdown"})
 |---|---|---|
 | `server_protocol` | `cpu` | No GPU or weights needed (details below) |
 | `package_install_tree` | `cpu` | `tests/server/test_install_tree.py`: installs the build twice (full, and `--component Unspecified` without CUDA libraries), asks each tree's `hello` which cuBLASLt it uses under `MOSSINFER_CUDA_LIBS` `auto` / `system` / `bundled` and `MOSSINFER_CUBLASLT` (a bundled copy found, a system copy outside the tree, clean errors for a missing copy or file and a bad policy), and runs `check_package.py` on both trees. The full tree is installed from a temporary certificate source (`MOSSINFER_QUALITY_CERTS_SOURCE`) with one fake `*.mossinfer-cert.json` and a `README.md`: only the certificate lands in `share/mossinfer/quality_certs/`, `check_package.py` lists it and refuses a stray file and an unparsable certificate there; the slim tree from the build's own source (none yet: no directory, and the install does not fail), then again from the fake source (the default component carries certificates). With `MOSSINFER_GPU_TESTS=1`, the installed `moss-server` also runs a 256², 2-step `high`-tier generate whose quality reason names the fake certificate: the install tree was searched. |
-| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params`; a 256² img2img from a PNG path (4 steps at strength 0.5: 2 run, `total_steps` 2) and the strength-1 note in `done.warnings`; a 256², 4-step generate with the color/depth `control` adapter (`$MOSS_COMMUNITY_MODELS`, skipped when absent) and a depth PNG plus `step_cache` `fbcache` (the report's `control` and `accelerators`, uncertified, the accelerator line in `done.warnings`, `done.certified` false), then a kind the adapter lacks (`done` with `invalid_argument`), then `cfg_truncation` at CFG 1 and a threshold without the step cache (the two no-effect warnings, `done.certified` true); `preload` → `release` → `generate` at 256², 2 steps (the `preload` events and `done` with `dit_load` and `preload_note`, `release` answering `busy` during the preload, the release's stats, the next generate loading from the host copy, a `cancel` sent right after a second `release`) |
+| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params`; a 256² img2img from a PNG path (4 steps at strength 0.5: 2 run, `total_steps` 2) and the strength-1 note in `done.warnings`; a 256², 4-step generate with the color/depth `control` adapter (`$MOSS_COMMUNITY_MODELS`, skipped when absent) and a depth PNG plus `step_cache` `fbcache` (the report's `control` and `accelerators`, uncertified, the accelerator line in `done.warnings`, `done.certified` false), then a kind the adapter lacks (`done` with `invalid_argument`), then `cfg_truncation` at CFG 1 and a threshold without the step cache (the two no-effect warnings, `done.certified` true); `preload` → `release` → `generate` at 256², 2 steps (the `preload` events and `done` with `dit_load` and `preload_note`, `release` answering `busy` during the preload, the release's stats, the next generate loading from the host copy, a `cancel` sent right after a second `release`: one of the documented outcomes, the text encoder's copy kept, and a 2-step generate after it running every step) |
 
 `server_protocol` covers:
 - `hello` (the capabilities and `probe.cublaslt` included), `status`, and idle `cancel` / `unload`

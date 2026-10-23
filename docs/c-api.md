@@ -66,7 +66,7 @@ cmake --build <build> --target mossinfer_example_c
 
 - **One job at a time per engine.** A job is `mi_generate()`, `mi_engine_preload()` or `mi_engine_release()`. A concurrent one on the same engine returns `MI_ERR_BUSY`. Separate engines may run concurrently, but they share the GPU and each one plans against its own budgets.
 - **`mi_cancel(engine)` is thread-safe** and may be called from any thread, including from a callback.
-  - A generation stops within one text-encoder layer, DiT block or decode band, and `mi_generate()` returns `MI_CANCELLED`. A preload stops between models and DiT weight groups (`MI_CANCELLED`). A release stops its host copy between 64 MiB reads and still returns `MI_OK`.
+  - A generation stops within one text-encoder layer, DiT block or decode band, and `mi_generate()` returns `MI_CANCELLED`. A preload stops between models and DiT weight groups (`MI_CANCELLED`). A release stops the DiT's host copy between 64 MiB reads, keeps a text encoder's copy and still returns `MI_OK`.
   - A cancel only affects the job running at that moment. It is a no-op when the engine is idle, and it never carries over to the next job.
 - **Callbacks** (`progress_callback`, `plan_callback`, `preview_callback`) run synchronously on the thread that called `mi_generate()` (or `mi_engine_preload()`), so keep them short.
   - They must not throw or longjmp.
@@ -172,7 +172,7 @@ A launcher can load the models before the first generation, and free the GPU wit
 - the request's LoRAs and control adapter;
 - a host-resident text encoder's copy (an encoder streamed from its files has nothing to keep).
 
-The request is planned as `mi_generate()` plans it: size, steps, CFG, LoRAs, control adapter, and the prompt's length, which sizes the workspaces. `params` NULL means the defaults. A NULL or blank prompt is allowed here only, and plans for a short prompt. Everything else is checked as for `mi_generate()`, with the same failures. The embedding cache is not consulted: the text encoder is planned as for a new prompt. A following `mi_generate()` of a request like it loads nothing (`mi_memory_stats.dit_loads` 0) and gives the same image bits as without the preload.
+The request is planned as `mi_generate()` plans it: size, steps, CFG, LoRAs, control adapter, and the prompt's length, which sizes the workspaces. `params` NULL means the defaults. A NULL or blank prompt is allowed here only, and plans for a short prompt. `mi_gen_params_validate()` checks a generation's request and so requires a prompt: validate a preload request as a copy with a stand-in prompt. Everything else is checked as for `mi_generate()`, with the same failures. The embedding cache is not consulted: the text encoder is planned as for a new prompt. A following `mi_generate()` of a request like it loads nothing (`mi_memory_stats.dit_loads` 0) and gives the same image bits as without the preload.
 - It occupies the engine like a generation: `MI_ERR_BUSY` while a job runs, and `mi_cancel()` stops it between models and DiT weight groups. It then returns `MI_CANCELLED` with a result. The engine stays usable and keeps what was loaded before the cancel; a DiT whose load was cancelled is dropped.
 - `params`' callbacks run on the calling thread. The progress callback runs once, at the start (`MI_PHASE_DIT_LOAD`, step 0). The plan callback runs once the loads are done, because the engine plans and loads in one call. There is no preview.
 - `result` may be NULL. Otherwise it receives the preload's result on `MI_OK` and `MI_CANCELLED`: the plan, the tier, the timings and memory, `mi_result_dit_load()` and `MI_TEXT_PRELOAD_NOTE`. It has no image and `steps_run` 0. Release it with `mi_result_free()`.
@@ -181,7 +181,8 @@ The request is planned as `mi_generate()` plans it: size, steps, CFG, LoRAs, con
 - With `keep_host_copy` nonzero, the weights stay in host RAM where the host has the room: a margin of the available memory stays free, and the copy fits `host_ram_budget_bytes` when that is set. The DiT's weight files are read into pinned memory, which takes seconds; its next load uploads them from there over PCIe, bit-identical, and frees them (`MI_DIT_LOAD_SOURCE_HOST_COPY`). Streamed blocks, if any, still read the files. A host-resident text encoder keeps its copy.
 - With `keep_host_copy` 0, every host copy is freed too.
 - The embedding cache stays either way.
-- `MI_ERR_BUSY` while a generation or preload runs. `mi_cancel()` from another thread interrupts the host copy between 64 MiB reads. The release itself always completes and returns `MI_OK`; a copy that did not fit, failed or was cancelled is not kept, and `info.note` says why.
+- `mi_cancel()` from another thread stops the DiT's host copy between 64 MiB reads. The release itself always completes: it frees the device memory, keeps a host-resident text encoder's copy and frees nothing else. A copy that did not fit, failed or was cancelled is not kept, and `info.note` says why.
+- It returns `MI_OK`, unless: `MI_ERR_INVALID_ARGUMENT` for a NULL engine, `MI_ERR_ABI_MISMATCH` for an unknown `info->struct_size`, `MI_ERR_BUSY` while a generation, a preload or another release runs (these three before anything is freed), and `MI_ERR_CUDA` when the device fails (free the engine then).
 - `info` may be NULL. Otherwise it is an output struct (`struct_size` set by the caller):
 
 | `mi_release_info` field | Meaning |

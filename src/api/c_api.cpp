@@ -32,7 +32,7 @@
 struct mi_engine {
   std::unique_ptr<mi::api::PipelineAdapter> adapter;
   std::atomic<bool> cancel{false};
-  // Guards busy and the cancel flag's reset, so a cancel lands on exactly the generation running when it is issued.
+  // Guards busy and the cancel flag's reset, so a cancel lands on exactly the job running when it is issued.
   std::mutex state;
   bool busy = false;
 };
@@ -496,7 +496,7 @@ mi_gen_params gen_params_defaults(std::size_t size = sizeof(mi_gen_params)) {
   p.hires_strength = 0.45;
   p.mask_encoding = MI_MASK_U8;
   p.resize = MI_RESIZE_CROP;
-  // No control adapter, the accelerators off (step_cache_threshold 0: the recommended one).
+  // No control adapter, the accelerators off (step_cache_threshold 0: unset, the model's default).
   p.control_lora_strength = 1.0;
   p.cfg_truncation = 1.0;
   p.step_cache = MI_STEP_CACHE_OFF;
