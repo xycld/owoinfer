@@ -22,8 +22,8 @@ int cmd_generate(const std::vector<std::string>& args);
 int cmd_quantize(const std::vector<std::string>& args);
 
 // A path argument (`what`: its flag), through the boundary check (util::check_user_path: a Windows device or pipe path
-// is refused before any file-system call touches it). Every path argument of the CLI enters through here, except the
-// --params file (read as a stream, process substitution included).
+// is refused before any file-system call touches it). Every path argument of the CLI enters through here, the --params
+// file included (read as a stream: process substitution works, the check is Windows-only).
 inline std::filesystem::path path_arg(std::string_view utf8, const std::string& what) {
   std::filesystem::path p = util::path_from_utf8(utf8);
   util::check_user_path(p, what);

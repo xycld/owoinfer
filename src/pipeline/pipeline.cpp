@@ -326,18 +326,22 @@ auto model_file_errors(const std::filesystem::path& file, F&& f) -> decltype(f()
 
 // The boundary check of the options' and the request's paths (util::check_user_path), before any std::filesystem call
 // touches them (cache keys use util::path_key, which opens nothing on Windows).
-void check_user_paths(const PipelineOptions& o, const Request& r) {
+void check_option_paths(const PipelineOptions& o) {
   const std::pair<const std::filesystem::path*, const char*> paths[] = {
       {&o.cache_dir, "cache_dir"},
       {&o.dit_file, "dit_file"},
       {&o.text_encoder_file, "text_encoder_file"},
       {&o.vae_file, "vae_file"},
-      {&o.time_embedding_file, "time_embedding_file"},
-      {&r.model, "model"},
-      {&r.dataspace_path, "dataspace_path"},
-      {&r.control.adapter, "control_adapter"}};
+      {&o.time_embedding_file, "time_embedding_file"}};
   for (const auto& [path, what] : paths) util::check_user_path(*path, what);
   for (const std::filesystem::path& d : o.certificate_dirs) util::check_user_path(d, "certificate_dirs");
+}
+
+void check_user_paths(const PipelineOptions& o, const Request& r) {
+  check_option_paths(o);
+  const std::pair<const std::filesystem::path*, const char*> paths[] = {
+      {&r.model, "model"}, {&r.dataspace_path, "dataspace_path"}, {&r.control.adapter, "control_adapter"}};
+  for (const auto& [path, what] : paths) util::check_user_path(*path, what);
   for (const lora::LoraSpec& l : r.loras) util::check_user_path(l.path, "loras");
 }
 
@@ -910,6 +914,7 @@ struct Pipeline::Impl {
   MemoryStats* mem = nullptr;
 
   explicit Impl(PipelineOptions o) : options(std::move(o)) {
+    check_option_paths(options);  // before the cache folder or a time embedding is touched
     free_at_start = runtime::DeviceArena::free_device_bytes();
     if (options.embedding_cache) {
       EmbeddingCacheOptions co;

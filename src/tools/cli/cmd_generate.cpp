@@ -277,7 +277,7 @@ int cmd_generate(const std::vector<std::string>& args) {
     flags.emplace_back(a, args[++i]);
   }
   for (const auto& [f, v] : flags) {
-    if (f == "--params") params = util::path_from_utf8(v);  // a stream: process substitution too
+    if (f == "--params") params = path_arg(v, f);  // a stream works too (process substitution)
   }
   if (!params.empty()) {
     pdoc = json::parse(read_file(params));

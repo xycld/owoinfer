@@ -722,6 +722,10 @@ TEST(RegularFile, WindowsDevicePaths) {
       LR"(\\host\mailslot\x)", LR"(\\host\MAILSLOT\x)", LR"(\\?\UNC\host\pipe\x)", LR"(\\?\unc\host\Pipe)",
       LR"(//?/UNC/host/mailslot/x)", LR"(\??\UNC\localhost\pipe\x)", LR"(\\?\UNC\host)", LR"(\\?\UNC)",
       LR"(\\host)", LR"(\\host\)", LR"(\\.)", LR"(\\?)",
+      // Provider-qualified UNC (\\;Provider\server\share) names a redirector; the NT upcase of dotless i and long s is
+      // ASCII, so these share names are pipe, IPC$ and mailslot.
+      LR"(\\;LanmanRedirector\host\pipe\x)", LR"(\\;x\host\share\m.safetensors)", LR"(\\?\UNC\;Lanman\host\share\x)",
+      L"\\\\host\\p\u0131pe\\x", L"\\\\host\\\u0131PC$\\x", L"\\\\host\\mail\u017Flot\\x",
       // IPC$ (the named pipes' share), and share names Win32 normalization turns into pipe (trailing dots, spaces).
       LR"(\\host\IPC$\x)", LR"(\\?\UNC\host\ipc$\x)", LR"(//host/Ipc$/x)", LR"(\\host\pipe.\x)",
       LR"(\\host\pipe..\x)", LR"(\\host\pipe \x)", LR"(\\host\mailslot.\x)", LR"(\\?\UNC\host\pipe.\x)",
@@ -759,6 +763,7 @@ TEST(RegularFile, UserPathBoundary) {
   const auto file = make_pattern_file(dir, 16);
   EXPECT_NO_THROW(mi::util::check_user_path(file, "dit_file"));
   EXPECT_NO_THROW(mi::util::check_user_path(dir.path(), "cache_dir"));
+  EXPECT_NO_THROW(mi::util::check_user_path({}, "cache_dir"));  // an unset option is not a path
 #ifdef _WIN32
   for (const char* p : {R"(\\.\pipe\x)", R"(\\?\GLOBALROOT\Device\Null)", R"(\\host\IPC$\x)", R"(//./COM1)", "NUL"}) {
     try {

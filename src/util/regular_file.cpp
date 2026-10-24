@@ -28,9 +28,15 @@ namespace {
 
 bool is_sep(wchar_t c) { return c == L'\\' || c == L'/'; }
 
+// ASCII case folding, plus the two letters whose NT upcase is ASCII (dotless i U+0131 -> I, long s U+017F -> S), so a
+// share name cannot pass for another by them.
 bool iequals(std::wstring_view a, std::wstring_view b) {
   if (a.size() != b.size()) return false;
-  const auto lower = [](wchar_t c) { return c >= L'A' && c <= L'Z' ? static_cast<wchar_t>(c - L'A' + L'a') : c; };
+  const auto lower = [](wchar_t c) {
+    if (c == L'\x0131') return L'i';
+    if (c == L'\x017F') return L's';
+    return c >= L'A' && c <= L'Z' ? static_cast<wchar_t>(c - L'A' + L'a') : c;
+  };
   for (std::size_t i = 0; i < a.size(); ++i) {
     if (lower(a[i]) != lower(b[i])) return false;
   }
@@ -67,12 +73,14 @@ bool windows_path_names_device(std::wstring_view p) {
     const bool letter = first.size() == 2 && ((d >= L'a' && d <= L'z') || (d >= L'A' && d <= L'Z'));
     if (letter && first[1] == L':') return !is_sep(p[pos - 1]);  // X:\... is a file; a bare X: is the raw volume
     if (!iequals(first, L"UNC")) return true;
-    return component(p, pos).empty() || device_share(p, pos);  // UNC\server\share\...
+    const std::wstring_view server = component(p, pos);  // UNC\server\share\...
+    return server.empty() || server[0] == L';' || device_share(p, pos);
   }
   if (p.size() >= 2 && is_sep(p[0]) && is_sep(p[1])) {  // \\server\share\...
     std::size_t pos = 2;
     const std::wstring_view server = component(p, pos);
-    if (server == L"." || server == L"?") return true;  // \\. or \\? alone
+    // \\. or \\? alone; a provider-qualified \\;Provider\... names a redirector, never a model path
+    if (server == L"." || server == L"?" || (!server.empty() && server[0] == L';')) return true;
     return device_share(p, pos);
   }
   return false;
@@ -80,7 +88,7 @@ bool windows_path_names_device(std::wstring_view p) {
 
 void check_user_path(const std::filesystem::path& path, std::string_view what) {
 #ifdef _WIN32
-  if (is_windows_device_path(path)) {
+  if (!path.empty() && is_windows_device_path(path)) {  // an unset path is not a path (GetFullPathNameW fails on it)
     const std::u8string text = path.u8string();
     throw std::invalid_argument(std::string(what) + ": " + kNotRegularFile + ": " +
                                 std::string(text.begin(), text.end()));
