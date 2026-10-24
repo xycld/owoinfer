@@ -85,12 +85,12 @@ def write_safetensors(path, tensors, metadata=None):
 
 
 def write_bf16_dit(path):
-    """A bf16 single-file DiT with MOSS-Image's names and the shapes the engine's DiT check reads."""
+    """A bf16 single-file DiT with MOSS-Image's names and shapes as the engine's DiT check reads them (block 0's GEMMs)."""
     t = []
     for i in range(42):
-        t += [("layers.%d.norm1.weight" % i, [3072]), ("layers.%d.q_norm.weight" % i, [128]),
-              ("layers.%d.proj.q.weight" % i, [4, 256]), ("layers.%d.proj.ffn_down.weight" % i, [4, 256])]
-    t += [("video_embedder.weight", [3072, 128]), ("text_embedder.proj.weight", [3072, 4096]),
+        t += [("layers.%d.norm1.weight" % i, [3072]), ("layers.%d.q_norm.weight" % i, [128])]
+    t += [("layers.0.proj.q.weight", [3072, 3072]), ("layers.0.proj.ffn_down.weight", [3072, 8192]),
+          ("video_embedder.weight", [3072, 128]), ("text_embedder.proj.weight", [3072, 4096]),
           ("time_embedding.0.weight", [3072, 256]), ("final_linear_video.weight", [128, 3072])]
     write_safetensors(path, t)
 
@@ -731,7 +731,7 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertEqual(r["path"], dit)
         self.assertEqual((r["kind"], r["loadable"], r["precision"], r["quantization"]), ("dit", True, "bf16", "bf16"))
         self.assertEqual(r["file_bytes"], os.path.getsize(dit))
-        self.assertEqual(r["tensors"], 42 * 4 + 4)
+        self.assertEqual(r["tensors"], 42 * 2 + 2 + 4)
         self.assertEqual(r["tiers"], ["auto", "reference", "high"])
         self.assertEqual(set(r["tier_reasons"]), {"auto", "reference", "high", "turbo"})
         self.assertIn("Reference", r["tier_reasons"]["auto"])
@@ -782,6 +782,33 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertError(s.call("inspect", {"path": dit, "deep": True}, id="u"), "invalid_params", "u")
         # No engine was needed or created.
         self.assertEqual(s.call("status")["result"], {"state": "unloaded"})
+
+    def test_inspect_runs_beside_other_requests(self):
+        """inspect answers from a thread of its own: requests sent after it can be answered first, every request
+        gets exactly one answer (an inspect over the limit of two at a time is busy), and shutdown waits for the
+        running ones."""
+        s = self.server
+        dit = os.path.join(self.tmp, "dit.safetensors")
+        write_bf16_dit(dit)
+        ids = ["i%d" % i for i in range(8)]
+        lines = "".join(json.dumps({"id": i, "method": "inspect", "params": {"path": dit}}) + "\n" for i in ids)
+        s.send_raw((lines + json.dumps({"id": "st", "method": "status"}) + "\n" +
+                    json.dumps({"id": "bye", "method": "shutdown"}) + "\n").encode())
+        answers = {}
+        while "bye" not in answers:
+            m = s.read()
+            self.assertNotIn(m["id"], answers, m)
+            answers[m["id"]] = m
+        self.assertEqual(set(answers), set(ids) | {"st", "bye"})
+        self.assertEqual(answers["st"]["result"], {"state": "unloaded"})
+        done = [i for i in ids if "result" in answers[i]]
+        self.assertTrue(done)
+        for i in done:
+            self.assertEqual((answers[i]["result"]["kind"], answers[i]["result"]["loadable"]), ("dit", True))
+        for i in set(ids) - set(done):
+            self.assertError(answers[i], "busy", i)
+            self.assertIn("inspects are running", answers[i]["error"]["message"])
+        self.assertEqual(s.proc.wait(timeout=TIMEOUT), 0)
 
     def test_shutdown(self):
         r = self.server.call("shutdown", id="bye")

@@ -15,6 +15,12 @@
 
 #include "mossinfer/mossinfer.h"
 
+namespace mi::planner {
+enum class Precision;
+}  // namespace mi::planner
+namespace mi::qwen35_text {
+enum class Precision : std::uint8_t;
+}  // namespace mi::qwen35_text
 namespace mi::pipeline {
 struct Request;
 struct Result;
@@ -130,6 +136,10 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
 // `cancelled` (optional) receives ReleaseReport::cancelled: the release was cancelled before it started and released
 // nothing.
 mi_release_info to_release_info(const pipeline::ReleaseReport& report, bool* cancelled = nullptr);
+
+// The mi_precision of a DiT's and of a text encoder's weights: one mapping for the results and mi_inspect_file().
+mi_precision to_precision(planner::Precision p);
+mi_precision to_precision(qwen35_text::Precision p);
 
 // A result holding `generation`, as mi_generate() returns it (release it with mi_result_free()). Defined in c_api.cpp;
 // public for the CPU tests of the result accessors.

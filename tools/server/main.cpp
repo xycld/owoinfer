@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <list>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -509,7 +510,7 @@ class Server {
       else if (m == "release") result = release(params, id);
       else if (m == "cancel") result = cancel(params);
       else if (m == "status") result = status(params);
-      else if (m == "inspect") result = inspect(params);
+      else if (m == "inspect") result = inspect(params, id);
       else if (m == "unload") result = unload(params);
       else if (m == "shutdown") {
         params.only({});
@@ -529,10 +530,12 @@ class Server {
     return true;
   }
 
-  // Cancels a running job, waits for it and releases the engine.
+  // Cancels a running job, waits for it and for the inspects (they have no cancel: each reads one file's header and
+  // small tensors), and releases the engine.
   void stop() {
     request_cancel();
     join_worker();
+    join_inspections();
     mi_engine_free(engine_);
     engine_ = nullptr;
   }
@@ -556,6 +559,13 @@ class Server {
     std::atomic<double> fraction{0}, eta{-1};  // < 0: unknown
   };
   struct Work;
+
+  // One inspect's thread; `done` once its answer is out.
+  struct Inspection {
+    std::thread thread;
+    std::atomic<bool> done{false};
+  };
+  static constexpr std::size_t kMaxInspects = 2;
 
   // A job runs on the worker (its id is job_->id).
   bool generating() const { return running_.load(); }
@@ -919,14 +929,48 @@ class Server {
     return s + "}";
   }
 
-  // Needs no engine and touches none, so it is answered in any state, on this thread: mi_inspect_file() reads headers
-  // and small tensors only.
-  std::string inspect(const Params& p) {
+  // Needs no engine and touches none, so it is answered in any state. mi_inspect_file() reads files (a slow disk, a
+  // network share), so it runs on a thread of its own and answers when done: cancel and status stay immediate. At most
+  // kMaxInspects run at a time; another one is refused with busy.
+  std::optional<std::string> inspect(const Params& p, const std::string& id) {
     p.only({"path"});
     const std::optional<std::string> path = p.path("path");
     if (!path) throw RequestError("invalid_params", "\"path\" (the file to inspect) is required");
+    inspections_.remove_if([](const std::unique_ptr<Inspection>& i) {
+      if (!i->done.load()) return false;
+      i->thread.join();  // it has sent its answer: only returning is left
+      return true;
+    });
+    if (inspections_.size() >= kMaxInspects) {
+      throw RequestError("busy", std::to_string(kMaxInspects) + " inspects are running; send it again after one answers");
+    }
+    auto slot = std::make_unique<Inspection>();
+    Inspection* s = slot.get();
+    s->thread = std::thread([this, s, id, file = *path] {
+      std::string line;
+      try {
+        line = "{\"id\":" + id + ",\"result\":" + inspect_json(file) + "}";
+      } catch (const RequestError& e) {
+        line = "{\"id\":" + id + ",\"error\":" + error_json(e.code, e.what()) + "}";
+      } catch (const std::exception& e) {
+        line = "{\"id\":" + id + ",\"error\":" + error_json("internal", e.what()) + "}";
+      }
+      out_.emit(line);
+      s->done.store(true);
+    });
+    inspections_.push_back(std::move(slot));
+    return std::nullopt;
+  }
+
+  void join_inspections() {
+    for (const std::unique_ptr<Inspection>& i : inspections_) i->thread.join();
+    inspections_.clear();
+  }
+
+  // inspect's result object for `path`.
+  static std::string inspect_json(const std::string& file) {
     mi_file_report* report = nullptr;
-    if (const mi_status s = mi_inspect_file(path->c_str(), &report); s != MI_OK) {
+    if (const mi_status s = mi_inspect_file(file.c_str(), &report); s != MI_OK) {
       throw RequestError(s == MI_ERR_INVALID_ARGUMENT ? "invalid_params" : status_code(s), mi_last_error_message());
     }
     const std::unique_ptr<mi_file_report, void (*)(mi_file_report*)> owner(report, mi_file_report_free);
@@ -934,7 +978,7 @@ class Server {
     info.struct_size = sizeof info;
     if (const mi_status s = mi_file_report_info(report, &info); s != MI_OK) throw_status(s);
     const auto text = [&](mi_file_text_kind k) { return str(mi_file_report_text(report, k)); };
-    std::string out = "{\"path\":" + str(*path) + ",\"kind\":\"" + file_kind_name(info.kind) + "\",\"loadable\":" +
+    std::string out = "{\"path\":" + str(file) + ",\"kind\":\"" + file_kind_name(info.kind) + "\",\"loadable\":" +
                       tf(info.loadable != 0) + ",\"file_bytes\":" + std::to_string(info.file_bytes) +
                       ",\"tensors\":" + std::to_string(info.tensor_count) + ",\"note\":" + text(MI_FILE_TEXT_NOTE);
     if (info.kind == MI_FILE_KIND_DIT || info.kind == MI_FILE_KIND_TEXT_ENCODER) {
@@ -1224,6 +1268,7 @@ class Server {
   mi_mode mode_ = MI_MODE_BALANCED;
   std::unique_ptr<Job> job_;
   std::thread worker_;
+  std::list<std::unique_ptr<Inspection>> inspections_;  // the main thread's: started, reaped and joined there
   std::atomic<bool> running_{false};
   // A release's cancel relay (run_release): woken by request_cancel() and by the release's end.
   std::mutex relay_mu_;

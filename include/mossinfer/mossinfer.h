@@ -973,8 +973,8 @@ typedef enum mi_file_kind {
   MI_FILE_KIND_DIT = 1,             /* a single-file DiT (mi_engine_params.dit_file) */
   MI_FILE_KIND_TEXT_ENCODER = 2,    /* mi_engine_params.text_encoder_file */
   MI_FILE_KIND_VAE = 3,             /* mi_engine_params.vae_file */
-  /* A LoRA with adapters on the MOSS-Image DiT (mi_gen_params.loras). One none of whose tensors applies to it (a LoRA
-   * for another model) is MI_FILE_KIND_UNKNOWN. */
+  /* A LoRA (mi_gen_params.loras): adapters on the MOSS-Image DiT, or tensors in the LoRA naming conventions that the
+   * LoRA reader refuses (a LoRA for another model, a malformed one: loadable 0). */
   MI_FILE_KIND_LORA = 4,
   MI_FILE_KIND_CONTROL_ADAPTER = 5, /* mi_gen_params.control_adapter */
   MI_FILE_KIND_MAX_ENUM = 0x7fffffff
@@ -996,7 +996,8 @@ typedef struct mi_file_info {
    * else BF16. */
   mi_precision precision;
   /* A loadable DiT: bit (1u << tier) for each mi_tier the engine accepts for it, with the bundle's bf16 text encoder
-   * (a quantized one refuses MI_TIER_REFERENCE too). No certificate is looked up (they are matched to the GPU), so
+   * (a quantized one refuses MI_TIER_REFERENCE too) and every attention kernel available (on a GPU without the 8-bit
+   * kernels HIGH and TURBO fall back to exact attention, and HIGH on a bf16 DiT is refused). No certificate is looked up (they are matched to the GPU), so
    * MI_TIER_AUTO on an INT4 DiT is refused here even where a certificate would allow it. 0 otherwise. */
   uint32_t tiers;
   int32_t lora_rank;            /* LoRA, control adapter: the largest rank of its low-rank adapters; 0 without */
@@ -1019,11 +1020,13 @@ typedef enum mi_file_text_kind {
 
 /* Reads what the file at `path` (UTF-8) is to the engine (MI_CAP_INSPECT): no engine, no GPU, no CUDA call. It reads
  * what the engine's loaders read before they upload anything: the safetensors header (at most 16 MiB), a DiT's
- * quantization configs and scales, a text encoder's small F32 tensors, a LoRA's alpha tensors. Thread-safe.
+ * quantization configs and scales, a text encoder's small F32 tensors, a LoRA's alpha tensors, a control adapter's
+ * embedder; at most 256 MiB of tensors, checked from the header first (a file that would need more is not loadable).
+ * Thread-safe. The answer depends only on the file's content and the library version (mi_version()), not on the GPU.
  * A file the engine cannot use (another model or container, a malformed or truncated header) is not an error: MI_OK
  * with MI_FILE_KIND_UNKNOWN or loadable 0, and the reason in MI_FILE_TEXT_NOTE. Fails with MI_ERR_INVALID_ARGUMENT for
- * a NULL or empty path or one that is not a regular file (a directory, a device, a pipe), and MI_ERR_IO when it does
- * not exist or cannot be read. On MI_OK *out_report is set: release it with mi_file_report_free(). */
+ * a NULL or empty path or one that is not a regular file (a directory, a device, a pipe: never read), and MI_ERR_IO
+ * when it does not exist or cannot be read. On MI_OK *out_report is set: release it with mi_file_report_free(). */
 MOSSINFER_API mi_status mi_inspect_file(const char* path, mi_file_report** out_report);
 /* `out` has struct_size set by the caller. */
 MOSSINFER_API mi_status mi_file_report_info(const mi_file_report* report, mi_file_info* out);

@@ -23,6 +23,7 @@
 #include "models/moss_dit/distill.h"
 #include "api/progress_model.h"
 #include "models/moss_dit/moss_dit.h"
+#include "models/qwen35_text/quant_text_model.h"
 #include "pipeline/hardware_profile.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_image.h"
@@ -40,6 +41,24 @@ void render_report(const pipeline::Request& q, const pipeline::Result& r, Genera
   pipeline::ReportParts parts = pipeline::report_parts(q, r, "");
   g.report_head = "{\n" + std::move(parts.head);
   g.report_tail = std::move(parts.tail) + "\n}\n";
+}
+
+mi_precision to_precision(planner::Precision p) {
+  switch (p) {
+    case planner::Precision::kBf16: return MI_PRECISION_BF16;
+    case planner::Precision::kInt8: return MI_PRECISION_INT8;
+    case planner::Precision::kInt4: return MI_PRECISION_W4A4;
+  }
+  return MI_PRECISION_BF16;
+}
+
+mi_precision to_precision(qwen35_text::Precision p) {
+  switch (p) {
+    case qwen35_text::Precision::kBF16: return MI_PRECISION_BF16;
+    case qwen35_text::Precision::kInt8: return MI_PRECISION_INT8;
+    case qwen35_text::Precision::kW4A8: return MI_PRECISION_W4A8;
+  }
+  return MI_PRECISION_BF16;
 }
 
 namespace {
@@ -214,11 +233,13 @@ mi_attention from_attention(planner::AttentionMode a) {
   return MI_ATTENTION_DEFAULT;
 }
 
-// Result::te_precision (qwen35_text::precision_name); empty means the bundle's bf16 text encoder.
+// Result::te_precision is qwen35_text::precision_name() of the encoder that ran ("int8_convrot" for INT8); empty means
+// the bundle's bf16 text encoder.
 mi_precision te_precision(const std::string& name) {
-  if (name == "int8") return MI_PRECISION_INT8;
-  if (name == "w4a8") return MI_PRECISION_W4A8;
-  if (name == "w4a4") return MI_PRECISION_W4A4;
+  for (const qwen35_text::Precision p :
+       {qwen35_text::Precision::kBF16, qwen35_text::Precision::kInt8, qwen35_text::Precision::kW4A8}) {
+    if (name == qwen35_text::precision_name(p)) return to_precision(p);
+  }
   return MI_PRECISION_BF16;
 }
 
@@ -726,9 +747,7 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
   // Reference needs no certificate: certified, also for the default decision of a generation cancelled before it.
   g.tier.certified = td.certified || td.effective == planner::Tier::kReference ? 1 : 0;
   g.tier.run_certified = td.certified ? 1 : 0;  // the run's, as the report's models.dit.certified
-  g.tier.dit_precision = td.precision == planner::Precision::kInt4   ? MI_PRECISION_W4A4
-                         : td.precision == planner::Precision::kInt8 ? MI_PRECISION_INT8
-                                                                     : MI_PRECISION_BF16;
+  g.tier.dit_precision = to_precision(td.precision);
   g.tier.text_encoder_precision = te_precision(r.te_precision);
   g.tier_reason = td.reason;
   g.certificate = td.certificate;

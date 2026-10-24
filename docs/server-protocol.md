@@ -54,7 +54,7 @@ The server trusts its launcher completely: whoever writes to its stdin has the s
 | response | `{"id": <same id>, "result": {...}}` or `{"id": <same id>, "error": {"code": "<code>", "message": "<text>"}}` |
 | event | `{"event": "progress" \| "plan" \| "preview" \| "done" \| "log", "id": <id of the generate or preload request>, ...}` |
 
-Every request gets exactly one response. Responses to different requests can interleave with events, so a client should match responses by `id`. A request whose `id` could not be read (malformed JSON, for example) is answered with `"id": null`. Most responses come in request order; a `release` is answered when it ends, so requests sent meanwhile (`status`, `cancel`) are answered first.
+Every request gets exactly one response. Responses to different requests can interleave with events, so a client should match responses by `id`. A request whose `id` could not be read (malformed JSON, for example) is answered with `"id": null`. Most responses come in request order; a `release` and an `inspect` are answered when they end, so requests sent meanwhile (`status`, `cancel`, another `inspect`) may be answered first.
 
 Unknown members in `params` are rejected (`invalid_params`), so a typo cannot be silently ignored. So is a member given twice, in `params` and in its objects (`loras` entries, `hires`, `control` and its images), because one of its values would be lost.
 
@@ -68,7 +68,7 @@ Unknown members in `params` are rejected (`invalid_params`), so a typo cannot be
 | `invalid_params` | wrong parameter type or value, unknown parameter, a string containing NUL (`\u0000`: the C API's strings are NUL-terminated), or a generation request the engine rejects (the message uses the official app's wording) |
 | `unsupported_protocol` | `hello` asked for another protocol version |
 | `no_engine` | a valid `generate`, `preload` or `release` before `load` |
-| `busy` | a valid `generate`, `preload` or `release`, or `load` or `unload`, while a job (a generation, preload or release) runs |
+| `busy` | a valid `generate`, `preload` or `release`, or `load` or `unload`, while a job (a generation, preload or release) runs; an `inspect` while two run |
 | `invalid_argument`, `abi_mismatch`, `not_supported`, `out_of_memory`, `model`, `io`, `cuda`, `internal` | the engine's `mi_status` (`MI_ERR_<CODE>`), with `mi_last_error_message()` as the message |
 
 ## Methods
@@ -387,28 +387,30 @@ When nothing runs, the answer is `{"cancelling": false}`. When another job runs,
 
 ### `inspect`
 
-Params: `path` (string, required): a file. Says what it is to the engine (`mi_inspect_file()`, [c-api.md](c-api.md#file-inspection)) without an engine or a GPU, so it works before `load` and in every state, also while a job runs: it touches no engine state and reads only headers and small tensors, on the request thread.
+Params: `path` (string, required): a file. Says what it is to the engine (`mi_inspect_file()`, [c-api.md](c-api.md#file-inspection)) without an engine or a GPU, so it works before `load` and in every state, also while a job runs: it touches no engine state. It runs on a thread of its own and is answered when it is done, so requests sent after it (`status`, `cancel`) may be answered first: match the response by `id`. At most two run at a time; a third is answered `busy` (send it again after one answers). `shutdown` waits for the running ones, which are answered before its own response.
 
 ```
 >> {"id": 5, "method": "inspect", "params": {"path": "/models/moss_image_sft_int4_convrot.safetensors"}}
 << {"id": 5, "result": {"path": "/models/moss_image_sft_int4_convrot.safetensors", "kind": "dit", "loadable": true,
-    "file_bytes": 3035537312, "tensors": 715, "note": "", "precision": "w4a4", "quantization": "int4_convrot256",
+    "file_bytes": 3000000000, "tensors": 700, "note": "", "precision": "w4a4", "quantization": "int4_convrot256",
     "tiers": ["turbo"], "tier_reasons": {"auto": "the loaded DiT is INT4 ConvRot (the Turbo tier) and no certificate covers it (...)",
     "reference": "tier reference runs bf16 weights exactly, ...", "high": "the loaded DiT is INT4 ConvRot, ...",
     "turbo": "Turbo tier: INT4 ConvRot GEMMs, q8_fp8 attention; uncertified (no certificate looked up)"}}}
 >> {"id": 6, "method": "inspect", "params": {"path": "/models/moss_image_color_depth_control.safetensors"}}
-<< {"id": 6, "result": {"path": "...", "kind": "control_adapter", "loadable": true, "file_bytes": 313063368, "tensors": 526,
+<< {"id": 6, "result": {"path": "...", "kind": "control_adapter", "loadable": true, "file_bytes": 300000000, "tensors": 500,
     "note": "", "control_kinds": ["color", "depth"], "base_model": "moss-base", "adapter_types": ["lora"], "lora_rank": 64,
-    "lora_adapters": 262, "lora_unknown_keys": 0}}
+    "lora_adapters": 250, "lora_unknown_keys": 0}}
 ```
 
 Every answer has `path`, `kind` (`"dit"`, `"text_encoder"`, `"vae"`, `"lora"`, `"control_adapter"` or `"unknown"`), `loadable` (the loader for that role accepts the file), `file_bytes`, `tensors` and `note` (why not loadable, or what an unknown file is instead, e.g. a GGUF file or a distill bundle file; `""` for none). By kind:
-- `dit`: `precision` (`"bf16"`, `"int8"` or `"w4a4"`; `null` when not loadable), `quantization` (its block linears as the engine runs them, e.g. `"int8_convrot256"`; `""` when not loadable), `tiers` (the `load` `tier` values the engine accepts for it with the bundle's text encoder, before certificates: `auto` on an INT4 DiT needs one, so it is not listed) and `tier_reasons` (for each tier, what it would run or why it is refused).
+- `dit`: `precision` (`"bf16"`, `"int8"` or `"w4a4"`; `null` when not loadable), `quantization` (its block linears as the engine runs them, e.g. `"int8_convrot256"`; `""` when not loadable), `tiers` (the `load` `tier` values the engine accepts for it with the bundle's text encoder and every attention kernel available, before certificates: `auto` on an INT4 DiT needs one, so it is not listed; on a GPU without the 8-bit kernels `high` and `turbo` run exact attention, and `high` on a bf16 DiT is refused) and `tier_reasons` (for each tier, what it would run or why it is refused).
 - `text_encoder`: `precision` (`"bf16"`, `"int8"` or `"w4a8"`) and `quantization`.
-- `lora`: `base_model` (the metadata, `""` when absent), `adapter_types` (`"lora"`, `"loha"`, `"lokr"`, `"full"`), `lora_rank` (the largest low-rank rank), `lora_adapters` (on the DiT) and `lora_unknown_keys`. A LoRA none of whose tensors applies to the MOSS-Image DiT is `unknown`.
+- `lora`: `base_model` (the metadata, `""` when absent), `adapter_types` (`"lora"`, `"loha"`, `"lokr"`, `"full"`), `lora_rank` (the largest low-rank rank), `lora_adapters` (on the DiT) and `lora_unknown_keys`. A file in the LoRA naming conventions that the LoRA reader refuses (a LoRA for another model, a malformed one) is a `lora` with `loadable` false and the reader's message as `note`.
 - `control_adapter`: `control_kinds` (in channel order: exactly the strings `generate`'s `control.images[].kind` takes) and the `lora` fields of its LoRA part.
 
-A file the engine cannot use is a result (`unknown` or `loadable` false), not an error. Errors: `invalid_params` for a missing or empty `path`, unknown params, and a path that is not a regular file (a directory, a device: never opened); `io` for a file that does not exist or cannot be read.
+A file the engine cannot use is a result (`unknown` or `loadable` false), not an error. Errors: `invalid_params` for a missing or empty `path`, unknown params, and a path that is not a regular file (a directory, a device, a pipe: opened without blocking and never read); `io` for a file that does not exist or cannot be read (the system's reason); `busy` beyond two running inspects.
+
+The result depends only on the file's content and the engine version (`hello`'s `version`), not on the GPU: a launcher may cache it per file (path, size, modification time) and `version`.
 
 ### `unload`
 
@@ -450,7 +452,7 @@ send({"id": 3, "method": "shutdown"})
 `server_protocol` covers:
 - `hello` (the capabilities, `values` and `probe.cublaslt` included), `status`, and idle `cancel` / `unload`
 - every name in `hello`'s `values` passing the server's validation (`load`'s to the engine's own check, `generate`'s to `no_engine`), and a name outside it refused with a message that lists exactly those names
-- `inspect` without an engine: a bf16 DiT (precision, quantization, tiers and their reasons), a LoRA with `base_model`, a control adapter whose `control_kinds` `generate` accepts, an oversized header and a GGUF file as results; a missing file (`io`), a directory, a missing or empty `path` and an unknown param (`invalid_params`)
+- `inspect` without an engine: a bf16 DiT (precision, quantization, tiers and their reasons), a LoRA with `base_model`, a control adapter whose `control_kinds` `generate` accepts, an oversized header and a GGUF file as results; a missing file (`io`), a directory, a missing or empty `path` and an unknown param (`invalid_params`); eight inspects, a `status` and a `shutdown` sent at once: every request answered exactly once, each inspect with its result or `busy`, all before `shutdown`'s answer
 - malformed input of every kind, unknown methods and params (an unknown or non-string `block_path` included), and NUL in strings
 - `load` errors mapped from engine statuses
 - the P6 `load` params: bad `tier` / `attention` names (`"q8"` and `"auto"` included) and types, every valid name, missing component files

@@ -43,8 +43,9 @@ if(_mi_nvfp4_sm120a)
     target_compile_options(mossinfer_nvfp4_sm120a PRIVATE --expt-relaxed-constexpr -lineinfo -diag-suppress=20012
                            ${MOSSINFER_CUDA_HOST_WARN})
     target_sources(mossinfer_core PRIVATE $<TARGET_OBJECTS:mossinfer_nvfp4_sm120a>)
-    set_property(SOURCE ${CMAKE_SOURCE_DIR}/src/kernels/nvfp4/nvfp4.cpp APPEND PROPERTY COMPILE_DEFINITIONS
-                 MOSSINFER_HAVE_NVFP4_SM120A)
+    # src/api/file_inspect.cpp: mi_inspect_file() judges NVFP4 files with the kernels this build has.
+    set_property(SOURCE ${CMAKE_SOURCE_DIR}/src/kernels/nvfp4/nvfp4.cpp ${CMAKE_SOURCE_DIR}/src/api/file_inspect.cpp
+                 APPEND PROPERTY COMPILE_DEFINITIONS MOSSINFER_HAVE_NVFP4_SM120A)
     # Each of these CUTLASS 3.x / CuTe instantiations needs ~5.5 GB of RAM to compile: at most two at a time under
     # Ninja (16 GB CI runners); other generators ignore job pools.
     set_property(GLOBAL APPEND PROPERTY JOB_POOLS mossinfer_nvfp4=2)

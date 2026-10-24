@@ -75,7 +75,7 @@ These are designed and partly built. The launcher can prepare for them now (see 
 | Server output other than PNG | not supported |
 | Progress inside a DiT load | not supported: a DiT load is one step, so `fraction` holds still while it runs and moves on at the next phase |
 | Inspecting a folder | not supported: `inspect` takes one file; a bundle folder is checked by `load` |
-| A LoRA for another model as a LoRA | not supported: `inspect` reports a file none of whose tensors applies to the MOSS-Image DiT as `unknown`, with the DiT check's note (`found a LoRA`) |
+| LoRAs for other models | not supported: `inspect` reports a file in the LoRA naming conventions none of whose tensors applies to the MOSS-Image DiT as a LoRA with `loadable` false, and the LoRA reader's reason as its note |
 
 ## Supported models
 
@@ -97,7 +97,7 @@ hf download OpenMOSS-Team/MOSS-Image-SFT  --revision 2c7954437269461767f533b0068
 - **How the engine checks.** It identifies a model by its architecture, from configs and safetensors headers only (no hashing): the folder's `transformer/config.json`, `text_encoder/config.json` and `vae/config.json`, and the tensor names and shapes of the DiT and text-encoder files. Anything else fails the first generation with `MI_ERR_MODEL` (server: `model`), and `moss-infer index` refuses it too. The message names what was found, e.g.: `MOSS-Image/x is not a supported MOSS-Image model (found transformer num_layers 40 (MOSS-Image: 42)). Supported: OpenMOSS-Team/MOSS-Image-Base and -SFT; see docs/integration.md#supported-models`. A folder without `transformer/config.json` or `text_encoder/config.json` is reported as incomplete (`… (incomplete download, or not the model folder?)`), also `MI_ERR_MODEL`. A LoRA, control adapter or distill bundle file given as the DiT or text encoder is named as such.
 
 **Community files verified during 1.0/1.1 development.** Files loaded next to an official folder. The last column names the run:
-- **E24, E25:** the RTX 5090 runs in `docs/experiment-log.md`, on pre-release commits `211ef35` and `1b141ce` (ancestors of v1.0.0); images generated end to end.
+- **E24, E25:** RTX 5090 runs on pre-release commits `211ef35` and `1b141ce` (ancestors of v1.0.0); images generated end to end.
 - **4090L:** RTX 4090 Laptop, the 1.1 development tree (2026-10-23); images generated end to end.
 - **Tests:** the GPU test suite loads the file and checks its results against reference values.
 

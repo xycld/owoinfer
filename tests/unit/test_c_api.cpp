@@ -32,6 +32,7 @@
 #include "backend/cuda_libs.h"
 #include "cuda_context_check.h"
 #include "models/lora/lora.h"
+#include "models/qwen35_text/quant_text_model.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/png_writer.h"
 #include "pipeline/report_json.h"
@@ -650,6 +651,17 @@ TEST(CApi, GenerationFromAPipelineResult) {
   const mi::api::Generation g = mi::api::to_generation(q, copy, true);
   EXPECT_EQ(g.tier.text_encoder_precision, MI_PRECISION_BF16);
   EXPECT_EQ(g.tier.dit_precision, MI_PRECISION_BF16);
+  // te_precision is qwen35_text::precision_name() of the encoder that ran: each maps to its mi_precision.
+  for (const auto& [p, want] : {std::pair{mi::qwen35_text::Precision::kBF16, MI_PRECISION_BF16},
+                                std::pair{mi::qwen35_text::Precision::kInt8, MI_PRECISION_INT8},
+                                std::pair{mi::qwen35_text::Precision::kW4A8, MI_PRECISION_W4A8}}) {
+    copy = r;
+    copy.te_precision = mi::qwen35_text::precision_name(p);
+    EXPECT_EQ(mi::api::to_generation(q, copy, true).tier.text_encoder_precision, want) << copy.te_precision;
+    EXPECT_EQ(mi::api::to_precision(p), want);
+  }
+  EXPECT_EQ(mi::api::to_precision(mi::planner::Precision::kInt4), MI_PRECISION_W4A4);
+  EXPECT_EQ(mi::api::to_precision(mi::planner::Precision::kInt8), MI_PRECISION_INT8);
   // Reference needs no certificate: certified, also in the default decision of a generation cancelled before its tier
   // was resolved.
   mi::pipeline::Result early;
