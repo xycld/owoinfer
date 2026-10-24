@@ -100,8 +100,6 @@ std::uint64_t regular_file_bytes(const fs::path& path) {
                                                 ? std::string("no such file")
                                                 : std::system_category().message(static_cast<int>(e))));
   };
-  // util::open_regular_file refuses the \\.\ device namespace unopened; \\?\GLOBALROOT\ paths name devices too.
-  if (path.native().starts_with(L"\\\\?\\GLOBALROOT")) throw not_regular();
   void* handle = nullptr;
   const util::OpenStatus status = util::open_regular_file(path, FILE_ATTRIBUTE_NORMAL, handle);
   if (status == util::OpenStatus::kNotRegular) throw not_regular();
@@ -158,11 +156,11 @@ bool inspect_lora(const lora::LoraSpec& spec, FileInspection& r) {
 // pipeline::inspect_dit_file, as the pipeline loads a DiT file, without the device: NVFP4 linears are judged for the
 // best device (an RTX 50) with this build's kernels; the tiers are planner::resolve_tier's verdicts, with every
 // attention kernel available.
-void inspect_dit(const fs::path& path, FileInspection& r) {
+void inspect_dit(const weights::SafetensorsFile& header, FileInspection& r) {
   r.info.kind = MI_FILE_KIND_DIT;
   std::optional<pipeline::DitFileInfo> dit;
   const auto nvfp4_refusal = [] { return moss_dit::nvfp4_unsupported_reason(12, 0, kNvfp4Kernels); };
-  if (!accepts([&] { dit.emplace(pipeline::inspect_dit_file(path, nvfp4_refusal)); }, r.note)) return;
+  if (!accepts([&] { dit.emplace(pipeline::inspect_dit_file(header, nvfp4_refusal)); }, r.note)) return;
   if (!dit->refusal.empty()) {
     r.note = dit->refusal;
     return;
@@ -248,7 +246,7 @@ FileInspection inspect_file(const fs::path& path) {
     return r;
   }
   if (dit) {
-    inspect_dit(path, r);
+    inspect_dit(*header, r);
     return r;
   }
   std::string why;
