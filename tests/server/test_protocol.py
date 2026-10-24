@@ -255,7 +255,8 @@ class CpuProtocolTest(ProtocolTestBase):
             self.assertEqual(lt["error"], "")
         else:
             self.assertEqual((lt["version"], lt["path"]), (0, ""))
-            self.assertIn("tried", lt["error"])
+            self.assertTrue(lt["error"].startswith("no usable cuBLASLt"), lt["error"])
+            self.assertRegex(lt["error"], r"rejected:|missing \(|no candidates")
         self.assertError(self.server.call("hello", {"protocol_version": 2}, id="v2"), "unsupported_protocol", "v2")
 
     def test_status_and_idle_commands_without_engine(self):

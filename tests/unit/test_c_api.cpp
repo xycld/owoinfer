@@ -1158,7 +1158,12 @@ TEST(CApi, ProbeWithoutRequiringAGpu) {
     EXPECT_STREQ(info.cublaslt_source, "");
     EXPECT_EQ(info.cublaslt_version, 0);
     EXPECT_STREQ(info.cublaslt_path, "");
-    EXPECT_NE(std::string(info.cublaslt_error).find("tried"), std::string::npos) << info.cublaslt_error;
+    // The search's message names every candidate: rejected ones with the reason, missing ones by path.
+    const std::string err = info.cublaslt_error;
+    EXPECT_EQ(err.rfind("no usable cuBLASLt", 0), 0u) << err;
+    EXPECT_TRUE(err.find("rejected:") != std::string::npos || err.find("missing (") != std::string::npos ||
+                err.find("no candidates") != std::string::npos)
+        << err;
   }
   std::printf("[c_api] cuBLASLt: '%s' %d %s%s\n", info.cublaslt_source, info.cublaslt_version, info.cublaslt_path,
               info.cublaslt_error);
