@@ -101,6 +101,7 @@ The table will be verified again on the RTX 5090 before 1.1 ships. The revision 
 | Repository (revision) | File | What it is | How it loads | Verified by |
 |---|---|---|---|---|
 | `Comfy-Org/MOSS-Image` (`24147db`) | `diffusion_models/moss_image_sft_int8_convrot.safetensors` | SFT DiT, INT8 ConvRot | `dit_file`, tier `high` | E25, 4090L |
+| `Comfy-Org/MOSS-Image` (`24147db`) | `diffusion_models/moss_image_base_int8_convrot.safetensors` | base DiT, INT8 ConvRot | `dit_file`, tier `high` | 5090 certification (sm_120) |
 | `Comfy-Org/MOSS-Image` (`24147db`) | `text_encoders/qwen3.5_9b_int8_convrot.safetensors` | text encoder, INT8 ConvRot | `text_encoder_file` | 4090L, tests |
 | `Comfy-Org/MOSS-Image` (`24147db`) | `text_encoders/qwen3.5_9b_w4a8_gptq.safetensors` | text encoder, W4A8 GPTQ | `text_encoder_file` | 4090L, tests |
 | `Comfy-Org/MOSS-Image` (`24147db`) | `vae/flux2-vae.safetensors` | full FLUX.2 VAE (decoder and encoder) | `vae_file` | 4090L, tests |
@@ -283,8 +284,9 @@ Packages install these certificates to `share/mossinfer/quality_certs/`. Each on
 |---|---|---|---|
 | RTX 50 series (sm_120) | SFT bundle, bf16 `transformer/` | `high`: bf16 weights, 8-bit attention (q8_fp16 or q8_fp8) | cu13 full, bundled cuBLASLt 13.6.0 |
 | RTX 50 series (sm_120) | Comfy-Org `moss_image_sft_int8_convrot.safetensors` | `high`: INT8 GEMMs with exact, q8_fp16 or q8_fp8 attention | cu13 full, bundled cuBLASLt 13.6.0 |
+| RTX 50 series (sm_120) | Comfy-Org `moss_image_base_int8_convrot.safetensors` | `high`: INT8 GEMMs with exact or q8_fp8 attention | cu13 full, bundled cuBLASLt 13.6.0 |
 
-- **Other files:** the base model's INT8 file is not certified yet. Neither are INT4 files: Turbo has to be chosen explicitly.
+- **Other files and configurations:** the base model's bf16 bundle is not certified with 8-bit attention, and its INT8 file not with q8_fp16 attention. INT4 files are not certified either: Turbo has to be chosen explicitly.
 - **Other packages:** the cu12 package bundles cuBLASLt 12.8, and a system copy may be any version. Neither carries an sm_120 certificate, so `auto` runs Reference there.
 - **Other GPUs:** RTX 40 and 30 series certificates are planned.
 - **How they're made:** 23 evaluation prompts are rendered at the same seeds as our bf16 engine and compared with it and with the official images. The gates and their limits are in `src/pipeline/quality_cert.h`, and the engine refuses a certificate that doesn't meet them.
