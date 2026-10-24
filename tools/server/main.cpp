@@ -843,6 +843,8 @@ class Server {
     job_ = std::make_unique<Job>();
     job_->id = id;
     job_->kind = kind;
+    // 0 until the first progress event; null throughout with a library without the whole-job fields.
+    if ((mi_capabilities() & MI_CAP_PROGRESS_FRACTION) == 0) job_->fraction.store(-1.0);
     w->job = job_.get();
     w->out = &out_;
     mi_gen_params& g = w->params;

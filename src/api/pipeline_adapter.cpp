@@ -1000,7 +1000,7 @@ Generation PipelineAdapter::generate(const mi_gen_params& params, const std::ato
   pipeline::Result r =
       cold_on_throw(impl_->held, [&] { return model_errors([&] { return impl_->pipe->generate(q, control); }); });
   impl_->hardware = r.hardware;
-  impl_->held.job_done(r.plan, shape.merge_key, r.cancelled, r.memory.arena_creations, r.dit_load.source);
+  impl_->held.job_done(r.plan, shape, false, r.cancelled, r.memory.arena_creations, r.dit_load.source);
   return to_generation(q, r, params.include_prompts != 0);
 }
 
@@ -1041,7 +1041,7 @@ Generation PipelineAdapter::preload(const mi_gen_params& params, const std::atom
   pipeline::Result r =
       cold_on_throw(impl_->held, [&] { return model_errors([&] { return impl_->pipe->preload(options); }); });
   impl_->hardware = r.hardware;
-  impl_->held.job_done(r.plan, shape.merge_key, r.cancelled, r.memory.arena_creations, r.dit_load.source);
+  impl_->held.job_done(r.plan, shape, true, r.cancelled, r.memory.arena_creations, r.dit_load.source);
   return to_generation(q, r, false);
 }
 

@@ -17,6 +17,9 @@
 // Known gaps: the compute of an image encode (img2img, inpainting, control images, the hires fix's upscale) is not
 // priced, only the VAE encoder's load; and the rates lag by one job: a job is priced with the rates of the job before
 // it (the first job of an engine with the cached hardware profile, or the planner's defaults before the first probe).
+// The VAE decoder's and encoder's loads are priced only when the record is cold (a warm engine that drops them for a
+// larger arena reloads them unpriced). A LoRA change is priced as a full DiT load, although merged adapters often switch
+// in place and side branches need no load.
 #pragma once
 
 #include <cstddef>
@@ -41,35 +44,6 @@ struct ProgressSegment {
   bool optional = false;
 };
 
-// What the engine holds when a job starts, as far as the adapter can tell (the pipeline reports no residency between
-// calls): warm (the last job's models are loaded) or cold, and the host-side copies.
-struct HeldModels {
-  // A generate or preload finished since the engine was created or last released, and nothing failed or dropped the
-  // models since: its plan's models are loaded, the DiT with last_dit's residency and the runtime LoRAs of
-  // last_merge_key.
-  bool warm = false;
-  planner::DitPlan last_dit;
-  std::string last_merge_key;
-  bool te_host_copy = false;    // a host-resident text encoder's copy (host memory: survives a release that keeps it)
-  bool dit_host_copy = false;   // a soft unload kept the DiT's weight files in pinned RAM (the next load reads it)
-  bool dit_files_read = false;  // this engine read the DiT's files before: the page cache likely holds them
-
-  // A generate (or preload) returned. Not cancelled: warm, with this plan's DiT and `merge_key`. Cancelled after creating
-  // an arena: cold (what it loaded is unknown). `dit_load_source`: Result::dit_load.source ("files", "host_copy", "").
-  void job_done(const planner::ExecutionPlan& plan, const std::string& merge_key, bool cancelled, int arena_creations,
-                std::string_view dit_load_source);
-  // The pipeline call threw: what is loaded is unknown.
-  void job_failed() { warm = false; }
-  // A release that was not cancelled: nothing stays on the device; the host copies are the release's.
-  void released(bool kept_dit_host_copy, bool kept_te_host_copy);
-};
-
-// Weight-file bytes of the models whose loads the plan does not size (the DiT's are the plan's).
-struct ModelBytes {
-  std::uint64_t text_encoder = 0;
-  std::uint64_t vae = 0;  // the VAE file (encoder and decoder): each load is priced at it
-};
-
 // The request's passes and adapters as the progress sees them.
 struct JobShape {
   int total_steps = 0;           // both passes (pipeline::schedule_steps)
@@ -82,10 +56,48 @@ struct JobShape {
   std::string merge_key;         // the runtime LoRAs and the control adapter's LoRA part: paths and strengths
 };
 
+// What the engine holds when a job starts, as far as the adapter can tell (the pipeline reports no residency between
+// calls): warm (the last job's models are loaded) or cold, the DiT, a VRAM-resident text encoder, and the host-side
+// copies.
+struct HeldModels {
+  // A generate or preload finished since the engine was created or last released, and nothing failed or dropped the
+  // models since: its plan's VAE models are loaded.
+  bool warm = false;
+  // The DiT is loaded with last_dit's residency and the runtime LoRAs of last_merge_key: set by a finished job that
+  // used the DiT (not one without a sampling step, nor a preload that left it to the generation).
+  bool dit = false;
+  planner::DitPlan last_dit;
+  std::string last_merge_key;
+  bool te_vram = false;         // a VRAM-resident text encoder, loaded by a generation that ran it (never by a preload)
+  bool te_host_copy = false;    // a host-resident text encoder's copy (host memory: survives a release that keeps it)
+  bool dit_host_copy = false;   // a soft unload kept the DiT's weight files in pinned RAM (the next load reads it)
+  bool dit_files_read = false;  // this engine read the DiT's files before: the page cache likely holds them
+
+  // A generate (`preload` false) or preload of `shape` returned. Not cancelled: warm, with this plan's DiT when the job
+  // used it. A new arena (arena_creations > 0) dropped the device models: a cancelled job leaves the record cold. A
+  // cancelled job that used another DiT residency or LoRA stack may have dropped the held DiT. `dit_load_source`:
+  // Result::dit_load.source ("files", "host_copy", "").
+  void job_done(const planner::ExecutionPlan& plan, const JobShape& shape, bool preload, bool cancelled,
+                int arena_creations, std::string_view dit_load_source);
+  // The pipeline call threw: what is loaded is unknown.
+  void job_failed() { forget_device(); }
+  // A release that was not cancelled: nothing stays on the device; the host copies are the release's.
+  void released(bool kept_dit_host_copy, bool kept_te_host_copy);
+
+ private:
+  void forget_device() { warm = dit = te_vram = false; }
+};
+
+// Weight-file bytes of the models whose loads the plan does not size (the DiT's are the plan's).
+struct ModelBytes {
+  std::uint64_t text_encoder = 0;
+  std::uint64_t vae = 0;  // the VAE file (encoder and decoder): each load is priced at it
+};
+
 // Seconds to load each model the plan needs and `held` lacks (0 when it is loaded, or the plan does not use it).
 struct LoadEstimates {
   double text_encoder = 0;  // the host or VRAM copy of a resident text encoder (a streamed one is the plan's)
-  // The DiT is loaded with this plan's residency and LoRAs (held.warm and both match); else `dit` is its load.
+  // The DiT is loaded with this plan's residency and LoRAs (held.dit and both match); else `dit` is its load.
   bool dit_held = false;
   double dit = 0;
   double vae_decoder = 0;

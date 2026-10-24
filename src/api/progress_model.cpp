@@ -13,8 +13,12 @@ using planner::DitResidency;
 
 double bytes_per_s(double gbps) { return std::max(1e-3, gbps) * 1e9; }
 
+// The planner's keep_dit test: the residency, and what parks or streams.
 bool same_residency(const DitPlan& a, const DitPlan& b) {
   if (a.residency != b.residency) return false;
+  if (a.residency == DitResidency::kParked) {
+    return a.park_for_text_encoder == b.park_for_text_encoder && a.park_for_decode == b.park_for_decode;
+  }
   if (a.residency != DitResidency::kStreamed) return true;
   return a.resident_blocks == b.resident_blocks && a.buffers == b.buffers && a.source == b.source;
 }
@@ -42,22 +46,33 @@ double dit_load_seconds(const planner::ExecutionPlan& plan, const HeldModels& he
 
 }  // namespace
 
-void HeldModels::job_done(const planner::ExecutionPlan& plan, const std::string& merge_key, bool cancelled,
+void HeldModels::job_done(const planner::ExecutionPlan& plan, const JobShape& shape, bool preload, bool cancelled,
                           int arena_creations, std::string_view dit_load_source) {
+  const bool uses_dit = shape.total_steps > 0 && !(preload && plan.dit.park_for_text_encoder);
+  if (arena_creations > 0) {
+    // A new arena dropped every device model; the job loads again what it uses.
+    if (cancelled) forget_device();
+    te_vram = false;
+    if (!uses_dit) dit = false;
+  }
   if (!cancelled) {
     warm = true;
-    last_dit = plan.dit;
-    last_merge_key = merge_key;
+    if (uses_dit) {
+      dit = true;
+      last_dit = plan.dit;
+      last_merge_key = shape.merge_key;
+    }
     if (plan.te.run && plan.te.residency == planner::TeResidency::kHostResident) te_host_copy = true;
-  } else if (arena_creations > 0) {
-    warm = false;  // a new arena dropped the models, and the cancel left unknown which came back
+    if (!preload && plan.te.run && plan.te.residency == planner::TeResidency::kVramResident) te_vram = true;
+  } else if (uses_dit && (!same_residency(last_dit, plan.dit) || last_merge_key != shape.merge_key)) {
+    dit = false;  // the job may have dropped the held DiT for its own before the cancel
   }
   if (dit_load_source == "files") dit_files_read = true;
   if (dit_load_source == "host_copy") dit_host_copy = false;  // the copy is freed once it served the load
 }
 
 void HeldModels::released(bool kept_dit_host_copy, bool kept_te_host_copy) {
-  warm = false;
+  forget_device();
   dit_host_copy = kept_dit_host_copy;
   te_host_copy = kept_te_host_copy;
 }
@@ -71,9 +86,9 @@ LoadEstimates load_estimates(const planner::ExecutionPlan& plan, const planner::
   if (plan.te.run) {
     const double te = static_cast<double>(bytes.text_encoder);
     if (plan.te.residency == planner::TeResidency::kHostResident && !held.te_host_copy) e.text_encoder = te / cold;
-    if (plan.te.residency == planner::TeResidency::kVramResident && !held.warm) e.text_encoder = te / cold_device;
+    if (plan.te.residency == planner::TeResidency::kVramResident && !held.te_vram) e.text_encoder = te / cold_device;
   }
-  e.dit_held = held.warm && same_residency(held.last_dit, plan.dit) && held.last_merge_key == shape.merge_key;
+  e.dit_held = held.dit && same_residency(held.last_dit, plan.dit) && held.last_merge_key == shape.merge_key;
   if (shape.total_steps > 0 && !e.dit_held) {
     const double device = static_cast<double>(plan.dit.device_bytes);
     if (held.dit_host_copy) {
