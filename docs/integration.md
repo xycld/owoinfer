@@ -21,7 +21,7 @@ Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what
 | Models | MOSS-Image Base and SFT only: the official Hugging Face folders (bf16), read in place, and fine-tunes with the same architecture; other models are refused when they load. See [Supported models](#supported-models). |
 | Component model files | a single-file DiT, text encoder or VAE next to the bundle folder: ComfyUI and community files, INT8 ConvRot and INT4 ConvRot DiT, INT8 ConvRot and W4A8 text encoder (`dit_file`, `text_encoder_file`, `vae_file`) |
 | Generation | text-to-image with the official app's parameters: prompt, negative prompt, size, steps, CFG, shift, seed, skip layers, skip-layer guidance |
-| Quality tier | `auto` (default: the fastest configuration with a quality certificate; 1.0 ships no certificates, so without one of your own the bf16 bundle runs Reference, and quantized files run their own GEMMs with exact attention, uncertified), `reference` (bf16, exact), `high` (the loaded weights plus 8-bit attention), `turbo` (an INT4 DiT file, chosen explicitly); the tier that ran is reported |
+| Quality tier | `auto` (default: the fastest configuration with a quality certificate; see [Shipped certificates](#shipped-certificates) for what the packages certify. Without a certificate, the bf16 bundle runs Reference and quantized files run their own GEMMs with exact attention, uncertified), `reference` (bf16, exact), `high` (the loaded weights plus 8-bit attention), `turbo` (an INT4 DiT file, chosen explicitly); the tier that ran is reported |
 | Image input | img2img (an init image and a denoise strength) and inpainting (a mask), with crop / fit / stretch resizing; pixels (library) or PNG / JPEG files (both surfaces) |
 | Hires fix | a second pass at a larger size from the first pass upscaled, with its own strength and steps |
 | Distill bundles | few-step distilled checkpoints shipped as a bundle folder (time embedding, LoRA, data-space sampler parameters), applied per engine and per generation |
@@ -273,7 +273,21 @@ The engine reads the official Hugging Face model folders in place, with no conve
 - **The folder can be read-only.** The engine writes nothing into it. An optional `moss.mossidx` index, made with `moss-infer index <folder>`, makes the first load slightly faster. Without one, the engine builds the index in memory.
 - **To save disk with both models,** hard-link SFT's `text_encoder/*.safetensors` and `vae/*.safetensors` to Base's. They are byte-identical.
 - **ComfyUI and quantized files** load as component files next to the bundle folder: `dit_file` (INT8 ConvRot, INT4 ConvRot, mixed INT8/bf16 or bf16 DiT), `text_encoder_file` (INT8 ConvRot or W4A8) and `vae_file`. The tokenizer and configs still come from the folder. A file as the model path itself (`MI_MODEL_FORMAT_COMFYUI`, or a file with `MI_MODEL_FORMAT_AUTO`) returns `MI_ERR_NOT_SUPPORTED`, and the server answers `not_supported`, while `MI_CAP_COMFYUI_MODELS` is unset.
-- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 DiT runs only under `turbo`, which must be chosen explicitly: offer it for INT4 files, and only for them. A quality certificate lets `auto` pick a lossy configuration. Certificates are searched in the engine's `certificate_dirs`, then `<cache_dir>/quality_certs/`, then the DiT's sidecar `<dit>.mossinfer-cert.json`, then the install tree's `share/mossinfer/quality_certs/`; the first usable one wins, and 1.0 ships none; the report's `quality` object says which one ran and whether it was certified.
+- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 DiT runs only under `turbo`, which must be chosen explicitly: offer it for INT4 files, and only for them. A quality certificate lets `auto` pick a lossy configuration. Certificates are searched in the engine's `certificate_dirs`, then `<cache_dir>/quality_certs/`, then the DiT's sidecar `<dit>.mossinfer-cert.json`, then the install tree's `share/mossinfer/quality_certs/`; the first usable one wins (see [Shipped certificates](#shipped-certificates)); the report's `quality` object says which one ran and whether it was certified.
+
+### Shipped certificates
+
+Packages install these certificates to `share/mossinfer/quality_certs/`. Each one holds only for its GPU class, the exact model file and the cuBLASLt version it was measured with.
+
+| GPU | Model file | Configuration under `auto` | Package |
+|---|---|---|---|
+| RTX 50 series (sm_120) | SFT bundle, bf16 `transformer/` | `high`: bf16 weights, 8-bit attention (q8_fp16 or q8_fp8) | cu13 full, bundled cuBLASLt 13.6.0 |
+| RTX 50 series (sm_120) | Comfy-Org `moss_image_sft_int8_convrot.safetensors` | `high`: INT8 GEMMs with exact, q8_fp16 or q8_fp8 attention | cu13 full, bundled cuBLASLt 13.6.0 |
+
+- **Other files:** the base model's INT8 file is not certified yet. Neither are INT4 files: Turbo has to be chosen explicitly.
+- **Other packages:** the cu12 package bundles cuBLASLt 12.8, and a system copy may be any version. Neither carries an sm_120 certificate, so `auto` runs Reference there.
+- **Other GPUs:** RTX 40 and 30 series certificates are planned.
+- **How they're made:** 23 evaluation prompts are rendered at the same seeds as our bf16 engine and compared with it and with the official images. The gates and their limits are in `src/pipeline/quality_cert.h`, and the engine refuses a certificate that doesn't meet them.
 
 ## Picking the build: cu12 or cu13
 
