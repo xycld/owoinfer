@@ -1424,12 +1424,13 @@ TEST(PipelineQuality, AutoUsesACertificateUnlessLorasAreActive) {
     gt.op = gs.op;
     gt.threshold = gs.limit;
     gt.value = gs.op == GateOp::kLe ? gs.limit * 0.5 : (gs.limit > 0 ? gs.limit + 0.5 * (1 - gs.limit) : gs.limit * 0.5);
-    if (gt.name.ends_with(".drift_count")) gt.value = std::floor(gt.value);  // whole prompts
+    if (gt.name.ends_with("_count")) gt.value = std::floor(gt.value);  // whole prompts
     gt.pass = true;
     c.gates.push_back(gt);
   }
   c.passed = true;
-  c.info = {{"same_seed.ocr_prompts", 3}, {"reference.ocr_prompts", 3}, {"official_images", 23}, {"drift_lpips", mi::pipeline::kDriftLpips}};
+  c.info = {{"same_seed.ocr_prompts", 3}, {"reference.ocr_prompts", 3}, {"official_images", 23}, {"drift_lpips", mi::pipeline::kDriftLpips},
+            {"drift_dino", mi::pipeline::kDriftDino}};
   ASSERT_EQ(validate_certificate(c), "");
   fs::create_directories(dir.path() / "cache" / "quality_certs");
   ASSERT_TRUE(write_certificate_file(dir.path() / "cache" / "quality_certs" / "fixture.json", {c}));

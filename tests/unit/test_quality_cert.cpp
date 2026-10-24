@@ -62,7 +62,7 @@ std::vector<Gate> gates_for(QualityTier tier, bool fail_first = false, bool gate
     g.op = s.op;
     g.threshold = s.limit;
     g.value = s.op == GateOp::kLe ? s.limit * 0.5 : (s.limit > 0 ? s.limit + 0.5 * (1 - s.limit) : s.limit * 0.5);
-    if (g.name.ends_with(".drift_count")) g.value = std::floor(g.value);  // whole prompts
+    if (g.name.ends_with("_count")) g.value = std::floor(g.value);  // whole prompts
     if (fail_first && out.empty()) g.value = s.op == GateOp::kLe ? s.limit + 1 : s.limit - 0.01;
     g.pass = s.op == GateOp::kLe ? g.value <= g.threshold : g.value >= g.threshold;
     out.push_back(g);
@@ -90,7 +90,7 @@ Certificate sample() {
   c.gates[1].value = 1.0 / 30.0;  // same_seed.lpips_mean; not exactly representable in decimal: must round-trip
   c.passed = true;
   c.info = {{"same_seed.ocr_prompts", 13}, {"reference.ocr_prompts", 13}, {"official_images", 23}, {"drift_lpips", kDriftLpips},
-            {"noise.bf16_vs_official.lpips_mean", 0.1 + 0.2}, {"tiny", 1e-300}, {"neg", -2.5}};
+            {"drift_dino", kDriftDino}, {"noise.bf16_vs_official.lpips_mean", 0.1 + 0.2}, {"tiny", 1e-300}, {"neg", -2.5}};
   c.tool = "certify.py 3 \"quoted\" \xE2\x9C\x93";
   return c;
 }
@@ -185,16 +185,17 @@ TEST(QualityCert, GateTables) {
   };
   using L = std::vector<std::pair<std::string, double>>;
   const L det = {{"determinism.mismatches", 0.0}};
-  const L same_seed = {{"determinism.mismatches", 0.0}, {"same_seed.lpips_mean", 0.12}, {"same_seed.drift_count", 3.0},
-                       {"same_seed.lpips_max", 0.45},     {"same_seed.dino_min", 0.90},   {"same_seed.ocr_sim_delta", -0.05}};
+  const L same_seed = {{"determinism.mismatches", 0.0}, {"same_seed.lpips_mean", 0.12}, {"same_seed.drift_count", 4.0},
+                       {"same_seed.lpips_max", 0.45},     {"same_seed.dino_min", 0.70},   {"same_seed.dino_mean", 0.90},
+                       {"same_seed.ocr_sim_delta", -0.05}};
   // T = 0.088 (k - 1): the tier's tolerance, independent of n; then the noise bound and drift's share.
   const auto reference = [](double k, int n) {
-    L out{{"reference.lpips_excess", 0.088 * (k - 1) + 3 * 0.0367 / std::sqrt(n) + 4.0 / 92 * k * 0.092},
+    L out{{"reference.lpips_excess", 0.088 * (k - 1) + 3 * 0.0367 / std::sqrt(n) + 3.0 / 36 * 0.092},
           {"reference.lpips_excess_kth", 0.092 * k},
           {"reference.lpips_excess_top", std::min(0.25 * k, 0.45)},
-          {"reference.dino_min", k == 3.0 ? 0.775 : 0.90}};
-    if (k == 1.0) out.emplace_back("reference.dino_mean", 0.925);  // the other tiers' mean limits lie at or below the floor
-    out.emplace_back("reference.drift_count", n == 23 ? 3.0 : 1.0);
+          {"reference.dino_min", 0.70},
+          {"reference.dino_mean", 1 - 0.075 * k},  // AC21: 0.925 / 0.8875 / 0.775, every tier
+          {"reference.outside_count", n == 23 ? 4.0 : 1.0}};
     return out;
   };
   const auto with = [](L a, const L& b) {
@@ -216,18 +217,19 @@ TEST(QualityCert, GateTables) {
     near(limits(QualityTier::kTurbo, true, n), with(with(det, reference(3.0, n)), {{"reference.ocr_sim_delta", -0.10}}));
     near(limits(QualityTier::kTurbo, false, n), with(with(det, reference(3.0, n)), {{"same_seed.ocr_sim_delta", -0.10}}));
   }
-  EXPECT_NEAR(required_gates(QualityTier::kHigh, true, 5)[6].limit, 0.0992, 1e-4);   // High, SFT: the excess mean
-  EXPECT_NEAR(required_gates(QualityTier::kHigh, true, 23)[6].limit, 0.0730, 1e-4);  // High, base
-  // The tier's tolerance does not depend on n: High minus Reference at the same n is 0.044 plus drift's larger share.
+  EXPECT_NEAR(required_gates(QualityTier::kHigh, true, 5)[7].limit, 0.1009, 1e-4);   // High, SFT: the excess mean
+  EXPECT_NEAR(required_gates(QualityTier::kHigh, true, 23)[7].limit, 0.0746, 1e-4);  // High, base
+  EXPECT_NEAR(required_gates(QualityTier::kTurbo, true, 5)[1].limit, 0.2329, 1e-4);  // Turbo, SFT
+  // The tier's tolerance does not depend on n: High minus Reference at the same n is exactly the 0.044 tolerance.
   for (const int n : {3, 5, 23}) {
-    EXPECT_NEAR(required_gates(QualityTier::kHigh, true, n)[6].limit - required_gates(QualityTier::kReference, true, n)[6].limit,
-                0.044 + 4.0 / 92 * 0.5 * 0.092, 1e-12)
+    EXPECT_NEAR(required_gates(QualityTier::kHigh, true, n)[7].limit - required_gates(QualityTier::kReference, true, n)[7].limit,
+                0.044, 1e-12)
         << n;
   }
   L defaults;  // the default: every prompt has an official image
   for (const GateSpec& g : required_gates(QualityTier::kHigh)) defaults.emplace_back(std::string(g.name), g.limit);
   EXPECT_EQ(defaults, limits(QualityTier::kHigh, true, kCertPrompts));
-  for (const auto& [n, want] : std::vector<std::pair<int, double>>{{1, 1}, {3, 1}, {5, 1}, {12, 2}, {23, 3}}) {
+  for (const auto& [n, want] : std::vector<std::pair<int, double>>{{1, 1}, {3, 1}, {5, 1}, {12, 2}, {23, 4}}) {
     EXPECT_EQ(reference_drift_max(n), want) << n;
   }
   for (const QualityTier t : {QualityTier::kReference, QualityTier::kHigh, QualityTier::kTurbo}) {
@@ -298,7 +300,8 @@ TEST(QualityCert, RoundTripText) {
   ref.scope = CertScope{1048576, {"ab2", "euler"}, 50, 50, false};
   ref.date = "2026-01-01T00:00:00Z";
   ref.gates = gates_for(QualityTier::kReference, true, false, 3);
-  ref.info = {{"same_seed.ocr_prompts", 2}, {"reference.ocr_prompts", 2}, {"official_images", 3}, {"drift_lpips", kDriftLpips}};
+  ref.info = {{"same_seed.ocr_prompts", 2}, {"reference.ocr_prompts", 2}, {"official_images", 3}, {"drift_lpips", kDriftLpips},
+              {"drift_dino", kDriftDino}};
   ref.passed = false;
   EXPECT_EQ(validate_certificate(ref), "");
 
@@ -395,15 +398,27 @@ TEST(QualityCert, RejectsCorruptAndInconsistentDocuments) {
       {"pass flag", "\"threshold\": 0.12, \"pass\": true", "\"threshold\": 0.12, \"pass\": false"},
       {"looser threshold", "\"threshold\": 0.12,", "\"threshold\": 0.2,"},
       {"looser max", "\"threshold\": 0.45,", "\"threshold\": 0.5,"},
-      {"looser dino", "\"threshold\": 0.9,", "\"threshold\": 0.8,"},
-      {"looser drift count", "\"threshold\": 3,", "\"threshold\": 4,"},
-      {"fractional drift count", "\"value\": 1, \"op\": \"<=\", \"threshold\": 3,", "\"value\": 1.5, \"op\": \"<=\", \"threshold\": 3,"},
+      {"looser same-seed composition floor", "\"same_seed.dino_min\", \"value\": 0.85, \"op\": \">=\", \"threshold\": 0.7,",
+       "\"same_seed.dino_min\", \"value\": 0.85, \"op\": \">=\", \"threshold\": 0.6,"},
+      {"looser reference composition floor", "\"reference.dino_min\", \"value\": 0.85, \"op\": \">=\", \"threshold\": 0.7,",
+       "\"reference.dino_min\", \"value\": 0.85, \"op\": \">=\", \"threshold\": 0.6,"},
+      {"looser same-seed dino mean", "\"same_seed.dino_mean\", \"value\": 0.95, \"op\": \">=\", \"threshold\": 0.9,",
+       "\"same_seed.dino_mean\", \"value\": 0.95, \"op\": \">=\", \"threshold\": 0.85,"},
+      {"looser reference dino mean", "\"reference.dino_mean\", \"value\": 0.94375, \"op\": \">=\", \"threshold\": 0.8875,",
+       "\"reference.dino_mean\", \"value\": 0.94375, \"op\": \">=\", \"threshold\": 0.85,"},
+      {"looser drift count", "\"threshold\": 4,", "\"threshold\": 5,"},
+      {"looser outside count", "\"reference.outside_count\", \"value\": 2, \"op\": \"<=\", \"threshold\": 4,",
+       "\"reference.outside_count\", \"value\": 2, \"op\": \"<=\", \"threshold\": 5,"},
+      {"fractional outside count", "\"reference.outside_count\", \"value\": 2,", "\"reference.outside_count\", \"value\": 2.5,"},
+      {"fractional drift count", "\"value\": 2, \"op\": \"<=\", \"threshold\": 4,", "\"value\": 1.5, \"op\": \"<=\", \"threshold\": 4,"},
       {"official images missing", "\"official_images\": 23, ", ""},
       {"official images zero", "\"official_images\": 23", "\"official_images\": 0"},
       {"official images above prompts", "\"official_images\": 23", "\"official_images\": 24"},
       {"official images fractional", "\"official_images\": 23", "\"official_images\": 4.5"},
       {"drift threshold missing", "\"drift_lpips\": 0.25, ", ""},
       {"other drift threshold", "\"drift_lpips\": 0.25", "\"drift_lpips\": 0.3"},
+      {"drift dino missing", "\"drift_dino\": 0.9, ", ""},
+      {"other drift dino", "\"drift_dino\": 0.9", "\"drift_dino\": 0.85"},
       {"wrong op for gate", "\"op\": \"<=\", \"threshold\": 0.12", "\"op\": \">=\", \"threshold\": 0.12"},
       {"passed", "\"passed\": true", "\"passed\": false"},
       {"info missing", "\"info\": {", "\"infos\": {"},
@@ -447,41 +462,41 @@ TEST(QualityCert, RejectsCorruptAndInconsistentDocuments) {
       }
       c.gates.clear();
       for (const GateSpec& spec : required_gates(t, n == 23, n)) {
-        const double v = spec.name.ends_with(".drift_count") ? 0.0 : spec.op == GateOp::kLe ? spec.limit * 0.5 : spec.limit + 0.01;
+        const double v = spec.name.ends_with("_count") ? 0.0 : spec.op == GateOp::kLe ? spec.limit * 0.5 : spec.limit + 0.01;
         c.gates.push_back(Gate{std::string(spec.name), v, spec.op, spec.limit, true});
       }
       ASSERT_EQ(validate_certificate(c), "") << cert_token(t) << " " << n;
       for (std::size_t i = 0; i < c.gates.size(); ++i) {
         Certificate loose = c;
         Gate& g = loose.gates[i];
-        g.threshold = g.op == GateOp::kLe ? g.threshold + (g.name.ends_with(".drift_count") ? 1 : 0.001) : g.threshold - 0.001;
+        g.threshold = g.op == GateOp::kLe ? g.threshold + (g.name.ends_with("_count") ? 1 : 0.001) : g.threshold - 0.001;
         EXPECT_EQ(validate_certificate(loose), "gate '" + g.name + "' is looser than the tier requires") << cert_token(t) << " " << n;
       }
     }
   }
-  // The SFT set (5 official images) allows one drifted official image, not the 3 of 23.
+  // The SFT set (5 official images) allows one official image outside the envelope, not the 4 of 23.
   {
     Certificate c = sample();
     c.prompt_set_sha256 = std::string(kCertPromptSetSha256Sft);
     set_info(c, "official_images", 5);
     set_info(c, "reference.ocr_prompts", 2);
     c.gates = gates_for(QualityTier::kHigh, false, false);  // thresholds for 23 official images
-    EXPECT_EQ(validate_certificate(c), "gate 'reference.drift_count' is looser than the tier requires");
+    EXPECT_EQ(validate_certificate(c), "gate 'reference.outside_count' is looser than the tier requires");
     c.gates.clear();
     for (const GateSpec& spec : required_gates(QualityTier::kHigh, false, 5)) {
       Gate g{std::string(spec.name), spec.op == GateOp::kLe ? spec.limit * 0.5 : 0.95, spec.op, spec.limit, true};
-      if (g.name.ends_with(".drift_count")) g.value = std::floor(g.value);
+      if (g.name.ends_with("_count")) g.value = std::floor(g.value);
       if (g.name == "same_seed.ocr_sim_delta" || g.name == "reference.ocr_sim_delta") g.value = 0;
       c.gates.push_back(g);
     }
     ASSERT_EQ(validate_certificate(c), "");
-    const auto drift = std::find_if(c.gates.begin(), c.gates.end(), [](const Gate& g) { return g.name == "reference.drift_count"; });
-    ASSERT_NE(drift, c.gates.end());
-    EXPECT_EQ(drift->threshold, 1.0);
-    drift->threshold = 3;
-    EXPECT_EQ(validate_certificate(c), "gate 'reference.drift_count' is looser than the tier requires");
+    const auto outside = std::find_if(c.gates.begin(), c.gates.end(), [](const Gate& g) { return g.name == "reference.outside_count"; });
+    ASSERT_NE(outside, c.gates.end());
+    EXPECT_EQ(outside->threshold, 1.0);
+    outside->threshold = 4;
+    EXPECT_EQ(validate_certificate(c), "gate 'reference.outside_count' is looser than the tier requires");
   }
-  // Consistency of the official-image count with the prompt set, the OCR count and the drift counts.
+  // Consistency of the official-image count with the prompt set, the OCR count and the outside count.
   {
     const auto with_info = [](std::string_view sha, double official, double ref_ocr) {
       Certificate c = sample();
@@ -507,24 +522,31 @@ TEST(QualityCert, RejectsCorruptAndInconsistentDocuments) {
       }
       c.passed = std::all_of(c.gates.begin(), c.gates.end(), [](const Gate& g) { return g.pass; });
     };
-    Certificate c = sample();
+    Certificate c = sample();  // the union count may exceed the same-seed drift count (DINO outside the reference bar)
     set_gate(c, "same_seed.drift_count", 0);
-    set_gate(c, "reference.drift_count", 1);
-    EXPECT_EQ(validate_certificate(c), "gate 'reference.drift_count' exceeds the official images or the same-seed drift count");
-    set_gate(c, "same_seed.drift_count", 2);
+    set_gate(c, "reference.outside_count", 1);
     EXPECT_EQ(validate_certificate(c), "");
-    Certificate few = sample();  // a development set with 1 official image: at most 1 drifted official image
+    Certificate few = sample();  // a development set with 1 official image: at most 1 official image outside
     few.prompt_set_sha256 = std::string(64, 'a');
     set_info(few, "official_images", 1);
     set_info(few, "reference.ocr_prompts", 0);
     few.gates = gates_for(QualityTier::kHigh, false, false, 1);
     set_gate(few, "same_seed.drift_count", 3);
-    set_gate(few, "reference.drift_count", 1);
+    set_gate(few, "reference.outside_count", 1);
     EXPECT_EQ(validate_certificate(few), "");
     for (Gate& g : few.gates) {
-      if (g.name == "reference.drift_count") g.threshold = 2, g.value = 2, g.pass = true;  // looser and above 1 image
+      if (g.name == "reference.outside_count") g.value = 2, g.pass = true;  // passes its threshold, exceeds 1 image
+    }
+    few.passed = std::all_of(few.gates.begin(), few.gates.end(), [](const Gate& g) { return g.pass; });
+    for (Gate& g : few.gates) {
+      if (g.name == "reference.outside_count") g.threshold = 2;
     }
     EXPECT_NE(validate_certificate(few), "");
+    for (Gate& g : few.gates) {
+      if (g.name == "reference.outside_count") g.threshold = 1, g.pass = false;
+    }
+    few.passed = false;
+    EXPECT_EQ(validate_certificate(few), "gate 'reference.outside_count' exceeds the official images");
   }
   // Every tier requires the determinism gate, and a non-reproducible Reference tier fails the certificate.
   for (const QualityTier t : {QualityTier::kReference, QualityTier::kHigh, QualityTier::kTurbo}) {
@@ -987,6 +1009,7 @@ TEST(QualityCert, HarnessFixture) {
   // tables.json: the harness's gate limits, numerics keys and prompt-set constants.
   const mi::json::Value t = mi::json::parse(read_text(kData / "tables.json"));
   EXPECT_EQ(t.at("drift_lpips").as_double(), kDriftLpips);
+  EXPECT_EQ(t.at("drift_dino").as_double(), kDriftDino);
   EXPECT_EQ(t.at("gates").as_object().size(), 18u);
   for (const auto& [tier_name, list] : t.at("gates").as_object()) {  // "<tier>[.no_reference_ocr].n<official images>"
     const std::size_t dot = tier_name.find('.');

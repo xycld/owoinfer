@@ -830,12 +830,13 @@ mi::pipeline::Certificate cert_fixture(const fs::path& dit, mi::pipeline::Qualit
     gt.op = gs.op;
     gt.threshold = gs.limit;
     gt.value = gs.op == GateOp::kLe ? gs.limit * 0.5 : (gs.limit > 0 ? gs.limit + 0.5 * (1 - gs.limit) : gs.limit * 0.5);
-    if (gt.name.ends_with(".drift_count")) gt.value = std::floor(gt.value);  // whole prompts
+    if (gt.name.ends_with("_count")) gt.value = std::floor(gt.value);  // whole prompts
     gt.pass = true;
     c.gates.push_back(gt);
   }
   c.passed = true;
-  c.info = {{"same_seed.ocr_prompts", 3}, {"reference.ocr_prompts", 3}, {"official_images", 23}, {"drift_lpips", kDriftLpips}};
+  c.info = {{"same_seed.ocr_prompts", 3}, {"reference.ocr_prompts", 3}, {"official_images", 23}, {"drift_lpips", kDriftLpips},
+            {"drift_dino", kDriftDino}};
   return c;
 }
 

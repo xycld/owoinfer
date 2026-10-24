@@ -67,7 +67,7 @@
      "name": "same_seed.drift_count",
      "value": 1.0,
      "op": "<=",
-     "threshold": 3.0,
+     "threshold": 4.0,
      "pass": true
     },
     {
@@ -80,6 +80,13 @@
     {
      "name": "same_seed.dino_min",
      "value": 0.9312,
+     "op": ">=",
+     "threshold": 0.7,
+     "pass": true
+    },
+    {
+     "name": "same_seed.dino_mean",
+     "value": 0.9811,
      "op": ">=",
      "threshold": 0.9,
      "pass": true
@@ -95,7 +102,7 @@
      "name": "reference.lpips_excess",
      "value": 0.0081,
      "op": "<=",
-     "threshold": 0.07295743698768394,
+     "threshold": 0.0746241036543506,
      "pass": true
     },
     {
@@ -116,14 +123,21 @@
      "name": "reference.dino_min",
      "value": 0.9502,
      "op": ">=",
-     "threshold": 0.9,
+     "threshold": 0.7,
      "pass": true
     },
     {
-     "name": "reference.drift_count",
-     "value": 0.0,
+     "name": "reference.dino_mean",
+     "value": 0.9688,
+     "op": ">=",
+     "threshold": 0.8875,
+     "pass": true
+    },
+    {
+     "name": "reference.outside_count",
+     "value": 1.0,
      "op": "<=",
-     "threshold": 3.0,
+     "threshold": 4.0,
      "pass": true
     },
     {
@@ -140,6 +154,7 @@
     "reference.ocr_prompts": 13.0,
     "official_images": 23.0,
     "drift_lpips": 0.25,
+    "drift_dino": 0.9,
     "noise.bf16_vs_official.lpips_mean": 0.0461,
     "noise.bf16_repeat.lpips_mean": 0.0
    },

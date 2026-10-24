@@ -871,42 +871,46 @@ ComponentIdentity identify_component(const fs::path& path, bool hash, const fs::
 }
 
 double reference_drift_max(int official_images) {
-  return std::min(3.0, std::max(1.0, std::floor(3.0 * official_images / kCertPrompts + 0.5)));
+  return std::min(4.0, std::max(1.0, std::floor(4.0 * official_images / kCertPrompts + 0.5)));
 }
 
 std::vector<GateSpec> required_gates(QualityTier t, bool reference_ocr_gateable, int official_images) {
   // Gate schema 3; the limits come from measured noise (quality_cert.h). The certification harness writes the same
   // table, and test_quality_cert's HarnessFixture compares the two bit for bit (same operation order).
-  constexpr double kDriftMax = 3;          // drifted prompts (same-seed LPIPS above kDriftLpips) allowed in 23
+  constexpr double kDriftMax = 4;          // drifted prompts (same seed: above kDriftLpips or below kDriftDino) in 23
   constexpr double kLpipsCap = 0.45;       // same-seed per-prompt cap: beyond it a difference is not plausible drift
   constexpr double kExcessClip = 0.092;    // largest |paired excess| of a noise-equivalent render; k x this per image
   constexpr double kExcessRms = 0.0367;    // RMS paired excess of a noise-equivalent render
-  constexpr double kDriftRate = 4.0 / 92;  // measured same-seed drift rate of lossy High configurations
+  constexpr double kDriftRate = 3.0 / 36;  // noise pairs outside the envelope across GPUs
   const double k = t == QualityTier::kReference ? 1.0 : t == QualityTier::kHigh ? 1.5 : 3.0;
   const double ocr = t == QualityTier::kReference ? -0.05 : t == QualityTier::kHigh ? -0.075 : -0.10;
-  // Per-prompt DINO floor: the same subject; Turbo, judged against the official images only, AC21's 1 - 0.075 x 3.
-  const double dino_floor = t == QualityTier::kTurbo ? 0.775 : 0.90;
+  constexpr double kComposition = 0.70;    // every prompt's DINO, both comparisons: the lowest noise pair minus 2 RMS
+  // The AC21 mean DINO against the official images, AC6's 0.925 scaled as a distance (0.925 / 0.8875 / 0.775).
+  const double dino_mean = 1.0 - 0.075 * k;
   const double n = std::max(1, official_images);
   // The tier's tolerance (AC21's official-image mean allowance 0.088 k beyond the Reference tier's 0.088), plus three
-  // standard errors of a noise-equivalent mean excess over n images, plus drift's expected share.
+  // standard errors of a noise-equivalent mean excess over n images, plus drift's expected share (a drifted noise
+  // render adds at most kExcessClip; loss beyond it is the tolerance's).
   const double tolerance = 0.088 * (k - 1.0);
-  const double excess = tolerance + 3.0 * kExcessRms / std::sqrt(n) + kDriftRate * k * kExcessClip;
+  const double excess = tolerance + 3.0 * kExcessRms / std::sqrt(n) + kDriftRate * kExcessClip;
   // Every tier: the Reference tier rendered every prompt twice bit-identically on the certifying machine.
   std::vector<GateSpec> out{{"determinism.mismatches", GateOp::kLe, 0.0}};
   if (t != QualityTier::kTurbo) {  // Turbo is not a same-image tier
     out.insert(out.end(), {{"same_seed.lpips_mean", GateOp::kLe, 0.12},
                            {"same_seed.drift_count", GateOp::kLe, kDriftMax},
                            {"same_seed.lpips_max", GateOp::kLe, kLpipsCap},
-                           {"same_seed.dino_min", GateOp::kGe, dino_floor},
+                           {"same_seed.dino_min", GateOp::kGe, kComposition},
+                           {"same_seed.dino_mean", GateOp::kGe, 0.90},
                            {"same_seed.ocr_sim_delta", GateOp::kGe, -0.05}});
   }
+  // The official prompts outside the noise envelope (drifted on the same seed, or below their reference DINO bar),
+  // each counted once: at most m.
   out.insert(out.end(), {{"reference.lpips_excess", GateOp::kLe, excess},
                          {"reference.lpips_excess_kth", GateOp::kLe, k * kExcessClip},
                          {"reference.lpips_excess_top", GateOp::kLe, std::min(kDriftLpips * k, kLpipsCap)},
-                         {"reference.dino_min", GateOp::kGe, dino_floor}});
-  // AC6's mean DINO limit; only the Reference tier's lies above the per-prompt floor.
-  if (1.0 - 0.075 * k > dino_floor) out.push_back({"reference.dino_mean", GateOp::kGe, 1.0 - 0.075 * k});
-  out.push_back({"reference.drift_count", GateOp::kLe, reference_drift_max(official_images)});
+                         {"reference.dino_min", GateOp::kGe, kComposition},
+                         {"reference.dino_mean", GateOp::kGe, dino_mean},
+                         {"reference.outside_count", GateOp::kLe, reference_drift_max(official_images)}});
   if (reference_ocr_gateable) {
     out.push_back({"reference.ocr_sim_delta", GateOp::kGe, ocr});
   } else if (t == QualityTier::kTurbo) {
@@ -989,6 +993,9 @@ std::string validate_certificate(const Certificate& c) {
   if (const double* d = info_value(c, "drift_lpips"); d == nullptr || *d != kDriftLpips) {
     return "info 'drift_lpips' must be the engine's drift threshold " + num(kDriftLpips);
   }
+  if (const double* d = info_value(c, "drift_dino"); d == nullptr || *d != kDriftDino) {
+    return "info 'drift_dino' must be the engine's drift threshold " + num(kDriftDino);
+  }
   if (c.gates.empty() || c.gates.size() > kMaxEntries) return "bad gate count";
   bool all = true;
   std::set<std::string_view> names;
@@ -996,7 +1003,8 @@ std::string validate_certificate(const Certificate& c) {
     if (!is_key_name(g.name)) return "bad gate name '" + g.name + "'";
     if (!names.insert(g.name).second) return "duplicate gate '" + g.name + "'";
     if (!std::isfinite(g.value) || !std::isfinite(g.threshold)) return "gate '" + g.name + "' is not finite";
-    if (g.name.ends_with(".drift_count") && (g.value < 0 || g.value != std::floor(g.value))) {
+    if ((g.name.ends_with(".drift_count") || g.name.ends_with(".outside_count")) &&
+        (g.value < 0 || g.value != std::floor(g.value))) {
       return "gate '" + g.name + "' must count whole prompts";
     }
     const bool pass = g.op == GateOp::kLe ? g.value <= g.threshold : g.value >= g.threshold;
@@ -1013,17 +1021,10 @@ std::string validate_certificate(const Certificate& c) {
                                (spec.op == GateOp::kLe ? it->threshold <= spec.limit + kTol : it->threshold >= spec.limit - kTol);
     if (!strict_enough) return "gate '" + std::string(spec.name) + "' is looser than the tier requires";
   }
-  // A drifted official image is a drifted prompt: the reference count cannot exceed the official images or the
-  // same-seed count.
-  const auto gate_value = [&](std::string_view name) -> const double* {
-    const auto it = std::find_if(c.gates.begin(), c.gates.end(), [&](const Gate& g) { return g.name == name; });
-    return it == c.gates.end() ? nullptr : &it->value;
-  };
-  if (const double* ref = gate_value("reference.drift_count")) {
-    const double* same = gate_value("same_seed.drift_count");
-    if (*ref > official_images || (same != nullptr && *ref > *same)) {
-      return "gate 'reference.drift_count' exceeds the official images or the same-seed drift count";
-    }
+  // The official prompts outside the envelope cannot exceed the official images.
+  const auto outside = std::find_if(c.gates.begin(), c.gates.end(), [](const Gate& g) { return g.name == "reference.outside_count"; });
+  if (outside != c.gates.end() && outside->value > official_images) {
+    return "gate 'reference.outside_count' exceeds the official images";
   }
   if (c.passed != all) return "'passed' disagrees with the gates";
   if (c.tool.size() > kMaxToolBytes) return "tool too long";

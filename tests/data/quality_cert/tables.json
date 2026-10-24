@@ -14,7 +14,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -23,6 +23,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -34,7 +39,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.026957436987683936
+    0.0306241036543506
    ],
    [
     "reference.lpips_excess_kth",
@@ -49,7 +54,7 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
     "reference.dino_mean",
@@ -57,9 +62,9 @@
     0.925
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "reference.ocr_sim_delta",
@@ -81,7 +86,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -90,6 +95,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -101,7 +111,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.05323821686454537
+    0.056904883531212036
    ],
    [
     "reference.lpips_excess_kth",
@@ -116,7 +126,7 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
     "reference.dino_mean",
@@ -124,7 +134,7 @@
     0.925
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
     1.0
    ],
@@ -148,7 +158,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -157,6 +167,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -168,7 +183,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.0675662646377778
+    0.07123293130444447
    ],
    [
     "reference.lpips_excess_kth",
@@ -183,7 +198,7 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
     "reference.dino_mean",
@@ -191,7 +206,7 @@
     0.925
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
     1.0
    ],
@@ -215,7 +230,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -224,6 +239,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -235,7 +255,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.026957436987683936
+    0.0306241036543506
    ],
    [
     "reference.lpips_excess_kth",
@@ -250,7 +270,7 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
     "reference.dino_mean",
@@ -258,9 +278,9 @@
     0.925
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
-    3.0
+    4.0
    ]
   ],
   "reference.no_reference_ocr.n5": [
@@ -277,7 +297,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -286,6 +306,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -297,7 +322,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.05323821686454537
+    0.056904883531212036
    ],
    [
     "reference.lpips_excess_kth",
@@ -312,7 +337,7 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
     "reference.dino_mean",
@@ -320,7 +345,7 @@
     0.925
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
     1.0
    ]
@@ -339,7 +364,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -348,6 +373,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -359,7 +389,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.0675662646377778
+    0.07123293130444447
    ],
    [
     "reference.lpips_excess_kth",
@@ -374,7 +404,7 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
     "reference.dino_mean",
@@ -382,7 +412,7 @@
     0.925
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
     1.0
    ]
@@ -401,7 +431,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -410,6 +440,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -421,7 +456,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.07295743698768394
+    0.0746241036543506
    ],
    [
     "reference.lpips_excess_kth",
@@ -436,12 +471,17 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
-    "reference.drift_count",
+    "reference.dino_mean",
+    ">=",
+    0.8875
+   ],
+   [
+    "reference.outside_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "reference.ocr_sim_delta",
@@ -463,7 +503,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -472,6 +512,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -483,7 +528,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.09923821686454537
+    0.10090488353121203
    ],
    [
     "reference.lpips_excess_kth",
@@ -498,10 +543,15 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
-    "reference.drift_count",
+    "reference.dino_mean",
+    ">=",
+    0.8875
+   ],
+   [
+    "reference.outside_count",
     "<=",
     1.0
    ],
@@ -525,7 +575,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -534,6 +584,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -545,7 +600,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.1135662646377778
+    0.11523293130444447
    ],
    [
     "reference.lpips_excess_kth",
@@ -560,10 +615,15 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
-    "reference.drift_count",
+    "reference.dino_mean",
+    ">=",
+    0.8875
+   ],
+   [
+    "reference.outside_count",
     "<=",
     1.0
    ],
@@ -587,7 +647,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -596,6 +656,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -607,7 +672,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.07295743698768394
+    0.0746241036543506
    ],
    [
     "reference.lpips_excess_kth",
@@ -622,12 +687,17 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
-    "reference.drift_count",
+    "reference.dino_mean",
+    ">=",
+    0.8875
+   ],
+   [
+    "reference.outside_count",
     "<=",
-    3.0
+    4.0
    ]
   ],
   "high.no_reference_ocr.n5": [
@@ -644,7 +714,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -653,6 +723,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -664,7 +739,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.09923821686454537
+    0.10090488353121203
    ],
    [
     "reference.lpips_excess_kth",
@@ -679,10 +754,15 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
-    "reference.drift_count",
+    "reference.dino_mean",
+    ">=",
+    0.8875
+   ],
+   [
+    "reference.outside_count",
     "<=",
     1.0
    ]
@@ -701,7 +781,7 @@
    [
     "same_seed.drift_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.lpips_max",
@@ -710,6 +790,11 @@
    ],
    [
     "same_seed.dino_min",
+    ">=",
+    0.7
+   ],
+   [
+    "same_seed.dino_mean",
     ">=",
     0.9
    ],
@@ -721,7 +806,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.1135662646377778
+    0.11523293130444447
    ],
    [
     "reference.lpips_excess_kth",
@@ -736,10 +821,15 @@
    [
     "reference.dino_min",
     ">=",
-    0.9
+    0.7
    ],
    [
-    "reference.drift_count",
+    "reference.dino_mean",
+    ">=",
+    0.8875
+   ],
+   [
+    "reference.outside_count",
     "<=",
     1.0
    ]
@@ -753,7 +843,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.21095743698768393
+    0.20662410365435058
    ],
    [
     "reference.lpips_excess_kth",
@@ -768,12 +858,17 @@
    [
     "reference.dino_min",
     ">=",
+    0.7
+   ],
+   [
+    "reference.dino_mean",
+    ">=",
     0.775
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "reference.ocr_sim_delta",
@@ -790,7 +885,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.23723821686454538
+    0.23290488353121203
    ],
    [
     "reference.lpips_excess_kth",
@@ -805,10 +900,15 @@
    [
     "reference.dino_min",
     ">=",
+    0.7
+   ],
+   [
+    "reference.dino_mean",
+    ">=",
     0.775
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
     1.0
    ],
@@ -827,7 +927,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.2515662646377778
+    0.24723293130444446
    ],
    [
     "reference.lpips_excess_kth",
@@ -842,10 +942,15 @@
    [
     "reference.dino_min",
     ">=",
+    0.7
+   ],
+   [
+    "reference.dino_mean",
+    ">=",
     0.775
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
     1.0
    ],
@@ -864,7 +969,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.21095743698768393
+    0.20662410365435058
    ],
    [
     "reference.lpips_excess_kth",
@@ -879,12 +984,17 @@
    [
     "reference.dino_min",
     ">=",
+    0.7
+   ],
+   [
+    "reference.dino_mean",
+    ">=",
     0.775
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
-    3.0
+    4.0
    ],
    [
     "same_seed.ocr_sim_delta",
@@ -901,7 +1011,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.23723821686454538
+    0.23290488353121203
    ],
    [
     "reference.lpips_excess_kth",
@@ -916,10 +1026,15 @@
    [
     "reference.dino_min",
     ">=",
+    0.7
+   ],
+   [
+    "reference.dino_mean",
+    ">=",
     0.775
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
     1.0
    ],
@@ -938,7 +1053,7 @@
    [
     "reference.lpips_excess",
     "<=",
-    0.2515662646377778
+    0.24723293130444446
    ],
    [
     "reference.lpips_excess_kth",
@@ -953,10 +1068,15 @@
    [
     "reference.dino_min",
     ">=",
+    0.7
+   ],
+   [
+    "reference.dino_mean",
+    ">=",
     0.775
    ],
    [
-    "reference.drift_count",
+    "reference.outside_count",
     "<=",
     1.0
    ],
@@ -968,6 +1088,7 @@
   ]
  },
  "drift_lpips": 0.25,
+ "drift_dino": 0.9,
  "numerics": [
   {
    "config": {
