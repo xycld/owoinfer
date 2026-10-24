@@ -1026,10 +1026,11 @@ typedef enum mi_file_text_kind {
 /* Reads what the file at `path` (UTF-8) is to the engine (MI_CAP_INSPECT): no engine, no GPU, no CUDA call. It reads
  * what the engine's loaders read before they upload anything: the safetensors header (at most 16 MiB), the
  * quantization configs (at most 4 KiB each), a DiT's scales (bounded by MOSS-Image's shapes, checked first: about
- * 290 MiB at most, one linear's at a time), a text encoder's scales and small F32 tensors and a control adapter's
- * embedder (at most 256 MiB, checked from the header first: a file that would need more is not loadable), a LoRA's
- * alpha tensors. Thread-safe. The answer depends only on the file's content and the library's version and build
- * (mi_version() and mi_probe_info.build_flavour: the NVFP4 kernels are a build option), not on the GPU.
+ * 290 MiB at most, one linear's at a time), a text encoder's scales and small F32 tensors (bounded the same way by
+ * its shapes: a few MB), a control adapter's embedder (at most 256 MiB, checked from the header first: a file that
+ * would need more is not loadable), a LoRA's alpha tensors. Thread-safe. The answer depends only on the file's
+ * content and the library's version and build (mi_version() and mi_probe_info.build_flavour: the NVFP4 kernels are a
+ * build option), not on the GPU.
  * A file the engine cannot use (another model or container, a malformed or truncated header) is not an error: MI_OK
  * with MI_FILE_KIND_UNKNOWN or loadable 0, and the reason in MI_FILE_TEXT_NOTE. Fails with MI_ERR_INVALID_ARGUMENT for
  * a NULL or empty path or one that is not a regular file (a directory, a device, a pipe: never read), and MI_ERR_IO

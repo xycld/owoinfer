@@ -476,11 +476,9 @@ TEST(CApiInspect, ControlAdapter) {
 }
 
 // A Qwen3.5 text encoder in ComfyUI's layout: a plain INT8 embedding table (its rows are the vocabulary) and the bf16
-// tensors the encoder check reads. The embedding is narrowed, so the importer's canonical shape check is off.
-TEST(CApiInspect, TextEncoder) {
-  const mi::testing::AnyModelShapes narrowed;
-  mi::testing::TempDir dir("inspect_te");
-  std::vector<T> t = {{"model.language_model.embed_tokens.weight", DType::kI8, {248320, 4}},
+// tensors the encoder check reads, with the embedding `width` wide.
+std::vector<T> text_encoder_tensors(std::int64_t width) {
+  std::vector<T> t = {{"model.language_model.embed_tokens.weight", DType::kI8, {248320, width}},
                       {"model.language_model.embed_tokens.weight_scale", DType::kF32, {248320}},
                       {"model.language_model.embed_tokens.comfy_quant", DType::kU8, {},
                        R"({"format": "int8_tensorwise"})"},
@@ -490,21 +488,36 @@ TEST(CApiInspect, TextEncoder) {
     t.push_back({l + "input_layernorm.weight", DType::kBF16, {4096}});
     if (i % 4 == 3) t.push_back({l + "self_attn.q_norm.weight", DType::kBF16, {256}});
   }
-  write_file(dir.path() / "te.safetensors", t);
-  const Report rep(dir.path() / "te.safetensors");
-  EXPECT_EQ(rep.info.kind, MI_FILE_KIND_TEXT_ENCODER);
-  EXPECT_EQ(rep.info.loadable, 1) << rep.text(MI_FILE_TEXT_NOTE);
-  EXPECT_EQ(rep.info.precision, MI_PRECISION_BF16);  // no decoder linear is quantized
-  EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "bf16");
-  EXPECT_EQ(rep.info.tiers, 0u);
+  return t;
+}
 
-  // A 180 MiB F32 layer tensor: the encoder would read it and keep a bf16 copy, past the 256 MiB inspection reads.
+TEST(CApiInspect, TextEncoder) {
+  mi::testing::TempDir dir("inspect_te");
+  {
+    // The embedding is narrowed, so the importer's canonical shape check is off.
+    const mi::testing::AnyModelShapes narrowed;
+    write_file(dir.path() / "te.safetensors", text_encoder_tensors(4));
+    const Report rep(dir.path() / "te.safetensors");
+    EXPECT_EQ(rep.info.kind, MI_FILE_KIND_TEXT_ENCODER);
+    EXPECT_EQ(rep.info.loadable, 1) << rep.text(MI_FILE_TEXT_NOTE);
+    EXPECT_EQ(rep.info.precision, MI_PRECISION_BF16);  // no decoder linear is quantized
+    EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "bf16");
+    EXPECT_EQ(rep.info.tiers, 0u);
+  }
+
+  // A 180 MiB F32 layer tensor, which the encoder would read and keep a bf16 copy of: the importer's canonical shape
+  // check refuses it before any read. The embedding has its real shape (1 GB, sparse) so that the check reaches it.
+  if (!sparse_files(dir.path())) {
+    GTEST_SKIP() << "the test folder's file system has no sparse files: the 1 GB fixture would be written in full";
+  }
+  std::vector<T> t = text_encoder_tensors(4096);
   t.push_back({"model.language_model.layers.0.linear_attn.A_log", DType::kF32, {std::int64_t{45} << 20}});
   write_file(dir.path() / "big.safetensors", t);
   const Report big(dir.path() / "big.safetensors");
   EXPECT_EQ(big.info.kind, MI_FILE_KIND_TEXT_ENCODER);
   EXPECT_EQ(big.info.loadable, 0);
-  EXPECT_NE(big.text(MI_FILE_TEXT_NOTE).find("more than 256 MiB"), std::string::npos) << big.text(MI_FILE_TEXT_NOTE);
+  EXPECT_NE(big.text(MI_FILE_TEXT_NOTE).find("A_log' F32 [47185920] (MOSS-Image: [32])"), std::string::npos)
+      << big.text(MI_FILE_TEXT_NOTE);
 }
 
 // A FLUX.2 VAE decoder in the diffusers layout, narrowed: the decoder's widths follow from its shapes.
@@ -591,13 +604,15 @@ TEST(CApiInspect, MalformedFiles) {
   EXPECT_EQ(other.info.kind, MI_FILE_KIND_UNKNOWN);
   EXPECT_EQ(other.info.tensor_count, 1);
   EXPECT_NE(other.text(MI_FILE_TEXT_NOTE).find("backbone.embeddings.cls_token"), std::string::npos);
-  // Alpha parameters without LoRA factors (another model's): not a LoRA.
+  // Alpha parameters without LoRA factors (another model's): in the LoRA conventions (weights::looks_like_lora, as the
+  // model-file checks name them), so a LoRA the stack refuses.
   write_file(dir.path() / "alpha.safetensors", {{"blocks.0.attn.alpha", DType::kF32, {1}},
                                                 {"blocks.0.attn.weight", DType::kF32, {4, 4}}});
   const Report alpha(dir.path() / "alpha.safetensors");
-  EXPECT_EQ(alpha.info.kind, MI_FILE_KIND_UNKNOWN);
+  EXPECT_EQ(alpha.info.kind, MI_FILE_KIND_LORA);
   EXPECT_EQ(alpha.info.loadable, 0);
-  EXPECT_FALSE(alpha.text(MI_FILE_TEXT_NOTE).empty());
+  EXPECT_NE(alpha.text(MI_FILE_TEXT_NOTE).find("no tensor applies"), std::string::npos)
+      << alpha.text(MI_FILE_TEXT_NOTE);
 }
 
 // A FIFO is refused at once: opening one for reading would wait for a writer.
