@@ -12,6 +12,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -68,6 +69,9 @@ using mi::server::str;
 using mi::server::utf8_sequence_length;
 
 const char* tf(bool b) { return b ? "true" : "false"; }
+
+// mi_progress.eta_seconds: null when unknown (negative).
+std::string eta_json(double eta) { return eta < 0 ? "null" : num(eta); }
 
 // Re-serializes a request id (string, integer or null) for the response.
 std::string id_json(const Value* id) {
@@ -527,6 +531,7 @@ class Server {
     std::atomic<int> phase{-1};
     std::atomic<int> step{0}, total_steps{0};
     std::atomic<double> elapsed{0};
+    std::atomic<double> fraction{0}, eta{-1};  // eta < 0: unknown
   };
   struct Work;
 
@@ -568,7 +573,8 @@ class Server {
            tf(caps & MI_CAP_DISTILL) + ",\"system_cuda\":" + tf(caps & MI_CAP_SYSTEM_CUDA) + ",\"control\":" +
            tf(caps & MI_CAP_CONTROL) + ",\"accel\":" + tf(caps & MI_CAP_ACCEL) + ",\"preload\":" + tf(caps & MI_CAP_PRELOAD) +
            ",\"release\":" + tf(caps & MI_CAP_RELEASE) + ",\"certificate_dirs\":" + tf(caps & MI_CAP_CERTIFICATE_DIRS) +
-           ",\"te_host_pin\":" + tf(caps & MI_CAP_TE_HOST_PIN) + "},\"probe\":{\"driver_cuda_version\":" +
+           ",\"te_host_pin\":" + tf(caps & MI_CAP_TE_HOST_PIN) + ",\"progress_fraction\":" +
+           tf(caps & MI_CAP_PROGRESS_FRACTION) + "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
            ",\"supported_device_count\":" + std::to_string(probe.supported_device_count) +
@@ -885,7 +891,8 @@ class Server {
         s += ",\"phase\":" +
              (phase < 0 ? std::string("null") : "\"" + std::string(phase_name(static_cast<mi_phase>(phase))) + "\"") +
              ",\"step\":" + std::to_string(job_->step.load()) + ",\"total_steps\":" + std::to_string(job_->total_steps.load()) +
-             ",\"elapsed_seconds\":" + num(job_->elapsed.load());
+             ",\"elapsed_seconds\":" + num(job_->elapsed.load()) + ",\"fraction\":" + num(job_->fraction.load()) +
+             ",\"eta_seconds\":" + eta_json(job_->eta.load());
       }
       s += std::string(",\"cancelling\":") + tf(job_->cancel.load());
     }
@@ -928,9 +935,14 @@ class Server {
     job.step.store(p->step);
     job.total_steps.store(p->total_steps);
     job.elapsed.store(p->elapsed_seconds);
+    // The whole-job fields come with the 56-byte struct (MI_CAP_PROGRESS_FRACTION).
+    const bool whole = p->struct_size >= offsetof(mi_progress, eta_seconds) + sizeof p->eta_seconds;
+    job.fraction.store(whole ? p->fraction : 0.0);
+    job.eta.store(whole ? p->eta_seconds : -1.0);
     w.out->emit("{\"event\":\"progress\",\"id\":" + job.id + ",\"phase\":\"" + phase_name(p->phase) + "\",\"step\":" +
                 std::to_string(p->step) + ",\"total_steps\":" + std::to_string(p->total_steps) +
-                ",\"step_seconds\":" + num(p->step_seconds) + ",\"elapsed_seconds\":" + num(p->elapsed_seconds) + "}");
+                ",\"step_seconds\":" + num(p->step_seconds) + ",\"elapsed_seconds\":" + num(p->elapsed_seconds) +
+                ",\"fraction\":" + num(job.fraction.load()) + ",\"eta_seconds\":" + eta_json(job.eta.load()) + "}");
   }
 
   static void on_plan(const char* explanation, const char* plan_json, void* user) {

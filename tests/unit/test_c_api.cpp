@@ -93,7 +93,7 @@ TEST(CApi, VersionAndAbi) {
   EXPECT_EQ(mi_capabilities(), MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS |
                                   MI_CAP_IMAGE_INPUT | MI_CAP_HIRES | MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL |
                                   MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE | MI_CAP_CERTIFICATE_DIRS |
-                                  MI_CAP_TE_HOST_PIN);
+                                  MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION);
   EXPECT_EQ(mi_capabilities() & MI_CAP_COMFYUI_MODELS, 0u);
   EXPECT_EQ(MI_CAP_PREVIEW | MI_CAP_COMFYUI_MODELS | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS, 0x3fu);
   EXPECT_EQ(MI_CAP_IMAGE_INPUT, 0x40u);
@@ -106,6 +106,7 @@ TEST(CApi, VersionAndAbi) {
   EXPECT_EQ(MI_CAP_RELEASE, 0x2000u);
   EXPECT_EQ(MI_CAP_CERTIFICATE_DIRS, 0x4000u);
   EXPECT_EQ(MI_CAP_TE_HOST_PIN, 0x8000u);
+  EXPECT_EQ(MI_CAP_PROGRESS_FRACTION, 0x10000u);
   EXPECT_STREQ(mi_status_string(MI_OK), "MI_OK");
   EXPECT_STREQ(mi_status_string(MI_CANCELLED), "MI_CANCELLED");
   EXPECT_STREQ(mi_status_string(MI_ERR_BUSY), "MI_ERR_BUSY");
@@ -2562,6 +2563,27 @@ void on_progress(const mi_progress* p, void* user) {
   }
 }
 
+// MI_CAP_PROGRESS_FRACTION: every callback has the 56-byte struct, the fraction in [0, 1) and never decreasing, and a
+// known eta (the plan comes before the first phase), >= 0.
+void expect_whole_job_progress(const std::vector<mi_progress>& events) {
+  ASSERT_FALSE(events.empty());
+  std::string trace;
+  for (std::size_t i = 0; i < events.size(); ++i) {
+    const mi_progress& e = events[i];
+    EXPECT_EQ(e.struct_size, std::size_t{56});
+    EXPECT_GE(e.fraction, 0.0) << i;
+    EXPECT_LT(e.fraction, 1.0) << i;
+    if (i > 0) {
+      EXPECT_GE(e.fraction, events[i - 1].fraction) << i;
+    }
+    EXPECT_GE(e.eta_seconds, 0.0) << i;
+    char buf[64];
+    std::snprintf(buf, sizeof buf, " %.3f/%.2fs", e.fraction, e.eta_seconds);
+    trace += buf;
+  }
+  std::printf("[c_api] progress fraction/eta:%s\n", trace.c_str());
+}
+
 void on_plan(const char* explanation, const char* plan_json, void* user) {
   auto& ev = *static_cast<Events*>(user);
   ++ev.plans;
@@ -2613,6 +2635,7 @@ TEST_F(GpuCApi, Generate256TwoSteps) {
   for (std::size_t i = 1; i < ev.progress.size(); ++i) {
     EXPECT_GE(ev.progress[i].elapsed_seconds, ev.progress[i - 1].elapsed_seconds);
   }
+  expect_whole_job_progress(ev.progress);
 
   EXPECT_EQ(mi_result_cancelled(r), 0);
   EXPECT_EQ(mi_result_width(r), 256);
@@ -3332,6 +3355,7 @@ class GpuCApiPreload : public ::testing::Test {
 
 struct PreloadEvents {
   int progress = 0, plans = 0;
+  std::vector<mi_progress> events;
   std::vector<int> order;  // -1 for the plan, else the progress phase, in arrival order
   mi_engine* cancel_engine = nullptr;  // cancelled from the progress callback when set
 };
@@ -3339,6 +3363,7 @@ struct PreloadEvents {
 void on_preload_progress(const mi_progress* p, void* user) {
   auto& ev = *static_cast<PreloadEvents*>(user);
   ++ev.progress;
+  ev.events.push_back(*p);
   ev.order.push_back(p->phase);
   EXPECT_EQ(p->step, 0);
   EXPECT_EQ(p->total_steps, 0);
@@ -3395,6 +3420,7 @@ TEST_F(GpuCApiPreload, PreloadThenGenerate) {
   EXPECT_EQ(ev.plans, 1);
   EXPECT_GE(ev.progress, 1);
   expect_preload_order(ev, std::strlen(mi_result_text(r, MI_TEXT_PRELOAD_NOTE)) == 0);
+  expect_whole_job_progress(ev.events);  // over the load steps
   EXPECT_EQ(mi_result_cancelled(r), 0);
   EXPECT_EQ(mi_result_steps_run(r), 0);
   EXPECT_EQ(mi_result_rgb(r, nullptr), nullptr);

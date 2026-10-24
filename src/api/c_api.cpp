@@ -115,14 +115,16 @@ MI_LAYOUT(mi_engine_params, certificate_dirs, 136);
 MI_LAYOUT(mi_engine_params, certificate_dirs_count, 144);
 MI_LAYOUT(mi_engine_params, dit_direct_io, 152);
 MI_LAYOUT(mi_engine_params, te_host_pin, 156);
-static_assert(sizeof(mi_progress) == 40);
+static_assert(sizeof(mi_progress) == 56);
 MI_LAYOUT(mi_progress, struct_size, 0);
 MI_LAYOUT(mi_progress, phase, 8);
 MI_LAYOUT(mi_progress, step, 12);
 MI_LAYOUT(mi_progress, total_steps, 16);
 MI_LAYOUT(mi_progress, _reserved0, 20);
 MI_LAYOUT(mi_progress, step_seconds, 24);
-MI_LAYOUT(mi_progress, elapsed_seconds, 32);
+MI_LAYOUT(mi_progress, elapsed_seconds, 32);  // the 1.0.0 layout ends here (40 bytes)
+MI_LAYOUT(mi_progress, fraction, 40);
+MI_LAYOUT(mi_progress, eta_seconds, 48);
 static_assert(sizeof(mi_gen_params) == 376);
 MI_LAYOUT(mi_gen_params, struct_size, 0);
 MI_LAYOUT(mi_gen_params, prompt, 8);
@@ -658,7 +660,7 @@ const char* mi_last_error_message(void) {
 uint32_t mi_capabilities(void) {
   return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS | MI_CAP_IMAGE_INPUT | MI_CAP_HIRES |
          MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL | MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE |
-         MI_CAP_CERTIFICATE_DIRS | MI_CAP_TE_HOST_PIN;
+         MI_CAP_CERTIFICATE_DIRS | MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION;
 }
 
 mi_status mi_probe(mi_probe_info* info) {
