@@ -314,7 +314,8 @@ TEST(CApiInspect, HostileDitShapes) {
     const Report rep(write_dit(dir.path() / "rows.safetensors", Gemm::kBf16, q));
     EXPECT_EQ(rep.info.kind, MI_FILE_KIND_DIT);
     EXPECT_EQ(rep.info.loadable, 0);
-    const std::string want = "linear 'layers.0.proj.q' is [1048576, 1]; MOSS-Image's is [3072, 3072]";
+    // The importer's own shape check (open_quant_model) refuses it before any read.
+    const std::string want = "tensor 'layers.0.proj.q.weight' I8 [1048576, 1] (MOSS-Image: [3072, 3072]";
     EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find(want),
               std::string::npos)
         << rep.text(MI_FILE_TEXT_NOTE);
@@ -475,8 +476,9 @@ TEST(CApiInspect, ControlAdapter) {
 }
 
 // A Qwen3.5 text encoder in ComfyUI's layout: a plain INT8 embedding table (its rows are the vocabulary) and the bf16
-// tensors the encoder check reads.
+// tensors the encoder check reads. The embedding is narrowed, so the importer's canonical shape check is off.
 TEST(CApiInspect, TextEncoder) {
+  const mi::testing::AnyModelShapes narrowed;
   mi::testing::TempDir dir("inspect_te");
   std::vector<T> t = {{"model.language_model.embed_tokens.weight", DType::kI8, {248320, 4}},
                       {"model.language_model.embed_tokens.weight_scale", DType::kF32, {248320}},

@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -13,6 +12,7 @@
 #include "pipeline/samplers/brownian_tree.h"
 #include "pipeline/samplers/sampler_kernels.h"
 #include "pipeline/samplers/torch_cuda_randn.h"
+#include "weights/file_reader.h"
 #include "weights/safetensors.h"
 
 namespace mi::pipeline {
@@ -69,11 +69,13 @@ int extra_buffers(SamplerKind k) {
 }
 
 template <typename T>
-std::vector<float> read_floats(std::ifstream& in, const weights::TensorInfo& t) {
+std::vector<float> read_floats(const weights::FileReader& in, const weights::TensorInfo& t) {
   std::vector<T> raw(static_cast<std::size_t>(t.numel()));
-  in.seekg(static_cast<std::streamoff>(t.offset));
-  in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size() * sizeof(T)));
-  if (!in) throw DataspaceError("load_dataspace: cannot read tensor " + t.name);
+  try {
+    in.read_at(t.offset, raw.data(), raw.size() * sizeof(T));
+  } catch (const weights::IoError&) {
+    throw DataspaceError("load_dataspace: cannot read tensor " + t.name);
+  }
   return std::vector<float>(raw.begin(), raw.end());
 }
 
@@ -146,7 +148,7 @@ DataSpaceParams load_dataspace(const std::string& path) {
   if (codes->shape.size() != 1 || codes->shape[0] < 1 || codes->shape[0] > 1000) {
     throw DataspaceError(path + ": step_codes must be a vector of 1..1000 values");
   }
-  std::ifstream in(file.path(), std::ios::binary);
+  const weights::FileReader in(file.path());  // regular files only, as SafetensorsFile opened it
   DataSpaceParams p;
   p.channels = static_cast<int>(q->shape[0]);
   p.q = read_floats<float>(in, *q);

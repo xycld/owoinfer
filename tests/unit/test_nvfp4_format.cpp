@@ -275,6 +275,7 @@ std::string error_of(const std::function<void()>& f) {
 }
 
 TEST(Nvfp4Import, MixedFileFusedQkvAndEngineView) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("nvfp4_mixed");
   std::vector<T> ts;
   const Fp4Module qkv = add_nvfp4(ts, "layers.0.proj.qkv", 3 * kD, kD, 1);
@@ -366,6 +367,7 @@ TEST(Nvfp4Import, MixedFileFusedQkvAndEngineView) {
 }
 
 TEST(Nvfp4Import, RefusesModelOptAndMalformedFiles) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("nvfp4_bad");
   int case_no = 0;
   // Builds a one-module file with `edit` applied to its tensors and returns the error of opening + indexing it.
@@ -452,6 +454,7 @@ TEST(Nvfp4Import, RefusesModelOptAndMalformedFiles) {
 
 // A valid file whose K the NVFP4 GEMMs cannot run (K % 32 != 0): it imports and dequantizes, the engine view refuses.
 TEST(Nvfp4Import, ViewNeedsKMultipleOf32) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("nvfp4_k48");
   std::vector<T> ts;
   const Fp4Module o = add_nvfp4(ts, "layers.0.proj.o", kD, 48, 3);
@@ -638,6 +641,32 @@ void write_sparse_nvfp4_dit(const fs::path& path) {
 fs::path weights_root() {
   const char* env = std::getenv("MOSS_WEIGHTS");
   return env != nullptr && *env != '\0' ? fs::path(env) : fs::path("/workspace/Models/MOSS-Image");
+}
+
+// The device-free inspection the load path runs (pipeline::inspect_dit_file): with a refusal reason an NVFP4 file is
+// answered by it before any scale is read; without one its scales are read and validated like any other layout's (the
+// holes hold a zero weight_scale_2, which is refused).
+TEST(Nvfp4Support, InspectDitFile) {
+  mi::testing::TempDir dir("nvfp4_inspect");
+  const fs::path file = dir.path() / "moss_nvfp4.safetensors";
+  write_sparse_nvfp4_dit(file);
+  int asked = 0;  // asked once, as the file has NVFP4 linears
+  const mi::pipeline::DitFileInfo info = mi::pipeline::inspect_dit_file(file, [&] {
+    ++asked;
+    return std::string("no FP4 tensor cores here");
+  });
+  EXPECT_EQ(asked, 1);
+  EXPECT_TRUE(info.nvfp4);
+  EXPECT_EQ(info.quant, nullptr);
+  EXPECT_EQ(info.refusal, mi::util::path_utf8(file) + ": no FP4 tensor cores here");
+  try {
+    mi::pipeline::inspect_dit_file(file, "");
+    ADD_FAILURE() << "zero tensor scales were accepted";
+  } catch (const mi::weights::IndexError& e) {
+    const std::string msg = e.what();
+    EXPECT_EQ(msg.rfind(mi::util::path_utf8(file), 0), 0u) << msg;
+    EXPECT_NE(msg.find("weight_scale_2 is not finite and > 0"), std::string::npos) << msg;
+  }
 }
 
 // The real load path (Pipeline -> open_dit_file) refuses an NVFP4 DiT as an unsupported model (MI_ERR_MODEL in the C

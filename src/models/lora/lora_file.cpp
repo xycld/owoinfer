@@ -14,6 +14,7 @@
 #include "weights/file_reader.h"
 #include "weights/quant/quant_codec.h"
 #include "weights/quant/quant_convert.h"
+#include "weights/supported_model.h"
 
 namespace mi::lora {
 
@@ -25,8 +26,8 @@ using weights::FormatError;
 [[noreturn]] void fail(const std::string& msg) { throw LoraError("mi::lora: " + msg); }
 
 // MOSS-Image DiT config (transformer/config.json).
-constexpr std::int64_t kDim = 3072, kFfn = 8192, kTextDim = 4096, kFreqDim = 256, kLatent = 128;
-constexpr int kLayers = 42, kTextBlocks = 2;
+constexpr std::int64_t kDim = 3072;
+constexpr int kLayers = 42;
 
 // The part of a module a tensor holds.
 enum class Part {
@@ -159,33 +160,11 @@ TargetModel moss_dit_targets() {
   TargetModel t;
   t.blocks = kLayers;
   t.dim = kDim;
-  const auto add = [&](std::string name, std::int64_t n, std::int64_t k, bool bias, int block = -1,
-                       BlockGemm g = BlockGemm::kQ) { t.modules.push_back({std::move(name), n, k, bias, block, g}); };
-  for (int b = 0; b < kLayers; ++b) {
-    const std::string p = "layers." + std::to_string(b) + ".proj.";
-    add(p + "q", kDim, kDim, false, b, BlockGemm::kQ);
-    add(p + "k", kDim, kDim, false, b, BlockGemm::kK);
-    add(p + "v", kDim, kDim, false, b, BlockGemm::kV);
-    add(p + "o", kDim, kDim, false, b, BlockGemm::kO);
-    add(p + "ffn_up_gate", 2 * kFfn, kDim, false, b, BlockGemm::kUpGate);
-    add(p + "ffn_down", kDim, kFfn, false, b, BlockGemm::kDown);
+  // weights::moss_dit_linears: the one table of the DiT's linear shapes (sorted by name, as TargetModel keeps them).
+  static_assert(static_cast<int>(BlockGemm::kQ) == 0 && static_cast<int>(BlockGemm::kDown) == kBlockGemms - 1);
+  for (const weights::DitLinear& l : weights::moss_dit_linears()) {
+    t.modules.push_back({l.name, l.n, l.k, l.has_bias, l.block, static_cast<BlockGemm>(l.gemm)});
   }
-  add("text_embedder.proj", kDim, kTextDim, true);
-  for (int b = 0; b < kTextBlocks; ++b) {
-    const std::string p = "text_embedder.blocks." + std::to_string(b) + ".";
-    add(p + "qkv", 3 * kDim, kDim, true);
-    add(p + "proj", kDim, kDim, true);
-    add(p + "ffn_gate", kFfn, kDim, true);
-    add(p + "ffn_up", kFfn, kDim, true);
-    add(p + "ffn_down", kDim, kFfn, true);
-  }
-  add("time_embedding.0", kDim, kFreqDim, true);
-  add("time_embedding.2", kDim, kDim, true);
-  add("shared_block_modulation", 6 * kDim, kDim, true);
-  add("video_head_modulation", 2 * kDim, kDim, true);
-  add("video_embedder", kDim, kLatent, true);
-  add("final_linear_video", kLatent, kDim, false);
-  std::sort(t.modules.begin(), t.modules.end(), [](const TargetModule& a, const TargetModule& b) { return a.name < b.name; });
   return t;
 }
 

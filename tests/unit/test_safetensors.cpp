@@ -15,8 +15,14 @@
 #include <sys/vfs.h>
 #include <unistd.h>
 #endif
+#ifndef _WIN32
+#include <sys/stat.h>
+
+#include <cerrno>
+#endif
 
 #include "test_util.h"
+#include "util/replaceable_file.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
 #include "weights/safetensors.h"
@@ -612,6 +618,88 @@ TEST(MappedFile, EmptyAndMissingFiles) {
   MappedFile m(dir.path() / "e.bin");
   EXPECT_EQ(m.size(), 0u);
   EXPECT_THROW(MappedFile(dir.path() / "missing.bin"), IoError);
+}
+
+#ifndef _WIN32
+// A FIFO given as a weight file is refused at once (an open(2) of one blocks until a writer appears), buffered and
+// direct: by FileReader (so SafetensorsFile), MappedFile, direct_io_support, page_cache_fraction and
+// read_replaceable_file (certificates, caches). error_within fails the test instead of hanging on a regression.
+TEST(FileReader, RefusesFifoPromptly) {
+  TempDir dir("fr_fifo");
+  const auto fifo = dir.path() / "model.safetensors";
+  ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0) << std::strerror(errno);
+  const std::string not_regular = mi::util::path_utf8(fifo) + ": not a regular file";
+  for (const bool direct : {false, true}) {
+    const std::optional<std::string> e = mi::testing::error_within(fifo, [&] { FileReader r(fifo, direct); });
+    ASSERT_TRUE(e.has_value()) << "FileReader blocked on a FIFO (direct " << direct << ")";
+    EXPECT_EQ(*e, not_regular) << direct;
+  }
+  std::optional<std::string> e = mi::testing::error_within(fifo, [&] { SafetensorsFile f(fifo); });
+  ASSERT_TRUE(e.has_value()) << "SafetensorsFile blocked on a FIFO";
+  EXPECT_EQ(*e, not_regular);
+  e = mi::testing::error_within(fifo, [&] { MappedFile m(fifo); });
+  ASSERT_TRUE(e.has_value()) << "MappedFile blocked on a FIFO";
+  EXPECT_EQ(*e, not_regular);
+  e = mi::testing::error_within(fifo, [&] {
+    const DirectIoSupport d = direct_io_support(fifo);
+    EXPECT_FALSE(d.supported);
+    EXPECT_EQ(d.reason, "model.safetensors is not a regular file");
+    EXPECT_LT(page_cache_fraction(fifo), 0.0);
+    std::string text;
+    EXPECT_EQ(mi::util::read_replaceable_file(fifo, 1024, text), mi::util::ReadStatus::kError);
+  });
+  ASSERT_TRUE(e.has_value()) << "a FIFO probe blocked";
+  EXPECT_EQ(*e, "");
+}
+#endif
+
+// A directory is not a file either (refused by its type before any open); a regular file, or a symlink to one, still
+// opens through the same checks, with and without direct I/O.
+TEST(FileReader, RefusesDirectoryAndReadsRegularFiles) {
+  TempDir dir("fr_dir");
+  try {
+    FileReader r(dir.path());
+    ADD_FAILURE() << "a directory opened as a file";
+  } catch (const IoError& e) {
+#ifndef _WIN32
+    EXPECT_EQ(std::string(e.what()), mi::util::path_utf8(dir.path()) + ": not a regular file");
+#endif
+  }
+  EXPECT_THROW(MappedFile m(dir.path()), IoError);
+  EXPECT_THROW(SafetensorsFile f(dir.path()), IoError);
+  EXPECT_FALSE(direct_io_support(dir.path()).supported);
+  std::string text;
+  EXPECT_EQ(mi::util::read_replaceable_file(dir.path(), 1024, text), mi::util::ReadStatus::kError);
+  const auto path = make_pattern_file(dir, 3 * kDirectAlign + 5);
+  for (const bool direct : {false, true}) {
+    FileReader r(path, direct);
+    EXPECT_EQ(r.size(), 3 * kDirectAlign + 5);
+    std::vector<std::byte> buf(kDirectAlign + 9);
+    r.read_at(kDirectAlign - 4, buf.data(), buf.size());
+    expect_pattern(buf.data(), kDirectAlign - 4, buf.size());
+  }
+  // A symlink to a regular file opens as the file: the type checks follow it.
+  const auto link = dir.path() / "link.bin";
+  std::error_code ec;
+  std::filesystem::create_symlink(path, link, ec);
+#ifndef _WIN32
+  ASSERT_FALSE(ec) << ec.message();
+#endif
+  if (!ec) {  // Windows creates symlinks only with a privilege or developer mode
+    for (const bool direct : {false, true}) {
+      FileReader r(link, direct);
+      EXPECT_EQ(r.size(), 3 * kDirectAlign + 5);
+      std::vector<std::byte> buf(100);
+      r.read_at(2 * kDirectAlign + 1, buf.data(), buf.size());
+      expect_pattern(buf.data(), 2 * kDirectAlign + 1, buf.size());
+    }
+    EXPECT_EQ(MappedFile(link).size(), 3 * kDirectAlign + 5);
+  }
+  ASSERT_EQ(mi::util::read_replaceable_file(path, 1 << 20, text), mi::util::ReadStatus::kOk);
+  EXPECT_EQ(text.size(), 3 * kDirectAlign + 5);
+  expect_pattern(reinterpret_cast<const std::byte*>(text.data()), 0, text.size());
+  EXPECT_EQ(mi::util::read_replaceable_file(path, 3 * kDirectAlign + 4, text), mi::util::ReadStatus::kTooLarge);
+  EXPECT_EQ(mi::util::read_replaceable_file(dir.path() / "missing", 1024, text), mi::util::ReadStatus::kMissing);
 }
 
 TEST(MappedFile, MapsSafetensorsTensorBytes) {

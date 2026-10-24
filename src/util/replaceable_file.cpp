@@ -2,6 +2,8 @@
 
 #include <system_error>
 
+#include "util/regular_file.h"
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -15,7 +17,10 @@
 #include <chrono>
 #include <thread>
 #else
-#include <fstream>
+#include <algorithm>
+#include <cerrno>
+
+#include <unistd.h>
 #endif
 
 namespace mi::util {
@@ -28,9 +33,13 @@ ReadStatus read_replaceable_file(const std::filesystem::path& path, std::size_t 
   // Backoff 1, 2, 4, 8, 16, 16, ... ms: about 100 ms before giving up on a file a writer keeps replacing.
   DWORD error = 0;
   for (int attempt = 0, waited_ms = 0;; ++attempt) {
-    h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h != INVALID_HANDLE_VALUE) break;
+    void* handle = nullptr;
+    const OpenStatus opened = open_regular_file(path, FILE_ATTRIBUTE_NORMAL, handle);
+    if (opened == OpenStatus::kNotRegular) return ReadStatus::kError;  // a pipe or a device: never waited on
+    if (opened == OpenStatus::kOk) {
+      h = static_cast<HANDLE>(handle);
+      break;
+    }
     error = GetLastError();
     if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return ReadStatus::kMissing;
     if ((error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED) || waited_ms >= 100) return ReadStatus::kError;
@@ -73,22 +82,31 @@ ReadStatus read_replaceable_file(const std::filesystem::path& path, std::size_t 
 
 ReadStatus read_replaceable_file(const std::filesystem::path& path, std::size_t max_bytes, std::string& out) {
   out.clear();
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
+  int fd = -1;
+  // A FIFO or a device is an error at once (open_regular_file), never a read that blocks.
+  const OpenStatus opened = open_regular_file(path, 0, fd);
+  if (opened == OpenStatus::kNotRegular) return ReadStatus::kError;
+  if (opened != OpenStatus::kOk) {
     std::error_code ec;
     return std::filesystem::exists(path, ec) || ec ? ReadStatus::kError : ReadStatus::kMissing;
   }
   // At most max_bytes + 1, growing as the file goes (no size query: the file may be replaced meanwhile).
   std::size_t done = 0;
+  bool failed = false;
   out.resize(std::min<std::size_t>(max_bytes + 1, std::size_t{64} << 10));
   for (;;) {
-    in.read(out.data() + done, static_cast<std::streamsize>(out.size() - done));
-    done += static_cast<std::size_t>(in.gcount());
-    if (!in) break;
+    const ssize_t n = ::read(fd, out.data() + done, std::min<std::size_t>(out.size() - done, std::size_t{1} << 30));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      failed = n < 0;
+      break;
+    }
+    done += static_cast<std::size_t>(n);
     if (done > max_bytes) break;
-    out.resize(std::min(out.size() * 2, max_bytes + 1));
+    if (done == out.size()) out.resize(std::min(out.size() * 2, max_bytes + 1));
   }
-  if (in.bad()) {
+  ::close(fd);
+  if (failed) {
     out.clear();
     return ReadStatus::kError;
   }

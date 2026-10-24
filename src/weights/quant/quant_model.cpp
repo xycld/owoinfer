@@ -19,6 +19,8 @@
 #include "weights/quant/nvfp4_codec.h"
 #include "weights/quant/quant_codec.h"
 #include "weights/safetensors.h"
+#include "weights/supported_model.h"
+#include "weights/test_seams.h"
 
 namespace mi::quant {
 
@@ -383,6 +385,58 @@ class Builder {
   std::unordered_map<std::string, std::size_t>& by_name_;
 };
 
+// A linear must be one of the model's with its shape (DiT: weights::moss_dit_linears, a fused proj.qkv being proj.q / k
+// / v by rows; text encoder: the linears of weights::qwen35_text_tensors), checked before any of its bytes are read:
+// to_model_index and the text encoder read every scale whole, so a hostile I8 [N, 1] weight with an F32 [N] scale
+// would make them read and copy 4N bytes. Builder checked the scale tensors against [n, k] per layout, so with the
+// canonical [n, k] they are bounded too.
+void check_linear_shape(ModelKind kind, const QuantLinear& l) {
+  if (weights::testing::any_model_shapes()) return;
+  bool known = false;
+  std::int64_t n = 0, k = 0;
+  if (kind == ModelKind::kDiT) {
+    const bool fused = is_fused_qkv(kind, l.name);
+    const std::string module = fused ? l.name.substr(0, l.name.size() - 3) + "q" : l.name;  // a fused part's rows
+    if (const weights::DitLinear* t = weights::find_moss_dit_linear(module)) {
+      known = true;
+      n = fused ? 3 * t->n : t->n;
+      k = t->k;
+    }
+  } else if (const weights::TeTensor* t = weights::find_qwen35_text_tensor(l.name + ".weight");
+             t != nullptr && t->linear) {
+    known = true;
+    n = t->shape[0];
+    k = t->shape[1];
+  }
+  if (known && l.n == n && l.k == k) return;
+  const std::string found =
+      "tensor '" + l.weight.name + "' " + weights::dtype_name(l.weight.dtype) + " " + shape_str(l.weight.shape);
+  const char* model = kind == ModelKind::kDiT ? "DiT" : "text encoder";
+  if (!known) fail("'" + l.name + "' is not a linear of the MOSS-Image " + model + " (" + found + ")");
+  // [n, k] as the layout stores it: packed codes are narrower.
+  std::int64_t cols = k;
+  if (l.encoding == Encoding::kW4A4 || l.encoding == Encoding::kW4A8 || l.encoding == Encoding::kNvfp4Raw) {
+    cols = k / 2;
+  } else if (l.encoding == Encoding::kW6A8) {
+    cols = k * 3 / 4;
+  }
+  const std::string layout = !l.spec.quantized()            ? std::string("bf16")
+                             : l.encoding == Encoding::kRaw ? describe(l.spec)
+                                                            : std::string(encoding_name(l.encoding));
+  fail(found + " (MOSS-Image: " + shape_str({n, cols}) + " as " + layout + ")");
+}
+
+// Every other kept tensor of a text encoder (norms, conv1d, A_log, dt_bias, a bf16 embedding table) must be one of
+// weights::qwen35_text_tensors with its shape, before any is read (the text encoder reads the F32 ones whole).
+void check_text_tensor(const IndexedTensor& t) {
+  if (weights::testing::any_model_shapes()) return;
+  const weights::TeTensor* e = weights::find_qwen35_text_tensor(t.name);
+  if (e != nullptr && e->shape == t.shape) return;
+  const std::string found = "tensor '" + t.name + "' " + weights::dtype_name(t.dtype) + " " + shape_str(t.shape);
+  if (e == nullptr) fail(found + " is not a tensor of the MOSS-Image text encoder");
+  fail(found + " (MOSS-Image: " + shape_str(e->shape) + ")");
+}
+
 std::vector<fs::path> component_files(const fs::path& dir) {
   std::vector<fs::path> files;
   for (const auto& e : fs::directory_iterator(dir)) {
@@ -585,6 +639,7 @@ QuantModel open_quant_model_impl(const fs::path& path, std::optional<ModelKind> 
   std::vector<QuantLinear> linears;
   std::set<std::string> modules_done;
   auto add = [&](QuantLinear l) {
+    check_linear_shape(model.kind, l);
     if (is_fused_qkv(model.kind, l.name)) {
       for (auto& part : b.unfuse(l)) linears.push_back(std::move(part));
     } else {
@@ -613,7 +668,9 @@ QuantModel open_quant_model_impl(const fs::path& path, std::optional<ModelKind> 
     }
   }
   for (Raw& r : kept) {
-    if (!r.used) model.tensors.push_back(std::move(r.t));
+    if (r.used) continue;
+    if (model.kind == ModelKind::kTextEncoder) check_text_tensor(r.t);
+    model.tensors.push_back(std::move(r.t));
   }
   std::sort(linears.begin(), linears.end(), [](const QuantLinear& a, const QuantLinear& c) { return a.name < c.name; });
   for (std::size_t i = 1; i < linears.size(); ++i) {

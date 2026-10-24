@@ -76,7 +76,8 @@ struct TargetModel {
 };
 
 // The MOSS-Image DiT (config.json: dim 3072, ffn_dim 8192, num_layers 42, num_heads 24, text_dim 4096, freq_dim 256,
-// latent_channels 128; 2 text-refiner blocks): every linear of the transformer.
+// latent_channels 128; 2 text-refiner blocks): every linear of the transformer, as weights::moss_dit_linears lists
+// them.
 TargetModel moss_dit_targets();
 
 // ---- Parsed adapters ------------------------------------------------------------------------------------------

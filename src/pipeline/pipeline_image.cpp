@@ -4,13 +4,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
-#include <fstream>
 #include <iterator>
 #include <memory>
 #include <numbers>
 #include <stdexcept>
 
 #include "util/path.h"
+#include "weights/file_reader.h"
 
 // PNG and JPEG decoding: the vendored stb_image (third_party/stb), static so the tests' own copy does not clash.
 #define STB_IMAGE_STATIC
@@ -448,21 +448,19 @@ Image decode_image(std::span<const std::uint8_t> file, int channels) {
 Image load_image(const std::filesystem::path& file, int channels) {
   std::error_code ec;
   if (!std::filesystem::is_regular_file(file, ec)) throw ImageReadError(util::path_utf8(file) + ": not a readable image file");
-  std::ifstream in(file, std::ios::binary);
-  if (!in) throw ImageReadError("cannot read " + util::path_utf8(file));
-  // Bounded read: never more than the cap plus one chunk, whatever the file claims or becomes.
+  // Bounded read of the size the open file has (a file replaced meanwhile by a FIFO or a device is refused by the open,
+  // never waited on; one that shrinks fails the read).
   std::vector<std::uint8_t> bytes;
-  constexpr std::size_t kChunk = std::size_t{1} << 20;
-  while (in) {
-    const std::size_t at = bytes.size();
-    bytes.resize(at + kChunk);
-    in.read(reinterpret_cast<char*>(bytes.data() + at), static_cast<std::streamsize>(kChunk));
-    bytes.resize(at + static_cast<std::size_t>(in.gcount()));
-    if (bytes.size() > kMaxImageFileBytes) {
+  try {
+    const weights::FileReader in(file);
+    if (in.size() > kMaxImageFileBytes) {
       throw ImageReadError(util::path_utf8(file) + ": image file larger than " + std::to_string(kMaxImageFileBytes >> 20) + " MiB");
     }
+    bytes.resize(static_cast<std::size_t>(in.size()));
+    in.read_at(0, bytes.data(), bytes.size());
+  } catch (const weights::IoError& e) {
+    throw ImageReadError(e.what());  // "<path>: cannot open: <reason>", "<path>: short read ..."
   }
-  if (in.bad()) throw ImageReadError("cannot read " + util::path_utf8(file));
   Image im;
   try {
     im = decode_image(bytes, channels);

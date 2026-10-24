@@ -1,19 +1,19 @@
 #include "weights/supported_model.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
 #include <initializer_list>
 #include <map>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "util/json.h"
 #include "util/path.h"
+#include "weights/file_reader.h"
 #include "weights/safetensors.h"
 
 namespace mi::weights {
@@ -36,19 +36,27 @@ constexpr std::size_t kMaxListed = 4;  // differences named in one message
   throw UnsupportedModelError(path_utf8(path) + " is not a supported MOSS-Image " + what + " (found " + list + "). " + kSupported);
 }
 
-// A config of the bundle, or nullopt when the file does not exist. Same bounds as build_index's configs.
+// A config of the bundle, or nullopt when the file does not exist. Same bounds as build_index's configs. Anything that
+// exists is opened through FileReader, whose open refuses what is not a regular file (a directory, a FIFO, a device:
+// IndexError "<path>: not a regular file"): a type check before the open could be raced by a file replaced between
+// the check and the open, and a FIFO swapped in would then block the open.
 std::optional<json::Value> read_config(const fs::path& path) {
   std::error_code ec;
-  if (!fs::is_regular_file(path, ec)) return std::nullopt;
-  const std::uintmax_t size = fs::file_size(path, ec);
-  if (ec) throw IndexError("cannot open " + path_utf8(path));
-  if (size > kMaxConfigBytes) throw IndexError(path_utf8(path) + ": " + std::to_string(size) + " bytes exceeds the limit of " + std::to_string(kMaxConfigBytes));
-  std::ifstream in(path, std::ios::binary);
-  if (!in) throw IndexError("cannot open " + path_utf8(path));
-  std::ostringstream ss;
-  ss << in.rdbuf();
+  if (!fs::exists(path, ec)) return std::nullopt;
+  std::string text;
   try {
-    json::Value v = json::parse(ss.str(), {.max_values = kMaxConfigValues});
+    const FileReader in(path);
+    if (in.size() > kMaxConfigBytes) {
+      throw IndexError(path_utf8(path) + ": " + std::to_string(in.size()) + " bytes exceeds the limit of " +
+                       std::to_string(kMaxConfigBytes));
+    }
+    text.resize(static_cast<std::size_t>(in.size()));
+    in.read_at(0, text.data(), text.size());
+  } catch (const IoError& e) {
+    throw IndexError(e.what());
+  }
+  try {
+    json::Value v = json::parse(text, {.max_values = kMaxConfigValues});
     if (!v.is_object()) throw IndexError(path_utf8(path) + ": not a JSON object");
     return v;
   } catch (const json::ParseError& e) {
@@ -128,15 +136,15 @@ Names read_names(const SafetensorsFile& file, std::initializer_list<std::string_
 }
 
 struct ExpectedTensor {
-  const char* name;
+  std::string name;
   std::vector<std::int64_t> shape;
 };
 
 void compare_tensors(const Names& n, std::initializer_list<ExpectedTensor> want, std::vector<std::string>& found) {
   for (const ExpectedTensor& w : want) {
     const TensorInfo* t = n.find(w.name);
-    if (t == nullptr) found.push_back(std::string("no ") + w.name);
-    else if (t->shape != w.shape) found.push_back(std::string(w.name) + " " + shape_text(t->shape) + " (MOSS-Image: " + shape_text(w.shape) + ")");
+    if (t == nullptr) found.push_back("no " + w.name);
+    else if (t->shape != w.shape) found.push_back(w.name + " " + shape_text(t->shape) + " (MOSS-Image: " + shape_text(w.shape) + ")");
   }
 }
 
@@ -158,8 +166,9 @@ bool is_fp8(DType d) { return d == DType::kF8E4M3 || d == DType::kF8E5M2; }
 // which can take any value, so its header's opening '{' at byte 8 always wins.
 void refuse_other_container(const fs::path& file, const char* what) {
   char magic[9] = {};
-  std::ifstream in(file, std::ios::binary);
-  if (!in.read(magic, sizeof magic)) return;  // too short: SafetensorsFile reports it
+  const FileReader in(file);  // IoError for a FIFO or a device, before any read could block
+  if (in.size() < sizeof magic) return;  // too short: SafetensorsFile reports it
+  in.read_at(0, magic, sizeof magic);
   if (magic[8] == '{') return;
   const std::string_view m(magic, 4);
   const auto proto = static_cast<unsigned char>(magic[1]);
@@ -170,9 +179,9 @@ void refuse_other_container(const fs::path& file, const char* what) {
 }
 
 // A DiT add-on given where a model file is expected: a LoRA, a control adapter or a distill bundle file.
-void refuse_other_role(const fs::path& file, const char* what, const Names& n) {
-  const bool lora = n.has(".lora_A.") || n.has(".lora_B.") || n.has(".lora_down.") || n.has(".lora_up.") || n.has(".hada_w") ||
-                    n.has(".lokr_w") || n.has(".alpha");
+void refuse_other_role(const SafetensorsFile& st, const char* what, const Names& n) {
+  const fs::path& file = st.path();
+  const bool lora = looks_like_lora(st);
   const TensorInfo* embedder = n.find("video_embedder.weight");
   if (lora && embedder != nullptr && embedder->shape.size() == 2 && embedder->shape[1] > 128) {
     refuse(file, what, {"a control adapter (a LoRA with a widened video_embedder); load it as the control adapter (`moss-infer generate --control`)"});
@@ -186,6 +195,113 @@ void refuse_other_role(const fs::path& file, const char* what, const Names& n) {
 }
 
 }  // namespace
+
+bool looks_like_lora(const SafetensorsFile& file) {
+  return std::any_of(file.tensors().begin(), file.tensors().end(), [](const TensorInfo& t) {
+    for (std::string_view part : {".lora_A.", ".lora_B.", ".lora_down.", ".lora_up.", ".hada_w", ".lokr_w", ".alpha"}) {
+      if (t.name.find(part) != std::string::npos) return true;
+    }
+    return false;
+  });
+}
+
+const std::vector<DitLinear>& moss_dit_linears() {
+  static const std::vector<DitLinear> table = [] {
+    constexpr std::int64_t kDim = 3072, kFfn = 8192, kTextDim = 4096, kFreqDim = 256, kLatent = 128;
+    constexpr int kLayers = 42, kTextBlocks = 2;
+    std::vector<DitLinear> t;
+    const auto add = [&](std::string name, std::int64_t n, std::int64_t k, bool bias, int block = -1, int gemm = 0) {
+      t.push_back({std::move(name), n, k, bias, block, gemm});
+    };
+    for (int b = 0; b < kLayers; ++b) {
+      const std::string p = "layers." + std::to_string(b) + ".proj.";
+      add(p + "q", kDim, kDim, false, b, 0);
+      add(p + "k", kDim, kDim, false, b, 1);
+      add(p + "v", kDim, kDim, false, b, 2);
+      add(p + "o", kDim, kDim, false, b, 3);
+      add(p + "ffn_up_gate", 2 * kFfn, kDim, false, b, 4);
+      add(p + "ffn_down", kDim, kFfn, false, b, 5);
+    }
+    add("text_embedder.proj", kDim, kTextDim, true);
+    for (int b = 0; b < kTextBlocks; ++b) {
+      const std::string p = "text_embedder.blocks." + std::to_string(b) + ".";
+      add(p + "qkv", 3 * kDim, kDim, true);
+      add(p + "proj", kDim, kDim, true);
+      add(p + "ffn_gate", kFfn, kDim, true);
+      add(p + "ffn_up", kFfn, kDim, true);
+      add(p + "ffn_down", kDim, kFfn, true);
+    }
+    add("time_embedding.0", kDim, kFreqDim, true);
+    add("time_embedding.2", kDim, kDim, true);
+    add("shared_block_modulation", 6 * kDim, kDim, true);
+    add("video_head_modulation", 2 * kDim, kDim, true);
+    add("video_embedder", kDim, kLatent, true);
+    add("final_linear_video", kLatent, kDim, false);
+    std::sort(t.begin(), t.end(), [](const DitLinear& a, const DitLinear& b) { return a.name < b.name; });
+    return t;
+  }();
+  return table;
+}
+
+const DitLinear* find_moss_dit_linear(std::string_view module) {
+  const std::vector<DitLinear>& t = moss_dit_linears();
+  const auto it =
+      std::lower_bound(t.begin(), t.end(), module, [](const DitLinear& l, std::string_view m) { return l.name < m; });
+  return it != t.end() && it->name == module ? &*it : nullptr;
+}
+
+const std::vector<TeTensor>& qwen35_text_tensors() {
+  static const std::vector<TeTensor> table = [] {
+    constexpr std::int64_t kVocab = 248320, kHidden = 4096, kInter = 12288;
+    constexpr std::int64_t kHeads = 16, kKvHeads = 4, kHeadDim = 256;                // full attention
+    constexpr std::int64_t kKHeads = 16, kVHeads = 32, kLinHeadDim = 128, kConv = 4;  // GatedDeltaNet
+    constexpr std::int64_t kKeyDim = kKHeads * kLinHeadDim, kValueDim = kVHeads * kLinHeadDim;
+    constexpr std::int64_t kConvDim = 2 * kKeyDim + kValueDim;
+    constexpr int kLayers = 32;
+    std::vector<TeTensor> t;
+    t.push_back({"language_model.embed_tokens.weight", {kVocab, kHidden}, true});
+    t.push_back({"language_model.norm.weight", {kHidden}, false});
+    for (int i = 0; i < kLayers; ++i) {
+      const std::string p = "language_model.layers." + std::to_string(i) + ".";
+      const auto add = [&](const char* name, std::vector<std::int64_t> shape, bool linear) {
+        t.push_back({p + name, std::move(shape), linear});
+      };
+      add("input_layernorm.weight", {kHidden}, false);
+      add("post_attention_layernorm.weight", {kHidden}, false);
+      add("mlp.gate_proj.weight", {kInter, kHidden}, true);
+      add("mlp.up_proj.weight", {kInter, kHidden}, true);
+      add("mlp.down_proj.weight", {kHidden, kInter}, true);
+      if (i % 4 == 3) {
+        add("self_attn.q_proj.weight", {2 * kHeads * kHeadDim, kHidden}, true);
+        add("self_attn.k_proj.weight", {kKvHeads * kHeadDim, kHidden}, true);
+        add("self_attn.v_proj.weight", {kKvHeads * kHeadDim, kHidden}, true);
+        add("self_attn.o_proj.weight", {kHidden, kHeads * kHeadDim}, true);
+        add("self_attn.q_norm.weight", {kHeadDim}, false);
+        add("self_attn.k_norm.weight", {kHeadDim}, false);
+      } else {
+        add("linear_attn.A_log", {kVHeads}, false);
+        add("linear_attn.dt_bias", {kVHeads}, false);
+        add("linear_attn.conv1d.weight", {kConvDim, 1, kConv}, false);
+        add("linear_attn.in_proj_qkv.weight", {kConvDim, kHidden}, true);
+        add("linear_attn.in_proj_z.weight", {kValueDim, kHidden}, true);
+        add("linear_attn.in_proj_b.weight", {kVHeads, kHidden}, true);
+        add("linear_attn.in_proj_a.weight", {kVHeads, kHidden}, true);
+        add("linear_attn.norm.weight", {kLinHeadDim}, false);
+        add("linear_attn.out_proj.weight", {kHidden, kValueDim}, true);
+      }
+    }
+    std::sort(t.begin(), t.end(), [](const TeTensor& a, const TeTensor& b) { return a.name < b.name; });
+    return t;
+  }();
+  return table;
+}
+
+const TeTensor* find_qwen35_text_tensor(std::string_view name) {
+  const std::vector<TeTensor>& t = qwen35_text_tensors();
+  const auto it =
+      std::lower_bound(t.begin(), t.end(), name, [](const TeTensor& e, std::string_view n) { return e.name < n; });
+  return it != t.end() && it->name == name ? &*it : nullptr;
+}
 
 void check_supported_bundle(const fs::path& dir) {
   std::error_code ec;
@@ -281,19 +397,27 @@ void check_supported_bundle(const fs::path& dir) {
 
 void check_supported_dit_file(const fs::path& file) {
   refuse_other_container(file, "DiT");
-  const SafetensorsFile st(file);
+  check_supported_dit_file(SafetensorsFile(file));
+}
+
+void check_supported_dit_file(const SafetensorsFile& st) {
+  const fs::path& file = st.path();
   const Names n = read_names(st, {"model.diffusion_model.", "diffusion_model."}, "layers.");
   if (n.tensors.empty()) refuse(file, "DiT", {"no tensors"});
-  refuse_other_role(file, "DiT", n);
+  refuse_other_role(st, "DiT", n);
   if (n.find("video_embedder.weight") == nullptr && n.find("layers.0.norm1.weight") == nullptr) {
     const bool te = n.has("language_model.");
     refuse(file, "DiT", {std::string(te ? "text-encoder tensors" : "tensors") + " such as '" + n.first + "'"});
   }
   std::vector<std::string> found;
   // Kept in bf16 by every supported format (INT8 / INT4 ConvRot, W4A8 / W6A8 GPTQ, mixed and bf16 files).
-  compare_tensors(n, {{"video_embedder.weight", {3072, 128}}, {"text_embedder.proj.weight", {3072, 4096}},
-                      {"time_embedding.0.weight", {3072, 256}}, {"final_linear_video.weight", {128, 3072}},
-                      {"layers.0.norm1.weight", {3072}}, {"layers.0.q_norm.weight", {128}}},
+  const auto linear = [](const char* module) {
+    const DitLinear* l = find_moss_dit_linear(module);
+    return ExpectedTensor{std::string(module) + ".weight", {l->n, l->k}};
+  };
+  compare_tensors(n,
+                  {linear("video_embedder"), linear("text_embedder.proj"), linear("time_embedding.0"),
+                   linear("final_linear_video"), {"layers.0.norm1.weight", {3072}}, {"layers.0.q_norm.weight", {128}}},
                   found);
   compare_layers(n, 42, "blocks", found);
   // The GEMM weights under the names and types the importer reads (`.weight`, plus its quantization tensors): other
@@ -320,11 +444,15 @@ void check_supported_dit_file(const fs::path& file) {
 
 void check_supported_text_encoder_file(const fs::path& file) {
   refuse_other_container(file, "text encoder");
-  const SafetensorsFile st(file);
+  check_supported_text_encoder_file(SafetensorsFile(file));
+}
+
+void check_supported_text_encoder_file(const SafetensorsFile& st) {
+  const fs::path& file = st.path();
   // Qwen3_5Model (`[model.]language_model.*`) and text-only (`model.*`) names alike; the importer explains the layout.
   const Names n = read_names(st, {"model.", "language_model."}, "layers.");
   if (n.tensors.empty()) refuse(file, "text encoder", {"no tensors"});
-  refuse_other_role(file, "text encoder", n);
+  refuse_other_role(st, "text encoder", n);
   if (n.has("video_embedder.")) refuse(file, "text encoder", {"DiT tensors such as '" + n.first + "'"});
   const TensorInfo* embed = n.find("embed_tokens.weight");
   if (embed == nullptr && n.layers.empty()) refuse(file, "text encoder", {"tensors such as '" + n.first + "'"});

@@ -323,31 +323,17 @@ auto model_file_errors(const std::filesystem::path& file, F&& f) -> decltype(f()
 }
 
 std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file) {
-  if (!std::filesystem::is_regular_file(file)) throw std::invalid_argument("DiT file not found: " + util::path_utf8(file));
-  weights::check_supported_dit_file(file);
+  // NVFP4 linears run only on cc 12.0 with the sm_120a kernels (user decision D1) and once the DiT has NVFP4 sites
+  // (moss_dit::kRunsNvfp4Linears); otherwise the file is refused as an unsupported model (MI_ERR_MODEL).
+  DitFileInfo info = inspect_dit_file(file, [] { return moss_dit::nvfp4_unsupported_reason(); });
+  if (!info.refusal.empty()) throw weights::UnsupportedModelError(info.refusal);
   auto d = std::make_unique<DitSource>();
   d->path = file;
   d->cert_path = file;
-  quant::QuantModel model = model_file_errors(file, [&] { return quant::open_quant_model(file, quant::ModelKind::kDiT); });
-  // NVFP4 linears run only on cc 12.0 with the sm_120a kernels (user decision D1) and once the DiT has NVFP4 sites
-  // (moss_dit::kRunsNvfp4Linears); otherwise the file is refused as an unsupported model (MI_ERR_MODEL).
-  if (std::any_of(model.linears.begin(), model.linears.end(), [](const quant::QuantLinear& l) { return l.spec.format == quant::QuantFormat::kNvfp4; })) {
-    if (const std::string why = moss_dit::nvfp4_unsupported_reason(); !why.empty()) {
-      throw weights::UnsupportedModelError(util::path_utf8(file) + ": " + why);
-    }
-  }
-  const auto static_input_scales =
-      std::count_if(model.linears.begin(), model.linears.end(), [](const quant::QuantLinear& l) { return l.input_scale.has_value(); });
-  // INT4 ConvRot (convrot_w4a4) linears stay packed for the INT4 GEMMs (the Turbo tier).
-  d->quant = std::make_unique<quant::QuantIndex>(model_file_errors(file, [&] { return quant::to_model_index(model, {.native_int4 = true}); }));
+  d->quant = std::move(info.quant);
   d->index = &d->quant->index;
-  d->precision = moss_dit::has_int4_linears(d->quant.get())   ? planner::Precision::kInt4
-                 : moss_dit::has_quantized_linears(d->quant.get()) ? planner::Precision::kInt8
-                                                              : planner::Precision::kBf16;
-  d->linears = moss_dit::describe_linears(d->quant.get());
-  if (static_input_scales > 0) {
-    d->linears += "; " + std::to_string(static_input_scales) + " linears carry a static input_scale; ignored (activations are scaled per token)";
-  }
+  d->precision = info.precision;
+  d->linears = std::move(info.linears);
   return d;
 }
 
@@ -493,6 +479,45 @@ std::optional<moss_dit::FusedCheck> process_fused_check(const std::string& key, 
 }
 
 }  // namespace
+
+DitFileInfo inspect_dit_file(const std::filesystem::path& file, const std::function<std::string()>& nvfp4_refusal) {
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(file, ec)) {
+    if (std::filesystem::exists(file, ec)) throw std::invalid_argument(util::path_utf8(file) + ": not a regular file");
+    throw std::invalid_argument("DiT file not found: " + util::path_utf8(file));
+  }
+  weights::check_supported_dit_file(file);
+  quant::QuantModel model =
+      model_file_errors(file, [&] { return quant::open_quant_model(file, quant::ModelKind::kDiT); });
+  DitFileInfo info;
+  info.nvfp4 = std::any_of(model.linears.begin(), model.linears.end(),
+                           [](const quant::QuantLinear& l) { return l.spec.format == quant::QuantFormat::kNvfp4; });
+  // Refused before to_model_index reads the block scales.
+  if (info.nvfp4 && nvfp4_refusal) {
+    if (const std::string why = nvfp4_refusal(); !why.empty()) {
+      info.refusal = util::path_utf8(file) + ": " + why;
+      return info;
+    }
+  }
+  const auto static_input_scales = std::count_if(model.linears.begin(), model.linears.end(),
+                                                 [](const quant::QuantLinear& l) { return l.input_scale.has_value(); });
+  // INT4 ConvRot (convrot_w4a4) linears stay packed for the INT4 GEMMs (the Turbo tier).
+  info.quant = std::make_unique<quant::QuantIndex>(
+      model_file_errors(file, [&] { return quant::to_model_index(model, {.native_int4 = true}); }));
+  info.precision = moss_dit::has_int4_linears(info.quant.get())       ? planner::Precision::kInt4
+                   : moss_dit::has_quantized_linears(info.quant.get()) ? planner::Precision::kInt8
+                                                                       : planner::Precision::kBf16;
+  info.linears = moss_dit::describe_linears(info.quant.get());
+  if (static_input_scales > 0) {
+    info.linears += "; " + std::to_string(static_input_scales) +
+                    " linears carry a static input_scale; ignored (activations are scaled per token)";
+  }
+  return info;
+}
+
+DitFileInfo inspect_dit_file(const std::filesystem::path& file, std::string_view nvfp4_refusal) {
+  return inspect_dit_file(file, [why = std::string(nvfp4_refusal)] { return why; });
+}
 
 std::vector<int> parse_layer_list(std::string_view text) {
   std::vector<int> out;

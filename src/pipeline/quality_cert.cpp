@@ -42,6 +42,7 @@
 #include "util/rename_replace.h"
 #include "util/replaceable_file.h"
 #include "util/xxh64.h"
+#include "weights/file_reader.h"
 
 // GCC's -Wdangling-reference heuristic flags every `const T& x = f(dom, where + "...")`: the DOM accessors below
 // return references into their json::Value argument, never into the temporary message string.
@@ -600,19 +601,26 @@ void write_hash_cache(const fs::path& file, const std::vector<HashEntry>& entrie
 }
 
 std::uint64_t hash_file(const fs::path& path, std::uint64_t expected_size) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) fail("cannot open " + util::path_utf8(path));
+  // FileReader: a model path that names a FIFO or a device is refused, never waited on.
+  std::optional<weights::FileReader> in;
+  try {
+    in.emplace(path);
+  } catch (const weights::IoError& e) {
+    fail(e.what());  // "<path>: cannot open: <reason>" / "<path>: not a regular file"
+  }
+  if (in->size() != expected_size) fail("read error (or the file changed) while hashing " + util::path_utf8(path));
   Xxh64 h;
   std::vector<char> buf(std::size_t{8} << 20);
-  std::uint64_t total = 0;
-  while (in) {
-    in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-    const std::streamsize n = in.gcount();
-    if (n <= 0) break;
-    h.update(buf.data(), static_cast<std::size_t>(n));
-    total += static_cast<std::uint64_t>(n);
+  try {
+    for (std::uint64_t at = 0; at < expected_size;) {
+      const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(buf.size(), expected_size - at));
+      in->read_at(at, buf.data(), n);
+      h.update(buf.data(), n);
+      at += n;
+    }
+  } catch (const weights::IoError&) {
+    fail("read error (or the file changed) while hashing " + util::path_utf8(path));
   }
-  if (in.bad() || total != expected_size) fail("read error (or the file changed) while hashing " + util::path_utf8(path));
   return h.digest();
 }
 

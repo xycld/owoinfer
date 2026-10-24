@@ -14,6 +14,7 @@ constexpr std::uint64_t kOff = std::numeric_limits<std::uint64_t>::max();
 std::atomic<std::uint64_t> g_pinned_left{kOff};  // bytes still allowed before the seam fails pinned allocations
 std::atomic<std::atomic<bool>*> g_chunk_cancel{nullptr};
 std::atomic<ResidencyQuery> g_query{ResidencyQuery::kAuto};
+std::atomic<bool> g_any_model_shapes{false};
 
 }  // namespace
 
@@ -43,5 +44,8 @@ void check_pinned_alloc(std::size_t bytes) {
 
 void force_residency_query(ResidencyQuery query) { g_query.store(query); }
 ResidencyQuery residency_query() { return g_query.load(); }
+
+void allow_any_model_shapes(bool allow) { g_any_model_shapes.store(allow); }
+bool any_model_shapes() { return g_any_model_shapes.load(std::memory_order_relaxed); }
 
 }  // namespace mi::weights::testing

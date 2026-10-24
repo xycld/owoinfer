@@ -28,4 +28,10 @@ enum class ResidencyQuery { kAuto, kMincore, kNone };
 void force_residency_query(ResidencyQuery query);
 ResidencyQuery residency_query();
 
+// The quantized importer (quant::open_quant_model) reads linears and text-encoder tensors of any shape instead of
+// refusing every one that is not the MOSS-Image DiT's or text encoder's with its shape (weights::moss_dit_linears,
+// weights::qwen35_text_tensors): for the reader's and converter's tests on small synthetic models. Off by default.
+void allow_any_model_shapes(bool allow);
+bool any_model_shapes();
+
 }  // namespace mi::weights::testing

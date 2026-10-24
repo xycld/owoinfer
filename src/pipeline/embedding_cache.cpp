@@ -15,6 +15,7 @@
 #include "util/rename_replace.h"
 #include "util/replaceable_file.h"
 #include "util/xxh64.h"
+#include "weights/file_reader.h"
 #include "weights/safetensors.h"
 
 namespace mi::pipeline {
@@ -77,15 +78,18 @@ void hash_string(Xxh64& h, const std::string& s) {
 // The safetensors header (u64 length + JSON: every tensor's name, dtype, shape and offsets) of `path`, hashed with its
 // length; an unreadable or malformed file hashes as a marker.
 void hash_safetensors_header(Xxh64& h, const fs::path& path) {
-  std::ifstream in(path, std::ios::binary);
   unsigned char len_bytes[8];
   std::string header;
-  if (in.read(reinterpret_cast<char*>(len_bytes), sizeof(len_bytes))) {
+  try {
+    const weights::FileReader in(path);  // a FIFO or a device is refused (the marker), never waited on
+    in.read_at(0, len_bytes, sizeof(len_bytes));
     const auto len = get_le<std::uint64_t>(len_bytes);
     if (len <= weights::kMaxHeaderBytes) {
       header.resize(static_cast<std::size_t>(len));
-      if (!in.read(header.data(), static_cast<std::streamsize>(len))) header.clear();
+      in.read_at(sizeof(len_bytes), header.data(), header.size());
     }
+  } catch (const weights::IoError&) {
+    header.clear();
   }
   const std::uint8_t ok = header.empty() ? 0 : 1;
   h.update(&ok, sizeof(ok));

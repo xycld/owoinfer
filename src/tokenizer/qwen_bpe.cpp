@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <fstream>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -11,6 +10,7 @@
 
 #include "tokenizer/unicode.h"
 #include "util/path.h"
+#include "util/replaceable_file.h"
 
 namespace mi::tok {
 
@@ -398,11 +398,15 @@ Tokenizer Tokenizer::load(const std::filesystem::path& tokenizer_json) {
     throw std::runtime_error("tokenizer: " + util::path_utf8(tokenizer_json) + " is " + std::to_string(size) +
                              " bytes, over the limit of " + std::to_string(kMaxTokenizerBytes));
   }
-  std::ifstream in(tokenizer_json, std::ios::binary);
-  if (!in) throw std::runtime_error("tokenizer: cannot open " + util::path_utf8(tokenizer_json));
-  std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  if (in.bad()) throw std::runtime_error("tokenizer: cannot read " + util::path_utf8(tokenizer_json));
-  if (text.size() > kMaxTokenizerBytes) throw std::runtime_error("tokenizer: " + util::path_utf8(tokenizer_json) + " grew past the size limit while reading");
+  // read_replaceable_file opens regular files only: a FIFO or a device in its place is an error, never waited on.
+  std::string text;
+  const std::string where = util::path_utf8(tokenizer_json);
+  const util::ReadStatus status =
+      util::read_replaceable_file(tokenizer_json, static_cast<std::size_t>(kMaxTokenizerBytes), text);
+  if (status == util::ReadStatus::kTooLarge) {
+    throw std::runtime_error("tokenizer: " + where + " grew past the size limit while reading");
+  }
+  if (status != util::ReadStatus::kOk) throw std::runtime_error("tokenizer: cannot read " + where);
   try {
     return from_json(json::parse(text, {.max_values = kMaxTokenizerValues}));
   } catch (const json::ParseError& e) {

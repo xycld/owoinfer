@@ -315,6 +315,7 @@ void add_int8_module(std::vector<T>& ts, const std::string& m, std::int64_t n, s
 }
 
 TEST(QuantModel, ComfyQuantFusedQkvIsUnfusedByByteRanges) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("quant_fused");
   std::vector<T> ts;
   add_int8_module(ts, "layers.0.proj.qkv", 3 * kD, kD, 1);
@@ -370,6 +371,7 @@ TEST(QuantModel, ComfyQuantFusedQkvIsUnfusedByByteRanges) {
 }
 
 TEST(QuantModel, LegacyMetadataAndGroupedFormats) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("quant_legacy");
   std::vector<T> ts;
   // W4A8 module from the vector set (64 x 512, g16, codebook).
@@ -430,6 +432,7 @@ TEST(QuantModel, LegacyMetadataAndGroupedFormats) {
 }
 
 TEST(QuantModel, TextEncoderNamesMapAndExclusions) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("quant_te");
   std::vector<T> ts;
   add_int8_module(ts, "model.language_model.layers.0.mlp.up_proj", 256, 256, 1);
@@ -464,6 +467,7 @@ TEST(QuantModel, TextEncoderNamesMapAndExclusions) {
 
 // Hostile or inconsistent headers are rejected, never misread.
 TEST(QuantModel, RejectsMalformedQuantization) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("quant_bad");
   int n = 0;
   auto expect_reject = [&](std::vector<T> ts, const std::string& md, const char* what) {
@@ -636,6 +640,7 @@ TEST(QuantModel, RejectsMalformedQuantization) {
 
 // Stored scales are validated when read: per-row scales finite and > 0, group scales not NaN or negative (0 is valid).
 TEST(QuantModel, RejectsInvalidStoredScales) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("quant_scales");
   auto with_scale = [&](const char* tag, float bad) {
     std::vector<T> ts;
@@ -686,6 +691,7 @@ TEST(QuantModel, RejectsInvalidStoredScales) {
 
 // A fused qkv with one tensorwise scale: every slice keeps the whole scalar.
 TEST(QuantModel, ScalarScaleFusedQkv) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("quant_scalar_qkv");
   std::vector<std::int8_t> w(6 * 256);
   for (std::size_t i = 0; i < w.size(); ++i) w[i] = static_cast<std::int8_t>(static_cast<int>(i % 255) - 127);
@@ -722,6 +728,7 @@ TEST(QuantModel, ScalarScaleFusedQkv) {
 }
 
 TEST(QuantModel, TextEncoderEdgeCases) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("quant_te_edge");
   // A malformed config on an excluded module is ignored (its tensors are excluded anyway).
   {
@@ -859,6 +866,7 @@ std::vector<float> widen(const std::vector<std::uint16_t>& v) {
 }
 
 TEST(QuantConvert, SyntheticDitWithLoraKeepAndFusion) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("quant_convert");
   TinyDit d = tiny_dit();
   write_st(dir.path() / "transformer" / "diffusion_pytorch_model.safetensors", d.ts);
@@ -994,6 +1002,7 @@ TEST(QuantConvert, SyntheticDitWithLoraKeepAndFusion) {
 }
 
 TEST(QuantConvert, GroupedImportIsLossless) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("quant_import");
   std::vector<T> ts;
   const std::string p = "w4a8_w4_g16_";
@@ -1016,6 +1025,7 @@ TEST(QuantConvert, GroupedImportIsLossless) {
 
 // LoRA edge cases: PEFT naming, non-finite coefficients, merges that overflow; a failed conversion leaves nothing.
 TEST(QuantConvert, LoraEdgeCasesAndCleanup) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("quant_lora_edge");
   TinyDit d = tiny_dit();
   write_st(dir.path() / "transformer" / "diffusion_pytorch_model.safetensors", d.ts);
@@ -1095,6 +1105,7 @@ TEST(QuantConvert, LoraEdgeCasesAndCleanup) {
 // Output metadata: the source's keys minus the legacy header and stale mossinfer_* keys; the converter line counts
 // the written specs. A quantized linear outside `layers.N.` gets no attention config.
 TEST(QuantConvert, MetadataAndNonBlockLinears) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("quant_meta");
   std::vector<T> ts;
   add_int8_module(ts, "layers.0.proj.o", kD, kD, 1, false);

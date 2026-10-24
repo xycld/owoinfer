@@ -37,7 +37,10 @@
 // The VAE is out of scope: it is small and stays bf16, so no VAE file is read here.
 //
 // Everything here is header-driven and validated as untrusted input (shapes, dtypes, sizes, config values); stored
-// scales are checked (finite, > 0) whenever their bytes are read.
+// scales are checked (finite, > 0) whenever their bytes are read. A DiT's linears must be the MOSS-Image DiT's, and a
+// text encoder's linears and tensors the MOSS-Image text encoder's, with their shapes (weights::moss_dit_linears,
+// weights::qwen35_text_tensors), before any of their bytes are read, so the stored shapes never size an allocation
+// beyond the model's.
 #pragma once
 
 #include <cstddef>
@@ -144,6 +147,10 @@ struct QuantModel {
 // Without `kind` a single file's kind is detected from its tensor names (bundle roots default to the DiT).
 // Text-encoder names are routed with weights::classify_tensor; a text-only Qwen3.5 checkpoint (`model.layers.*`) is
 // refused. A quantization config on an excluded module (visual, mtp, lm_head) is ignored, even when malformed.
+// A DiT linear (a quantized module or a bf16 block GEMM) that is not a MOSS-Image DiT linear with its [n, k] (a fused
+// proj.qkv: [3 * 3072, 3072]) is refused, naming the tensor, its shape and the expected one; so is a text-encoder
+// linear or kept tensor that is not one of the MOSS-Image text encoder's with its shape. Scale tensors are checked
+// against [n, k] per layout; no tensor data but the comfy_quant configs is read here.
 // Throws QuantError / weights::FormatError / weights::IoError.
 QuantModel open_quant_model(const std::filesystem::path& path, std::optional<ModelKind> kind = std::nullopt);
 

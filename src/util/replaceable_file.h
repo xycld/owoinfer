@@ -22,7 +22,8 @@ enum class ReadStatus {
   kOk,
   kMissing,   // no such file (or a path component is missing)
   kTooLarge,  // more than max_bytes (`out` holds nothing)
-  kError,     // could not be opened or read (still locked after the retries, a permission, an I/O error)
+  kError,     // could not be opened or read (still locked after the retries, a permission, an I/O error, or not a
+              // regular file: a FIFO or a device is refused at once, util::open_regular_file)
 };
 
 // The whole of `path` into `out` (cleared first) when it holds at most `max_bytes`.

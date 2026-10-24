@@ -58,6 +58,7 @@
 #include "planner/planner.h"
 #include "util/json.h"
 #include "weights/file_reader.h"
+#include "weights/quant/quant_model.h"
 
 namespace mi::pipeline {
 
@@ -397,7 +398,7 @@ struct Result {
   std::string dit_linears;
   std::string time_embedding;  // PipelineOptions::time_embedding_file when a replacement step embedder ran (else empty)
   std::string te_source;     // the bundle's text_encoder directory or PipelineOptions::text_encoder_file
-  std::string te_precision;  // qwen35_text::precision_name: "bf16", "int8", "w4a8"
+  std::string te_precision;  // qwen35_text::precision_name: "bf16", "int8_convrot", "w4a8"
   std::string te_note;       // e.g. a pinned host copy that could not be allocated (the encoder streamed instead)
   std::string preload_note;  // preload(): what it did not load and why (e.g. a DiT the plan parks for the encoder)
   std::string vae_source;    // the bundle's vae directory or PipelineOptions::vae_file
@@ -462,6 +463,33 @@ struct GenerateControl {
 // weights and the files derived from them, "" for anything else (or unreadable). XXH64 of the tensor's 786 KB; `index`
 // is a bundle's or a single file's (quant::to_model_index).
 std::string dit_lineage(const weights::ModelIndex& index);
+
+// What a single DiT file (PipelineOptions::dit_file) is, as loading it determines before any device work: the
+// supported-model check (weights::check_supported_dit_file), the quantized importer (quant::open_quant_model: every
+// linear's layout and MOSS-Image shapes) and its index (quant::to_model_index with INT4 linears kept packed, which
+// reads and validates every quantized linear's scales: ~1.5 MB for an INT8 DiT, ~130 MB of block scales for a
+// half-NVFP4 one). Device-free; Pipeline loads a DiT file through it.
+struct DitFileInfo {
+  std::unique_ptr<quant::QuantIndex> quant;  // the index the DiT loads from; null when `refusal` is set
+  // Of the block linears: kInt4 when some is INT4, else kInt8 when some is quantized (INT8 or NVFP4), else kBf16.
+  planner::Precision precision = planner::Precision::kBf16;
+  // moss_dit::describe_linears (e.g. "int8_convrot256", "mixed (210 int4_convrot256, 42 bf16)"), plus a note when
+  // linears carry a static input_scale (ignored): Result::dit_linears.
+  std::string linears;
+  bool nvfp4 = false;   // some linear is NVFP4
+  std::string refusal;  // "<file>: <reason>" when nvfp4 and the NVFP4 refusal reason is not empty, else empty
+};
+// `nvfp4_refusal` says why NVFP4 linears cannot run where the file is meant to; it is called only for a file with NVFP4
+// linears (Pipeline passes moss_dit::nvfp4_unsupported_reason, which queries the device). A non-empty reason answers
+// the file by `refusal` alone (no index, precision or linears), before its block scales are read; an empty one (or no
+// function) indexes NVFP4 linears like the others.
+// Throws std::invalid_argument when `file` does not exist ("DiT file not found: <file>") or is not a regular file
+// ("<file>: not a regular file"), weights::UnsupportedModelError for another model or add-on, weights::IndexError
+// (MI_ERR_MODEL, the message naming the file) for a layout or shape the importer refuses, weights::FormatError /
+// IoError for an unreadable file.
+DitFileInfo inspect_dit_file(const std::filesystem::path& file, const std::function<std::string()>& nvfp4_refusal);
+// The same with the reason already known (e.g. for another device, or "" to index NVFP4 linears).
+DitFileInfo inspect_dit_file(const std::filesystem::path& file, std::string_view nvfp4_refusal);
 
 // How a DiT load reads its weight files (PipelineOptions::dit_load_direct_io; pure, for the pipeline and its tests).
 // forced_*: the options; support: weights::direct_io_support of the files (the first that does not gain); parked: a

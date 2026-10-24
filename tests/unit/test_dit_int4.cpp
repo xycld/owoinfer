@@ -59,6 +59,7 @@
 #include "reference_gpu.h"
 #include "runtime/stream_set.h"
 #include "test_lora_util.h"
+#include "test_util.h"
 #include "util/json.h"
 #include "util/npy.h"
 #include "weights/model_index.h"
@@ -249,7 +250,9 @@ TEST(DitInt4Index, NativeViewOfTheCommunityFile) {
 
 // comfy-kitchen runs convrot_w4a4 only with quant_group_size 64 (its default when absent): other values keep the
 // decode path (to_model_index then asks for conversion), never the native INT4 view.
-TEST(DitInt4Index, QuantGroupSizeGatesTheNativeView) {
+// Pure CPU (the index only): a suite name outside the GPU labels' DitInt4* pattern, so CI runs it.
+TEST(QuantInt4Index, QuantGroupSizeGatesTheNativeView) {
+  const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   const fs::path file = fs::temp_directory_path() / ("mossinfer_test_dit_int4_qgs_" + std::to_string(std::random_device{}()) + ".safetensors");
   for (const int g : {0, 64, 128}) {
     const std::string conf = std::string(R"({\"format\":\"convrot_w4a4\",\"convrot_groupsize\":256)") +

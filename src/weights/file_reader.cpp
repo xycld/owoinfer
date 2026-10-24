@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "weights/test_seams.h"
 
 #ifdef _WIN32
@@ -70,26 +71,30 @@ AlignedRange align_range(std::uint64_t offset, std::size_t size) {
 #ifdef _WIN32
 
 namespace {
-HANDLE open_win(const std::filesystem::path& path, bool direct) {
-  DWORD flags = FILE_FLAG_OVERLAPPED | (direct ? FILE_FLAG_NO_BUFFERING : 0);
-  // FILE_SHARE_DELETE lets the app replace or delete model files (an update) while a reader is open, and with
-  // FILE_SHARE_WRITE a reader never blocks a writer. The trade-off: a program writing into a weight file in place while
-  // it is read can hand the reader torn bytes (no lock stops it); the engine and its tools never write weight files in
-  // place (they write a temporary file and rename it over the old one), and a torn read fails the format checks or the
-  // quality identity rather than passing silently in most cases.
-  return CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                     OPEN_EXISTING, flags, nullptr);
+// FILE_SHARE_DELETE lets the app replace or delete model files (an update) while a reader is open, and with
+// FILE_SHARE_WRITE a reader never blocks a writer (util::open_regular_file opens with both). The trade-off: a program
+// writing into a weight file in place while it is read can hand the reader torn bytes (no lock stops it); the engine
+// and its tools never write weight files in place (they write a temporary file and rename it over the old one), and a
+// torn read fails the format checks or the quality identity rather than passing silently in most cases.
+util::OpenStatus open_win(const std::filesystem::path& path, bool direct, HANDLE& h) {
+  void* handle = nullptr;
+  const DWORD flags = FILE_FLAG_OVERLAPPED | (direct ? FILE_FLAG_NO_BUFFERING : 0);
+  const util::OpenStatus status = util::open_regular_file(path, flags, handle);
+  h = status == util::OpenStatus::kOk ? static_cast<HANDLE>(handle) : INVALID_HANDLE_VALUE;
+  return status;
 }
 }  // namespace
 
 FileReader::FileReader(const std::filesystem::path& path, bool direct) : path_(path) {
-  HANDLE h = open_win(path, direct);
+  HANDLE h = INVALID_HANDLE_VALUE;
+  util::OpenStatus status = open_win(path, direct, h);
   direct_ = direct;
-  if (h == INVALID_HANDLE_VALUE && direct) {
-    h = open_win(path, false);
+  if (status == util::OpenStatus::kError && direct) {
+    status = open_win(path, false, h);
     direct_ = false;
   }
-  if (h == INVALID_HANDLE_VALUE) fail(path_, "cannot open", static_cast<int>(GetLastError()));
+  if (status == util::OpenStatus::kNotRegular) throw IoError(util::path_utf8(path_) + ": " + util::kNotRegularFile);
+  if (status != util::OpenStatus::kOk) fail(path_, "cannot open", static_cast<int>(GetLastError()));
   handle_ = h;
   LARGE_INTEGER sz;
   if (!GetFileSizeEx(h, &sz)) {
@@ -149,8 +154,10 @@ DirectIoSupport direct_io_support(const std::filesystem::path& path) {
   if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_COMPRESSED) != 0) {
     return {false, name + " is NTFS-compressed: unbuffered reads gain nothing"};
   }
-  HANDLE h = open_win(path, true);
-  if (h == INVALID_HANDLE_VALUE) {
+  HANDLE h = INVALID_HANDLE_VALUE;
+  const util::OpenStatus status = open_win(path, true, h);
+  if (status == util::OpenStatus::kNotRegular) return {false, name + " is " + util::kNotRegularFile};
+  if (status != util::OpenStatus::kOk) {
     const int code = static_cast<int>(GetLastError());
     if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return {false, name + " does not exist"};
     return {false, name + ": the file system refuses unbuffered reads (" + std::system_category().message(code) + ")"};
@@ -267,8 +274,8 @@ constexpr long kSysCachestat = 451;
 double page_cache_fraction(const std::filesystem::path& path) {
   const testing::ResidencyQuery query = testing::residency_query();
   if (query == testing::ResidencyQuery::kNone) return -1.0;
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) return -1.0;
+  int fd = -1;
+  if (util::open_regular_file(path, 0, fd) != util::OpenStatus::kOk) return -1.0;
   struct stat st {};
   double fraction = -1.0;
   if (::fstat(fd, &st) == 0 && st.st_size > 0) {
@@ -312,8 +319,10 @@ DirectIoSupport direct_io_support(const std::filesystem::path& path) {
 #ifndef O_DIRECT
   return {false, "this platform has no O_DIRECT"};
 #else
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-  if (fd < 0) {
+  int fd = -1;
+  const util::OpenStatus status = util::open_regular_file(path, O_DIRECT, fd);
+  if (status == util::OpenStatus::kNotRegular) return {false, name + " is " + util::kNotRegularFile};
+  if (status != util::OpenStatus::kOk) {
     if (errno == ENOENT) return {false, name + " does not exist"};
     return {false, name + ": the file system refuses O_DIRECT (" + std::system_category().message(errno) + ")"};
   }
@@ -350,15 +359,19 @@ DirectIoSupport direct_io_support(const std::filesystem::path& path) {
 #ifndef _WIN32
 
 FileReader::FileReader(const std::filesystem::path& path, bool direct) : path_(path) {
-  int flags = O_RDONLY | O_CLOEXEC;
+  // util::open_regular_file: a FIFO or a device is refused instead of blocking the open (or the reads) forever.
+  util::OpenStatus status = util::OpenStatus::kError;
 #ifdef O_DIRECT
   if (direct) {
-    fd_ = ::open(path.c_str(), flags | O_DIRECT);
-    direct_ = fd_ >= 0;
+    status = util::open_regular_file(path, O_DIRECT, fd_);
+    direct_ = status == util::OpenStatus::kOk;
   }
+#else
+  static_cast<void>(direct);
 #endif
-  if (fd_ < 0) fd_ = ::open(path.c_str(), flags);
-  if (fd_ < 0) fail(path_, "cannot open", errno);
+  if (status == util::OpenStatus::kError) status = util::open_regular_file(path, 0, fd_);
+  if (status == util::OpenStatus::kNotRegular) throw IoError(util::path_utf8(path_) + ": " + util::kNotRegularFile);
+  if (status != util::OpenStatus::kOk) fail(path_, "cannot open", errno);
   struct stat st;
   if (::fstat(fd_, &st) != 0) {
     int code = errno;
@@ -495,9 +508,11 @@ void FileReader::read_at(std::uint64_t offset, void* dst, std::size_t size) cons
 #ifdef _WIN32
 
 MappedFile::MappedFile(const std::filesystem::path& path) {
-  HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (f == INVALID_HANDLE_VALUE) fail(path, "cannot open", static_cast<int>(GetLastError()));
+  void* handle = nullptr;
+  const util::OpenStatus status = util::open_regular_file(path, FILE_ATTRIBUTE_NORMAL, handle);
+  if (status == util::OpenStatus::kNotRegular) throw IoError(util::path_utf8(path) + ": " + util::kNotRegularFile);
+  if (status != util::OpenStatus::kOk) fail(path, "cannot open", static_cast<int>(GetLastError()));
+  HANDLE f = static_cast<HANDLE>(handle);
   LARGE_INTEGER sz;
   if (!GetFileSizeEx(f, &sz)) {
     int code = static_cast<int>(GetLastError());
@@ -529,8 +544,10 @@ void MappedFile::unmap() noexcept {
 #else
 
 MappedFile::MappedFile(const std::filesystem::path& path) {
-  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) fail(path, "cannot open", errno);
+  int fd = -1;
+  const util::OpenStatus status = util::open_regular_file(path, 0, fd);
+  if (status == util::OpenStatus::kNotRegular) throw IoError(util::path_utf8(path) + ": " + util::kNotRegularFile);
+  if (status != util::OpenStatus::kOk) fail(path, "cannot open", errno);
   struct stat st;
   if (::fstat(fd, &st) != 0) {
     int code = errno;

@@ -61,7 +61,8 @@ bool direct_short_read_continues(std::uint64_t pos, std::size_t remaining, std::
 class FileReader {
  public:
   // `direct` requests unbuffered I/O. If the file system refuses it (tmpfs, some network mounts)
-  // the file is opened buffered and direct() reports false, so callers keep working.
+  // the file is opened buffered and direct() reports false, so callers keep working. Only a regular file opens
+  // (util::open_regular_file): a FIFO, a device or a directory throws IoError "<path>: not a regular file" at once.
   explicit FileReader(const std::filesystem::path& path, bool direct = false);
   // An in-memory reader: `size` bytes at `memory` hold the file's contents (`path` names it in messages). Reads copy
   // out of them (never direct); `pinned` says they are page-locked, so the device can DMA from them (memory()).
@@ -112,7 +113,8 @@ class FileReader {
 // on btrfs, compressed extents are read through the page cache whatever the flag says, so a file with more than
 // kMaxCompressedFraction of its bytes in compressed extents (FIEMAP's "encoded" extents; when FIEMAP is unavailable:
 // a compress / compress-force mount option) counts as unsupported. Windows: false when a FILE_FLAG_NO_BUFFERING open
-// fails. `reason` is empty when supported, else one human-readable sentence naming the file system or the error.
+// fails. A path that is not a regular file is never supported. `reason` is empty when supported, else one
+// human-readable sentence naming the file system or the error.
 struct DirectIoSupport {
   bool supported = false;
   std::string reason;
@@ -132,7 +134,8 @@ DirectIoSupport direct_io_support(const std::filesystem::path& path);
 inline constexpr int kResidencySamples = 64;
 double page_cache_fraction(const std::filesystem::path& path);
 
-// Read-only view of a whole file. Empty files map to a null/zero-size view.
+// Read-only view of a whole regular file (anything else throws IoError, as FileReader). Empty files map to a
+// null/zero-size view.
 class MappedFile {
  public:
   explicit MappedFile(const std::filesystem::path& path);
