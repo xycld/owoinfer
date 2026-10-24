@@ -473,9 +473,13 @@ struct DitFileInfo {
   std::unique_ptr<quant::QuantIndex> quant;  // the index the DiT loads from; null when `refusal` is set
   // Of the block linears: kInt4 when some is INT4, else kInt8 when some is quantized (INT8 or NVFP4), else kBf16.
   planner::Precision precision = planner::Precision::kBf16;
-  // moss_dit::describe_linears (e.g. "int8_convrot256", "mixed (210 int4_convrot256, 42 bf16)"), plus a note when
-  // linears carry a static input_scale (ignored): Result::dit_linears.
+  // moss_dit::describe_linears (e.g. "int8_convrot256", "mixed (210 int4_convrot256, 42 bf16)"): Result::dit_linears.
   std::string linears;
+  // Linears with a static activation scale (input_scale), which the engine ignores (it scales activations per token),
+  // and the remark that says so ("N linears carry a static input_scale; ignored (activations are scaled per token)";
+  // empty when there are none). The plan explanation shows it.
+  int static_input_scales = 0;
+  std::string remarks;
   bool nvfp4 = false;   // some linear is NVFP4
   std::string refusal;  // "<file>: <reason>" when nvfp4 and the NVFP4 refusal reason is not empty, else empty
 };
@@ -483,13 +487,18 @@ struct DitFileInfo {
 // linears (Pipeline passes moss_dit::nvfp4_unsupported_reason, which queries the device). A non-empty reason answers
 // the file by `refusal` alone (no index, precision or linears), before its block scales are read; an empty one (or no
 // function) indexes NVFP4 linears like the others.
-// Throws std::invalid_argument when `file` does not exist ("DiT file not found: <file>") or is not a regular file
-// ("<file>: not a regular file"), weights::UnsupportedModelError for another model or add-on, weights::IndexError
-// (MI_ERR_MODEL, the message naming the file) for a layout or shape the importer refuses, weights::FormatError /
-// IoError for an unreadable file.
+// Throws std::invalid_argument when `file` exists but is not a regular file ("<file>: not a regular file"),
+// weights::IoError (MI_ERR_IO) when it does not exist (any more: "<file>: no such file") or cannot be read,
+// weights::UnsupportedModelError for another model, container or add-on, weights::IndexError (MI_ERR_MODEL, the message
+// naming the file) for a layout or shape the importer refuses, weights::FormatError for a malformed header. (Pipeline
+// keeps its own std::invalid_argument "DiT file not found: <file>" for a dit_file that does not exist.)
 DitFileInfo inspect_dit_file(const std::filesystem::path& file, const std::function<std::string()>& nvfp4_refusal);
 // The same with the reason already known (e.g. for another device, or "" to index NVFP4 linears).
 DitFileInfo inspect_dit_file(const std::filesystem::path& file, std::string_view nvfp4_refusal);
+// The same on a header the caller already parsed (messages and reads use header.path(); the header is not read
+// again). A parsed header is a safetensors file, so the GGUF / pickle container check of the path form is skipped.
+DitFileInfo inspect_dit_file(const weights::SafetensorsFile& header,
+                             const std::function<std::string()>& nvfp4_refusal);
 
 // How a DiT load reads its weight files (PipelineOptions::dit_load_direct_io; pure, for the pipeline and its tests).
 // forced_*: the options; support: weights::direct_io_support of the files (the first that does not gain); parked: a

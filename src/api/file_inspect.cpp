@@ -35,6 +35,7 @@
 #include "planner/planner.h"
 #include "util/json.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "weights/file_reader.h"
 #include "weights/model_index.h"
 #include "weights/quant/quant_model.h"
@@ -99,12 +100,10 @@ std::uint64_t regular_file_bytes(const fs::path& path) {
                                                 ? std::string("no such file")
                                                 : std::system_category().message(static_cast<int>(e))));
   };
-  // The device namespace (\\.\, \\?\GLOBALROOT\...) and device or directory attributes: refused unopened. A reparse
-  // point (a symbolic link to a model file) is followed by CreateFileW and judged by the handle below.
-  const std::wstring& text = path.native();
-  if (text.starts_with(L"\\\\.\\") || text.starts_with(L"\\\\?\\GLOBALROOT")) {
-    throw std::invalid_argument(where + " is not a regular file");
-  }
+  // Device and pipe paths (util::is_windows_device_path: the device namespaces, DOS device names, UNC pipe shares) and
+  // device or directory attributes: refused unopened. A reparse point (a symbolic link to a model file) is followed by
+  // CreateFileW and judged by the handle below.
+  if (util::is_windows_device_path(path)) throw std::invalid_argument(where + " is not a regular file");
   const DWORD attributes = GetFileAttributesW(path.c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES) throw no_file(GetLastError());
   if ((attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE)) != 0) {
@@ -112,7 +111,7 @@ std::uint64_t regular_file_bytes(const fs::path& path) {
   }
   const HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                               FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                               FILE_FLAG_BACKUP_SEMANTICS | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
   if (h == INVALID_HANDLE_VALUE) throw no_file(GetLastError());
   BY_HANDLE_FILE_INFORMATION info{};
   const bool disk = GetFileType(h) == FILE_TYPE_DISK && GetFileInformationByHandle(h, &info) != 0 &&

@@ -46,9 +46,11 @@ void check_supported_text_encoder_file(const std::filesystem::path& file);
 // The same on a header already parsed, as check_supported_dit_file(const SafetensorsFile&).
 void check_supported_text_encoder_file(const SafetensorsFile& file);
 
-// Whether a safetensors file holds adapter tensors (`.lora_A.` / `.lora_B.`, `.lora_down.` / `.lora_up.`, LyCORIS
-// `.hada_w` / `.lokr_w`, `.alpha`): a LoRA, or a control adapter (a LoRA with a widened video_embedder). From names
-// only; what the check functions above refuse as "a LoRA" / "a control adapter".
+// Whether a safetensors file holds LoRA factors (`.lora_A.` / `.lora_B.`, `.lora_down.` / `.lora_up.`, diffusers'
+// `.lora.down.` / `.lora.up.` / `.lora_linear_layer.`, LyCORIS `.hada_w` / `.lokr_w`): a LoRA, or a control adapter (a
+// LoRA with a widened video_embedder). From names only; what the check functions above refuse as "a LoRA" / "a control
+// adapter". An `.alpha` tensor is no marker of its own (a LoRA's sits next to its module's factors; Snake activations'
+// `.act.alpha` and `.alphas` belong to other models).
 bool looks_like_lora(const SafetensorsFile& file);
 
 // The linears of the MOSS-Image DiT (transformer/config.json: dim 3072, ffn_dim 8192, num_layers 42, text_dim 4096,

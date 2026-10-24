@@ -39,6 +39,7 @@
 #include "models/qwen35_text/text_encoder.h"
 #include "util/json.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "util/rename_replace.h"
 #include "util/replaceable_file.h"
 #include "util/xxh64.h"
@@ -471,8 +472,9 @@ bool write_atomic(const fs::path& path, const std::string& text) {
       return false;
     }
   }
+  const DWORD flags = FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
   HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                         OPEN_EXISTING, flags, nullptr);
   const bool flushed = h != INVALID_HANDLE_VALUE && FlushFileBuffers(h);
   if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
   if (!flushed) {
@@ -527,8 +529,11 @@ FileKey file_key(const fs::path& path) {
   FileKey k;
   k.path = util::path_utf8(canon);
 #ifdef _WIN32
+  // A device or pipe path is never opened (util::open_regular_file's rules); SQOS: no impersonation by a pipe server.
+  if (util::is_windows_device_path(canon)) fail(k.path + ": " + util::kNotRegularFile);
+  const DWORD flags = FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
   HANDLE h = CreateFileW(canon.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                         nullptr, OPEN_EXISTING, flags, nullptr);
   BY_HANDLE_FILE_INFORMATION info{};
   const bool ok = h != INVALID_HANDLE_VALUE && GetFileInformationByHandle(h, &info);
   if (h != INVALID_HANDLE_VALUE) CloseHandle(h);

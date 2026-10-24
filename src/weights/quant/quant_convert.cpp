@@ -20,6 +20,7 @@
 #include "util/checked_math.h"
 #include "util/json.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "util/rename_replace.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
@@ -53,7 +54,10 @@ namespace {
 // Flushes a closed file's data to stable storage, so the rename that publishes it cannot outrun its bytes.
 void sync_file(const fs::path& path) {
 #ifdef _WIN32
-  HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  const DWORD flags = FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
+  HANDLE h = util::is_windows_device_path(path)
+                 ? INVALID_HANDLE_VALUE
+                 : CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
   const bool ok = h != INVALID_HANDLE_VALUE && FlushFileBuffers(h);
   if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
 #else
@@ -682,6 +686,12 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   const std::uint64_t data_start = 8 + header0.size();
   for (std::size_t i = 0; i < tensors.size(); ++i) tensors[i].offset = data_start + rel[i];
 
+#ifdef _WIN32
+  // The output is written next to its name: a device or pipe name (util::open_regular_file's rules) is no file.
+  if (util::is_windows_device_path(fs::path(output) += ".partial")) {
+    fail("output " + util::path_utf8(output) + ": " + util::kNotRegularFile);
+  }
+#endif
   PartialFile partial(fs::path(output) += ".partial");
   Writer writer(partial.path(), tensors, header0);
   const int threads = options.threads;

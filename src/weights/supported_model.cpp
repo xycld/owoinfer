@@ -197,8 +197,11 @@ void refuse_other_role(const SafetensorsFile& st, const char* what, const Names&
 }  // namespace
 
 bool looks_like_lora(const SafetensorsFile& file) {
+  // The factors only: a LoRA's `.alpha` always sits next to its module's factors, and an alpha of its own is another
+  // model's parameter (Snake activations' `.act.alpha`, `.alphas`).
   return std::any_of(file.tensors().begin(), file.tensors().end(), [](const TensorInfo& t) {
-    for (std::string_view part : {".lora_A.", ".lora_B.", ".lora_down.", ".lora_up.", ".hada_w", ".lokr_w", ".alpha"}) {
+    for (std::string_view part : {".lora_A.", ".lora_B.", ".lora_down.", ".lora_up.", ".lora.down.", ".lora.up.",
+                                  ".lora_linear_layer.", ".hada_w", ".lokr_w"}) {
       if (t.name.find(part) != std::string::npos) return true;
     }
     return false;

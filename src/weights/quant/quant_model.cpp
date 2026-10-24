@@ -514,10 +514,15 @@ const IndexedTensor* QuantModel::find_tensor(std::string_view name) const {
 
 namespace {
 
-QuantModel open_quant_model_impl(const fs::path& path, std::optional<ModelKind> kind) {
+// `parsed`: the header of the single file `path`, already read (open_quant_model(const SafetensorsFile&)).
+QuantModel open_quant_model_impl(const fs::path& path, std::optional<ModelKind> kind,
+                                 const weights::SafetensorsFile* parsed = nullptr) {
   QuantModel model;
   std::vector<fs::path> paths;
-  if (fs::is_regular_file(path)) {
+  if (parsed != nullptr) {
+    paths.push_back(path);
+    model.base_dir = path.parent_path();
+  } else if (fs::is_regular_file(path)) {
     paths.push_back(path);
     model.base_dir = path.parent_path();
   } else if (fs::is_directory(path)) {
@@ -549,7 +554,8 @@ QuantModel open_quant_model_impl(const fs::path& path, std::optional<ModelKind> 
   std::vector<Raw> raws;
   std::vector<PendingConfig> pending;
   for (const fs::path& p : paths) {
-    weights::SafetensorsFile file(p);
+    std::optional<weights::SafetensorsFile> owned;
+    const weights::SafetensorsFile& file = parsed != nullptr ? *parsed : owned.emplace(p);
     const auto id = static_cast<std::uint32_t>(model.files.size());
     model.files.push_back({util::path_utf8(p.lexically_relative(model.base_dir)), file.file_size(), util::file_mtime_ns(p)});
     if (id == 0) model.metadata = file.metadata();
@@ -686,6 +692,16 @@ QuantModel open_quant_model_impl(const fs::path& path, std::optional<ModelKind> 
 }
 
 }  // namespace
+
+QuantModel open_quant_model(const weights::SafetensorsFile& file, std::optional<ModelKind> kind) {
+  try {
+    return open_quant_model_impl(file.path(), kind, &file);
+  } catch (const weights::IndexError& e) {
+    fail(util::path_utf8(file.path()) + ": " + e.what());
+  } catch (const fs::filesystem_error& e) {
+    fail(util::path_utf8(file.path()) + ": cannot read (" + e.what() + ")");
+  }
+}
 
 QuantModel open_quant_model(const fs::path& path, std::optional<ModelKind> kind) {
   try {
