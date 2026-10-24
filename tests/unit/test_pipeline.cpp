@@ -1400,6 +1400,38 @@ TEST(PipelineEndToEnd, RuntimeLorasAndPreview) {
   EXPECT_EQ(bit_mismatches(again.latents, with.latents), 0u);
 }
 
+// A LoRA file replaced under the same path (a launcher re-downloads it, a user overwrites it): the next generate loads
+// the new contents, not the stack kept from the old file, giving the same latents as the new file under its own path.
+TEST(PipelineEndToEnd, ReplacedLoraFileLoadsAnew) {
+  const fs::path kohya = kKohyaLora;
+  const fs::path peft = kPeftLora;
+  if (!fs::is_regular_file(weights_root() / "sft" / "moss.mossidx") || !fs::is_regular_file(kohya) || !fs::is_regular_file(peft)) {
+    GTEST_SKIP() << "SFT bundle or LoRA files not present";
+  }
+  const fs::path dir = fs::temp_directory_path() / ("mossinfer_lora_" + std::to_string(std::random_device{}()));
+  fs::create_directories(dir);
+  const fs::path file = dir / "style.safetensors";
+  fs::copy_file(kohya, file);
+  mi::pipeline::Request req;
+  req.model = weights_root() / "sft";
+  req.prompt = "portrait of a woman in a garden, soft light";
+  req.height = req.width = 256;
+  req.steps = 3;
+  req.decode = false;
+  mi::pipeline::Pipeline pipe;
+  req.loras = {{file, 0.6f}};
+  const mi::pipeline::Result first = pipe.generate(req);
+  fs::copy_file(peft, file, fs::copy_options::overwrite_existing);
+  const mi::pipeline::Result replaced = pipe.generate(req);
+  EXPECT_GT(replaced.timings.lora_load_s, 0.0) << "the replaced file was not loaded again";
+  EXPECT_GT(bit_mismatches(replaced.latents, first.latents), 0u);
+  req.loras = {{peft, 0.6f}};
+  const mi::pipeline::Result direct = pipe.generate(req);
+  EXPECT_EQ(bit_mismatches(replaced.latents, direct.latents), 0u);
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
 // Auto with a certificate (a fixture for the Comfy-Org INT8 file, config int8 + q8_fp8, in <cache_dir>/quality_certs):
 // found without LoRAs (8-bit attention turned on, the file named); with runtime LoRAs never, in either order, since
 // the search is not cached for LoRA requests.

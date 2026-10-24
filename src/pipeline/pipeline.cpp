@@ -287,6 +287,17 @@ planner::CertificateAnswer search_certificate(const std::filesystem::path& dit, 
   return a;
 }
 
+// A file's size and modification time, for keys of state built from its contents: a file replaced under the same
+// path gets another stamp (empty when it cannot be read; the load that follows reports why).
+std::string file_stamp(const std::filesystem::path& p) {
+  std::error_code ec;
+  const std::uintmax_t size = std::filesystem::file_size(p, ec);
+  if (ec) return {};
+  const auto mtime = std::filesystem::last_write_time(p, ec);
+  if (ec) return {};
+  return std::to_string(size) + "@" + std::to_string(mtime.time_since_epoch().count());
+}
+
 // Bytes of a weight file, or of the *.safetensors files directly inside a directory (as quality_cert identifies them).
 std::uint64_t weight_bytes(const std::filesystem::path& p) {
   std::error_code ec;
@@ -1733,9 +1744,10 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
       q.te_identity = src.identity->te;
     }
   }
-  // Runtime LoRAs: the stack is kept while its files (and the DiT source) stay the same; a strength change updates the
-  // side branches in place and re-merges merged adapters from the pristine weights. The loaded DiT carries merged
-  // adapters of the files in `merge_key`. A new stack is built into locals and committed only once it is complete.
+  // Runtime LoRAs: the stack is kept while its files (paths, sizes and modification times) and the DiT source stay the
+  // same; a file replaced under the same path loads anew, and so do its merges and their memo. A strength change
+  // updates the side branches in place and re-merges merged adapters from the pristine weights. The loaded DiT carries
+  // merged adapters of the files in `merge_key`. A new stack is built into locals and committed only once it is complete.
   std::string merge_key;
   if (!lora_requested) {
     if (m.dit) m.dit->set_lora(nullptr);
@@ -1747,7 +1759,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     // The control adapter's entry is tagged: the same file as a plain LoRA is another stack (and is refused below).
     for (std::size_t i = 0; i < loras.size(); ++i) {
       files += (ctl != nullptr && i + 1 == loras.size() ? "|control:" : "|") +
-               util::path_utf8(std::filesystem::weakly_canonical(loras[i].path));
+               util::path_utf8(std::filesystem::weakly_canonical(loras[i].path)) + "#" + file_stamp(loras[i].path);
     }
     if (!m.lora_stack || files != m.lora_files_key) {
       for (const lora::LoraSpec& l : req.loras) {
