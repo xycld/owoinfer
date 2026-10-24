@@ -322,6 +322,7 @@ DirectIoSupport direct_io_support(const std::filesystem::path& path) {
   int fd = -1;
   const util::OpenStatus status = util::open_regular_file(path, O_DIRECT, fd);
   if (status == util::OpenStatus::kNotRegular) return {false, name + " is " + util::kNotRegularFile};
+  if (status == util::OpenStatus::kLeased) return {false, name + ": " + util::kLeasedFile};
   if (status != util::OpenStatus::kOk) {
     if (errno == ENOENT) return {false, name + " does not exist"};
     return {false, name + ": the file system refuses O_DIRECT (" + std::system_category().message(errno) + ")"};
@@ -371,6 +372,7 @@ FileReader::FileReader(const std::filesystem::path& path, bool direct) : path_(p
 #endif
   if (status == util::OpenStatus::kError) status = util::open_regular_file(path, 0, fd_);
   if (status == util::OpenStatus::kNotRegular) throw IoError(util::path_utf8(path_) + ": " + util::kNotRegularFile);
+  if (status == util::OpenStatus::kLeased) throw IoError(util::path_utf8(path_) + ": " + util::kLeasedFile);
   if (status != util::OpenStatus::kOk) fail(path_, "cannot open", errno);
   struct stat st;
   if (::fstat(fd_, &st) != 0) {
@@ -547,6 +549,7 @@ MappedFile::MappedFile(const std::filesystem::path& path) {
   int fd = -1;
   const util::OpenStatus status = util::open_regular_file(path, 0, fd);
   if (status == util::OpenStatus::kNotRegular) throw IoError(util::path_utf8(path) + ": " + util::kNotRegularFile);
+  if (status == util::OpenStatus::kLeased) throw IoError(util::path_utf8(path) + ": " + util::kLeasedFile);
   if (status != util::OpenStatus::kOk) fail(path, "cannot open", errno);
   struct stat st;
   if (::fstat(fd, &st) != 0) {

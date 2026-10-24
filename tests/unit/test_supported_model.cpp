@@ -527,7 +527,49 @@ TEST(SupportedModel, ParsedHeaderOverloadsAndLoraDetection) {
   for (const fs::path& f : {kohya, peft, loha, control}) EXPECT_TRUE(looks_like_lora(SafetensorsFile(f))) << f;
   const fs::path dataspace = dir.path() / "dataspace.safetensors";
   write_safetensors(dataspace, {{"latent_mix.Q", DType::kF32, {128, 128}}, {"step_codes", DType::kF32, {8}}});
-  for (const fs::path& f : {ok, te, dataspace}) EXPECT_FALSE(looks_like_lora(SafetensorsFile(f))) << f;
+  // Alphas of other models: a Snake activation's `.act.alpha`, `.alphas`, `.alpha_`, and an `.alpha` without factors.
+  const fs::path snake = dir.path() / "snake.safetensors";
+  write_safetensors(snake, {{"decoder.block.0.act.alpha", DType::kF32, {64}},
+                            {"decoder.block.0.conv.weight", DType::kF32, {64, 64, 3}}});
+  const fs::path alphas = dir.path() / "alphas.safetensors";
+  write_safetensors(alphas, {{"mixer.alphas", DType::kF32, {8}}, {"mixer.alpha_scale", DType::kF32, {8}},
+                             {"gate.alpha_.weight", DType::kF32, {4}}});
+  const fs::path lone = dir.path() / "lone_alpha.safetensors";
+  write_safetensors(lone, {{"layers.0.proj.q.alpha", DType::kF32, {}},
+                           {"layers.0.proj.q.weight", DType::kBF16, {8, 8}}});
+  for (const fs::path& f : {ok, te, dataspace, snake, alphas, lone}) {
+    EXPECT_FALSE(looks_like_lora(SafetensorsFile(f))) << f;
+  }
+  // diffusers' other spellings of the factors.
+  const fs::path diffusers = dir.path() / "diffusers.safetensors";
+  write_safetensors(diffusers, {{"transformer.layers.0.proj.q.lora.down.weight", DType::kBF16, {4, 3072}},
+                                {"transformer.layers.0.proj.q.lora.up.weight", DType::kBF16, {3072, 4}}});
+  const fs::path linear_layer = dir.path() / "linear_layer.safetensors";
+  write_safetensors(linear_layer, {{"layers.0.proj.q.lora_linear_layer.down.weight", DType::kBF16, {4, 3072}}});
+  const fs::path lokr = dir.path() / "lokr.safetensors";
+  write_safetensors(lokr, {{"layers.0.proj.q.lokr_w1", DType::kBF16, {8, 8}},
+                           {"layers.0.proj.q.alpha", DType::kF32, {}}});
+  for (const fs::path& f : {diffusers, linear_layer, lokr}) EXPECT_TRUE(looks_like_lora(SafetensorsFile(f))) << f;
+  // Every LoRA and control adapter of the community, when present.
+  const fs::path c = "/workspace/Models/community";
+  for (const char* f : {"akhaliq/MOSS-Image-SFT-4-steps/lora.safetensors",
+                        "axiomofmind/Moss-image-beauty-lora/pytorch_lora_weights.safetensors",
+                        "comfyanonymous/MOSS_image_MAX_ULTRA_hires_lora_test/moss_hires_lora_test_v0.1.safetensors",
+                        "comfy-org/moss_image_color_depth_control.safetensors",
+                        "lodestones/MOSS-Image-SFT-8-steps-dmd/lora.safetensors",
+                        "congruency/MOSS-Image-Turbo-MFD/MOSS-Image-SFT-Turbo-MFD-v0.1.comfy.safetensors",
+                        "nynxz/MOSS-Image/moss_sft_destripe_top64_bf16.safetensors"}) {
+    if (fs::is_regular_file(c / f)) {
+  EXPECT_TRUE(looks_like_lora(SafetensorsFile(c / f))) << f;
+    }
+  }
+  for (const char* f : {"lodestones/MOSS-Image-SFT-8-steps-dmd/dataspace.safetensors",
+                        "lodestones/MOSS-Image-SFT-8-steps-dmd/time_embedding.safetensors",
+                        "comfy-org/moss_image_sft_int8_convrot.safetensors", "comfy-org/flux2-vae.safetensors"}) {
+    if (fs::is_regular_file(c / f)) {
+  EXPECT_FALSE(looks_like_lora(SafetensorsFile(c / f))) << f;
+    }
+  }
   expect_refused([&] { check_supported_dit_file(SafetensorsFile(control)); }, {"found a control adapter"});
 }
 
@@ -771,8 +813,39 @@ TEST(DitFileInspect, Int8FileAndMixedFile) {
     return std::string("accepted");
   };
   EXPECT_EQ(refusal(dir.path()), mi::util::path_utf8(dir.path()) + ": not a regular file");
+  // A path that does not exist (or no longer does): an I/O error (MI_ERR_IO), not an invalid argument.
   const fs::path missing = dir.path() / "missing.safetensors";
-  EXPECT_EQ(refusal(missing), "DiT file not found: " + mi::util::path_utf8(missing));
+  try {
+    mi::pipeline::inspect_dit_file(missing, "");
+    ADD_FAILURE() << "a missing file was inspected";
+  } catch (const IoError& e) {
+    EXPECT_EQ(std::string(e.what()), mi::util::path_utf8(missing) + ": no such file");
+  }
+
+  // The header form gives the path form's answer.
+  const SafetensorsFile header(p);
+  const mi::pipeline::DitFileInfo again = mi::pipeline::inspect_dit_file(header, {});
+  EXPECT_EQ(again.linears, info.linears);
+  EXPECT_EQ(again.precision, info.precision);
+  EXPECT_EQ(again.quant->specs.size(), info.quant->specs.size());
+  EXPECT_EQ(info.static_input_scales, 0);
+  EXPECT_EQ(info.remarks, "");
+
+  // Block 0's o as NVFP4 with a static input_scale: counted and remarked apart from the linears summary.
+  const fs::path scaled = write_int8_dit(dir.path() / "input_scale.safetensors", [](std::vector<SparseTensor>& ts) {
+    std::erase_if(ts, [](const SparseTensor& t) { return t.name.starts_with("layers.0.proj.o."); });
+    const std::string o = "layers.0.proj.o";
+    ts.push_back({o + ".weight", DType::kU8, {3072, 1536}, ""});
+    ts.push_back({o + ".weight_scale", DType::kF8E4M3, {3072, 192}, ""});
+    ts.push_back({o + ".weight_scale_2", DType::kF32, {}, f32_bytes(1, 1.0f)});
+    ts.push_back({o + ".input_scale", DType::kF32, {}, f32_bytes(1, 1.0f)});
+    ts.push_back(comfy_quant(o, R"({"format": "nvfp4"})"));
+  });
+  const mi::pipeline::DitFileInfo with_scale = mi::pipeline::inspect_dit_file(scaled, "");
+  EXPECT_TRUE(with_scale.nvfp4);
+  EXPECT_EQ(with_scale.linears, "mixed (251 int8_convrot256, 1 nvfp4)");
+  EXPECT_EQ(with_scale.static_input_scales, 1);
+  EXPECT_EQ(with_scale.remarks, "1 linears carry a static input_scale; ignored (activations are scaled per token)");
 }
 #endif
 

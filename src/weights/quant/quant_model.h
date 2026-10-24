@@ -58,6 +58,7 @@
 
 #include "core/tensor.h"
 #include "weights/model_index.h"
+#include "weights/safetensors.h"
 #include "weights/upload.h"
 
 // mi::quant rather than mi::weights: the format is shared by the reader, the converter and the GEMM kernels.
@@ -153,6 +154,9 @@ struct QuantModel {
 // against [n, k] per layout; no tensor data but the comfy_quant configs is read here.
 // Throws QuantError / weights::FormatError / weights::IoError.
 QuantModel open_quant_model(const std::filesystem::path& path, std::optional<ModelKind> kind = std::nullopt);
+// The same for a single safetensors file whose header the caller already parsed (not read again; base_dir is its
+// directory). Configs and tensors are read from file.path().
+QuantModel open_quant_model(const weights::SafetensorsFile& file, std::optional<ModelKind> kind = std::nullopt);
 
 // The canonical DiT GEMM modules (6 per block: proj.q/k/v/o/ffn_up_gate/ffn_down) and TE GEMM modules
 // (language_model.layers.N.*), in the order a converter visits them.

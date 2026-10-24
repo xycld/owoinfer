@@ -215,12 +215,9 @@ void inspect_control(const fs::path& path, const weights::SafetensorsFile& heade
 }  // namespace
 
 void describe_dit_linears(const pipeline::DitFileInfo& dit, FileInspection& r) {
-  const std::string describe = moss_dit::describe_linears(dit.quant.get());
-  const std::string prefix = describe + "; ";
-  const bool remark = dit.linears.size() > prefix.size() && dit.linears.starts_with(prefix);
-  r.quantization = remark || dit.linears == describe ? describe : dit.linears;
+  r.quantization = dit.linears;
   r.note = dit.nvfp4 ? "NVFP4 linears run on compute capability 12.0 only (an RTX 50 GPU)" : "";
-  if (remark) r.note += (r.note.empty() ? "" : "; ") + dit.linears.substr(prefix.size());
+  if (!dit.remarks.empty()) r.note += (r.note.empty() ? "" : "; ") + dit.remarks;
 }
 
 FileInspection inspect_file(const fs::path& path) {

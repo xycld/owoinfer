@@ -377,31 +377,27 @@ TEST(CApiInspect, DitLinearsText) {
   ASSERT_TRUE(dit.refusal.empty()) << dit.refusal;
   ASSERT_TRUE(dit.nvfp4);
   const std::string describe = mi::moss_dit::describe_linears(dit.quant.get());
-  ASSERT_EQ(dit.linears, describe + "; " + remark);
+  ASSERT_EQ(dit.linears, describe);
+  ASSERT_EQ(dit.remarks, remark);
+  EXPECT_EQ(dit.static_input_scales, 1);
   mi::api::FileInspection r;
   mi::api::describe_dit_linears(dit, r);
   EXPECT_EQ(r.quantization, describe);
   EXPECT_EQ(r.note, "NVFP4 linears run on compute capability 12.0 only (an RTX 50 GPU); " + remark);
 
-  // Without NVFP4 linears (none carries an input_scale then, so the answers are built here): the remark alone, or
-  // nothing; and linears that do not start with describe_linears' text and "; " are the quantization text, whole.
-  mi::pipeline::DitFileInfo plain;  // no index: describe_linears says "bf16"
-  plain.linears = "bf16; " + remark;
+  // Without NVFP4 linears (built here): the quantization text is `linears` whole, the note the remarks alone or nothing.
+  mi::pipeline::DitFileInfo plain;
+  plain.linears = "bf16";
+  plain.remarks = remark;
+  plain.static_input_scales = 1;
   mi::api::describe_dit_linears(plain, r);
   EXPECT_EQ(r.quantization, "bf16");
   EXPECT_EQ(r.note, remark);
-  plain.linears = "bf16";
+  plain.remarks.clear();
+  plain.static_input_scales = 0;
   mi::api::describe_dit_linears(plain, r);
   EXPECT_EQ(r.quantization, "bf16");
   EXPECT_EQ(r.note, "");
-  const std::vector<std::string> others = {"int8_convrot256; " + remark, "bf16;" + remark, "bf16; ", "bf16x"};
-  for (const std::string& other : others) {
-    SCOPED_TRACE(other);
-    plain.linears = other;
-    mi::api::describe_dit_linears(plain, r);
-    EXPECT_EQ(r.quantization, other);
-    EXPECT_EQ(r.note, "");
-  }
 }
 
 // Every block GEMM in NVFP4 (ComfyUI's configs, here the legacy metadata form): its swizzled block scales take about
@@ -674,15 +670,14 @@ TEST(CApiInspect, MalformedFiles) {
   EXPECT_EQ(other.info.kind, MI_FILE_KIND_UNKNOWN);
   EXPECT_EQ(other.info.tensor_count, 1);
   EXPECT_NE(other.text(MI_FILE_TEXT_NOTE).find("backbone.embeddings.cls_token"), std::string::npos);
-  // Alpha parameters without LoRA factors (another model's): in the LoRA conventions (weights::looks_like_lora, as the
-  // model-file checks name them), so a LoRA the stack refuses.
+  // Alpha parameters without LoRA factors (another model's, e.g. Snake activations): not a LoRA (weights::looks_like_lora
+  // needs LoRA factor names), so unknown, with what was found named.
   write_file(dir.path() / "alpha.safetensors", {{"blocks.0.attn.alpha", DType::kF32, {1}},
                                                 {"blocks.0.attn.weight", DType::kF32, {4, 4}}});
   const Report alpha(dir.path() / "alpha.safetensors");
-  EXPECT_EQ(alpha.info.kind, MI_FILE_KIND_LORA);
+  EXPECT_EQ(alpha.info.kind, MI_FILE_KIND_UNKNOWN);
   EXPECT_EQ(alpha.info.loadable, 0);
-  EXPECT_NE(alpha.text(MI_FILE_TEXT_NOTE).find("no tensor applies"), std::string::npos)
-      << alpha.text(MI_FILE_TEXT_NOTE);
+  EXPECT_NE(alpha.text(MI_FILE_TEXT_NOTE).find("blocks.0.attn"), std::string::npos) << alpha.text(MI_FILE_TEXT_NOTE);
 }
 
 // A FIFO is refused at once: opening one for reading would wait for a writer.

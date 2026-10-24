@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -13,7 +14,10 @@
 #ifdef __linux__
 #include <fcntl.h>
 #include <sys/vfs.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+#include <csignal>
 #endif
 #ifndef _WIN32
 #include <sys/stat.h>
@@ -22,6 +26,7 @@
 #endif
 
 #include "test_util.h"
+#include "util/regular_file.h"
 #include "util/replaceable_file.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
@@ -701,6 +706,77 @@ TEST(FileReader, RefusesDirectoryAndReadsRegularFiles) {
   EXPECT_EQ(mi::util::read_replaceable_file(path, 3 * kDirectAlign + 4, text), mi::util::ReadStatus::kTooLarge);
   EXPECT_EQ(mi::util::read_replaceable_file(dir.path() / "missing", 1024, text), mi::util::ReadStatus::kMissing);
 }
+
+// The Windows device-path rules (util::windows_path_names_device), pure, so checked on every platform: the device and
+// NT namespaces name a file only as a drive path or a UNC share; UNC pipe and mailslot shares are devices on any host;
+// DOS device names are caught in their GetFullPathNameW form (\\.\NAME). Case variants and both separators.
+TEST(RegularFile, WindowsDevicePaths) {
+  using mi::util::windows_path_names_device;
+  const wchar_t* devices[] = {
+      LR"(\\.\pipe\x)", LR"(\\?\pipe\x)", LR"(//?/pipe/x)", LR"(//./pipe/x)", LR"(\??\pipe\x)", LR"(/??/pipe/x)",
+      LR"(\\.\COM1)", LR"(\\?\COM1)", LR"(\\.\PhysicalDrive0)", LR"(\\?\physicaldrive0)", LR"(\\.\NUL)",
+      LR"(\\.\CONIN$)", LR"(\\.\C:)", LR"(\\?\c:)", LR"(\\?\GLOBALROOT\Device\Null)",
+      LR"(\\?\globalroot\device\harddiskvolume1\m.safetensors)", LR"(\\?\GlobalRoot\x)",
+      LR"(\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\m.safetensors)", LR"(\??\GLOBALROOT\x)",
+      LR"(\/?\pipe\x)", LR"(/\.\COM1)", LR"(\\localhost\pipe\x)", LR"(\\host\PIPE\x)", LR"(//host/Pipe/x)",
+      LR"(\\host\mailslot\x)", LR"(\\host\MAILSLOT\x)", LR"(\\?\UNC\host\pipe\x)", LR"(\\?\unc\host\Pipe)",
+      LR"(//?/UNC/host/mailslot/x)", LR"(\??\UNC\localhost\pipe\x)", LR"(\\?\UNC\host)", LR"(\\?\UNC)",
+      LR"(\\host)", LR"(\\host\)", LR"(\\.)", LR"(\\?)"};
+  for (const wchar_t* p : devices) EXPECT_TRUE(windows_path_names_device(p)) << std::wstring(p).size() << " chars";
+  const wchar_t* files[] = {
+      LR"(C:\m\model.safetensors)", LR"(c:/m/model.safetensors)", LR"(m\model.safetensors)", LR"(model.safetensors)",
+      LR"(\m\model.safetensors)", LR"(\\?\C:\m\model.safetensors)", LR"(\\?\c:\)", LR"(//?/C:/m/x)",
+      LR"(\\.\D:\m\x)", LR"(\??\C:\m\x)", LR"(\\nas\models\m.safetensors)", LR"(//nas/models/m.safetensors)",
+      LR"(\\nas\pipeline\m.safetensors)", LR"(\\nas\mailslots\m)", LR"(\\?\UNC\nas\models\m.safetensors)",
+      LR"(\\?\unc\nas\share\x)", LR"(//?/UNC/nas/models/m)", LR"(C:\m\COM1)", LR"(COM1.txt)", LR"(NUL)",
+      LR"(C:\pipe\x)", LR"(pipe\x)"};
+  for (const wchar_t* p : files) EXPECT_FALSE(windows_path_names_device(p)) << std::wstring(p).size() << " chars";
+}
+
+#ifdef __linux__
+// A file under another process's lease (a write lease, broken by our open) is not waited on for the 45 s of the lease
+// break: the non-blocking open is retried for about a second, then refused as leased.
+TEST(FileReader, LeasedFileIsRefusedAfterRetries) {
+  TempDir dir("fr_lease");
+  const auto path = make_pattern_file(dir, 4096);
+  int ready[2];
+  ASSERT_EQ(::pipe(ready), 0);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {  // only async-signal-safe calls until _exit
+    ::signal(SIGIO, SIG_IGN);  // the lease-break notice
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    const char ok = fd >= 0 && ::fcntl(fd, F_SETLEASE, F_WRLCK) == 0 ? 'y' : 'n';
+    if (::write(ready[1], &ok, 1) != 1) ::_exit(1);
+    ::sleep(60);
+    ::_exit(0);
+  }
+  ::close(ready[1]);
+  char ok = 'n';
+  const bool got = ::read(ready[0], &ok, 1) == 1;
+  ::close(ready[0]);
+  struct Reap {
+    pid_t pid;
+    ~Reap() {
+      ::kill(pid, SIGKILL);
+      ::waitpid(pid, nullptr, 0);
+    }
+  } reap{child};
+  ASSERT_TRUE(got) << "the child did not report";
+  // Leases need a file system that supports them (overlayfs before Linux 4.19 and some FUSE / network mounts do not).
+  if (ok != 'y') GTEST_SKIP() << "this file system grants no write lease";
+  const auto t0 = std::chrono::steady_clock::now();
+  try {
+    FileReader r(path);
+    ADD_FAILURE() << "a leased file opened";
+  } catch (const IoError& e) {
+    EXPECT_EQ(std::string(e.what()), mi::util::path_utf8(path) + ": file is leased by another process (EWOULDBLOCK)");
+  }
+  const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  EXPECT_GT(s, 0.9);
+  EXPECT_LT(s, 5.0);
+}
+#endif
 
 TEST(MappedFile, MapsSafetensorsTensorBytes) {
   TempDir dir("mm_st");
