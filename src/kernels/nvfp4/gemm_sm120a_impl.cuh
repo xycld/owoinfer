@@ -1,13 +1,14 @@
-// Internal to src/kernels/nvfp4: the CUTLASS 3.x SM120 block-scaled NVFP4 GEMM type and its launch, shared by the
-// gemm_sm120a_*.cu translation units (one tile each, so they compile in parallel; each needs ~5.5 GB of RAM).
-// Compiled for sm_120a only (cmake/modules/nvfp4.cmake): plain sm_120 cannot assemble the block-scaled MMA.
+// Internal to src/kernels/nvfp4: the CUTLASS 3.x SM120 block-scaled NVFP4 GEMM types, their epilogue visitor trees
+// and the launch, shared by the gemm_sm120a_<epilogue>_<tile>.cu translation units (one instantiation each, so they
+// compile in parallel; each needs ~5.5 GB of RAM). Compiled for sm_120a only (cmake/modules/nvfp4.cmake): plain
+// sm_120 cannot assemble the block-scaled MMA.
 //
 // The kernel composition (collective builders, GemmUniversal, GemmUniversalAdapter, the scale-factor layouts) follows
 // CUTLASS v4.7.1 examples/79_blackwell_geforce_gemm/79a_blackwell_geforce_nvfp4_bf16_gemm.cu (Copyright (c) 2025 -
-// 2026 NVIDIA CORPORATION & AFFILIATES, BSD-3-Clause; see THIRD_PARTY_NOTICES.md). Changes: our Sm90 EVT epilogue
-// (per-row x scale, per-tensor w scale, optional bias) in place of the linear combination, no source C, and no
-// workspace (graph-capturable), and the kernel is launched through gemm_kernel below instead of
-// GemmUniversalAdapter's cutlass::device_kernel.
+// 2026 NVIDIA CORPORATION & AFFILIATES, BSD-3-Clause; see THIRD_PARTY_NOTICES.md). Changes: our Sm90 EVT epilogues
+// (nvfp4.h: per-row x scale, per-tensor w scale, optional bias, LoRA delta, gated residual in place) in place of the
+// linear combination, the Pingpong schedule as a third configuration, no workspace (graph-capturable), and the kernel
+// is launched through gemm_kernel below instead of GemmUniversalAdapter's cutlass::device_kernel.
 #pragma once
 
 #include <cuda_bf16.h>
@@ -45,34 +46,127 @@ constexpr int kAlignAB = 32;  // e2m1 elements per 16-byte access
 constexpr int kAlignD = 8;    // bf16 elements per 16-byte access
 constexpr auto kRn = cutlass::FloatRoundStyle::round_to_nearest;
 
-// E1: D = bf16((acc * x_scale[m]) * w_scale2 + bias[n]). The fp32 rounding of each step is not pinned yet (the
-// compiler may contract the multiply and the add); N4 fixes it with the numerics version.
-template <class Tile>
-struct PlainEpilogue {
-  using XScale = fusion::Sm90ColBroadcast<0, Tile, float, float, cute::Stride<cute::_1, cute::_0, std::int64_t>>;
-  using WScale = fusion::Sm90ScalarBroadcast<float>;
-  using Bias = fusion::Sm90RowBroadcast<0, Tile, bf16, float, cute::Stride<cute::_0, cute::_1, std::int64_t>>;
-  using Mul = fusion::Sm90Compute<cutlass::multiplies, float, float, kRn>;
-  using AccX = fusion::Sm90EVT<Mul, fusion::Sm90AccFetch, XScale>;
-  using AccXW = fusion::Sm90EVT<Mul, AccX, WScale>;
-  using Tree = fusion::Sm90EVT<fusion::Sm90Compute<cutlass::plus, bf16, float, kRn>, AccXW, Bias>;
+// Threadblock tile and mainloop schedule of each Nvfp4Tile. KernelScheduleAuto is the Cooperative schedule (two
+// consumer warp groups on one tile); Pingpong alternates two tiles between the consumer warp groups.
+template <Nvfp4Tile kTile>
+struct TileConfig;
+template <>
+struct TileConfig<Nvfp4Tile::k128x128x128> {
+  using Shape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+  using Schedule = cutlass::gemm::collective::KernelScheduleAuto;
+};
+template <>
+struct TileConfig<Nvfp4Tile::k128x128x128Pingpong> {
+  using Shape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+  using Schedule = cutlass::gemm::KernelTmaWarpSpecializedPingpongNvf4Sm120;
+};
+template <>
+struct TileConfig<Nvfp4Tile::k256x128x128> {
+  using Shape = cute::Shape<cute::_256, cute::_128, cute::_128>;
+  using Schedule = cutlass::gemm::collective::KernelScheduleAuto;
 };
 
-template <class Tile>
+// ---- Epilogue compute nodes: one fused node per epilogue, one fp32 rounding per operation (_rn: no FMA contraction).
+// Sm90Compute converts every input to float (bf16 -> float is exact) and rounds the result to bf16 (round to nearest).
+
+using kernels::detail::add;
+using kernels::detail::mul;
+using kernels::detail::rbf;
+
+// The INT8 epilogue's dequantization (kernels/quant int8_gemm_impl.cuh dequant) with g for s_x and s2 for s_w.
+__device__ __forceinline__ float dequant(float acc, float xs, float ws) { return mul(mul(acc, xs), ws); }
+
+template <class T>
+struct PlainFn {  // E1: dequant + bias
+  CUTLASS_DEVICE T operator()(T const& acc, T const& xs, T const& ws, T const& bias) const {
+    T out;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < T::kElements; ++i) out[i] = add(dequant(acc[i], xs[i], ws[i]), bias[i]);
+    return out;
+  }
+};
+
+template <class T>
+struct PlainDeltaFn {  // E1L: (dequant + delta) + bias
+  CUTLASS_DEVICE T operator()(T const& acc, T const& xs, T const& ws, T const& delta, T const& bias) const {
+    T out;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < T::kElements; ++i) out[i] = add(add(dequant(acc[i], xs[i], ws[i]), delta[i]), bias[i]);
+    return out;
+  }
+};
+
+template <class T>
+struct GatedResidualFn {  // E2: residual + bf16(bf16(dequant + bias) * gate), kernels::gated_residual's order
+  CUTLASS_DEVICE T operator()(T const& acc, T const& xs, T const& ws, T const& bias, T const& gate,
+                              T const& residual) const {
+    T out;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < T::kElements; ++i) {
+      out[i] = add(residual[i], rbf(mul(rbf(add(dequant(acc[i], xs[i], ws[i]), bias[i])), gate[i])));
+    }
+    return out;
+  }
+};
+
+template <class T>
+struct GatedResidualDeltaFn {  // E2L: E2 on the E1L value
+  CUTLASS_DEVICE T operator()(T const& acc, T const& xs, T const& ws, T const& delta, T const& bias, T const& gate,
+                              T const& residual) const {
+    T out;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < T::kElements; ++i) {
+      const float y = rbf(add(add(dequant(acc[i], xs[i], ws[i]), delta[i]), bias[i]));
+      out[i] = add(residual[i], rbf(mul(y, gate[i])));
+    }
+    return out;
+  }
+};
+
+// Visitor nodes and trees of one tile shape. Children in the compute functor's argument order.
+template <class Tile, Epi kEpi>
+struct EpilogueTree {
+  using XScale = fusion::Sm90ColBroadcast<0, Tile, float, float, cute::Stride<cute::_1, cute::_0, std::int64_t>>;
+  using WScale = fusion::Sm90ScalarBroadcast<float>;
+  using RowVec = fusion::Sm90RowBroadcast<0, Tile, bf16, float, cute::Stride<cute::_0, cute::_1, std::int64_t>>;
+  // The delta, read straight from global memory into the accumulator layout's registers (no shared-memory stage).
+  using Delta = fusion::Sm90AuxLoad<0, Tile, bf16, cute::Stride<std::int64_t, cute::_1, std::int64_t>, void, void,
+                                    kAlignD, false>;
+  using Residual = fusion::Sm90SrcFetch<bf16>;  // C = the residual, D = the same buffer
+  template <template <class> class Fn>
+  using Compute = fusion::Sm90Compute<Fn, bf16, float, kRn>;
+
+  static constexpr bool kResidual = kEpi == Epi::kGatedResidual || kEpi == Epi::kGatedResidualDelta;
+  using ElementC = cute::conditional_t<kResidual, bf16, void>;
+  using Tree = cute::conditional_t<
+      kEpi == Epi::kPlain, fusion::Sm90EVT<Compute<PlainFn>, fusion::Sm90AccFetch, XScale, WScale, RowVec>,
+      cute::conditional_t<
+          kEpi == Epi::kPlainDelta,
+          fusion::Sm90EVT<Compute<PlainDeltaFn>, fusion::Sm90AccFetch, XScale, WScale, Delta, RowVec>,
+          cute::conditional_t<
+              kEpi == Epi::kGatedResidual,
+              fusion::Sm90EVT<Compute<GatedResidualFn>, fusion::Sm90AccFetch, XScale, WScale, RowVec, RowVec, Residual>,
+              fusion::Sm90EVT<Compute<GatedResidualDeltaFn>, fusion::Sm90AccFetch, XScale, WScale, Delta, RowVec,
+                              RowVec, Residual>>>>;
+};
+
+template <Nvfp4Tile kTile, Epi kEpi>
 struct GemmType {
+  using Tile = typename TileConfig<kTile>::Shape;
+  using Tree = EpilogueTree<Tile, kEpi>;
   using Arch = cutlass::arch::Sm120;
   using OpClass = cutlass::arch::OpClassBlockScaledTensorOp;
   using Cluster = cute::Shape<cute::_1, cute::_1, cute::_1>;  // GeForce Blackwell: no multicast, cluster 1x1x1
   using RowMajor = cutlass::layout::RowMajor;
   using ColumnMajor = cutlass::layout::ColumnMajor;  // w [N, K] row-major is B [K, N] column-major (TN only)
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      Arch, OpClass, Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto, float, float, void, RowMajor,
-      kAlignD, bf16, RowMajor, kAlignD, cutlass::epilogue::collective::EpilogueScheduleAuto,
-      typename PlainEpilogue<Tile>::Tree>::CollectiveOp;
+      Arch, OpClass, Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto, float, float,
+      typename Tree::ElementC, RowMajor, kAlignD, bf16, RowMajor, kAlignD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto, typename Tree::Tree>::CollectiveOp;
   using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       Arch, OpClass, ElementAB, RowMajor, kAlignAB, ElementAB, ColumnMajor, kAlignAB, float, Tile, Cluster,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
-      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+      typename TileConfig<kTile>::Schedule>::CollectiveOp;
   using Kernel = cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, Mainloop, Epilogue, void>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
@@ -105,16 +199,18 @@ inline void check_status(cutlass::Status status, const char* op, const char* sta
   }
 }
 
-template <class Tile>
-void launch(const char* op, const Nvfp4Operands& a, const __nv_bfloat16* bias, __nv_bfloat16* out, std::int64_t ldo,
-            int sm_count, cudaStream_t stream) {
-  using T = GemmType<Tile>;
+// gemm_sm120a.h: each gemm_sm120a_<epilogue>_<tile>.cu instantiates one (tile, epilogue) pair explicitly.
+template <Nvfp4Tile kTile, Epi kEpi>
+void gemm(const GemmArgs& g, int sm_count, cudaStream_t stream) {
+  constexpr const char* op = "nvfp4_gemm";
+  using T = GemmType<kTile, kEpi>;
   using Gemm = typename T::Gemm;
   using Kernel = typename T::Kernel;
   using Mainloop = typename T::Mainloop;
   using Sf = typename Mainloop::Sm1xxBlkScaledConfig;
   using Data = typename ElementAB::DataType;
   using Scale = typename ElementAB::ScaleFactorType;
+  const Nvfp4Operands& a = g.op;
   const int m = static_cast<int>(a.m), n = static_cast<int>(a.n), k = static_cast<int>(a.k);
   const auto shape = cute::make_shape(m, n, k, 1);
 
@@ -129,14 +225,34 @@ void launch(const char* op, const Nvfp4Operands& a, const __nv_bfloat16* bias, _
   args.mainloop.layout_SFA = Sf::tile_atom_to_shape_SFA(shape);
   args.mainloop.ptr_SFB = reinterpret_cast<const Scale*>(a.w_sf);
   args.mainloop.layout_SFB = Sf::tile_atom_to_shape_SFB(shape);
-  // EVT arguments nest as {children..., node}: ((acc * x_scale) * w_scale2) + bias.
+  // EVT arguments: {children..., node}, children in the compute functor's order.
+  const typename T::Tree::XScale::Arguments xs{a.x_scale, 0.0f, {}};
+  const typename T::Tree::WScale::Arguments ws{{a.w_scale2}};
+  const typename T::Tree::RowVec::Arguments bias{reinterpret_cast<const bf16*>(g.bias), bf16(0.0f), {}};
+  const typename T::Tree::Delta::Arguments delta{reinterpret_cast<const bf16*>(g.delta.p), bf16(0.0f),
+                                                 {g.delta.ld, cute::Int<1>{}, std::int64_t{0}}};
   auto& t = args.epilogue.thread;
-  t = {{{{}, {a.x_scale, 0.0f, {}}, {}}, {{a.w_scale2}}, {}},
-       {reinterpret_cast<const bf16*>(bias), bf16(0.0f), {}},
-       {}};
-  args.epilogue.ptr_C = nullptr;
-  args.epilogue.ptr_D = reinterpret_cast<bf16*>(out);
-  args.epilogue.dD = cute::make_stride(ldo, cute::Int<1>{}, std::int64_t{0});
+  if constexpr (kEpi == Epi::kPlain) {
+    t = {{}, xs, ws, bias, {}};
+  } else if constexpr (kEpi == Epi::kPlainDelta) {
+    t = {{}, xs, ws, delta, bias, {}};
+  } else {
+    const typename T::Tree::RowVec::Arguments gate{reinterpret_cast<const bf16*>(g.gate), bf16(0.0f), {}};
+    if constexpr (kEpi == Epi::kGatedResidual) {
+      t = {{}, xs, ws, bias, gate, {}, {}};
+    } else {
+      t = {{}, xs, ws, delta, bias, gate, {}, {}};
+    }
+  }
+  const auto d_stride = cute::make_stride(g.ldo, cute::Int<1>{}, std::int64_t{0});
+  if constexpr (T::Tree::kResidual) {
+    args.epilogue.ptr_C = reinterpret_cast<const bf16*>(g.out);  // in place: each tile reads C before writing D
+    args.epilogue.dC = d_stride;
+  } else {
+    args.epilogue.ptr_C = nullptr;
+  }
+  args.epilogue.ptr_D = reinterpret_cast<bf16*>(g.out);
+  args.epilogue.dD = d_stride;
   MI_CUDA_CHECK(cudaGetDevice(&args.hw_info.device_id));
   args.hw_info.sm_count = sm_count;
 
@@ -156,10 +272,10 @@ void launch(const char* op, const Nvfp4Operands& a, const __nv_bfloat16* bias, _
   MI_CUDA_CHECK_LAUNCH();
 }
 
-template <class Tile>
+template <Nvfp4Tile kTile, Epi kEpi>
 cudaError_t probe() {
   cudaFuncAttributes attr{};
-  const cudaError_t err = cudaFuncGetAttributes(&attr, gemm_kernel<typename GemmType<Tile>::Kernel>);
+  const cudaError_t err = cudaFuncGetAttributes(&attr, gemm_kernel<typename GemmType<kTile, kEpi>::Kernel>);
   if (err != cudaSuccess) (void)cudaGetLastError();  // not sticky; leave no error behind for the next check
   return err;
 }

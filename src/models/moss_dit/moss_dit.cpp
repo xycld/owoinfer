@@ -908,7 +908,7 @@ void MossDit::set_input_extension(const InputExtension* ext) {
   input_ext_ = ext;
 }
 
-void MossDit::run_block(const Block& b, const Activations& a, const Run& run, cudaStream_t stream) {
+void MossDit::run_block(int bi, const Block& b, const Activations& a, const Run& run, cudaStream_t stream) {
   // _Block.forward (P:138-148) on tokens [t0, t1); mod chunks (P:139): shift_a, scale_a, gate_a, shift_f, scale_f, gate_f.
   const Tensor& mod = a.mod;
   const Tensor x = a.x.slice0(run.t0, run.t1), y = a.y.slice0(run.t0, run.t1);
@@ -916,7 +916,11 @@ void MossDit::run_block(const Block& b, const Activations& a, const Run& run, cu
   const Tensor q = heads_view(qkv, 0), k = heads_view(qkv, kDim), v = heads_view(qkv, 2 * kDim);
   const Tensor rope = a.rope.slice0(run.t0, run.t1);
 
+  const auto inputs = [&](BlockGemm g, const Tensor& in) {
+    if (linear_input_hook_) linear_input_hook_(bi, g, in, stream);
+  };
   kernels::rms_norm_modulate_moss(x, b.norm1, vec(mod, 1), vec(mod, 0), y, stream);
+  inputs(BlockGemm::kQkv, y);
   linear(qkv, y, b.qkv, stream);
   kernels::rms_norm_moss(q, b.q_norm, q, stream);
   kernels::rms_norm_moss(k, b.k_norm, k, stream);
@@ -925,12 +929,15 @@ void MossDit::run_block(const Block& b, const Activations& a, const Run& run, cu
   const Tensor attn = a.attn.slice0(run.t0, run.t1);
   attention::flash_fwd(q, k, v, heads_view(attn, 0), run.cu_seqlens, run.cu_seqlens, run.max_seqlen, false,
                        kAttnScale, a.lse, a.lse_bytes, stream);
+  inputs(BlockGemm::kO, attn);
   linear(y, attn, b.o, stream);
   kernels::gated_residual(x, y, vec(mod, 2), x, stream);
   kernels::rms_norm_modulate_moss(x, b.norm2, vec(mod, 4), vec(mod, 3), y, stream);
   const Tensor up_gate = a.up_gate.slice0(run.t0, run.t1), ffn = a.ffn.slice0(run.t0, run.t1);
+  inputs(BlockGemm::kUpGate, y);
   linear(up_gate, y, b.up_gate, stream);
   kernels::situ_glu(up_gate, ffn, stream);
+  inputs(BlockGemm::kDown, ffn);
   linear(y, ffn, b.down, stream);
   kernels::gated_residual(x, y, vec(mod, 5), x, stream);
 }
@@ -966,6 +973,9 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
                                    : request_route_              ? *request_route_
                                                                  : fused_route_snapshot();
   const bool quantized = config_.quantized;
+  if (linear_input_hook_ && (quantized || path_ != BlockPath::kOpByOp)) {
+    throw std::logic_error("moss_dit: a linear-input hook needs the bf16 op-by-op block path");
+  }
   runtime::StackScope scope(arena_);
   StackPlan plan(&arena_);
   Activations a(plan, total, total, static_cast<std::int64_t>(rows.size()), true,
@@ -1073,7 +1083,7 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
       if (quantized) {
         run_block_quant(b, qa, run, qkv_gemm, route, config_.attention, s, bi);
       } else if (path_ == BlockPath::kOpByOp) {
-        run_block(b, a, run, s);
+        run_block(bi, b, a, run, s);
       } else {
         run_block_fused(b, fused, run, qkv_gemm, route, s);
       }

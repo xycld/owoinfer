@@ -102,6 +102,13 @@ struct Row {
 // stream has not necessarily finished; synchronize before reading.
 using BlockHook = std::function<void(int block, const Tensor& x)>;
 
+// Calibration seam (the NVFP4 converter's Hessian capture, pipeline/nvfp4_calibration.h; MossDit::set_linear_input_hook):
+// called with the input of each block GEMM unit, for every run of rows the block executes, as CUDA bf16
+// [run tokens, K] (contiguous rows) on `stream`. The input is valid until the GEMM after the call reads it: enqueue
+// work on `stream` only.
+enum class BlockGemm { kQkv, kO, kUpGate, kDown };
+using LinearInputHook = std::function<void(int block, BlockGemm gemm, const Tensor& x, cudaStream_t stream)>;
+
 // Step caching (P6b, e.g. the first-block cache of pipeline/accel), around the block loop of every forward() while set
 // (MossDit::set_step_cache). x: every row's residual stream as BlockHook's; rows: the forward's rows; offsets:
 // token_offsets() of them (row r's video tokens are x[offsets[r], offsets[r] + video)). before_blocks runs before block
@@ -311,6 +318,10 @@ class MossDit {
   // ahead of the GPU, so a cancel lands within about one block.
   void set_cancel(const std::atomic<bool>* cancel) { cancel_ = cancel; }
 
+  // Linear-input hook (LinearInputHook; empty: none, the default). While set, forward() calls it at every block GEMM
+  // unit; it needs block path kOpByOp and a bf16 DiT (std::logic_error from forward() otherwise). Set between forwards.
+  void set_linear_input_hook(LinearInputHook hook) { linear_input_hook_ = std::move(hook); }
+
   // Step caching (P6b; nullptr: none, the default). The hook must outlive its use; set between forwards.
   void set_step_cache(StepCacheHook* hook) { step_cache_ = hook; }
   StepCacheHook* step_cache() const { return step_cache_; }
@@ -388,7 +399,7 @@ class MossDit {
   void refresh_config(AttentionMode attention);  // config_ from the loaded linears, `attention` and the LoRA
   void linear(const Tensor& out, const Tensor& x, const Linear& l, cudaStream_t stream);
   void linear(const Tensor& out, const Tensor& x, const Tensor& w, cudaStream_t stream);
-  void run_block(const Block& b, const Activations& a, const Run& run, cudaStream_t stream);
+  void run_block(int bi, const Block& b, const Activations& a, const Run& run, cudaStream_t stream);
 
   runtime::DeviceArena& arena_;
   const quant::QuantIndex* quant_ = nullptr;
@@ -442,6 +453,7 @@ class MossDit {
   LoadStats load_stats_;
   const std::atomic<bool>* cancel_ = nullptr;
   StepCacheHook* step_cache_ = nullptr;
+  LinearInputHook linear_input_hook_;
   cudaEvent_t block_done_[2] = {nullptr, nullptr};  // blocks k - 2 and k - 1 of a forward (cancel throttle)
 
   Linear video_embedder_, time_in_, time_out_, block_modulation_, head_modulation_, text_proj_;

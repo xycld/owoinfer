@@ -119,15 +119,22 @@ target_include_directories(mossinfer_core SYSTEM PRIVATE
 target_link_libraries(mossinfer_core PUBLIC CUDA::cudart ${CMAKE_DL_LIBS})  # cuBLASLt: loaded at run time (src/backend/cuda_libs.h)
 set_target_properties(mossinfer_core PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_SEPARABLE_COMPILATION OFF)
 
-# torch_cpu_randn, the INT8 ConvRot quantizer and the LoRA merge are bit-exact only if the compiler neither contracts
-# mul+add into FMAs nor applies fast-math. Source options come after CMAKE_CXX_FLAGS on the command line, so these win.
+# torch_cpu_randn, the INT8 ConvRot quantizer, the LoRA merge and the NVFP4 codec and recipes are bit-exact (and the
+# NVFP4 converter's output reproducible across machines) only if the compiler neither contracts mul+add into FMAs nor
+# applies fast-math. Source options come after CMAKE_CXX_FLAGS on the command line, so these win.
 set(MOSSINFER_STRICT_FP_SOURCES ${CMAKE_SOURCE_DIR}/src/pipeline/rng_torch_compat.cpp
-    ${CMAKE_SOURCE_DIR}/src/weights/quant/quant_codec.cpp ${CMAKE_SOURCE_DIR}/src/weights/quant/quant_convert.cpp)
+    ${CMAKE_SOURCE_DIR}/src/weights/quant/quant_codec.cpp ${CMAKE_SOURCE_DIR}/src/weights/quant/quant_convert.cpp
+    ${CMAKE_SOURCE_DIR}/src/weights/quant/nvfp4_codec.cpp ${CMAKE_SOURCE_DIR}/src/weights/quant/nvfp4_recipes.cpp)
+# clang-cl maps /fp:precise to -ffp-contract=on (contraction within an expression), so it also gets the clang flag.
 if(MSVC)
-  set_source_files_properties(${MOSSINFER_STRICT_FP_SOURCES} PROPERTIES COMPILE_OPTIONS "/fp:precise")
+  set(MOSSINFER_STRICT_FP_OPTIONS /fp:precise)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    list(APPEND MOSSINFER_STRICT_FP_OPTIONS /clang:-ffp-contract=off)
+  endif()
 else()
-  set_source_files_properties(${MOSSINFER_STRICT_FP_SOURCES} PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math")
+  set(MOSSINFER_STRICT_FP_OPTIONS -ffp-contract=off -fno-fast-math)
 endif()
+set_source_files_properties(${MOSSINFER_STRICT_FP_SOURCES} PROPERTIES COMPILE_OPTIONS "${MOSSINFER_STRICT_FP_OPTIONS}")
 
 if(MOSSINFER_ASAN AND NOT MSVC)
   target_compile_options(mossinfer_core PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address,undefined -fno-omit-frame-pointer>)
@@ -170,6 +177,13 @@ if(MOSSINFER_TESTS)
     list(FILTER MOSSINFER_TEST_SOURCES EXCLUDE REGEX ".*/tests/unit/test_(c_api|c_api_inspect|progress_model)\\.cpp$")
   endif()
   add_executable(mossinfer_tests ${MOSSINFER_TEST_SOURCES})
+  # Its reference arithmetic is compared bit for bit with the NVFP4 recipes (MOSSINFER_STRICT_FP_SOURCES).
+  set(_mi_strict_tests ${MOSSINFER_TEST_SOURCES})
+  list(FILTER _mi_strict_tests INCLUDE REGEX ".*/tests/unit/test_nvfp4_convert\\.cpp$")
+  if(_mi_strict_tests)
+    set_source_files_properties(${_mi_strict_tests} PROPERTIES COMPILE_OPTIONS "${MOSSINFER_STRICT_FP_OPTIONS}")
+  endif()
+  unset(_mi_strict_tests)
   target_link_libraries(mossinfer_tests PRIVATE mossinfer_core GTest::gtest_main)
   target_compile_options(mossinfer_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${MOSSINFER_WARN}>
                                                 $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -lineinfo>)
@@ -177,6 +191,15 @@ if(MOSSINFER_TESTS)
     $<$<COMPILE_LANGUAGE:CUDA>:${CMAKE_SOURCE_DIR}/third_party/cutlass/include ${CMAKE_SOURCE_DIR}/third_party/cutlass/tools/util/include>)
   target_compile_definitions(mossinfer_tests PRIVATE
     MOSSINFER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  # Host references that must round every fp32 operation separately (no mul+add contraction), as the strict-FP
+  # sources above; .cu files, so the options go to the host compiler.
+  set(MOSSINFER_STRICT_FP_TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_nvfp4_kernels.cu)
+  if(MSVC)
+    set_source_files_properties(${MOSSINFER_STRICT_FP_TEST_SOURCES} PROPERTIES COMPILE_OPTIONS "-Xcompiler=/fp:precise")
+  else()
+    set_source_files_properties(${MOSSINFER_STRICT_FP_TEST_SOURCES} PROPERTIES COMPILE_OPTIONS
+                                "-Xcompiler=-ffp-contract=off,-fno-fast-math")
+  endif()
   include(GoogleTest)
   # The 5 s default discovery timeout is too short on Windows runners, where the first start of the large test
   # executable can be slow (seen once in CI: "Process terminated due to timeout").

@@ -1,0 +1,123 @@
+{
+ "generator": "tools/reference/gen_nvfp4_convert_vectors.py",
+ "oracle": "comfy-kitchen dba9fac (eager, CPU) for rtn; the converter's mse rule; nvfp4_study.gptq_quant (fp32) for gptq; torch 2.14.1+cu130",
+ "files": {
+  "convert_qkv_w": {
+   "dtype": "uint16",
+   "shape": [
+    768,
+    256
+   ]
+  },
+  "convert_qkv_s2": {
+   "dtype": "float32",
+   "shape": [
+    1
+   ]
+  },
+  "convert_qkv_rtn_packed": {
+   "dtype": "uint8",
+   "shape": [
+    768,
+    128
+   ]
+  },
+  "convert_qkv_rtn_sf": {
+   "dtype": "uint8",
+   "shape": [
+    768,
+    16
+   ]
+  },
+  "convert_qkv_mse_packed": {
+   "dtype": "uint8",
+   "shape": [
+    768,
+    128
+   ]
+  },
+  "convert_qkv_mse_sf": {
+   "dtype": "uint8",
+   "shape": [
+    768,
+    16
+   ]
+  },
+  "convert_qkv_h": {
+   "dtype": "float32",
+   "shape": [
+    256,
+    256
+   ]
+  },
+  "convert_qkv_gptq_packed": {
+   "dtype": "uint8",
+   "shape": [
+    768,
+    128
+   ]
+  },
+  "convert_qkv_gptq_sf": {
+   "dtype": "uint8",
+   "shape": [
+    768,
+    16
+   ]
+  },
+  "convert_qkv_gptqm_packed": {
+   "dtype": "uint8",
+   "shape": [
+    768,
+    128
+   ]
+  },
+  "convert_qkv_gptqm_sf": {
+   "dtype": "uint8",
+   "shape": [
+    768,
+    16
+   ]
+  },
+  "convert_down_w": {
+   "dtype": "uint16",
+   "shape": [
+    256,
+    512
+   ]
+  },
+  "convert_down_s2": {
+   "dtype": "float32",
+   "shape": [
+    1
+   ]
+  },
+  "convert_down_rtn_packed": {
+   "dtype": "uint8",
+   "shape": [
+    256,
+    256
+   ]
+  },
+  "convert_down_rtn_sf": {
+   "dtype": "uint8",
+   "shape": [
+    256,
+    32
+   ]
+  },
+  "convert_down_mse_packed": {
+   "dtype": "uint8",
+   "shape": [
+    256,
+    256
+   ]
+  },
+  "convert_down_mse_sf": {
+   "dtype": "uint8",
+   "shape": [
+    256,
+    32
+   ]
+  }
+ }
+}

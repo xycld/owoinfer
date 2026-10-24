@@ -1655,6 +1655,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
         m.dit->set_request_route(std::nullopt);
         m.dit->set_input_extension(nullptr);  // a pass's control latents live on its stack
         m.dit->set_step_cache(nullptr);       // a pass's step cache too (run_pass also clears it)
+        m.dit->set_linear_input_hook({});     // and the call's calibration hook
       }
       if (m.vae) m.vae->set_cancel(nullptr);
     }
@@ -2331,6 +2332,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
       return false;
     }
     m.dit->set_cancel(control.cancel);
+    if (control.dit_linear_inputs) m.dit->set_linear_input_hook(control.dit_linear_inputs);
     // A DiT read buffered from the weight files: page-cached or cold (the loader's one reader). Direct reads and a soft
     // unload's host copy bypass the page cache, so they say nothing about it.
     // Each mode's load rate is kept, buffered ones from a warm cache apart (they price loads and decide the warm mode;

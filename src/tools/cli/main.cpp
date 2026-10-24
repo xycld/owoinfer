@@ -17,7 +17,7 @@ constexpr Command kCommands[] = {
     {"index", mi::cli::cmd_index, "index <bundle_dir> [-o <path>] [--checksum]   build a .mossidx for a model bundle"},
     {"inspect", mi::cli::cmd_inspect, "inspect <bundle_dir|.mossidx>                  print a weight-group summary"},
     {"generate", mi::cli::cmd_generate, "generate (--params <json> | --prompt <text>) --model <bundle_dir> -o <out.png> [...]   text to image"},
-    {"quantize", mi::cli::cmd_quantize, "quantize <dit> -o <out.safetensors> [--fuse-qkv] [--keep-bf16 <globs>] [--lora <f> [--lora-scale s]]   INT8 ConvRot DiT"},
+    {"quantize", mi::cli::cmd_quantize, "quantize <dit> -o <out.safetensors> [--format int8|nvfp4] [--recipe r] [--keep units] [--fuse-qkv] [--keep-bf16 <globs>] [--lora <f> [--lora-scale s]]   INT8 ConvRot or NVFP4 DiT"},
 };
 
 void usage(std::ostream& os) {

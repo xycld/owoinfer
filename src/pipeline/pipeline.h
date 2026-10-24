@@ -456,6 +456,9 @@ struct GenerateControl {
   // weight group while loading, between DiT blocks and per tiled-decode band (each phase then keeps at most one
   // layer / block / band queued on the GPU). The pipeline stays usable after a cancel.
   const std::atomic<bool>* cancel = nullptr;
+  // Internal (the NVFP4 converter's calibration capture, pipeline/nvfp4_calibration.h): installed on the DiT for the
+  // call (moss_dit::MossDit::set_linear_input_hook). Needs PipelineOptions::block_path kOpByOp and a bf16 DiT.
+  moss_dit::LinearInputHook dit_linear_inputs;
 };
 
 // The model a DiT was trained as, from its input embedder (video_embedder.weight, which the INT8 / INT4 ConvRot
