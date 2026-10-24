@@ -2584,6 +2584,31 @@ void expect_whole_job_progress(const std::vector<mi_progress>& events) {
   std::printf("[c_api] progress fraction/eta:%s\n", trace.c_str());
 }
 
+// A generation's bar moves: from the first event (TEXT_ENCODER) to the last (the final DECODE) the fraction grows past
+// one half and the eta shrinks.
+void expect_bar_moves(const std::vector<mi_progress>& events) {
+  ASSERT_GE(events.size(), 2u);
+  const mi_progress& first = events.front();
+  const mi_progress& last = events.back();
+  EXPECT_EQ(first.phase, MI_PHASE_TEXT_ENCODER);
+  EXPECT_EQ(last.phase, MI_PHASE_DECODE);
+  EXPECT_GT(last.fraction, first.fraction);
+  EXPECT_GT(last.fraction, 0.5);
+  EXPECT_LT(last.eta_seconds, first.eta_seconds);
+}
+
+// The DIT_LOAD phase's estimate in a generation's events: the eta at its start less the eta at the denoise's start.
+double dit_load_estimate(const std::vector<mi_progress>& events) {
+  double at_load = -1, at_denoise = -1;
+  for (const mi_progress& e : events) {
+    if (e.phase == MI_PHASE_DIT_LOAD) at_load = e.eta_seconds;
+    if (e.phase == MI_PHASE_DENOISE && e.step == 0 && at_denoise < 0) at_denoise = e.eta_seconds;
+  }
+  EXPECT_GE(at_load, 0.0);
+  EXPECT_GE(at_denoise, 0.0);
+  return at_load - at_denoise;
+}
+
 void on_plan(const char* explanation, const char* plan_json, void* user) {
   auto& ev = *static_cast<Events*>(user);
   ++ev.plans;
@@ -2636,6 +2661,7 @@ TEST_F(GpuCApi, Generate256TwoSteps) {
     EXPECT_GE(ev.progress[i].elapsed_seconds, ev.progress[i - 1].elapsed_seconds);
   }
   expect_whole_job_progress(ev.progress);
+  expect_bar_moves(ev.progress);
 
   EXPECT_EQ(mi_result_cancelled(r), 0);
   EXPECT_EQ(mi_result_width(r), 256);
@@ -3333,11 +3359,16 @@ class GpuCApiPreload : public ::testing::Test {
     std::vector<std::uint8_t> rgb;
     mi_memory_stats memory{};
     mi_dit_load_info dit_load{};
+    std::vector<mi_progress> progress;
   };
   static Generated generate(mi_engine* e) {
-    const mi_gen_params p = request();
+    mi_gen_params p = request();
     mi_result* r = nullptr;
     Generated g;
+    p.progress_callback = [](const mi_progress* pr, void* user) {
+      static_cast<std::vector<mi_progress>*>(user)->push_back(*pr);
+    };
+    p.user_data = &g.progress;
     EXPECT_EQ(mi_generate(e, &p, &r), MI_OK) << last_error();
     if (r == nullptr) return g;
     std::size_t n = 0;
@@ -3449,15 +3480,27 @@ TEST_F(GpuCApiPreload, PreloadThenGenerate) {
   // out_result NULL is allowed: a second preload of the same request finds everything loaded.
   ASSERT_EQ(mi_engine_preload(e, &p, nullptr), MI_OK) << last_error();
   const Generated after = generate(e);
+  expect_whole_job_progress(after.progress);
+  expect_bar_moves(after.progress);
+  const double preloaded_dit_s = dit_load_estimate(after.progress);
   if (note.empty()) {
     EXPECT_EQ(after.memory.dit_loads, 0);
     EXPECT_EQ(after.dit_load.source, MI_DIT_LOAD_SOURCE_NONE);
+    // The preloaded DiT is known to be loaded: the eta does not jump at DIT_LOAD.
+    EXPECT_LT(preloaded_dit_s, 0.5);
   }
   mi_engine_free(e);
 
   e = create();
   ASSERT_NE(e, nullptr);
   const Generated fresh = generate(e);
+  expect_bar_moves(fresh.progress);
+  // A fresh engine prices its DiT's cold load; the preloaded one did not.
+  const double fresh_dit_s = dit_load_estimate(fresh.progress);
+  std::printf("[c_api] DiT load estimate: %.3f s preloaded, %.3f s on a fresh engine\n", preloaded_dit_s, fresh_dit_s);
+  if (note.empty()) {
+    EXPECT_GT(fresh_dit_s, preloaded_dit_s);
+  }
   EXPECT_EQ(fresh.memory.dit_loads, 1);
   EXPECT_EQ(fresh.dit_load.source, MI_DIT_LOAD_SOURCE_FILES);
   ASSERT_FALSE(fresh.rgb.empty());
