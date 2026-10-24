@@ -12,6 +12,9 @@
         shipped binary has a DT_NEEDED / import-table entry for it or imports a cublasLt* symbol (readelf -d, nm -D
         --undefined-only / dumpbin /dependents, /imports). The full package bundles it (with the CUDA EULA); the
         --system-cuda variant ships no CUDA library at all and needs no EULA
+  CERT  the quality certificates in share/mossinfer/quality_certs/ (the engine's install-tree search; the directory
+        may be absent): listed; any entry there that is not a regular *.mossinfer-cert.json file (a symbolic link
+        included), or does not parse as JSON, fails
   find_package: optionally builds and runs examples/consumer-cmake against the tree, with the CUDA toolkit removed
         from PATH / LD_LIBRARY_PATH so that only the package's own libraries can satisfy it
 
@@ -22,6 +25,7 @@ Usage:
 Only the standard library; Windows needs dumpbin on PATH (a VS developer prompt).
 """
 import argparse
+import json
 import os
 import re
 import shutil
@@ -48,6 +52,7 @@ IS_WINDOWS = os.name == "nt"
 HEADER = "include/mossinfer/mossinfer.h"
 API_DECL = re.compile(r"^\s*MOSSINFER_API\b[^;(]*?\b(\w+)\s*\(", re.MULTILINE)
 INTERNAL_CLI_ENTRY = "mi_internal_cli_main"
+CERT_SUFFIX = ".mossinfer-cert.json"
 
 
 # The C++ runtime DLLs of MSVC's /MD (the UCRT, api-ms-win-*, ships with Windows 10 and newer).
@@ -296,6 +301,35 @@ def main():
             print(f"CRT bin/{dll}: {'ok' if dll in shipped else 'MISSING'}")
             if dll not in shipped:
                 failures.append(f"CRT: bin/{dll} missing (InstallRequiredSystemLibraries)")
+
+    # CERT: the certificates the engine finds in the install tree (src/pipeline/quality_cert.cpp, packaging.cmake).
+    cert_rel = os.path.join("share", "mossinfer", "quality_certs")
+    cert_dir = os.path.join(prefix, cert_rel)
+    if os.path.isdir(cert_dir):
+        certs = 0
+        for name in sorted(os.listdir(cert_dir)):
+            rel = os.path.join(cert_rel, name)
+            path = os.path.join(cert_dir, name)
+            if os.path.islink(path):
+                print(f"CERT {rel}: a symbolic link")
+                failures.append(f"CERT: {rel} is a symbolic link (a package carries regular files only)")
+                continue
+            if not name.endswith(CERT_SUFFIX) or not os.path.isfile(path):
+                print(f"CERT {rel}: not a {CERT_SUFFIX} file")
+                failures.append(f"CERT: {rel} is not a {CERT_SUFFIX} file (only certificates belong there)")
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    json.load(f)
+            except (OSError, ValueError) as e:  # ValueError: JSON and UTF-8 decoding errors
+                print(f"CERT {rel}: unparsable ({e})")
+                failures.append(f"CERT: {rel} is not valid JSON: {e}")
+                continue
+            certs += 1
+            print(f"CERT {rel}: ok")
+        print(f"CERT {cert_rel}: {certs} certificate(s)")
+    else:
+        print(f"CERT {cert_rel}: none (no directory)")
 
     total = tree_size(prefix)
     cuda12 = any(CUBLASLT_12.match(n) for _, _, files in os.walk(prefix) for n in files)

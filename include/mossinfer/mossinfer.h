@@ -27,12 +27,15 @@
  *   0 / NULL return from accessors.
  *
  * Threading
- * - Each engine runs one generation at a time. A concurrent mi_generate() on the same engine fails with MI_ERR_BUSY.
- *   Different engines may run concurrently, but they share the GPU and the memory budgets are per engine.
- * - mi_cancel() is thread-safe and may be called from any thread, including from inside a callback.
- * - Callbacks run on the thread that called mi_generate(), synchronously, while the GPU waits. Keep them short.
- *   They must not throw (C++), longjmp, or call mi_generate() / mi_engine_free() on the same engine.
- * - mi_engine_free() must not race with a running mi_generate() on that engine.
+ * - Each engine runs one job at a time: mi_generate(), mi_engine_preload() or mi_engine_release(). A concurrent one on
+ *   the same engine fails with MI_ERR_BUSY. Different engines may run concurrently, but they share the GPU and the
+ *   memory budgets are per engine.
+ * - mi_cancel() is thread-safe and may be called from any thread, including from inside a callback. It stops the job
+ *   running on the engine, whichever it is.
+ * - Callbacks run on the thread that called mi_generate() (or mi_engine_preload()), synchronously, while the GPU
+ *   waits. Keep them short. They must not throw (C++), longjmp, or call mi_generate(), mi_engine_preload(),
+ *   mi_engine_release() or mi_engine_free() on the same engine.
+ * - mi_engine_free() must not race with a running job on that engine.
  * - mi_result objects are independent of their engine. They may outlive it and be used from any one thread at a time.
  */
 #ifndef MOSSINFER_MOSSINFER_H
@@ -85,11 +88,12 @@ MOSSINFER_API int32_t mi_abi_version(void);
 
 typedef enum mi_status {
   MI_OK = 0,
-  MI_CANCELLED = 1,                /* mi_generate(): stopped by mi_cancel(); a result is still returned */
+  MI_CANCELLED = 1,                /* stopped by mi_cancel(): a generation or preload (a result is returned), or a release
+                                    * before it freed anything */
   MI_ERR_INVALID_ARGUMENT = -1,    /* NULL handle or pointer, value out of range, invalid request */
   MI_ERR_ABI_MISMATCH = -2,        /* struct_size this library does not know */
   MI_ERR_NOT_SUPPORTED = -3,       /* feature not in this build (e.g. ComfyUI single-file checkpoints) */
-  MI_ERR_BUSY = -4,                /* the engine is already generating */
+  MI_ERR_BUSY = -4,                /* the engine is already running a job (generation, preload or release) */
   MI_ERR_OUT_OF_MEMORY = -5,       /* request does not fit the device or host memory budgets in any mode */
   MI_ERR_MODEL = -6,               /* model files missing, incomplete or malformed */
   MI_ERR_IO = -7,                  /* file system error (reading weights, writing an image) */
@@ -126,6 +130,15 @@ MOSSINFER_API const char* mi_last_error_message(void);
 /* The lossy accelerators: mi_gen_params.cfg_truncation / step_cache / step_cache_threshold, mi_result_accel(),
  * mi_result_accel_cached_steps() and MI_TEXT_ACCELERATORS. */
 #define MI_CAP_ACCEL 0x800u
+/* mi_engine_preload(): loads the models for a request before the first mi_generate(). */
+#define MI_CAP_PRELOAD 0x1000u
+/* mi_engine_release(): a soft unload that frees the device memory and keeps the engine, optionally with the weights
+ * kept in host RAM (keep_host_copy) for a fast reload; mi_result_dit_load() says where a DiT load read from. */
+#define MI_CAP_RELEASE 0x2000u
+/* mi_engine_params.certificate_dirs: extra quality-certificate directories. */
+#define MI_CAP_CERTIFICATE_DIRS 0x4000u
+/* mi_engine_params.te_host_pin: whether a host-resident text encoder may hold a pinned copy. */
+#define MI_CAP_TE_HOST_PIN 0x8000u
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -245,6 +258,30 @@ typedef enum mi_precision {
   MI_PRECISION_MAX_ENUM = 0x7fffffff
 } mi_precision;
 
+/* How the DiT reads its weight files when it loads (mi_engine_params.dit_direct_io). mi_engine_params.direct_io = 1
+ * forces direct reads for every weight read; dit_direct_io only refines the DiT's load when direct_io is 0. Streamed DiT
+ * blocks (a DiT that does not fit the device) read buffered every step unless direct_io. */
+typedef enum mi_direct_io {
+  /* Adaptive (default): direct I/O, unless it gains nothing on the files (tmpfs, network file systems, compressed
+   * extents, a refused open); buffered for a parking reload. With most of the files in the page cache already (Linux:
+   * probed before every load; Windows: once buffered loads measure faster), the mode this machine measured faster from
+   * the cache (each is tried once while its rate is unknown; the rates are kept in the hardware profile under
+   * cache_dir). */
+  MI_DIRECT_IO_AUTO = 0,
+  MI_DIRECT_IO_BUFFERED = 1, /* buffered reads (the page cache) */
+  MI_DIRECT_IO_DIRECT = 2,   /* direct I/O (O_DIRECT / FILE_FLAG_NO_BUFFERING); a refused open still reads buffered */
+  MI_DIRECT_IO_MAX_ENUM = 0x7fffffff
+} mi_direct_io;
+
+/* Whether a host-resident text encoder may hold a pinned host copy (MI_CAP_TE_HOST_PIN). A pinned copy uploads faster
+ * and costs page-locked RAM; one whose allocation fails streams from the files instead (MI_TEXT_TE_NOTE says so). */
+typedef enum mi_te_host_pin {
+  MI_TE_HOST_PIN_AUTO = 0, /* where the machine clearly has the room (default) */
+  MI_TE_HOST_PIN_ON = 1,   /* whenever the copy fits the host limit */
+  MI_TE_HOST_PIN_OFF = 2,  /* never */
+  MI_TE_HOST_PIN_MAX_ENUM = 0x7fffffff
+} mi_te_host_pin;
+
 typedef struct mi_engine_params {
   size_t struct_size;
   const char* model_path;          /* required: bundle directory */
@@ -281,10 +318,19 @@ typedef struct mi_engine_params {
    * (as time_embedding_file; both set with different files is MI_ERR_INVALID_ARGUMENT); mi_gen_params.distill_dir
    * takes the rest per generation. NULL or "" = none. */
   const char* distill_dir;
+  /* Fields after the 136-byte layout (1.0.0). */
+  /* Extra quality-certificate directories (MI_CAP_CERTIFICATE_DIRS), searched first, in order, before
+   * <cache_dir>/quality_certs, the DiT file's sidecar and the install tree's share/mossinfer/quality_certs: the *.json
+   * files in each. UTF-8 paths, at most 16, none NULL or empty; a directory that does not exist is searched as empty.
+   * The array and its strings are copied by mi_engine_create(). Default none (NULL, count 0). */
+  const char* const* certificate_dirs;
+  size_t certificate_dirs_count;
+  mi_direct_io dit_direct_io;      /* default MI_DIRECT_IO_AUTO; see mi_direct_io for its interplay with direct_io */
+  mi_te_host_pin te_host_pin;      /* default MI_TE_HOST_PIN_AUTO */
 } mi_engine_params;
 
 /* Fills the first `struct_size` bytes of `params` with the defaults. struct_size is sizeof(mi_engine_params) of the
- * caller's header: 136, 120 (an earlier 0.2.0 header) or 80 (0.1.0). */
+ * caller's header: 160, 136 (1.0.0), 120 (an earlier 0.2.0 header) or 80 (0.1.0). */
 MOSSINFER_API mi_status mi_engine_params_init(mi_engine_params* params, size_t struct_size);
 
 /* Creates an engine on `params->device_index`. Checks the parameters, the model path and that the component files exist
@@ -298,8 +344,10 @@ MOSSINFER_API mi_status mi_engine_create(const mi_engine_params* params, mi_engi
 MOSSINFER_API void mi_engine_free(mi_engine* engine);
 
 /* Requests the generation running on `engine` to stop. It stops within one text-encoder layer, DiT block or decode
- * band, and mi_generate() returns MI_CANCELLED. No effect when nothing runs (a cancel never carries over to the next
- * generation). Thread-safe. */
+ * band, and mi_generate() returns MI_CANCELLED. It also stops a running mi_engine_preload() (MI_CANCELLED) and a running
+ * mi_engine_release(): before it frees anything (MI_CANCELLED), else its host copy. No effect when nothing runs (a cancel
+ * never carries over to the next job).
+ * Thread-safe. */
 MOSSINFER_API mi_status mi_cancel(mi_engine* engine);
 
 /* ------------------------------------------------------------------------------------------------ generation */
@@ -525,8 +573,10 @@ typedef struct mi_gen_params {
   double cfg_truncation;
   mi_step_cache step_cache;         /* default MI_STEP_CACHE_OFF */
   int32_t _reserved4;               /* must be 0 */
-  /* The step cache's threshold: 0 (default) = the engine's recommended value (0.03), else (0, 1]; larger is faster
-   * and further from the uncached image. Ignored with the step cache off. */
+  /* The step cache's threshold: 0 (default) = unset, the engine's default for the loaded model (0.02 on the base
+   * model, 0.03 on the SFT model, the files derived from it and a model it cannot place; mi_accel_info and
+   * MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE report what ran), else (0, 1]; larger is faster and further from the uncached
+   * image. Ignored with the step cache off. */
   double step_cache_threshold;
 } mi_gen_params;
 
@@ -552,7 +602,8 @@ MOSSINFER_API mi_status mi_gen_params_init(mi_gen_params* params, size_t struct_
  * file read) included. Image inputs are checked (sizes, channels, file existence and size) but neither copied nor
  * decoded. Left to mi_generate(): the match of a distill bundle's time embedding with the engine's, and the control
  * adapter's format and kinds. MI_ERR_INVALID_ARGUMENT names the problem; a malformed distill bundle or dataspace file
- * is MI_ERR_MODEL. */
+ * is MI_ERR_MODEL. It checks a generation's request, which needs a prompt: to check a mi_engine_preload() request
+ * without one, validate a copy with a stand-in prompt (e.g. "preload"). */
 MOSSINFER_API mi_status mi_gen_params_validate(const mi_gen_params* params);
 
 /* Runs one generation to completion. Returns MI_OK with the image, or MI_CANCELLED after mi_cancel() (the result then
@@ -560,6 +611,56 @@ MOSSINFER_API mi_status mi_gen_params_validate(const mi_gen_params* params);
  * mi_result_free(). On any other status *out_result is NULL. The engine stays usable after every status except
  * MI_ERR_CUDA, after which it should be freed. */
 MOSSINFER_API mi_status mi_generate(mi_engine* engine, const mi_gen_params* params, mi_result** out_result);
+
+/* Loads what the engine keeps resident for a request like `params`, without generating (MI_CAP_PRELOAD), so that the
+ * first mi_generate() starts at once: the arena at the plan's size, the DiT as the plan keeps it (not when the plan
+ * parks it for the text encoder: MI_TEXT_PRELOAD_NOTE says so), the VAE decoder, the VAE encoder of a request with an
+ * init image, the LoRAs and control adapter it names, and a host-resident text encoder's copy. The request is planned as
+ * mi_generate() plans it (size, steps, CFG, LoRAs, control adapter, the prompt's length). `params` NULL = the defaults;
+ * a NULL or blank prompt is allowed here only (it plans for a short prompt). Otherwise `params` is checked as for
+ * mi_generate(), with the same failures. A following mi_generate() of a request like it reuses everything
+ * (mi_memory_stats.dit_loads 0) and gives the same image bits as without the preload.
+ * It occupies the engine like a generation: MI_ERR_BUSY while a job runs, and mi_cancel() stops it between models and
+ * weight groups (MI_CANCELLED with a result; the engine stays usable and keeps what was loaded before the cancel).
+ * params' callbacks run on this thread: the plan once, after planning and before any load; then a progress (step 0,
+ * total_steps 0) before each load step, also for a model already resident, in this order: MI_PHASE_TEXT_ENCODER before
+ * a host-resident text encoder's copy, MI_PHASE_DECODE before each VAE (twice for a request with an init image: its
+ * encoder, then the decoder), MI_PHASE_DIT_LOAD before the DiT. A step the plan skips reports nothing; MI_PHASE_DENOISE
+ * never comes, and there is no preview. A mi_cancel() from a callback stops the preload at once. `out_result` may be
+ * NULL; else it
+ * receives the preload's result on MI_OK and MI_CANCELLED (release it with mi_result_free()): the plan, the tier, the
+ * timings, the memory, mi_result_dit_load() and MI_TEXT_PRELOAD_NOTE; no image, steps_run 0. */
+MOSSINFER_API mi_status mi_engine_preload(mi_engine* engine, const mi_gen_params* params, mi_result** out_result);
+
+/* What mi_engine_release() freed and kept. An output struct: struct_size set by the caller. */
+typedef struct mi_release_info {
+  size_t struct_size;
+  double seconds;                /* the whole release, host_copy_seconds included */
+  uint64_t vram_released_bytes;  /* the arena plus the device memory held outside it (LoRA side branches, control) */
+  uint64_t host_copy_bytes;      /* host RAM the kept copies hold */
+  double host_copy_seconds;      /* reading the DiT's files into RAM */
+  int32_t dit_host_copy;         /* the DiT's weights are kept in RAM: its next load uploads them from there */
+  int32_t te_host_copy;          /* a host-resident text encoder's copy is kept */
+  char note[512];                /* why a copy was not kept (the host budget, a cancel), cut at 511 bytes; "" if none */
+} mi_release_info;
+
+/* Soft unload (MI_CAP_RELEASE): frees the engine's device memory (the arena, every resident model, LoRA side branches,
+ * a control adapter's embedder) so that another application can use the GPU, and keeps the engine: the next
+ * mi_generate() plans and loads again. With keep_host_copy nonzero the weights stay in host RAM where the host has the
+ * room (a margin of the available memory stays free; within host_ram_budget_bytes when set): the DiT's weight files are
+ * read into pinned memory (seconds; its next load uploads them from there, bit-identical, then frees them) and a
+ * host-resident text encoder keeps its copy. With 0 every host copy is freed too. The embedding cache stays either way.
+ * mi_cancel() from another thread, during this call (one sent before the call has no effect: like every job, the
+ * release clears the cancel flag when it marks the engine busy):
+ * - landing after the call started and before it frees anything: nothing is released, MI_CANCELLED, `out` with
+ *   vram_released_bytes 0, the host copies already held and note "cancelled before it started";
+ * - during the DiT's host copy (between 64 MiB reads): the copy stops; the release still completes (MI_OK), keeps a
+ *   host-resident text encoder's copy, frees nothing else, and the note says the copy was cancelled.
+ * `out` (may be NULL) receives what was released and kept, and why not. Returns MI_OK or MI_CANCELLED (above), else:
+ * MI_ERR_INVALID_ARGUMENT for a NULL engine, MI_ERR_ABI_MISMATCH for an unknown out->struct_size, MI_ERR_BUSY while a
+ * generation, a preload or another release runs (all three before anything is freed), and MI_ERR_CUDA when the device
+ * fails (free the engine then). */
+MOSSINFER_API mi_status mi_engine_release(mi_engine* engine, int32_t keep_host_copy, mi_release_info* out);
 
 /* ------------------------------------------------------------------------------------------------ results */
 
@@ -581,6 +682,9 @@ typedef struct mi_timings {
   double vae_encoder_load_s;
   double image_encode_s;  /* every VAE encode (the init image, the hires fix's upscaled first pass) */
   double image_ops_s;     /* host-side image work: resizes, the hires upscale, mask preparation, inpainting blends */
+  /* Fields after the 128-byte layout (1.0.0): runtime LoRAs and a control adapter's LoRA part; 0 when reused as is. */
+  double lora_load_s;     /* reading the adapter files and uploading the side branches */
+  double lora_merge_s;    /* merging adapters into a loaded DiT in place (a strength change, a control switched) */
 } mi_timings;
 
 typedef struct mi_memory_stats {
@@ -591,6 +695,11 @@ typedef struct mi_memory_stats {
   uint64_t device_free_at_start_bytes;
   uint64_t host_private_start_bytes;
   uint64_t host_private_peak_bytes;
+  /* Fields after the 56-byte layout (1.0.0), at the end of the call. */
+  uint64_t host_copy_bytes;   /* host copies kept across calls (mi_engine_release(), a host-resident text encoder) */
+  uint64_t merge_memo_bytes;  /* host RAM the DiT keeps to switch a merged adapter set back on (at most 1 GiB) */
+  int32_t dit_loads;          /* DiT loads in the call: 0 when it was resident (or not needed) */
+  int32_t _reserved0;
 } mi_memory_stats;
 
 /* DiT block streaming over the whole denoise (all zero when every block was resident). The DiT streams when it does
@@ -622,6 +731,29 @@ MOSSINFER_API int32_t mi_result_steps_run(const mi_result* result);
 MOSSINFER_API mi_status mi_result_timings(const mi_result* result, mi_timings* out);
 MOSSINFER_API mi_status mi_result_memory(const mi_result* result, mi_memory_stats* out);
 MOSSINFER_API mi_status mi_result_dit_stream(const mi_result* result, mi_dit_stream_stats* out);
+
+/* Where the call's last DiT load read the weights from (MI_CAP_RELEASE). */
+typedef enum mi_dit_load_source {
+  MI_DIT_LOAD_SOURCE_NONE = 0,      /* no DiT load in the call (it was resident, or not needed) */
+  MI_DIT_LOAD_SOURCE_FILES = 1,     /* the weight files (page cache or disk) */
+  MI_DIT_LOAD_SOURCE_HOST_COPY = 2, /* the host copy mi_engine_release() kept */
+  MI_DIT_LOAD_SOURCE_MAX_ENUM = 0x7fffffff
+} mi_dit_load_source;
+typedef enum mi_load_io {
+  MI_LOAD_IO_NONE = 0,     /* not read from the files */
+  MI_LOAD_IO_BUFFERED = 1, /* buffered reads (MI_TEXT_DIT_LOAD_NOTE says why) */
+  MI_LOAD_IO_DIRECT = 2,   /* direct I/O */
+  MI_LOAD_IO_MAX_ENUM = 0x7fffffff
+} mi_load_io;
+typedef struct mi_dit_load_info {
+  size_t struct_size;
+  mi_dit_load_source source;
+  mi_load_io io;             /* MI_LOAD_IO_NONE unless source is MI_DIT_LOAD_SOURCE_FILES */
+  uint64_t bytes;            /* read by the load */
+  double seconds;
+} mi_dit_load_info;
+/* `out` has struct_size set by the caller. All zero when the call loaded no DiT. */
+MOSSINFER_API mi_status mi_result_dit_load(const mi_result* result, mi_dit_load_info* out);
 /* The DiT block path the denoise actually ran (never MI_BLOCK_PATH_DEFAULT, except for a NULL result). It can differ
  * from mi_engine_params.block_path; mi_result_block_path_note() then says why. When a cancel landed before the DiT
  * was ready for the denoise (text encoder or DiT load), no block ran and this is MI_BLOCK_PATH_FUSED, the engine
@@ -679,8 +811,15 @@ typedef enum mi_result_text_kind {
   MI_TEXT_CONTROL_BASE_MODEL = 11, /* the file's base_model metadata (informational); "" when absent */
   MI_TEXT_CONTROL_ENCODE_SCHEDULE = 12, /* how the control images were VAE-encoded: "untiled" or the tile plans */
   /* MI_CAP_ACCEL: the requested lossy accelerators that are active for this request (not what ran: a run cancelled
-   * before sampling reports them too), e.g. "cfg_truncation 0.8, step_cache fbcache 0.03"; "off" when none. */
+   * before sampling reports them too), e.g. "cfg_truncation 0.8, step_cache fbcache 0.03" (an unset threshold as the
+   * model's default that ran, or "default" when the run stopped before it was resolved); "off" when none. */
   MI_TEXT_ACCELERATORS = 13,
+  MI_TEXT_DIT_LOAD_NOTE = 14,      /* why the DiT's load read buffered, or what decided; "" for a plain direct load */
+  MI_TEXT_TE_NOTE = 15,            /* a remark on the text encoder, e.g. a pinned copy that could not be allocated */
+  MI_TEXT_PRELOAD_NOTE = 16,       /* mi_engine_preload(): what it did not load and why; "" otherwise */
+  /* MI_CAP_ACCEL: where the step cache's threshold came from: "request", or "default for the base model" (sft,
+   * unrecognized); "" with the step cache off or before it was resolved (a run cancelled early). */
+  MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE = 17,
   MI_TEXT_MAX_ENUM = 0x7fffffff
 } mi_result_text_kind;
 /* Owned by the result; "" when empty (e.g. cancelled early). NULL for a NULL result or an unknown kind. */
@@ -713,13 +852,21 @@ typedef struct mi_accel_info {
   /* The request's settings activate a lossy accelerator (MI_TEXT_ACCELERATORS), so the run is uncertified. It describes
    * the requested, active settings, not what ran: a run cancelled before sampling still reports 1. */
   int32_t lossy;
+  /* Fields after the 24-byte layout (an earlier 1.1.0 header). The threshold the step cache ran with: the request's,
+   * or the model's default (MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE says which); 0 with the step cache off. */
+  double step_cache_threshold;
 } mi_accel_info;
-/* `out` has struct_size set by the caller. */
+/* `out` has struct_size set by the caller: the current size or the 24-byte one. */
 MOSSINFER_API mi_status mi_result_accel(const mi_result* result, mi_accel_info* out);
 /* The 1-based steps (counting on across the passes of a hires fix) with a DiT call that reused the step cache, in
  * order; owned by the result. `count` (required) receives their number. NULL with *count 0 when there are none, and
  * for a NULL result or count (mi_last_error_message() then set). */
 MOSSINFER_API const int32_t* mi_result_accel_cached_steps(const mi_result* result, size_t* count);
+/* The relative change of DiT block 0's output that the step cache measured at every DiT call with the cache on (both
+ * passes of a hires fix), in order: what the threshold was compared against; NaN where a call had nothing to compare
+ * with. Owned by the result; `count` (required) receives their number. NULL with *count 0 when there are none, and for a
+ * NULL result or count (mi_last_error_message() then set). */
+MOSSINFER_API const double* mi_result_accel_step_cache_diffs(const mi_result* result, size_t* count);
 
 /* What the image input ran (MI_CAP_IMAGE_INPUT, MI_CAP_HIRES). */
 typedef enum mi_image_mode {
@@ -789,6 +936,9 @@ typedef enum mi_message_kind {
   /* MI_CAP_CONTROL: the same for the control adapter's LoRA part. */
   MI_MESSAGE_CONTROL_WARNING = 2,
   MI_MESSAGE_CONTROL_NOTE = 3,
+  /* MI_CAP_ACCEL: what the user should know about the accelerators for this model, e.g. a step-cache threshold that
+   * moves the base model's composition, or a cache that never engaged. */
+  MI_MESSAGE_ACCEL_WARNING = 4,
   MI_MESSAGE_MAX_ENUM = 0x7fffffff
 } mi_message_kind;
 /* 0 for a NULL result or an unknown kind. */

@@ -355,14 +355,14 @@ mi_image_mode to_image_mode(const std::string& mode) {
 
 }  // namespace
 
-pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embedding, bool load_images) {
-  if (p.prompt == nullptr) throw std::invalid_argument("Enter a prompt.");
+pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embedding, bool load_images, bool preload) {
+  if (p.prompt == nullptr && !preload) throw std::invalid_argument("Enter a prompt.");
   // A distill bundle supplies what the caller left unset (cmd_generate's --distill).
   std::optional<moss_dit::DistillBundle> distill;
   if (given(p.distill_dir)) distill = distill_bundle(p.distill_dir, "distill_dir");
   if (distill_time_embedding != nullptr) *distill_time_embedding = distill ? distill->time_embedding : fs::path();
   pipeline::Request q;
-  q.prompt = p.prompt;
+  q.prompt = p.prompt != nullptr ? p.prompt : "";
   q.negative_prompt = p.negative_prompt != nullptr ? p.negative_prompt : "";
   q.width = p.width;
   q.height = p.height;
@@ -509,7 +509,8 @@ pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embe
     q.control.images.push_back(std::move(ci));
   }
 
-  // The lossy accelerators (pipeline/accel/accel.h): a threshold of 0 is the recommended one.
+  // The lossy accelerators (pipeline/accel/accel.h): a threshold of 0 is unset (the model's default, which the pipeline
+  // fills in and reports).
   q.accel.cfg_truncation = p.cfg_truncation;
   switch (p.step_cache) {
     case MI_STEP_CACHE_OFF: q.accel.step_cache = pipeline::accel::StepCacheKind::kOff; break;
@@ -519,13 +520,21 @@ pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embe
   if (!std::isfinite(p.step_cache_threshold) || p.step_cache_threshold < 0 || p.step_cache_threshold > 1) {
     throw std::invalid_argument("step_cache_threshold must be 0 (the default) or greater than 0 and at most 1.");
   }
-  q.accel.step_cache_threshold = p.step_cache_threshold > 0 ? p.step_cache_threshold : pipeline::accel::kDefaultFbCacheThreshold;
+  q.accel.step_cache_threshold = p.step_cache_threshold > 0 ? std::optional<double>(p.step_cache_threshold) : std::nullopt;
 
   if (distill_dataspace && (init.given() || q.hires.enabled())) {
     throw std::invalid_argument("distill_dir selected the bundle's dataspace sampler, which cannot start from an image "
                                 "(init_image, hires_width / hires_height); set sampler to use another sampler.");
   }
-  pipeline::validate(q);
+  if (preload) {
+    // The prompt is the one thing a preload need not have: the rest is checked as for a generation.
+    std::string prompt = std::move(q.prompt);
+    q.prompt = "preload";
+    pipeline::validate(q);
+    q.prompt = std::move(prompt);
+  } else {
+    pipeline::validate(q);
+  }
   if (step_codes && static_cast<std::size_t>(q.steps) > *step_codes) {
     throw std::invalid_argument("The dataspace sampler runs 1 to " + std::to_string(*step_codes) + " steps (its file has " +
                                 std::to_string(*step_codes) + " step codes), not " + std::to_string(q.steps) + ".");
@@ -565,6 +574,32 @@ pipeline::PipelineOptions to_options(const mi_engine_params& p) {
   o.tier = to_tier(p.tier);
   o.attention = to_attention(p.attention);
   o.lora_strict = p.lora_strict != 0;
+  // Certificate directories: copied, in order; the engine searches a missing one as empty.
+  if (p.certificate_dirs_count > 0 && p.certificate_dirs == nullptr) {
+    throw std::invalid_argument("certificate_dirs: NULL array with a nonzero count.");
+  }
+  if (p.certificate_dirs_count > kMaxCertificateDirs) {
+    throw std::invalid_argument("certificate_dirs: at most " + std::to_string(kMaxCertificateDirs) + " entries (got " +
+                                std::to_string(p.certificate_dirs_count) + ").");
+  }
+  for (std::size_t i = 0; i < p.certificate_dirs_count; ++i) {
+    if (!given(p.certificate_dirs[i])) {
+      throw std::invalid_argument("certificate_dirs[" + std::to_string(i) + "] is empty; pass a directory.");
+    }
+    o.certificate_dirs.push_back(util::path_from_utf8(p.certificate_dirs[i]));
+  }
+  switch (p.dit_direct_io) {
+    case MI_DIRECT_IO_AUTO: o.dit_load_direct_io = std::nullopt; break;  // adaptive
+    case MI_DIRECT_IO_BUFFERED: o.dit_load_direct_io = false; break;
+    case MI_DIRECT_IO_DIRECT: o.dit_load_direct_io = true; break;
+    default: unknown("dit_direct_io", static_cast<int>(p.dit_direct_io));
+  }
+  switch (p.te_host_pin) {
+    case MI_TE_HOST_PIN_AUTO: o.te_host_pin = planner::TeHostPin::kAuto; break;
+    case MI_TE_HOST_PIN_ON: o.te_host_pin = planner::TeHostPin::kOn; break;
+    case MI_TE_HOST_PIN_OFF: o.te_host_pin = planner::TeHostPin::kOff; break;
+    default: unknown("te_host_pin", static_cast<int>(p.te_host_pin));
+  }
   // The step-embedder replacement is per engine: given directly, or a distill bundle's.
   o.time_embedding_file = component(p.time_embedding_file, "time_embedding_file");
   if (given(p.distill_dir)) {
@@ -615,6 +650,8 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
   g.timings.vae_encoder_load_s = t.vae_encoder_load_s;
   g.timings.image_encode_s = t.encode_s;
   g.timings.image_ops_s = t.image_ops_s;
+  g.timings.lora_load_s = t.lora_load_s;
+  g.timings.lora_merge_s = t.lora_merge_s;
   g.image.struct_size = sizeof g.image;
   g.image.mode = to_image_mode(r.image_mode);
   g.image.hires_ran = r.hires.ran ? 1 : 0;
@@ -643,6 +680,23 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
   g.memory.device_free_at_start_bytes = m.free_at_start;
   g.memory.host_private_start_bytes = m.host_private_start;
   g.memory.host_private_peak_bytes = m.host_private_peak;
+  g.memory.host_copy_bytes = m.host_copy_bytes;
+  g.memory.merge_memo_bytes = m.merge_memo_bytes;
+  g.memory.dit_loads = m.dit_loads;
+  const pipeline::DitLoadReport& dl = r.dit_load;
+  g.dit_load.struct_size = sizeof g.dit_load;
+  g.dit_load.source = dl.source == "files"       ? MI_DIT_LOAD_SOURCE_FILES
+                      : dl.source == "host_copy" ? MI_DIT_LOAD_SOURCE_HOST_COPY
+                                                 : MI_DIT_LOAD_SOURCE_NONE;
+  g.dit_load.io = g.dit_load.source != MI_DIT_LOAD_SOURCE_FILES ? MI_LOAD_IO_NONE
+                  : dl.io == "direct"                           ? MI_LOAD_IO_DIRECT
+                  : dl.io == "buffered"                         ? MI_LOAD_IO_BUFFERED
+                                                                : MI_LOAD_IO_NONE;
+  g.dit_load.bytes = dl.bytes;
+  g.dit_load.seconds = dl.seconds;
+  g.dit_load_note = dl.note;
+  g.te_note = r.te_note;
+  g.preload_note = r.preload_note;
   g.plan_explanation = r.plan.explanation;
   g.block_path = to_block_path(r.block_path);
   g.block_path_note = r.block_path_note;
@@ -721,8 +775,15 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
   g.accel.dit_calls = a.dit_calls;
   g.accel.cached_calls = a.cached_calls;
   g.accel.lossy = q.accel.active(q.cfg != 1.0) ? 1 : 0;
-  g.accelerators = q.accel.describe(q.cfg != 1.0);
+  g.accel.step_cache_threshold = a.step_cache_threshold;
+  // As the report's accelerators.active: an unset threshold as the model's default that ran.
+  pipeline::accel::Options ran = q.accel;
+  if (ran.step_cache_on() && a.step_cache_threshold > 0) ran.step_cache_threshold = a.step_cache_threshold;
+  g.accelerators = ran.describe(q.cfg != 1.0);
   g.cached_steps.assign(a.cached_steps.begin(), a.cached_steps.end());
+  g.step_cache_diffs = a.step_cache_diffs;
+  g.step_cache_threshold_source = a.step_cache_threshold_source;
+  g.accel_warnings = r.accel_warnings;
   return g;
 }
 
@@ -763,44 +824,66 @@ PipelineAdapter::~PipelineAdapter() {
   impl_->pipe.reset();
 }
 
+namespace {
+
+// A distill bundle's step embedder is the engine's (PipelineOptions): the request's bundle must use the same one.
+void check_distill_time_embedding(const fs::path& engine_te, const fs::path& distill_te) {
+  if (distill_te.empty()) return;
+  std::error_code ec;
+  if (engine_te.empty() || !fs::equivalent(engine_te, distill_te, ec)) {
+    throw std::invalid_argument("distill_dir has a time embedding (" + util::path_utf8(distill_te) +
+                                ") that this engine does not use; set the bundle as mi_engine_params.distill_dir "
+                                "(or its file as time_embedding_file) when creating the engine.");
+  }
+}
+
+// A pipeline call with its model-file errors as ModelError (MI_ERR_MODEL).
+template <class F>
+pipeline::Result model_errors(F&& call) {
+  try {
+    return call();
+  } catch (const lora::LoraError& e) {
+    throw ModelError(e.what());  // a LoRA file that cannot be applied (or, strict, an unknown key or a lossy merge)
+  } catch (const pipeline::DataspaceError& e) {
+    throw ModelError(e.what());  // a dataspace file that changed since to_request read it
+  } catch (const control::ControlError& e) {
+    throw ModelError(e.what());  // control_adapter is not a control adapter (no widened embedder, bad kinds metadata)
+  }
+}
+
+// The progress callback of `params`, with the time since t0.
+void progress(const mi_gen_params& params, Clock::time_point t0, mi_phase phase, int step, int total, double step_s) {
+  if (params.progress_callback == nullptr) return;
+  mi_progress p{};
+  p.struct_size = sizeof p;
+  p.phase = phase;
+  p.step = step;
+  p.total_steps = total;
+  p.step_seconds = step_s;
+  p.elapsed_seconds = std::chrono::duration<double>(Clock::now() - t0).count();
+  params.progress_callback(&p, params.user_data);
+}
+
+}  // namespace
+
 Generation PipelineAdapter::generate(const mi_gen_params& params, const std::atomic<bool>& cancel) {
   const auto t0 = Clock::now();
   fs::path distill_te;
   pipeline::Request q = to_request(params, &distill_te, true);
   q.model = impl_->model;
-  // A distill bundle's step embedder is the engine's (PipelineOptions): the request's bundle must use the same one.
-  if (!distill_te.empty()) {
-    std::error_code ec;
-    if (impl_->time_embedding.empty() || !fs::equivalent(impl_->time_embedding, distill_te, ec)) {
-      throw std::invalid_argument("distill_dir has a time embedding (" + util::path_utf8(distill_te) +
-                                  ") that this engine does not use; set the bundle as mi_engine_params.distill_dir "
-                                  "(or its file as time_embedding_file) when creating the engine.");
-    }
-  }
+  check_distill_time_embedding(impl_->time_embedding, distill_te);
   // The CUDA device is per host thread; the caller's thread may not be the one that created the engine.
   const backend::ScopedCurrentContext restore;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
   const int total_steps = static_cast<int>(pipeline::schedule_steps(q));  // both passes, after the strengths
-  const auto elapsed = [&] { return std::chrono::duration<double>(Clock::now() - t0).count(); };
-  const auto report = [&](mi_phase phase, int step, int total, double step_s) {
-    if (params.progress_callback == nullptr) return;
-    mi_progress p{};
-    p.struct_size = sizeof p;
-    p.phase = phase;
-    p.step = step;
-    p.total_steps = total;
-    p.step_seconds = step_s;
-    p.elapsed_seconds = elapsed();
-    params.progress_callback(&p, params.user_data);
-  };
   pipeline::GenerateControl control;
   control.cancel = &cancel;
   control.on_phase = [&](pipeline::Phase phase) {
-    report(to_phase(phase), 0, total_steps, 0.0);
+    progress(params, t0, to_phase(phase), 0, total_steps, 0.0);
     return true;
   };
   control.on_step = [&](const pipeline::StepInfo& s) {
-    report(MI_PHASE_DENOISE, s.step, s.num_steps, s.step_seconds);
+    progress(params, t0, MI_PHASE_DENOISE, s.step, s.num_steps, s.step_seconds);
     return true;
   };
   if (params.plan_callback != nullptr) {
@@ -815,17 +898,66 @@ Generation PipelineAdapter::generate(const mi_gen_params& params, const std::ato
       params.preview_callback(im.rgb, im.width, im.height, im.step, params.user_data);
     };
   }
-  pipeline::Result r;
-  try {
-    r = impl_->pipe->generate(q, control);
-  } catch (const lora::LoraError& e) {
-    throw ModelError(e.what());  // a LoRA file that cannot be applied (or, strict, an unknown key or a lossy merge)
-  } catch (const pipeline::DataspaceError& e) {
-    throw ModelError(e.what());  // a dataspace file that changed since to_request read it
-  } catch (const control::ControlError& e) {
-    throw ModelError(e.what());  // control_adapter is not a control adapter (no widened embedder, bad kinds metadata)
-  }
+  pipeline::Result r = model_errors([&] { return impl_->pipe->generate(q, control); });
   return to_generation(q, r, params.include_prompts != 0);
+}
+
+Generation PipelineAdapter::preload(const mi_gen_params& params, const std::atomic<bool>& cancel) {
+  const auto t0 = Clock::now();
+  fs::path distill_te;
+  pipeline::PreloadOptions options;
+  // The images are decoded (load_images true) although the plan needs no pixels: its residencies and workspaces follow
+  // the request's size and which images it has, but the plan's explanation names the init image's own size (a 1x1
+  // stand-in would show there), and a file that cannot be decoded fails the preload as it would the generation instead
+  // of passing it. One decode is small next to the model loads.
+  options.request = to_request(params, &distill_te, true, true);
+  pipeline::Request& q = options.request;
+  q.model = impl_->model;
+  q.save_metadata = false;  // no image
+  check_distill_time_embedding(impl_->time_embedding, distill_te);
+  options.cancel = &cancel;
+  const backend::ScopedCurrentContext restore;
+  MI_CUDA_CHECK(cudaSetDevice(impl_->device));
+  // The plan once, before any load; a progress (step 0, no sampling steps) before each load step, resident models
+  // included: kTextEncoder (a host-resident text encoder's copy), kDecode (each VAE: an image request's encoder, then the
+  // decoder) and kDitLoad. Returning false cancels, as the cancel flag does (a callback's mi_cancel() lands at once).
+  if (params.plan_callback != nullptr) {
+    options.on_plan = [&](const planner::ExecutionPlan& plan) {
+      params.plan_callback(plan.explanation.c_str(), plan.to_json().c_str(), params.user_data);
+    };
+  }
+  options.on_phase = [&](pipeline::Phase phase) {
+    progress(params, t0, to_phase(phase), 0, 0, 0.0);
+    return !cancel.load();
+  };
+  pipeline::Result r = model_errors([&] { return impl_->pipe->preload(options); });
+  return to_generation(q, r, false);
+}
+
+mi_release_info PipelineAdapter::release(bool keep_host_copy, const std::atomic<bool>& cancel, bool* cancelled) {
+  const backend::ScopedCurrentContext restore;
+  MI_CUDA_CHECK(cudaSetDevice(impl_->device));
+  return to_release_info(impl_->pipe->release_device_memory(keep_host_copy, &cancel), cancelled);
+}
+
+mi_release_info to_release_info(const pipeline::ReleaseReport& rr, bool* cancelled) {
+  if (cancelled != nullptr) *cancelled = rr.cancelled;  // the cancel was set on entry: nothing was released
+  mi_release_info out{};
+  out.struct_size = sizeof out;
+  out.seconds = rr.seconds;
+  out.vram_released_bytes = rr.vram_released;
+  out.host_copy_bytes = rr.host_copy_bytes;
+  out.host_copy_seconds = rr.host_copy_s;
+  out.dit_host_copy = rr.dit_host_copy ? 1 : 0;
+  out.te_host_copy = rr.te_host_copy ? 1 : 0;
+  // Cut at 511 bytes, never inside a UTF-8 sequence.
+  std::size_t n = std::min(rr.note.size(), sizeof out.note - 1);
+  if (n < rr.note.size()) {
+    while (n > 0 && (static_cast<unsigned char>(rr.note[n]) & 0xC0) == 0x80) --n;
+  }
+  std::memcpy(out.note, rr.note.data(), n);
+  out.note[n] = '\0';
+  return out;
 }
 
 std::string report_json(const Generation& generation, const std::string& image_path_utf8) {

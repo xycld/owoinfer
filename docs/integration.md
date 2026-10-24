@@ -35,7 +35,10 @@ Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what
 | Prompt token report | token counts per prompt and a truncation warning |
 | Memory modes | `min_memory`, `balanced`, `max_speed`, plus explicit VRAM and RAM budgets and a VRAM reserve. The engine plans against the VRAM that is actually free and streams the model when it doesn't fit. |
 | Integration surfaces | the C library (`libmossinfer`) and the sidecar process (`moss-server`), with the same features |
-| Run-time control | progress, cancel from any thread, one generation at a time per engine, device probe and build recommendation |
+| Run-time control | progress, cancel from any thread, one job (generation, preload or release) at a time per engine, device probe and build recommendation |
+| Preload | load the models for a request before the first generation (`mi_engine_preload()`, server `preload`), so the first image starts sampling at once; the next generation of a like request loads nothing and gives the same bits |
+| Soft unload | free the VRAM and keep the engine (`mi_engine_release()`, server `release`), optionally with the DiT kept in RAM for a fast reload over PCIe (`keep_host_copy`); the embedding cache survives it. See [Fast switching](#fast-switching). |
+| Certificate directories | extra quality-certificate directories per engine (`certificate_dirs`), searched before the cache folder, the DiT's sidecar and the package's `share/mossinfer/quality_certs/`, where packages install their certificates |
 | System CUDA reuse | a compatible cuBLASLt from the user's CUDA install, used by the `-system-cuda` package or on request (`MOSSINFER_CUDA_LIBS=system`); the probe reports which copy runs (verified on Linux; see [CUDA libraries](#cuda-libraries)) |
 | Output | PNG file (both surfaces), or RGB8 in memory (library), plus a JSON report per image |
 
@@ -136,7 +139,7 @@ Same formats, not tested: Comfy-Org's Base INT8 DiT and its bf16 DiTs, tsolful's
 |---|---|---|
 | Launcher language | any: talk JSON over pipes | C, or anything with a C FFI (C++, Rust, C#, Python ctypes, Node N-API) |
 | Crash isolation | a GPU fault or driver reset kills only the server | a fault takes down the launcher |
-| Releasing VRAM | `unload`, or end the process (always complete) | `mi_engine_free()` |
+| Releasing VRAM | `release` (keeps the engine, optionally the weights in RAM), `unload`, or end the process (always complete) | `mi_engine_release()` (keeps the engine), `mi_engine_free()` |
 | Image hand-off | a PNG written to a path you choose | the RGB8 buffer in memory, or a PNG |
 | Progress and cancel | JSON events; a `cancel` request | callbacks; `mi_cancel()` from any thread |
 | What you ship | `moss-server` plus `libmossinfer` and the CUDA libraries | `libmossinfer` and the CUDA libraries |
@@ -206,6 +209,7 @@ cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-
 | Windows: `bin/vcruntime140*.dll`, `bin/msvcp140.dll` | the MSVC runtime, so users need no Visual C++ Redistributable |
 | `include/mossinfer/mossinfer.h` | the C API header |
 | `share/cmake/MossInfer/` | the CMake package: `find_package(MossInfer)` |
+| `share/mossinfer/quality_certs/` | the quality certificates the package ships (`*.mossinfer-cert.json`), searched by the engine from its own location; absent when there are none |
 | `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`, `share/doc/mossinfer/` | licences (see [Licensing](#licensing-and-redistribution)) |
 
 **Two variants per flavour.**
@@ -269,7 +273,7 @@ The engine reads the official Hugging Face model folders in place, with no conve
 - **The folder can be read-only.** The engine writes nothing into it. An optional `moss.mossidx` index, made with `moss-infer index <folder>`, makes the first load slightly faster. Without one, the engine builds the index in memory.
 - **To save disk with both models,** hard-link SFT's `text_encoder/*.safetensors` and `vae/*.safetensors` to Base's. They are byte-identical.
 - **ComfyUI and quantized files** load as component files next to the bundle folder: `dit_file` (INT8 ConvRot, INT4 ConvRot, mixed INT8/bf16 or bf16 DiT), `text_encoder_file` (INT8 ConvRot or W4A8) and `vae_file`. The tokenizer and configs still come from the folder. A file as the model path itself (`MI_MODEL_FORMAT_COMFYUI`, or a file with `MI_MODEL_FORMAT_AUTO`) returns `MI_ERR_NOT_SUPPORTED`, and the server answers `not_supported`, while `MI_CAP_COMFYUI_MODELS` is unset.
-- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 DiT runs only under `turbo`, which must be chosen explicitly: offer it for INT4 files, and only for them. A quality certificate lets `auto` pick a lossy configuration. Certificates are searched in `<cache_dir>/quality_certs/`, then the DiT's sidecar `<dit>.mossinfer-cert.json`, then the install tree's `share/mossinfer/quality_certs/`; the first usable one wins, and 1.0 ships none; the report's `quality` object says which one ran and whether it was certified.
+- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 DiT runs only under `turbo`, which must be chosen explicitly: offer it for INT4 files, and only for them. A quality certificate lets `auto` pick a lossy configuration. Certificates are searched in the engine's `certificate_dirs`, then `<cache_dir>/quality_certs/`, then the DiT's sidecar `<dit>.mossinfer-cert.json`, then the install tree's `share/mossinfer/quality_certs/`; the first usable one wins, and 1.0 ships none; the report's `quality` object says which one ran and whether it was certified.
 
 ## Picking the build: cu12 or cu13
 
@@ -311,7 +315,7 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 2. `load` `{"model": "<folder>", "mode": "balanced", "cache_dir": "<launcher cache dir>/mossinfer"}`. This returns quickly. The weights load during `generate`: the DiT in the first `dit_load` phase, and the text encoder streams in `text_encoder` whenever the prompt is not in the embedding cache.
 3. `generate` `{"prompt": ..., "output": "<path>.png", ...}`. The answer is immediate: `{"accepted": true}`. Then come `plan` once, `progress` at each phase start and after each step, `preview` before a step's `progress` when `preview_output` is set, and finally `done` with `status` `ok`, `cancelled` or `error`. Show `done.warnings` (LoRA losses, a truncated prompt) next to the image.
 4. `cancel` `{"id": <the generate request's id>}` from the UI's stop button. The id must match exactly, JSON type included (`"g1"` is not `1`). The generation stops within one block or layer, and `done` arrives with `"status": "cancelled"`.
-5. `unload` frees the VRAM while the launcher stays open. `load` with different settings replaces the engine: the old one is released first, so if the new `load` fails, no engine is loaded.
+5. `release` frees the VRAM and keeps the engine, so the next `generate` needs no `load` (see [Fast switching](#fast-switching)). `unload` frees the engine too. `load` with different settings replaces the engine: the old one is released first, so if the new `load` fails, no engine is loaded.
 6. `shutdown` on exit. The server cancels any running generation, answers, and exits with status 0. Kill it if it hasn't exited after a few seconds.
 
 **Progress bar.**
@@ -319,7 +323,17 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 - `denoise` takes most of the time. `text_encoder` also takes a few seconds for each prompt not in the embedding cache, and so does the first `dit_load`.
 - A simple bar is `step / total_steps` during `denoise`, with the other phases shown as indeterminate.
 
-**One generation at a time.** A second `generate` while one runs is answered with `busy`, so queue requests in the launcher. `done` is written only after the server is idle again, so the next `generate` can go out as soon as `done` is read.
+**One generation at a time.** A second `generate` while one runs is answered with `busy`, so queue requests in the launcher. The same holds for `preload` and `release`: one job at a time. `done` is written only after the server is idle again, so the next `generate` can go out as soon as `done` is read.
+
+### Fast switching
+
+A launcher that shares the GPU with other tabs or applications keeps the engine and moves the weights between VRAM and RAM:
+1. **At startup, or when the user selects a model:** `load`, then `preload` with the request the UI will send (its size, steps, CFG, LoRAs; the prompt may be left out). The first `generate` then starts sampling without the `dit_load` wait. `done.preload_note` says when the plan leaves the DiT to the first generation.
+2. **When the user leaves the image tab, or starts another GPU application** (a game, a video editor, another model): `release` with `keep_host_copy` true. The VRAM is free when the response arrives. The DiT stays in RAM where the host has the room (`dit_host_copy`; `note` says why not), and the embedding cache survives, so repeated prompts skip the text encoder.
+3. **When the user comes back:** `generate` as usual, or `preload` first to pay the reload before the click. The DiT loads from the host copy over PCIe (the report's `dit_load.source` `"host_copy"`) and gives the same image bits.
+4. **To give the RAM back as well:** `release` with `keep_host_copy` false. `unload` frees everything, the in-memory embedding cache included (its spill in `cache_dir` stays), and needs a new `load`.
+
+A `release` that keeps a host copy reads the DiT's files into RAM and takes seconds; it is answered when it ends, and a `cancel` meanwhile stops the copy (the VRAM is freed), or the whole release when it lands before anything was freed (the response's `cancelled`: the engine keeps its VRAM). The library has the same calls: `mi_engine_preload()` and `mi_engine_release()`, on the generation thread, with `mi_cancel()` from any thread.
 
 **Errors.**
 - **Request errors** arrive as `{"error": {"code", "message"}}`.
@@ -378,6 +392,9 @@ Bindings in other languages can follow the frozen struct layouts in [c-api.md](c
 | Distill bundle | `distill_dir` / `distill` (engine) | An optional folder picker. Set the same bundle on the engine and on each generation (the engine takes its time embedding). Leave steps, CFG and the sampler unset to get the bundle's. |
 | Attention | `attention`: `default` / `exact` / `q8_fp8` / ... | An advanced setting, default `default` (the tier's choice). |
 | LoRA strictness | `lora_strict` | Off. Turn it on only for workflows where a partly applied LoRA must fail instead of warn. |
+| Text-encoder pinning | `te_host_pin`: `auto` / `on` / `off` | An advanced setting, default `auto`. A pinned copy of a host-resident text encoder uploads faster and holds page-locked RAM: `off` on machines that need the RAM for other applications, `on` where RAM is plentiful. Offer it when `MI_CAP_TE_HOST_PIN` / `te_host_pin` is set. |
+| DiT reads | `dit_direct_io`: `auto` / `buffered` / `direct` | An advanced setting, default `auto` (direct I/O unless the file system gains nothing from it or the files are already cached). `buffered` when the model sits on storage that handles direct I/O badly; `direct_io` (all reads direct) is for cold-cache measurements only. |
+| Extra certificate folders | `certificate_dirs` (at most 16) | An advanced setting, empty by default: folders of quality certificates the user downloaded, searched before the launcher's cache folder and the package's own. Offer it when `MI_CAP_CERTIFICATE_DIRS` / `certificate_dirs` is set. |
 
 **Per-image settings** (`generate` / `mi_gen_params`) mirror the official app's `parameters.json`, and so do the defaults:
 - 1024×1024, 50 steps, CFG 3.0, shift 5.0 (steps and CFG are left unset by `mi_gen_params_init()` and an absent server field, and resolve to these unless a distill bundle applies: see [c-api.md](c-api.md#unset-markers));
@@ -425,6 +442,10 @@ Features are announced by a capability bit. Check `mi_capabilities()`, or `capab
 | System CUDA reuse | `MI_CAP_SYSTEM_CUDA` (0x200) | `"system_cuda"` | set | `mi_probe_info.cublaslt_*` / `probe.cublaslt`; `MOSSINFER_CUDA_LIBS`, `MOSSINFER_CUBLASLT` |
 | Control adapters | `MI_CAP_CONTROL` (0x400) | `"control"` | set | `control_adapter`, `control_lora_strength`, `control_images` / `control` |
 | Lossy accelerators | `MI_CAP_ACCEL` (0x800) | `"accel"` | set | `cfg_truncation`, `step_cache`, `step_cache_threshold` |
+| Preload | `MI_CAP_PRELOAD` (0x1000) | `"preload"` | set | `mi_engine_preload()` / `preload` |
+| Soft unload | `MI_CAP_RELEASE` (0x2000) | `"release"` | set | `mi_engine_release()` / `release`, the report's `dit_load` |
+| Certificate directories | `MI_CAP_CERTIFICATE_DIRS` (0x4000) | `"certificate_dirs"` | set | `certificate_dirs` |
+| Text-encoder pinning | `MI_CAP_TE_HOST_PIN` (0x8000) | `"te_host_pin"` | set | `te_host_pin` |
 
 Future features will arrive the same way: **new trailing struct fields, new enum values and new capability bits** in the C API, and **new optional parameters** for the server. Leaving them unset keeps today's behaviour. A program built against an older header keeps working with a newer library, because the library accepts every older struct size (see [Versioning](#versioning)).
 
@@ -437,7 +458,8 @@ Every result carries a JSON report: `mi_result_report_json()`, or `done.report` 
 - the execution plan: what was resident, and the memory per phase;
 - timings per phase, and VRAM and RAM peaks;
 - model streaming statistics and the hardware profile;
-- the control adapter and the accelerators (`control`, `accelerators`).
+- the control adapter and the accelerators (`control`, `accelerators`);
+- how the DiT's weights were read (`dit_load`: from the files, direct or buffered, or from a soft unload's host copy), and a preload's `preload_note`.
 
 The library also has accessors for the parts a launcher shows: `mi_result_tier()`, `mi_result_text()`, `mi_result_prompt_tokens()`, `mi_result_lora()`, `mi_result_message()`, `mi_result_control()` and `mi_result_accel()` (see [c-api.md](c-api.md#results)).
 

@@ -7,6 +7,7 @@
 #include <cublasLt.h>  // never cublas_api.h directly: CUDA 12 requires CUBLASAPI, which cublasLt.h defines
 
 #include <atomic>
+#include <chrono>
 #include <clocale>
 #include <cmath>
 #include <cstddef>
@@ -22,6 +23,9 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "api/pipeline_adapter.h"
@@ -88,7 +92,8 @@ TEST(CApi, VersionAndAbi) {
   // P6: preview, component files, LoRA, tiers and the extended samplers; a ComfyUI file as model_path is not.
   EXPECT_EQ(mi_capabilities(), MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS |
                                   MI_CAP_IMAGE_INPUT | MI_CAP_HIRES | MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL |
-                                  MI_CAP_ACCEL);
+                                  MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE | MI_CAP_CERTIFICATE_DIRS |
+                                  MI_CAP_TE_HOST_PIN);
   EXPECT_EQ(mi_capabilities() & MI_CAP_COMFYUI_MODELS, 0u);
   EXPECT_EQ(MI_CAP_PREVIEW | MI_CAP_COMFYUI_MODELS | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS, 0x3fu);
   EXPECT_EQ(MI_CAP_IMAGE_INPUT, 0x40u);
@@ -97,6 +102,10 @@ TEST(CApi, VersionAndAbi) {
   EXPECT_EQ(MI_CAP_SYSTEM_CUDA, 0x200u);
   EXPECT_EQ(MI_CAP_CONTROL, 0x400u);
   EXPECT_EQ(MI_CAP_ACCEL, 0x800u);
+  EXPECT_EQ(MI_CAP_PRELOAD, 0x1000u);
+  EXPECT_EQ(MI_CAP_RELEASE, 0x2000u);
+  EXPECT_EQ(MI_CAP_CERTIFICATE_DIRS, 0x4000u);
+  EXPECT_EQ(MI_CAP_TE_HOST_PIN, 0x8000u);
   EXPECT_STREQ(mi_status_string(MI_OK), "MI_OK");
   EXPECT_STREQ(mi_status_string(MI_CANCELLED), "MI_CANCELLED");
   EXPECT_STREQ(mi_status_string(MI_ERR_BUSY), "MI_ERR_BUSY");
@@ -173,6 +182,7 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_EQ(q.accel.step_cache, mi::pipeline::accel::StepCacheKind::kOff);
   EXPECT_EQ(g._reserved4, 0);
   EXPECT_EQ(g.step_cache_threshold, 0.0);  // unset: Options::step_cache_threshold
+  EXPECT_FALSE(q.accel.step_cache_threshold.has_value());
 
   const mi_engine_params e = engine_defaults();
   const mi::pipeline::PipelineOptions o;
@@ -204,6 +214,13 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_EQ(e.time_embedding_file, nullptr);
   EXPECT_TRUE(o.time_embedding_file.empty());
   EXPECT_EQ(e.distill_dir, nullptr);
+  // 1.1 fields: no extra certificate directories, the adaptive DiT load, the automatic pin policy.
+  EXPECT_EQ(e.certificate_dirs, nullptr);
+  EXPECT_EQ(e.certificate_dirs_count, o.certificate_dirs.size());
+  EXPECT_EQ(e.dit_direct_io, MI_DIRECT_IO_AUTO);
+  EXPECT_FALSE(o.dit_load_direct_io.has_value());
+  EXPECT_EQ(e.te_host_pin, MI_TE_HOST_PIN_AUTO);
+  EXPECT_EQ(o.te_host_pin, mi::planner::TeHostPin::kAuto);
 
   // The adapter turns the defaults into the pipeline's defaults.
   mi_gen_params valid = g;
@@ -227,12 +244,17 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_TRUE(r.control.images.empty());
   EXPECT_EQ(r.accel.cfg_truncation, q.accel.cfg_truncation);
   EXPECT_EQ(r.accel.step_cache, q.accel.step_cache);
-  EXPECT_EQ(r.accel.step_cache_threshold, q.accel.step_cache_threshold);
+  EXPECT_EQ(r.accel.step_cache_threshold, q.accel.step_cache_threshold);  // unset <-> unset (the model's default)
+  EXPECT_FALSE(r.accel.step_cache_threshold.has_value());
   const mi::pipeline::PipelineOptions ro = mi::api::to_options(e);
   EXPECT_EQ(ro.tier, o.tier);
   EXPECT_EQ(ro.attention, o.attention);
   EXPECT_EQ(ro.lora_strict, o.lora_strict);
   EXPECT_EQ(ro.block_path, o.block_path);
+  EXPECT_EQ(ro.certificate_dirs, o.certificate_dirs);
+  EXPECT_EQ(ro.dit_load_direct_io, o.dit_load_direct_io);
+  EXPECT_EQ(ro.te_host_pin, o.te_host_pin);
+  EXPECT_EQ(ro.direct_io, o.direct_io);
 }
 
 // Every C enum value maps to the pipeline value of the same name; anything else is rejected.
@@ -374,7 +396,7 @@ TEST(CApi, OldStructSizes) {
   EXPECT_NE(last_error().find("_reserved2"), std::string::npos) << last_error();
   for (const std::size_t bad : {kEngine01 - 8, kEngine01 + 8, sizeof e + 8}) {
     EXPECT_EQ(mi_engine_params_init(&e, bad), MI_ERR_ABI_MISMATCH) << bad;
-    EXPECT_NE(last_error().find("80, 120 or 136"), std::string::npos) << last_error();
+    EXPECT_NE(last_error().find("80, 120, 136 or 160"), std::string::npos) << last_error();
   }
 }
 
@@ -790,7 +812,7 @@ TEST(CApi, NullHandlesAndPointers) {
   EXPECT_EQ(mi_result_timings(nullptr, &t), MI_ERR_INVALID_ARGUMENT);
   t.struct_size = 112;
   EXPECT_EQ(mi_result_timings(nullptr, &t), MI_ERR_ABI_MISMATCH);
-  EXPECT_NE(last_error().find("104 or 128"), std::string::npos) << last_error();
+  EXPECT_NE(last_error().find("104, 128 or 144"), std::string::npos) << last_error();
   mi_image_info image{};
   image.struct_size = sizeof image;
   EXPECT_EQ(mi_result_image(nullptr, &image), MI_ERR_INVALID_ARGUMENT);
@@ -1715,7 +1737,7 @@ TEST(CApi, ControlAndAccelerators) {
   EXPECT_EQ(q.control.images[1].start, 0.25);
   EXPECT_EQ(q.accel.cfg_truncation, 0.6);
   EXPECT_EQ(q.accel.step_cache, mi::pipeline::accel::StepCacheKind::kFbCache);
-  EXPECT_EQ(q.accel.step_cache_threshold, mi::pipeline::accel::kDefaultFbCacheThreshold);  // 0: the recommended one
+  EXPECT_FALSE(q.accel.step_cache_threshold.has_value());  // 0: unset, the model's default (the pipeline's to pick)
   p.step_cache_threshold = 0.2;
   EXPECT_EQ(mi::api::to_request(p).accel.step_cache_threshold, 0.2);
   // Validation loads nothing: 1x1 stand-ins, and an undecodable file passes until mi_generate() decodes it.
@@ -1926,7 +1948,7 @@ TEST(CApi, ControlAndAcceleratorResults) {
   EXPECT_EQ(a.lossy, 1);
   a.struct_size = 16;
   EXPECT_EQ(mi_result_accel(res, &a), MI_ERR_ABI_MISMATCH);
-  EXPECT_NE(last_error().find("accepts 24"), std::string::npos) << last_error();
+  EXPECT_NE(last_error().find("accepts 24 or 32"), std::string::npos) << last_error();
   std::size_t count = 0;
   const int32_t* steps = mi_result_accel_cached_steps(res, &count);
   ASSERT_EQ(count, 2u);
@@ -2047,6 +2069,392 @@ TEST(CApi, TierRunCertified) {
   EXPECT_EQ(mi_result_tier(res, &bad), MI_ERR_ABI_MISMATCH);
   EXPECT_NE(last_error().find("32 or 40"), std::string::npos) << last_error();
   mi_result_free(res);
+}
+
+// The 1.1 engine fields: certificate_dirs (copied, in order), dit_direct_io and te_host_pin map to PipelineOptions;
+// bad values fail mi_engine_create() before CUDA.
+TEST(CApi, EngineParams110Fields) {
+  mi_engine_params e = engine_defaults();
+  const std::string umlaut = "/certs/\xc3\xa4rger";  // UTF-8 "/certs/ärger"
+  const char* dirs[] = {"/certs/first", umlaut.c_str(), "relative/dir"};
+  e.certificate_dirs = dirs;
+  e.certificate_dirs_count = 3;
+  mi::pipeline::PipelineOptions o = mi::api::to_options(e);
+  ASSERT_EQ(o.certificate_dirs.size(), 3u);
+  EXPECT_EQ(mi::util::path_utf8(o.certificate_dirs[0]), "/certs/first");
+  EXPECT_EQ(mi::util::path_utf8(o.certificate_dirs[1]), umlaut);
+  EXPECT_EQ(mi::util::path_utf8(o.certificate_dirs[2]), "relative/dir");
+  e.certificate_dirs_count = 0;  // a count of 0 reads nothing
+  e.certificate_dirs = nullptr;
+  EXPECT_TRUE(mi::api::to_options(e).certificate_dirs.empty());
+
+  const std::pair<mi_direct_io, std::optional<bool>> io[] = {
+      {MI_DIRECT_IO_AUTO, std::nullopt}, {MI_DIRECT_IO_BUFFERED, false}, {MI_DIRECT_IO_DIRECT, true}};
+  for (const auto& [c, want] : io) {
+    e.dit_direct_io = c;
+    EXPECT_EQ(mi::api::to_options(e).dit_load_direct_io, want) << c;
+    // direct_io stays its own field (it forces direct reads everywhere; the engine applies the precedence).
+    e.direct_io = 1;
+    EXPECT_TRUE(mi::api::to_options(e).direct_io);
+    EXPECT_EQ(mi::api::to_options(e).dit_load_direct_io, want) << c;
+    e.direct_io = 0;
+  }
+  e.dit_direct_io = MI_DIRECT_IO_AUTO;
+  const std::pair<mi_te_host_pin, mi::planner::TeHostPin> pins[] = {{MI_TE_HOST_PIN_AUTO, mi::planner::TeHostPin::kAuto},
+                                                                    {MI_TE_HOST_PIN_ON, mi::planner::TeHostPin::kOn},
+                                                                    {MI_TE_HOST_PIN_OFF, mi::planner::TeHostPin::kOff}};
+  for (const auto& [c, want] : pins) {
+    e.te_host_pin = c;
+    EXPECT_EQ(mi::api::to_options(e).te_host_pin, want) << c;
+  }
+
+  // Rejections, through mi_engine_create() on a bundle without weights (checked before any CUDA work).
+  mi::testing::TempDir dir("c_api_engine_110");
+  make_fake_bundle(dir.path() / "bundle");
+  const std::string bundle = mi::util::path_utf8(dir.path() / "bundle");
+  const char* with_empty[] = {"/certs/a", ""};
+  const char* with_null[] = {nullptr};
+  std::vector<std::string> many(17, "/certs/x");
+  std::vector<const char*> many_ptrs;
+  for (const std::string& s : many) many_ptrs.push_back(s.c_str());
+  struct Case {
+    const char* what;
+    std::function<void(mi_engine_params&)> edit;
+    const char* message;
+  };
+  const std::vector<Case> cases = {
+      {"NULL array", [](mi_engine_params& p) { p.certificate_dirs_count = 1; }, "certificate_dirs: NULL array"},
+      {"empty dir", [&](mi_engine_params& p) { p.certificate_dirs = with_empty; p.certificate_dirs_count = 2; },
+       "certificate_dirs[1] is empty"},
+      {"NULL dir", [&](mi_engine_params& p) { p.certificate_dirs = with_null; p.certificate_dirs_count = 1; },
+       "certificate_dirs[0] is empty"},
+      {"17 dirs", [&](mi_engine_params& p) { p.certificate_dirs = many_ptrs.data(); p.certificate_dirs_count = 17; },
+       "certificate_dirs: at most 16 entries (got 17)"},
+      {"dit_direct_io 3", [](mi_engine_params& p) { p.dit_direct_io = static_cast<mi_direct_io>(3); },
+       "dit_direct_io: unknown value 3"},
+      {"dit_direct_io MAX_ENUM", [](mi_engine_params& p) { p.dit_direct_io = MI_DIRECT_IO_MAX_ENUM; },
+       "dit_direct_io: unknown value 2147483647"},
+      {"te_host_pin 3", [](mi_engine_params& p) { p.te_host_pin = static_cast<mi_te_host_pin>(3); },
+       "te_host_pin: unknown value 3"},
+      {"te_host_pin MAX_ENUM", [](mi_engine_params& p) { p.te_host_pin = MI_TE_HOST_PIN_MAX_ENUM; },
+       "te_host_pin: unknown value 2147483647"},
+  };
+  for (const Case& c : cases) {
+    mi_engine_params p = engine_defaults();
+    p.model_path = bundle.c_str();
+    c.edit(p);
+    mi_engine* engine = nullptr;
+    EXPECT_EQ(mi_engine_create(&p, &engine), MI_ERR_INVALID_ARGUMENT) << c.what;
+    EXPECT_NE(last_error().find(c.message), std::string::npos) << c.what << ": " << last_error();
+    EXPECT_EQ(engine, nullptr);
+  }
+  // 16 directories are accepted.
+  e.certificate_dirs = many_ptrs.data();
+  e.certificate_dirs_count = 16;
+  EXPECT_EQ(mi::api::to_options(e).certificate_dirs.size(), 16u);
+
+  // The 1.0.0 mi_engine_params (136 bytes): init fills only that prefix; create reads only the prefix, so the garbage
+  // tail (an unknown dit_direct_io, a count without an array) is never seen and the next check is reached.
+  constexpr std::size_t kEngine100 = 136;
+  mi_engine_params old;
+  std::memset(&old, 0x5a, sizeof old);
+  ASSERT_EQ(mi_engine_params_init(&old, kEngine100), MI_OK) << last_error();
+  EXPECT_EQ(old.struct_size, kEngine100);
+  EXPECT_EQ(old.distill_dir, nullptr);
+  const auto* bytes = reinterpret_cast<const unsigned char*>(&old);
+  for (std::size_t i = kEngine100; i < sizeof old; ++i) ASSERT_EQ(bytes[i], 0x5a) << "byte " << i << " written";
+  const std::string missing = mi::util::path_utf8(dir.path() / "missing");
+  old.model_path = missing.c_str();
+  mi_engine* engine = nullptr;
+  EXPECT_EQ(mi_engine_create(&old, &engine), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("not found"), std::string::npos) << last_error();
+  old.model_path = bundle.c_str();
+  old.struct_size = sizeof old;  // the current size reads the tail: its garbage is rejected
+  EXPECT_EQ(mi_engine_create(&old, &engine), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(engine, nullptr);
+  old.struct_size = kEngine100 + 8;
+  EXPECT_EQ(mi_engine_create(&old, &engine), MI_ERR_ABI_MISMATCH);
+  EXPECT_NE(last_error().find("80, 120, 136 or 160"), std::string::npos) << last_error();
+}
+
+// mi_timings, mi_memory_stats and mi_accel_info grew in 1.1: the current sizes get every field, the earlier sizes (128,
+// 56 bytes of 1.0.0; 24 of the first 1.1.0 header) get exactly their prefix, any other size is a mismatch.
+TEST(CApi, GrownOutputStructs110) {
+  mi::pipeline::Request q;
+  q.prompt = "a cat";
+  q.accel.step_cache = mi::pipeline::accel::StepCacheKind::kFbCache;  // threshold unset: the model's default
+  mi::pipeline::Result r;
+  r.timings.lora_load_s = 0.25;
+  r.timings.lora_merge_s = 0.125;
+  r.timings.image_ops_s = 0.5;
+  r.memory.host_private_peak = 7;
+  r.memory.host_copy_bytes = std::uint64_t{20} << 30;
+  r.memory.merge_memo_bytes = std::uint64_t{1} << 29;
+  r.memory.dit_loads = 1;
+  r.accel.dit_calls = 4;
+  r.accel.cached_calls = 1;
+  r.accel.step_cache_threshold = 0.02;
+  r.accel.step_cache_threshold_source = "default for the base model";
+  mi_result* res = mi::api::new_result(mi::api::to_generation(q, r, true));
+
+  mi_timings t;
+  std::memset(&t, 0xff, sizeof t);
+  t.struct_size = sizeof t;
+  ASSERT_EQ(mi_result_timings(res, &t), MI_OK) << last_error();
+  EXPECT_EQ(t.lora_load_s, 0.25);
+  EXPECT_EQ(t.lora_merge_s, 0.125);
+  EXPECT_EQ(t.image_ops_s, 0.5);
+  mi_memory_stats m;
+  std::memset(&m, 0xff, sizeof m);
+  m.struct_size = sizeof m;
+  ASSERT_EQ(mi_result_memory(res, &m), MI_OK) << last_error();
+  EXPECT_EQ(m.host_private_peak_bytes, 7u);
+  EXPECT_EQ(m.host_copy_bytes, std::uint64_t{20} << 30);
+  EXPECT_EQ(m.merge_memo_bytes, std::uint64_t{1} << 29);
+  EXPECT_EQ(m.dit_loads, 1);
+  EXPECT_EQ(m._reserved0, 0);  // output padding is zeroed
+  mi_accel_info a;
+  std::memset(&a, 0xff, sizeof a);
+  a.struct_size = sizeof a;
+  ASSERT_EQ(mi_result_accel(res, &a), MI_OK) << last_error();
+  EXPECT_EQ(a.dit_calls, 4);
+  EXPECT_EQ(a.cached_calls, 1);
+  EXPECT_EQ(a.lossy, 1);
+  EXPECT_EQ(a.step_cache_threshold, 0.02);  // what ran: the model's default the pipeline filled in
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE), "default for the base model");
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_ACCELERATORS), "step_cache fbcache 0.02");
+
+  // The earlier sizes: their bytes only.
+  const auto old_size = [&](auto& out, std::size_t size, auto accessor, const char* what) {
+    using T = std::remove_reference_t<decltype(out)>;
+    alignas(T) unsigned char buf[sizeof(T)];
+    std::memset(buf, 0x5a, sizeof buf);
+    std::memcpy(buf, &size, sizeof size);
+    ASSERT_EQ(accessor(res, reinterpret_cast<T*>(buf)), MI_OK) << what << ": " << last_error();
+    std::size_t got = 0;
+    std::memcpy(&got, buf, sizeof got);
+    EXPECT_EQ(got, size) << what;
+    for (std::size_t i = size; i < sizeof buf; ++i) ASSERT_EQ(buf[i], 0x5a) << what << ": byte " << i << " written";
+    std::memcpy(&out, buf, sizeof buf);
+  };
+  old_size(t, 128, mi_result_timings, "mi_timings");
+  EXPECT_EQ(t.image_ops_s, 0.5);
+  old_size(m, 56, mi_result_memory, "mi_memory_stats");
+  EXPECT_EQ(m.host_private_peak_bytes, 7u);
+  old_size(a, 24, mi_result_accel, "mi_accel_info");
+  EXPECT_EQ(a.lossy, 1);
+  m.struct_size = 64;
+  EXPECT_EQ(mi_result_memory(res, &m), MI_ERR_ABI_MISMATCH);
+  EXPECT_NE(last_error().find("56 or 80"), std::string::npos) << last_error();
+  a.struct_size = 28;
+  EXPECT_EQ(mi_result_accel(res, &a), MI_ERR_ABI_MISMATCH);
+  t.struct_size = 136;
+  EXPECT_EQ(mi_result_timings(res, &t), MI_ERR_ABI_MISMATCH);
+  mi_result_free(res);
+
+  // Step cache off: threshold 0, no source; a threshold the request set is the request's.
+  mi::pipeline::Request plain;
+  plain.prompt = "a cat";
+  mi::pipeline::Result pr;
+  res = mi::api::new_result(mi::api::to_generation(plain, pr, true));
+  a.struct_size = sizeof a;
+  ASSERT_EQ(mi_result_accel(res, &a), MI_OK);
+  EXPECT_EQ(a.step_cache_threshold, 0.0);
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE), "");
+  mi_result_free(res);
+  // Cancelled before the pipeline resolved the unset threshold: described as "default".
+  mi::pipeline::Result early;
+  early.cancelled = true;
+  res = mi::api::new_result(mi::api::to_generation(q, early, true));
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_ACCELERATORS), "step_cache fbcache default");
+  mi_result_free(res);
+}
+
+// mi_result_dit_load, the notes, the accelerator warnings and the step cache's diffs, from synthetic pipeline results.
+TEST(CApi, DitLoadNotesAndDiffs) {
+  mi::pipeline::Request q;
+  q.prompt = "a cat";
+  q.accel.step_cache = mi::pipeline::accel::StepCacheKind::kFbCache;
+  q.accel.step_cache_threshold = 0.05;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  mi::pipeline::Result r;
+  r.dit_load.source = "files";
+  r.dit_load.io = "buffered";
+  r.dit_load.note = "buffered: 97 % of the files is in the page cache";
+  r.dit_load.bytes = 12345678901ull;
+  r.dit_load.seconds = 2.5;
+  r.te_note = "pinned host copy not allocated: streamed from the files";
+  r.preload_note = "the DiT was not loaded: the plan parks it for the text encoder";
+  r.accel_warnings = {"step cache: fbcache 0.05 moves the base model's composition", "step cache never engaged"};
+  r.accel.step_cache_diffs = {nan, 0.1, 0.04};
+  r.accel.step_cache_threshold = 0.05;
+  r.accel.step_cache_threshold_source = "request";
+  mi_result* res = mi::api::new_result(mi::api::to_generation(q, r, true));
+  mi_dit_load_info d;
+  std::memset(&d, 0xff, sizeof d);
+  d.struct_size = sizeof d;
+  ASSERT_EQ(mi_result_dit_load(res, &d), MI_OK) << last_error();
+  EXPECT_EQ(d.struct_size, sizeof d);
+  EXPECT_EQ(d.source, MI_DIT_LOAD_SOURCE_FILES);
+  EXPECT_EQ(d.io, MI_LOAD_IO_BUFFERED);
+  EXPECT_EQ(d.bytes, 12345678901ull);
+  EXPECT_EQ(d.seconds, 2.5);
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_DIT_LOAD_NOTE), "buffered: 97 % of the files is in the page cache");
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_TE_NOTE), "pinned host copy not allocated: streamed from the files");
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_PRELOAD_NOTE), "the DiT was not loaded: the plan parks it for the text encoder");
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE), "request");
+  EXPECT_EQ(mi_result_text(res, MI_TEXT_MAX_ENUM), nullptr);
+  EXPECT_EQ(mi_result_text(res, static_cast<mi_result_text_kind>(18)), nullptr);
+  ASSERT_EQ(mi_result_message_count(res, MI_MESSAGE_ACCEL_WARNING), 2);
+  EXPECT_STREQ(mi_result_message(res, MI_MESSAGE_ACCEL_WARNING, 1), "step cache never engaged");
+  EXPECT_EQ(mi_result_message(res, MI_MESSAGE_ACCEL_WARNING, 2), nullptr);
+  EXPECT_EQ(mi_result_message_count(res, static_cast<mi_message_kind>(5)), 0);
+  std::size_t count = 0;
+  const double* diffs = mi_result_accel_step_cache_diffs(res, &count);
+  ASSERT_EQ(count, 3u);
+  ASSERT_NE(diffs, nullptr);
+  EXPECT_TRUE(std::isnan(diffs[0]));
+  EXPECT_EQ(diffs[1], 0.1);
+  EXPECT_EQ(diffs[2], 0.04);
+  EXPECT_EQ(mi_result_accel_step_cache_diffs(res, nullptr), nullptr);
+  EXPECT_NE(last_error().find("count is NULL"), std::string::npos) << last_error();
+  count = 9;
+  EXPECT_EQ(mi_result_accel_step_cache_diffs(nullptr, &count), nullptr);
+  EXPECT_EQ(count, 0u);
+  EXPECT_NE(last_error().find("result is NULL"), std::string::npos) << last_error();
+  d.struct_size = sizeof d - 8;
+  EXPECT_EQ(mi_result_dit_load(res, &d), MI_ERR_ABI_MISMATCH);
+  EXPECT_NE(last_error().find("mi_dit_load_info.struct_size"), std::string::npos) << last_error();
+  EXPECT_EQ(mi_result_dit_load(res, nullptr), MI_ERR_INVALID_ARGUMENT);
+  d.struct_size = sizeof d;
+  EXPECT_EQ(mi_result_dit_load(nullptr, &d), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("result is NULL"), std::string::npos) << last_error();
+  mi_result_free(res);
+
+  // From the host copy (no I/O mode), direct reads, and no load at all.
+  const std::tuple<const char*, const char*, mi_dit_load_source, mi_load_io> loads[] = {
+      {"host_copy", "", MI_DIT_LOAD_SOURCE_HOST_COPY, MI_LOAD_IO_NONE},
+      {"files", "direct", MI_DIT_LOAD_SOURCE_FILES, MI_LOAD_IO_DIRECT},
+      {"", "", MI_DIT_LOAD_SOURCE_NONE, MI_LOAD_IO_NONE}};
+  for (const auto& [source, io, want_source, want_io] : loads) {
+    mi::pipeline::Result l;
+    l.dit_load.source = source;
+    l.dit_load.io = io;
+    l.dit_load.bytes = *source != '\0' ? 100 : 0;
+    res = mi::api::new_result(mi::api::to_generation(q, l, true));
+    std::memset(&d, 0xff, sizeof d);
+    d.struct_size = sizeof d;
+    ASSERT_EQ(mi_result_dit_load(res, &d), MI_OK);
+    EXPECT_EQ(d.source, want_source) << source;
+    EXPECT_EQ(d.io, want_io) << source;
+    EXPECT_EQ(d.bytes, *source != '\0' ? 100u : 0u);
+    EXPECT_STREQ(mi_result_text(res, MI_TEXT_DIT_LOAD_NOTE), "");
+    EXPECT_STREQ(mi_result_text(res, MI_TEXT_PRELOAD_NOTE), "");
+    count = 9;
+    EXPECT_EQ(mi_result_accel_step_cache_diffs(res, &count), nullptr);
+    EXPECT_EQ(count, 0u);
+    mi_result_free(res);
+  }
+}
+
+// mi_engine_preload's request: the prompt may be NULL or blank (kept blank for Pipeline::preload), everything else is
+// checked as for mi_generate(); mi_gen_params_validate() still requires a prompt. Preload and release on a NULL engine.
+TEST(CApi, PreloadAndReleaseWithoutAnEngine) {
+  mi_gen_params p = gen_defaults();
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_ERR_INVALID_ARGUMENT);  // NULL prompt
+  EXPECT_NE(last_error().find("Enter a prompt."), std::string::npos) << last_error();
+  EXPECT_THROW(mi::api::to_request(p), std::invalid_argument);
+  mi::pipeline::Request q = mi::api::to_request(p, nullptr, true, true);
+  EXPECT_EQ(q.prompt, "");
+  EXPECT_EQ(q.steps, MI_DEFAULT_STEPS);
+  EXPECT_EQ(q.width, 1024);
+  p.prompt = "  \t ";
+  EXPECT_EQ(mi_gen_params_validate(&p), MI_ERR_INVALID_ARGUMENT);
+  q = mi::api::to_request(p, nullptr, true, true);
+  EXPECT_EQ(q.prompt, "  \t ");  // Pipeline::preload plans a blank prompt as a short one
+  p.prompt = "a long prompt that sizes the workspaces";
+  EXPECT_EQ(mi::api::to_request(p, nullptr, true, true).prompt, p.prompt);
+  // The rest of the request is checked: size, steps, LoRAs, the accelerators.
+  p.prompt = nullptr;
+  p.width = 1000;
+  try {
+    mi::api::to_request(p, nullptr, true, true);
+    ADD_FAILURE() << "a bad size was accepted";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string(e.what()).find("multiples of 16"), std::string::npos) << e.what();
+  }
+  p.width = 512;
+  p.step_cache_threshold = 2.0;
+  EXPECT_THROW(mi::api::to_request(p, nullptr, true, true), std::invalid_argument);
+  p.step_cache_threshold = 0;
+  const mi_lora missing_lora{"/nonexistent/lora.safetensors", 1.0};
+  p.loras = &missing_lora;
+  p.loras_count = 1;
+  EXPECT_THROW(mi::api::to_request(p, nullptr, true, true), std::invalid_argument);
+
+  mi_result* r = reinterpret_cast<mi_result*>(&p);  // must be reset to NULL
+  EXPECT_EQ(mi_engine_preload(nullptr, nullptr, &r), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(r, nullptr);
+  EXPECT_NE(last_error().find("engine is NULL"), std::string::npos) << last_error();
+  EXPECT_EQ(mi_engine_preload(nullptr, &p, nullptr), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_engine_release(nullptr, 1, nullptr), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("engine is NULL"), std::string::npos) << last_error();
+  mi_release_info info{};
+  info.struct_size = sizeof info;
+  EXPECT_EQ(mi_engine_release(nullptr, 0, &info), MI_ERR_INVALID_ARGUMENT);
+}
+
+// The release report in C terms: every field, and the note cut at 511 bytes without splitting a UTF-8 sequence.
+TEST(CApi, ReleaseInfo) {
+  mi::pipeline::ReleaseReport rr;
+  rr.seconds = 3.5;
+  rr.vram_released = std::size_t{18} << 30;
+  rr.dit_host_copy = true;
+  rr.te_host_copy = false;
+  rr.host_copy_bytes = std::uint64_t{19} << 30;
+  rr.host_copy_s = 3.25;
+  rr.note = "text encoder: no host copy (streamed from its files)";
+  mi_release_info info = mi::api::to_release_info(rr);
+  EXPECT_EQ(info.struct_size, sizeof info);
+  EXPECT_EQ(info.seconds, 3.5);
+  EXPECT_EQ(info.vram_released_bytes, std::uint64_t{18} << 30);
+  EXPECT_EQ(info.host_copy_bytes, std::uint64_t{19} << 30);
+  EXPECT_EQ(info.host_copy_seconds, 3.25);
+  EXPECT_EQ(info.dit_host_copy, 1);
+  EXPECT_EQ(info.te_host_copy, 0);
+  EXPECT_STREQ(info.note, "text encoder: no host copy (streamed from its files)");
+  // 510 ASCII bytes, then a 2-byte sequence across the 511-byte limit: cut before it.
+  rr.note = std::string(510, 'a') + "\xc3\xa4" + "tail";
+  info = mi::api::to_release_info(rr);
+  EXPECT_EQ(std::strlen(info.note), 510u);
+  // 509 bytes, then a 2-byte sequence that fits exactly.
+  rr.note = std::string(509, 'a') + "\xc3\xa4" + "tail";
+  info = mi::api::to_release_info(rr);
+  EXPECT_EQ(std::strlen(info.note), 511u);
+  EXPECT_EQ(std::string(info.note).substr(509), "\xc3\xa4");
+  rr.note.clear();
+  EXPECT_STREQ(mi::api::to_release_info(rr).note, "");
+  // Cancelled before it started (ReleaseReport::cancelled): mi_engine_release() maps it to MI_CANCELLED. A cancelled
+  // host copy (a note, no flag) is not that case.
+  bool cancelled = true;
+  (void)mi::api::to_release_info(rr, &cancelled);
+  EXPECT_FALSE(cancelled);
+  mi::pipeline::ReleaseReport early;
+  early.cancelled = true;
+  early.note = "cancelled before it started";
+  early.dit_host_copy = true;
+  early.host_copy_bytes = 123;
+  info = mi::api::to_release_info(early, &cancelled);
+  EXPECT_TRUE(cancelled);
+  EXPECT_EQ(info.vram_released_bytes, 0u);
+  EXPECT_EQ(info.dit_host_copy, 1);  // the copies already held, as they are
+  EXPECT_EQ(info.host_copy_bytes, 123u);
+  EXPECT_STREQ(info.note, "cancelled before it started");
+  mi::pipeline::ReleaseReport copy_cancelled;
+  copy_cancelled.vram_released = 1;
+  copy_cancelled.note = "the DiT's host copy was cancelled";
+  (void)mi::api::to_release_info(copy_cancelled, &cancelled);
+  EXPECT_FALSE(cancelled);
 }
 
 // ---------------------------------------------------------------- GPU
@@ -2681,6 +3089,26 @@ TEST_F(GpuCApi, Accelerators) {
   for (std::size_t i = 0; i < count; ++i) list += (i ? "," : "") + std::to_string(steps[i]);
   std::printf("[c_api] accel (%s): CFG truncated on %d steps, step cache reused %d of %d DiT calls (steps %s)\n",
               mi_result_text(r, MI_TEXT_ACCELERATORS), a.cfg_truncated_steps, a.cached_calls, a.dit_calls, list.c_str());
+  // The threshold that ran and where it came from; one measured change per DiT call.
+  EXPECT_EQ(a.step_cache_threshold, 0.5);
+  EXPECT_STREQ(mi_result_text(r, MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE), "request");
+  std::size_t diffs = 0;
+  EXPECT_NE(mi_result_accel_step_cache_diffs(r, &diffs), nullptr);
+  EXPECT_EQ(diffs, static_cast<std::size_t>(a.dit_calls));
+  mi_result_free(r);
+
+  // 0 = unset: the engine's default for the base model.
+  p.step_cache_threshold = 0;
+  r = nullptr;
+  ASSERT_EQ(mi_generate(engine_, &p, &r), MI_OK) << last_error();
+  a.struct_size = sizeof a;
+  ASSERT_EQ(mi_result_accel(r, &a), MI_OK);
+  EXPECT_EQ(a.step_cache_threshold, mi::pipeline::accel::kBaseModelFbCacheThreshold);
+  EXPECT_STREQ(mi_result_text(r, MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE), "default for the base model");
+  EXPECT_NE(std::string(mi_result_text(r, MI_TEXT_ACCELERATORS)).find("step_cache fbcache 0.02"), std::string::npos)
+      << mi_result_text(r, MI_TEXT_ACCELERATORS);
+  std::printf("[c_api] accel, threshold unset: %s (%s)\n", mi_result_text(r, MI_TEXT_ACCELERATORS),
+              mi_result_text(r, MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE));
   mi_result_free(r);
 }
 
@@ -2847,6 +3275,335 @@ TEST_F(GpuCApi, CancelFromAnotherThread) {
   EXPECT_EQ(mi_result_steps_run(r), 2);
   EXPECT_NE(mi_result_rgb(r, nullptr), nullptr);
   mi_result_free(r);
+}
+
+// mi_engine_preload / mi_engine_release, each test with engines of its own (created one at a time, so that a fresh
+// engine is the reference): 256^2, 2 steps.
+class GpuCApiPreload : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    std::string why;
+    if (!have_gpu_and_weights(why)) GTEST_SKIP() << why;
+    model_ = mi::util::path_utf8(weights_root() / "base");
+  }
+  mi_engine* create() {
+    mi_engine_params p = engine_defaults();
+    p.model_path = model_.c_str();
+    mi_engine* e = nullptr;
+    EXPECT_EQ(mi_engine_create(&p, &e), MI_OK) << last_error();
+    return e;
+  }
+  static mi_gen_params request() {
+    mi_gen_params p = gen_defaults();
+    p.prompt = "a red apple on a wooden table";
+    p.width = p.height = 256;
+    p.steps = 2;
+    p.seed = 11;
+    return p;
+  }
+  struct Generated {
+    std::vector<std::uint8_t> rgb;
+    mi_memory_stats memory{};
+    mi_dit_load_info dit_load{};
+  };
+  static Generated generate(mi_engine* e) {
+    const mi_gen_params p = request();
+    mi_result* r = nullptr;
+    Generated g;
+    EXPECT_EQ(mi_generate(e, &p, &r), MI_OK) << last_error();
+    if (r == nullptr) return g;
+    std::size_t n = 0;
+    const std::uint8_t* rgb = mi_result_rgb(r, &n);
+    if (rgb != nullptr) g.rgb.assign(rgb, rgb + n);
+    g.memory.struct_size = sizeof g.memory;
+    EXPECT_EQ(mi_result_memory(r, &g.memory), MI_OK);
+    g.dit_load.struct_size = sizeof g.dit_load;
+    EXPECT_EQ(mi_result_dit_load(r, &g.dit_load), MI_OK);
+    mi_result_free(r);
+    return g;
+  }
+  std::string model_;
+};
+
+struct PreloadEvents {
+  int progress = 0, plans = 0;
+  std::vector<int> order;  // -1 for the plan, else the progress phase, in arrival order
+  mi_engine* cancel_engine = nullptr;  // cancelled from the progress callback when set
+};
+
+void on_preload_progress(const mi_progress* p, void* user) {
+  auto& ev = *static_cast<PreloadEvents*>(user);
+  ++ev.progress;
+  ev.order.push_back(p->phase);
+  EXPECT_EQ(p->step, 0);
+  EXPECT_EQ(p->total_steps, 0);
+  EXPECT_GE(p->elapsed_seconds, 0.0);
+  if (ev.cancel_engine != nullptr) {
+    EXPECT_EQ(mi_cancel(ev.cancel_engine), MI_OK);
+  }
+}
+
+void on_preload_plan(const char* explanation, const char* plan_json, void* user) {
+  auto& ev = *static_cast<PreloadEvents*>(user);
+  ++ev.plans;
+  ev.order.push_back(-1);
+  EXPECT_GT(std::strlen(explanation), 0u);
+  EXPECT_NO_THROW(mi::json::parse(plan_json)) << plan_json;
+}
+
+// The preload's callbacks of a txt2img request: the plan first, then the load steps in the pipeline's order, a
+// host-resident text encoder's copy (TEXT_ENCODER) before the DiT (DIT_LOAD, unless the plan leaves it to the
+// generation) and the VAE decoder (DECODE) after it; never DENOISE.
+void expect_preload_order(const PreloadEvents& ev, bool dit_loaded) {
+  ASSERT_FALSE(ev.order.empty());
+  EXPECT_EQ(ev.order.front(), -1) << "the plan comes before the first load step";
+  std::string seq;
+  int rank = -1;
+  bool dit = false;
+  for (std::size_t i = 1; i < ev.order.size(); ++i) {
+    const int ph = ev.order[i];
+    seq += std::to_string(ph) + " ";
+    EXPECT_NE(ph, -1) << "one plan";
+    EXPECT_NE(ph, MI_PHASE_DENOISE);
+    const int r = ph == MI_PHASE_TEXT_ENCODER ? 0 : ph == MI_PHASE_DIT_LOAD ? 1 : 2;  // no init image: DECODE is the decoder
+    EXPECT_GT(r, rank) << "phases out of order: " << seq;
+    rank = r;
+    dit = dit || ph == MI_PHASE_DIT_LOAD;
+  }
+  EXPECT_EQ(dit, dit_loaded) << seq;
+  std::printf("[c_api] preload callbacks: plan, then phases %s\n", seq.c_str());
+}
+
+// A preload loads what the generation needs: the generate that follows loads no DiT and gives the bits of a fresh
+// engine without the preload.
+TEST_F(GpuCApiPreload, PreloadThenGenerate) {
+  mi_engine* e = create();
+  ASSERT_NE(e, nullptr);
+  PreloadEvents ev;
+  mi_gen_params p = request();
+  p.progress_callback = on_preload_progress;
+  p.plan_callback = on_preload_plan;
+  p.user_data = &ev;
+  mi_result* r = nullptr;
+  ASSERT_EQ(mi_engine_preload(e, &p, &r), MI_OK) << last_error();
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(ev.plans, 1);
+  EXPECT_GE(ev.progress, 1);
+  expect_preload_order(ev, std::strlen(mi_result_text(r, MI_TEXT_PRELOAD_NOTE)) == 0);
+  EXPECT_EQ(mi_result_cancelled(r), 0);
+  EXPECT_EQ(mi_result_steps_run(r), 0);
+  EXPECT_EQ(mi_result_rgb(r, nullptr), nullptr);
+  EXPECT_GT(std::strlen(mi_result_plan_explanation(r)), 0u);
+  mi_dit_load_info d{};
+  d.struct_size = sizeof d;
+  ASSERT_EQ(mi_result_dit_load(r, &d), MI_OK);
+  mi_memory_stats m{};
+  m.struct_size = sizeof m;
+  ASSERT_EQ(mi_result_memory(r, &m), MI_OK);
+  const std::string note = mi_result_text(r, MI_TEXT_PRELOAD_NOTE);
+  std::printf("[c_api] preload: dit_loads %d, source %d io %d, %.2f GB in %.2f s; note \"%s\"; dit_load note \"%s\"\n",
+              m.dit_loads, d.source, d.io, static_cast<double>(d.bytes) / 1e9, d.seconds, note.c_str(),
+              mi_result_text(r, MI_TEXT_DIT_LOAD_NOTE));
+  if (note.empty()) {
+    EXPECT_EQ(m.dit_loads, 1);
+    EXPECT_EQ(d.source, MI_DIT_LOAD_SOURCE_FILES);
+    EXPECT_NE(d.io, MI_LOAD_IO_NONE);
+    EXPECT_GT(d.bytes, 0u);
+  } else {
+    std::printf("[c_api] SKIPPED checks: the preload left the DiT to the generation (\"%s\"): its dit_loads 1 / source "
+                "FILES, and the generation's dit_loads 0 / source NONE, are not checked\n",
+                note.c_str());
+  }
+  mi_result_free(r);
+  // out_result NULL is allowed: a second preload of the same request finds everything loaded.
+  ASSERT_EQ(mi_engine_preload(e, &p, nullptr), MI_OK) << last_error();
+  const Generated after = generate(e);
+  if (note.empty()) {
+    EXPECT_EQ(after.memory.dit_loads, 0);
+    EXPECT_EQ(after.dit_load.source, MI_DIT_LOAD_SOURCE_NONE);
+  }
+  mi_engine_free(e);
+
+  e = create();
+  ASSERT_NE(e, nullptr);
+  const Generated fresh = generate(e);
+  EXPECT_EQ(fresh.memory.dit_loads, 1);
+  EXPECT_EQ(fresh.dit_load.source, MI_DIT_LOAD_SOURCE_FILES);
+  ASSERT_FALSE(fresh.rgb.empty());
+  EXPECT_TRUE(after.rgb == fresh.rgb) << "the preloaded engine's image differs from a fresh engine's";
+  mi_engine_free(e);
+}
+
+// release(keep_host_copy = 1): the next load reads the host copy (bit-identical); release(0): the files again. A blank
+// prompt preloads. A release while a generation runs is MI_ERR_BUSY.
+TEST_F(GpuCApiPreload, ReleaseThenGenerate) {
+  mi_engine* e = create();
+  ASSERT_NE(e, nullptr);
+  mi_gen_params blank = request();
+  blank.prompt = "";
+  ASSERT_EQ(mi_engine_preload(e, &blank, nullptr), MI_OK) << last_error();
+  const Generated first = generate(e);
+  ASSERT_FALSE(first.rgb.empty());
+
+  mi_release_info info;
+  std::memset(&info, 0xff, sizeof info);
+  info.struct_size = sizeof info;
+  ASSERT_EQ(mi_engine_release(e, 1, &info), MI_OK) << last_error();
+  std::printf("[c_api] release(keep): %.2f s, %.2f GB VRAM released, host copy %.2f GB in %.2f s (dit %d te %d) \"%s\"\n",
+              info.seconds, static_cast<double>(info.vram_released_bytes) / 1e9,
+              static_cast<double>(info.host_copy_bytes) / 1e9, info.host_copy_seconds, info.dit_host_copy,
+              info.te_host_copy, info.note);
+  EXPECT_EQ(info.struct_size, sizeof info);
+  EXPECT_GT(info.vram_released_bytes, 0u);
+  EXPECT_GE(info.seconds, info.host_copy_seconds);
+  EXPECT_LT(std::strlen(info.note), sizeof info.note);
+  const Generated from_copy = generate(e);
+  EXPECT_TRUE(from_copy.rgb == first.rgb) << "the image after a release differs";
+  EXPECT_EQ(from_copy.memory.dit_loads, 1);
+  if (info.dit_host_copy == 1) {
+    EXPECT_GT(info.host_copy_bytes, 0u);
+    EXPECT_EQ(from_copy.dit_load.source, MI_DIT_LOAD_SOURCE_HOST_COPY);
+    EXPECT_EQ(from_copy.dit_load.io, MI_LOAD_IO_NONE);
+  } else {
+    // The host's free memory decides; the release says why it kept nothing.
+    EXPECT_NE(std::string(info.note).find("not kept in RAM"), std::string::npos) << info.note;
+    EXPECT_EQ(from_copy.dit_load.source, MI_DIT_LOAD_SOURCE_FILES);
+    std::printf("[c_api] SKIPPED checks: no DiT host copy on this machine now (\"%s\"): the host-copy load is not "
+                "checked\n",
+                info.note);
+  }
+
+  info.struct_size = sizeof info;
+  ASSERT_EQ(mi_engine_release(e, 0, &info), MI_OK) << last_error();
+  EXPECT_EQ(info.dit_host_copy, 0);
+  EXPECT_EQ(info.te_host_copy, 0);
+  EXPECT_EQ(info.host_copy_bytes, 0u);
+  ASSERT_EQ(mi_engine_release(e, 0, nullptr), MI_OK) << last_error();  // nothing left: still fine
+  const Generated from_files = generate(e);
+  EXPECT_EQ(from_files.dit_load.source, MI_DIT_LOAD_SOURCE_FILES);
+  EXPECT_NE(from_files.dit_load.io, MI_LOAD_IO_NONE);
+  EXPECT_TRUE(from_files.rgb == first.rgb);
+  info.struct_size = sizeof info - 8;
+  EXPECT_EQ(mi_engine_release(e, 0, &info), MI_ERR_ABI_MISMATCH);
+
+  // Busy: release and preload from another thread while a generation runs.
+  struct Busy {
+    mi_engine* engine;
+    mi_status release = MI_OK, preload = MI_OK;
+    bool checked = false;
+  } busy{e};
+  mi_gen_params p = request();
+  p.steps = 4;
+  p.user_data = &busy;
+  p.progress_callback = [](const mi_progress* pr, void* user) {
+    auto& b = *static_cast<Busy*>(user);
+    if (b.checked || pr->phase != MI_PHASE_DENOISE) return;
+    b.checked = true;
+    std::thread([&b] {
+      b.release = mi_engine_release(b.engine, 1, nullptr);
+      mi_gen_params q = request();
+      b.preload = mi_engine_preload(b.engine, &q, nullptr);
+    }).join();
+  };
+  mi_result* r = nullptr;
+  ASSERT_EQ(mi_generate(e, &p, &r), MI_OK) << last_error();
+  mi_result_free(r);
+  EXPECT_TRUE(busy.checked);
+  EXPECT_EQ(busy.release, MI_ERR_BUSY);
+  EXPECT_EQ(busy.preload, MI_ERR_BUSY);
+  mi_engine_free(e);
+}
+
+// A cancelled preload returns MI_CANCELLED with a result, and the engine stays usable.
+TEST_F(GpuCApiPreload, CancelDuringPreload) {
+  mi_engine* e = create();
+  ASSERT_NE(e, nullptr);
+  PreloadEvents ev;
+  ev.cancel_engine = e;  // cancelled from the first load step's callback: before that step loads anything
+  mi_gen_params p = request();
+  p.progress_callback = on_preload_progress;
+  p.plan_callback = on_preload_plan;
+  p.user_data = &ev;
+  mi_result* r = nullptr;
+  ASSERT_EQ(mi_engine_preload(e, &p, &r), MI_CANCELLED) << last_error();
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(mi_result_cancelled(r), 1);
+  EXPECT_EQ(ev.plans, 1);
+  EXPECT_EQ(ev.progress, 1) << "the cancel in the first step's callback stops the preload there";
+  mi_memory_stats m{};
+  m.struct_size = sizeof m;
+  ASSERT_EQ(mi_result_memory(r, &m), MI_OK);
+  EXPECT_EQ(m.dit_loads, 0);
+  mi_result_free(r);
+  // From another thread while it loads (it may also finish first: both leave the engine usable).
+  mi_status status = MI_OK;
+  mi_gen_params q = request();
+  std::thread worker([&] { status = mi_engine_preload(e, &q, nullptr); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  ASSERT_EQ(mi_cancel(e), MI_OK);
+  worker.join();
+  EXPECT_TRUE(status == MI_CANCELLED || status == MI_OK) << mi_status_string(status);
+  std::printf("[c_api] preload cancelled after 300 ms: %s\n", mi_status_string(status));
+  const Generated g = generate(e);
+  EXPECT_FALSE(g.rgb.empty());
+  mi_engine_free(e);
+}
+
+// A release whose cancel is set before it starts releases nothing: the next generation needs no DiT load and gives the
+// same bits. Through the adapter (mi_engine_release() clears the flag when it marks the engine busy, so only a cancel
+// landing between that and the pipeline's check reaches this case; the second part races one from another thread).
+TEST_F(GpuCApiPreload, ReleaseCancelledBeforeItStarts) {
+  mi_engine_params ep = engine_defaults();
+  ep.model_path = model_.c_str();
+  std::atomic<bool> go{false}, stop{true};
+  {
+    mi::api::PipelineAdapter a(ep);
+    const mi_gen_params g = request();
+    const mi::api::Generation first = a.generate(g, go);
+    ASSERT_FALSE(first.rgb.empty());
+    bool cancelled = false;
+    mi_release_info info = a.release(true, stop, &cancelled);
+    EXPECT_TRUE(cancelled);
+    EXPECT_EQ(info.vram_released_bytes, 0u);
+    EXPECT_EQ(info.dit_host_copy, 0);
+    EXPECT_STREQ(info.note, "cancelled before it started");
+    const mi::api::Generation again = a.generate(g, go);
+    EXPECT_EQ(again.memory.dit_loads, 0) << "the DiT stayed resident";
+    EXPECT_EQ(again.dit_load.source, MI_DIT_LOAD_SOURCE_NONE);
+    EXPECT_TRUE(again.rgb == first.rgb);
+    info = a.release(false, go, &cancelled);
+    EXPECT_FALSE(cancelled);
+    EXPECT_GT(info.vram_released_bytes, 0u);
+  }
+
+  // mi_engine_release() with mi_cancel() spinning on another thread: MI_CANCELLED when the cancel lands before the
+  // pipeline starts releasing (VRAM kept: the next generate loads no DiT), MI_OK otherwise. A few tries; a miss is no
+  // failure, the mapping is covered above and by CApi.ReleaseInfo.
+  mi_engine* e = create();
+  ASSERT_NE(e, nullptr);
+  bool seen = false;
+  for (int attempt = 0; attempt < 4 && !seen; ++attempt) {
+    ASSERT_FALSE(generate(e).rgb.empty());  // the DiT resident
+    std::atomic<bool> done{false};
+    std::thread canceller([&] {
+      while (!done.load()) (void)mi_cancel(e);
+    });
+    mi_release_info info{};
+    info.struct_size = sizeof info;
+    const mi_status s = mi_engine_release(e, 0, &info);
+    done.store(true);
+    canceller.join();
+    ASSERT_TRUE(s == MI_OK || s == MI_CANCELLED) << mi_status_string(s) << ": " << last_error();
+    if (s == MI_CANCELLED) {
+      seen = true;
+      EXPECT_EQ(info.vram_released_bytes, 0u);
+      EXPECT_STREQ(info.note, "cancelled before it started");
+      const Generated g = generate(e);
+      EXPECT_EQ(g.memory.dit_loads, 0);
+    }
+  }
+  std::printf("[c_api] mi_engine_release with a racing cancel: %s\n", seen ? "MI_CANCELLED seen" : "never cancelled early");
+  mi_engine_free(e);
 }
 
 }  // namespace

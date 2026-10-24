@@ -1,8 +1,8 @@
 // moss-server: the engine as a sidecar process for launchers. JSON lines over stdin/stdout (docs/server-protocol.md),
 // built only on the public C API (mossinfer.h).
 //
-// Threads: the main thread reads and answers requests; a generation runs on one worker thread, so cancel and status
-// are answered while it runs. Every protocol line goes through emit() under one mutex. stdout carries protocol lines
+// Threads: the main thread reads and answers requests; a job (generate, preload, release) runs on one worker thread, so
+// cancel and status are answered while it runs. Every protocol line goes through emit() under one mutex. stdout carries protocol lines
 // only: at startup the protocol stream gets a private, non-inheritable copy of fd 1 and fd 1 is pointed at stderr (or
 // at the null device when stderr is unusable), so anything else printing to stdout (the engine, a library) never
 // reaches the protocol stream.
@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -473,11 +475,13 @@ class Server {
       }
       const Params params(doc.find("params"));
       const std::string& m = method->as_string();
-      std::string result;
+      std::optional<std::string> result;  // none: the worker answers when the job ends (release)
       bool keep_running = true;
       if (m == "hello") result = hello(params);
       else if (m == "load") result = load(params, id);
       else if (m == "generate") result = generate(params, id);
+      else if (m == "preload") result = preload(params, id);
+      else if (m == "release") result = release(params, id);
       else if (m == "cancel") result = cancel(params);
       else if (m == "status") result = status(params);
       else if (m == "unload") result = unload(params);
@@ -489,7 +493,7 @@ class Server {
       } else {
         throw RequestError("method_not_found", "unknown method \"" + m + "\"");
       }
-      out_.emit("{\"id\":" + id + ",\"result\":" + result + "}");
+      if (result) out_.emit("{\"id\":" + id + ",\"result\":" + *result + "}");
       return keep_running;
     } catch (const RequestError& e) {
       out_.emit("{\"id\":" + id + ",\"error\":" + error_json(e.code, e.what()) + "}");
@@ -499,7 +503,7 @@ class Server {
     return true;
   }
 
-  // Cancels a running generation, waits for it and releases the engine.
+  // Cancels a running job, waits for it and releases the engine.
   void stop() {
     request_cancel();
     join_worker();
@@ -513,16 +517,26 @@ class Server {
   }
 
  private:
+  enum class Kind { kGenerate, kPreload, kRelease };
+
   // State shared with the worker thread.
   struct Job {
     std::string id;  // JSON of the request id
+    Kind kind = Kind::kGenerate;
     std::atomic<bool> cancel{false};
     std::atomic<int> phase{-1};
     std::atomic<int> step{0}, total_steps{0};
     std::atomic<double> elapsed{0};
   };
+  struct Work;
 
+  // A job runs on the worker (its id is job_->id).
   bool generating() const { return running_.load(); }
+
+  static RequestError busy_error() {
+    return RequestError("busy", "a generate, preload or release is running; cancel it or wait until it ends (its done "
+                                "event, or the release's response)");
+  }
 
   std::string hello(const Params& p) {
     p.only({"client", "protocol_version", "devices"});
@@ -552,7 +566,9 @@ class Server {
            tf(caps & MI_CAP_LORA) + ",\"tiers\":" + tf(caps & MI_CAP_TIERS) + ",\"samplers\":" + tf(caps & MI_CAP_SAMPLERS) +
            ",\"image_input\":" + tf(caps & MI_CAP_IMAGE_INPUT) + ",\"hires\":" + tf(caps & MI_CAP_HIRES) + ",\"distill\":" +
            tf(caps & MI_CAP_DISTILL) + ",\"system_cuda\":" + tf(caps & MI_CAP_SYSTEM_CUDA) + ",\"control\":" +
-           tf(caps & MI_CAP_CONTROL) + ",\"accel\":" + tf(caps & MI_CAP_ACCEL) + "},\"probe\":{\"driver_cuda_version\":" +
+           tf(caps & MI_CAP_CONTROL) + ",\"accel\":" + tf(caps & MI_CAP_ACCEL) + ",\"preload\":" + tf(caps & MI_CAP_PRELOAD) +
+           ",\"release\":" + tf(caps & MI_CAP_RELEASE) + ",\"certificate_dirs\":" + tf(caps & MI_CAP_CERTIFICATE_DIRS) +
+           ",\"te_host_pin\":" + tf(caps & MI_CAP_TE_HOST_PIN) + "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
            ",\"supported_device_count\":" + std::to_string(probe.supported_device_count) +
@@ -565,8 +581,8 @@ class Server {
   std::string load(const Params& p, const std::string& id) {
     p.only({"model", "mode", "device", "vram_budget_bytes", "vram_reserve_bytes", "host_ram_budget_bytes", "cache_dir",
             "embedding_cache", "direct_io", "block_path", "dit_file", "text_encoder_file", "vae_file", "tier", "attention",
-            "lora_strict", "time_embedding_file", "distill"});
-    if (generating()) throw RequestError("busy", "a generation is running; cancel it or wait for its done event");
+            "lora_strict", "time_embedding_file", "distill", "certificate_dirs", "dit_direct_io", "te_host_pin"});
+    if (generating()) throw busy_error();
     mi_engine_params e;
     if (const mi_status s = mi_engine_params_init(&e, sizeof e); s != MI_OK) throw_status(s);
     const std::optional<std::string> model = p.string("model");
@@ -608,6 +624,25 @@ class Server {
     const std::optional<std::string> distill = p.path("distill");
     if (te) e.time_embedding_file = te->c_str();
     if (distill) e.distill_dir = distill->c_str();
+    // The engine copies the directories; these live until mi_engine_create() returns. Its own checks count them.
+    std::vector<std::string> cert_dirs;
+    std::vector<const char*> cert_ptrs;
+    if (const Value* v = p.find("certificate_dirs")) {
+      constexpr const char* kWhat = "an array of non-empty directory paths";
+      if (!v->is_array()) throw RequestError("invalid_params", std::string("\"certificate_dirs\" must be ") + kWhat);
+      for (const Value& d : v->as_array()) {
+        if (!d.is_string() || d.as_string().empty() || d.as_string().find('\0') != std::string::npos) {
+          throw RequestError("invalid_params", "\"certificate_dirs[" + std::to_string(cert_dirs.size()) + "]\" must be a " +
+                                                   "non-empty path without NUL characters (" + kWhat + ")");
+        }
+        cert_dirs.push_back(d.as_string());
+      }
+      for (const std::string& d : cert_dirs) cert_ptrs.push_back(d.c_str());
+      e.certificate_dirs = cert_ptrs.data();
+      e.certificate_dirs_count = cert_ptrs.size();
+    }
+    if (const auto v = p.name("dit_direct_io", mi::server::kDitDirectIoNames)) e.dit_direct_io = *v;
+    if (const auto v = p.name("te_host_pin", mi::server::kTeHostPinNames)) e.te_host_pin = *v;
     // The old engine goes first: two engines would hold two arenas.
     join_worker();
     mi_engine_free(engine_);
@@ -634,11 +669,40 @@ class Server {
             "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation", "step_cache",
             "step_cache_threshold"});
     auto w = std::make_unique<Work>();
-    mi_gen_params& g = w->params;
-    if (const mi_status s = mi_gen_params_init(&g, sizeof g); s != MI_OK) throw_status(s);
     const auto output = p.string("output");
     if (!output || output->empty()) throw RequestError("invalid_params", "\"output\" (PNG path) is required");
     w->output = *output;
+    request_params(p, *w, false);
+    return start(std::move(w), id, Kind::kGenerate);
+  }
+
+  // generate's parameters without the output, the preview and the PNG metadata; the prompt is optional.
+  std::string preload(const Params& p, const std::string& id) {
+    p.only({"prompt", "negative_prompt", "width", "height", "steps", "cfg", "shift", "seed", "uncond_skip_layers",
+            "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length", "sampler", "scheduler",
+            "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise", "dataspace", "loras", "init_image", "mask",
+            "mask_encoding", "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation", "step_cache",
+            "step_cache_threshold"});
+    auto w = std::make_unique<Work>();
+    request_params(p, *w, true);
+    return start(std::move(w), id, Kind::kPreload);
+  }
+
+  // Answered by the worker when the release ends (reading the DiT into RAM takes seconds), so a cancel sent meanwhile
+  // is read and interrupts the host copy.
+  std::optional<std::string> release(const Params& p, const std::string& id) {
+    p.only({"keep_host_copy"});
+    auto w = std::make_unique<Work>();
+    w->keep_host_copy = p.boolean("keep_host_copy").value_or(true);
+    start(std::move(w), id, Kind::kRelease);
+    return std::nullopt;
+  }
+
+  // The parameters of a generate or preload request into w.params, checked by the C API (without an engine).
+  void request_params(const Params& p, Work& work, bool preload) {
+    Work* w = &work;
+    mi_gen_params& g = w->params;
+    if (const mi_status s = mi_gen_params_init(&g, sizeof g); s != MI_OK) throw_status(s);
     w->prompt = p.string("prompt").value_or("");
     w->negative = p.string("negative_prompt").value_or("");
     g.prompt = w->prompt.c_str();
@@ -755,18 +819,27 @@ class Server {
     } else if (preview_every) {
       throw RequestError("invalid_params", "\"preview_every\" needs \"preview_output\"");
     }
-    if (const mi_status s = mi_gen_params_validate(&g); s != MI_OK) {
+    // A preload may leave the prompt out (mi_engine_preload() plans for a short one); mi_gen_params_validate() checks
+    // a generation's request, so it sees a stand-in prompt.
+    mi_gen_params check = g;
+    if (preload) check.prompt = "preload";
+    if (const mi_status s = mi_gen_params_validate(&check); s != MI_OK) {
       throw RequestError(s == MI_ERR_INVALID_ARGUMENT ? "invalid_params" : status_code(s),
                          protocol_names(mi_last_error_message()));
     }
-    // The request is checked first (no engine or GPU needed), then the server's state.
+  }
+
+  // Starts a job on the worker. The request is checked first (no engine or GPU needed), then the server's state.
+  std::string start(std::unique_ptr<Work> w, const std::string& id, Kind kind) {
     if (engine_ == nullptr) throw RequestError("no_engine", "no model loaded; send \"load\" first");
-    if (generating()) throw RequestError("busy", "a generation is running; cancel it or wait for its done event");
+    if (generating()) throw busy_error();
     join_worker();
     job_ = std::make_unique<Job>();
     job_->id = id;
+    job_->kind = kind;
     w->job = job_.get();
     w->out = &out_;
+    mi_gen_params& g = w->params;
     g.progress_callback = on_progress;
     g.plan_callback = on_plan;
     if (!w->preview.empty()) g.preview_callback = on_preview;
@@ -795,21 +868,33 @@ class Server {
 
   std::string status(const Params& p) {
     p.only({});
-    std::string s = "{\"state\":\"" + std::string(engine_ == nullptr ? "unloaded" : generating() ? "generating" : "idle") + "\"";
+    const bool running = generating();
+    const Kind kind = running ? job_->kind : Kind::kGenerate;
+    const char* state = engine_ == nullptr        ? "unloaded"
+                        : !running                ? "idle"
+                        : kind == Kind::kPreload  ? "preloading"
+                        : kind == Kind::kRelease  ? "releasing"
+                                                  : "generating";
+    std::string s = "{\"state\":\"" + std::string(state) + "\"";
     if (engine_ != nullptr) s += ",\"model\":" + str(model_) + ",\"mode\":\"" + mode_name(mode_) + "\"";
-    if (generating()) {
-      const int phase = job_->phase.load();
-      s += ",\"generating_id\":" + job_->id + ",\"phase\":" +
-           (phase < 0 ? std::string("null") : "\"" + std::string(phase_name(static_cast<mi_phase>(phase))) + "\"") +
-           ",\"step\":" + std::to_string(job_->step.load()) + ",\"total_steps\":" + std::to_string(job_->total_steps.load()) +
-           ",\"elapsed_seconds\":" + num(job_->elapsed.load()) + ",\"cancelling\":" + tf(job_->cancel.load());
+    if (running) {
+      // generating_id names the running job of any kind (the field predates preload and release).
+      s += ",\"generating_id\":" + job_->id;
+      if (kind != Kind::kRelease) {
+        const int phase = job_->phase.load();
+        s += ",\"phase\":" +
+             (phase < 0 ? std::string("null") : "\"" + std::string(phase_name(static_cast<mi_phase>(phase))) + "\"") +
+             ",\"step\":" + std::to_string(job_->step.load()) + ",\"total_steps\":" + std::to_string(job_->total_steps.load()) +
+             ",\"elapsed_seconds\":" + num(job_->elapsed.load());
+      }
+      s += std::string(",\"cancelling\":") + tf(job_->cancel.load());
     }
     return s + "}";
   }
 
   std::string unload(const Params& p) {
     p.only({});
-    if (generating()) throw RequestError("busy", "a generation is running; cancel it or wait for its done event");
+    if (generating()) throw busy_error();
     join_worker();
     const bool had = engine_ != nullptr;
     mi_engine_free(engine_);
@@ -818,9 +903,10 @@ class Server {
     return std::string("{\"unloaded\":") + tf(had) + "}";
   }
 
-  // One generation's inputs; owned by the worker thread.
+  // One job's inputs; owned by the worker thread.
   struct Work {
     mi_gen_params params{};
+    bool keep_host_copy = true;  // release
     std::string output, prompt, negative, dataspace, preview, init_image, mask, distill;
     std::vector<std::int32_t> uncond, slg;
     std::vector<std::string> lora_paths;
@@ -895,6 +981,12 @@ class Server {
         }
         add("lossy accelerators (" + active + "), uncertified: " + what);
       }
+      // What the engine says about the accelerators for this model (a threshold that moves the base model's
+      // composition, a cache that never engaged).
+      const std::int32_t n = mi_result_message_count(r, MI_MESSAGE_ACCEL_WARNING);
+      for (std::int32_t i = 0; i < n; ++i) {
+        if (const char* m = mi_result_message(r, MI_MESSAGE_ACCEL_WARNING, i)) add(m);
+      }
       // Settings without effect, as `moss-infer generate` warns about them.
       if (g.step_cache_threshold != 0 && g.step_cache == MI_STEP_CACHE_OFF) {
         add("step_cache_threshold has no effect without step_cache \"fbcache\"");
@@ -913,17 +1005,92 @@ class Server {
       if (const char* note = mi_result_text(r, MI_TEXT_IMAGE_NOTE); note != nullptr && *note != '\0') {
         add(std::string("image input: ") + note);
       }
+      if (const char* note = mi_result_text(r, MI_TEXT_TE_NOTE); note != nullptr && *note != '\0') {
+        add(std::string("text encoder: ") + note);
+      }
     }
     return "[" + out + "]";
+  }
+
+  // done's dit_load summary: {"source": "files" | "host_copy" | null, "io": "direct" | "buffered" | null, "bytes",
+  // "seconds", "note"}.
+  static std::string dit_load_json(const mi_result* r) {
+    mi_dit_load_info d{};
+    d.struct_size = sizeof d;
+    if (mi_result_dit_load(r, &d) != MI_OK) return "null";
+    const char* source = d.source == MI_DIT_LOAD_SOURCE_FILES       ? "\"files\""
+                         : d.source == MI_DIT_LOAD_SOURCE_HOST_COPY ? "\"host_copy\""
+                                                                    : "null";
+    const char* io = d.io == MI_LOAD_IO_DIRECT ? "\"direct\"" : d.io == MI_LOAD_IO_BUFFERED ? "\"buffered\"" : "null";
+    return std::string("{\"source\":") + source + ",\"io\":" + io + ",\"bytes\":" + std::to_string(d.bytes) +
+           ",\"seconds\":" + num(d.seconds) + ",\"note\":" + str(mi_result_text(r, MI_TEXT_DIT_LOAD_NOTE)) + "}";
+  }
+
+  // release: the response, sent when the release ends. A cancel that lands before the release frees anything stops it
+  // whole ("cancelled": true, nothing released); one during the DiT's host copy stops the copy (between 64 MiB reads),
+  // and the release still frees the device memory, keeps a host-resident text encoder's copy and frees nothing else.
+  // mi_cancel() only stops a running job, and a release has no callback in which a cancel issued before
+  // mi_engine_release() marked the engine busy could land (as on_progress does for generate and preload). A relay thread
+  // sleeps until request_cancel() wakes it, then repeats mi_cancel() every 10 ms until the release ends, so a cancel
+  // lands at the latest before the copy's first read.
+  void run_release(Work& w) {
+    Job& job = *w.job;
+    mi_release_info info{};
+    info.struct_size = sizeof info;
+    {
+      const std::lock_guard<std::mutex> lock(relay_mu_);
+      relay_finished_ = false;
+    }
+    std::thread relay;
+    if (w.keep_host_copy) {
+      try {
+        relay = std::thread([this, &job] {
+          std::unique_lock<std::mutex> lock(relay_mu_);
+          relay_cv_.wait(lock, [&] { return relay_finished_ || job.cancel.load(); });
+          while (!relay_finished_) {
+            lock.unlock();
+            mi_cancel(engine_);  // a no-op until the release marks the engine busy
+            lock.lock();
+            relay_cv_.wait_for(lock, std::chrono::milliseconds(10), [&] { return relay_finished_; });
+          }
+        });
+      } catch (const std::system_error&) {
+        // No thread: a cancel still reaches a release already running (request_cancel()'s own mi_cancel()).
+      }
+    }
+    const mi_status s = mi_engine_release(engine_, w.keep_host_copy ? 1 : 0, &info);
+    {
+      const std::lock_guard<std::mutex> lock(relay_mu_);
+      relay_finished_ = true;
+    }
+    relay_cv_.notify_all();
+    if (relay.joinable()) relay.join();
+    std::string line = "{\"id\":" + job.id;
+    if (s == MI_OK || s == MI_CANCELLED) {
+      // cancelled: the cancel landed before the release freed anything (the engine still holds its device memory).
+      line += ",\"result\":{\"cancelled\":" + std::string(tf(s == MI_CANCELLED)) + ",\"seconds\":" + num(info.seconds) +
+              ",\"vram_released_bytes\":" +
+              std::to_string(info.vram_released_bytes) + ",\"host_copy_bytes\":" + std::to_string(info.host_copy_bytes) +
+              ",\"host_copy_seconds\":" + num(info.host_copy_seconds) + ",\"dit_host_copy\":" + tf(info.dit_host_copy) +
+              ",\"te_host_copy\":" + tf(info.te_host_copy) + ",\"note\":" + str(info.note) + "}}";
+    } else {
+      line += ",\"error\":" + error_json(status_code(s), protocol_names(mi_last_error_message())) + "}";
+    }
+    running_.store(false);  // idle before the answer goes out, as for done
+    out_.emit(line);
   }
 
   void run(Work& w) {
     w.engine = engine_;
     Job& job = *w.job;
+    if (job.kind == Kind::kRelease) return run_release(w);
+    const bool preload = job.kind == Kind::kPreload;
     mi_result* r = nullptr;
-    const mi_status s = mi_generate(engine_, &w.params, &r);
+    const mi_status s = preload ? mi_engine_preload(engine_, &w.params, &r) : mi_generate(engine_, &w.params, &r);
     std::string done = "{\"event\":\"done\",\"id\":" + job.id;
-    if (s == MI_OK) {
+    if (s == MI_OK && preload) {
+      done += ",\"status\":\"ok\",\"report\":" + one_line(mi_result_report_json(r));
+    } else if (s == MI_OK) {
       if (const mi_status ws = mi_save_png(r, w.output.c_str()); ws == MI_OK) {
         done += ",\"status\":\"ok\",\"image\":" + str(w.output) + ",\"report\":" + one_line(mi_result_report_json(r));
       } else {
@@ -935,6 +1102,10 @@ class Server {
               ",\"report\":" + one_line(mi_result_report_json(r));
     } else {
       done += ",\"status\":\"error\",\"error\":" + error_json(status_code(s), protocol_names(mi_last_error_message()));
+    }
+    if (r != nullptr && preload) {
+      // What the preload loaded, without parsing the report (which has both too).
+      done += ",\"preload_note\":" + str(mi_result_text(r, MI_TEXT_PRELOAD_NOTE)) + ",\"dit_load\":" + dit_load_json(r);
     }
     if (r != nullptr) {
       // Whether the run as a whole is certified (the report's models.dit.certified), without parsing the report.
@@ -953,6 +1124,10 @@ class Server {
     if (!generating()) return;
     job_->cancel.store(true);
     mi_cancel(engine_);
+    {
+      const std::lock_guard<std::mutex> lock(relay_mu_);  // a release's relay sees the flag, or is woken
+    }
+    relay_cv_.notify_all();
   }
 
   void join_worker() {
@@ -966,6 +1141,10 @@ class Server {
   std::unique_ptr<Job> job_;
   std::thread worker_;
   std::atomic<bool> running_{false};
+  // A release's cancel relay (run_release): woken by request_cancel() and by the release's end.
+  std::mutex relay_mu_;
+  std::condition_variable relay_cv_;
+  bool relay_finished_ = false;  // guarded by relay_mu_ while a relay runs
 };
 
 // fds 0-2 must exist before anything else is opened. A launcher that started the server with one of them closed would

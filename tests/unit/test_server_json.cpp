@@ -159,6 +159,18 @@ TEST(ServerJson, EnumNamesAreThePipelines) {
     EXPECT_EQ(p::accel::step_cache_name(p::accel::parse_step_cache(n.name)), n.name);
   }
   EXPECT_EQ(i, 2);
+  const mi::planner::TeHostPin pins[] = {mi::planner::TeHostPin::kAuto, mi::planner::TeHostPin::kOn,
+                                         mi::planner::TeHostPin::kOff};
+  i = 0;
+  for (const auto& n : mi::server::kTeHostPinNames) {
+    EXPECT_EQ(static_cast<int>(n.value), i);
+    EXPECT_EQ(mi::planner::parse_te_host_pin(n.name), pins[i]) << n.name;
+    EXPECT_EQ(mi::planner::te_host_pin_name(pins[i++]), n.name);
+  }
+  EXPECT_EQ(i, 3);
+  i = 0;
+  for (const auto& n : mi::server::kDitDirectIoNames) EXPECT_EQ(static_cast<int>(n.value), i++);  // the server's own names
+  EXPECT_EQ(i, 3);
 }
 
 // The report of a done event: a NULL from mi_result_report_json() becomes JSON null instead of a crash.
