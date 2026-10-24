@@ -39,7 +39,10 @@ std::vector<T> load(const std::string& name) {
 using Config = cutlass::detail::Sm1xxBlockScaledConfig<16>;
 
 TEST(Nvfp4CutlassRef, ScaleLayoutIsCutlassSfLayout) {
-  for (auto [rows, k] : {std::pair<int, int>{200, 96}, {128, 3072}, {9216, 3072}, {3072, 8192}, {1, 32}, {257, 160}}) {
+  // A named array, not a braced list: nvcc 12.8's front end cannot deduce the range's type from a braced list whose
+  // later elements are themselves braced ("cannot deduce type of range in range-based for").
+  const std::pair<int, int> cases[] = {{200, 96}, {128, 3072}, {9216, 3072}, {3072, 8192}, {1, 32}, {257, 160}};
+  for (const auto& [rows, k] : cases) {
     const auto layout = Config::tile_atom_to_shape_SFA(cute::make_shape(rows, 64, k, 1));
     const std::int64_t sfk = k / 16;
     EXPECT_EQ(static_cast<std::int64_t>(cute::cosize(layout)), q::nvfp4_scale_rows(rows) * q::nvfp4_scale_cols(sfk)) << rows << "x" << k;
