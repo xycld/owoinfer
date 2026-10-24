@@ -68,7 +68,7 @@ These are designed and partly built. The launcher can prepare for them now (see 
 | One generation split across several GPUs | not supported. One engine per GPU is the intended pattern (not yet tested on multi-GPU machines). |
 | Several generations at once on one engine | not supported: queue them in the launcher |
 | A ComfyUI checkpoint or models folder as the model path | not supported: the model path is a bundle folder; ComfyUI files load as component files |
-| An uncertified Turbo run under tier `auto` | not supported: `auto` refuses an INT4 DiT without a quality certificate (none exists yet). Choose `turbo` explicitly. |
+| An uncertified Turbo run under tier `auto` | not supported: `auto` refuses an INT4 DiT without a quality certificate (none ships). Choose `turbo` explicitly. |
 | Pixel data over the server protocol | not supported: the server takes image file paths |
 | Server output other than PNG | not supported |
 

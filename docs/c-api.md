@@ -148,7 +148,7 @@ The loaded weights fix the GEMM precision: an INT8 DiT runs INT8 GEMMs. The tier
 | `HIGH` (2) | the loaded DiT's precision plus 8-bit attention (`Q8_FP8` unless `attention` says otherwise), certified or not. Refused for a bf16 DiT with exact attention. |
 | `TURBO` (3) | an INT4 DiT file (`dit_file`): INT4 GEMMs plus 8-bit attention, as for `HIGH`. Runs certified or not (reported uncertified without a certificate). Refused for any other DiT. |
 
-1.0 ships no quality certificates: without one of your own, `AUTO` runs Reference for the bf16 bundle and refuses an INT4 file. Offer `TURBO` for INT4 DiT files only, as an explicit choice.
+The packages ship quality certificates for some configurations (RTX 50 series, cu13 package; see [integration.md](integration.md#shipped-certificates)). Without a usable certificate, `AUTO` runs Reference for the bf16 bundle, runs a quantized file's own GEMMs with exact attention, uncertified, and refuses an INT4 file. Offer `TURBO` for INT4 DiT files only, as an explicit choice.
 
 | `mi_attention` | Pipeline name |
 |---|---|
