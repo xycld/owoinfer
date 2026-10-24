@@ -408,7 +408,7 @@ Every answer has `path`, `kind` (`"dit"`, `"text_encoder"`, `"vae"`, `"lora"`, `
 - `lora`: `base_model` (the metadata, `""` when absent), `adapter_types` (`"lora"`, `"loha"`, `"lokr"`, `"full"`), `lora_rank` (the largest low-rank rank), `lora_adapters` (on the DiT) and `lora_unknown_keys`. A file in the LoRA naming conventions that the LoRA reader refuses (a LoRA for another model, a malformed one) is a `lora` with `loadable` false and the reader's message as `note`.
 - `control_adapter`: `control_kinds` (in channel order: exactly the strings `generate`'s `control.images[].kind` takes) and the `lora` fields of its LoRA part.
 
-A file the engine cannot use is a result (`unknown` or `loadable` false), not an error. Errors: `invalid_params` for a missing or empty `path`, unknown params, and a path that is not a regular file (a directory, a device, a pipe: refused from its type, without opening it); `io` for a file that does not exist or cannot be read (the system's reason); `busy` beyond two running inspects.
+A file the engine cannot use is a result (`unknown` or `loadable` false), not an error. Errors: `invalid_params` for a missing or empty `path`, unknown params, and a path that is not a regular file (a directory, a device, a pipe: refused from its type, without opening it on POSIX; on Windows a device or pipe path other than `\\.\` and `\\?\GLOBALROOT\` may be opened first); `io` for a file that does not exist or cannot be read (the system's reason); `busy` beyond two running inspects.
 
 The result depends only on the file's content and the engine's version and build, not on the GPU: a launcher may cache it per file (path, size, modification time), `hello`'s `version` and `probe.build_flavour` (the NVFP4 kernels are a build option).
 

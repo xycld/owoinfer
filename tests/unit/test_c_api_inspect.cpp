@@ -25,11 +25,15 @@
 #include <windows.h>
 #include <winioctl.h>
 #else
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
 
+#include "api/file_inspect.h"
 #include "models/lora/lora.h"
+#include "models/moss_dit/moss_dit.h"
+#include "pipeline/pipeline.h"
 #include "test_util.h"
 #include "util/path.h"
 #include "weights/safetensors.h"
@@ -39,8 +43,8 @@ namespace {
 namespace fs = std::filesystem;
 using mi::weights::DType;
 
-// A tensor: zeros, an F32 `*weight_scale` of ones (the readers check scales are finite and > 0), or a comfy_quant
-// config's JSON (U8).
+// A tensor: zeros, an F32 `*weight_scale`, `*weight_scale_2` or `*input_scale` of ones (the readers check scales are
+// finite and > 0), or a comfy_quant config's JSON (U8).
 struct T {
   std::string name;
   DType dtype;
@@ -82,18 +86,32 @@ bool write_sparse(const fs::path& path, const Regions& regions, std::uint64_t si
 }
 #endif
 
-// Whether `dir` takes sparse files: on Linux the seeks below leave holes; on Windows FSCTL_SET_SPARSE must work.
+// Whether `dir` takes sparse files. Windows: FSCTL_SET_SPARSE must work. POSIX: a probe written as write_file writes
+// (a byte, a seek past 1 MiB, a byte) must have a hole before its end (lseek SEEK_HOLE; a file system without holes
+// reports only the one at the end). Without SEEK_HOLE the seeks are assumed to leave holes.
 bool sparse_files(const fs::path& dir) {
-#ifdef _WIN32
   const fs::path probe = dir / "sparse_probe";
+#ifdef _WIN32
   const bool ok = write_sparse(probe, {}, std::uint64_t{1} << 20);
+#elif defined(SEEK_HOLE)
+  constexpr std::streamoff kEnd = std::streamoff{1} << 20;
+  {
+    std::ofstream out(probe, std::ios::binary | std::ios::trunc);
+    out.put('x');
+    out.seekp(kEnd);
+    out.put('x');
+  }
+  bool ok = false;
+  if (const int fd = ::open(probe.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0) {
+    ok = ::lseek(fd, 0, SEEK_HOLE) < kEnd;
+    ::close(fd);
+  }
+#else
+  const bool ok = true;
+#endif
   std::error_code ec;
   fs::remove(probe, ec);
   return ok;
-#else
-  static_cast<void>(dir);
-  return true;
-#endif
 }
 
 // Laid out like the safetensors library writes files: larger dtypes first, the header padded to 8 bytes. Zero tensors
@@ -118,7 +136,8 @@ void write_file(const fs::path& path, std::vector<T> ts, const std::string& meta
       std::uint64_t n = 1;
       for (const std::int64_t d : t.shape) n *= static_cast<std::uint64_t>(d);
       nbytes = n * mi::weights::dtype_size(t.dtype);
-      if (t.dtype == DType::kF32 && t.name.ends_with("weight_scale")) {
+      if (t.dtype == DType::kF32 && (t.name.ends_with("weight_scale") || t.name.ends_with("weight_scale_2") ||
+                                     t.name.ends_with("input_scale"))) {
         bytes.assign(nbytes, '\0');
         const float one = 1.0f;
         for (std::uint64_t i = 0; i < n; ++i) std::memcpy(bytes.data() + 4 * i, &one, 4);
@@ -335,6 +354,56 @@ TEST(CApiInspect, HostileDitShapes) {
   }
 }
 
+// The quantization text and note of a loadable DiT whose linears carry a static input_scale. Only NVFP4 linears do,
+// which this version refuses (inspect gives the NVFP4 verdict), so the DiT is indexed by pipeline::inspect_dit_file
+// with no NVFP4 refusal, as a version that runs them would, and its answer split as inspect splits it.
+TEST(CApiInspect, DitLinearsText) {
+  mi::testing::TempDir dir("inspect_linears");
+  const std::string q = "layers.0.proj.q";
+  const std::vector<T> nvfp4 = {{q + ".weight", DType::kU8, {3072, 1536}},
+                                {q + ".weight_scale", DType::kF8E4M3, {3072, 192}},
+                                {q + ".weight_scale_2", DType::kF32, {}},
+                                {q + ".input_scale", DType::kF32, {}},
+                                {q + ".comfy_quant", DType::kU8, {}, R"({"format": "nvfp4"})"}};
+  const fs::path file = write_dit(dir.path() / "nvfp4_input_scale.safetensors", Gemm::kBf16, nvfp4);
+  const Report rep(file);
+  EXPECT_EQ(rep.info.kind, MI_FILE_KIND_DIT);
+  EXPECT_EQ(rep.info.loadable, 0);  // this version's NVFP4 verdict
+  EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("NVFP4"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
+  EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "");
+
+  const std::string remark = "1 linears carry a static input_scale; ignored (activations are scaled per token)";
+  const mi::pipeline::DitFileInfo dit = mi::pipeline::inspect_dit_file(file, "");
+  ASSERT_TRUE(dit.refusal.empty()) << dit.refusal;
+  ASSERT_TRUE(dit.nvfp4);
+  const std::string describe = mi::moss_dit::describe_linears(dit.quant.get());
+  ASSERT_EQ(dit.linears, describe + "; " + remark);
+  mi::api::FileInspection r;
+  mi::api::describe_dit_linears(dit, r);
+  EXPECT_EQ(r.quantization, describe);
+  EXPECT_EQ(r.note, "NVFP4 linears run on compute capability 12.0 only (an RTX 50 GPU); " + remark);
+
+  // Without NVFP4 linears (none carries an input_scale then, so the answers are built here): the remark alone, or
+  // nothing; and linears that do not start with describe_linears' text and "; " are the quantization text, whole.
+  mi::pipeline::DitFileInfo plain;  // no index: describe_linears says "bf16"
+  plain.linears = "bf16; " + remark;
+  mi::api::describe_dit_linears(plain, r);
+  EXPECT_EQ(r.quantization, "bf16");
+  EXPECT_EQ(r.note, remark);
+  plain.linears = "bf16";
+  mi::api::describe_dit_linears(plain, r);
+  EXPECT_EQ(r.quantization, "bf16");
+  EXPECT_EQ(r.note, "");
+  const std::vector<std::string> others = {"int8_convrot256; " + remark, "bf16;" + remark, "bf16; ", "bf16x"};
+  for (const std::string& other : others) {
+    SCOPED_TRACE(other);
+    plain.linears = other;
+    mi::api::describe_dit_linears(plain, r);
+    EXPECT_EQ(r.quantization, other);
+    EXPECT_EQ(r.note, "");
+  }
+}
+
 // Every block GEMM in NVFP4 (ComfyUI's configs, here the legacy metadata form): its swizzled block scales take about
 // 283 MiB, and the file gets the NVFP4 verdict, never a size refusal.
 TEST(CApiInspect, Nvfp4Dit) {
@@ -492,21 +561,22 @@ std::vector<T> text_encoder_tensors(std::int64_t width) {
 }
 
 TEST(CApiInspect, TextEncoder) {
+  // The embedding is narrowed, so the importer's canonical shape check is off.
+  const mi::testing::AnyModelShapes narrowed;
   mi::testing::TempDir dir("inspect_te");
-  {
-    // The embedding is narrowed, so the importer's canonical shape check is off.
-    const mi::testing::AnyModelShapes narrowed;
-    write_file(dir.path() / "te.safetensors", text_encoder_tensors(4));
-    const Report rep(dir.path() / "te.safetensors");
-    EXPECT_EQ(rep.info.kind, MI_FILE_KIND_TEXT_ENCODER);
-    EXPECT_EQ(rep.info.loadable, 1) << rep.text(MI_FILE_TEXT_NOTE);
-    EXPECT_EQ(rep.info.precision, MI_PRECISION_BF16);  // no decoder linear is quantized
-    EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "bf16");
-    EXPECT_EQ(rep.info.tiers, 0u);
-  }
+  write_file(dir.path() / "te.safetensors", text_encoder_tensors(4));
+  const Report rep(dir.path() / "te.safetensors");
+  EXPECT_EQ(rep.info.kind, MI_FILE_KIND_TEXT_ENCODER);
+  EXPECT_EQ(rep.info.loadable, 1) << rep.text(MI_FILE_TEXT_NOTE);
+  EXPECT_EQ(rep.info.precision, MI_PRECISION_BF16);  // no decoder linear is quantized
+  EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "bf16");
+  EXPECT_EQ(rep.info.tiers, 0u);
+}
 
-  // A 180 MiB F32 layer tensor, which the encoder would read and keep a bf16 copy of: the importer's canonical shape
-  // check refuses it before any read. The embedding has its real shape (1 GB, sparse) so that the check reaches it.
+// A 180 MiB F32 layer tensor, which the encoder would read and keep a bf16 copy of: the importer's canonical shape
+// check refuses it before any read. The embedding has its real shape (1 GB, sparse) so that the check reaches it.
+TEST(CApiInspect, TextEncoderTensorShapes) {
+  mi::testing::TempDir dir("inspect_te_shapes");
   if (!sparse_files(dir.path())) {
     GTEST_SKIP() << "the test folder's file system has no sparse files: the 1 GB fixture would be written in full";
   }
