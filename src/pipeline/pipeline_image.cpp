@@ -10,6 +10,7 @@
 #include <stdexcept>
 
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "weights/file_reader.h"
 
 // PNG and JPEG decoding: the vendored stb_image (third_party/stb), static so the tests' own copy does not clash.
@@ -446,6 +447,7 @@ Image decode_image(std::span<const std::uint8_t> file, int channels) {
 }
 
 Image load_image(const std::filesystem::path& file, int channels) {
+  util::check_user_path(file, "image");  // a Windows device or pipe path: refused before any file-system call
   std::error_code ec;
   if (!std::filesystem::is_regular_file(file, ec)) throw ImageReadError(util::path_utf8(file) + ": not a readable image file");
   // Bounded read of the size the open file has (a file replaced meanwhile by a FIFO or a device is refused by the open,

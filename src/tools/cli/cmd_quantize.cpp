@@ -62,7 +62,7 @@ int cmd_quantize(const std::vector<std::string>& args) {
     const std::string& a = args[i];
     const bool has_value = i + 1 < args.size();
     if (a == "-o" && has_value) {
-      output = util::path_from_utf8(args[++i]);
+      output = path_arg(args[++i], "-o");
     } else if (a == "--fuse-qkv") {
       options.fuse_qkv = true;
     } else if (a == "--comfy-attention-config") {
@@ -70,7 +70,7 @@ int cmd_quantize(const std::vector<std::string>& args) {
     } else if (a == "--keep-bf16" && has_value) {
       for (auto& p : split_commas(args[++i])) options.keep_bf16.push_back(p);
     } else if (a == "--lora" && has_value) {
-      options.loras.push_back({util::path_from_utf8(args[++i]), 1.0f});
+      options.loras.push_back({path_arg(args[++i], "--lora"), 1.0f});
     } else if (a == "--lora-scale" && has_value && !options.loras.empty()) {
       const auto v = parse_number<float>(args[++i]);
       if (!v || !std::isfinite(*v)) return bad_value(a, args[i], "a finite number");
@@ -84,7 +84,7 @@ int cmd_quantize(const std::vector<std::string>& args) {
       if (!v || *v < 0) return bad_value(a, args[i], "a non-negative integer");
       options.threads = *v;
     } else if (input.empty() && !a.empty() && a[0] != '-') {
-      input = util::path_from_utf8(a);
+      input = path_arg(a, "input");
     } else {
       std::cerr << kUsage;
       return 2;

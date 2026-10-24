@@ -486,6 +486,11 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   auto log = [&](const std::string& s) {
     if (options.log) options.log(s);
   };
+  // The boundary check of every path the conversion takes (util::check_user_path), before any file-system call.
+  util::check_user_path(input, "input");
+  util::check_user_path(output, "output");
+  util::check_user_path(fs::path(output) += ".partial", "output");
+  for (const LoraInput& li : options.loras) util::check_user_path(li.file, "LoRA");
   if (!valid_convrot_group(options.group)) fail("--group must be a power of 4 in [4, 1024]");
   if (options.threads < 0) fail("--threads must be >= 0");
   for (const LoraInput& li : options.loras) {
@@ -686,12 +691,6 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   const std::uint64_t data_start = 8 + header0.size();
   for (std::size_t i = 0; i < tensors.size(); ++i) tensors[i].offset = data_start + rel[i];
 
-#ifdef _WIN32
-  // The output is written next to its name: a device or pipe name (util::open_regular_file's rules) is no file.
-  if (util::is_windows_device_path(fs::path(output) += ".partial")) {
-    fail("output " + util::path_utf8(output) + ": " + util::kNotRegularFile);
-  }
-#endif
   PartialFile partial(fs::path(output) += ".partial");
   Writer writer(partial.path(), tensors, header0);
   const int threads = options.threads;

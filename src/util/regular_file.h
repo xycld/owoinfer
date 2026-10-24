@@ -27,11 +27,24 @@ inline constexpr const char* kLeasedFile = "file is leased by another process (E
 //   - the device and NT namespaces (\\?\, \\.\, \??\): only a drive path (X:\...) or
 //     UNC\server\share\... names a file; everything else is refused (\\?\pipe\x, \\.\COM1, \\?\PhysicalDrive0,
 //     \\?\GLOBALROOT\..., \\.\C: the raw volume, \\?\Volume{...});
-//   - UNC paths (\\server\share\..., or UNC\ under a namespace prefix) whose share is `pipe` or `mailslot`, on any
-//     server; other UNC shares (models on a NAS) are files.
+//   - UNC paths (\\server\share\..., or UNC\ under a namespace prefix) whose share is `pipe`, `mailslot` or `IPC$`
+//     (trailing dots and spaces ignored, as Win32 path normalization drops them), on any server; other UNC shares
+//     (models on a NAS, `pipe$`) are files.
 // DOS device names in any folder (NUL, CONIN$, C:\m\COM1, COM1.txt) are not visible in the text: GetFullPathNameW
 // maps them to \\.\<name>, which this refuses.
 bool windows_path_names_device(std::wstring_view path);
+
+// The boundary check of a user-supplied path, called once where it enters (C API and server fields, CLI arguments, the
+// converter's input and output, the pipeline's options and request, quality_cert's file identity, image and PNG
+// paths) before any std::filesystem call touches it: MSVC's canonical, weakly_canonical and equivalent (and status,
+// exists, file_size on a reparse point) open the path without SECURITY_SQOS_PRESENT. On Windows it throws
+// std::invalid_argument "<what>: not a regular file: <path>" when is_windows_device_path says so; elsewhere it does
+// nothing (POSIX device files are refused where they are opened, open_regular_file).
+void check_user_path(const std::filesystem::path& path, std::string_view what);
+
+// A path's identity for cache keys, without opening it on Windows: std::filesystem::weakly_canonical on POSIX (as
+// before); on Windows std::filesystem::absolute (GetFullPathNameW, which opens nothing), lexically normalized.
+std::filesystem::path path_key(const std::filesystem::path& path);
 
 #ifdef _WIN32
 // windows_path_names_device of the path or of its GetFullPathNameW form (true too when there is no full path): such a
@@ -39,10 +52,12 @@ bool windows_path_names_device(std::wstring_view path);
 // the caller; a device's open runs its driver.) Every CreateFileW of a user path checks it first.
 bool is_windows_device_path(const std::filesystem::path& path);
 
-// kNotRegular without opening anything for is_windows_device_path or a path whose attributes say directory or device;
-// then CreateFileW(GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING, `flags` |
-// SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION as dwFlagsAndAttributes), and the handle must be FILE_TYPE_DISK with
-// neither FILE_ATTRIBUTE_DIRECTORY nor FILE_ATTRIBUTE_DEVICE in its FileAttributeTagInfo. `handle` receives the HANDLE
+// kNotRegular without opening anything for is_windows_device_path. Then a probe: CreateFileW(FILE_READ_ATTRIBUTES,
+// share-all, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION), which reads
+// no data and runs no device read; its handle must be FILE_TYPE_DISK with neither FILE_ATTRIBUTE_DIRECTORY nor
+// FILE_ATTRIBUTE_DEVICE in its FileAttributeTagInfo. Then CreateFileW(GENERIC_READ, share-all, OPEN_EXISTING, `flags`
+// | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION), whose handle is checked the same way (the path may have been
+// replaced since the probe). Every kernel open of the path carries SECURITY_SQOS_PRESENT. `handle` receives the HANDLE
 // on kOk.
 OpenStatus open_regular_file(const std::filesystem::path& path, unsigned long flags, void*& handle);
 #else

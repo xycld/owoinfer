@@ -721,7 +721,13 @@ TEST(RegularFile, WindowsDevicePaths) {
       LR"(\/?\pipe\x)", LR"(/\.\COM1)", LR"(\\localhost\pipe\x)", LR"(\\host\PIPE\x)", LR"(//host/Pipe/x)",
       LR"(\\host\mailslot\x)", LR"(\\host\MAILSLOT\x)", LR"(\\?\UNC\host\pipe\x)", LR"(\\?\unc\host\Pipe)",
       LR"(//?/UNC/host/mailslot/x)", LR"(\??\UNC\localhost\pipe\x)", LR"(\\?\UNC\host)", LR"(\\?\UNC)",
-      LR"(\\host)", LR"(\\host\)", LR"(\\.)", LR"(\\?)"};
+      LR"(\\host)", LR"(\\host\)", LR"(\\.)", LR"(\\?)",
+      // IPC$ (the named pipes' share), and share names Win32 normalization turns into pipe (trailing dots, spaces).
+      LR"(\\host\IPC$\x)", LR"(\\?\UNC\host\ipc$\x)", LR"(//host/Ipc$/x)", LR"(\\host\pipe.\x)",
+      LR"(\\host\pipe..\x)", LR"(\\host\pipe \x)", LR"(\\host\mailslot.\x)", LR"(\\?\UNC\host\pipe.\x)",
+      // DOS device names as GetFullPathNameW gives them, superscript-digit ports included (COM¹ is COM1 to Windows).
+      L"\\\\.\\COM\u00B9", L"\\\\.\\COM\u00B2", L"\\\\.\\COM\u00B3", L"\\\\.\\LPT\u00B9", LR"(\\.\LPT1)", LR"(\\.\AUX)",
+      LR"(\\.\PRN)", LR"(\\.\CON)"};
   for (const wchar_t* p : devices) EXPECT_TRUE(windows_path_names_device(p)) << std::wstring(p).size() << " chars";
   const wchar_t* files[] = {
       LR"(C:\m\model.safetensors)", LR"(c:/m/model.safetensors)", LR"(m\model.safetensors)", LR"(model.safetensors)",
@@ -729,8 +735,45 @@ TEST(RegularFile, WindowsDevicePaths) {
       LR"(\\.\D:\m\x)", LR"(\??\C:\m\x)", LR"(\\nas\models\m.safetensors)", LR"(//nas/models/m.safetensors)",
       LR"(\\nas\pipeline\m.safetensors)", LR"(\\nas\mailslots\m)", LR"(\\?\UNC\nas\models\m.safetensors)",
       LR"(\\?\unc\nas\share\x)", LR"(//?/UNC/nas/models/m)", LR"(C:\m\COM1)", LR"(COM1.txt)", LR"(NUL)",
-      LR"(C:\pipe\x)", LR"(pipe\x)"};
+      LR"(C:\pipe\x)", LR"(pipe\x)",
+      // `pipe$` is an ordinary (hidden) file share, not the named pipes' namespace (that is `pipe`, or IPC$).
+      LR"(\\host\pipe$\x)", LR"(\\?\UNC\host\pipe$\x)", LR"(\\host\pipes\x)", LR"(\\host\ipc\x)",
+      // 8.3 short names.
+      LR"(C:\PROGRA~1\MOSSIN~1\MODEL~1.SAF)", LR"(\\nas\MODELS~1\X~1.SAF)", LR"(\\?\C:\PROGRA~1\M~1)",
+      // Text that only GetFullPathNameW turns into a device (on Windows): not a device by its text.
+      L"C:\\m\\COM\u00B9", L"COM\u00B9.txt", LR"(CONIN$)"};
   for (const wchar_t* p : files) EXPECT_FALSE(windows_path_names_device(p)) << std::wstring(p).size() << " chars";
+  // Long paths under \\?\ (beyond MAX_PATH, up to the 32767 characters NT allows) are files.
+  std::wstring long_path = LR"(\\?\C:\models)";
+  while (long_path.size() < 32000) long_path += L"\\a-rather-long-folder-name";
+  EXPECT_FALSE(windows_path_names_device(long_path + L"\\model.safetensors"));
+  EXPECT_FALSE(windows_path_names_device(LR"(\\?\UNC\nas\models)" + long_path.substr(13)));
+  EXPECT_TRUE(windows_path_names_device(LR"(\\?\UNC\nas\pipe)" + long_path.substr(13)));
+}
+
+// The boundary check of user paths (util::check_user_path): on Windows a device or pipe path is refused, naming the
+// field, before any file-system call; off Windows it is a no-op (device files are refused where they are opened, by
+// util::open_regular_file). util::path_key opens nothing on Windows and is weakly_canonical elsewhere.
+TEST(RegularFile, UserPathBoundary) {
+  TempDir dir("user_path");
+  const auto file = make_pattern_file(dir, 16);
+  EXPECT_NO_THROW(mi::util::check_user_path(file, "dit_file"));
+  EXPECT_NO_THROW(mi::util::check_user_path(dir.path(), "cache_dir"));
+#ifdef _WIN32
+  for (const char* p : {R"(\\.\pipe\x)", R"(\\?\GLOBALROOT\Device\Null)", R"(\\host\IPC$\x)", R"(//./COM1)", "NUL"}) {
+    try {
+      mi::util::check_user_path(mi::util::path_from_utf8(p), "dit_file");
+      ADD_FAILURE() << p << " passed";
+    } catch (const std::invalid_argument& e) {
+      EXPECT_EQ(std::string(e.what()), std::string("dit_file: not a regular file: ") + p);
+    }
+  }
+  EXPECT_EQ(mi::util::path_key(dir.path() / "sub" / ".." / "data.bin"), std::filesystem::absolute(file));
+#else
+  EXPECT_NO_THROW(mi::util::check_user_path(R"(\\.\pipe\x)", "dit_file"));
+  EXPECT_NO_THROW(mi::util::check_user_path("/dev/null", "dit_file"));
+  EXPECT_EQ(mi::util::path_key(dir.path() / "sub" / ".." / "data.bin"), std::filesystem::weakly_canonical(file));
+#endif
 }
 
 #ifdef __linux__

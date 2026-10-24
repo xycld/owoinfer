@@ -32,7 +32,6 @@ namespace mi::cli {
 namespace {
 
 namespace fs = std::filesystem;
-using util::path_from_utf8;
 
 constexpr const char* kUsage =
     "usage: moss-infer generate (--params <parameters.json> | --prompt <text>) --model <bundle_dir>\n"
@@ -278,7 +277,7 @@ int cmd_generate(const std::vector<std::string>& args) {
     flags.emplace_back(a, args[++i]);
   }
   for (const auto& [f, v] : flags) {
-    if (f == "--params") params = path_from_utf8(v);
+    if (f == "--params") params = util::path_from_utf8(v);  // a stream: process substitution too
   }
   if (!params.empty()) {
     pdoc = json::parse(read_file(params));
@@ -296,10 +295,10 @@ int cmd_generate(const std::vector<std::string>& args) {
     for (const auto& [f, v] : flags) {
       if (f == "--params") continue;
       else if (f == "--prompt") req.prompt = v, have_prompt = true;
-      else if (f == "--model") req.model = path_from_utf8(v);
-      else if (f == "-o" || f == "--output") out_png = path_from_utf8(v);
-      else if (f == "--latent-out") out_latent = path_from_utf8(v);
-      else if (f == "--json-report") report = path_from_utf8(v);
+      else if (f == "--model") req.model = path_arg(v, f);
+      else if (f == "-o" || f == "--output") out_png = path_arg(v, f);
+      else if (f == "--latent-out") out_latent = path_arg(v, f);
+      else if (f == "--json-report") report = path_arg(v, f);
       else if (f == "--negative") req.negative_prompt = v;
       else if (f == "--size") {
         size_given = true;
@@ -327,15 +326,15 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--noise-source") req.noise_source = pipeline::parse_noise_source(v);
       else if (f == "--eta") req.eta = to_double(f, v);
       else if (f == "--s-noise") req.s_noise = to_double(f, v);
-      else if (f == "--dataspace") req.dataspace_path = path_from_utf8(v);
+      else if (f == "--dataspace") req.dataspace_path = path_arg(v, f);
       else if (f == "--no-metadata") req.save_metadata = false;
-      else if (f == "--lora") req.loras.push_back({path_from_utf8(v), 1.0f});
+      else if (f == "--lora") req.loras.push_back({path_arg(v, f), 1.0f});
       else if (f == "--lora-scale") {
         if (req.loras.empty()) throw std::invalid_argument("--lora-scale must follow a --lora");
         req.loras.back().strength = static_cast<float>(to_double(f, v));
       }
       else if (f == "--lora-strict") options.lora_strict = true;
-      else if (f == "--control") req.control.adapter = path_from_utf8(v);
+      else if (f == "--control") req.control.adapter = path_arg(v, f);
       else if (f == "--control-scale") req.control.lora_strength = static_cast<float>(to_double(f, v));
       else if (f == "--control-image") {
         const std::size_t eq = v.find('=');
@@ -343,18 +342,18 @@ int cmd_generate(const std::vector<std::string>& args) {
         pipeline::Request::ControlImage c;
         c.kind = v.substr(0, eq);
         req.control.images.push_back(c);
-        control_images.push_back(path_from_utf8(v.substr(eq + 1)));
+        control_images.push_back(path_arg(v.substr(eq + 1), f));
       }
       else if (f == "--control-strength" || f == "--control-start" || f == "--control-end") {
         if (req.control.images.empty()) throw std::invalid_argument(f + " must follow a --control-image");
         pipeline::Request::ControlImage& c = req.control.images.back();
         (f == "--control-strength" ? c.strength : f == "--control-start" ? c.start : c.end) = to_double(f, v);
       }
-      else if (f == "--time-embedding") options.time_embedding_file = path_from_utf8(v);
+      else if (f == "--time-embedding") options.time_embedding_file = path_arg(v, f);
       else if (f == "--distill") {
         moss_dit::DistillBundle b;
         try {
-          b = moss_dit::open_distill_bundle(path_from_utf8(v));
+          b = moss_dit::open_distill_bundle(path_arg(v, f));
           if (!b.dataspace.empty()) {
             distill_steps = static_cast<int>(pipeline::load_dataspace(util::path_utf8(b.dataspace)).step_codes.size());
           }
@@ -374,23 +373,23 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--vram-budget") options.vram_budget = pipeline::vram_option_bytes(to_double(f, v), kGiB, f);
       else if (f == "--vram-reserve") options.vram_reserve = pipeline::vram_option_bytes(to_double(f, v), 1024.0 * 1024.0, f);
       else if (f == "--host-ram-budget") options.host_ram_budget = pipeline::vram_option_bytes(to_double(f, v), kGiB, f);
-      else if (f == "--cache-dir") options.cache_dir = path_from_utf8(v);
+      else if (f == "--cache-dir") options.cache_dir = path_arg(v, f);
       else if (f == "--then-prompt") then_prompts.push_back(v);
       else if (f == "--direct-io") options.direct_io = true;
       else if (f == "--buffered-io") options.dit_load_direct_io = false;
       else if (f == "--te-host-pin") options.te_host_pin = planner::parse_te_host_pin(v);
-      else if (f == "--cert-dir") options.certificate_dirs.push_back(path_from_utf8(v));
+      else if (f == "--cert-dir") options.certificate_dirs.push_back(path_arg(v, f));
       else if (f == "--dit-blocks") options.block_path = moss_dit::parse_block_path(v);
-      else if (f == "--dit") options.dit_file = path_from_utf8(v);
-      else if (f == "--te") options.text_encoder_file = path_from_utf8(v);
-      else if (f == "--vae") options.vae_file = path_from_utf8(v);
-      else if (f == "--preview") preview_png = path_from_utf8(v);
+      else if (f == "--dit") options.dit_file = path_arg(v, f);
+      else if (f == "--te") options.text_encoder_file = path_arg(v, f);
+      else if (f == "--vae") options.vae_file = path_arg(v, f);
+      else if (f == "--preview") preview_png = path_arg(v, f);
       else if (f == "--preview-every") preview_every = to_int32(f, v);
       else if (f == "--tier") options.tier = planner::parse_tier(v);
       else if (f == "--attention") options.attention = v == "auto" ? std::optional<planner::AttentionMode>() : planner::parse_attention(v);
-      else if (f == "--init-image") init_image = path_from_utf8(v);
+      else if (f == "--init-image") init_image = path_arg(v, f);
       else if (f == "--strength") strength = to_double(f, v);
-      else if (f == "--mask") mask = path_from_utf8(v);
+      else if (f == "--mask") mask = path_arg(v, f);
       else if (f == "--resize") req.resize = pipeline::parse_resize_mode(v);
       else if (f == "--hires") hires = v;
       else if (f == "--hires-strength") req.hires.strength = to_double(f, v);
@@ -443,7 +442,7 @@ int cmd_generate(const std::vector<std::string>& args) {
     const auto param_path = [&](const char* key) {
       const std::string v = param_string(key);
       if (v.empty()) return fs::path();
-      const fs::path p = path_from_utf8(v);
+      const fs::path p = path_arg(v, std::string("--params ") + key);
       return p.is_absolute() ? p : params.parent_path() / p;
     };
     if (init_image.empty()) init_image = param_path("init_image");

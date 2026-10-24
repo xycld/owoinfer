@@ -44,6 +44,7 @@
 #include "runtime/stream_set.h"
 #include "tokenizer/qwen_bpe.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
 #include "weights/model_index.h"
@@ -321,6 +322,23 @@ auto model_file_errors(const std::filesystem::path& file, F&& f) -> decltype(f()
     const std::string what = e.what();
     throw weights::IndexError(what.find(where) == std::string::npos ? where + ": " + what : what);
   }
+}
+
+// The boundary check of the options' and the request's paths (util::check_user_path), before any std::filesystem call
+// touches them (cache keys use util::path_key, which opens nothing on Windows).
+void check_user_paths(const PipelineOptions& o, const Request& r) {
+  const std::pair<const std::filesystem::path*, const char*> paths[] = {
+      {&o.cache_dir, "cache_dir"},
+      {&o.dit_file, "dit_file"},
+      {&o.text_encoder_file, "text_encoder_file"},
+      {&o.vae_file, "vae_file"},
+      {&o.time_embedding_file, "time_embedding_file"},
+      {&r.model, "model"},
+      {&r.dataspace_path, "dataspace_path"},
+      {&r.control.adapter, "control_adapter"}};
+  for (const auto& [path, what] : paths) util::check_user_path(*path, what);
+  for (const std::filesystem::path& d : o.certificate_dirs) util::check_user_path(d, "certificate_dirs");
+  for (const lora::LoraSpec& l : r.loras) util::check_user_path(l.path, "loras");
 }
 
 std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file) {
@@ -762,7 +780,7 @@ GenerationMetadata generation_metadata(const Request& q, const Result& r) {
   m.engine_version = std::to_string(MI_VERSION_MAJOR) + "." + std::to_string(MI_VERSION_MINOR) + "." + std::to_string(MI_VERSION_PATCH);
   m.tier = planner::tier_name(r.tier.effective);
   const auto name = [](const std::string& p) { return util::path_utf8(util::path_from_utf8(p).filename()); };
-  m.models.push_back({"bundle", util::path_utf8(std::filesystem::weakly_canonical(q.model).filename()), ""});
+  m.models.push_back({"bundle", util::path_utf8(util::path_key(q.model).filename()), ""});
   if (!r.dit_source.empty()) m.models.push_back({"dit", name(r.dit_source), ""});
   if (!r.te_source.empty()) m.models.push_back({"text_encoder", name(r.te_source), ""});
   if (!r.vae_source.empty()) m.models.push_back({"vae", name(r.vae_source), ""});
@@ -912,7 +930,7 @@ struct Pipeline::Impl {
   }
 
   Bundle& bundle(const std::filesystem::path& dir, double& load_s) {
-    const std::string key = util::path_utf8(std::filesystem::weakly_canonical(dir));
+    const std::string key = util::path_utf8(util::path_key(dir));
     auto it = bundles.find(key);
     if (it == bundles.end()) {
       const auto t0 = Clock::now();
@@ -926,7 +944,7 @@ struct Pipeline::Impl {
   DitSource& dit_source(const Bundle& b, double& load_s) {
     const bool file = !options.dit_file.empty();
     const std::filesystem::path path = file ? options.dit_file : b.dir;
-    const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(std::filesystem::weakly_canonical(path));
+    const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(util::path_key(path));
     auto it = dit_sources.find(key);
     if (it == dit_sources.end()) {
       const auto t0 = Clock::now();
@@ -952,7 +970,7 @@ struct Pipeline::Impl {
   TeSource& te_source(const Bundle& b, double& load_s) {
     const bool file = !options.text_encoder_file.empty();
     const std::filesystem::path path = file ? options.text_encoder_file : b.dir;
-    const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(std::filesystem::weakly_canonical(path));
+    const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(util::path_key(path));
     auto it = te_sources.find(key);
     if (it == te_sources.end()) {
       const auto t0 = Clock::now();
@@ -981,8 +999,8 @@ struct Pipeline::Impl {
     const bool file = !options.vae_file.empty();
     const std::filesystem::path path = file ? options.vae_file : b.dir;
     // A file is decoded with the bundle's latent statistics: one source per (file, bundle).
-    const std::string key = (file ? "file:" + util::path_utf8(std::filesystem::weakly_canonical(path)) + "|bundle:" : "bundle:") +
-                            util::path_utf8(std::filesystem::weakly_canonical(b.dir));
+    const std::string key = (file ? "file:" + util::path_utf8(util::path_key(path)) + "|bundle:" : "bundle:") +
+                            util::path_utf8(util::path_key(b.dir));
     auto it = vae_sources.find(key);
     if (it == vae_sources.end()) {
       const auto t0 = Clock::now();
@@ -1006,8 +1024,8 @@ struct Pipeline::Impl {
 
   // The VAE encoder of this call (EncoderSource).
   EncoderSource& encoder_source(const Bundle& b, double& load_s) {
-    const std::string key = (options.vae_file.empty() ? std::string() : "file:" + util::path_utf8(std::filesystem::weakly_canonical(options.vae_file)) + "|") +
-                            "bundle:" + util::path_utf8(std::filesystem::weakly_canonical(b.dir));
+    const std::string key = (options.vae_file.empty() ? std::string() : "file:" + util::path_utf8(util::path_key(options.vae_file)) + "|") +
+                            "bundle:" + util::path_utf8(util::path_key(b.dir));
     auto it = encoder_sources.find(key);
     if (it == encoder_sources.end()) {
       const auto t0 = Clock::now();
@@ -1044,7 +1062,7 @@ struct Pipeline::Impl {
   // Data-space sampler parameters by file (read once per pipeline).
   std::map<std::string, DataSpaceParams> dataspaces;
   const DataSpaceParams& dataspace(const std::filesystem::path& file) {
-    const std::string key = util::path_utf8(std::filesystem::weakly_canonical(file));
+    const std::string key = util::path_utf8(util::path_key(file));
     auto it = dataspaces.find(key);
     if (it == dataspaces.end()) it = dataspaces.emplace(key, load_dataspace(util::path_utf8(file))).first;
     return it->second;
@@ -1597,6 +1615,7 @@ Result Pipeline::preload(const PreloadOptions& options) {
 // generate(), or with `preload` the same up to the plan and the arena, then the loads of the models the plan keeps.
 Result Pipeline::run(const Request& req, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
+  check_user_paths(m.options, req);
   validate(req);
   Result r;
   Timings& tm = r.timings;
@@ -1665,7 +1684,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
         }
       }
     };
-    const std::string key = util::path_utf8(std::filesystem::weakly_canonical(req.control.adapter));
+    const std::string key = util::path_utf8(util::path_key(req.control.adapter));
     if (!m.control_file || m.control_key != key) {
       if (!std::filesystem::is_regular_file(req.control.adapter)) {
         throw std::invalid_argument("control adapter not found: " + util::path_utf8(req.control.adapter));
@@ -1795,7 +1814,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     // The control adapter's entry is tagged: the same file as a plain LoRA is another stack (and is refused below).
     for (std::size_t i = 0; i < loras.size(); ++i) {
       files += (ctl != nullptr && i + 1 == loras.size() ? "|control:" : "|") +
-               util::path_utf8(std::filesystem::weakly_canonical(loras[i].path)) + "#" + file_stamp(loras[i].path);
+               util::path_utf8(util::path_key(loras[i].path)) + "#" + file_stamp(loras[i].path);
     }
     if (!m.lora_stack || files != m.lora_files_key) {
       for (const lora::LoraSpec& l : req.loras) {

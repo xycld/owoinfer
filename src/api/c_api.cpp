@@ -26,6 +26,7 @@
 #include "runtime/device_arena.h"
 #include "util/json.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "weights/file_reader.h"
 #include "weights/model_index.h"
 #include "weights/safetensors.h"
@@ -1149,7 +1150,9 @@ mi_status mi_inspect_file(const char* path, mi_file_report** out_report) {
     require(path, "path");
     if (*path == '\0') throw std::invalid_argument("path is empty.");
     auto report = std::make_unique<mi_file_report>();
-    report->inspection = mi::api::inspect_file(mi::util::path_from_utf8(path));
+    const std::filesystem::path file = mi::util::path_from_utf8(path);
+    mi::util::check_user_path(file, "path");  // a Windows device or pipe path: refused before anything touches it
+    report->inspection = mi::api::inspect_file(file);
     *out_report = report.release();
     return MI_OK;
   });

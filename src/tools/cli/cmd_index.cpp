@@ -11,15 +11,14 @@
 namespace mi::cli {
 
 namespace fs = std::filesystem;
-using util::path_from_utf8;
 
 int cmd_index(const std::vector<std::string>& args) {
   fs::path bundle, out;
   weights::BuildOptions options;
   for (std::size_t i = 0; i < args.size(); ++i) {
-    if (args[i] == "-o" && i + 1 < args.size()) out = path_from_utf8(args[++i]);
+    if (args[i] == "-o" && i + 1 < args.size()) out = path_arg(args[++i], "-o");
     else if (args[i] == "--checksum") options.checksum = true;
-    else if (bundle.empty() && !args[i].empty() && args[i][0] != '-') bundle = path_from_utf8(args[i]);
+    else if (bundle.empty() && !args[i].empty() && args[i][0] != '-') bundle = path_arg(args[i], "bundle_dir");
     else {
       std::cerr << "usage: moss-infer index <bundle_dir> [-o <path>] [--checksum]\n";
       return 2;
@@ -44,7 +43,7 @@ int cmd_inspect(const std::vector<std::string>& args) {
     std::cerr << "usage: moss-infer inspect <bundle_dir|.mossidx>\n";
     return 2;
   }
-  const fs::path target = path_from_utf8(args[0]);
+  const fs::path target = path_arg(args[0], "target");
   weights::ModelIndex index = fs::is_directory(target) ? weights::build_index(target) : weights::load_index(target);
   weights::print_summary(index, std::cout);
   return 0;

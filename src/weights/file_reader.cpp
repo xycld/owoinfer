@@ -150,11 +150,16 @@ double page_cache_fraction(const std::filesystem::path&) { return -1.0; }
 
 DirectIoSupport direct_io_support(const std::filesystem::path& path) {
   const std::string name = util::path_utf8(path.filename());
-  const DWORD attributes = GetFileAttributesW(path.c_str());
-  if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_COMPRESSED) != 0) {
-    return {false, name + " is NTFS-compressed: unbuffered reads gain nothing"};
-  }
+  // The attributes from a handle opened through util::open_regular_file (no path-based query, which would open the path
+  // without SECURITY_SQOS_PRESENT when it is a reparse point).
   HANDLE h = INVALID_HANDLE_VALUE;
+  if (open_win(path, false, h) == util::OpenStatus::kOk) {
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    const bool compressed = GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag) &&
+                            (tag.FileAttributes & FILE_ATTRIBUTE_COMPRESSED) != 0;
+    CloseHandle(h);
+    if (compressed) return {false, name + " is NTFS-compressed: unbuffered reads gain nothing"};
+  }
   const util::OpenStatus status = open_win(path, true, h);
   if (status == util::OpenStatus::kNotRegular) return {false, name + " is " + util::kNotRegularFile};
   if (status != util::OpenStatus::kOk) {

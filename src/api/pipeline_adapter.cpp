@@ -33,6 +33,7 @@
 #include "pipeline/sampler.h"
 #include "planner/planner.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 
 namespace mi::api {
 
@@ -79,9 +80,17 @@ std::vector<int> layer_list(const int32_t* layers, std::size_t count, const char
   return std::vector<int>(layers, layers + count);
 }
 
+// A UTF-8 path field, through the boundary check (util::check_user_path: a Windows device or pipe path is refused
+// before any file-system call touches it). Every path field of the C API enters through here.
+fs::path user_path(const char* utf8, const std::string& name) {
+  fs::path path = util::path_from_utf8(utf8);
+  util::check_user_path(path, name);
+  return path;
+}
+
 // A UTF-8 path that must name an existing regular file.
 fs::path existing_file(const char* utf8, const std::string& name) {
-  const fs::path path = util::path_from_utf8(utf8);
+  const fs::path path = user_path(utf8, name);
   std::error_code ec;
   const fs::file_status st = fs::status(path, ec);
   if (!fs::exists(st)) throw std::invalid_argument(name + ": file not found: " + utf8);
@@ -181,7 +190,7 @@ mi_block_path to_block_path(moss_dit::BlockPath path) {
 // The bundle directory `p` names, after the format checks.
 fs::path model_dir(const mi_engine_params& p) {
   if (p.model_path == nullptr || *p.model_path == '\0') throw std::invalid_argument("model_path is required.");
-  const fs::path path = util::path_from_utf8(p.model_path);
+  const fs::path path = user_path(p.model_path, "model_path");
   std::error_code ec;
   const fs::file_status st = fs::status(path, ec);
   if (p.model_format == MI_MODEL_FORMAT_COMFYUI || (p.model_format == MI_MODEL_FORMAT_AUTO && fs::is_regular_file(st))) {
@@ -265,7 +274,7 @@ bool given(const char* utf8) { return utf8 != nullptr && *utf8 != '\0'; }
 // A distill bundle directory: DistillError (a bundle without any of its files, an unreadable entry) is a model error;
 // a path that is not a directory is an argument error.
 moss_dit::DistillBundle distill_bundle(const char* utf8, const std::string& name) {
-  const fs::path dir = util::path_from_utf8(utf8);
+  const fs::path dir = user_path(utf8, name);
   std::error_code ec;
   if (!fs::is_directory(dir, ec)) throw std::invalid_argument(name + ": not a directory: " + utf8);
   try {
@@ -406,7 +415,7 @@ pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embe
   q.eta = p.eta;
   q.s_noise = p.s_noise;
   q.save_metadata = p.save_metadata != 0;
-  if (given(p.dataspace_path)) q.dataspace_path = util::path_from_utf8(p.dataspace_path);
+  if (given(p.dataspace_path)) q.dataspace_path = user_path(p.dataspace_path, "dataspace_path");
   if (p.loras_count > 0 && p.loras == nullptr) throw std::invalid_argument("loras: NULL array with a nonzero count.");
   const auto check_lora_count = [](std::size_t n, const char* what) {
     if (n > kMaxLoras) {
@@ -581,7 +590,7 @@ pipeline::PipelineOptions to_options(const mi_engine_params& p) {
   o.host_ram_budget = p.host_ram_budget_bytes != 0 ? budget_bytes(p.host_ram_budget_bytes, "host_ram_budget_bytes") : 0;
   o.embedding_cache = p.embedding_cache != 0;
   o.direct_io = p.direct_io != 0;
-  if (p.cache_dir != nullptr && *p.cache_dir != '\0') o.cache_dir = util::path_from_utf8(p.cache_dir);
+  if (p.cache_dir != nullptr && *p.cache_dir != '\0') o.cache_dir = user_path(p.cache_dir, "cache_dir");
   switch (p.block_path) {
     case MI_BLOCK_PATH_DEFAULT: break;  // PipelineOptions' default
     case MI_BLOCK_PATH_OP_BY_OP: o.block_path = moss_dit::BlockPath::kOpByOp; break;
@@ -610,7 +619,7 @@ pipeline::PipelineOptions to_options(const mi_engine_params& p) {
     if (!given(p.certificate_dirs[i])) {
       throw std::invalid_argument("certificate_dirs[" + std::to_string(i) + "] is empty; pass a directory.");
     }
-    o.certificate_dirs.push_back(util::path_from_utf8(p.certificate_dirs[i]));
+    o.certificate_dirs.push_back(user_path(p.certificate_dirs[i], "certificate_dirs[" + std::to_string(i) + "]"));
   }
   switch (p.dit_direct_io) {
     case MI_DIRECT_IO_AUTO: o.dit_load_direct_io = std::nullopt; break;  // adaptive
@@ -1101,12 +1110,14 @@ void write_png(const Generation& generation, const std::string& path_utf8) {
   if (generation.rgb.empty()) throw std::invalid_argument("the result has no image (the generation was cancelled).");
   std::vector<pipeline::PngText> text;
   for (const auto& [keyword, body] : generation.png_text) text.push_back({keyword, body});
-  pipeline::write_png_rgb8(util::path_from_utf8(path_utf8), generation.rgb, generation.width, generation.height, text);
+  const fs::path path = user_path(path_utf8.c_str(), "path");
+  pipeline::write_png_rgb8(path, generation.rgb, generation.width, generation.height, text);
 }
 
 void write_png_rgb(const std::string& path_utf8, const std::uint8_t* rgb, int width, int height) {
   const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3;
-  pipeline::write_png_rgb8(util::path_from_utf8(path_utf8), std::span<const std::uint8_t>(rgb, bytes), width, height);
+  const fs::path path = user_path(path_utf8.c_str(), "path");
+  pipeline::write_png_rgb8(path, std::span<const std::uint8_t>(rgb, bytes), width, height);
 }
 
 }  // namespace mi::api

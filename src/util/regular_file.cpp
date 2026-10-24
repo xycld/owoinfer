@@ -1,6 +1,7 @@
 #include "util/regular_file.h"
 
 #include <cstddef>
+#include <stdexcept>
 #include <string>
 
 #ifdef _WIN32
@@ -45,10 +46,12 @@ std::wstring_view component(std::wstring_view s, std::size_t& pos) {
   return c;
 }
 
-// A UNC path's share, from `pos` (just after the server): a named pipe's or a mailslot's, or missing.
+// A UNC path's share, from `pos` (just after the server): the named pipes' (`pipe`, and `IPC$` that carries them), the
+// mailslots', or missing. Trailing dots and spaces are dropped first, as Win32 path normalization drops them.
 bool device_share(std::wstring_view s, std::size_t pos) {
-  const std::wstring_view share = component(s, pos);
-  return share.empty() || iequals(share, L"pipe") || iequals(share, L"mailslot");
+  std::wstring_view share = component(s, pos);
+  while (!share.empty() && (share.back() == L'.' || share.back() == L' ')) share.remove_suffix(1);
+  return share.empty() || iequals(share, L"pipe") || iequals(share, L"mailslot") || iequals(share, L"IPC$");
 }
 
 }  // namespace
@@ -75,6 +78,27 @@ bool windows_path_names_device(std::wstring_view p) {
   return false;
 }
 
+void check_user_path(const std::filesystem::path& path, std::string_view what) {
+#ifdef _WIN32
+  if (is_windows_device_path(path)) {
+    const std::u8string text = path.u8string();
+    throw std::invalid_argument(std::string(what) + ": " + kNotRegularFile + ": " +
+                                std::string(text.begin(), text.end()));
+  }
+#else
+  static_cast<void>(path);
+  static_cast<void>(what);
+#endif
+}
+
+std::filesystem::path path_key(const std::filesystem::path& path) {
+#ifdef _WIN32
+  return std::filesystem::absolute(path).lexically_normal();
+#else
+  return std::filesystem::weakly_canonical(path);
+#endif
+}
+
 #ifdef _WIN32
 
 bool is_windows_device_path(const std::filesystem::path& path) {
@@ -89,24 +113,32 @@ bool is_windows_device_path(const std::filesystem::path& path) {
   return windows_path_names_device(full);
 }
 
+namespace {
+
+// A disk file that is neither a directory nor a device.
+bool regular_handle(HANDLE h) {
+  FILE_ATTRIBUTE_TAG_INFO tag{};
+  return GetFileType(h) == FILE_TYPE_DISK && GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag) &&
+         (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE)) == 0;
+}
+
+}  // namespace
+
 OpenStatus open_regular_file(const std::filesystem::path& path, unsigned long flags, void*& handle) {
   if (is_windows_device_path(path)) return OpenStatus::kNotRegular;
-  // Before the open, as on POSIX; a missing path falls through to the open, which reports the error.
-  const DWORD attributes = GetFileAttributesW(path.c_str());
-  if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE)) != 0) {
-    return OpenStatus::kNotRegular;
-  }
-  // SECURITY_IDENTIFICATION: were it a pipe after all, its server could identify the caller but not impersonate it.
-  HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                         OPEN_EXISTING, flags | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
+  // SECURITY_IDENTIFICATION on every open: were it a pipe after all, its server could identify the caller but not
+  // impersonate it. The probe reads attributes only (BACKUP_SEMANTICS: a directory opens too, to be refused here).
+  const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+  const DWORD sqos = SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
+  HANDLE probe = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, share, nullptr, OPEN_EXISTING,
+                             FILE_FLAG_BACKUP_SEMANTICS | sqos, nullptr);
+  if (probe == INVALID_HANDLE_VALUE) return OpenStatus::kError;
+  const bool probed = regular_handle(probe);
+  CloseHandle(probe);
+  if (!probed) return OpenStatus::kNotRegular;
+  HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, share, nullptr, OPEN_EXISTING, flags | sqos, nullptr);
   if (h == INVALID_HANDLE_VALUE) return OpenStatus::kError;
-  // What was opened (the path may have been replaced since the check): a disk file that is neither a directory nor a
-  // device.
-  FILE_ATTRIBUTE_TAG_INFO tag{};
-  const bool regular = GetFileType(h) == FILE_TYPE_DISK &&
-                       GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag) &&
-                       (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE)) == 0;
-  if (!regular) {
+  if (!regular_handle(h)) {  // replaced since the probe
     CloseHandle(h);
     return OpenStatus::kNotRegular;
   }

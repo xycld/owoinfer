@@ -13,6 +13,7 @@
 #include <system_error>
 
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "util/rename_replace.h"
 
 namespace mi::pipeline {
@@ -273,6 +274,7 @@ std::vector<std::uint8_t> encode_png_rgb8(std::span<const std::uint8_t> rgb, int
 
 void write_png_rgb8(const std::filesystem::path& path, std::span<const std::uint8_t> rgb, int width, int height,
                     std::span<const PngText> text) {
+  util::check_user_path(path, "PNG output");  // a Windows device or pipe path: refused before anything opens it
   const std::vector<std::uint8_t> png = encode_png_rgb8(rgb, width, height, text);
   // Write a sibling temporary file and rename it over `path`, so a failed or interrupted write never leaves a
   // truncated image under the final name (rename within one directory replaces atomically on POSIX).

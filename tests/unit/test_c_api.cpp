@@ -494,6 +494,67 @@ TEST(CApi, LoraAndDataspaceValidation) {
   EXPECT_NE(last_error().find("s_noise"), std::string::npos) << last_error();
 }
 
+#ifdef _WIN32
+// Every path entry of the C API refuses a Windows device or pipe path (util::check_user_path) with
+// MI_ERR_INVALID_ARGUMENT, naming the field, before anything opens or queries it (checked before CUDA).
+TEST(CApi, PathFieldsRefuseDevicePaths) {
+  mi::testing::TempDir dir("c_api_device_paths");
+  make_fake_bundle(dir.path() / "bundle");
+  const std::string bundle = mi::util::path_utf8(dir.path() / "bundle");
+  const fs::path adapter = dir.path() / "control.safetensors";
+  std::ofstream(adapter) << "x";
+  const std::string adapter_s = mi::util::path_utf8(adapter);
+  const char* const kPipe = R"(\\.\pipe\mossinfer_test)";
+  const auto refused = [&](mi_status s, const std::string& field) {
+    EXPECT_EQ(s, MI_ERR_INVALID_ARGUMENT) << field;
+    EXPECT_NE(last_error().find(field + ": not a regular file: " + kPipe), std::string::npos)
+        << field << ": " << last_error();
+  };
+  const char* certificate_dirs[] = {kPipe};
+  const std::pair<const char*, std::function<void(mi_engine_params&)>> engine_fields[] = {
+      {"model_path", [&](mi_engine_params& e) { e.model_path = kPipe; }},
+      {"cache_dir", [&](mi_engine_params& e) { e.cache_dir = kPipe; }},
+      {"dit_file", [&](mi_engine_params& e) { e.dit_file = kPipe; }},
+      {"text_encoder_file", [&](mi_engine_params& e) { e.text_encoder_file = kPipe; }},
+      {"vae_file", [&](mi_engine_params& e) { e.vae_file = kPipe; }},
+      {"time_embedding_file", [&](mi_engine_params& e) { e.time_embedding_file = kPipe; }},
+      {"distill_dir", [&](mi_engine_params& e) { e.distill_dir = kPipe; }},
+      {"certificate_dirs[0]",
+       [&](mi_engine_params& e) { e.certificate_dirs = certificate_dirs, e.certificate_dirs_count = 1; }}};
+  for (const auto& [field, set] : engine_fields) {
+    mi_engine_params e = engine_defaults();
+    e.model_path = bundle.c_str();
+    set(e);
+    mi_engine* engine = nullptr;
+    refused(mi_engine_create(&e, &engine), field);
+    EXPECT_EQ(engine, nullptr);
+  }
+  const mi_lora lora{kPipe, 1.0};
+  const mi_control_image control{"depth", nullptr, kPipe, 1.0, 0.0, 1.0};
+  const std::pair<const char*, std::function<void(mi_gen_params&)>> gen_fields[] = {
+      {"dataspace_path", [&](mi_gen_params& g) { g.sampler = MI_SAMPLER_DATASPACE, g.dataspace_path = kPipe; }},
+      {"init_image_path", [&](mi_gen_params& g) { g.init_image_path = kPipe, g.denoise_strength = 0.5; }},
+      {"mask_path", [&](mi_gen_params& g) { g.mask_path = kPipe; }},
+      {"control_adapter", [&](mi_gen_params& g) { g.control_adapter = kPipe; }},
+      {"control_images[0].image_path", [&](mi_gen_params& g) {
+         g.control_adapter = adapter_s.c_str(), g.control_images = &control, g.control_images_count = 1;
+       }},
+      {"loras[0].path", [&](mi_gen_params& g) { g.loras = &lora, g.loras_count = 1; }},
+      {"distill_dir", [&](mi_gen_params& g) { g.distill_dir = kPipe; }}};
+  for (const auto& [field, set] : gen_fields) {
+    mi_gen_params g = gen_defaults();
+    g.prompt = "a red apple";
+    set(g);
+    refused(mi_gen_params_validate(&g), field);
+  }
+  const std::uint8_t rgb[3] = {1, 2, 3};
+  refused(mi_write_png(kPipe, rgb, 1, 1), "path");
+  mi_file_report* report = nullptr;
+  refused(mi_inspect_file(kPipe, &report), "path");
+  EXPECT_EQ(report, nullptr);
+}
+#endif
+
 // Component files: each given one must exist and be a file (checked before CUDA); "" means the bundle's.
 TEST(CApi, ComponentFiles) {
   mi::testing::TempDir dir("c_api_files");

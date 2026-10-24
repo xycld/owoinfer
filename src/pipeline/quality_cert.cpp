@@ -523,6 +523,7 @@ struct FileKey {
 };
 
 FileKey file_key(const fs::path& path) {
+  util::check_user_path(path, "model file");  // before fs::canonical, which opens the path on Windows
   std::error_code ec;
   const fs::path canon = fs::canonical(path, ec);
   if (ec) fail("cannot resolve " + util::path_utf8(path) + ": " + ec.message());
