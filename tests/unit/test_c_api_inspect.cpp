@@ -19,6 +19,7 @@
 #include <unistd.h>
 #endif
 
+#include "models/lora/lora.h"
 #include "test_util.h"
 #include "util/path.h"
 #include "weights/safetensors.h"
@@ -41,7 +42,9 @@ struct T {
 // are left as a hole (sparse where the file system allows), so files with MOSS-Image's shapes stay cheap.
 void write_file(const fs::path& path, std::vector<T> ts, const std::string& metadata_json = "") {
   std::stable_sort(ts.begin(), ts.end(),
-                   [](const T& a, const T& b) { return mi::weights::dtype_size(a.dtype) > mi::weights::dtype_size(b.dtype); });
+                   [](const T& a, const T& b) {
+                     return mi::weights::dtype_size(a.dtype) > mi::weights::dtype_size(b.dtype);
+                   });
   std::vector<std::pair<std::uint64_t, std::string>> data;  // non-zero tensors: offset in the data section, bytes
   std::string h = "{";
   if (!metadata_json.empty()) h += "\"__metadata__\":" + metadata_json;
@@ -86,10 +89,15 @@ void write_file(const fs::path& path, std::vector<T> ts, const std::string& meta
 }
 
 void write_bytes(const fs::path& path, const std::string& bytes) {
-  std::ofstream(path, std::ios::binary | std::ios::trunc).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
 enum class Gemm { kBf16, kInt8, kInt4, kInt8ScalarScale };
+
+// The comfy_quant configs of the INT8 ConvRot256 and INT4 ConvRot256 linears.
+constexpr const char* kInt8Config = R"({"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256})";
+constexpr const char* kInt4Config = R"({"format": "convrot_w4a4", "convrot_groupsize": 256, "quant_group_size": 64})";
 
 // Linear `w` [n, k] stored as `gemm` (ComfyUI comfy_quant configs).
 void add_linear(std::vector<T>& t, const std::string& w, Gemm gemm, std::int64_t n, std::int64_t k) {
@@ -98,12 +106,12 @@ void add_linear(std::vector<T>& t, const std::string& w, Gemm gemm, std::int64_t
     case Gemm::kInt8:
       t.push_back({w + ".weight", DType::kI8, {n, k}});
       t.push_back({w + ".weight_scale", DType::kF32, {n}});
-      t.push_back({w + ".comfy_quant", DType::kU8, {}, R"({"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256})"});
+      t.push_back({w + ".comfy_quant", DType::kU8, {}, kInt8Config});
       break;
     case Gemm::kInt4:
       t.push_back({w + ".weight", DType::kI8, {n, k / 2}});
       t.push_back({w + ".weight_scale", DType::kF32, {n}});
-      t.push_back({w + ".comfy_quant", DType::kU8, {}, R"({"format": "convrot_w4a4", "convrot_groupsize": 256, "quant_group_size": 64})"});
+      t.push_back({w + ".comfy_quant", DType::kU8, {}, kInt4Config});
       break;
     case Gemm::kInt8ScalarScale:
       t.push_back({w + ".weight", DType::kI8, {n, k}});
@@ -114,22 +122,25 @@ void add_linear(std::vector<T>& t, const std::string& w, Gemm gemm, std::int64_t
 }
 
 // A single-file DiT with MOSS-Image's names and shapes as check_supported_dit_file reads them: 42 blocks, the bf16
-// embedders, and block 0's proj.q [3072, 3072] and ffn_down [3072, 8192] stored as `gemm`. `extra` is added as is.
-fs::path write_dit(const fs::path& path, Gemm gemm, std::vector<T> extra = {}) {
+// embedders, and block 0's proj.q [3072, 3072] and ffn_down [3072, 8192] stored as `gemm` unless `extra` has them.
+// `extra` and `metadata_json` are added as they are.
+fs::path write_dit(const fs::path& path, Gemm gemm, std::vector<T> extra = {}, const std::string& metadata_json = "") {
   std::vector<T> t = std::move(extra);
+  const auto given = [&](const std::string& name) {
+    return std::any_of(t.begin(), t.end(), [&](const T& x) { return x.name == name; });
+  };
   for (int i = 0; i < 42; ++i) {
     const std::string b = "layers." + std::to_string(i) + ".";
     t.push_back({b + "norm1.weight", DType::kBF16, {3072}});
     t.push_back({b + "q_norm.weight", DType::kBF16, {128}});
   }
-  const bool q_given = std::any_of(t.begin(), t.end(), [](const T& x) { return x.name == "layers.0.proj.q.weight"; });
-  if (!q_given) add_linear(t, "layers.0.proj.q", gemm, 3072, 3072);
-  add_linear(t, "layers.0.proj.ffn_down", gemm, 3072, 8192);
+  if (!given("layers.0.proj.q.weight")) add_linear(t, "layers.0.proj.q", gemm, 3072, 3072);
+  if (!given("layers.0.proj.ffn_down.weight")) add_linear(t, "layers.0.proj.ffn_down", gemm, 3072, 8192);
   t.push_back({"video_embedder.weight", DType::kBF16, {3072, 128}});
   t.push_back({"text_embedder.proj.weight", DType::kBF16, {3072, 4096}});
   t.push_back({"time_embedding.0.weight", DType::kBF16, {3072, 256}});
   t.push_back({"final_linear_video.weight", DType::kBF16, {128, 3072}});
-  write_file(path, t);
+  write_file(path, t, metadata_json);
   return path;
 }
 
@@ -162,7 +173,9 @@ struct Report {
     return s != nullptr ? s : "";
   }
   std::string text(mi_file_text_kind k) const { return checked(r != nullptr ? mi_file_report_text(r, k) : nullptr); }
-  std::string tier_reason(mi_tier t) const { return checked(r != nullptr ? mi_file_report_tier_reason(r, t) : nullptr); }
+  std::string tier_reason(mi_tier t) const {
+    return checked(r != nullptr ? mi_file_report_tier_reason(r, t) : nullptr);
+  }
   mi_file_report* r = nullptr;
   mi_file_info info{};
 };
@@ -197,7 +210,8 @@ TEST(CApiInspect, QuantizedDits) {
     EXPECT_EQ(rep.info.precision, MI_PRECISION_INT8);
     EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "int8_convrot256");
     EXPECT_EQ(rep.info.tiers, bit(MI_TIER_AUTO) | bit(MI_TIER_HIGH));
-    EXPECT_NE(rep.tier_reason(MI_TIER_REFERENCE).find("quantized"), std::string::npos) << rep.tier_reason(MI_TIER_REFERENCE);
+    EXPECT_NE(rep.tier_reason(MI_TIER_REFERENCE).find("quantized"), std::string::npos)
+        << rep.tier_reason(MI_TIER_REFERENCE);
     EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("INT8 ConvRot GEMMs, exact attention, uncertified"), std::string::npos)
         << rep.tier_reason(MI_TIER_AUTO);
   }
@@ -207,7 +221,8 @@ TEST(CApiInspect, QuantizedDits) {
     EXPECT_EQ(rep.info.precision, MI_PRECISION_W4A4);
     EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "int4_convrot256");
     EXPECT_EQ(rep.info.tiers, bit(MI_TIER_TURBO));
-    EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("choose tier turbo"), std::string::npos) << rep.tier_reason(MI_TIER_AUTO);
+    EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("choose tier turbo"), std::string::npos)
+        << rep.tier_reason(MI_TIER_AUTO);
     EXPECT_NE(rep.tier_reason(MI_TIER_TURBO).find("Turbo tier: INT4 ConvRot GEMMs"), std::string::npos);
   }
   {
@@ -235,22 +250,53 @@ TEST(CApiInspect, HostileDitShapes) {
     const Report rep(write_dit(dir.path() / "rows.safetensors", Gemm::kBf16, q));
     EXPECT_EQ(rep.info.kind, MI_FILE_KIND_DIT);
     EXPECT_EQ(rep.info.loadable, 0);
-    EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("linear 'layers.0.proj.q' is [1048576, 1]; MOSS-Image's is [3072, 3072]"),
+    const std::string want = "linear 'layers.0.proj.q' is [1048576, 1]; MOSS-Image's is [3072, 3072]";
+    EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find(want),
               std::string::npos)
         << rep.text(MI_FILE_TEXT_NOTE);
     EXPECT_EQ(rep.info.tiers, 0u);
   }
   {
-    // The right weight with a scale of another size.
+    // The right weight with a scale of another size: the importer matches every scale to its linear's rows.
     std::vector<T> q;
     q.push_back({"layers.0.proj.q.weight", DType::kI8, {3072, 3072}});
     q.push_back({"layers.0.proj.q.weight_scale", DType::kF32, {kRows}});
-    q.push_back({"layers.0.proj.q.comfy_quant", DType::kU8, {}, R"({"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256})"});
+    q.push_back({"layers.0.proj.q.comfy_quant", DType::kU8, {}, kInt8Config});
     const Report rep(write_dit(dir.path() / "scale.safetensors", Gemm::kInt8, q));
     EXPECT_EQ(rep.info.kind, MI_FILE_KIND_DIT);
     EXPECT_EQ(rep.info.loadable, 0);
-    EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("weight_scale"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
+    EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("weight_scale must be F32 [N]"), std::string::npos)
+        << rep.text(MI_FILE_TEXT_NOTE);
   }
+}
+
+// Every block GEMM in NVFP4 (ComfyUI's configs, here the legacy metadata form): its swizzled block scales take about
+// 283 MiB, and the file gets the NVFP4 verdict, never a size refusal.
+TEST(CApiInspect, Nvfp4Dit) {
+  mi::testing::TempDir dir("inspect_nvfp4");
+  const auto round_up = [](std::int64_t v, std::int64_t to) { return (v + to - 1) / to * to; };
+  std::vector<T> t;
+  std::string layers;
+  std::uint64_t scale_bytes = 0;
+  for (const mi::lora::TargetModule& m : mi::lora::moss_dit_targets().modules) {
+    if (m.block < 0) continue;
+    const std::vector<std::int64_t> sf = {round_up(m.n, 128), round_up(m.k / 16, 4)};
+    t.push_back({m.name + ".weight", DType::kU8, {m.n, m.k / 2}});
+    t.push_back({m.name + ".weight_scale", DType::kF8E4M3, sf});
+    t.push_back({m.name + ".weight_scale_2", DType::kF32, {}});
+    layers += (layers.empty() ? "" : ", ") + std::string("\\\"") + m.name + "\\\": {\\\"format\\\": \\\"nvfp4\\\"}";
+    scale_bytes += static_cast<std::uint64_t>(sf[0] * sf[1]);
+  }
+  ASSERT_EQ(t.size(), 42u * 6 * 3);
+  EXPECT_GT(scale_bytes, std::uint64_t{256} << 20);
+  const Report rep(write_dit(dir.path() / "nvfp4.safetensors", Gemm::kBf16, t,
+                             R"({"_quantization_metadata":"{\"layers\": {)" + layers + R"(}}"})"));
+  EXPECT_EQ(rep.info.kind, MI_FILE_KIND_DIT);
+  EXPECT_EQ(rep.info.loadable, 0);
+  // nvfp4_unsupported_reason()'s verdict for this build (no kernels, or no NVFP4 DiT support yet): both point to INT8.
+  EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("NVFP4"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
+  EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("INT8"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
+  EXPECT_EQ(rep.text(MI_FILE_TEXT_NOTE).find("MiB"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
 }
 
 TEST(CApiInspect, Lora) {
@@ -264,7 +310,8 @@ TEST(CApiInspect, Lora) {
   EXPECT_EQ(rep.info.lora_rank, 4);
   EXPECT_EQ(rep.info.lora_adapters, 1);
   EXPECT_EQ(rep.info.lora_unknown_keys, 1);
-  EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("1 tensors not applied, first: training.step_count: not an adapter tensor"),
+  const std::string want = "1 tensors not applied, first: training.step_count: not an adapter tensor";
+  EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find(want),
             std::string::npos)
       << rep.text(MI_FILE_TEXT_NOTE);
   EXPECT_EQ(rep.text(MI_FILE_TEXT_BASE_MODEL), "moss-sft");
@@ -273,8 +320,9 @@ TEST(CApiInspect, Lora) {
   EXPECT_EQ(rep.tier_reason(MI_TIER_AUTO), "not a loadable DiT file");
 
   // A LoRA for another model: a LoRA (its names say so) that the stack refuses, with the stack's reason.
-  write_file(dir.path() / "sdxl.safetensors", {{"lora_unet_down_blocks_0_attn.lora_down.weight", DType::kBF16, {4, 320}},
-                                               {"lora_unet_down_blocks_0_attn.lora_up.weight", DType::kBF16, {320, 4}}},
+  write_file(dir.path() / "sdxl.safetensors",
+             {{"lora_unet_down_blocks_0_attn.lora_down.weight", DType::kBF16, {4, 320}},
+              {"lora_unet_down_blocks_0_attn.lora_up.weight", DType::kBF16, {320, 4}}},
              R"({"base_model": "sdxl"})");
   const Report other(dir.path() / "sdxl.safetensors");
   EXPECT_EQ(other.info.kind, MI_FILE_KIND_LORA);
@@ -285,18 +333,21 @@ TEST(CApiInspect, Lora) {
   EXPECT_EQ(other.info.lora_adapters, 0);
 
   // A malformed MOSS-Image LoRA: the factors' ranks differ.
-  write_file(dir.path() / "broken.safetensors", {{"transformer.layers.0.proj.q.lora_A.weight", DType::kBF16, {4, 3072}},
-                                                 {"transformer.layers.0.proj.q.lora_B.weight", DType::kBF16, {3072, 8}}});
+  write_file(dir.path() / "broken.safetensors",
+             {{"transformer.layers.0.proj.q.lora_A.weight", DType::kBF16, {4, 3072}},
+              {"transformer.layers.0.proj.q.lora_B.weight", DType::kBF16, {3072, 8}}});
   const Report broken(dir.path() / "broken.safetensors");
   EXPECT_EQ(broken.info.kind, MI_FILE_KIND_LORA);
   EXPECT_EQ(broken.info.loadable, 0);
-  EXPECT_NE(broken.text(MI_FILE_TEXT_NOTE).find("layers.0.proj.q"), std::string::npos) << broken.text(MI_FILE_TEXT_NOTE);
+  EXPECT_NE(broken.text(MI_FILE_TEXT_NOTE).find("layers.0.proj.q"), std::string::npos)
+      << broken.text(MI_FILE_TEXT_NOTE);
 }
 
 // The kinds are the file's control_channels, in channel order: the strings mi_control_image.kind takes.
 TEST(CApiInspect, ControlAdapter) {
   mi::testing::TempDir dir("inspect_control");
-  write_file(dir.path() / "control.safetensors", lora_tensors(2), R"({"control_channels": "color, depth", "base_model": "moss-base"})");
+  write_file(dir.path() / "control.safetensors", lora_tensors(2),
+             R"({"control_channels": "color, depth", "base_model": "moss-base"})");
   const Report rep(dir.path() / "control.safetensors");
   EXPECT_EQ(rep.info.kind, MI_FILE_KIND_CONTROL_ADAPTER);
   EXPECT_EQ(rep.info.loadable, 1) << rep.text(MI_FILE_TEXT_NOTE);
@@ -362,7 +413,8 @@ TEST(CApiInspect, TextEncoder) {
   mi::testing::TempDir dir("inspect_te");
   std::vector<T> t = {{"model.language_model.embed_tokens.weight", DType::kI8, {248320, 4}},
                       {"model.language_model.embed_tokens.weight_scale", DType::kF32, {248320}},
-                      {"model.language_model.embed_tokens.comfy_quant", DType::kU8, {}, R"({"format": "int8_tensorwise"})"},
+                      {"model.language_model.embed_tokens.comfy_quant", DType::kU8, {},
+                       R"({"format": "int8_tensorwise"})"},
                       {"model.language_model.norm.weight", DType::kBF16, {4096}}};
   for (int i = 0; i < 32; ++i) {
     const std::string l = "model.language_model.layers." + std::to_string(i) + ".";
@@ -376,6 +428,14 @@ TEST(CApiInspect, TextEncoder) {
   EXPECT_EQ(rep.info.precision, MI_PRECISION_BF16);  // no decoder linear is quantized
   EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "bf16");
   EXPECT_EQ(rep.info.tiers, 0u);
+
+  // A 180 MiB F32 layer tensor: the encoder would read it and keep a bf16 copy, past the 256 MiB inspection reads.
+  t.push_back({"model.language_model.layers.0.linear_attn.A_log", DType::kF32, {std::int64_t{45} << 20}});
+  write_file(dir.path() / "big.safetensors", t);
+  const Report big(dir.path() / "big.safetensors");
+  EXPECT_EQ(big.info.kind, MI_FILE_KIND_TEXT_ENCODER);
+  EXPECT_EQ(big.info.loadable, 0);
+  EXPECT_NE(big.text(MI_FILE_TEXT_NOTE).find("more than 256 MiB"), std::string::npos) << big.text(MI_FILE_TEXT_NOTE);
 }
 
 // A FLUX.2 VAE decoder in the diffusers layout, narrowed: the decoder's widths follow from its shapes.
@@ -407,7 +467,9 @@ TEST(CApiInspect, Vae) {
   }
   for (int b = 0; b < 4; ++b) {
     const std::string u = "decoder.up_blocks." + std::to_string(b);
-    for (int r = 0; r < 3; ++r) resnet(u + ".resnets." + std::to_string(r), r == 0 && b > 0 ? outs[b - 1] : outs[b], outs[b]);
+    for (int r = 0; r < 3; ++r) {
+      resnet(u + ".resnets." + std::to_string(r), r == 0 && b > 0 ? outs[b - 1] : outs[b], outs[b]);
+    }
     if (b < 3) conv(u + ".upsamplers.0.conv", outs[b], outs[b], 3);
   }
   norm("decoder.conv_norm_out", outs[3]);
@@ -460,6 +522,13 @@ TEST(CApiInspect, MalformedFiles) {
   EXPECT_EQ(other.info.kind, MI_FILE_KIND_UNKNOWN);
   EXPECT_EQ(other.info.tensor_count, 1);
   EXPECT_NE(other.text(MI_FILE_TEXT_NOTE).find("backbone.embeddings.cls_token"), std::string::npos);
+  // Alpha parameters without LoRA factors (another model's): not a LoRA.
+  write_file(dir.path() / "alpha.safetensors", {{"blocks.0.attn.alpha", DType::kF32, {1}},
+                                                {"blocks.0.attn.weight", DType::kF32, {4, 4}}});
+  const Report alpha(dir.path() / "alpha.safetensors");
+  EXPECT_EQ(alpha.info.kind, MI_FILE_KIND_UNKNOWN);
+  EXPECT_EQ(alpha.info.loadable, 0);
+  EXPECT_FALSE(alpha.text(MI_FILE_TEXT_NOTE).empty());
 }
 
 // A FIFO is refused at once: opening one for reading would wait for a writer.
@@ -472,7 +541,8 @@ TEST(CApiInspect, Fifo) {
   ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
   mi_file_report* r = nullptr;
   EXPECT_EQ(mi_inspect_file(fifo.c_str(), &r), MI_ERR_INVALID_ARGUMENT);
-  EXPECT_NE(std::string(mi_last_error_message()).find("not a regular file"), std::string::npos) << mi_last_error_message();
+  EXPECT_NE(std::string(mi_last_error_message()).find("not a regular file"), std::string::npos)
+      << mi_last_error_message();
   EXPECT_EQ(r, nullptr);
 #endif
 }
@@ -501,10 +571,17 @@ TEST(CApiInspect, ArgumentsAndAccessors) {
     fs::create_directory(locked);
     write_bytes(locked / "x.safetensors", "x");
     fs::permissions(locked, fs::perms::none);
+    struct Restore {  // whatever the assertions do, so TempDir can remove the folder
+      fs::path dir;
+      ~Restore() {
+        std::error_code ec;
+        fs::permissions(dir, fs::perms::owner_all, ec);
+      }
+    } restore{locked};
     const std::string inside = mi::util::path_utf8(locked / "x.safetensors");
     EXPECT_EQ(mi_inspect_file(inside.c_str(), &r), MI_ERR_IO);
-    EXPECT_NE(std::string(mi_last_error_message()).find("ermission denied"), std::string::npos) << mi_last_error_message();
-    fs::permissions(locked, fs::perms::owner_all);
+    EXPECT_NE(std::string(mi_last_error_message()).find("ermission denied"), std::string::npos)
+        << mi_last_error_message();
   }
 #endif
   EXPECT_EQ(r, nullptr);
@@ -546,15 +623,17 @@ TEST(CApiInspect, CommunityFiles) {
        MI_PRECISION_W4A4},
       {"tsolful/moss_image_sft_W4A8_GPTQ.safetensors", MI_FILE_KIND_DIT, 0, "", 0, MI_PRECISION_BF16},  // to quantize
       {"bennydaball/moss_image_sft_nvfp4.safetensors", MI_FILE_KIND_DIT, 0, "", 0, MI_PRECISION_BF16},  // NVFP4
-      {"comfy-org/qwen3.5_9b_int8_convrot.safetensors", MI_FILE_KIND_TEXT_ENCODER, 1, "int8_convrot", 0, MI_PRECISION_INT8},
+      {"comfy-org/qwen3.5_9b_int8_convrot.safetensors", MI_FILE_KIND_TEXT_ENCODER, 1, "int8_convrot", 0,
+       MI_PRECISION_INT8},
       {"comfy-org/qwen3.5_9b_w4a8_gptq.safetensors", MI_FILE_KIND_TEXT_ENCODER, 1, "w4a8", 0, MI_PRECISION_W4A8},
       {"comfy-org/flux2-vae.safetensors", MI_FILE_KIND_VAE, 1, "", 0, MI_PRECISION_BF16},
       {"comfy-org/flux2-vae_small.safetensors", MI_FILE_KIND_VAE, 1, "", 0, MI_PRECISION_BF16},
       {"congruency/MOSS-Image-Turbo-MFD/MOSS-Image-SFT-Turbo-MFD-v0.1.comfy.safetensors", MI_FILE_KIND_LORA, 1, "", 0,
        MI_PRECISION_BF16},
-      {"comfyanonymous/MOSS_image_MAX_ULTRA_hires_lora_test/moss_hires_lora_test_v0.1.safetensors", MI_FILE_KIND_LORA, 1,
-       "", 0, MI_PRECISION_BF16},
-      {"comfy-org/moss_image_color_depth_control.safetensors", MI_FILE_KIND_CONTROL_ADAPTER, 1, "", 0, MI_PRECISION_BF16},
+      {"comfyanonymous/MOSS_image_MAX_ULTRA_hires_lora_test/moss_hires_lora_test_v0.1.safetensors",
+       MI_FILE_KIND_LORA, 1, "", 0, MI_PRECISION_BF16},
+      {"comfy-org/moss_image_color_depth_control.safetensors", MI_FILE_KIND_CONTROL_ADAPTER, 1, "", 0,
+       MI_PRECISION_BF16},
       {"lodestones/MOSS-Image-SFT-8-steps-dmd/time_embedding.safetensors", MI_FILE_KIND_UNKNOWN, 0, "", 0,
        MI_PRECISION_BF16},
   };
@@ -575,11 +654,18 @@ TEST(CApiInspect, CommunityFiles) {
       EXPECT_EQ(rep.info.lora_rank, 64);
     }
     if (e.kind == MI_FILE_KIND_UNKNOWN) {
-      EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("distill bundle file"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
+      EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("distill bundle file"), std::string::npos)
+          << rep.text(MI_FILE_TEXT_NOTE);
+    }
+    if (std::string(e.file).find("nvfp4") != std::string::npos) {
+      EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("NVFP4"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
+      EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("INT8"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
     }
     ++checked;
   }
-  if (checked == 0) GTEST_SKIP() << "no community file under " << mi::util::path_utf8(c) << " (set MOSS_COMMUNITY_MODELS)";
+  if (checked == 0) {
+    GTEST_SKIP() << "no community file under " << mi::util::path_utf8(c) << " (set MOSS_COMMUNITY_MODELS)";
+  }
 }
 
 }  // namespace

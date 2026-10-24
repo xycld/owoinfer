@@ -997,11 +997,15 @@ typedef struct mi_file_info {
   mi_precision precision;
   /* A loadable DiT: bit (1u << tier) for each mi_tier the engine accepts for it, with the bundle's bf16 text encoder
    * (a quantized one refuses MI_TIER_REFERENCE too) and every attention kernel available (on a GPU without the 8-bit
-   * kernels HIGH and TURBO fall back to exact attention, and HIGH on a bf16 DiT is refused). No certificate is looked up (they are matched to the GPU), so
-   * MI_TIER_AUTO on an INT4 DiT is refused here even where a certificate would allow it. 0 otherwise. */
+   * kernels HIGH and TURBO fall back to exact attention, and HIGH on a bf16 DiT is refused). No certificate is looked
+   * up (they are matched to the GPU and the package), so the tiers and mi_file_report_tier_reason() are the decisions
+   * without one: MI_TIER_AUTO runs REFERENCE on a bf16 DiT and exact attention on an INT8 one, and is refused for an
+   * INT4 DiT. With a certificate for the GPU, AUTO may run a lossy configuration instead (docs/integration.md,
+   * "Shipped certificates"). 0 otherwise. */
   uint32_t tiers;
   int32_t lora_rank;            /* LoRA, control adapter: the largest rank of its low-rank adapters; 0 without */
-  int32_t lora_adapters;        /* adapters on the DiT, as mi_lora_report.adapters (a fused qkv adapter counts as three) */
+  /* adapters on the DiT, as mi_lora_report.adapters (a fused qkv adapter counts as three) */
+  int32_t lora_adapters;
   int32_t lora_unknown_keys;    /* tensors not applied, as mi_lora_report.unknown_keys */
   int32_t control_kind_count;   /* control adapter: its kinds (mi_file_report_control_kind()) */
   int32_t _reserved0;
@@ -1012,17 +1016,20 @@ typedef enum mi_file_text_kind {
   /* A loadable DiT: its block linears as the engine runs them, e.g. "bf16", "int8_convrot256", "int4_convrot256",
    * "mixed (80 bf16, 172 int8_convrot256)"; a loadable text encoder: "bf16", "int8_convrot" or "w4a8"; else "". */
   MI_FILE_TEXT_QUANTIZATION = 1,
-  MI_FILE_TEXT_BASE_MODEL = 2,    /* LoRA, control adapter: the file's base_model metadata (informational); "" if absent */
+  /* LoRA, control adapter: the file's base_model metadata (informational); "" if absent */
+  MI_FILE_TEXT_BASE_MODEL = 2,
   /* LoRA, control adapter: its adapter types in file order, comma-separated: "lora", "loha", "lokr", "full". */
   MI_FILE_TEXT_ADAPTER_TYPES = 3,
   MI_FILE_TEXT_MAX_ENUM = 0x7fffffff
 } mi_file_text_kind;
 
 /* Reads what the file at `path` (UTF-8) is to the engine (MI_CAP_INSPECT): no engine, no GPU, no CUDA call. It reads
- * what the engine's loaders read before they upload anything: the safetensors header (at most 16 MiB), a DiT's
- * quantization configs and scales, a text encoder's small F32 tensors, a LoRA's alpha tensors, a control adapter's
- * embedder; at most 256 MiB of tensors, checked from the header first (a file that would need more is not loadable).
- * Thread-safe. The answer depends only on the file's content and the library version (mi_version()), not on the GPU.
+ * what the engine's loaders read before they upload anything: the safetensors header (at most 16 MiB), the
+ * quantization configs (at most 4 KiB each), a DiT's scales (bounded by MOSS-Image's shapes, checked first: about
+ * 290 MiB at most, one linear's at a time), a text encoder's scales and small F32 tensors and a control adapter's
+ * embedder (at most 256 MiB, checked from the header first: a file that would need more is not loadable), a LoRA's
+ * alpha tensors. Thread-safe. The answer depends only on the file's content and the library's version and build
+ * (mi_version() and mi_probe_info.build_flavour: the NVFP4 kernels are a build option), not on the GPU.
  * A file the engine cannot use (another model or container, a malformed or truncated header) is not an error: MI_OK
  * with MI_FILE_KIND_UNKNOWN or loadable 0, and the reason in MI_FILE_TEXT_NOTE. Fails with MI_ERR_INVALID_ARGUMENT for
  * a NULL or empty path or one that is not a regular file (a directory, a device, a pipe: never read), and MI_ERR_IO

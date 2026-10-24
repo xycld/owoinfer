@@ -47,9 +47,11 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// The tensor bytes inspection lets the loaders read and the scale buffers it lets them allocate, beyond the header
-// (at most weights::kMaxHeaderBytes): a header cannot make it read or allocate more. Far above what real files need
-// (the scales of an INT8 or INT4 DiT: a few MB; an NVFP4 DiT's block scales: about 130 MB).
+// The tensor bytes inspection lets a text encoder's or control adapter's loader read (and the buffers it keeps), beyond
+// the header (at most weights::kMaxHeaderBytes) and the quantization configs (at most 4 KiB each): a header cannot make
+// it read or allocate more. Far above what real files need (an INT8 or W4A8 text encoder: a few MB; the published
+// control adapter's embedder: 2.4 MB). A DiT needs no such cap: check_dit_linears bounds its scales by MOSS-Image's
+// shapes (at most about 290 MiB in all, for a fully NVFP4 file), and to_model_index holds one linear's at a time.
 constexpr std::uint64_t kMaxTensorReads = std::uint64_t{256} << 20;
 
 // Whether the sm_120a NVFP4 GEMMs are compiled in (cmake/modules/nvfp4.cmake defines this for this file as for
@@ -85,20 +87,33 @@ bool accepts(F&& load, std::string& why) {
   return false;
 }
 
-// The file's size, from a handle opened without blocking (a FIFO's open would wait for a writer) and only when it is
-// a regular file: a directory, device or pipe is never handed to the loaders. They reopen the file by name, so a path
-// swapped for a pipe in between is the readers' to refuse.
+// The file's size, only when it is a regular file: a directory, device or pipe is never handed to the loaders. The
+// path's type is read first, without opening it (opening a device runs its driver); then a handle opened without
+// blocking (a FIFO's open would wait for a writer) confirms it. The loaders reopen the file by name, so a path swapped
+// for a pipe in between is the readers' to refuse.
 std::uint64_t regular_file_bytes(const fs::path& path) {
   const std::string where = util::path_utf8(path);
 #ifdef _WIN32
-  const HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                               nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-  if (h == INVALID_HANDLE_VALUE) {
-    const DWORD e = GetLastError();
-    throw weights::IoError(where + ": " + (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND
-                                               ? std::string("no such file")
-                                               : std::system_category().message(static_cast<int>(e))));
+  const auto no_file = [&](DWORD e) {
+    return weights::IoError(where + ": " + (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND
+                                                ? std::string("no such file")
+                                                : std::system_category().message(static_cast<int>(e))));
+  };
+  // The device namespace (\\.\, \\?\GLOBALROOT\...) and device or directory attributes: refused unopened. A reparse
+  // point (a symbolic link to a model file) is followed by CreateFileW and judged by the handle below.
+  const std::wstring& text = path.native();
+  if (text.starts_with(L"\\\\.\\") || text.starts_with(L"\\\\?\\GLOBALROOT")) {
+    throw std::invalid_argument(where + " is not a regular file");
   }
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) throw no_file(GetLastError());
+  if ((attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE)) != 0) {
+    throw std::invalid_argument(where + " is not a regular file");
+  }
+  const HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (h == INVALID_HANDLE_VALUE) throw no_file(GetLastError());
   BY_HANDLE_FILE_INFORMATION info{};
   const bool disk = GetFileType(h) == FILE_TYPE_DISK && GetFileInformationByHandle(h, &info) != 0 &&
                     (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
@@ -106,12 +121,15 @@ std::uint64_t regular_file_bytes(const fs::path& path) {
   if (!disk) throw std::invalid_argument(where + " is not a regular file");
   return (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
 #else
-  const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-  if (fd < 0) {
-    const int e = errno;
-    throw weights::IoError(where + ": " + (e == ENOENT || e == ENOTDIR ? std::string("no such file")
-                                                                      : std::generic_category().message(e)));
-  }
+  const auto no_file = [&](int e) {
+    return weights::IoError(where + ": " + (e == ENOENT || e == ENOTDIR ? std::string("no such file")
+                                                                       : std::generic_category().message(e)));
+  };
+  struct stat named {};
+  if (::stat(path.c_str(), &named) != 0) throw no_file(errno);
+  if (!S_ISREG(named.st_mode)) throw std::invalid_argument(where + " is not a regular file");
+  const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+  if (fd < 0) throw no_file(errno);
   struct stat st {};
   const int stat_error = ::fstat(fd, &st) == 0 ? 0 : errno;
   ::close(fd);
@@ -121,23 +139,23 @@ std::uint64_t regular_file_bytes(const fs::path& path) {
 #endif
 }
 
-// Tensor names in the conventions the LoRA stack reads (the ones check_supported_dit_file names a LoRA by).
+// Tensor names in the conventions the LoRA stack reads (the factors check_supported_dit_file names a LoRA by). An
+// `.alpha` is no marker of its own: other models have alpha parameters, and a LoRA's sits next to its factors.
 bool has_lora_keys(const weights::SafetensorsFile& header) {
   for (const weights::TensorInfo& t : header.tensors()) {
     for (const std::string_view part : {".lora_A.", ".lora_B.", ".lora_down.", ".lora_up.", ".hada_w", ".lokr_w"}) {
       if (t.name.find(part) != std::string::npos) return true;
     }
-    if (t.name.ends_with(".alpha")) return true;
   }
   return false;
 }
 
 std::string mib(std::uint64_t bytes) { return std::to_string((bytes + (std::uint64_t{1} << 20) - 1) >> 20) + " MiB"; }
 
-// What the importer's readers (to_model_index, QuantTextModel) read before anything is uploaded, from the header
-// alone: the stored scales and codebooks, a text encoder's F32 tensors (and their bf16 copies), and a float buffer of
-// the linear's rows per scale. Throws std::invalid_argument when that exceeds kMaxTensorReads.
-void check_reads(const quant::QuantModel& m) {
+// What QuantTextModel reads before anything is uploaded, from the header alone: the stored scales and codebooks, the
+// F32 tensors (and the bf16 copies it keeps), and a float buffer of the linear's rows per scale. Throws
+// std::invalid_argument when that exceeds kMaxTensorReads.
+void check_text_encoder_reads(const quant::QuantModel& m) {
   std::uint64_t total = 0;
   const auto add = [&](std::uint64_t bytes) { total = bytes > kMaxTensorReads ? kMaxTensorReads + 1 : total + bytes; };
   for (const quant::QuantLinear& l : m.linears) {
@@ -151,21 +169,23 @@ void check_reads(const quant::QuantModel& m) {
     if (total > kMaxTensorReads) break;
   }
   for (const weights::IndexedTensor& t : m.tensors) {
-    if (m.kind == quant::ModelKind::kTextEncoder && t.dtype == weights::DType::kF32) add(t.nbytes + t.nbytes / 2);
+    if (t.dtype == weights::DType::kF32) add(t.nbytes + t.nbytes / 2);
   }
   if (total > kMaxTensorReads) {
     throw std::invalid_argument("the file's scales and small tensors take more than " + mib(kMaxTensorReads) +
-                                ", more than any MOSS-Image file; not read");
+                                ", more than any MOSS-Image text encoder; not read");
   }
 }
 
-std::string shape_text(std::int64_t n, std::int64_t k) { return "[" + std::to_string(n) + ", " + std::to_string(k) + "]"; }
+std::string shape_text(std::int64_t n, std::int64_t k) {
+  return "[" + std::to_string(n) + ", " + std::to_string(k) + "]";
+}
 
-// Every GEMM of a DiT file against MOSS-Image's (lora::moss_dit_targets), and each stored scale against the linear's
-// rows, before to_model_index reads any of them. Throws std::invalid_argument naming the first difference.
+// Every GEMM of a DiT file against MOSS-Image's (lora::moss_dit_targets), before to_model_index reads any scale. The
+// importer has already matched each scale to its linear's [n, k] (per row, scalar, NVFP4 block scales, s_channel,
+// codebook), so this bounds them too. Throws std::invalid_argument naming the first difference.
 void check_dit_linears(const quant::QuantModel& m) {
   const lora::TargetModel targets = lora::moss_dit_targets();
-  const auto round_up = [](std::int64_t v, std::int64_t to) { return (v + to - 1) / to * to; };
   for (const quant::QuantLinear& l : m.linears) {
     const lora::TargetModule* t = targets.find(l.name);
     if (t == nullptr) throw std::invalid_argument("linear '" + l.name + "' is not a MOSS-Image DiT linear");
@@ -173,36 +193,26 @@ void check_dit_linears(const quant::QuantModel& m) {
       throw std::invalid_argument("linear '" + l.name + "' is " + shape_text(l.n, l.k) + "; MOSS-Image's is " +
                                   shape_text(t->n, t->k));
     }
-    std::int64_t rows_scale = l.n;  // per-row scales: raw INT8, W4A4, the grouped formats' s_channel
-    if (l.encoding == quant::Encoding::kScalarScale) rows_scale = 1;
-    if (l.encoding == quant::Encoding::kNvfp4Raw) rows_scale = round_up(l.n, 128) * round_up(l.k / 16, 4);
-    const auto check = [&](const std::optional<weights::IndexedTensor>& s, std::int64_t want, const char* what) {
-      if (s && s->numel() != want) {
-        throw std::invalid_argument("linear '" + l.name + "' has a " + what + " of " + std::to_string(s->numel()) +
-                                    " values; its shape needs " + std::to_string(want));
-      }
-    };
-    if (l.encoding == quant::Encoding::kW4A8 || l.encoding == quant::Encoding::kW6A8) {
-      check(l.s_channel, l.n, "weight_s_channel");
-      check(l.codebook, 16, "weight_codebook");
-    } else {
-      check(l.scale, rows_scale, "weight_scale");
-    }
-    check(l.scale_2, 1, "weight_scale_2");
   }
 }
 
 // The LoRA stack's reading of `spec` (a LoRA, or a control adapter's LoRA part), as the pipeline builds it.
 bool inspect_lora(const lora::LoraSpec& spec, FileInspection& r) {
   std::optional<lora::LoraStack> stack;
-  if (!accepts([&] { stack.emplace(std::vector<lora::LoraSpec>{spec}, lora::moss_dit_targets()); }, r.note)) return false;
+  if (!accepts([&] { stack.emplace(std::vector<lora::LoraSpec>{spec}, lora::moss_dit_targets()); }, r.note)) {
+    return false;
+  }
   const lora::FileReport& rep = stack->reports().front();
   r.info.lora_adapters = rep.adapters;
   r.info.lora_unknown_keys = static_cast<std::int32_t>(rep.unknown.size());
-  if (!rep.unknown.empty()) r.note = std::to_string(rep.unknown.size()) + " tensors not applied, first: " + rep.unknown.front();
+  if (!rep.unknown.empty()) {
+    r.note = std::to_string(rep.unknown.size()) + " tensors not applied, first: " + rep.unknown.front();
+  }
   std::vector<std::string> types;
   for (const lora::Adapter& a : stack->adapters()) {
-    if (a.kind == lora::AdapterKind::kLowRank) r.info.lora_rank = std::max(r.info.lora_rank, static_cast<std::int32_t>(a.rank));
+    if (a.kind == lora::AdapterKind::kLowRank) {
+      r.info.lora_rank = std::max(r.info.lora_rank, static_cast<std::int32_t>(a.rank));
+    }
     const std::string type = lora::kind_name(a.kind);
     if (std::find(types.begin(), types.end(), type) == types.end()) types.push_back(type);
   }
@@ -217,7 +227,7 @@ void inspect_dit(const fs::path& path, FileInspection& r) {
   r.info.kind = MI_FILE_KIND_DIT;
   std::optional<quant::QuantModel> model;
   if (!accepts([&] { model.emplace(quant::open_quant_model(path, quant::ModelKind::kDiT)); }, r.note)) return;
-  if (!accepts([&] { check_dit_linears(*model); }, r.note) || !accepts([&] { check_reads(*model); }, r.note)) return;
+  // The NVFP4 verdict first, as open_dit_file gives it: such a file gets its real reason.
   std::string remarks;
   if (std::any_of(model->linears.begin(), model->linears.end(),
                   [](const quant::QuantLinear& l) { return l.spec.format == quant::QuantFormat::kNvfp4; })) {
@@ -227,6 +237,7 @@ void inspect_dit(const fs::path& path, FileInspection& r) {
     }
     remarks = "NVFP4 linears run on compute capability 12.0 only (an RTX 50 GPU)";
   }
+  if (!accepts([&] { check_dit_linears(*model); }, r.note)) return;
   const auto static_input_scales = std::count_if(model->linears.begin(), model->linears.end(),
                                                  [](const quant::QuantLinear& l) { return l.input_scale.has_value(); });
   if (static_input_scales > 0) {
@@ -261,7 +272,7 @@ void inspect_text_encoder(const fs::path& path, FileInspection& r) {
   r.info.kind = MI_FILE_KIND_TEXT_ENCODER;
   std::optional<quant::QuantModel> model;
   if (!accepts([&] { model.emplace(quant::open_quant_model(path, quant::ModelKind::kTextEncoder)); }, r.note) ||
-      !accepts([&] { check_reads(*model); }, r.note)) {
+      !accepts([&] { check_text_encoder_reads(*model); }, r.note)) {
     return;
   }
   model.reset();
@@ -339,7 +350,8 @@ FileInspection inspect_file(const fs::path& path) {
     r = std::move(as_lora);
     r.info.kind = MI_FILE_KIND_LORA;
     r.info.loadable = lora ? 1 : 0;
-    if (const auto it = header->metadata().find("base_model"); it != header->metadata().end()) r.base_model = it->second;
+    const auto& meta = header->metadata();
+    if (const auto it = meta.find("base_model"); it != meta.end()) r.base_model = it->second;
     return r;
   }
   r.note = dit_why;

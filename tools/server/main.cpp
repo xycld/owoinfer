@@ -2,10 +2,10 @@
 // built only on the public C API (mossinfer.h).
 //
 // Threads: the main thread reads and answers requests; a job (generate, preload, release) runs on one worker thread, so
-// cancel, status and inspect are answered while it runs. Every protocol line goes through emit() under one mutex.
-// stdout carries protocol lines only: at startup the protocol stream gets a private, non-inheritable copy of fd 1 and fd 1 is pointed at stderr (or
-// at the null device when stderr is unusable), so anything else printing to stdout (the engine, a library) never
-// reaches the protocol stream.
+// cancel and status are answered while it runs; an inspect runs on a short-lived thread of its own. Every protocol
+// line goes through emit() under one mutex. stdout carries protocol lines only: at startup the protocol stream gets
+// a private, non-inheritable copy of fd 1 and fd 1 is pointed at stderr (or at the null device when stderr is
+// unusable), so anything else printing to stdout (the engine, a library) never reaches the protocol stream.
 #include <atomic>
 #include <cerrno>
 #include <charconv>
@@ -501,7 +501,7 @@ class Server {
       }
       const Params params(doc.find("params"));
       const std::string& m = method->as_string();
-      std::optional<std::string> result;  // none: the worker answers when the job ends (release)
+      std::optional<std::string> result;  // none: answered later, by the worker (release) or an inspect's thread
       bool keep_running = true;
       if (m == "hello") result = hello(params);
       else if (m == "load") result = load(params, id);
@@ -613,8 +613,8 @@ class Server {
            tf(caps & MI_CAP_CONTROL) + ",\"accel\":" + tf(caps & MI_CAP_ACCEL) + ",\"preload\":" + tf(caps & MI_CAP_PRELOAD) +
            ",\"release\":" + tf(caps & MI_CAP_RELEASE) + ",\"certificate_dirs\":" + tf(caps & MI_CAP_CERTIFICATE_DIRS) +
            ",\"te_host_pin\":" + tf(caps & MI_CAP_TE_HOST_PIN) + ",\"progress_fraction\":" +
-           tf(caps & MI_CAP_PROGRESS_FRACTION) + ",\"inspect\":" + tf(caps & MI_CAP_INSPECT) + "},\"values\":{" + values +
-           "},\"probe\":{\"driver_cuda_version\":" +
+           tf(caps & MI_CAP_PROGRESS_FRACTION) + ",\"inspect\":" + tf(caps & MI_CAP_INSPECT) +
+           "},\"values\":{" + values + "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
            ",\"supported_device_count\":" + std::to_string(probe.supported_device_count) +
@@ -942,21 +942,34 @@ class Server {
       return true;
     });
     if (inspections_.size() >= kMaxInspects) {
-      throw RequestError("busy", std::to_string(kMaxInspects) + " inspects are running; send it again after one answers");
+      throw RequestError("busy",
+                         std::to_string(kMaxInspects) + " inspects are running; send it again after one answers");
     }
     auto slot = std::make_unique<Inspection>();
     Inspection* s = slot.get();
-    s->thread = std::thread([this, s, id, file = *path] {
+    // Prepared here: the answer when building the real one fails (out of memory), so nothing escapes the thread.
+    std::string fallback =
+        "{\"id\":" + id + ",\"error\":" + error_json("internal", "inspect could not build its answer") + "}";
+    s->thread = std::thread([this, s, id, file = *path, fallback = std::move(fallback)] {
       std::string line;
       try {
-        line = "{\"id\":" + id + ",\"result\":" + inspect_json(file) + "}";
-      } catch (const RequestError& e) {
-        line = "{\"id\":" + id + ",\"error\":" + error_json(e.code, e.what()) + "}";
-      } catch (const std::exception& e) {
-        line = "{\"id\":" + id + ",\"error\":" + error_json("internal", e.what()) + "}";
+        try {
+          line = "{\"id\":" + id + ",\"result\":" + inspect_json(file) + "}";
+        } catch (const RequestError& e) {
+          line = "{\"id\":" + id + ",\"error\":" + error_json(e.code, e.what()) + "}";
+        } catch (const std::exception& e) {
+          line = "{\"id\":" + id + ",\"error\":" + error_json("internal", e.what()) + "}";
+        }
+      } catch (...) {
+        line.clear();
       }
-      out_.emit(line);
+      // Done before the answer goes out: a client that sends the next inspect on reading it finds a free slot.
       s->done.store(true);
+      try {
+        out_.emit(line.empty() ? fallback : line);
+      } catch (...) {
+        // The protocol stream is unusable (emit's lock failed): nothing to answer on.
+      }
     });
     inspections_.push_back(std::move(slot));
     return std::nullopt;

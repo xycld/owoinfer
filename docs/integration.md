@@ -293,7 +293,7 @@ Packages install these certificates to `share/mossinfer/quality_certs/`. Each on
 | RTX 50 series (sm_120) | Comfy-Org `moss_image_base_int8_convrot.safetensors` | `high`: INT8 GEMMs with exact or q8_fp8 attention | cu13 full, bundled cuBLASLt 13.6.0 |
 
 - **Other files and configurations:** the base model's bf16 bundle is not certified with 8-bit attention, and its INT8 file not with q8_fp16 attention. INT4 files are not certified either: Turbo has to be chosen explicitly.
-- **Other packages:** the cu12 package bundles cuBLASLt 12.8, and a system copy may be any version. Neither carries an sm_120 certificate, so `auto` runs Reference there.
+- **Other packages:** the cu12 package bundles cuBLASLt 12.8, and a system copy may be any version. Neither carries an sm_120 certificate, so `auto` runs the uncertified default there: Reference for the bf16 bundle, a quantized file's own GEMMs with exact attention, and an INT4 file is refused (choose `turbo`).
 - **Other GPUs:** RTX 40 and 30 series certificates are planned.
 - **How they're made:** 23 evaluation prompts are rendered at the same seeds as our bf16 engine and compared with it and with the official images. The gates and their limits are in `src/pipeline/quality_cert.h`, and the engine refuses a certificate that doesn't meet them.
 

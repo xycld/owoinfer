@@ -810,6 +810,23 @@ class CpuProtocolTest(ProtocolTestBase):
             self.assertIn("inspects are running", answers[i]["error"]["message"])
         self.assertEqual(s.proc.wait(timeout=TIMEOUT), 0)
 
+    def test_inspect_slot_free_once_answered(self):
+        """An inspect counts as running until its answer is sent, never after: two more sent on reading the answers
+        of two are never busy."""
+        s = self.server
+        dit = os.path.join(self.tmp, "dit.safetensors")
+        write_bf16_dit(dit)
+        for round in range(20):
+            ids = ["r%d.%d" % (round, i) for i in range(2)]
+            s.send_raw("".join(json.dumps({"id": i, "method": "inspect", "params": {"path": dit}}) + "\n"
+                               for i in ids).encode())
+            answers = {}
+            while len(answers) < 2:
+                m = s.read()
+                answers[m["id"]] = m
+            for i in ids:
+                self.assertIn("result", answers[i], answers[i])
+
     def test_shutdown(self):
         r = self.server.call("shutdown", id="bye")
         self.assertEqual(r, {"id": "bye", "result": {}})
