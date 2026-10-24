@@ -35,7 +35,7 @@ Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what
 | Prompt token report | token counts per prompt and a truncation warning |
 | Memory modes | `min_memory`, `balanced`, `max_speed`, plus explicit VRAM and RAM budgets and a VRAM reserve. The engine plans against the VRAM that is actually free and streams the model when it doesn't fit. |
 | Integration surfaces | the C library (`libmossinfer`) and the sidecar process (`moss-server`), with the same features |
-| Run-time control | progress, cancel from any thread, one job (generation, preload or release) at a time per engine, device probe and build recommendation |
+| Run-time control | progress: the phase and step, and the whole job's share done and time left over every phase, the text encoder and model loads included (`fraction`, `eta_seconds`); cancel from any thread, one job (generation, preload or release) at a time per engine, device probe and build recommendation |
 | Preload | load the models for a request before the first generation (`mi_engine_preload()`, server `preload`), so the first image starts sampling at once; the next generation of a like request loads nothing and gives the same bits |
 | Soft unload | free the VRAM and keep the engine (`mi_engine_release()`, server `release`), optionally with the DiT kept in RAM for a fast reload over PCIe (`keep_host_copy`); the embedding cache survives it. See [Fast switching](#fast-switching). |
 | Certificate directories | extra quality-certificate directories per engine (`certificate_dirs`), searched before the cache folder, the DiT's sidecar and the package's `share/mossinfer/quality_certs/`, where packages install their certificates |
@@ -71,6 +71,7 @@ These are designed and partly built. The launcher can prepare for them now (see 
 | An uncertified Turbo run under tier `auto` | not supported: `auto` refuses an INT4 DiT without a quality certificate (none ships). Choose `turbo` explicitly. |
 | Pixel data over the server protocol | not supported: the server takes image file paths |
 | Server output other than PNG | not supported |
+| Progress inside a DiT load | not supported: a DiT load is one step, so `fraction` holds still while it runs and moves on at the next phase |
 
 ## Supported models
 
@@ -335,9 +336,11 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 6. `shutdown` on exit. The server cancels any running generation, answers, and exits with status 0. Kill it if it hasn't exited after a few seconds.
 
 **Progress bar.**
-- `progress` events report the `phase`: `text_encoder`, then `dit_load`, `denoise` and `decode`. `denoise` also reports `step` and `total_steps`.
-- `denoise` takes most of the time. `text_encoder` also takes a few seconds for each prompt not in the embedding cache, and so does the first `dit_load`.
-- A simple bar is `step / total_steps` during `denoise`, with the other phases shown as indeterminate.
+- Drive the bar from `fraction` and the remaining time from `eta_seconds`, both in every `progress` event (and in `status`). `fraction` is the share of the whole job done, 0 to 1: the text encoder, the model loads, every sampling step (both passes of a hires fix) and the decode. It never goes back, and `done` is the end. `eta_seconds` is `null` while unknown.
+- Do not build the bar from `step / total_steps`: it is 0 through the text encoder and the loads, which can be most of a first run, and covers only the sampling steps.
+- `progress` events also report the `phase` (`text_encoder`, then `dit_load`, `denoise` and `decode`) for a label; `denoise` also reports `step` and `total_steps`.
+- The estimate is roughest on the first run and corrects itself as phases and steps are measured. A DiT load is one step: the bar holds still while it runs.
+- Check `capabilities.progress_fraction` in `hello`; a server without it sends neither field.
 
 **One generation at a time.** A second `generate` while one runs is answered with `busy`, so queue requests in the launcher. The same holds for `preload` and `release`: one job at a time. `done` is written only after the server is idle again, so the next `generate` can go out as soon as `done` is read.
 

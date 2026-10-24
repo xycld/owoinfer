@@ -103,7 +103,7 @@ int main(void) {
   FIELD(mi_engine_params, dit_direct_io, 152);
   FIELD(mi_engine_params, te_host_pin, 156);
 
-  SIZE(mi_progress, 40);
+  SIZE(mi_progress, 56);
   FIELD(mi_progress, struct_size, 0);
   FIELD(mi_progress, phase, 8);
   FIELD(mi_progress, step, 12);
@@ -111,6 +111,8 @@ int main(void) {
   FIELD(mi_progress, _reserved0, 20);
   FIELD(mi_progress, step_seconds, 24);
   FIELD(mi_progress, elapsed_seconds, 32);
+  FIELD(mi_progress, fraction, 40);
+  FIELD(mi_progress, eta_seconds, 48);
 
   SIZE(mi_gen_params, 376);
   FIELD(mi_gen_params, struct_size, 0);

@@ -139,6 +139,8 @@ MOSSINFER_API const char* mi_last_error_message(void);
 #define MI_CAP_CERTIFICATE_DIRS 0x4000u
 /* mi_engine_params.te_host_pin: whether a host-resident text encoder may hold a pinned copy. */
 #define MI_CAP_TE_HOST_PIN 0x8000u
+/* mi_progress.fraction and eta_seconds: the whole job's progress and remaining time. */
+#define MI_CAP_PROGRESS_FRACTION 0x10000u
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -469,6 +471,13 @@ typedef struct mi_progress {
   int32_t _reserved0;
   double step_seconds;     /* wall time of the step just finished; 0 at a phase start */
   double elapsed_seconds;  /* since mi_generate() was called */
+  /* Fields after the 40-byte layout (MI_CAP_PROGRESS_FRACTION). The engine allocates the struct and sets struct_size:
+   * read them only when struct_size >= 56. They cover the whole job (every phase, both passes of a hires fix, a
+   * preload's loads), estimated from the plan's time estimate, the measured transfer rates for models not loaded yet,
+   * and the phases and steps measured so far. */
+  /* Share of the job done, 0..1, never decreasing within a job. Below 1 in every callback: the call's return is 1. */
+  double fraction;
+  double eta_seconds;      /* estimated seconds remaining; < 0 when unknown (no estimate yet) */
 } mi_progress;
 
 /* Called when a phase starts and after every sampling step. */
@@ -624,12 +633,12 @@ MOSSINFER_API mi_status mi_generate(mi_engine* engine, const mi_gen_params* para
  * weight groups (MI_CANCELLED with a result; the engine stays usable and keeps what was loaded before the cancel).
  * params' callbacks run on this thread: the plan once, after planning and before any load; then a progress (step 0,
  * total_steps 0) before each load step, also for a model already resident, in this order: MI_PHASE_TEXT_ENCODER before
- * a host-resident text encoder's copy, MI_PHASE_DECODE before each VAE (twice for a request with an init image: its
- * encoder, then the decoder), MI_PHASE_DIT_LOAD before the DiT. A step the plan skips reports nothing; MI_PHASE_DENOISE
- * never comes, and there is no preview. A mi_cancel() from a callback stops the preload at once. `out_result` may be
- * NULL; else it
- * receives the preload's result on MI_OK and MI_CANCELLED (release it with mi_result_free()): the plan, the tier, the
- * timings, the memory, mi_result_dit_load() and MI_TEXT_PRELOAD_NOTE; no image, steps_run 0. */
+ * a host-resident text encoder's copy, MI_PHASE_DECODE before the VAE encoder of a request with an init image,
+ * MI_PHASE_DIT_LOAD before the DiT, MI_PHASE_DECODE before the VAE decoder. A step the plan skips reports nothing;
+ * MI_PHASE_DENOISE never comes, and there is no preview. The progress fraction and eta_seconds cover these loads. A
+ * mi_cancel() from a callback stops the preload at once. `out_result` may be NULL; else it receives the preload's
+ * result on MI_OK and MI_CANCELLED (release it with mi_result_free()): the plan, the tier, the timings, the memory,
+ * mi_result_dit_load() and MI_TEXT_PRELOAD_NOTE; no image, steps_run 0. */
 MOSSINFER_API mi_status mi_engine_preload(mi_engine* engine, const mi_gen_params* params, mi_result** out_result);
 
 /* What mi_engine_release() freed and kept. An output struct: struct_size set by the caller. */

@@ -86,7 +86,7 @@ Params (all optional):
     "capabilities": {"preview": true, "comfyui_models": false, "model_files": true, "lora": true, "tiers": true,
                      "samplers": true, "image_input": true, "hires": true, "distill": true, "system_cuda": true,
                      "control": true, "accel": true, "preload": true, "release": true, "certificate_dirs": true,
-                     "te_host_pin": true},
+                     "te_host_pin": true, "progress_fraction": true},
     "probe": {"driver_cuda_version": 13040, "runtime_cuda_version": 13040, "driver_compatible": true,
               "device_count": 1, "supported_device_count": 1, "build_flavour": "cu13", "recommended_flavour": "cu13",
               "message": "recommended flavour cu13 (the driver supports CUDA 13.4)",
@@ -129,6 +129,7 @@ The server's environment steers the search: `MOSSINFER_CUDA_LIBS` (`auto`: the b
 | `release` | `MI_CAP_RELEASE` | true | the `release` method; the report's `dit_load` |
 | `certificate_dirs` | `MI_CAP_CERTIFICATE_DIRS` | true | `load`'s `certificate_dirs` |
 | `te_host_pin` | `MI_CAP_TE_HOST_PIN` | true | `load`'s `te_host_pin` |
+| `progress_fraction` | `MI_CAP_PROGRESS_FRACTION` | true | `fraction` and `eta_seconds` in `progress` events and in `status` |
 
 ### `load`
 
@@ -232,12 +233,12 @@ A complete run. Lines are shortened; a real `plan` and `report` are longer:
 >> {"id": "g1", "method": "generate", "params": {"prompt": "a red apple on a wooden table", "width": 256, "height": 256, "steps": 2, "seed": 7, "output": "/tmp/apple.png"}}
 << {"id": "g1", "result": {"accepted": true}}
 << {"event": "plan", "id": "g1", "explanation": "Mode balanced (least time within the budget), 256x256, 17+10 tokens. ...", "plan": {"mode": "balanced", "dit": {...}, ...}}
-<< {"event": "progress", "id": "g1", "phase": "text_encoder", "step": 0, "total_steps": 2, "step_seconds": 0, "elapsed_seconds": 0.17703}
-<< {"event": "progress", "id": "g1", "phase": "dit_load", "step": 0, "total_steps": 2, "step_seconds": 0, "elapsed_seconds": 7.07368}
-<< {"event": "progress", "id": "g1", "phase": "denoise", "step": 0, "total_steps": 2, "step_seconds": 0, "elapsed_seconds": 8.29395}
-<< {"event": "progress", "id": "g1", "phase": "denoise", "step": 1, "total_steps": 2, "step_seconds": 0.12715, "elapsed_seconds": 8.42648}
-<< {"event": "progress", "id": "g1", "phase": "denoise", "step": 2, "total_steps": 2, "step_seconds": 0.116925, "elapsed_seconds": 8.54342}
-<< {"event": "progress", "id": "g1", "phase": "decode", "step": 0, "total_steps": 2, "step_seconds": 0, "elapsed_seconds": 8.54358}
+<< {"event": "progress", "id": "g1", "phase": "text_encoder", "step": 0, "total_steps": 2, "step_seconds": 0, "elapsed_seconds": 0.17703, "fraction": 0.018, "eta_seconds": 9.5}
+<< {"event": "progress", "id": "g1", "phase": "dit_load", "step": 0, "total_steps": 2, "step_seconds": 0, "elapsed_seconds": 7.07368, "fraction": 0.8, "eta_seconds": 1.8}
+<< {"event": "progress", "id": "g1", "phase": "denoise", "step": 0, "total_steps": 2, "step_seconds": 0, "elapsed_seconds": 8.29395, "fraction": 0.965, "eta_seconds": 0.3}
+<< {"event": "progress", "id": "g1", "phase": "denoise", "step": 1, "total_steps": 2, "step_seconds": 0.12715, "elapsed_seconds": 8.42648, "fraction": 0.98, "eta_seconds": 0.17}
+<< {"event": "progress", "id": "g1", "phase": "denoise", "step": 2, "total_steps": 2, "step_seconds": 0.116925, "elapsed_seconds": 8.54342, "fraction": 0.994, "eta_seconds": 0.05}
+<< {"event": "progress", "id": "g1", "phase": "decode", "step": 0, "total_steps": 2, "step_seconds": 0, "elapsed_seconds": 8.54358, "fraction": 0.994, "eta_seconds": 0.05}
 << {"event": "done", "id": "g1", "status": "ok", "image": "/tmp/apple.png", "report": {"request": {...}, "seed_used": 7, "steps_run": 2, "cancelled": false, "image": "/tmp/apple.png", ...}, "certified": true, "warnings": []}
 ```
 
@@ -245,7 +246,7 @@ With a preview (`"preview_output": "/tmp/preview.png"`), each denoise step that 
 
 ```
 << {"event": "preview", "id": "g1", "step": 1, "total_steps": 2, "image": "/tmp/preview.png", "width": 256, "height": 256}
-<< {"event": "progress", "id": "g1", "phase": "denoise", "step": 1, "total_steps": 2, "step_seconds": 0.13021, "elapsed_seconds": 8.43117}
+<< {"event": "progress", "id": "g1", "phase": "denoise", "step": 1, "total_steps": 2, "step_seconds": 0.13021, "elapsed_seconds": 8.43117, "fraction": 0.98, "eta_seconds": 0.17}
 ```
 
 ### Events of a generation
@@ -253,7 +254,7 @@ With a preview (`"preview_output": "/tmp/preview.png"`), each denoise step that 
 | Event | Fields |
 |---|---|
 | `plan` | `explanation` (several lines of text), `plan` (object: residencies, arena, per-phase peaks, time estimate). Sent once, before the first phase. |
-| `progress` | `phase` (`text_encoder`, `dit_load`, `denoise`, `decode`, in that order), `step`, `total_steps`, `step_seconds`, `elapsed_seconds` |
+| `progress` | `phase` (`text_encoder`, `dit_load`, `denoise`, `decode`, in that order), `step`, `total_steps`, `step_seconds`, `elapsed_seconds`, `fraction`, `eta_seconds` |
 | `preview` | `step`, `total_steps`, `image` (the `preview_output` path), `width`, `height`. Only with `preview_output`. |
 | `done` | `status`, `warnings`, `certified` (with a result), plus fields that depend on `status` (below) |
 | `log` | `level` (`info`, `warning`), `message`; `id` when it belongs to a request |
@@ -261,6 +262,9 @@ With a preview (`"preview_output": "/tmp/preview.png"`), each denoise step that 
 `progress` is sent at each phase start (`step` 0) and after every sampling step.
 - `text_encoder` is entered even on a full embedding-cache hit, and `dit_load` even when the DiT is resident.
 - `total_steps` counts the scheduled steps, which can be fewer than the requested `steps`.
+- `fraction` (0 to 1) is the share of the whole job done: every phase, both passes of a `hires` fix, a `preload`'s loads. It never decreases within a job and stays below 1 until `done`, which is the end. `eta_seconds` is the estimated time left, `null` when unknown. Drive a progress bar and its ETA from these two, not from `step / total_steps`, which is 0 through the text encoder and the loads and covers only the sampling steps.
+- They come from the plan's time estimate, plus a load estimate for each model not loaded yet (its size at the transfer rates the engine measured), corrected as the job runs: a phase that ended counts at its measured time, and the remaining steps of a pass at its measured step time (the first step, which carries the pass's setup, sets the price only until a later one is measured). The first run's estimate is the roughest.
+- A DiT load is one step: no `progress` comes during it, so the bar holds still while the DiT loads.
 
 `preview` is sent after every `preview_every`-th sampling step and after the last one, before that step's `progress`.
 - The server first rewrites the `preview_output` PNG through `mi_write_png()` (atomically: a reader never sees a partial file), then sends the event. Read the file when the event arrives; the next preview replaces it.
@@ -308,14 +312,14 @@ Loads what the engine keeps resident for a request, without generating (`mi_engi
 
 The params are `generate`'s without `output`, `preview_output`, `preview_every`, `save_metadata` and `include_prompts` (those are rejected as unknown). `prompt` is optional: an absent or blank prompt plans for a short one, and a long prompt sizes the workspaces for its length. The other params drive the plan: size, steps, CFG, `loras`, `control`, `init_image`, `hires`, the accelerators. They are validated as for `generate`, before the server's state.
 
-Like `generate`, it answers at once with `{"accepted": true}`, then sends events with its `id`: one `plan` after planning and before any load, then a `progress` (`step` 0, `total_steps` 0) before each load step, also for a model already resident (`text_encoder` before a host-resident text encoder's copy, `decode` before each VAE: an `init_image` request's encoder, then the decoder, `dit_load` before the DiT; never `denoise`), and `done`. `busy` and `cancel` work as for `generate`; a cancel stops it between models and DiT weight groups, and the engine keeps what was loaded before it.
+Like `generate`, it answers at once with `{"accepted": true}`, then sends events with its `id`: one `plan` after planning and before any load, then a `progress` (`step` 0, `total_steps` 0) before each load step, also for a model already resident (`text_encoder` before a host-resident text encoder's copy, `decode` before an `init_image` request's VAE encoder, `dit_load` before the DiT, `decode` before the VAE decoder; never `denoise`), and `done`. Their `fraction` and `eta_seconds` cover the load steps. `busy` and `cancel` work as for `generate`; a cancel stops it between models and DiT weight groups, and the engine keeps what was loaded before it.
 
 ```
 >> {"id": "p1", "method": "preload", "params": {"width": 1024, "height": 1024, "steps": 30}}
 << {"id": "p1", "result": {"accepted": true}}
 << {"event": "plan", "id": "p1", "explanation": "Mode balanced ...", "plan": {...}}
-<< {"event": "progress", "id": "p1", "phase": "dit_load", "step": 0, "total_steps": 0, "step_seconds": 0, "elapsed_seconds": 0.1}
-<< {"event": "progress", "id": "p1", "phase": "decode", "step": 0, "total_steps": 0, "step_seconds": 0, "elapsed_seconds": 2.1}
+<< {"event": "progress", "id": "p1", "phase": "dit_load", "step": 0, "total_steps": 0, "step_seconds": 0, "elapsed_seconds": 0.1, "fraction": 0.045, "eta_seconds": 2.1}
+<< {"event": "progress", "id": "p1", "phase": "decode", "step": 0, "total_steps": 0, "step_seconds": 0, "elapsed_seconds": 2.1, "fraction": 0.95, "eta_seconds": 0.1}
 << {"event": "done", "id": "p1", "status": "ok", "report": {...}, "preload_note": "", "dit_load": {"source": "files", "io": "direct", "bytes": 10000000000, "seconds": 2.0, "note": ""}, "certified": true, "warnings": []}
 ```
 
@@ -369,10 +373,11 @@ When nothing runs, the answer is `{"cancelling": false}`. When another job runs,
 ```
 >> {"id": 3, "method": "status"}
 << {"id": 3, "result": {"state": "generating", "model": "/models/MOSS-Image/base", "mode": "balanced", "generating_id": "g2",
-    "phase": "denoise", "step": 2, "total_steps": 30, "elapsed_seconds": 5.94924, "cancelling": false}}
+    "phase": "denoise", "step": 2, "total_steps": 30, "elapsed_seconds": 5.94924, "fraction": 0.3, "eta_seconds": 14,
+    "cancelling": false}}
 ```
 
-`state` is `"unloaded"` (no engine), `"idle"`, `"generating"`, `"preloading"` or `"releasing"`; the last two appear only to a client that sent `preload` or `release`. `model` and `mode` are present when an engine is loaded. While a job runs, `generating_id` is its id and `cancelling` says whether a cancel was requested; the progress fields (`phase`, `step`, `total_steps`, `elapsed_seconds`) are present while generating or preloading.
+`state` is `"unloaded"` (no engine), `"idle"`, `"generating"`, `"preloading"` or `"releasing"`; the last two appear only to a client that sent `preload` or `release`. `model` and `mode` are present when an engine is loaded. While a job runs, `generating_id` is its id and `cancelling` says whether a cancel was requested; the progress fields (`phase`, `step`, `total_steps`, `elapsed_seconds`, `fraction`, `eta_seconds`) are present while generating or preloading. They are the last `progress` event's (before the first one: `phase` `null`, `fraction` 0 and `eta_seconds` `null`).
 
 ### `unload`
 
@@ -393,8 +398,11 @@ send({"id": 1, "method": "load", "params": {"model": "/models/MOSS-Image/base"}}
 while "event" in (m := read()): pass            # skip the log event, keep the response
 send({"id": 2, "method": "generate", "params": {"prompt": "a cat", "output": "cat.png"}})
 while not ((m := read()).get("event") == "done" and m["id"] == 2):
-    if m.get("event") == "progress": print(m["phase"], m["step"], "/", m["total_steps"])
-print(m["status"], m.get("image"))
+    if m.get("event") == "progress":                # the whole job's share and time left
+        eta = "?" if m["eta_seconds"] is None else "%.0f s" % m["eta_seconds"]
+        print("\r[%-30s] %3.0f%% %s left (%s)" % ("#" * int(30 * m["fraction"]), 100 * m["fraction"], eta, m["phase"]),
+              end="", flush=True)
+print("\n" + m["status"], m.get("image"))
 send({"id": 3, "method": "shutdown"})
 ```
 
@@ -406,7 +414,7 @@ send({"id": 3, "method": "shutdown"})
 |---|---|---|
 | `server_protocol` | `cpu` | No GPU or weights needed (details below) |
 | `package_install_tree` | `cpu` | `tests/server/test_install_tree.py`: installs the build twice (full, and `--component Unspecified` without CUDA libraries), asks each tree's `hello` which cuBLASLt it uses under `MOSSINFER_CUDA_LIBS` `auto` / `system` / `bundled` and `MOSSINFER_CUBLASLT` (a bundled copy found, a system copy outside the tree, clean errors for a missing copy or file and a bad policy), and runs `check_package.py` on both trees. The full tree is installed from a temporary certificate source (`MOSSINFER_QUALITY_CERTS_SOURCE`) with one fake `*.mossinfer-cert.json` and a `README.md`: only the certificate lands in `share/mossinfer/quality_certs/`, `check_package.py` lists it and refuses a stray file and an unparsable certificate there; the slim tree from the build's own source (none yet: no directory, and the install does not fail), then again from the fake source (the default component carries certificates). With `MOSSINFER_GPU_TESTS=1`, the installed `moss-server` also runs a 256², 2-step `high`-tier generate whose quality reason names the fake certificate: the install tree was searched. |
-| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt), cancel mid-run, the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params`; a 256² img2img from a PNG path (4 steps at strength 0.5: 2 run, `total_steps` 2) and the strength-1 note in `done.warnings`; a 256², 4-step generate with the color/depth `control` adapter (`$MOSS_COMMUNITY_MODELS`, skipped when absent) and a depth PNG plus `step_cache` `fbcache` (the report's `control` and `accelerators`, uncertified, the accelerator line in `done.warnings`, `done.certified` false), then a kind the adapter lacks (`done` with `invalid_argument`), then `cfg_truncation` at CFG 1 and a threshold without the step cache (the two no-effect warnings, `done.certified` true); `preload` → `release` → `generate` at 256², 2 steps (the `preload` events and `done` with `dit_load` and `preload_note`, `release` answering `busy` during the preload, the release's stats, the next generate loading from the host copy, a `cancel` sent right after a second `release`: one of the documented outcomes, the text encoder's copy kept, and a 2-step generate after it running every step) |
+| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt; `fraction` and `eta_seconds` in every `progress`: the fraction in [0, 1) and never decreasing, the eta known and not negative), cancel mid-run (a `status` mid-run with `fraction` and a known `eta_seconds`), the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params`; a 256² img2img from a PNG path (4 steps at strength 0.5: 2 run, `total_steps` 2) and the strength-1 note in `done.warnings`; a 256², 4-step generate with the color/depth `control` adapter (`$MOSS_COMMUNITY_MODELS`, skipped when absent) and a depth PNG plus `step_cache` `fbcache` (the report's `control` and `accelerators`, uncertified, the accelerator line in `done.warnings`, `done.certified` false), then a kind the adapter lacks (`done` with `invalid_argument`), then `cfg_truncation` at CFG 1 and a threshold without the step cache (the two no-effect warnings, `done.certified` true); `preload` → `release` → `generate` at 256², 2 steps (the `preload` events, their `fraction` and `eta_seconds` as for `generate`, and `done` with `dit_load` and `preload_note`, `release` answering `busy` during the preload, the release's stats, the next generate loading from the host copy, a `cancel` sent right after a second `release`: one of the documented outcomes, the text encoder's copy kept, and a 2-step generate after it running every step) |
 
 `server_protocol` covers:
 - `hello` (the capabilities and `probe.cublaslt` included), `status`, and idle `cancel` / `unload`

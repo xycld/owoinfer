@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <limits>
 #include <optional>
@@ -20,7 +21,9 @@
 #include "models/control/control.h"
 #include "models/lora/lora.h"
 #include "models/moss_dit/distill.h"
+#include "api/progress_model.h"
 #include "models/moss_dit/moss_dit.h"
+#include "pipeline/hardware_profile.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_image.h"
 #include "pipeline/png_writer.h"
@@ -790,14 +793,63 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
 struct PipelineAdapter::Impl {
   fs::path model;
   fs::path time_embedding;  // PipelineOptions::time_embedding_file
+  fs::path cache_dir;       // PipelineOptions::cache_dir (the hardware profile's directory)
   int device = 0;
   std::unique_ptr<pipeline::Pipeline> pipe;
+  // The progress model's inputs that outlive a job: the weight files' sizes, what the engine holds (from the jobs'
+  // results and releases), and the transfer rates of the last plan (none yet: the cached profile, else the defaults).
+  ModelBytes model_bytes;
+  HeldModels held;
+  std::optional<planner::HardwareProfile> hardware;
+  const planner::HardwareProfile& rates();
 };
+
+namespace {
+
+// Bytes of a component's weights: its file, else the *.safetensors files in the bundle's folder (0 when unreadable).
+std::uint64_t weight_bytes(const fs::path& file, const fs::path& folder) {
+  std::error_code ec;
+  if (!file.empty()) {
+    const std::uintmax_t n = fs::file_size(file, ec);
+    return ec ? 0 : n;
+  }
+  std::uint64_t total = 0;
+  for (fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+    if (it->path().extension() != ".safetensors") continue;
+    std::error_code size_ec;
+    const std::uintmax_t n = it->file_size(size_ec);
+    if (!size_ec) total += n;
+  }
+  return total;
+}
+
+}  // namespace
+
+// The rates the pipeline plans with: the last result's, else (the engine's first job) the profile the pipeline reads
+// from (or has just probed into) its cache directory, else the planner's defaults. Called from the plan callback.
+const planner::HardwareProfile& PipelineAdapter::Impl::rates() {
+  if (!hardware) {
+    hardware = planner::HardwareProfile{};
+    if (!cache_dir.empty()) {
+      try {
+        const std::optional<pipeline::StoredProfile> stored =
+            pipeline::read_profile(cache_dir / "hardware_profile.json", pipeline::hardware_key(), std::time(nullptr));
+        if (stored) hardware = stored->learned;
+      } catch (const std::exception&) {
+        // A progress estimate never fails the job: the defaults stand.
+      }
+    }
+  }
+  return *hardware;
+}
 
 PipelineAdapter::PipelineAdapter(const mi_engine_params& params) : impl_(std::make_unique<Impl>()) {
   impl_->model = model_dir(params);
   const pipeline::PipelineOptions options = to_options(params);
   impl_->time_embedding = options.time_embedding_file;
+  impl_->cache_dir = options.cache_dir;
+  impl_->model_bytes.text_encoder = weight_bytes(options.text_encoder_file, impl_->model / "text_encoder");
+  impl_->model_bytes.vae = weight_bytes(options.vae_file, impl_->model / "vae");
   backend::load_cublaslt();  // before any CUDA work: no usable copy is CudaLibraryError (MI_ERR_CUDA), with every candidate
   const backend::ScopedCurrentContext restore;  // the caller's CUDA context is current again on return
   int count = 0;
@@ -851,8 +903,11 @@ pipeline::Result model_errors(F&& call) {
   }
 }
 
-// The progress callback of `params`, with the time since t0.
-void progress(const mi_gen_params& params, Clock::time_point t0, mi_phase phase, int step, int total, double step_s) {
+double since(Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); }
+
+// The progress callback of `params`, `t` seconds into the job, with the job's fraction and eta from `estimate`.
+void progress(const mi_gen_params& params, double t, mi_phase phase, int step, int total, double step_s,
+              const ProgressModel& estimate) {
   if (params.progress_callback == nullptr) return;
   mi_progress p{};
   p.struct_size = sizeof p;
@@ -860,8 +915,51 @@ void progress(const mi_gen_params& params, Clock::time_point t0, mi_phase phase,
   p.step = step;
   p.total_steps = total;
   p.step_seconds = step_s;
-  p.elapsed_seconds = std::chrono::duration<double>(Clock::now() - t0).count();
+  p.elapsed_seconds = t;
+  p.fraction = estimate.fraction();
+  p.eta_seconds = estimate.eta_seconds();
   params.progress_callback(&p, params.user_data);
+}
+
+// The passes of request `q` for the progress model.
+JobShape job_shape(const pipeline::Request& q) {
+  JobShape s;
+  s.total_steps = static_cast<int>(pipeline::schedule_steps(q));  // both passes, after the strengths
+  s.first_steps = s.total_steps;
+  s.hires = q.hires.enabled();
+  if (s.hires) {
+    pipeline::Request first = q;
+    first.hires = {};
+    s.first_steps = static_cast<int>(pipeline::schedule_steps(first));
+    const double target = static_cast<double>(q.hires.width) * static_cast<double>(q.hires.height);
+    if (target > 0) s.first_pixel_share = static_cast<double>(q.width) * static_cast<double>(q.height) / target;
+  }
+  // The pipeline's img2img condition (an init image at strength 1 without a mask is not used), and control images.
+  s.encodes_image = (q.init_image != nullptr && (q.denoise_strength < 1.0 || q.mask != nullptr)) ||
+                    (q.control.enabled() && !q.control.images.empty() && s.total_steps > 0);
+  return s;
+}
+
+// What a finished job (generate, or preload) leaves loaded, from its result: the pipeline reports no residency between
+// calls. A new arena drops every device model; a job that was not cancelled has the models of its plan loaded.
+void remember(HeldModels& h, const pipeline::Result& r, const JobShape& shape, bool generate) {
+  const bool arena_kept = r.memory.arena_creations == 0;
+  if (!arena_kept) {
+    h.loaded = false;
+    h.encoder = false;
+    h.te_vram = false;
+  }
+  if (!r.cancelled) {
+    h.loaded = true;
+    h.dit = r.plan.dit;
+    h.vae = r.plan.vae.run;
+    h.encoder = h.encoder || shape.encodes_image || shape.hires;
+    if (generate && r.plan.te.run && r.plan.te.residency == planner::TeResidency::kVramResident) h.te_vram = true;
+    if (r.plan.te.run && r.plan.te.residency == planner::TeResidency::kHostResident) h.te_host_copy = true;
+  }
+  h.arena_bytes = r.memory.arena_capacity;
+  if (r.dit_load.source == "files") h.dit_files_read = true;
+  if (r.dit_load.source == "host_copy") h.dit_host_copy = false;  // the copy is freed once it served the load
 }
 
 }  // namespace
@@ -875,22 +973,28 @@ Generation PipelineAdapter::generate(const mi_gen_params& params, const std::ato
   // The CUDA device is per host thread; the caller's thread may not be the one that created the engine.
   const backend::ScopedCurrentContext restore;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
-  const int total_steps = static_cast<int>(pipeline::schedule_steps(q));  // both passes, after the strengths
+  const JobShape shape = job_shape(q);
+  ProgressModel estimate;
   pipeline::GenerateControl control;
   control.cancel = &cancel;
+  control.on_plan = [&](const planner::ExecutionPlan& plan) {
+    estimate.expect(generate_segments(plan, impl_->rates(), impl_->held, impl_->model_bytes, shape));
+    if (params.plan_callback != nullptr) {
+      params.plan_callback(plan.explanation.c_str(), plan.to_json().c_str(), params.user_data);
+    }
+  };
   control.on_phase = [&](pipeline::Phase phase) {
-    progress(params, t0, to_phase(phase), 0, total_steps, 0.0);
+    const double t = since(t0);
+    estimate.phase(to_phase(phase), t);
+    progress(params, t, to_phase(phase), 0, shape.total_steps, 0.0, estimate);
     return true;
   };
   control.on_step = [&](const pipeline::StepInfo& s) {
-    progress(params, t0, MI_PHASE_DENOISE, s.step, s.num_steps, s.step_seconds);
+    const double t = since(t0);
+    estimate.step(s.step, s.step_seconds, t);
+    progress(params, t, MI_PHASE_DENOISE, s.step, s.num_steps, s.step_seconds, estimate);
     return true;
   };
-  if (params.plan_callback != nullptr) {
-    control.on_plan = [&](const planner::ExecutionPlan& plan) {
-      params.plan_callback(plan.explanation.c_str(), plan.to_json().c_str(), params.user_data);
-    };
-  }
   // Only with a callback: the preview's device buffers count in the denoise phase's plan.
   if (params.preview_callback != nullptr) {
     control.preview_every = params.preview_interval;
@@ -899,6 +1003,8 @@ Generation PipelineAdapter::generate(const mi_gen_params& params, const std::ato
     };
   }
   pipeline::Result r = model_errors([&] { return impl_->pipe->generate(q, control); });
+  impl_->hardware = r.hardware;
+  remember(impl_->held, r, shape, true);
   return to_generation(q, r, params.include_prompts != 0);
 }
 
@@ -919,25 +1025,43 @@ Generation PipelineAdapter::preload(const mi_gen_params& params, const std::atom
   const backend::ScopedCurrentContext restore;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
   // The plan once, before any load; a progress (step 0, no sampling steps) before each load step, resident models
-  // included: kTextEncoder (a host-resident text encoder's copy), kDecode (each VAE: an image request's encoder, then the
-  // decoder) and kDitLoad. Returning false cancels, as the cancel flag does (a callback's mi_cancel() lands at once).
-  if (params.plan_callback != nullptr) {
-    options.on_plan = [&](const planner::ExecutionPlan& plan) {
+  // included: kTextEncoder (a host-resident text encoder's copy), kDecode (an image request's VAE encoder), kDitLoad and
+  // kDecode (the VAE decoder). Returning false cancels, as the cancel flag does (a callback's mi_cancel() lands at once).
+  // The fraction and eta cover these load steps.
+  const JobShape shape = job_shape(q);
+  ProgressModel estimate;
+  options.on_plan = [&](const planner::ExecutionPlan& plan) {
+    estimate.expect(preload_segments(plan, impl_->rates(), impl_->held, impl_->model_bytes, shape));
+    if (params.plan_callback != nullptr) {
       params.plan_callback(plan.explanation.c_str(), plan.to_json().c_str(), params.user_data);
-    };
-  }
+    }
+  };
   options.on_phase = [&](pipeline::Phase phase) {
-    progress(params, t0, to_phase(phase), 0, 0, 0.0);
+    const double t = since(t0);
+    estimate.phase(to_phase(phase), t);
+    progress(params, t, to_phase(phase), 0, 0, 0.0, estimate);
     return !cancel.load();
   };
   pipeline::Result r = model_errors([&] { return impl_->pipe->preload(options); });
+  impl_->hardware = r.hardware;
+  remember(impl_->held, r, shape, false);
   return to_generation(q, r, false);
 }
 
 mi_release_info PipelineAdapter::release(bool keep_host_copy, const std::atomic<bool>& cancel, bool* cancelled) {
   const backend::ScopedCurrentContext restore;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
-  return to_release_info(impl_->pipe->release_device_memory(keep_host_copy, &cancel), cancelled);
+  const pipeline::ReleaseReport report = impl_->pipe->release_device_memory(keep_host_copy, &cancel);
+  if (!report.cancelled) {
+    // Nothing stays on the device; the host copies are what the release kept.
+    HeldModels& h = impl_->held;
+    const bool files_read = h.dit_files_read;
+    h = HeldModels{};
+    h.dit_host_copy = report.dit_host_copy;
+    h.te_host_copy = report.te_host_copy;
+    h.dit_files_read = files_read;
+  }
+  return to_release_info(report, cancelled);
 }
 
 mi_release_info to_release_info(const pipeline::ReleaseReport& rr, bool* cancelled) {

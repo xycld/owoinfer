@@ -239,7 +239,7 @@ class CpuProtocolTest(ProtocolTestBase):
                                                "image_input": True, "hires": True, "distill": True,
                                                "system_cuda": True, "control": True, "accel": True,
                                                "preload": True, "release": True, "certificate_dirs": True,
-                                               "te_host_pin": True})
+                                               "te_host_pin": True, "progress_fraction": True})
         probe = res["probe"]
         self.assertGreaterEqual(probe["device_count"], probe["supported_device_count"])
         self.assertIn(probe["recommended_flavour"], ("cu12", "cu13", ""))
@@ -804,6 +804,27 @@ class GpuProtocolTest(ProtocolTestBase):
             if msg["event"] == "done" and msg["id"] == gen_id:
                 return msg
 
+    def assertWholeJobProgress(self, progress):
+        """fraction and eta_seconds in every progress event: the fraction in [0, 1) and never decreasing, the eta known
+        (the plan comes first) and >= 0."""
+        self.assertTrue(progress)
+        last = 0.0
+        for e in progress:
+            self.assertIsInstance(e["fraction"], (int, float), e)
+            self.assertGreaterEqual(e["fraction"], last, progress)
+            self.assertLess(e["fraction"], 1.0, e)
+            last = e["fraction"]
+            self.assertIsNotNone(e["eta_seconds"], e)
+            self.assertGreaterEqual(e["eta_seconds"], 0, e)
+
+    def assertStatusProgress(self, st):
+        """A running job's status: the progress fields, the whole-job ones included."""
+        for key in ("phase", "step", "total_steps", "elapsed_seconds", "fraction", "eta_seconds"):
+            self.assertIn(key, st)
+        self.assertGreaterEqual(st["fraction"], 0)
+        self.assertLess(st["fraction"], 1)
+        self.assertTrue(st["eta_seconds"] is None or st["eta_seconds"] >= 0, st)
+
     def test_preload_release_generate(self):
         self.load_base()
         events = []
@@ -832,6 +853,7 @@ class GpuProtocolTest(ProtocolTestBase):
         self.assertEqual([rank[p] for p in phases], sorted(rank[p] for p in phases), phases)
         self.assertEqual(len(set(phases)), len(phases), phases)
         self.assertTrue(all(e["step"] == 0 and e["total_steps"] == 0 for e in mine[1:]), mine)
+        self.assertWholeJobProgress(mine[1:])
         if not done["preload_note"]:
             self.assertIn("dit_load", phases)
         self.assertEqual(self.server.call("status")["result"]["state"], "idle")
@@ -910,6 +932,8 @@ class GpuProtocolTest(ProtocolTestBase):
         self.assertError(self.server.response(busy, events=events), "busy", "g2")
         st = self.server.call("status")["result"]
         self.assertIn(st["state"], ("generating", "idle"))
+        if st["state"] == "generating":
+            self.assertStatusProgress(st)
         done = self.wait_done(gid, events)
         self.assertEqual(done["status"], "ok", done)
         self.assertEqual(done["image"], out)
@@ -943,6 +967,7 @@ class GpuProtocolTest(ProtocolTestBase):
         self.assertEqual(progress, [("text_encoder", 0), ("dit_load", 0), ("denoise", 0), ("denoise", 1), ("denoise", 2),
                                     ("decode", 0)])
         self.assertTrue(all(e["total_steps"] == 2 for e in events if e["event"] == "progress"))
+        self.assertWholeJobProgress([e for e in events if e["event"] == "progress"])
         self.assertEqual(self.server.call("status")["result"]["state"], "idle")
         # Invalid requests are rejected up front with the engine's wording.
         r = self.server.call("generate", {"prompt": "x", "width": 1000, "output": out}, id="bad")
@@ -1126,6 +1151,11 @@ class GpuProtocolTest(ProtocolTestBase):
         self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
         while not any(e["event"] == "progress" and e["phase"] == "denoise" and e["step"] >= 2 for e in events):
             events.append(self.server.read(GPU_TIMEOUT))
+        # Mid-run, after measured steps: the status has the whole-job fields, the eta known.
+        st = self.server.response(self.server.send("status"), events=events)["result"]
+        self.assertEqual(st["state"], "generating", st)
+        self.assertStatusProgress(st)
+        self.assertIsNotNone(st["eta_seconds"], st)
         cid = self.server.send("cancel", {"id": "other"})
         self.assertEqual(self.server.response(cid, events=events)["result"], {"cancelling": False, "generating_id": "long"})
         cid = self.server.send("cancel", {"id": "long"})
