@@ -623,8 +623,9 @@ MOSSINFER_API mi_status mi_generate(mi_engine* engine, const mi_gen_params* para
 
 /* Loads what the engine keeps resident for a request like `params`, without generating (MI_CAP_PRELOAD), so that the
  * first mi_generate() starts at once: the arena at the plan's size, the DiT as the plan keeps it (not when the plan
- * parks it for the text encoder: MI_TEXT_PRELOAD_NOTE says so), the VAE decoder, the VAE encoder of a request with an
- * init image, the LoRAs and control adapter it names, and a host-resident text encoder's copy. The request is planned as
+ * parks it for the text encoder: MI_TEXT_PRELOAD_NOTE says so), the VAE decoder, the VAE encoder of a request that
+ * encodes an image (an init image below strength 1 or with a mask, control images, or a hires fix), the LoRAs and
+ * control adapter it names, and a host-resident text encoder's copy. The request is planned as
  * mi_generate() plans it (size, steps, CFG, LoRAs, control adapter, the prompt's length). `params` NULL = the defaults;
  * a NULL or blank prompt is allowed here only (it plans for a short prompt). Otherwise `params` is checked as for
  * mi_generate(), with the same failures. A following mi_generate() of a request like it reuses everything
@@ -633,7 +634,7 @@ MOSSINFER_API mi_status mi_generate(mi_engine* engine, const mi_gen_params* para
  * weight groups (MI_CANCELLED with a result; the engine stays usable and keeps what was loaded before the cancel).
  * params' callbacks run on this thread: the plan once, after planning and before any load; then a progress (step 0,
  * total_steps 0) before each load step, also for a model already resident, in this order: MI_PHASE_TEXT_ENCODER before
- * a host-resident text encoder's copy, MI_PHASE_DECODE before the VAE encoder of a request with an init image,
+ * a host-resident text encoder's copy, MI_PHASE_DECODE before the VAE encoder of a request that encodes an image,
  * MI_PHASE_DIT_LOAD before the DiT, MI_PHASE_DECODE before the VAE decoder. A step the plan skips reports nothing;
  * MI_PHASE_DENOISE never comes, and there is no preview. The progress fraction and eta_seconds cover these loads. A
  * mi_cancel() from a callback stops the preload at once. `out_result` may be NULL; else it receives the preload's

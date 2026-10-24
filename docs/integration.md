@@ -340,7 +340,7 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 - Do not build the bar from `step / total_steps`: it is 0 through the text encoder and the loads, which can be most of a first run, and covers only the sampling steps.
 - `progress` events also report the `phase` (`text_encoder`, then `dit_load`, `denoise` and `decode`) for a label; `denoise` also reports `step` and `total_steps`.
 - The estimate is roughest on the first run and corrects itself as phases and steps are measured. A DiT load is one step: the bar holds still while it runs.
-- Check `capabilities.progress_fraction` in `hello`; a server without it sends neither field.
+- `hello`'s `capabilities.progress_fraction` says whether they are there. A server older than them sends neither field; this server on a library without them sends both as `null`. Without them, fall back to `step / total_steps` during `denoise`.
 
 **One generation at a time.** A second `generate` while one runs is answered with `busy`, so queue requests in the launcher. The same holds for `preload` and `release`: one job at a time. `done` is written only after the server is idle again, so the next `generate` can go out as soon as `done` is read.
 

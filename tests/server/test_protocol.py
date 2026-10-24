@@ -817,6 +817,15 @@ class GpuProtocolTest(ProtocolTestBase):
             self.assertIsNotNone(e["eta_seconds"], e)
             self.assertGreaterEqual(e["eta_seconds"], 0, e)
 
+    def assertBarMoves(self, progress):
+        """A generation's bar moves: from text_encoder to the final decode the fraction grows past one half and the eta
+        shrinks."""
+        first, last = progress[0], progress[-1]
+        self.assertEqual((first["phase"], last["phase"]), ("text_encoder", "decode"), progress)
+        self.assertGreater(last["fraction"], first["fraction"], progress)
+        self.assertGreater(last["fraction"], 0.5, progress)
+        self.assertLess(last["eta_seconds"], first["eta_seconds"], progress)
+
     def assertStatusProgress(self, st):
         """A running job's status: the progress fields, the whole-job ones included."""
         for key in ("phase", "step", "total_steps", "elapsed_seconds", "fraction", "eta_seconds"):
@@ -874,6 +883,9 @@ class GpuProtocolTest(ProtocolTestBase):
         done = self.wait_done(gid, events)
         self.assertEqual(done["status"], "ok", done)
         self.assertEqual(done["report"]["dit_load"]["source"], "host_copy" if stats["dit_host_copy"] else "files")
+        progress = [e for e in events if e.get("id") == "g1" and e["event"] == "progress"]
+        self.assertWholeJobProgress(progress)
+        self.assertBarMoves(progress)
         # The host's room decides whether a copy is kept: without it the release says why, and the cancel below can
         # only find that the copy does not fit.
         no_room = not stats["dit_host_copy"]
@@ -968,6 +980,7 @@ class GpuProtocolTest(ProtocolTestBase):
                                     ("decode", 0)])
         self.assertTrue(all(e["total_steps"] == 2 for e in events if e["event"] == "progress"))
         self.assertWholeJobProgress([e for e in events if e["event"] == "progress"])
+        self.assertBarMoves([e for e in events if e["event"] == "progress"])
         self.assertEqual(self.server.call("status")["result"]["state"], "idle")
         # Invalid requests are rejected up front with the engine's wording.
         r = self.server.call("generate", {"prompt": "x", "width": 1000, "output": out}, id="bad")

@@ -30,25 +30,51 @@ double file_gbps(const planner::HardwareProfile& hw, bool warm) {
   return hw.direct_gbps > 0 ? hw.direct_gbps : hw.disk_gbps;
 }
 
+// The DIT_LOAD estimate of a generation: a load when the DiT is not held, else the plan's parking reload. A parked DiT
+// stays loaded after a job that did not park it for its decode, until a text-encoder pass evicts it.
+double dit_load_seconds(const planner::ExecutionPlan& plan, const HeldModels& held, const LoadEstimates& load,
+                        const JobShape& shape) {
+  if (shape.total_steps <= 0) return 0;
+  if (!load.dit_held) return std::max(plan.time.dit_load_s, load.dit);
+  if (plan.dit.residency == DitResidency::kParked && !plan.te.run && !held.last_dit.park_for_decode) return 0;
+  return std::max(plan.time.dit_load_s, 0.0);
+}
+
 }  // namespace
+
+void HeldModels::job_done(const planner::ExecutionPlan& plan, const std::string& merge_key, bool cancelled,
+                          int arena_creations, std::string_view dit_load_source) {
+  if (!cancelled) {
+    warm = true;
+    last_dit = plan.dit;
+    last_merge_key = merge_key;
+    if (plan.te.run && plan.te.residency == planner::TeResidency::kHostResident) te_host_copy = true;
+  } else if (arena_creations > 0) {
+    warm = false;  // a new arena dropped the models, and the cancel left unknown which came back
+  }
+  if (dit_load_source == "files") dit_files_read = true;
+  if (dit_load_source == "host_copy") dit_host_copy = false;  // the copy is freed once it served the load
+}
+
+void HeldModels::released(bool kept_dit_host_copy, bool kept_te_host_copy) {
+  warm = false;
+  dit_host_copy = kept_dit_host_copy;
+  te_host_copy = kept_te_host_copy;
+}
 
 LoadEstimates load_estimates(const planner::ExecutionPlan& plan, const planner::HardwareProfile& hw, const HeldModels& held,
                              const ModelBytes& bytes, const JobShape& shape) {
   LoadEstimates e;
-  // A larger arena than the held one is created anew, without the models it held.
-  const bool arena_kept = held.loaded && held.arena_bytes >= plan.arena_bytes;
   const double h2d = bytes_per_s(hw.h2d_gbps);
   const double cold = bytes_per_s(file_gbps(hw, false));
   const double cold_device = std::min(cold, h2d);
   if (plan.te.run) {
     const double te = static_cast<double>(bytes.text_encoder);
     if (plan.te.residency == planner::TeResidency::kHostResident && !held.te_host_copy) e.text_encoder = te / cold;
-    if (plan.te.residency == planner::TeResidency::kVramResident && !(held.te_vram && arena_kept)) {
-      e.text_encoder = te / cold_device;
-    }
+    if (plan.te.residency == planner::TeResidency::kVramResident && !held.warm) e.text_encoder = te / cold_device;
   }
-  const bool dit_held = arena_kept && held.dit.residency != DitResidency::kParked && same_residency(held.dit, plan.dit);
-  if (shape.total_steps > 0 && !dit_held) {
+  e.dit_held = held.warm && same_residency(held.last_dit, plan.dit) && held.last_merge_key == shape.merge_key;
+  if (shape.total_steps > 0 && !e.dit_held) {
     const double device = static_cast<double>(plan.dit.device_bytes);
     if (held.dit_host_copy) {
       e.dit = device / h2d;
@@ -61,9 +87,11 @@ LoadEstimates load_estimates(const planner::ExecutionPlan& plan, const planner::
       }
     }
   }
-  const double vae = static_cast<double>(bytes.vae);
-  if (plan.vae.run && !(arena_kept && held.vae)) e.vae_decoder = vae / cold_device;
-  if ((shape.encodes_image || shape.hires) && !(arena_kept && held.encoder)) e.vae_encoder = vae / cold_device;
+  if (!held.warm) {
+    const double vae = static_cast<double>(bytes.vae);
+    if (plan.vae.run) e.vae_decoder = vae / cold_device;
+    if (shape.encodes_image || shape.hires) e.vae_encoder = vae / cold_device;
+  }
   return e;
 }
 
@@ -71,17 +99,23 @@ std::vector<ProgressSegment> generate_segments(const planner::ExecutionPlan& pla
                                                const HeldModels& held, const ModelBytes& bytes, const JobShape& shape) {
   const LoadEstimates load = load_estimates(plan, hw, held, bytes, shape);
   const planner::TimeEstimate& t = plan.time;
-  const double per_step = shape.total_steps > 0 ? t.denoise_s / shape.total_steps : 0;
-  // A parked DiT reloads every generation (dit_load_s); a first load costs at least as much.
-  const double dit = shape.total_steps > 0 ? std::max(t.dit_load_s, load.dit) : 0;
   const int first = shape.hires ? shape.first_steps : shape.total_steps;
+  // The planner counts a hires fix's first-pass steps at the target's cost times their pixel share.
+  double first_price = shape.total_steps > 0 ? t.denoise_s / shape.total_steps : 0;
+  double second_price = first_price;
+  if (shape.hires) {
+    const double share = shape.first_pixel_share;
+    const double target_steps = (shape.total_steps - first) + first * share;
+    second_price = target_steps > 0 ? t.denoise_s / target_steps : 0;
+    first_price = second_price * share;
+  }
   std::vector<ProgressSegment> s;
   s.push_back({MI_PHASE_TEXT_ENCODER, t.text_encoder_s + load.text_encoder});
-  s.push_back({MI_PHASE_DIT_LOAD, dit + (shape.encodes_image ? load.vae_encoder : 0)});
-  s.push_back({MI_PHASE_DENOISE, 0, first, per_step});
+  s.push_back({MI_PHASE_DIT_LOAD, dit_load_seconds(plan, held, load, shape) + (shape.encodes_image ? load.vae_encoder : 0)});
+  s.push_back({MI_PHASE_DENOISE, 0, first, first_price});
   if (shape.hires) {
     s.push_back({MI_PHASE_DECODE, t.decode_s * shape.first_pixel_share + load.vae_decoder});
-    s.push_back({MI_PHASE_DENOISE, shape.encodes_image ? 0 : load.vae_encoder, shape.total_steps - first, per_step});
+    s.push_back({MI_PHASE_DENOISE, shape.encodes_image ? 0 : load.vae_encoder, shape.total_steps - first, second_price});
     s.push_back({MI_PHASE_DECODE, t.decode_s});
   } else {
     s.push_back({MI_PHASE_DECODE, t.decode_s + load.vae_decoder});
@@ -93,10 +127,11 @@ std::vector<ProgressSegment> preload_segments(const planner::ExecutionPlan& plan
                                               const HeldModels& held, const ModelBytes& bytes, const JobShape& shape) {
   const LoadEstimates load = load_estimates(plan, hw, held, bytes, shape);
   std::vector<ProgressSegment> s;
+  // The text encoder's copy and the VAE encoder follow conditions the progress sees only roughly: optional.
   if (plan.te.run && plan.te.residency == planner::TeResidency::kHostResident) {
-    s.push_back({MI_PHASE_TEXT_ENCODER, load.text_encoder});
+    s.push_back({MI_PHASE_TEXT_ENCODER, load.text_encoder, 0, 0, true});
   }
-  if (shape.encodes_image || shape.hires) s.push_back({MI_PHASE_DECODE, load.vae_encoder});
+  if (shape.encodes_image || shape.hires) s.push_back({MI_PHASE_DECODE, load.vae_encoder, 0, 0, true});
   if (shape.total_steps > 0 && !plan.dit.park_for_text_encoder) s.push_back({MI_PHASE_DIT_LOAD, load.dit});
   if (plan.vae.run && !plan.dit.park_for_decode) s.push_back({MI_PHASE_DECODE, load.vae_decoder});
   return s;
@@ -111,8 +146,8 @@ void ProgressModel::expect(std::vector<ProgressSegment> segments) {
 
 void ProgressModel::phase(mi_phase phase, double t) {
   std::size_t i = next_;
-  while (i < segments_.size() && segments_[i].phase != phase) ++i;
-  if (i == segments_.size()) {
+  while (i < segments_.size() && segments_[i].phase != phase && segments_[i].optional) ++i;
+  if (i == segments_.size() || segments_[i].phase != phase) {
     i = next_;
     segments_.insert(segments_.begin() + static_cast<std::ptrdiff_t>(i), ProgressSegment{phase});
   }
@@ -138,6 +173,8 @@ void ProgressModel::step(int step, double step_seconds, double t) {
       later_s_ += t - last_step_t_;
     }
     steps_ = step;
+    const double plan = current_ >= 0 ? segments_[static_cast<std::size_t>(current_)].step_seconds : 0;
+    if (plan > 0) scale_ = step_price() / plan;
   }
   last_step_t_ = t;
   update(t);
@@ -146,7 +183,7 @@ void ProgressModel::step(int step, double step_seconds, double t) {
 double ProgressModel::step_price() const {
   if (later_steps_ > 0) return later_s_ / later_steps_;
   if (first_step_s_ >= 0) return first_step_s_;
-  return segments_[static_cast<std::size_t>(current_)].step_seconds;
+  return segments_[static_cast<std::size_t>(current_)].step_seconds * scale_;
 }
 
 void ProgressModel::update(double t) {
@@ -165,7 +202,9 @@ void ProgressModel::update(double t) {
       eta += c.seconds;  // it just started: updates come at phase starts and steps only
     }
   }
-  for (std::size_t i = next_; i < segments_.size(); ++i) eta += segments_[i].seconds + segments_[i].steps * segments_[i].step_seconds;
+  for (std::size_t i = next_; i < segments_.size(); ++i) {
+    eta += segments_[i].seconds + segments_[i].steps * segments_[i].step_seconds * scale_;
+  }
   if (!std::isfinite(eta) || eta < 0) {
     eta_ = -1;
     return;

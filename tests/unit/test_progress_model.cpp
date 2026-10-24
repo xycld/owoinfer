@@ -3,7 +3,6 @@
 // steps.
 #include <gtest/gtest.h>
 
-#include <cmath>
 #include <limits>
 #include <vector>
 
@@ -117,6 +116,8 @@ TEST(ProgressModel, MeasuredPhaseReplacesItsEstimate) {
 TEST(ProgressModel, StepsAfterTheFirstSetThePrice) {
   ProgressModel m;
   m.expect(txt2img());
+  m.phase(MI_PHASE_TEXT_ENCODER, 1.0);
+  m.phase(MI_PHASE_DIT_LOAD, 4.0);
   m.phase(MI_PHASE_DENOISE, 10.0);
   // The first event 3 s after the phase start: refiner and setup, then a 1.5 s step (its own time).
   m.step(1, 1.5, 13.0);
@@ -127,6 +128,8 @@ TEST(ProgressModel, StepsAfterTheFirstSetThePrice) {
   // Without a step time (0), the first step's price is its wall time since the phase started.
   ProgressModel n;
   n.expect(txt2img());
+  n.phase(MI_PHASE_TEXT_ENCODER, 1.0);
+  n.phase(MI_PHASE_DIT_LOAD, 4.0);
   n.phase(MI_PHASE_DENOISE, 10.0);
   n.step(1, 0.0, 12.0);
   EXPECT_NEAR(n.eta_seconds(), 9 * 2.0 + 1, 1e-9);
@@ -138,6 +141,7 @@ TEST(ProgressModel, UnknownEta) {
   EXPECT_LT(m.eta_seconds(), 0.0);
   EXPECT_EQ(m.fraction(), 0.0);
   m.expect(txt2img());
+  m.phase(MI_PHASE_TEXT_ENCODER, 0.5);
   m.phase(MI_PHASE_DIT_LOAD, 1.0);
   EXPECT_NEAR(m.eta_seconds(), 4 + 10 + 1, 1e-9);
   // A non-finite estimate: unknown again, and the fraction keeps its value.
@@ -150,8 +154,10 @@ TEST(ProgressModel, UnknownEta) {
 
 TEST(ProgressModel, SkippedAndUnexpectedPhases) {
   ProgressModel m;
-  m.expect(txt2img());
-  // The text-encoder segment never starts: the DiT load's start drops it.
+  std::vector<ProgressSegment> segments = txt2img();
+  segments[0].optional = true;
+  m.expect(segments);
+  // The optional text-encoder segment never starts: the DiT load's start passes it.
   m.phase(MI_PHASE_DIT_LOAD, 0.5);
   EXPECT_NEAR(m.eta_seconds(), 4 + 10 + 1, 1e-9);
   m.phase(MI_PHASE_DENOISE, 4.5);
@@ -163,6 +169,14 @@ TEST(ProgressModel, SkippedAndUnexpectedPhases) {
   EXPECT_NEAR(m.eta_seconds(), 0.0, 1e-12);
   EXPECT_GE(m.fraction(), before);
   EXPECT_LE(m.fraction(), kFractionBeforeEnd);
+  // A phase that is not expected next does not pass a pending one that is not optional: it counts with no estimate,
+  // and the pending ones keep theirs.
+  ProgressModel n;
+  n.expect(txt2img());
+  n.phase(MI_PHASE_DENOISE, 0.5);
+  EXPECT_NEAR(n.eta_seconds(), 2 + 4 + 10 + 1, 1e-9);
+  n.phase(MI_PHASE_TEXT_ENCODER, 1.0);
+  EXPECT_NEAR(n.eta_seconds(), 2 + 4 + 10 + 1, 1e-9);
 }
 
 TEST(ProgressModel, ColdLoadEstimate) {
@@ -174,6 +188,7 @@ TEST(ProgressModel, ColdLoadEstimate) {
   HeldModels cold;
   // Nothing loaded: the DiT's plan bytes at the cold-disk rate (below the H2D rate), the VAE decoder likewise.
   mi::api::LoadEstimates e = mi::api::load_estimates(plan, hw, cold, bytes, shape);
+  EXPECT_FALSE(e.dit_held);
   EXPECT_NEAR(e.dit, 10e9 / 2e9, 1e-9);
   EXPECT_NEAR(e.vae_decoder, 0.2e9 / 2e9, 1e-9);
   EXPECT_EQ(e.text_encoder, 0.0);  // a streamed encoder: the plan's own estimate
@@ -186,56 +201,138 @@ TEST(ProgressModel, ColdLoadEstimate) {
   EXPECT_EQ(s[2].steps, 20);
   EXPECT_NEAR(s[2].step_seconds, 1.0, 1e-9);
   EXPECT_NEAR(s[3].seconds, 0.5 + 0.1, 1e-9);
+  for (const ProgressSegment& g : s) EXPECT_FALSE(g.optional);  // a generation enters every phase
   // The measured direct-I/O rate prices a cold load, at most at the H2D rate.
   hw.direct_gbps = 20;
   EXPECT_NEAR(mi::api::load_estimates(plan, hw, cold, bytes, shape).dit, 10e9 / 12e9, 1e-9);
   hw.direct_gbps = 0;
   // Files read before: the page-cache rate, or the learned warm buffered rate.
-  HeldModels warm;
-  warm.dit_files_read = true;
-  EXPECT_NEAR(mi::api::load_estimates(plan, hw, warm, bytes, shape).dit, 10e9 / 8e9, 1e-9);
+  HeldModels read_before;
+  read_before.dit_files_read = true;
+  EXPECT_NEAR(mi::api::load_estimates(plan, hw, read_before, bytes, shape).dit, 10e9 / 8e9, 1e-9);
   hw.buffered_warm_gbps = 4;
-  EXPECT_NEAR(mi::api::load_estimates(plan, hw, warm, bytes, shape).dit, 10e9 / 4e9, 1e-9);
+  EXPECT_NEAR(mi::api::load_estimates(plan, hw, read_before, bytes, shape).dit, 10e9 / 4e9, 1e-9);
   // A soft unload's host copy: the H2D rate.
   HeldModels copy;
   copy.dit_host_copy = true;
   EXPECT_NEAR(mi::api::load_estimates(plan, hw, copy, bytes, shape).dit, 10e9 / 12e9, 1e-9);
-  // Loaded with this residency in a large enough arena: nothing to load; a larger arena drops the models.
-  HeldModels held;
-  held.loaded = true;
-  held.dit = plan.dit;
-  held.vae = true;
-  held.arena_bytes = plan.arena_bytes;
-  e = mi::api::load_estimates(plan, hw, held, bytes, shape);
+  // Warm with this residency and no LoRA change: nothing to load.
+  HeldModels warm;
+  warm.warm = true;
+  warm.last_dit = plan.dit;
+  e = mi::api::load_estimates(plan, hw, warm, bytes, shape);
+  EXPECT_TRUE(e.dit_held);
   EXPECT_EQ(e.dit, 0.0);
   EXPECT_EQ(e.vae_decoder, 0.0);
-  held.arena_bytes = plan.arena_bytes - 1;
-  EXPECT_GT(mi::api::load_estimates(plan, hw, held, bytes, shape).dit, 0.0);
-  held.arena_bytes = plan.arena_bytes;
-  // Another residency reloads.
+  EXPECT_EQ(mi::api::generate_segments(plan, hw, warm, bytes, shape)[1].seconds, 0.0);
+  // Another residency loads.
   plan.dit.residency = mi::planner::DitResidency::kStreamed;
-  EXPECT_GT(mi::api::load_estimates(plan, hw, held, bytes, shape).dit, 0.0);
-  plan.dit.residency = mi::planner::DitResidency::kResident;
-  // A parked DiT reloads every generation at the plan's dit_load_s.
+  EXPECT_NEAR(mi::api::load_estimates(plan, hw, warm, bytes, shape).dit, 10e9 / 2e9, 1e-9);
+  // A parked DiT reloads at the plan's dit_load_s, unless the last job left it loaded (no decode parking) and this one
+  // runs no text encoder.
+  plan.dit.residency = mi::planner::DitResidency::kParked;
   plan.time.dit_load_s = 3;
-  EXPECT_NEAR(mi::api::generate_segments(plan, hw, held, bytes, shape)[1].seconds, 3.0, 1e-9);
-  // A host-resident text encoder without its copy reads it from the files; a VRAM-resident one is capped by the H2D rate.
-  plan.te.residency = mi::planner::TeResidency::kHostResident;
-  EXPECT_NEAR(mi::api::load_estimates(plan, hw, held, bytes, shape).text_encoder, 14e9 / 2e9, 1e-9);
-  held.te_host_copy = true;
-  EXPECT_EQ(mi::api::load_estimates(plan, hw, held, bytes, shape).text_encoder, 0.0);
-  plan.te.run = false;  // an embedding-cache hit
-  held.te_host_copy = false;
-  EXPECT_EQ(mi::api::load_estimates(plan, hw, held, bytes, shape).text_encoder, 0.0);
-  // An image request loads the VAE encoder before the DiT load.
+  warm.last_dit = plan.dit;
+  EXPECT_NEAR(mi::api::generate_segments(plan, hw, warm, bytes, shape)[1].seconds, 3.0, 1e-9);
+  plan.te.run = false;
+  EXPECT_EQ(mi::api::generate_segments(plan, hw, warm, bytes, shape)[1].seconds, 0.0);
+  warm.last_dit.park_for_decode = true;
+  EXPECT_NEAR(mi::api::generate_segments(plan, hw, warm, bytes, shape)[1].seconds, 3.0, 1e-9);
+  // Cold, a parked DiT costs the larger of its load and the plan's reload.
+  EXPECT_NEAR(mi::api::generate_segments(plan, hw, cold, bytes, shape)[1].seconds, 5.0, 1e-9);
   plan.te.run = true;
+  plan.dit = resident_plan().dit;
+  plan.time.dit_load_s = 0;
+  // A host-resident text encoder without its copy reads it from the files; a VRAM-resident one loads when cold, capped
+  // by the H2D rate.
+  plan.te.residency = mi::planner::TeResidency::kHostResident;
+  EXPECT_NEAR(mi::api::load_estimates(plan, hw, warm, bytes, shape).text_encoder, 14e9 / 2e9, 1e-9);
+  warm.te_host_copy = true;
+  EXPECT_EQ(mi::api::load_estimates(plan, hw, warm, bytes, shape).text_encoder, 0.0);
+  plan.te.run = false;  // an embedding-cache hit
+  EXPECT_EQ(mi::api::load_estimates(plan, hw, cold, bytes, shape).text_encoder, 0.0);
+  plan.te.run = true;
+  plan.te.residency = mi::planner::TeResidency::kVramResident;
+  EXPECT_NEAR(mi::api::load_estimates(plan, hw, cold, bytes, shape).text_encoder, 14e9 / 2e9, 1e-9);
+  EXPECT_EQ(mi::api::load_estimates(plan, hw, warm, bytes, shape).text_encoder, 0.0);
   plan.te.residency = mi::planner::TeResidency::kStreamed;
+  // An image request loads the VAE encoder before the DiT load when cold.
   shape.encodes_image = true;
   s = mi::api::generate_segments(plan, hw, cold, bytes, shape);
   EXPECT_NEAR(s[1].seconds, 5.0 + 0.1, 1e-9);
+  EXPECT_EQ(mi::api::load_estimates(plan, hw, warm, bytes, shape).vae_encoder, 0.0);
   // No sampling step (denoise strength 0): no DiT load.
   shape.total_steps = shape.first_steps = 0;
   EXPECT_EQ(mi::api::load_estimates(plan, hw, cold, bytes, shape).dit, 0.0);
+  EXPECT_NEAR(mi::api::generate_segments(plan, hw, cold, bytes, shape)[1].seconds, 0.1, 1e-12);
+}
+
+// The warm / cold record across jobs, as the adapter feeds it.
+TEST(ProgressModel, HeldModelsRecord) {
+  const mi::planner::ExecutionPlan plan = resident_plan();
+  const mi::planner::HardwareProfile hw = slow_disk();
+  const ModelBytes bytes{14'000'000'000, 200'000'000};
+  JobShape shape;
+  shape.total_steps = shape.first_steps = 20;
+  const auto dit = [&](const HeldModels& h) { return mi::api::load_estimates(plan, hw, h, bytes, shape).dit; };
+  const auto vae = [&](const HeldModels& h) { return mi::api::load_estimates(plan, hw, h, bytes, shape).vae_decoder; };
+
+  HeldModels h;  // a new engine: cold
+  EXPECT_FALSE(h.warm);
+  EXPECT_GT(dit(h), 0.0);
+  // A generation that loaded from the files: warm, and the files were read.
+  h.job_done(plan, "", false, 1, "files");
+  EXPECT_TRUE(h.warm);
+  EXPECT_TRUE(h.dit_files_read);
+  EXPECT_EQ(dit(h), 0.0);
+  EXPECT_EQ(vae(h), 0.0);
+  // Cancelled without a new arena: still warm. Cancelled after creating one: cold.
+  h.job_done(plan, "", true, 0, "");
+  EXPECT_TRUE(h.warm);
+  h.job_done(plan, "", true, 1, "");
+  EXPECT_FALSE(h.warm);
+  h.job_done(plan, "", false, 0, "");
+  EXPECT_TRUE(h.warm);
+  // An exception from the pipeline: cold.
+  h.job_failed();
+  EXPECT_FALSE(h.warm);
+  EXPECT_NEAR(dit(h), 10e9 / 8e9, 1e-9);  // the files read before: the page-cache rate
+  EXPECT_GT(vae(h), 0.0);
+  h.job_done(plan, "", false, 0, "");
+  // A LoRA change prices a DiT load (the VAE stays loaded); the same stack again does not.
+  shape.merge_key = "/loras/a.safetensors\n0.800000\n";
+  EXPECT_NEAR(dit(h), 10e9 / 8e9, 1e-9);
+  EXPECT_EQ(vae(h), 0.0);
+  h.job_done(plan, shape.merge_key, false, 0, "files");
+  EXPECT_EQ(dit(h), 0.0);
+  // A release with the DiT's host copy: cold, and the next load reads the copy at the H2D rate; it is gone after it.
+  h.released(true, false);
+  EXPECT_FALSE(h.warm);
+  EXPECT_NEAR(dit(h), 10e9 / 12e9, 1e-9);
+  EXPECT_GT(vae(h), 0.0);
+  h.job_done(plan, shape.merge_key, false, 1, "host_copy");
+  EXPECT_FALSE(h.dit_host_copy);
+  EXPECT_TRUE(h.warm);
+  // A host-resident text encoder's copy is kept by a job that ran it, and by a release that keeps it.
+  mi::planner::ExecutionPlan host_te = plan;
+  host_te.te.residency = mi::planner::TeResidency::kHostResident;
+  h.job_done(host_te, shape.merge_key, false, 0, "");
+  EXPECT_TRUE(h.te_host_copy);
+  h.released(false, true);
+  EXPECT_TRUE(h.te_host_copy);
+  EXPECT_EQ(mi::api::load_estimates(host_te, hw, h, bytes, shape).text_encoder, 0.0);
+  h.released(false, false);
+  EXPECT_NEAR(mi::api::load_estimates(host_te, hw, h, bytes, shape).text_encoder, 14e9 / 2e9, 1e-9);
+
+  // A preload, then a generation of a like request: the generation's DIT_LOAD and DECODE price no load.
+  HeldModels fresh;
+  const std::vector<ProgressSegment> pre = mi::api::preload_segments(plan, hw, fresh, bytes, shape);
+  ASSERT_EQ(pre.size(), 2u);
+  EXPECT_NEAR(pre[0].seconds, 10e9 / 2e9, 1e-9);
+  fresh.job_done(plan, shape.merge_key, false, 1, "files");
+  const std::vector<ProgressSegment> gen = mi::api::generate_segments(plan, hw, fresh, bytes, shape);
+  EXPECT_EQ(gen[1].seconds, 0.0);
+  EXPECT_NEAR(gen[3].seconds, plan.time.decode_s, 1e-12);
 }
 
 TEST(ProgressModel, HiresPasses) {
@@ -246,11 +343,8 @@ TEST(ProgressModel, HiresPasses) {
   shape.hires = true;
   shape.first_pixel_share = 0.25;
   HeldModels held;
-  held.loaded = true;
-  held.dit = plan.dit;
-  held.vae = true;
-  held.encoder = true;
-  held.arena_bytes = plan.arena_bytes;
+  held.warm = true;
+  held.last_dit = plan.dit;
   const std::vector<ProgressSegment> s = mi::api::generate_segments(plan, slow_disk(), held, ModelBytes{}, shape);
   ASSERT_EQ(s.size(), 6u);
   const std::vector<mi_phase> phases = {MI_PHASE_TEXT_ENCODER, MI_PHASE_DIT_LOAD, MI_PHASE_DENOISE,
@@ -258,13 +352,18 @@ TEST(ProgressModel, HiresPasses) {
   for (std::size_t i = 0; i < s.size(); ++i) EXPECT_EQ(s[i].phase, phases[i]) << i;
   EXPECT_EQ(s[2].steps, 12);
   EXPECT_EQ(s[4].steps, 8);
+  // As the planner counts them: the 12 first-pass steps at a quarter of a target step, 8 + 12 / 4 = 11 target steps.
+  EXPECT_NEAR(s[4].step_seconds, 20.0 / 11, 1e-9);
+  EXPECT_NEAR(s[2].step_seconds, 20.0 / 11 * 0.25, 1e-9);
+  EXPECT_NEAR(s[2].steps * s[2].step_seconds + s[4].steps * s[4].step_seconds, plan.time.denoise_s, 1e-9);
   EXPECT_NEAR(s[3].seconds, 0.5 * 0.25, 1e-9);
-  // The first pass's measured price does not carry over: the second pass is priced at the plan until it is measured.
   ProgressModel m;
   m.expect(s);
   m.phase(MI_PHASE_TEXT_ENCODER, 0);
   m.phase(MI_PHASE_DIT_LOAD, 1.5);
   m.phase(MI_PHASE_DENOISE, 1.5);
+  EXPECT_NEAR(m.eta_seconds(), 20 + 0.125 + 0.5, 1e-9);
+  // Pass 1 measured at 0.25 s a step: pass 2's steps are priced at 0.25 / 0.25 = 1 s until they are measured.
   for (int k = 1; k <= 12; ++k) m.step(k, 0.25, 1.5 + 0.25 * k);
   EXPECT_NEAR(m.eta_seconds(), 0.125 + 8 * 1.0 + 0.5, 1e-9);
   m.phase(MI_PHASE_DECODE, 4.5);
@@ -286,8 +385,10 @@ TEST(ProgressModel, PreloadLoadSteps) {
   ASSERT_EQ(s.size(), 3u);
   EXPECT_EQ(s[0].phase, MI_PHASE_TEXT_ENCODER);
   EXPECT_NEAR(s[0].seconds, 7.0, 1e-9);
+  EXPECT_TRUE(s[0].optional);
   EXPECT_EQ(s[1].phase, MI_PHASE_DIT_LOAD);
   EXPECT_NEAR(s[1].seconds, 5.0, 1e-9);
+  EXPECT_FALSE(s[1].optional);
   EXPECT_EQ(s[2].phase, MI_PHASE_DECODE);
   EXPECT_NEAR(s[2].seconds, 0.1, 1e-9);
   for (const ProgressSegment& g : s) EXPECT_EQ(g.steps, 0);
@@ -304,8 +405,13 @@ TEST(ProgressModel, PreloadLoadSteps) {
   f.push_back(m.fraction());
   EXPECT_NEAR(m.eta_seconds(), 0.1, 1e-9);
   expect_monotonic(f);
-  // A DiT the plan parks for the text encoder is not preloaded, nor a VAE decoder it parks for; an image request's
-  // VAE encoder comes before the DiT.
+  // The optional text-encoder step may not run: the DiT load's start passes it.
+  ProgressModel skip;
+  skip.expect(s);
+  skip.phase(MI_PHASE_DIT_LOAD, 0.1);
+  EXPECT_NEAR(skip.eta_seconds(), 5.1, 1e-9);
+  // A DiT the plan parks for the text encoder is not preloaded, nor a VAE decoder it parks for; the VAE encoder of a
+  // request that encodes an image comes before the DiT.
   plan.dit.park_for_text_encoder = true;
   plan.dit.park_for_decode = true;
   shape.encodes_image = true;
@@ -313,6 +419,31 @@ TEST(ProgressModel, PreloadLoadSteps) {
   ASSERT_EQ(parked.size(), 2u);
   EXPECT_EQ(parked[0].phase, MI_PHASE_TEXT_ENCODER);
   EXPECT_EQ(parked[1].phase, MI_PHASE_DECODE);
+}
+
+// A preload's DECODE that nothing expected (a VAE encoder the shape did not predict) before the DiT: it does not take
+// the decoder's segment past the pending DiT load, whose estimate stays.
+TEST(ProgressModel, UnexpectedDecodeInPreload) {
+  const ModelBytes bytes{14'000'000'000, 200'000'000};
+  JobShape shape;
+  shape.total_steps = shape.first_steps = 20;
+  const std::vector<ProgressSegment> s =
+      mi::api::preload_segments(resident_plan(), slow_disk(), HeldModels{}, bytes, shape);
+  ASSERT_EQ(s.size(), 2u);  // DIT_LOAD 5 s, DECODE (the decoder) 0.1 s
+  ProgressModel m;
+  m.expect(s);
+  std::vector<double> f;
+  m.phase(MI_PHASE_DECODE, 0.2);  // the encoder: unexpected, no estimate
+  f.push_back(m.fraction());
+  EXPECT_NEAR(m.eta_seconds(), 5.0 + 0.1, 1e-9);
+  m.phase(MI_PHASE_DIT_LOAD, 0.4);
+  f.push_back(m.fraction());
+  EXPECT_NEAR(m.eta_seconds(), 5.0 + 0.1, 1e-9);
+  m.phase(MI_PHASE_DECODE, 5.4);
+  f.push_back(m.fraction());
+  EXPECT_NEAR(m.eta_seconds(), 0.1, 1e-9);
+  expect_monotonic(f);
+  EXPECT_GT(f.back(), 0.9);
 }
 
 }  // namespace

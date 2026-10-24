@@ -796,8 +796,9 @@ struct PipelineAdapter::Impl {
   fs::path cache_dir;       // PipelineOptions::cache_dir (the hardware profile's directory)
   int device = 0;
   std::unique_ptr<pipeline::Pipeline> pipe;
-  // The progress model's inputs that outlive a job: the weight files' sizes, what the engine holds (from the jobs'
-  // results and releases), and the transfer rates of the last plan (none yet: the cached profile, else the defaults).
+  // The progress model's inputs that outlive a job: the weight files' sizes, the warm / cold record (from the jobs'
+  // results, their exceptions and the releases), and the transfer rates of the last plan (none yet: the cached profile,
+  // else the defaults).
   ModelBytes model_bytes;
   HeldModels held;
   std::optional<planner::HardwareProfile> hardware;
@@ -937,29 +938,23 @@ JobShape job_shape(const pipeline::Request& q) {
   // The pipeline's img2img condition (an init image at strength 1 without a mask is not used), and control images.
   s.encodes_image = (q.init_image != nullptr && (q.denoise_strength < 1.0 || q.mask != nullptr)) ||
                     (q.control.enabled() && !q.control.images.empty() && s.total_steps > 0);
+  // A LoRA change may re-merge or reload the DiT: the progress prices a load whenever the stack differs.
+  for (const lora::LoraSpec& l : q.loras) s.merge_key += util::path_utf8(l.path) + '\n' + std::to_string(l.strength) + '\n';
+  if (q.control.enabled()) {
+    s.merge_key += "control\n" + util::path_utf8(q.control.adapter) + '\n' + std::to_string(q.control.lora_strength);
+  }
   return s;
 }
 
-// What a finished job (generate, or preload) leaves loaded, from its result: the pipeline reports no residency between
-// calls. A new arena drops every device model; a job that was not cancelled has the models of its plan loaded.
-void remember(HeldModels& h, const pipeline::Result& r, const JobShape& shape, bool generate) {
-  const bool arena_kept = r.memory.arena_creations == 0;
-  if (!arena_kept) {
-    h.loaded = false;
-    h.encoder = false;
-    h.te_vram = false;
+// A pipeline call whose exception leaves the progress record cold: what the call loaded or dropped is unknown.
+template <class F>
+auto cold_on_throw(HeldModels& held, F&& call) {
+  try {
+    return call();
+  } catch (...) {
+    held.job_failed();
+    throw;
   }
-  if (!r.cancelled) {
-    h.loaded = true;
-    h.dit = r.plan.dit;
-    h.vae = r.plan.vae.run;
-    h.encoder = h.encoder || shape.encodes_image || shape.hires;
-    if (generate && r.plan.te.run && r.plan.te.residency == planner::TeResidency::kVramResident) h.te_vram = true;
-    if (r.plan.te.run && r.plan.te.residency == planner::TeResidency::kHostResident) h.te_host_copy = true;
-  }
-  h.arena_bytes = r.memory.arena_capacity;
-  if (r.dit_load.source == "files") h.dit_files_read = true;
-  if (r.dit_load.source == "host_copy") h.dit_host_copy = false;  // the copy is freed once it served the load
 }
 
 }  // namespace
@@ -1002,9 +997,10 @@ Generation PipelineAdapter::generate(const mi_gen_params& params, const std::ato
       params.preview_callback(im.rgb, im.width, im.height, im.step, params.user_data);
     };
   }
-  pipeline::Result r = model_errors([&] { return impl_->pipe->generate(q, control); });
+  pipeline::Result r =
+      cold_on_throw(impl_->held, [&] { return model_errors([&] { return impl_->pipe->generate(q, control); }); });
   impl_->hardware = r.hardware;
-  remember(impl_->held, r, shape, true);
+  impl_->held.job_done(r.plan, shape.merge_key, r.cancelled, r.memory.arena_creations, r.dit_load.source);
   return to_generation(q, r, params.include_prompts != 0);
 }
 
@@ -1025,7 +1021,7 @@ Generation PipelineAdapter::preload(const mi_gen_params& params, const std::atom
   const backend::ScopedCurrentContext restore;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
   // The plan once, before any load; a progress (step 0, no sampling steps) before each load step, resident models
-  // included: kTextEncoder (a host-resident text encoder's copy), kDecode (an image request's VAE encoder), kDitLoad and
+  // included: kTextEncoder (a host-resident text encoder's copy), kDecode (an image encode's VAE encoder), kDitLoad and
   // kDecode (the VAE decoder). Returning false cancels, as the cancel flag does (a callback's mi_cancel() lands at once).
   // The fraction and eta cover these load steps.
   const JobShape shape = job_shape(q);
@@ -1042,25 +1038,19 @@ Generation PipelineAdapter::preload(const mi_gen_params& params, const std::atom
     progress(params, t, to_phase(phase), 0, 0, 0.0, estimate);
     return !cancel.load();
   };
-  pipeline::Result r = model_errors([&] { return impl_->pipe->preload(options); });
+  pipeline::Result r =
+      cold_on_throw(impl_->held, [&] { return model_errors([&] { return impl_->pipe->preload(options); }); });
   impl_->hardware = r.hardware;
-  remember(impl_->held, r, shape, false);
+  impl_->held.job_done(r.plan, shape.merge_key, r.cancelled, r.memory.arena_creations, r.dit_load.source);
   return to_generation(q, r, false);
 }
 
 mi_release_info PipelineAdapter::release(bool keep_host_copy, const std::atomic<bool>& cancel, bool* cancelled) {
   const backend::ScopedCurrentContext restore;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
-  const pipeline::ReleaseReport report = impl_->pipe->release_device_memory(keep_host_copy, &cancel);
-  if (!report.cancelled) {
-    // Nothing stays on the device; the host copies are what the release kept.
-    HeldModels& h = impl_->held;
-    const bool files_read = h.dit_files_read;
-    h = HeldModels{};
-    h.dit_host_copy = report.dit_host_copy;
-    h.te_host_copy = report.te_host_copy;
-    h.dit_files_read = files_read;
-  }
+  const pipeline::ReleaseReport report =
+      cold_on_throw(impl_->held, [&] { return impl_->pipe->release_device_memory(keep_host_copy, &cancel); });
+  if (!report.cancelled) impl_->held.released(report.dit_host_copy, report.te_host_copy);
   return to_release_info(report, cancelled);
 }
 
