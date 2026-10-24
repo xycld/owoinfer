@@ -1,5 +1,6 @@
 // mi_inspect_file() (MI_CAP_INSPECT) on synthetic files written here, and on the community files when present. CPU
-// only: inspection never touches CUDA (the cpu label's guard fails a test that leaves a context).
+// only: inspection never touches CUDA (the cpu label's guard fails a test that leaves a context). Each test writes its
+// files into a TempDir of its own, removed with them when the test ends.
 #include "mossinfer/mossinfer.h"
 
 #include <gtest/gtest.h>
@@ -14,7 +15,16 @@
 #include <utility>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <winioctl.h>
+#else
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -38,8 +48,56 @@ struct T {
   std::string json = "";
 };
 
+// Byte ranges of a file to write: (offset, bytes). The rest of the file is zeros.
+using Regions = std::vector<std::pair<std::uint64_t, std::string>>;
+
+#ifdef _WIN32
+// A new sparse file of `size` bytes holding `regions`: the zero ranges stay unallocated (NTFS would otherwise write
+// every zero up to the last region and the end). False when the file system has no sparse files; the file is removed.
+bool write_sparse(const fs::path& path, const Regions& regions, std::uint64_t size) {
+  const HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD returned = 0;
+  bool ok = DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr) != 0;
+  for (const auto& [at, bytes] : regions) {
+    if (!ok) break;
+    LARGE_INTEGER pos;
+    pos.QuadPart = static_cast<LONGLONG>(at);
+    DWORD written = 0;
+    ok = SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0 &&
+         WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) != 0 &&
+         written == bytes.size();
+  }
+  if (ok) {
+    LARGE_INTEGER end;
+    end.QuadPart = static_cast<LONGLONG>(size);
+    ok = SetFilePointerEx(h, end, nullptr, FILE_BEGIN) != 0 && SetEndOfFile(h) != 0;
+  }
+  CloseHandle(h);
+  if (!ok) {
+    std::error_code ec;
+    fs::remove(path, ec);
+  }
+  return ok;
+}
+#endif
+
+// Whether `dir` takes sparse files: on Linux the seeks below leave holes; on Windows FSCTL_SET_SPARSE must work.
+bool sparse_files(const fs::path& dir) {
+#ifdef _WIN32
+  const fs::path probe = dir / "sparse_probe";
+  const bool ok = write_sparse(probe, {}, std::uint64_t{1} << 20);
+  std::error_code ec;
+  fs::remove(probe, ec);
+  return ok;
+#else
+  static_cast<void>(dir);
+  return true;
+#endif
+}
+
 // Laid out like the safetensors library writes files: larger dtypes first, the header padded to 8 bytes. Zero tensors
-// are left as a hole (sparse where the file system allows), so files with MOSS-Image's shapes stay cheap.
+// are left as a hole (a sparse file where the file system allows), so files with MOSS-Image's shapes stay cheap.
 void write_file(const fs::path& path, std::vector<T> ts, const std::string& metadata_json = "") {
   std::stable_sort(ts.begin(), ts.end(),
                    [](const T& a, const T& b) {
@@ -75,17 +133,23 @@ void write_file(const fs::path& path, std::vector<T> ts, const std::string& meta
   }
   h += "}";
   h.append((8 - h.size() % 8) % 8, ' ');
+  Regions regions;
+  std::string header(8, '\0');
+  for (int i = 0; i < 8; ++i) header[static_cast<std::size_t>(i)] = static_cast<char>((h.size() >> (8 * i)) & 0xFF);
+  regions.emplace_back(0, header + h);
+  for (auto& [at, bytes] : data) regions.emplace_back(8 + h.size() + at, std::move(bytes));
+  const std::uint64_t size = 8 + h.size() + off;
+#ifdef _WIN32
+  if (write_sparse(path, regions, size)) return;
+#endif
   {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    const std::uint64_t len = h.size();
-    for (int i = 0; i < 8; ++i) out.put(static_cast<char>((len >> (8 * i)) & 0xFF));
-    out.write(h.data(), static_cast<std::streamsize>(h.size()));
-    for (const auto& [at, bytes] : data) {
-      out.seekp(static_cast<std::streamoff>(8 + h.size() + at));
+    for (const auto& [at, bytes] : regions) {
+      out.seekp(static_cast<std::streamoff>(at));
       out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     }
   }
-  fs::resize_file(path, 8 + h.size() + off);
+  fs::resize_file(path, size);
 }
 
 void write_bytes(const fs::path& path, const std::string& bytes) {
@@ -274,6 +338,9 @@ TEST(CApiInspect, HostileDitShapes) {
 // 283 MiB, and the file gets the NVFP4 verdict, never a size refusal.
 TEST(CApiInspect, Nvfp4Dit) {
   mi::testing::TempDir dir("inspect_nvfp4");
+  if (!sparse_files(dir.path())) {
+    GTEST_SKIP() << "the test folder's file system has no sparse files: the 2.5 GB fixture would be written in full";
+  }
   const auto round_up = [](std::int64_t v, std::int64_t to) { return (v + to - 1) / to * to; };
   std::vector<T> t;
   std::string layers;
