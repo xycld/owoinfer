@@ -377,7 +377,7 @@ When nothing runs, the answer is `{"cancelling": false}`. When another job runs,
     "cancelling": false}}
 ```
 
-`state` is `"unloaded"` (no engine), `"idle"`, `"generating"`, `"preloading"` or `"releasing"`; the last two appear only to a client that sent `preload` or `release`. `model` and `mode` are present when an engine is loaded. While a job runs, `generating_id` is its id and `cancelling` says whether a cancel was requested; the progress fields (`phase`, `step`, `total_steps`, `elapsed_seconds`, `fraction`, `eta_seconds`) are present while generating or preloading. They are the last `progress` event's (before the first one: `phase` `null`, `fraction` 0 and `eta_seconds` `null`).
+`state` is `"unloaded"` (no engine), `"idle"`, `"generating"`, `"preloading"` or `"releasing"`; the last two appear only to a client that sent `preload` or `release`. `model` and `mode` are present when an engine is loaded. While a job runs, `generating_id` is its id and `cancelling` says whether a cancel was requested; the progress fields (`phase`, `step`, `total_steps`, `elapsed_seconds`, `fraction`, `eta_seconds`) are present while generating or preloading. They are the last `progress` event's (before the first one: `phase` `null`, `fraction` 0 and `eta_seconds` `null`; on a library without them both stay `null`).
 
 ### `unload`
 

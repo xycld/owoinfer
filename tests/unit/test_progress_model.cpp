@@ -219,6 +219,7 @@ TEST(ProgressModel, ColdLoadEstimate) {
   // Warm with this residency and no LoRA change: nothing to load.
   HeldModels warm;
   warm.warm = true;
+  warm.dit = true;
   warm.last_dit = plan.dit;
   e = mi::api::load_estimates(plan, hw, warm, bytes, shape);
   EXPECT_TRUE(e.dit_held);
@@ -236,15 +237,19 @@ TEST(ProgressModel, ColdLoadEstimate) {
   EXPECT_NEAR(mi::api::generate_segments(plan, hw, warm, bytes, shape)[1].seconds, 3.0, 1e-9);
   plan.te.run = false;
   EXPECT_EQ(mi::api::generate_segments(plan, hw, warm, bytes, shape)[1].seconds, 0.0);
-  warm.last_dit.park_for_decode = true;
+  plan.dit.park_for_decode = true;  // the last job parked it for its decode: evicted, reloaded at dit_load_s
+  warm.last_dit = plan.dit;
   EXPECT_NEAR(mi::api::generate_segments(plan, hw, warm, bytes, shape)[1].seconds, 3.0, 1e-9);
+  // Other parking than the held DiT's: not the same residency, a load.
+  warm.last_dit.park_for_decode = false;
+  EXPECT_NEAR(mi::api::generate_segments(plan, hw, warm, bytes, shape)[1].seconds, 5.0, 1e-9);
   // Cold, a parked DiT costs the larger of its load and the plan's reload.
   EXPECT_NEAR(mi::api::generate_segments(plan, hw, cold, bytes, shape)[1].seconds, 5.0, 1e-9);
   plan.te.run = true;
   plan.dit = resident_plan().dit;
   plan.time.dit_load_s = 0;
-  // A host-resident text encoder without its copy reads it from the files; a VRAM-resident one loads when cold, capped
-  // by the H2D rate.
+  // A host-resident text encoder without its copy reads it from the files; a VRAM-resident one loads unless the record
+  // holds it (te_vram), capped by the H2D rate.
   plan.te.residency = mi::planner::TeResidency::kHostResident;
   EXPECT_NEAR(mi::api::load_estimates(plan, hw, warm, bytes, shape).text_encoder, 14e9 / 2e9, 1e-9);
   warm.te_host_copy = true;
@@ -254,6 +259,7 @@ TEST(ProgressModel, ColdLoadEstimate) {
   plan.te.run = true;
   plan.te.residency = mi::planner::TeResidency::kVramResident;
   EXPECT_NEAR(mi::api::load_estimates(plan, hw, cold, bytes, shape).text_encoder, 14e9 / 2e9, 1e-9);
+  warm.te_vram = true;
   EXPECT_EQ(mi::api::load_estimates(plan, hw, warm, bytes, shape).text_encoder, 0.0);
   plan.te.residency = mi::planner::TeResidency::kStreamed;
   // An image request loads the VAE encoder before the DiT load when cold.
@@ -279,44 +285,63 @@ TEST(ProgressModel, HeldModelsRecord) {
 
   HeldModels h;  // a new engine: cold
   EXPECT_FALSE(h.warm);
+  EXPECT_FALSE(h.dit);
   EXPECT_GT(dit(h), 0.0);
-  // A generation that loaded from the files: warm, and the files were read.
-  h.job_done(plan, "", false, 1, "files");
+  // A generation that loaded from the files: warm, the DiT held, and the files were read.
+  h.job_done(plan, shape, false, false, 1, "files");
   EXPECT_TRUE(h.warm);
+  EXPECT_TRUE(h.dit);
   EXPECT_TRUE(h.dit_files_read);
   EXPECT_EQ(dit(h), 0.0);
   EXPECT_EQ(vae(h), 0.0);
-  // Cancelled without a new arena: still warm. Cancelled after creating one: cold.
-  h.job_done(plan, "", true, 0, "");
+  // Cancelled without a new arena, with the same DiT: still warm. Cancelled after creating one: cold.
+  h.job_done(plan, shape, false, true, 0, "");
   EXPECT_TRUE(h.warm);
-  h.job_done(plan, "", true, 1, "");
+  EXPECT_TRUE(h.dit);
+  h.job_done(plan, shape, false, true, 1, "");
   EXPECT_FALSE(h.warm);
-  h.job_done(plan, "", false, 0, "");
+  EXPECT_FALSE(h.dit);
+  h.job_done(plan, shape, false, false, 0, "");
   EXPECT_TRUE(h.warm);
+  // A cancelled job without a new arena that used another residency or LoRA stack: the held DiT may be gone.
+  mi::planner::ExecutionPlan streamed = plan;
+  streamed.dit.residency = mi::planner::DitResidency::kStreamed;
+  h.job_done(streamed, shape, false, true, 0, "");
+  EXPECT_TRUE(h.warm);
+  EXPECT_FALSE(h.dit);
+  EXPECT_GT(dit(h), 0.0);
+  h.job_done(plan, shape, false, false, 0, "");
+  JobShape other_loras = shape;
+  other_loras.merge_key = "/loras/b.safetensors\n1.000000\n";
+  h.job_done(plan, other_loras, false, true, 0, "");
+  EXPECT_FALSE(h.dit);
+  h.job_done(plan, shape, false, false, 0, "");
   // An exception from the pipeline: cold.
   h.job_failed();
   EXPECT_FALSE(h.warm);
+  EXPECT_FALSE(h.dit);
   EXPECT_NEAR(dit(h), 10e9 / 8e9, 1e-9);  // the files read before: the page-cache rate
   EXPECT_GT(vae(h), 0.0);
-  h.job_done(plan, "", false, 0, "");
+  h.job_done(plan, shape, false, false, 0, "");
   // A LoRA change prices a DiT load (the VAE stays loaded); the same stack again does not.
   shape.merge_key = "/loras/a.safetensors\n0.800000\n";
   EXPECT_NEAR(dit(h), 10e9 / 8e9, 1e-9);
   EXPECT_EQ(vae(h), 0.0);
-  h.job_done(plan, shape.merge_key, false, 0, "files");
+  h.job_done(plan, shape, false, false, 0, "files");
   EXPECT_EQ(dit(h), 0.0);
   // A release with the DiT's host copy: cold, and the next load reads the copy at the H2D rate; it is gone after it.
   h.released(true, false);
   EXPECT_FALSE(h.warm);
+  EXPECT_FALSE(h.dit);
   EXPECT_NEAR(dit(h), 10e9 / 12e9, 1e-9);
   EXPECT_GT(vae(h), 0.0);
-  h.job_done(plan, shape.merge_key, false, 1, "host_copy");
+  h.job_done(plan, shape, false, false, 1, "host_copy");
   EXPECT_FALSE(h.dit_host_copy);
   EXPECT_TRUE(h.warm);
   // A host-resident text encoder's copy is kept by a job that ran it, and by a release that keeps it.
   mi::planner::ExecutionPlan host_te = plan;
   host_te.te.residency = mi::planner::TeResidency::kHostResident;
-  h.job_done(host_te, shape.merge_key, false, 0, "");
+  h.job_done(host_te, shape, false, false, 0, "");
   EXPECT_TRUE(h.te_host_copy);
   h.released(false, true);
   EXPECT_TRUE(h.te_host_copy);
@@ -324,15 +349,65 @@ TEST(ProgressModel, HeldModelsRecord) {
   h.released(false, false);
   EXPECT_NEAR(mi::api::load_estimates(host_te, hw, h, bytes, shape).text_encoder, 14e9 / 2e9, 1e-9);
 
+  // A job that did not use the DiT does not mark it held: no sampling step (img2img at strength 0), or a preload that
+  // left a DiT parked for the text encoder to the generation.
+  HeldModels no_dit;
+  JobShape no_steps = shape;
+  no_steps.total_steps = no_steps.first_steps = 0;
+  no_dit.job_done(plan, no_steps, false, false, 1, "");
+  EXPECT_TRUE(no_dit.warm);
+  EXPECT_FALSE(no_dit.dit);
+  EXPECT_GT(dit(no_dit), 0.0);
+  mi::planner::ExecutionPlan parked = plan;
+  parked.dit.residency = mi::planner::DitResidency::kParked;
+  parked.dit.park_for_text_encoder = true;
+  HeldModels preloaded_parked;
+  preloaded_parked.job_done(parked, shape, true, false, 1, "");
+  EXPECT_FALSE(preloaded_parked.dit);
+  // A new arena in a job without the DiT drops a held one.
+  no_dit.job_done(plan, shape, false, false, 0, "files");
+  EXPECT_TRUE(no_dit.dit);
+  no_dit.job_done(plan, no_steps, false, false, 1, "");
+  EXPECT_FALSE(no_dit.dit);
+  // Parking differs: another residency (the planner keeps a DiT only with the same parking).
+  HeldModels parked_held;
+  parked_held.job_done(parked, shape, false, false, 1, "files");
+  mi::planner::ExecutionPlan parked_decode = parked;
+  parked_decode.dit.park_for_decode = true;
+  EXPECT_TRUE(mi::api::load_estimates(parked, hw, parked_held, bytes, shape).dit_held);
+  EXPECT_FALSE(mi::api::load_estimates(parked_decode, hw, parked_held, bytes, shape).dit_held);
+
   // A preload, then a generation of a like request: the generation's DIT_LOAD and DECODE price no load.
   HeldModels fresh;
   const std::vector<ProgressSegment> pre = mi::api::preload_segments(plan, hw, fresh, bytes, shape);
   ASSERT_EQ(pre.size(), 2u);
   EXPECT_NEAR(pre[0].seconds, 10e9 / 2e9, 1e-9);
-  fresh.job_done(plan, shape.merge_key, false, 1, "files");
+  fresh.job_done(plan, shape, true, false, 1, "files");
   const std::vector<ProgressSegment> gen = mi::api::generate_segments(plan, hw, fresh, bytes, shape);
   EXPECT_EQ(gen[1].seconds, 0.0);
   EXPECT_NEAR(gen[3].seconds, plan.time.decode_s, 1e-12);
+
+  // A VRAM-resident text encoder: a preload does not load it, so the generation after it prices its load; a generation
+  // that ran it holds it; an embedding-cache hit neither loads nor drops it; a new arena drops it.
+  mi::planner::ExecutionPlan vram_te = plan;
+  vram_te.te.residency = mi::planner::TeResidency::kVramResident;
+  const auto te = [&](const HeldModels& m) { return mi::api::load_estimates(vram_te, hw, m, bytes, shape).text_encoder; };
+  HeldModels v;
+  v.job_done(vram_te, shape, true, false, 1, "files");
+  EXPECT_TRUE(v.warm);
+  EXPECT_FALSE(v.te_vram);
+  EXPECT_NEAR(te(v), 14e9 / 2e9, 1e-9);
+  EXPECT_NEAR(mi::api::generate_segments(vram_te, hw, v, bytes, shape)[0].seconds, vram_te.time.text_encoder_s + 7.0, 1e-9);
+  v.job_done(vram_te, shape, false, false, 0, "");
+  EXPECT_TRUE(v.te_vram);
+  EXPECT_EQ(te(v), 0.0);
+  mi::planner::ExecutionPlan cache_hit = vram_te;
+  cache_hit.te.run = false;
+  v.job_done(cache_hit, shape, false, false, 0, "");
+  EXPECT_TRUE(v.te_vram);
+  v.job_done(cache_hit, shape, false, false, 1, "");
+  EXPECT_FALSE(v.te_vram);
+  EXPECT_NEAR(te(v), 14e9 / 2e9, 1e-9);
 }
 
 TEST(ProgressModel, HiresPasses) {
@@ -344,6 +419,7 @@ TEST(ProgressModel, HiresPasses) {
   shape.first_pixel_share = 0.25;
   HeldModels held;
   held.warm = true;
+  held.dit = true;
   held.last_dit = plan.dit;
   const std::vector<ProgressSegment> s = mi::api::generate_segments(plan, slow_disk(), held, ModelBytes{}, shape);
   ASSERT_EQ(s.size(), 6u);
