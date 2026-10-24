@@ -67,6 +67,34 @@ def write_dataspace(path, codes):
                 struct.pack("<%df" % len(codes), *codes))
 
 
+def write_safetensors(path, tensors, metadata=None):
+    """A safetensors file of zero-filled BF16 tensors: tensors is [(name, shape)]."""
+    header, off = {}, 0
+    if metadata:
+        header["__metadata__"] = metadata
+    for name, shape in tensors:
+        n = 2
+        for d in shape:
+            n *= d
+        header[name] = {"dtype": "BF16", "shape": shape, "data_offsets": [off, off + n]}
+        off += n
+    text = json.dumps(header).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(text)) + text)
+        f.truncate(8 + len(text) + off)
+
+
+def write_bf16_dit(path):
+    """A bf16 single-file DiT with MOSS-Image's names and the shapes the engine's DiT check reads."""
+    t = []
+    for i in range(42):
+        t += [("layers.%d.norm1.weight" % i, [3072]), ("layers.%d.q_norm.weight" % i, [128]),
+              ("layers.%d.proj.q.weight" % i, [4, 256]), ("layers.%d.proj.ffn_down.weight" % i, [4, 256])]
+    t += [("video_embedder.weight", [3072, 128]), ("text_embedder.proj.weight", [3072, 4096]),
+          ("time_embedding.0.weight", [3072, 256]), ("final_linear_video.weight", [128, 3072])]
+    write_safetensors(path, t)
+
+
 def png_chunks(path):
     """(type, data) of every chunk of the PNG at `path`."""
     with open(path, "rb") as f:
@@ -239,7 +267,12 @@ class CpuProtocolTest(ProtocolTestBase):
                                                "image_input": True, "hires": True, "distill": True,
                                                "system_cuda": True, "control": True, "accel": True,
                                                "preload": True, "release": True, "certificate_dirs": True,
-                                               "te_host_pin": True, "progress_fraction": True})
+                                               "te_host_pin": True, "progress_fraction": True, "inspect": True})
+        self.assertEqual(set(res["values"]), {"mode", "block_path", "tier", "attention", "dit_direct_io", "te_host_pin",
+                                              "sampler", "scheduler", "noise_layout", "noise_source", "resize",
+                                              "mask_encoding", "step_cache"})
+        self.assertEqual(res["values"]["tier"], ["auto", "reference", "high", "turbo"])
+        self.assertEqual(res["values"]["mode"], ["min_memory", "balanced", "max_speed"])
         probe = res["probe"]
         self.assertGreaterEqual(probe["device_count"], probe["supported_device_count"])
         self.assertIn(probe["recommended_flavour"], ("cu12", "cu13", ""))
@@ -661,6 +694,94 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertError(r, "invalid_argument", "d")
         self.assertIn("vram_budget_bytes", r["error"]["message"])
         self.assertEqual(self.server.call("status")["result"]["state"], "unloaded")
+
+    def test_hello_values_are_accepted(self):
+        """Every value hello lists passes the server's validation; a value it does not list is refused, and the
+        refusal names exactly the listed values."""
+        values = self.server.call("hello")["result"]["values"]
+        load_params = ("mode", "block_path", "tier", "attention", "dit_direct_io", "te_host_pin")
+        missing = os.path.join(self.tmp, "missing")
+        base = {"prompt": "a cat", "output": os.path.join(self.tmp, "x.png")}
+        ds = os.path.join(self.tmp, "dataspace.safetensors")
+        write_dataspace(ds, [1000, 750, 500, 250])
+        for param, names in values.items():
+            self.assertTrue(names, param)
+            for v in names:
+                if param in load_params:
+                    # Through the server to the engine's own checks (here: the missing bundle).
+                    r = self.server.call("load", {"model": missing, param: v}, id=v)
+                    self.assertError(r, "invalid_argument", v)
+                    self.assertIn("not found", r["error"]["message"])
+                else:
+                    extra = {"dataspace": ds} if v == "dataspace" else {}
+                    self.assertError(self.server.call("generate", dict(base, **{param: v}, **extra), id=v), "no_engine", v)
+            listed = ", ".join('"%s"' % n for n in names[:-1]) + ' or "%s"' % names[-1]
+            if len(names) == 2:
+                listed = '"%s" or "%s"' % tuple(names)
+            method, params = ("load", {"model": missing}) if param in load_params else ("generate", dict(base))
+            r = self.server.call(method, dict(params, **{param: "not-a-value"}), id=param)
+            self.assertError(r, "invalid_params", param)
+            self.assertEqual(r["error"]["message"], '"%s" must be %s' % (param, listed))
+
+    def test_inspect(self):
+        s = self.server
+        dit = os.path.join(self.tmp, "dit.safetensors")
+        write_bf16_dit(dit)
+        r = s.call("inspect", {"path": dit})["result"]
+        self.assertEqual(r["path"], dit)
+        self.assertEqual((r["kind"], r["loadable"], r["precision"], r["quantization"]), ("dit", True, "bf16", "bf16"))
+        self.assertEqual(r["file_bytes"], os.path.getsize(dit))
+        self.assertEqual(r["tensors"], 42 * 4 + 4)
+        self.assertEqual(r["tiers"], ["auto", "reference", "high"])
+        self.assertEqual(set(r["tier_reasons"]), {"auto", "reference", "high", "turbo"})
+        self.assertIn("Reference", r["tier_reasons"]["auto"])
+        self.assertIn("INT4", r["tier_reasons"]["turbo"])
+        self.assertNotIn("control_kinds", r)
+
+        lora = os.path.join(self.tmp, "lora.safetensors")
+        write_safetensors(lora, [("transformer.layers.0.proj.q.lora_A.weight", [8, 3072]),
+                                 ("transformer.layers.0.proj.q.lora_B.weight", [3072, 8])], {"base_model": "moss-sft"})
+        r = s.call("inspect", {"path": lora})["result"]
+        self.assertEqual({k: r[k] for k in ("kind", "loadable", "base_model", "adapter_types", "lora_rank", "lora_adapters",
+                                            "lora_unknown_keys", "note")},
+                         {"kind": "lora", "loadable": True, "base_model": "moss-sft", "adapter_types": ["lora"],
+                          "lora_rank": 8, "lora_adapters": 1, "lora_unknown_keys": 0, "note": ""})
+        self.assertNotIn("tiers", r)
+
+        # The kinds are exactly what generate's control.images[].kind takes.
+        control = os.path.join(self.tmp, "control.safetensors")
+        write_safetensors(control, [("transformer.layers.0.proj.q.lora_A.weight", [8, 3072]),
+                                    ("transformer.layers.0.proj.q.lora_B.weight", [3072, 8]),
+                                    ("video_embedder.weight", [3072, 384]), ("video_embedder.bias", [3072])],
+                          {"control_channels": "color,depth"})
+        r = s.call("inspect", {"path": control})["result"]
+        self.assertEqual((r["kind"], r["loadable"], r["control_kinds"], r["lora_rank"]), ("control_adapter", True, ["color", "depth"], 8))
+        image = os.path.join(self.tmp, "depth.png")
+        write_png(image, 16, 16, lambda x, y: (x * 16, x * 16, x * 16))
+        for kind in r["control_kinds"]:
+            req = {"prompt": "a cat", "output": os.path.join(self.tmp, "x.png"),
+                   "control": {"adapter": control, "images": [{"kind": kind, "path": image}]}}
+            self.assertError(s.call("generate", req, id=kind), "no_engine", kind)
+
+        # Files the engine cannot use are answers, not errors.
+        garbage = os.path.join(self.tmp, "garbage.safetensors")
+        with open(garbage, "wb") as f:
+            f.write(struct.pack("<Q", 1 << 40) + b"{}")
+        r = s.call("inspect", {"path": garbage})["result"]
+        self.assertEqual((r["kind"], r["loadable"], r["tensors"]), ("unknown", False, 0))
+        self.assertIn("16 MiB", r["note"])
+        gguf = os.path.join(self.tmp, "model.gguf")
+        with open(gguf, "wb") as f:
+            f.write(b"GGUF" + bytes(60))
+        self.assertIn("GGUF", s.call("inspect", {"path": gguf})["result"]["note"])
+
+        self.assertError(s.call("inspect", {"path": os.path.join(self.tmp, "missing")}, id="m"), "io", "m")
+        self.assertError(s.call("inspect", {"path": self.tmp}, id="d"), "invalid_params", "d")
+        self.assertError(s.call("inspect", id="n"), "invalid_params", "n")
+        self.assertError(s.call("inspect", {"path": ""}, id="e"), "invalid_params", "e")
+        self.assertError(s.call("inspect", {"path": dit, "deep": True}, id="u"), "invalid_params", "u")
+        # No engine was needed or created.
+        self.assertEqual(s.call("status")["result"], {"state": "unloaded"})
 
     def test_shutdown(self):
         r = self.server.call("shutdown", id="bye")

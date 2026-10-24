@@ -13,6 +13,7 @@
 
 #include "../../tools/server/json_out.h"
 #include "../../tools/server/names.h"
+#include "models/moss_dit/moss_dit.h"
 #include "pipeline/accel/accel.h"
 #include "pipeline/pipeline_image.h"
 #include "pipeline/report_json.h"
@@ -171,6 +172,52 @@ TEST(ServerJson, EnumNamesAreThePipelines) {
   i = 0;
   for (const auto& n : mi::server::kDitDirectIoNames) EXPECT_EQ(static_cast<int>(n.value), i++);  // the server's own names
   EXPECT_EQ(i, 3);
+  i = 0;
+  for (const auto& n : mi::server::kModeNames) {
+    EXPECT_EQ(static_cast<int>(n.value), i++);
+    EXPECT_EQ(static_cast<int>(mi::planner::parse_mode(n.name)), static_cast<int>(n.value)) << n.name;
+    EXPECT_EQ(mi::planner::mode_name(mi::planner::parse_mode(n.name)), n.name);
+  }
+  EXPECT_EQ(i, 3);
+  i = 0;
+  for (const auto& n : mi::server::kBlockPathNames) {
+    EXPECT_EQ(static_cast<int>(n.value), i++);
+    if (n.value == MI_BLOCK_PATH_DEFAULT) {
+      EXPECT_EQ(n.name, "default");
+      EXPECT_THROW(mi::moss_dit::parse_block_path(n.name), std::invalid_argument);
+      continue;
+    }
+    EXPECT_EQ(static_cast<int>(mi::moss_dit::parse_block_path(n.name)) + 1, static_cast<int>(n.value)) << n.name;
+    EXPECT_EQ(mi::moss_dit::block_path_name(mi::moss_dit::parse_block_path(n.name)), n.name);
+  }
+  EXPECT_EQ(i, 4);
+}
+
+// hello's "values": every enum table, each under the parameter it validates, with the table's names in order.
+TEST(ServerJson, HelloValuesAreTheTables) {
+  namespace s = mi::server;
+  const auto same = [](std::span<const std::string_view> listed, const auto& table) {
+    ASSERT_EQ(listed.size(), std::size(table));
+    for (std::size_t i = 0; i < listed.size(); ++i) EXPECT_EQ(listed[i], table[i].name);
+  };
+  ASSERT_EQ(std::size(s::kValueTables), 13u);
+  for (const s::ValueTable& t : s::kValueTables) {
+    SCOPED_TRACE(t.param);
+    if (t.param == "mode") same(t.names, s::kModeNames);
+    else if (t.param == "block_path") same(t.names, s::kBlockPathNames);
+    else if (t.param == "tier") same(t.names, s::kTierNames);
+    else if (t.param == "attention") same(t.names, s::kAttentionNames);
+    else if (t.param == "dit_direct_io") same(t.names, s::kDitDirectIoNames);
+    else if (t.param == "te_host_pin") same(t.names, s::kTeHostPinNames);
+    else if (t.param == "sampler") same(t.names, s::kSamplerNames);
+    else if (t.param == "scheduler") same(t.names, s::kSchedulerNames);
+    else if (t.param == "noise_layout") same(t.names, s::kNoiseLayoutNames);
+    else if (t.param == "noise_source") same(t.names, s::kNoiseSourceNames);
+    else if (t.param == "resize") same(t.names, s::kResizeNames);
+    else if (t.param == "mask_encoding") same(t.names, s::kMaskEncodingNames);
+    else if (t.param == "step_cache") same(t.names, s::kStepCacheNames);
+    else ADD_FAILURE() << "unexpected parameter";
+  }
 }
 
 // The report of a done event: a NULL from mi_result_report_json() becomes JSON null instead of a crash.

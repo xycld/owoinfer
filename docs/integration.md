@@ -41,6 +41,8 @@ Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what
 | Certificate directories | extra quality-certificate directories per engine (`certificate_dirs`), searched before the cache folder, the DiT's sidecar and the package's `share/mossinfer/quality_certs/`, where packages install their certificates |
 | System CUDA reuse | a compatible cuBLASLt from the user's CUDA install, used by the `-system-cuda` package or on request (`MOSSINFER_CUDA_LIBS=system`); the probe reports which copy runs (verified on Linux; see [CUDA libraries](#cuda-libraries)) |
 | Output | PNG file (both surfaces), or RGB8 in memory (library), plus a JSON report per image |
+| File inspection | what a file is before anything loads, without an engine or a GPU (`mi_inspect_file()`, server `inspect`): DiT, text encoder, VAE, LoRA or control adapter, whether the engine accepts it and why not; a DiT's precision, quantization and the tiers it allows; a LoRA's rank, adapters and `base_model`; a control adapter's kinds |
+| Accepted values | `hello`'s `values`: the names of every enum-like `load` / `generate` parameter, from the tables the server validates against |
 
 ### Control adapters and accelerators
 
@@ -72,6 +74,8 @@ These are designed and partly built. The launcher can prepare for them now (see 
 | Pixel data over the server protocol | not supported: the server takes image file paths |
 | Server output other than PNG | not supported |
 | Progress inside a DiT load | not supported: a DiT load is one step, so `fraction` holds still while it runs and moves on at the next phase |
+| Inspecting a folder | not supported: `inspect` takes one file; a bundle folder is checked by `load` |
+| A LoRA for another model as a LoRA | not supported: `inspect` reports a file none of whose tensors applies to the MOSS-Image DiT as `unknown`, with the DiT check's note (`found a LoRA`) |
 
 ## Supported models
 
@@ -276,6 +280,7 @@ The engine reads the official Hugging Face model folders in place, with no conve
 - **To save disk with both models,** hard-link SFT's `text_encoder/*.safetensors` and `vae/*.safetensors` to Base's. They are byte-identical.
 - **ComfyUI and quantized files** load as component files next to the bundle folder: `dit_file` (INT8 ConvRot, INT4 ConvRot, mixed INT8/bf16 or bf16 DiT), `text_encoder_file` (INT8 ConvRot or W4A8) and `vae_file`. The tokenizer and configs still come from the folder. A file as the model path itself (`MI_MODEL_FORMAT_COMFYUI`, or a file with `MI_MODEL_FORMAT_AUTO`) returns `MI_ERR_NOT_SUPPORTED`, and the server answers `not_supported`, while `MI_CAP_COMFYUI_MODELS` is unset.
 - **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 DiT runs only under `turbo`, which must be chosen explicitly: offer it for INT4 files, and only for them. A quality certificate lets `auto` pick a lossy configuration. Certificates are searched in the engine's `certificate_dirs`, then `<cache_dir>/quality_certs/`, then the DiT's sidecar `<dit>.mossinfer-cert.json`, then the install tree's `share/mossinfer/quality_certs/`; the first usable one wins (see [Shipped certificates](#shipped-certificates)); the report's `quality` object says which one ran and whether it was certified.
+- **Sort files before loading them** with `mi_inspect_file()` / `inspect`: it names each file's role (DiT, text encoder, VAE, LoRA, control adapter), says whether the engine accepts it (and why not: a GGUF or FP8 file, a W4A8 DiT to convert with `moss-infer quantize`, an NVFP4 DiT), and gives a DiT's tiers, so the tier menu offers `turbo` for exactly the INT4 files.
 
 ### Shipped certificates
 
@@ -328,7 +333,7 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 - Events (`plan`, `progress`, `preview`, `done`, `log`) carry the `id` of the request they belong to, and can arrive between responses. Read stdout on a dedicated thread, and dispatch by `id` and `event`.
 
 **Lifecycle.**
-1. `hello`: check `protocol_version == 1` and `abi_version`, and pick the flavour (see above).
+1. `hello`: check `protocol_version == 1` and `abi_version`, and pick the flavour (see above). Fill the settings' menus from `values`. `inspect` `{"path": ...}` classifies the user's model files at any time, before `load` too.
 2. `load` `{"model": "<folder>", "mode": "balanced", "cache_dir": "<launcher cache dir>/mossinfer"}`. This returns quickly. The weights load during `generate`: the DiT in the first `dit_load` phase, and the text encoder streams in `text_encoder` whenever the prompt is not in the embedding cache.
 3. `generate` `{"prompt": ..., "output": "<path>.png", ...}`. The answer is immediate: `{"accepted": true}`. Then come `plan` once, `progress` at each phase start and after each step, `preview` before a step's `progress` when `preview_output` is set, and finally `done` with `status` `ok`, `cancelled` or `error`. Show `done.warnings` (LoRA losses, a truncated prompt) next to the image.
 4. `cancel` `{"id": <the generate request's id>}` from the UI's stop button. The id must match exactly, JSON type included (`"g1"` is not `1`). The generation stops within one block or layer, and `done` arrives with `"status": "cancelled"`.
@@ -403,7 +408,7 @@ Bindings in other languages can follow the frozen struct layouts in [c-api.md](c
 |---|---|---|
 | Memory mode | `mode`: `min_memory` / `balanced` / `max_speed` | Default `balanced`; it already adapts to free VRAM. Offer `min_memory` for "share the GPU with other apps / games", and `max_speed` for machines with plenty of RAM. |
 | VRAM limit | `vram_budget_bytes` (0 = automatic) | Leave it automatic. Expose it as an advanced option, e.g. to keep room for another app. |
-| Cache folder | `cache_dir` | **Always set it** to a folder the launcher owns. It holds the prompt-embedding cache and a small hardware profile, which spare later runs a short measurement and a self-check. |
+| Cache folder | `cache_dir` | **Always set it** to a folder the launcher owns. It holds the prompt-embedding cache and a small hardware profile, which spare later runs a short measurement and a self-check. Several processes may use one folder at once, engines of other versions included: every file is written under a unique temporary name and renamed into place, so none reads a partial file. An embedding entry in another format version is a miss and stays until the size cap ages it out; a hardware profile or file-hash cache of another version or GPU is ignored and rewritten, which costs a measurement or a re-hash. Sharing the folder shares embedding-cache hits between engines that compute the same embeddings (the same text encoder, numerics and kind of GPU). It does not share the GPU: each engine plans against the VRAM free when it plans, so two engines on one GPU still compete for memory. |
 | GPU | `device_index` / `device` | From `hello`'s device list. Supported devices only. |
 | Model | `model_path` / `model` | The Base or SFT folder. |
 | Model files | `dit_file`, `text_encoder_file`, `vae_file` | Optional file pickers next to the model folder, empty by default (the folder's own components). Offer them when `MI_CAP_MODEL_FILES` / `model_files` is set. |
@@ -426,13 +431,13 @@ Width and height must be multiples of 16, at most 4096 per side, and at most 4.2
 | Launcher setting | Engine field (`mi_gen_params` / server `generate`) | Recommendation |
 |---|---|---|
 | LoRA list | `loras` (`{path, strength}` each, at most 64) | A list per generation with a strength slider each. Show `done.warnings` (`mi_result_message()`) after the run. |
-| Sampler and scheduler | `sampler`, `scheduler` | Default Euler + `moss` (the official result). List all names; group the stochastic samplers' `eta` and `s_noise`, and `noise_source`, as advanced options. The `dataspace` sampler needs its parameters file (`dataspace`). |
+| Sampler and scheduler | `sampler`, `scheduler` | Default Euler + `moss` (the official result). List all names (server: `hello`'s `values`); group the stochastic samplers' `eta` and `s_noise`, and `noise_source`, as advanced options. The `dataspace` sampler needs its parameters file (`dataspace`). |
 | Embed settings | `save_metadata` | On by default (`mi_gen_params_init(p, sizeof *p)`; a program built against the 0.1.0 header gets no metadata). |
 | Include prompts | `include_prompts` | On by default. Offer it as a privacy option for images that will be shared. |
 | Init image | `init_image` (pixels) or `init_image_path` / `init_image` (path) | An optional image picker with a denoise strength slider, pre-filled with `MI_DEFAULT_DENOISE_STRENGTH` (0.75, what an unset strength resolves to; 1 without a mask ignores the image). The output size stays `width` × `height` and the image is resized to it (crop by default): set the size from the image to keep its aspect ratio. `moss-infer` does that itself; the C API and the server do not. |
 | Inpainting mask | `mask` / `mask_path` / `mask`, `mask_encoding` | A mask painter next to the init image. Pass 0/1 masks with `binary01`, 0/255 masks with `u8`. |
 | Hires fix | `hires_width`, `hires_height`, `hires_strength`, `hires_steps` / `hires` | Off by default; a target size (or a scale rounded to multiples of 16) with a strength (default 0.45). |
-| Control adapter and images | `control_adapter`, `control_lora_strength`, `control_images` (`{kind, image or image_path, strength, start, end}` each, at most 16) / `control` | An advanced setting, off by default: an adapter file picker, then one image picker per kind the adapter has (`MI_TEXT_CONTROL_KINDS` / the report's `control.kinds` after a first run), each with a strength slider (default 1) and a step window (default 0 to 1). The images are resized to the output size like an init image. Mark the result uncertified from `run_certified` / `done.certified`. |
+| Control adapter and images | `control_adapter`, `control_lora_strength`, `control_images` (`{kind, image or image_path, strength, start, end}` each, at most 16) / `control` | An advanced setting, off by default: an adapter file picker, then one image picker per kind the adapter has (`mi_file_report_control_kind()` / `inspect`'s `control_kinds` before a run, `MI_TEXT_CONTROL_KINDS` / the report's `control.kinds` after one), each with a strength slider (default 1) and a step window (default 0 to 1). The images are resized to the output size like an init image. Mark the result uncertified from `run_certified` / `done.certified`. |
 | CFG truncation | `cfg_truncation` | An advanced setting, default 1 (off). Lossy: mark the result uncertified from `run_certified` / `done.certified`. No effect at CFG 1 (the server's `done.warnings` says so). |
 | Step cache | `step_cache` (`off` / `fbcache`), `step_cache_threshold` | An advanced setting, default off; the threshold left unset (0 in the C API, absent on the server) takes the engine's per-model default (0.02 base, 0.03 SFT and derived files). Higher thresholds are faster and change the image more. Lossy: mark the result uncertified from `run_certified` / `done.certified` (`mi_accel_info.lossy` and the report's `accelerators.lossy` say an accelerator was requested). |
 | Preview | `preview_callback` + `preview_interval` / `preview_output` + `preview_every` | On. Every step is fine for small images; use about 5 for large ones, because each preview is a full-size device-to-host copy plus (server) a PNG write, on the generating thread while the GPU waits. The preview is coarse (no VAE). On Windows, do not keep the server's preview file open: the server renames each new preview over it, a held file makes that fail, and the server then logs a warning and goes on. |
@@ -465,6 +470,7 @@ Features are announced by a capability bit. Check `mi_capabilities()`, or `capab
 | Soft unload | `MI_CAP_RELEASE` (0x2000) | `"release"` | set | `mi_engine_release()` / `release`, the report's `dit_load` |
 | Certificate directories | `MI_CAP_CERTIFICATE_DIRS` (0x4000) | `"certificate_dirs"` | set | `certificate_dirs` |
 | Text-encoder pinning | `MI_CAP_TE_HOST_PIN` (0x8000) | `"te_host_pin"` | set | `te_host_pin` |
+| File inspection | `MI_CAP_INSPECT` (0x20000) | `"inspect"` | set | `mi_inspect_file()` / `inspect` |
 
 Future features will arrive the same way: **new trailing struct fields, new enum values and new capability bits** in the C API, and **new optional parameters** for the server. Leaving them unset keeps today's behaviour. A program built against an older header keeps working with a newer library, because the library accepts every older struct size (see [Versioning](#versioning)).
 

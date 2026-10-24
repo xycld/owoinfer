@@ -23,8 +23,8 @@
  *   thread-local and stays valid until the next failing mi_* call on the same thread.
  * - Enums are 32-bit (each has a *_MAX_ENUM = 0x7fffffff member for that); unknown values are rejected with
  *   MI_ERR_INVALID_ARGUMENT.
- * - Handles (mi_engine, mi_result) are opaque. NULL handles are rejected with MI_ERR_INVALID_ARGUMENT, or by a
- *   0 / NULL return from accessors.
+ * - Handles (mi_engine, mi_result, mi_file_report) are opaque. NULL handles are rejected with MI_ERR_INVALID_ARGUMENT,
+ *   or by a 0 / NULL return from accessors.
  *
  * Threading
  * - Each engine runs one job at a time: mi_generate(), mi_engine_preload() or mi_engine_release(). A concurrent one on
@@ -141,6 +141,8 @@ MOSSINFER_API const char* mi_last_error_message(void);
 #define MI_CAP_TE_HOST_PIN 0x8000u
 /* mi_progress.fraction and eta_seconds: the whole job's progress and remaining time. */
 #define MI_CAP_PROGRESS_FRACTION 0x10000u
+/* mi_inspect_file(): what a model file is to the engine, without an engine or a GPU. */
+#define MI_CAP_INSPECT 0x20000u
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -962,6 +964,80 @@ MOSSINFER_API const char* mi_result_message(const mi_result* result, mi_message_
 MOSSINFER_API mi_status mi_write_png(const char* path, const uint8_t* rgb, int32_t width, int32_t height);
 /* NULL is a no-op. */
 MOSSINFER_API void mi_result_free(mi_result* result);
+
+/* ------------------------------------------------------------------------------------------------ file inspection */
+
+/* The role a file has for the engine (MI_CAP_INSPECT). */
+typedef enum mi_file_kind {
+  MI_FILE_KIND_UNKNOWN = 0,         /* none of the roles below; MI_FILE_TEXT_NOTE says what was found */
+  MI_FILE_KIND_DIT = 1,             /* a single-file DiT (mi_engine_params.dit_file) */
+  MI_FILE_KIND_TEXT_ENCODER = 2,    /* mi_engine_params.text_encoder_file */
+  MI_FILE_KIND_VAE = 3,             /* mi_engine_params.vae_file */
+  /* A LoRA with adapters on the MOSS-Image DiT (mi_gen_params.loras). One none of whose tensors applies to it (a LoRA
+   * for another model) is MI_FILE_KIND_UNKNOWN. */
+  MI_FILE_KIND_LORA = 4,
+  MI_FILE_KIND_CONTROL_ADAPTER = 5, /* mi_gen_params.control_adapter */
+  MI_FILE_KIND_MAX_ENUM = 0x7fffffff
+} mi_file_kind;
+
+typedef struct mi_file_report mi_file_report;
+
+/* What mi_inspect_file() found. An output struct: struct_size set by the caller. */
+typedef struct mi_file_info {
+  size_t struct_size;
+  mi_file_kind kind;
+  /* The engine's loader for that role accepts the file. What depends on the request or the GPU is checked later (a
+   * control image's kind, a LoRA merge on INT4 weights, the tier's certificate). 0 for MI_FILE_KIND_UNKNOWN;
+   * MI_FILE_TEXT_NOTE says why not. */
+  int32_t loadable;
+  uint64_t file_bytes;
+  int32_t tensor_count;     /* tensors in the safetensors header; 0 when the header cannot be read */
+  /* A loadable DiT: BF16, INT8 or W4A4, as mi_tier_info.dit_precision; a loadable text encoder: BF16, INT8 or W4A8;
+   * else BF16. */
+  mi_precision precision;
+  /* A loadable DiT: bit (1u << tier) for each mi_tier the engine accepts for it, with the bundle's bf16 text encoder
+   * (a quantized one refuses MI_TIER_REFERENCE too). No certificate is looked up (they are matched to the GPU), so
+   * MI_TIER_AUTO on an INT4 DiT is refused here even where a certificate would allow it. 0 otherwise. */
+  uint32_t tiers;
+  int32_t lora_rank;            /* LoRA, control adapter: the largest rank of its low-rank adapters; 0 without */
+  int32_t lora_adapters;        /* adapters on the DiT, as mi_lora_report.adapters (a fused qkv adapter counts as three) */
+  int32_t lora_unknown_keys;    /* tensors not applied, as mi_lora_report.unknown_keys */
+  int32_t control_kind_count;   /* control adapter: its kinds (mi_file_report_control_kind()) */
+  int32_t _reserved0;
+} mi_file_info;
+
+typedef enum mi_file_text_kind {
+  MI_FILE_TEXT_NOTE = 0,          /* why the file is not loadable or what it is instead, or a remark; "" for none */
+  /* A loadable DiT: its block linears as the engine runs them, e.g. "bf16", "int8_convrot256", "int4_convrot256",
+   * "mixed (80 bf16, 172 int8_convrot256)"; a loadable text encoder: "bf16", "int8_convrot" or "w4a8"; else "". */
+  MI_FILE_TEXT_QUANTIZATION = 1,
+  MI_FILE_TEXT_BASE_MODEL = 2,    /* LoRA, control adapter: the file's base_model metadata (informational); "" if absent */
+  /* LoRA, control adapter: its adapter types in file order, comma-separated: "lora", "loha", "lokr", "full". */
+  MI_FILE_TEXT_ADAPTER_TYPES = 3,
+  MI_FILE_TEXT_MAX_ENUM = 0x7fffffff
+} mi_file_text_kind;
+
+/* Reads what the file at `path` (UTF-8) is to the engine (MI_CAP_INSPECT): no engine, no GPU, no CUDA call. It reads
+ * what the engine's loaders read before they upload anything: the safetensors header (at most 16 MiB), a DiT's
+ * quantization configs and scales, a text encoder's small F32 tensors, a LoRA's alpha tensors. Thread-safe.
+ * A file the engine cannot use (another model or container, a malformed or truncated header) is not an error: MI_OK
+ * with MI_FILE_KIND_UNKNOWN or loadable 0, and the reason in MI_FILE_TEXT_NOTE. Fails with MI_ERR_INVALID_ARGUMENT for
+ * a NULL or empty path or one that is not a regular file (a directory, a device, a pipe), and MI_ERR_IO when it does
+ * not exist or cannot be read. On MI_OK *out_report is set: release it with mi_file_report_free(). */
+MOSSINFER_API mi_status mi_inspect_file(const char* path, mi_file_report** out_report);
+/* `out` has struct_size set by the caller. */
+MOSSINFER_API mi_status mi_file_report_info(const mi_file_report* report, mi_file_info* out);
+/* Owned by the report; "" when empty. NULL for a NULL report or an unknown kind. */
+MOSSINFER_API const char* mi_file_report_text(const mi_file_report* report, mi_file_text_kind kind);
+/* A control adapter's kind `index` in [0, control_kind_count), in channel order: the strings mi_control_image.kind
+ * (and MI_TEXT_CONTROL_KINDS) use. Owned by the report. NULL for a NULL report or an index out of range. */
+MOSSINFER_API const char* mi_file_report_control_kind(const mi_file_report* report, int32_t index);
+/* The engine's tier decision for a loadable DiT: what `tier` would run (e.g. "High tier: INT8 ConvRot GEMMs, q8_fp8
+ * attention; uncertified (...)") when mi_file_info.tiers has its bit, else why the engine refuses it; for other files,
+ * why there is no tier. Owned by the report. NULL for a NULL report or an unknown tier. */
+MOSSINFER_API const char* mi_file_report_tier_reason(const mi_file_report* report, mi_tier tier);
+/* NULL is a no-op. */
+MOSSINFER_API void mi_file_report_free(mi_file_report* report);
 
 #ifdef __cplusplus
 }

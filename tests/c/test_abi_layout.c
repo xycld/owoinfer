@@ -42,6 +42,8 @@ int main(void) {
   check("sizeof(mi_te_host_pin)", sizeof(mi_te_host_pin), 4);
   check("sizeof(mi_dit_load_source)", sizeof(mi_dit_load_source), 4);
   check("sizeof(mi_load_io)", sizeof(mi_load_io), 4);
+  check("sizeof(mi_file_kind)", sizeof(mi_file_kind), 4);
+  check("sizeof(mi_file_text_kind)", sizeof(mi_file_text_kind), 4);
 
   SIZE(mi_device_info, 592);
   FIELD(mi_device_info, struct_size, 0);
@@ -324,6 +326,20 @@ int main(void) {
   FIELD(mi_dit_load_info, io, 12);
   FIELD(mi_dit_load_info, bytes, 16);
   FIELD(mi_dit_load_info, seconds, 24);
+
+  SIZE(mi_file_info, 56);
+  FIELD(mi_file_info, struct_size, 0);
+  FIELD(mi_file_info, kind, 8);
+  FIELD(mi_file_info, loadable, 12);
+  FIELD(mi_file_info, file_bytes, 16);
+  FIELD(mi_file_info, tensor_count, 24);
+  FIELD(mi_file_info, precision, 28);
+  FIELD(mi_file_info, tiers, 32);
+  FIELD(mi_file_info, lora_rank, 36);
+  FIELD(mi_file_info, lora_adapters, 40);
+  FIELD(mi_file_info, lora_unknown_keys, 44);
+  FIELD(mi_file_info, control_kind_count, 48);
+  FIELD(mi_file_info, _reserved0, 52);
 
   printf("%s: C struct layouts %s the frozen ABI %d table\n", failures ? "FAIL" : "ok",
          failures ? "differ from" : "match", MI_ABI_VERSION);

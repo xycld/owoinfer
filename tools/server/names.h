@@ -1,9 +1,13 @@
 // moss-server's protocol spellings of the C API enums, with their C values. They are the pipeline's own names
-// (sampler_name(), scheduler_name(), noise_layout_name(), noise_source_name(), tier_name(), attention_name()), but the
-// server links only the C API, so it keeps its own tables; tests/unit/test_server_json.cpp checks them against the
-// pipeline's names.
+// (sampler_name(), scheduler_name(), noise_layout_name(), noise_source_name(), tier_name(), attention_name(),
+// planner::mode_name(), moss_dit::block_path_name()), but the server links only the C API, so it keeps its own tables;
+// tests/unit/test_server_json.cpp checks them against the pipeline's names. The server validates every enum parameter
+// against these tables and lists them in hello's "values" (kValueTables).
 #pragma once
 
+#include <array>
+#include <cstddef>
+#include <span>
 #include <string_view>
 
 #include "mossinfer/mossinfer.h"
@@ -47,6 +51,20 @@ inline constexpr Name<mi_noise_source> kNoiseSourceNames[] = {
     {"philox", MI_NOISE_SOURCE_PHILOX},
     {"philox_device", MI_NOISE_SOURCE_PHILOX_DEVICE},
     {"brownian_tree", MI_NOISE_SOURCE_BROWNIAN_TREE},
+};
+
+inline constexpr Name<mi_mode> kModeNames[] = {
+    {"min_memory", MI_MODE_MIN_MEMORY},
+    {"balanced", MI_MODE_BALANCED},
+    {"max_speed", MI_MODE_MAX_SPEED},
+};
+
+// "default" is the server's spelling of an unset block path (the engine's default); the others are block_path_name()'s.
+inline constexpr Name<mi_block_path> kBlockPathNames[] = {
+    {"default", MI_BLOCK_PATH_DEFAULT},
+    {"op_by_op", MI_BLOCK_PATH_OP_BY_OP},
+    {"fused", MI_BLOCK_PATH_FUSED},
+    {"fused_graphs", MI_BLOCK_PATH_FUSED_GRAPHS},
 };
 
 inline constexpr Name<mi_tier> kTierNames[] = {
@@ -97,6 +115,52 @@ inline constexpr Name<mi_te_host_pin> kTeHostPinNames[] = {
 inline constexpr Name<mi_step_cache> kStepCacheNames[] = {
     {"off", MI_STEP_CACHE_OFF},
     {"fbcache", MI_STEP_CACHE_FBCACHE},
+};
+
+// A table's names, for hello's "values".
+template <class E, std::size_t N>
+constexpr std::array<std::string_view, N> names_of(const Name<E> (&table)[N]) {
+  std::array<std::string_view, N> out{};
+  for (std::size_t i = 0; i < N; ++i) out[i] = table[i].name;
+  return out;
+}
+
+namespace detail {
+inline constexpr auto kModes = names_of(kModeNames);
+inline constexpr auto kBlockPaths = names_of(kBlockPathNames);
+inline constexpr auto kTiers = names_of(kTierNames);
+inline constexpr auto kAttentions = names_of(kAttentionNames);
+inline constexpr auto kDitDirectIos = names_of(kDitDirectIoNames);
+inline constexpr auto kTeHostPins = names_of(kTeHostPinNames);
+inline constexpr auto kSamplers = names_of(kSamplerNames);
+inline constexpr auto kSchedulers = names_of(kSchedulerNames);
+inline constexpr auto kNoiseLayouts = names_of(kNoiseLayoutNames);
+inline constexpr auto kNoiseSources = names_of(kNoiseSourceNames);
+inline constexpr auto kResizes = names_of(kResizeNames);
+inline constexpr auto kMaskEncodings = names_of(kMaskEncodingNames);
+inline constexpr auto kStepCaches = names_of(kStepCacheNames);
+}  // namespace detail
+
+// The parameter each table validates, for hello's "values": load's (mode .. te_host_pin), then generate's and
+// preload's (sampler .. step_cache).
+struct ValueTable {
+  std::string_view param;
+  std::span<const std::string_view> names;
+};
+inline constexpr ValueTable kValueTables[] = {
+    {"mode", detail::kModes},
+    {"block_path", detail::kBlockPaths},
+    {"tier", detail::kTiers},
+    {"attention", detail::kAttentions},
+    {"dit_direct_io", detail::kDitDirectIos},
+    {"te_host_pin", detail::kTeHostPins},
+    {"sampler", detail::kSamplers},
+    {"scheduler", detail::kSchedulers},
+    {"noise_layout", detail::kNoiseLayouts},
+    {"noise_source", detail::kNoiseSources},
+    {"resize", detail::kResizes},
+    {"mask_encoding", detail::kMaskEncodings},
+    {"step_cache", detail::kStepCaches},
 };
 
 }  // namespace mi::server

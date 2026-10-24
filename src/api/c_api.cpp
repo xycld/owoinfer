@@ -16,6 +16,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "api/file_inspect.h"
 #include "api/pipeline_adapter.h"
 #include "backend/cuda_libs.h"
 #include "backend/probe.h"
@@ -24,6 +25,7 @@
 #include "planner/planner.h"
 #include "runtime/device_arena.h"
 #include "util/json.h"
+#include "util/path.h"
 #include "weights/file_reader.h"
 #include "weights/model_index.h"
 #include "weights/safetensors.h"
@@ -43,6 +45,10 @@ struct mi_result {
   std::string report;
 };
 
+struct mi_file_report {
+  mi::api::FileInspection inspection;
+};
+
 namespace {
 
 // ---------------------------------------------------------------- frozen layouts (ABI 1, docs/c-api.md)
@@ -55,7 +61,8 @@ static_assert(sizeof(mi_status) == 4 && sizeof(mi_mode) == 4 && sizeof(mi_model_
               sizeof(mi_noise_layout) == 4 && sizeof(mi_noise_source) == 4 && sizeof(mi_result_text_kind) == 4 &&
               sizeof(mi_message_kind) == 4 && sizeof(mi_mask_encoding) == 4 && sizeof(mi_resize_mode) == 4 &&
               sizeof(mi_image_mode) == 4 && sizeof(mi_step_cache) == 4 && sizeof(mi_direct_io) == 4 &&
-              sizeof(mi_te_host_pin) == 4 && sizeof(mi_dit_load_source) == 4 && sizeof(mi_load_io) == 4,
+              sizeof(mi_te_host_pin) == 4 && sizeof(mi_dit_load_source) == 4 && sizeof(mi_load_io) == 4 &&
+              sizeof(mi_file_kind) == 4 && sizeof(mi_file_text_kind) == 4,
               "C API enums are 32-bit");
 #define MI_LAYOUT(type, field, offset) static_assert(offsetof(type, field) == (offset), #type "." #field)
 static_assert(sizeof(mi_device_info) == 592);
@@ -321,6 +328,19 @@ MI_LAYOUT(mi_dit_load_info, source, 8);
 MI_LAYOUT(mi_dit_load_info, io, 12);
 MI_LAYOUT(mi_dit_load_info, bytes, 16);
 MI_LAYOUT(mi_dit_load_info, seconds, 24);
+static_assert(sizeof(mi_file_info) == 56);
+MI_LAYOUT(mi_file_info, struct_size, 0);
+MI_LAYOUT(mi_file_info, kind, 8);
+MI_LAYOUT(mi_file_info, loadable, 12);
+MI_LAYOUT(mi_file_info, file_bytes, 16);
+MI_LAYOUT(mi_file_info, tensor_count, 24);
+MI_LAYOUT(mi_file_info, precision, 28);
+MI_LAYOUT(mi_file_info, tiers, 32);
+MI_LAYOUT(mi_file_info, lora_rank, 36);
+MI_LAYOUT(mi_file_info, lora_adapters, 40);
+MI_LAYOUT(mi_file_info, lora_unknown_keys, 44);
+MI_LAYOUT(mi_file_info, control_kind_count, 48);
+MI_LAYOUT(mi_file_info, _reserved0, 52);
 #undef MI_LAYOUT
 
 // Every size a versioned input struct has had: the 0.1 layout, then today's. A struct of an older size is read as
@@ -660,7 +680,7 @@ const char* mi_last_error_message(void) {
 uint32_t mi_capabilities(void) {
   return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS | MI_CAP_IMAGE_INPUT | MI_CAP_HIRES |
          MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL | MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE |
-         MI_CAP_CERTIFICATE_DIRS | MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION;
+         MI_CAP_CERTIFICATE_DIRS | MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT;
 }
 
 mi_status mi_probe(mi_probe_info* info) {
@@ -1121,5 +1141,67 @@ mi_status mi_write_png(const char* path, const uint8_t* rgb, int32_t width, int3
 }
 
 void mi_result_free(mi_result* result) { delete result; }
+
+mi_status mi_inspect_file(const char* path, mi_file_report** out_report) {
+  return guarded([&] {
+    require(out_report, "out_report");
+    *out_report = nullptr;
+    require(path, "path");
+    if (*path == '\0') throw std::invalid_argument("path is empty.");
+    auto report = std::make_unique<mi_file_report>();
+    report->inspection = mi::api::inspect_file(mi::util::path_from_utf8(path));
+    *out_report = report.release();
+    return MI_OK;
+  });
+}
+
+mi_status mi_file_report_info(const mi_file_report* report, mi_file_info* out) {
+  return guarded([&] {
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_file_info), "mi_file_info");
+    require(report, "report");
+    write_output(out, report->inspection.info);
+    return MI_OK;
+  });
+}
+
+const char* mi_file_report_text(const mi_file_report* report, mi_file_text_kind kind) {
+  if (report == nullptr) {
+    set_error("report is NULL.");
+    return nullptr;
+  }
+  const mi::api::FileInspection& r = report->inspection;
+  switch (kind) {
+    case MI_FILE_TEXT_NOTE: return r.note.c_str();
+    case MI_FILE_TEXT_QUANTIZATION: return r.quantization.c_str();
+    case MI_FILE_TEXT_BASE_MODEL: return r.base_model.c_str();
+    case MI_FILE_TEXT_ADAPTER_TYPES: return r.adapter_types.c_str();
+    case MI_FILE_TEXT_MAX_ENUM: break;
+  }
+  set_error("mi_file_report_text: unknown kind.");
+  return nullptr;
+}
+
+const char* mi_file_report_control_kind(const mi_file_report* report, int32_t index) {
+  if (report == nullptr) {
+    set_error("report is NULL.");
+    return nullptr;
+  }
+  return item(report->inspection.control_kinds, index, "mi_file_report_control_kind: index out of range.");
+}
+
+const char* mi_file_report_tier_reason(const mi_file_report* report, mi_tier tier) {
+  if (report == nullptr) {
+    set_error("report is NULL.");
+    return nullptr;
+  }
+  if (static_cast<int32_t>(tier) < MI_TIER_AUTO || static_cast<int32_t>(tier) > MI_TIER_TURBO) {
+    set_error("mi_file_report_tier_reason: unknown tier.");
+    return nullptr;
+  }
+  return report->inspection.tier_reasons[static_cast<std::size_t>(tier)].c_str();
+}
+
+void mi_file_report_free(mi_file_report* report) { delete report; }
 
 }  // extern "C"

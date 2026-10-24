@@ -2,8 +2,8 @@
 // built only on the public C API (mossinfer.h).
 //
 // Threads: the main thread reads and answers requests; a job (generate, preload, release) runs on one worker thread, so
-// cancel and status are answered while it runs. Every protocol line goes through emit() under one mutex. stdout carries protocol lines
-// only: at startup the protocol stream gets a private, non-inheritable copy of fd 1 and fd 1 is pointed at stderr (or
+// cancel, status and inspect are answered while it runs. Every protocol line goes through emit() under one mutex.
+// stdout carries protocol lines only: at startup the protocol stream gets a private, non-inheritable copy of fd 1 and fd 1 is pointed at stderr (or
 // at the null device when stderr is unusable), so anything else printing to stdout (the engine, a library) never
 // reaches the protocol stream.
 #include <atomic>
@@ -433,11 +433,32 @@ const char* phase_name(mi_phase p) {
 }
 
 const char* mode_name(mi_mode m) {
-  switch (m) {
-    case MI_MODE_MIN_MEMORY: return "min_memory";
-    case MI_MODE_BALANCED: return "balanced";
-    case MI_MODE_MAX_SPEED: return "max_speed";
-    case MI_MODE_MAX_ENUM: break;
+  for (const auto& n : mi::server::kModeNames) {
+    if (n.value == m) return n.name.data();  // a string literal
+  }
+  return "unknown";
+}
+
+const char* precision_name(mi_precision p) {
+  switch (p) {
+    case MI_PRECISION_BF16: return "bf16";
+    case MI_PRECISION_INT8: return "int8";
+    case MI_PRECISION_W4A8: return "w4a8";
+    case MI_PRECISION_W4A4: return "w4a4";
+    case MI_PRECISION_MAX_ENUM: break;
+  }
+  return "unknown";
+}
+
+const char* file_kind_name(mi_file_kind k) {
+  switch (k) {
+    case MI_FILE_KIND_UNKNOWN: return "unknown";
+    case MI_FILE_KIND_DIT: return "dit";
+    case MI_FILE_KIND_TEXT_ENCODER: return "text_encoder";
+    case MI_FILE_KIND_VAE: return "vae";
+    case MI_FILE_KIND_LORA: return "lora";
+    case MI_FILE_KIND_CONTROL_ADAPTER: return "control_adapter";
+    case MI_FILE_KIND_MAX_ENUM: break;
   }
   return "unknown";
 }
@@ -488,6 +509,7 @@ class Server {
       else if (m == "release") result = release(params, id);
       else if (m == "cancel") result = cancel(params);
       else if (m == "status") result = status(params);
+      else if (m == "inspect") result = inspect(params);
       else if (m == "unload") result = unload(params);
       else if (m == "shutdown") {
         params.only({});
@@ -564,6 +586,13 @@ class Server {
                  ",\"unsupported_reason\":" + str(d.unsupported_reason) + "}";
     }
     const std::uint32_t caps = mi_capabilities();
+    // The accepted names of every enum parameter, from the tables the parameters are validated against.
+    std::string values;
+    for (const mi::server::ValueTable& t : mi::server::kValueTables) {
+      std::string names;
+      for (const std::string_view n : t.names) names += (names.empty() ? "" : ",") + str(n);
+      values += (values.empty() ? "" : ",") + str(t.param) + ":[" + names + "]";
+    }
     return "{\"protocol_version\":" + std::to_string(kProtocolVersion) + ",\"server\":\"moss-server\",\"version\":" +
            str(mi_version()) + ",\"abi_version\":" + std::to_string(mi_abi_version()) +
            ",\"capabilities\":{\"preview\":" + tf(caps & MI_CAP_PREVIEW) + ",\"comfyui_models\":" +
@@ -574,7 +603,8 @@ class Server {
            tf(caps & MI_CAP_CONTROL) + ",\"accel\":" + tf(caps & MI_CAP_ACCEL) + ",\"preload\":" + tf(caps & MI_CAP_PRELOAD) +
            ",\"release\":" + tf(caps & MI_CAP_RELEASE) + ",\"certificate_dirs\":" + tf(caps & MI_CAP_CERTIFICATE_DIRS) +
            ",\"te_host_pin\":" + tf(caps & MI_CAP_TE_HOST_PIN) + ",\"progress_fraction\":" +
-           tf(caps & MI_CAP_PROGRESS_FRACTION) + "},\"probe\":{\"driver_cuda_version\":" +
+           tf(caps & MI_CAP_PROGRESS_FRACTION) + ",\"inspect\":" + tf(caps & MI_CAP_INSPECT) + "},\"values\":{" + values +
+           "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
            ",\"supported_device_count\":" + std::to_string(probe.supported_device_count) +
@@ -594,12 +624,7 @@ class Server {
     const std::optional<std::string> model = p.string("model");
     if (!model) throw RequestError("invalid_params", "\"model\" (bundle directory) is required");
     e.model_path = model->c_str();
-    if (const auto mode = p.string("mode")) {
-      if (*mode == "min_memory") e.mode = MI_MODE_MIN_MEMORY;
-      else if (*mode == "balanced") e.mode = MI_MODE_BALANCED;
-      else if (*mode == "max_speed") e.mode = MI_MODE_MAX_SPEED;
-      else throw RequestError("invalid_params", "\"mode\" must be \"min_memory\", \"balanced\" or \"max_speed\"");
-    }
+    if (const auto v = p.name("mode", mi::server::kModeNames)) e.mode = *v;
     constexpr std::int64_t kMaxBytes = std::numeric_limits<std::int64_t>::max();
     if (const auto v = p.integer("device", 0, 1024)) e.device_index = static_cast<std::int32_t>(*v);
     if (const auto v = p.integer("vram_budget_bytes", 0, kMaxBytes)) e.vram_budget_bytes = static_cast<std::uint64_t>(*v);
@@ -609,14 +634,7 @@ class Server {
     if (cache_dir) e.cache_dir = cache_dir->c_str();
     if (const auto v = p.boolean("embedding_cache")) e.embedding_cache = *v ? 1 : 0;
     if (const auto v = p.boolean("direct_io")) e.direct_io = *v ? 1 : 0;
-    if (const auto path = p.string("block_path")) {
-      if (*path == "default") e.block_path = MI_BLOCK_PATH_DEFAULT;
-      else if (*path == "op_by_op") e.block_path = MI_BLOCK_PATH_OP_BY_OP;
-      else if (*path == "fused") e.block_path = MI_BLOCK_PATH_FUSED;
-      else if (*path == "fused_graphs") e.block_path = MI_BLOCK_PATH_FUSED_GRAPHS;
-      else throw RequestError("invalid_params",
-                              "\"block_path\" must be \"default\", \"op_by_op\", \"fused\" or \"fused_graphs\"");
-    }
+    if (const auto v = p.name("block_path", mi::server::kBlockPathNames)) e.block_path = *v;
     const std::optional<std::string> dit_file = p.string("dit_file");
     const std::optional<std::string> te_file = p.string("text_encoder_file");
     const std::optional<std::string> vae_file = p.string("vae_file");
@@ -899,6 +917,58 @@ class Server {
       s += std::string(",\"cancelling\":") + tf(job_->cancel.load());
     }
     return s + "}";
+  }
+
+  // Needs no engine and touches none, so it is answered in any state, on this thread: mi_inspect_file() reads headers
+  // and small tensors only.
+  std::string inspect(const Params& p) {
+    p.only({"path"});
+    const std::optional<std::string> path = p.path("path");
+    if (!path) throw RequestError("invalid_params", "\"path\" (the file to inspect) is required");
+    mi_file_report* report = nullptr;
+    if (const mi_status s = mi_inspect_file(path->c_str(), &report); s != MI_OK) {
+      throw RequestError(s == MI_ERR_INVALID_ARGUMENT ? "invalid_params" : status_code(s), mi_last_error_message());
+    }
+    const std::unique_ptr<mi_file_report, void (*)(mi_file_report*)> owner(report, mi_file_report_free);
+    mi_file_info info{};
+    info.struct_size = sizeof info;
+    if (const mi_status s = mi_file_report_info(report, &info); s != MI_OK) throw_status(s);
+    const auto text = [&](mi_file_text_kind k) { return str(mi_file_report_text(report, k)); };
+    std::string out = "{\"path\":" + str(*path) + ",\"kind\":\"" + file_kind_name(info.kind) + "\",\"loadable\":" +
+                      tf(info.loadable != 0) + ",\"file_bytes\":" + std::to_string(info.file_bytes) +
+                      ",\"tensors\":" + std::to_string(info.tensor_count) + ",\"note\":" + text(MI_FILE_TEXT_NOTE);
+    if (info.kind == MI_FILE_KIND_DIT || info.kind == MI_FILE_KIND_TEXT_ENCODER) {
+      const std::string precision = info.loadable ? "\"" + std::string(precision_name(info.precision)) + "\"" : "null";
+      out += ",\"precision\":" + precision + ",\"quantization\":" + text(MI_FILE_TEXT_QUANTIZATION);
+    }
+    if (info.kind == MI_FILE_KIND_DIT) {
+      std::string tiers, reasons;
+      for (const auto& t : mi::server::kTierNames) {
+        if (info.tiers & (1u << t.value)) tiers += (tiers.empty() ? "" : ",") + str(t.name);
+        reasons += (reasons.empty() ? "" : ",") + str(t.name) + ":" + str(mi_file_report_tier_reason(report, t.value));
+      }
+      out += ",\"tiers\":[" + tiers + "],\"tier_reasons\":{" + reasons + "}";
+    }
+    if (info.kind == MI_FILE_KIND_CONTROL_ADAPTER) {
+      std::string kinds;
+      for (std::int32_t i = 0; i < info.control_kind_count; ++i) {
+        kinds += (i ? "," : "") + str(mi_file_report_control_kind(report, i));
+      }
+      out += ",\"control_kinds\":[" + kinds + "]";
+    }
+    if (info.kind == MI_FILE_KIND_LORA || info.kind == MI_FILE_KIND_CONTROL_ADAPTER) {
+      std::string types;
+      const std::string_view all = mi_file_report_text(report, MI_FILE_TEXT_ADAPTER_TYPES);
+      for (std::size_t pos = 0; pos < all.size();) {
+        const std::size_t comma = std::min(all.find(',', pos), all.size());
+        types += (types.empty() ? "" : ",") + str(all.substr(pos, comma - pos));
+        pos = comma + 1;
+      }
+      out += ",\"base_model\":" + text(MI_FILE_TEXT_BASE_MODEL) + ",\"adapter_types\":[" + types + "],\"lora_rank\":" +
+             std::to_string(info.lora_rank) + ",\"lora_adapters\":" + std::to_string(info.lora_adapters) +
+             ",\"lora_unknown_keys\":" + std::to_string(info.lora_unknown_keys);
+    }
+    return out + "}";
   }
 
   std::string unload(const Params& p) {

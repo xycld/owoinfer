@@ -26,7 +26,7 @@ If `<pid>` is not running at startup, the server exits with status 1. A malforme
 
 The server trusts its launcher completely: whoever writes to its stdin has the server's file-system rights. The protocol is a local pipe between a launcher and the child it spawned, not an interface for untrusted input.
 - **No network surface.** The server opens no socket and listens on no port. Its only input is stdin.
-- **Paths are used as given.** `generate`'s `output` and `preview_output` are written wherever they point, and an existing file there is overwritten (atomically: a temporary file renamed over it). `load`'s `model`, `dit_file`, `text_encoder_file`, `vae_file`, `time_embedding_file`, `distill` and `cache_dir`, and `generate`'s `loras` paths, `dataspace`, `init_image`, `mask`, `distill` and `control` (the adapter and image paths), are read, and the cache directory is written to. The server does not confine any path to a directory, resolve symlinks, or check ownership.
+- **Paths are used as given.** `generate`'s `output` and `preview_output` are written wherever they point, and an existing file there is overwritten (atomically: a temporary file renamed over it). `load`'s `model`, `dit_file`, `text_encoder_file`, `vae_file`, `time_embedding_file`, `distill` and `cache_dir`, and `generate`'s `loras` paths, `dataspace`, `init_image`, `mask`, `distill` and `control` (the adapter and image paths), are read, and the cache directory is written to. `inspect` reads its `path` (only a regular file is opened; its header and small tensors, with the bounds of [c-api.md](c-api.md#file-inspection)). The server does not confine any path to a directory, resolve symlinks, or check ownership.
 - **The launcher validates paths.** A launcher that takes any of these paths from a user, a web page, a workflow file or another program must check them first. For example, it can confine outputs to its own output directory, reject `..` components and symlinks it did not create, and refuse to overwrite files it does not own.
 - **Run it as the user.** Run the server with the launcher's own (unprivileged) rights, never elevated.
 - **Images are decoded in-process.** `generate`'s `init_image`, `mask` and `control` image paths are PNG / JPEG files that moss-server decodes itself, with the vendored stb_image decoder. That decoder is hardened (at most 64 MiB per file, at most 16384 pixels per side and 64,000,000 pixels in all, checked from the header before any pixel allocation; fuzzed), but it is not memory-safe: a crafted file can exploit it.
@@ -86,7 +86,10 @@ Params (all optional):
     "capabilities": {"preview": true, "comfyui_models": false, "model_files": true, "lora": true, "tiers": true,
                      "samplers": true, "image_input": true, "hires": true, "distill": true, "system_cuda": true,
                      "control": true, "accel": true, "preload": true, "release": true, "certificate_dirs": true,
-                     "te_host_pin": true, "progress_fraction": true},
+                     "te_host_pin": true, "progress_fraction": true, "inspect": true},
+    "values": {"mode": ["min_memory", "balanced", "max_speed"], "block_path": ["default", "op_by_op", "fused", "fused_graphs"],
+               "tier": ["auto", "reference", "high", "turbo"], "attention": ["default", "exact", ...], ...,
+               "sampler": ["euler", "ab2", ...], ..., "step_cache": ["off", "fbcache"]},
     "probe": {"driver_cuda_version": 13040, "runtime_cuda_version": 13040, "driver_compatible": true,
               "device_count": 1, "supported_device_count": 1, "build_flavour": "cu13", "recommended_flavour": "cu13",
               "message": "recommended flavour cu13 (the driver supports CUDA 13.4)",
@@ -130,6 +133,9 @@ The server's environment steers the search: `MOSSINFER_CUDA_LIBS` (`auto`: the b
 | `certificate_dirs` | `MI_CAP_CERTIFICATE_DIRS` | true | `load`'s `certificate_dirs` |
 | `te_host_pin` | `MI_CAP_TE_HOST_PIN` | true | `load`'s `te_host_pin` |
 | `progress_fraction` | `MI_CAP_PROGRESS_FRACTION` | true | `fraction` and `eta_seconds` in `progress` events and in `status` |
+| `inspect` | `MI_CAP_INSPECT` | true | the `inspect` method |
+
+`values` lists the accepted names of every enum-like string parameter, in the C enum's order, from the same tables the server validates against (`tools/server/names.h`), so a launcher can fill its menus from them: `load`'s `mode`, `block_path`, `tier`, `attention`, `dit_direct_io` and `te_host_pin`, and `generate`'s (and `preload`'s) `sampler`, `scheduler`, `noise_layout`, `noise_source`, `resize`, `mask_encoding` and `step_cache`. A name outside the list is `invalid_params`, and the message lists the names. Gate a feature's values on its capability as before (e.g. `turbo` needs an INT4 DiT, `inspect` says which files are).
 
 ### `load`
 
@@ -379,6 +385,31 @@ When nothing runs, the answer is `{"cancelling": false}`. When another job runs,
 
 `state` is `"unloaded"` (no engine), `"idle"`, `"generating"`, `"preloading"` or `"releasing"`; the last two appear only to a client that sent `preload` or `release`. `model` and `mode` are present when an engine is loaded. While a job runs, `generating_id` is its id and `cancelling` says whether a cancel was requested; the progress fields (`phase`, `step`, `total_steps`, `elapsed_seconds`, `fraction`, `eta_seconds`) are present while generating or preloading. They are the last `progress` event's (before the first one: `phase` `null`, `fraction` 0 and `eta_seconds` `null`; on a library without them both stay `null`).
 
+### `inspect`
+
+Params: `path` (string, required): a file. Says what it is to the engine (`mi_inspect_file()`, [c-api.md](c-api.md#file-inspection)) without an engine or a GPU, so it works before `load` and in every state, also while a job runs: it touches no engine state and reads only headers and small tensors, on the request thread.
+
+```
+>> {"id": 5, "method": "inspect", "params": {"path": "/models/moss_image_sft_int4_convrot.safetensors"}}
+<< {"id": 5, "result": {"path": "/models/moss_image_sft_int4_convrot.safetensors", "kind": "dit", "loadable": true,
+    "file_bytes": 3035537312, "tensors": 715, "note": "", "precision": "w4a4", "quantization": "int4_convrot256",
+    "tiers": ["turbo"], "tier_reasons": {"auto": "the loaded DiT is INT4 ConvRot (the Turbo tier) and no certificate covers it (...)",
+    "reference": "tier reference runs bf16 weights exactly, ...", "high": "the loaded DiT is INT4 ConvRot, ...",
+    "turbo": "Turbo tier: INT4 ConvRot GEMMs, q8_fp8 attention; uncertified (no certificate looked up)"}}}
+>> {"id": 6, "method": "inspect", "params": {"path": "/models/moss_image_color_depth_control.safetensors"}}
+<< {"id": 6, "result": {"path": "...", "kind": "control_adapter", "loadable": true, "file_bytes": 313063368, "tensors": 526,
+    "note": "", "control_kinds": ["color", "depth"], "base_model": "moss-base", "adapter_types": ["lora"], "lora_rank": 64,
+    "lora_adapters": 262, "lora_unknown_keys": 0}}
+```
+
+Every answer has `path`, `kind` (`"dit"`, `"text_encoder"`, `"vae"`, `"lora"`, `"control_adapter"` or `"unknown"`), `loadable` (the loader for that role accepts the file), `file_bytes`, `tensors` and `note` (why not loadable, or what an unknown file is instead, e.g. a GGUF file or a distill bundle file; `""` for none). By kind:
+- `dit`: `precision` (`"bf16"`, `"int8"` or `"w4a4"`; `null` when not loadable), `quantization` (its block linears as the engine runs them, e.g. `"int8_convrot256"`; `""` when not loadable), `tiers` (the `load` `tier` values the engine accepts for it with the bundle's text encoder, before certificates: `auto` on an INT4 DiT needs one, so it is not listed) and `tier_reasons` (for each tier, what it would run or why it is refused).
+- `text_encoder`: `precision` (`"bf16"`, `"int8"` or `"w4a8"`) and `quantization`.
+- `lora`: `base_model` (the metadata, `""` when absent), `adapter_types` (`"lora"`, `"loha"`, `"lokr"`, `"full"`), `lora_rank` (the largest low-rank rank), `lora_adapters` (on the DiT) and `lora_unknown_keys`. A LoRA none of whose tensors applies to the MOSS-Image DiT is `unknown`.
+- `control_adapter`: `control_kinds` (in channel order: exactly the strings `generate`'s `control.images[].kind` takes) and the `lora` fields of its LoRA part.
+
+A file the engine cannot use is a result (`unknown` or `loadable` false), not an error. Errors: `invalid_params` for a missing or empty `path`, unknown params, and a path that is not a regular file (a directory, a device: never opened); `io` for a file that does not exist or cannot be read.
+
 ### `unload`
 
 Releases the engine and its device memory, and answers `{"unloaded": true}`, or `false` when nothing was loaded. While a job runs it answers `busy`. A launcher that wants the GPU back but keeps the model selected sends `release` instead: it keeps the engine (and optionally the weights in RAM), so the next `generate` needs no `load`.
@@ -408,7 +439,7 @@ send({"id": 3, "method": "shutdown"})
 
 ## Tests
 
-`tests/server/test_protocol.py` uses the standard library only. The server's JSON output helpers (`tools/server/json_out.h`; the server links only the C API, so it cannot use the pipeline's report renderer) are checked by the `cpu` gtest suite `ServerJson.*` (`tests/unit/test_server_json.cpp`): strings and numbers are written exactly as `pipeline::json_escape` / `json_number` write them, numbers ignore the C and C++ locales, and a NULL report becomes `null`. `ServerJson.EnumNamesAreThePipelines` checks the name tables of `tools/server/names.h` against the pipeline's names and the C enum values.
+`tests/server/test_protocol.py` uses the standard library only. The server's JSON output helpers (`tools/server/json_out.h`; the server links only the C API, so it cannot use the pipeline's report renderer) are checked by the `cpu` gtest suite `ServerJson.*` (`tests/unit/test_server_json.cpp`): strings and numbers are written exactly as `pipeline::json_escape` / `json_number` write them, numbers ignore the C and C++ locales, and a NULL report becomes `null`. `ServerJson.EnumNamesAreThePipelines` checks the name tables of `tools/server/names.h` against the pipeline's names and the C enum values, and `ServerJson.HelloValuesAreTheTables` that hello's `values` lists every table under the parameter it validates.
 
 | ctest name | Label | What it runs |
 |---|---|---|
@@ -417,7 +448,9 @@ send({"id": 3, "method": "shutdown"})
 | `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt; `fraction` and `eta_seconds` in every `progress`: the fraction in [0, 1) and never decreasing, the eta known and not negative, and from `text_encoder` to the final `decode` the fraction past one half and the eta smaller), cancel mid-run (a `status` mid-run with `fraction` and a known `eta_seconds`), the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params`; a 256² img2img from a PNG path (4 steps at strength 0.5: 2 run, `total_steps` 2) and the strength-1 note in `done.warnings`; a 256², 4-step generate with the color/depth `control` adapter (`$MOSS_COMMUNITY_MODELS`, skipped when absent) and a depth PNG plus `step_cache` `fbcache` (the report's `control` and `accelerators`, uncertified, the accelerator line in `done.warnings`, `done.certified` false), then a kind the adapter lacks (`done` with `invalid_argument`), then `cfg_truncation` at CFG 1 and a threshold without the step cache (the two no-effect warnings, `done.certified` true); `preload` → `release` → `generate` at 256², 2 steps (the `preload` events, their `fraction` and `eta_seconds` as for `generate` and the following generations' too, and `done` with `dit_load` and `preload_note`, `release` answering `busy` during the preload, the release's stats, the next generate loading from the host copy, a `cancel` sent right after a second `release`: one of the documented outcomes, the text encoder's copy kept, and a 2-step generate after it running every step) |
 
 `server_protocol` covers:
-- `hello` (the capabilities and `probe.cublaslt` included), `status`, and idle `cancel` / `unload`
+- `hello` (the capabilities, `values` and `probe.cublaslt` included), `status`, and idle `cancel` / `unload`
+- every name in `hello`'s `values` passing the server's validation (`load`'s to the engine's own check, `generate`'s to `no_engine`), and a name outside it refused with a message that lists exactly those names
+- `inspect` without an engine: a bf16 DiT (precision, quantization, tiers and their reasons), a LoRA with `base_model`, a control adapter whose `control_kinds` `generate` accepts, an oversized header and a GGUF file as results; a missing file (`io`), a directory, a missing or empty `path` and an unknown param (`invalid_params`)
 - malformed input of every kind, unknown methods and params (an unknown or non-string `block_path` included), and NUL in strings
 - `load` errors mapped from engine statuses
 - the P6 `load` params: bad `tier` / `attention` names (`"q8"` and `"auto"` included) and types, every valid name, missing component files
