@@ -33,6 +33,7 @@
 #include "kernels/attention_q8/attention_q8.h"
 #include "kernels/basic/elementwise.h"
 #include "kernels/fused/fused_gemm.h"
+#include "kernels/nvfp4/nvfp4.h"
 #include "kernels/quant/quant.h"
 #include "kernels/quant/w4a8_decode.h"
 #include "kernels/quant4/quant4.h"
@@ -82,8 +83,8 @@ using Tokens = std::array<std::pair<E, std::string_view>, N>;
 
 constexpr Tokens<QualityTier, 3> kTiers{{{QualityTier::kReference, "reference"}, {QualityTier::kHigh, "high"},
                                          {QualityTier::kTurbo, "turbo"}}};
-constexpr Tokens<DitPrecision, 3> kDit{{{DitPrecision::kBf16, "bf16"}, {DitPrecision::kInt8ConvRot, "int8_convrot"},
-                                        {DitPrecision::kW4A4, "w4a4"}}};
+constexpr Tokens<DitPrecision, 4> kDit{{{DitPrecision::kBf16, "bf16"}, {DitPrecision::kInt8ConvRot, "int8_convrot"},
+                                        {DitPrecision::kW4A4, "w4a4"}, {DitPrecision::kNvfp4, "nvfp4"}}};
 constexpr Tokens<AttentionMode, 5> kAttention{{{AttentionMode::kExact, "exact"}, {AttentionMode::kQ8Fp16, "q8_fp16"},
                                                {AttentionMode::kQ8Fp16F32Acc, "q8_fp16_f32acc"},
                                                {AttentionMode::kQ8Fp8, "q8_fp8"},
@@ -768,7 +769,7 @@ std::optional<AttentionMode> parse_attention_mode(std::string_view s) { return p
 std::optional<TePrecision> parse_te_precision(std::string_view s) { return parse_token(kTe, s); }
 
 QualityTier tier_of(const CertConfig& c) {
-  if (c.dit == DitPrecision::kW4A4) return QualityTier::kTurbo;
+  if (c.dit == DitPrecision::kW4A4 || c.dit == DitPrecision::kNvfp4) return QualityTier::kTurbo;
   if (c.dit == DitPrecision::kBf16 && c.attention == AttentionMode::kExact && c.te == TePrecision::kBf16) {
     return QualityTier::kReference;
   }
@@ -785,10 +786,12 @@ EngineNumerics engine_numerics(const CertConfig& c, std::uint64_t cublaslt_versi
                    {"elementwise", kernels::kElementwiseNumericsVersion},
                    {"fused_gemm", kernels::fused::kFusedGemmVersion},
                    {"te", qwen35_text::kNumericsVersion}};
-  if (c.dit == DitPrecision::kInt8ConvRot || c.te == TePrecision::kInt8ConvRot || c.te == TePrecision::kW4A8) {
+  if (c.dit == DitPrecision::kInt8ConvRot || (c.dit == DitPrecision::kNvfp4 && c.dit_int8_units) ||
+      c.te == TePrecision::kInt8ConvRot || c.te == TePrecision::kW4A8) {
     n.emplace_back("int8", kernels::quant::kInt8NumericsVersion);
   }
   if (c.dit == DitPrecision::kW4A4) n.emplace_back("w4a4", kernels::quant4::kInt4NumericsVersion);
+  if (c.dit == DitPrecision::kNvfp4) n.emplace_back("nvfp4", kernels::nvfp4::kNvfp4NumericsVersion);
   if (c.te == TePrecision::kW4A8) n.emplace_back("te_w4a8", kernels::quant::kGroupedDecodeVersion);
   if (c.attention != AttentionMode::kExact) n.emplace_back("attention_q8", attention_q8::kNumericsVersion);
   std::sort(n.begin(), n.end());

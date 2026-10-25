@@ -14,6 +14,7 @@
 #include "kernels/fused/fused_gemm.h"
 #include "kernels/fused/qk_norm_rope.h"
 #include "kernels/lora/lora_gemm.h"
+#include "kernels/nvfp4/nvfp4.h"
 #include "kernels/quant/quant.h"
 #include "kernels/quant4/quant4.h"
 #include "models/moss_dit/dit_kernels.h"
@@ -23,6 +24,7 @@ namespace {
 
 namespace kq = kernels::quant;
 namespace kq4 = kernels::quant4;
+namespace kn = kernels::nvfp4;
 
 constexpr std::int64_t kD = 3072, kH = 24, kHd = 128, kF = 8192;
 static_assert(kFusedBigCols * 2 >= kF * 2 + kF, "the INT8 ffn_down input must fit next to the fused ffn output");
@@ -96,8 +98,22 @@ kq4::Int4Operands operands4(const std::uint8_t* xq, std::int64_t ldx, const floa
   return op;
 }
 
+kn::Nvfp4Operands operands_nv(const kn::Nvfp4Act& x, const Nvfp4Linear& w, std::int64_t m) {
+  kn::Nvfp4Operands op;
+  op.x = x.q;
+  op.x_sf = x.sf;
+  op.x_scale = x.scale;
+  op.w = static_cast<const std::uint8_t*>(w.w.data);
+  op.w_sf = static_cast<const std::uint8_t*>(w.sf.data);
+  op.w_scale2 = w.scale2;
+  op.m = m;
+  op.n = w.w.dim(0);
+  op.k = w.k();
+  return op;
+}
+
 bool bf16_up_gate_runs_op_by_op(const BlockTensors& w, const FusedRoute& route, bool lora) {
-  return w.up_gate8.empty() && w.up_gate4.empty() && !route.up_gate && !lora;
+  return w.up_gate8.empty() && w.up_gate4.empty() && w.up_gate_nvfp4.empty() && !route.up_gate && !lora;
 }
 
 }  // namespace
@@ -139,9 +155,15 @@ AttentionMode parse_attention_mode(std::string_view name) {
 bool attention_supported(AttentionMode m) { return m == AttentionMode::kExact || attention_q8::supported(variant_of(m)); }
 
 std::int64_t quant_big_cols(std::int64_t hw, std::span<const std::int64_t> text_lengths, bool bf16_up_gate,
-                            const FusedRouteSnapshot& route) {
-  return bf16_up_gate ? fused_big_cols(hw, text_lengths, route) : kFusedBigCols;
+                            const FusedRouteSnapshot& route, std::int64_t nvfp4_cols) {
+  return std::max(bf16_up_gate ? fused_big_cols(hw, text_lengths, route) : kFusedBigCols, nvfp4_cols);
 }
+
+std::int64_t nvfp4_big_cols(bool nvfp4_up_gate, bool bf16_ffn) {
+  return !nvfp4_up_gate ? 0 : bf16_ffn ? kOpByOpBigCols : 2 * kF;
+}
+
+std::size_t nvfp4_sf_bytes(std::int64_t l) { return static_cast<std::size_t>(kn::sf_bytes(l, kF)); }
 
 std::size_t q8_attention_workspace_bytes(std::int64_t hw, std::span<const std::int64_t> text_lengths, AttentionMode mode) {
   if (mode == AttentionMode::kExact) return 0;
@@ -206,8 +228,32 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
                     qkv_gemm.workspace_bytes, stream);
     return lora::lora_slices(sb, t);
   };
+  // An NVFP4 ffn_up_gate writes its whole [m, 2F] output (no SiTU epilogue): the ffn_down quantizer applies SiTU-GLU as
+  // it reads it when ffn_down is NVFP4 without a side branch; otherwise the bf16 ffn is materialized after it, in the
+  // op-by-op layout.
+  const bool nv_up = !w.up_gate_nvfp4.empty();
+  const bool nv_ffn_fused = nv_up && !w.down_nvfp4.empty() && s_down == nullptr;
   const bool up_gate_op_by_op = bf16_up_gate_runs_op_by_op(w, route, s_up != nullptr);
-  const std::int64_t big_cols = up_gate_op_by_op ? kOpByOpBigCols : kFusedBigCols;
+  // With a side branch on an NVFP4 ffn_up_gate its codes go after the [L, 2F] output, where the op-by-op layout keeps
+  // the ffn (written only after the GEMM): the 3F columns too.
+  const std::int64_t big_cols =
+      up_gate_op_by_op ? kOpByOpBigCols
+                       : std::max(kFusedBigCols, nvfp4_big_cols(nv_up, !nv_ffn_fused || s_up != nullptr));
+  // Columns of Δ this block needs: its widest NVFP4 site with a side branch.
+  std::int64_t delta_cols = 0;
+  if (s_qkv != nullptr && !w.qkv_nvfp4.empty()) delta_cols = std::max(delta_cols, 3 * kD);
+  if (s_o != nullptr && !w.o_nvfp4.empty()) delta_cols = std::max(delta_cols, kD);
+  if (s_up != nullptr && nv_up) delta_cols = std::max(delta_cols, 2 * kF);
+  if (s_down != nullptr && !w.down_nvfp4.empty()) delta_cols = std::max(delta_cols, kD);
+  if (w.nvfp4() && (qa.nvfp4_sf == nullptr || qa.nvfp4_sf_bytes < nvfp4_sf_bytes(l))) {
+    throw std::invalid_argument("mi::moss_dit::run_block_quant: NVFP4 linears need the nvfp4_sf buffer (nvfp4_sf_bytes)");
+  }
+  if (delta_cols > 0 &&
+      (qa.nvfp4_delta.dtype != DType::kBF16 || qa.nvfp4_delta.numel() < l * delta_cols || qa.nvfp4_scratch == nullptr ||
+       qa.nvfp4_scratch_bytes < lora::delta_scratch_bytes(l, qa.lora->max_rank(), delta_cols))) {
+    throw std::invalid_argument("mi::moss_dit::run_block_quant: a LoRA side branch on an NVFP4 linear needs the nvfp4_delta "
+                                "(" + std::to_string(delta_cols) + " columns per token) and nvfp4_scratch buffers");
+  }
   std::size_t attn_need = 0;
   if (attention != AttentionMode::kExact) {
     const int batch = static_cast<int>(run.cu_seqlens.numel()) - 1;
@@ -258,8 +304,37 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     return op;
   };
 
+  // NVFP4 inputs: the codes at `q` (a run-local [m, k / 2] region), the swizzled scales in nvfp4_sf and the per-token
+  // scales at the start of `scale`'s buffer (16-byte aligned; the runs of a block are sequential on one stream).
+  const auto nv_act = [&](std::int8_t* q) {
+    return kn::Nvfp4Act{u8(q), static_cast<std::uint8_t*>(qa.nvfp4_sf), static_cast<float*>(qa.scale.data)};
+  };
+  // The E1L / E2L term of an NVFP4 site with a side branch, from its bf16 input `in` (rows of this run): t, then
+  // Δ = t · Bᵀ stored in bf16 (natural: ffn_up_gate's stored column order).
+  const auto nv_delta = [&](const lora::SiteBranch& sb, const Tensor& in, bool natural) {
+    Tensor t = Tensor::view(qa.lora_t.data, DType::kBF16, Device::kCUDA, {m, sb.rank});
+    t.stride[0] = qa.lora_t.stride[0];
+    lora::compute_t(sb, in, t, qa.lora_workspace, qa.lora_workspace_bytes, *qkv_gemm.gemm, qkv_gemm.workspace,
+                    qkv_gemm.workspace_bytes, stream);
+    const Tensor d = Tensor::view(qa.nvfp4_delta.data, DType::kBF16, Device::kCUDA, {m, sb.n});
+    lora::compute_delta(sb, t, d, natural, qa.nvfp4_scratch, qa.nvfp4_scratch_bytes, *qkv_gemm.gemm, qkv_gemm.workspace,
+                        qkv_gemm.workspace_bytes, stream);
+    return kn::Nvfp4Delta{bf(d), sb.n};
+  };
+
   // QKV projection (P:139-140 up to the linear).
-  if (!w.qkv4.empty() && s_qkv != nullptr) {
+  if (!w.qkv_nvfp4.empty() && s_qkv != nullptr) {
+    kernels::rms_norm_modulate_moss(x, w.norm1, vec(a.mod, 1), vec(a.mod, 0), y, stream);
+    const kn::Nvfp4Delta d = nv_delta(*s_qkv, y, false);
+    const kn::Nvfp4Act act = nv_act(xq_qkv);
+    kn::quantize_nvfp4(bf(y), kD, act, m, static_cast<int>(kD), stream);
+    kn::nvfp4_gemm(operands_nv(act, w.qkv_nvfp4, m), nullptr, bf_mut(qkv), 3 * kD, stream, kn::Nvfp4Tile::kAuto, d);
+  } else if (!w.qkv_nvfp4.empty()) {
+    const kn::Nvfp4Act act = nv_act(xq_qkv);
+    kn::rms_norm_modulate_quantize_nvfp4(bf(x), kD, bf(w.norm1), bf(vec(a.mod, 1)), bf(vec(a.mod, 0)), act, m,
+                                         static_cast<int>(kD), stream);
+    kn::nvfp4_gemm(operands_nv(act, w.qkv_nvfp4, m), nullptr, bf_mut(qkv), 3 * kD, stream);
+  } else if (!w.qkv4.empty() && s_qkv != nullptr) {
     kernels::rms_norm_modulate_moss(x, w.norm1, vec(a.mod, 1), vec(a.mod, 0), y, stream);
     kq4::convrot_quantize_int4(bf(y), kD, u8(xq_qkv + m * kD), kD / 2, scale, m, static_cast<int>(kD), stream);
     const kq::Int8Operands op = unpacked(xq_qkv + m * kD, xq_qkv, w.qkv4);
@@ -287,21 +362,23 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     } else if (!w.qkv_split) {
       linear(qkv, y, w.qkv);
     } else {
-      // q, k and v of different precisions, each GEMM into its columns of qkv: the bf16 parts from the norm output,
-      // the INT8 parts from one shared INT8 input, then the INT4 parts from one shared INT4 input (it overwrites the
-      // INT8 input and scales once their GEMMs are queued: one stream).
+      // q, k and v of different precisions (or NVFP4 parts with different tensor scales), each GEMM into its columns
+      // of qkv: the bf16 parts from the norm output, the INT8 parts from one shared INT8 input, then the INT4 parts from
+      // one shared INT4 input, then the NVFP4 parts from one shared NVFP4 input (each overwrites the earlier inputs and
+      // scales once their GEMMs are queued: one stream).
       const auto part = [&](int i) {
         Tensor out = Tensor::view(static_cast<std::uint16_t*>(qkv.data) + i * kD, DType::kBF16, Device::kCUDA, {m, kD});
         out.stride[0] = 3 * kD;
         return out;
       };
-      bool any_int8 = false, any_int4 = false;
+      bool any_int8 = false, any_int4 = false, any_nvfp4 = false;
       for (int i = 0; i < 3; ++i) {
         any_int8 = any_int8 || !w.qkv8_part[i].empty();
         any_int4 = any_int4 || !w.qkv4_part[i].empty();
+        any_nvfp4 = any_nvfp4 || !w.qkv_nvfp4_part[i].empty();
       }
       for (int i = 0; i < 3; ++i) {
-        if (w.qkv8_part[i].empty() && w.qkv4_part[i].empty()) linear(part(i), y, w.qkv_part[i]);
+        if (w.qkv8_part[i].empty() && w.qkv4_part[i].empty() && w.qkv_nvfp4_part[i].empty()) linear(part(i), y, w.qkv_part[i]);
       }
       if (any_int8) {
         kq::rotate_quantize(bf(y), kD, xq_qkv, kD, scale, m, static_cast<int>(kD), stream);
@@ -323,6 +400,15 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
           }
         }
       }
+      if (any_nvfp4) {
+        const kn::Nvfp4Act act = nv_act(xq_qkv);
+        kn::quantize_nvfp4(bf(y), kD, act, m, static_cast<int>(kD), stream);
+        for (int i = 0; i < 3; ++i) {
+          if (!w.qkv_nvfp4_part[i].empty()) {
+            kn::nvfp4_gemm(operands_nv(act, w.qkv_nvfp4_part[i], m), nullptr, bf_mut(part(i)), 3 * kD, stream);
+          }
+        }
+      }
     }
   }
   kernels::fused::qk_norm_rope_moss(qkv, static_cast<int>(kH), w.q_norm, w.k_norm, a.rope.slice0(run.t0, run.t1), stream);
@@ -336,7 +422,14 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   }
 
   // x += o(attn) * gate_a (P:142).
-  if (!w.o4.empty()) {
+  if (!w.o_nvfp4.empty()) {
+    kn::Nvfp4Delta d;
+    if (s_o != nullptr) d = nv_delta(*s_o, attn, false);  // from the bf16 input, before it is quantized
+    const kn::Nvfp4Act act = nv_act(xq_y);
+    kn::quantize_nvfp4(bf(attn), kD, act, m, static_cast<int>(kD), stream);
+    kn::nvfp4_gemm_gated_residual(operands_nv(act, w.o_nvfp4, m), nullptr, bf(vec(a.mod, 2)), bf_mut(x), kD, stream,
+                                  kn::Nvfp4Tile::kAuto, d);
+  } else if (!w.o4.empty()) {
     kl::LoraSlices lo;
     if (s_o != nullptr) lo = prepare(*s_o, attn);  // t from the bf16 input, before it is rotated
     std::int8_t* const xq4 = u_o ? xq_y + m * kD : xq_y;
@@ -369,8 +462,29 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   }
 
   // ffn = situ_glu(up_gate(rms_norm_modulate(x))) (P:143-147).
-  Tensor ffn;
-  if (!w.up_gate4.empty() && s_up != nullptr) {
+  Tensor ffn, up_out;
+  if (nv_up) {
+    // The [m, 2F] output in the op-by-op layout's place; with a side branch the bf16 norm output stays in y for t and
+    // the codes go past the whole [L, 2F] output (the op-by-op ffn's place: free until situ_glu below), never inside
+    // it: other tiles' epilogues write it while the GEMM still reads its input.
+    up_out = rows_of(a.big, 0, l, 2 * kF, run.t0, run.t1);
+    if (s_up != nullptr) {
+      kernels::rms_norm_modulate_moss(x, w.norm2, vec(a.mod, 4), vec(a.mod, 3), y, stream);
+      const kn::Nvfp4Delta d = nv_delta(*s_up, y, true);
+      const kn::Nvfp4Act act = nv_act(static_cast<std::int8_t*>(a.big.data) + l * 2 * kF * 2 + run.t0 * (kD / 2));
+      kn::quantize_nvfp4(bf(y), kD, act, m, static_cast<int>(kD), stream);
+      kn::nvfp4_gemm(operands_nv(act, w.up_gate_nvfp4, m), nullptr, bf_mut(up_out), 2 * kF, stream, kn::Nvfp4Tile::kAuto, d);
+    } else {
+      const kn::Nvfp4Act act = nv_act(xq_y);
+      kn::rms_norm_modulate_quantize_nvfp4(bf(x), kD, bf(w.norm2), bf(vec(a.mod, 4)), bf(vec(a.mod, 3)), act, m,
+                                           static_cast<int>(kD), stream);
+      kn::nvfp4_gemm(operands_nv(act, w.up_gate_nvfp4, m), nullptr, bf_mut(up_out), 2 * kF, stream);
+    }
+    if (!nv_ffn_fused) {
+      ffn = rows_of(a.big, l * 2 * kF, l, kF, run.t0, run.t1);
+      kernels::situ_glu(up_out, ffn, stream);
+    }
+  } else if (!w.up_gate4.empty() && s_up != nullptr) {
     // As the INT8 LoRA case: the bf16 norm output stays in y, the quantized input goes to the attention output's columns.
     ffn = rows_of(a.big, 0, l, kF, run.t0, run.t1);
     kernels::rms_norm_modulate_moss(x, w.norm2, vec(a.mod, 4), vec(a.mod, 3), y, stream);
@@ -419,10 +533,22 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   // x += down(ffn) * gate_f (P:148).
   // [L, kF] int8 (or packed int4) where the FFN leaves `big` free: after the fused [L, kF] ffn, or over the op-by-op
   // up_gate output. With an INT4 linear's LoRA the packed input goes to y instead (free here), the INT8 copy to `big`.
-  std::int8_t* const base =
-      up_gate_op_by_op ? static_cast<std::int8_t*>(a.big.data) : static_cast<std::int8_t*>(a.big.data) + l * kF * 2;
+  std::int8_t* const base = up_gate_op_by_op || nv_up ? static_cast<std::int8_t*>(a.big.data)
+                                                     : static_cast<std::int8_t*>(a.big.data) + l * kF * 2;
   std::int8_t* const xq = base + run.t0 * kF;
-  if (!w.down4.empty()) {
+  if (!w.down_nvfp4.empty()) {
+    // The codes in y (free here), as the INT8 / INT4 o-proj input.
+    kn::Nvfp4Delta d;
+    const kn::Nvfp4Act act = nv_act(xq_y);
+    if (nv_ffn_fused) {
+      kn::situ_glu_quantize_nvfp4(bf(up_out), 2 * kF, act, m, static_cast<int>(kF), stream);
+    } else {
+      if (s_down != nullptr) d = nv_delta(*s_down, ffn, false);
+      kn::quantize_nvfp4(bf(ffn), ffn.stride[0], act, m, static_cast<int>(kF), stream);
+    }
+    kn::nvfp4_gemm_gated_residual(operands_nv(act, w.down_nvfp4, m), nullptr, bf(vec(a.mod, 5)), bf_mut(x), kD, stream,
+                                  kn::Nvfp4Tile::kAuto, d);
+  } else if (!w.down4.empty()) {
     kl::LoraSlices ld;
     if (s_down != nullptr) ld = prepare(*s_down, ffn);
     std::int8_t* const xq4 = u_down ? static_cast<std::int8_t*>(a.y.data) + run.t0 * (kF / 2) : xq;

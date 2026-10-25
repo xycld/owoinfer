@@ -24,6 +24,7 @@
 #include <utility>
 
 #include "core/cuda_check.h"
+#include "kernels/nvfp4/nvfp4.h"
 #include "mossinfer/mossinfer.h"
 #include "models/flux2_vae/flux2_vae.h"
 #include "models/flux2_vae/vae_file.h"
@@ -246,12 +247,16 @@ static_assert(static_cast<int>(planner::AttentionMode::kQ8Fp8F32Acc) == static_c
               static_cast<int>(moss_dit::AttentionMode::kExact) == 0);
 moss_dit::AttentionMode dit_attention(planner::AttentionMode a) { return static_cast<moss_dit::AttentionMode>(a); }
 
-CertConfig cert_config(planner::Precision precision, planner::AttentionMode mode, qwen35_text::Precision te, bool lora) {
+// int8_units: the DiT keeps some linears INT8 ConvRot (an NVFP4 file's keep list: CertConfig::dit_int8_units).
+CertConfig cert_config(planner::Precision precision, planner::AttentionMode mode, qwen35_text::Precision te, bool lora,
+                       bool int8_units) {
   CertConfig c;
   c.lora = lora;  // runtime LoRAs: certificates cover the base model only, so this never matches one
-  c.dit = precision == planner::Precision::kInt8   ? DitPrecision::kInt8ConvRot
-          : precision == planner::Precision::kInt4 ? DitPrecision::kW4A4
-                                                   : DitPrecision::kBf16;
+  c.dit = precision == planner::Precision::kInt8    ? DitPrecision::kInt8ConvRot
+          : precision == planner::Precision::kInt4  ? DitPrecision::kW4A4
+          : precision == planner::Precision::kNvfp4 ? DitPrecision::kNvfp4
+                                                    : DitPrecision::kBf16;
+  c.dit_int8_units = precision == planner::Precision::kNvfp4 && int8_units;
   c.attention = static_cast<AttentionMode>(mode);
   c.te = te == qwen35_text::Precision::kInt8   ? TePrecision::kInt8ConvRot
          : te == qwen35_text::Precision::kW4A8 ? TePrecision::kW4A8
@@ -346,8 +351,8 @@ void check_user_paths(const PipelineOptions& o, const Request& r) {
 }
 
 std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file) {
-  // NVFP4 linears run only on cc 12.0 with the sm_120a kernels (user decision D1) and once the DiT has NVFP4 sites
-  // (moss_dit::kRunsNvfp4Linears); otherwise the file is refused as an unsupported model (MI_ERR_MODEL).
+  // NVFP4 linears run only on cc 12.0 with the sm_120a kernels (user decision D1); otherwise the file is refused as an
+  // unsupported model (MI_ERR_MODEL).
   if (!std::filesystem::exists(file)) throw std::invalid_argument("DiT file not found: " + util::path_utf8(file));
   DitFileInfo info = inspect_dit_file(file, [] { return moss_dit::nvfp4_unsupported_reason(); });
   if (!info.refusal.empty()) throw weights::UnsupportedModelError(info.refusal);
@@ -514,6 +519,13 @@ DitFileInfo inspect_dit_file(const weights::SafetensorsFile& header,
   DitFileInfo info;
   info.nvfp4 = std::any_of(model.linears.begin(), model.linears.end(),
                            [](const quant::QuantLinear& l) { return l.spec.format == quant::QuantFormat::kNvfp4; });
+  // One 4-bit format per DiT: a file mixing INT4 ConvRot (convrot_w4a4) and NVFP4 linears is not a supported layout.
+  if (info.nvfp4 && std::any_of(model.linears.begin(), model.linears.end(),
+                                [](const quant::QuantLinear& l) { return l.encoding == quant::Encoding::kW4A4; })) {
+    throw weights::IndexError(util::path_utf8(file) +
+                              ": mixes INT4 ConvRot (convrot_w4a4) and NVFP4 linears; a DiT may use one 4-bit format "
+                              "(with INT8 ConvRot and bf16 linears beside it)");
+  }
   // Refused before to_model_index reads the block scales.
   if (info.nvfp4 && nvfp4_refusal) {
     if (const std::string why = nvfp4_refusal(); !why.empty()) {
@@ -527,6 +539,7 @@ DitFileInfo inspect_dit_file(const weights::SafetensorsFile& header,
   info.quant = std::make_unique<quant::QuantIndex>(
       model_file_errors(file, [&] { return quant::to_model_index(model, {.native_int4 = true}); }));
   info.precision = moss_dit::has_int4_linears(info.quant.get())       ? planner::Precision::kInt4
+                   : info.nvfp4                                         ? planner::Precision::kNvfp4
                    : moss_dit::has_quantized_linears(info.quant.get()) ? planner::Precision::kInt8
                                                                        : planner::Precision::kBf16;
   info.linears = moss_dit::describe_linears(info.quant.get());
@@ -1738,6 +1751,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     // once per configuration and scope while the source is loaded; runtime LoRAs are never certified, so with LoRAs
     // nothing is searched (and nothing LoRA-specific is cached).
     const std::filesystem::path te_file = tes.model ? tes.path : std::filesystem::path();
+    const bool int8_units = moss_dit::int8_gemm_fraction(src.quant.get()) > 0;
     GenerationScope scope;
     scope.pixels = std::int64_t{req.width} * req.height;
     scope.sampler = sampler_name(req.sampler);
@@ -1750,7 +1764,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     // The P6b accelerators are an explicit speed opt-in: the tier is resolved as if they were off (they never make auto
     // pick a slower tier or refuse), and the run is marked uncertified below.
     const auto lookup = [&](planner::Precision precision, planner::AttentionMode mode) {
-      const CertConfig cfg = cert_config(precision, mode, tes.precision, lora_requested);
+      const CertConfig cfg = cert_config(precision, mode, tes.precision, lora_requested, int8_units);
       if (lora_requested) return planner::CertificateAnswer{false, "", uncertifiable_reason(cfg)};
       const std::string key = std::string(planner::attention_name(mode)) + "|" + util::path_utf8(te_file) + "|" +
                               qwen35_text::precision_name(tes.precision) + "|" + std::to_string(scope.pixels) + "|" +
@@ -1766,7 +1780,8 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     };
     const auto supported = [](planner::AttentionMode mode) { return moss_dit::attention_supported(dit_attention(mode)); };
     r.tier = planner::resolve_tier(m.options.tier, m.options.attention, src.precision, lookup, supported,
-                                   tes.precision != qwen35_text::Precision::kBF16);
+                                   tes.precision != qwen35_text::Precision::kBF16,
+                                   src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available());
     if (lora_requested) {
       r.tier.certified = false;
       r.tier.certificate.clear();
@@ -1792,7 +1807,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     }
     // The report's quality object (quality_report_json): what ran, why, and the models it ran.
     QualityReport& q = r.quality;
-    q.config = cert_config(r.tier.precision, r.tier.attention, tes.precision, lora_requested);
+    q.config = cert_config(r.tier.precision, r.tier.attention, tes.precision, lora_requested, int8_units);
     q.gpu_arch = r.gpu_arch;
     q.reason = r.tier.reason;
     q.certificate = r.tier.certificate.empty() ? std::filesystem::path() : util::path_from_utf8(r.tier.certificate);
@@ -2044,11 +2059,9 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   const moss_dit::FusedRouteSnapshot route =
       block_path == moss_dit::BlockPath::kOpByOp ? moss_dit::FusedRouteSnapshot{} : moss_dit::fused_route_snapshot();
   const moss_dit::AttentionMode attention = dit_attention(r.tier.attention);
-  moss_dit::ComputeConfig dit_config = moss_dit::MossDit::compute_config(src.quant.get(), attention);
-  if (m.lora_sb && m.lora_sb->any_active()) {
-    dit_config.quantized = true;  // the side branches run on the quantized block path (its fused LoRA GEMMs)
-    dit_config.lora_rank = m.lora_sb->max_rank();
-  }
+  // The side branches run on the quantized block path (its fused LoRA GEMMs; on NVFP4 sites a stored Δ).
+  const moss_dit::ComputeConfig dit_config =
+      moss_dit::MossDit::compute_config(src.quant.get(), attention, moss_dit::Int4Route::kAuto, m.lora_sb.get());
 
   // Exact stack need of the phases this request runs, and the plan.
   const auto latent_bytes_of = [](int H, int W) {
@@ -2112,6 +2125,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   in.shapes.dit_bytes = moss_dit::MossDit::persistent_bytes(*src.index);
   if (src.quant) in.shapes.dit_int8_fraction = moss_dit::int8_gemm_fraction(src.quant.get());
   if (src.quant) in.shapes.dit_int4_fraction = moss_dit::int4_gemm_fraction(src.quant.get());
+  if (src.quant) in.shapes.dit_nvfp4_fraction = moss_dit::nvfp4_gemm_fraction(src.quant.get());
   if (src.quant && m.lora_sb) {
     // INT4 sites with an active LoRA side branch run the INT8 LoRA GEMMs: costed at INT8 speed.
     const double f = moss_dit::int4_side_branch_fraction(src.quant.get(), *m.lora_sb);
@@ -2203,6 +2217,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   }
   in.caps.dit_host_pinned = true;
   in.caps.int4_mma_native = moss_dit::int4_mma_native();
+  in.caps.nvfp4_native = src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available();
   if (m.lora_stack) {
     for (int bi = 0; bi < moss_dit::kLayers; ++bi) {
       if (moss_dit::MossDit::block_has_merges(*m.lora_stack, bi)) in.caps.dit_file_source = false;

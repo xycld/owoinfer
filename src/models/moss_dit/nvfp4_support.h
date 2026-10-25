@@ -7,10 +7,6 @@
 
 namespace mi::moss_dit {
 
-// Whether the DiT runs NVFP4 linears at all. False until the NVFP4 block sites are integrated (NVFP4 plan, phase N5,
-// which flips it): every NVFP4 DiT is refused, also on an RTX 50 with the kernels built.
-inline constexpr bool kRunsNvfp4Linears = false;
-
 // Empty when NVFP4 linears can run, else the message for the user. major < 0: no CUDA device. The GPU checks come
 // first, so a GPU without FP4 tensor cores always gets the D1 message.
 std::string nvfp4_unsupported_reason(int major, int minor, bool kernels_available);

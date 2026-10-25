@@ -354,9 +354,10 @@ TEST(CApiInspect, HostileDitShapes) {
   }
 }
 
-// The quantization text and note of a loadable DiT whose linears carry a static input_scale. Only NVFP4 linears do,
-// which this version refuses (inspect gives the NVFP4 verdict), so the DiT is indexed by pipeline::inspect_dit_file
-// with no NVFP4 refusal, as a version that runs them would, and its answer split as inspect splits it.
+// The quantization text and note of a loadable DiT whose linears carry a static input_scale. Only NVFP4 linears do:
+// inspect loads them with this build's NVFP4 kernels and refuses them without (the D1 verdict); either way the DiT is
+// indexed by pipeline::inspect_dit_file with no NVFP4 refusal, as a build that runs them does, and its answer split as
+// inspect splits it.
 TEST(CApiInspect, DitLinearsText) {
   mi::testing::TempDir dir("inspect_linears");
   const std::string q = "layers.0.proj.q";
@@ -368,9 +369,7 @@ TEST(CApiInspect, DitLinearsText) {
   const fs::path file = write_dit(dir.path() / "nvfp4_input_scale.safetensors", Gemm::kBf16, nvfp4);
   const Report rep(file);
   EXPECT_EQ(rep.info.kind, MI_FILE_KIND_DIT);
-  EXPECT_EQ(rep.info.loadable, 0);  // this version's NVFP4 verdict
   EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("NVFP4"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
-  EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "");
 
   const std::string remark = "1 linears carry a static input_scale; ignored (activations are scaled per token)";
   const mi::pipeline::DitFileInfo dit = mi::pipeline::inspect_dit_file(file, "");
@@ -384,6 +383,13 @@ TEST(CApiInspect, DitLinearsText) {
   mi::api::describe_dit_linears(dit, r);
   EXPECT_EQ(r.quantization, describe);
   EXPECT_EQ(r.note, "NVFP4 linears run on compute capability 12.0 only (an RTX 50 GPU); " + remark);
+  if (rep.info.loadable == 1) {  // with the NVFP4 kernels: inspect's answer is that split
+    EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), describe);
+    EXPECT_EQ(rep.text(MI_FILE_TEXT_NOTE), r.note);
+    EXPECT_EQ(rep.info.precision, MI_PRECISION_NVFP4);
+  } else {  // without: the D1 verdict
+    EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "");
+  }
 
   // Without NVFP4 linears (built here): the quantization text is `linears` whole, the note the remarks alone or nothing.
   mi::pipeline::DitFileInfo plain;
@@ -425,11 +431,21 @@ TEST(CApiInspect, Nvfp4Dit) {
   const Report rep(write_dit(dir.path() / "nvfp4.safetensors", Gemm::kBf16, t,
                              R"({"_quantization_metadata":"{\"layers\": {)" + layers + R"(}}"})"));
   EXPECT_EQ(rep.info.kind, MI_FILE_KIND_DIT);
-  EXPECT_EQ(rep.info.loadable, 0);
-  // nvfp4_unsupported_reason()'s verdict for this build (no kernels, or no NVFP4 DiT support yet): both point to INT8.
-  EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("NVFP4"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
-  EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("INT8"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
-  EXPECT_EQ(rep.text(MI_FILE_TEXT_NOTE).find("MiB"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
+  // A build without the NVFP4 kernels: nvfp4_unsupported_reason()'s verdict, pointing to INT8. With them: the scales
+  // are read and validated (one linear's at a time, within the bound) and the DiT loads, Turbo only.
+  const std::string note = rep.text(MI_FILE_TEXT_NOTE);
+  if (rep.info.loadable == 1) {
+    EXPECT_EQ(rep.info.precision, MI_PRECISION_NVFP4);
+    EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "nvfp4");
+    EXPECT_EQ(rep.info.tiers, 1u << MI_TIER_TURBO);
+    EXPECT_NE(note.find("compute capability 12.0"), std::string::npos) << note;
+    EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("the loaded DiT is NVFP4 (the Turbo tier)"), std::string::npos)
+        << rep.tier_reason(MI_TIER_AUTO);
+  } else {
+    EXPECT_NE(note.find("NVFP4"), std::string::npos) << note;
+    EXPECT_NE(note.find("INT8"), std::string::npos) << note;
+  }
+  EXPECT_EQ(note.find("MiB"), std::string::npos) << note;
 }
 
 TEST(CApiInspect, Lora) {
@@ -771,7 +787,8 @@ TEST(CApiInspect, CommunityFiles) {
       {"toxicdog/moss_image_sft_int4_convrot.safetensors", MI_FILE_KIND_DIT, 1, "int4_convrot256", bit(MI_TIER_TURBO),
        MI_PRECISION_W4A4},
       {"tsolful/moss_image_sft_W4A8_GPTQ.safetensors", MI_FILE_KIND_DIT, 0, "", 0, MI_PRECISION_BF16},  // to quantize
-      {"bennydaball/moss_image_sft_nvfp4.safetensors", MI_FILE_KIND_DIT, 0, "", 0, MI_PRECISION_BF16},  // NVFP4
+      // NVFP4 (mixed with INT8 keep-list linears): as this build judges it, below
+      {"bennydaball/moss_image_sft_nvfp4.safetensors", MI_FILE_KIND_DIT, 1, "", bit(MI_TIER_TURBO), MI_PRECISION_NVFP4},
       {"comfy-org/qwen3.5_9b_int8_convrot.safetensors", MI_FILE_KIND_TEXT_ENCODER, 1, "int8_convrot", 0,
        MI_PRECISION_INT8},
       {"comfy-org/qwen3.5_9b_w4a8_gptq.safetensors", MI_FILE_KIND_TEXT_ENCODER, 1, "w4a8", 0, MI_PRECISION_W4A8},
@@ -792,6 +809,24 @@ TEST(CApiInspect, CommunityFiles) {
     SCOPED_TRACE(e.file);
     const Report rep(c / e.file);
     EXPECT_EQ(rep.info.kind, e.kind);
+    if (std::string(e.file).find("nvfp4") != std::string::npos) {
+      // With the NVFP4 kernels in the build: Turbo only (auto needs a certificate); without them: D1's refusal.
+      const std::string note = rep.text(MI_FILE_TEXT_NOTE);
+      if (rep.info.loadable == 1) {
+        EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION).rfind("mixed (", 0), 0u) << rep.text(MI_FILE_TEXT_QUANTIZATION);
+        EXPECT_NE(rep.text(MI_FILE_TEXT_QUANTIZATION).find(" nvfp4"), std::string::npos);
+        EXPECT_EQ(rep.info.tiers, e.tiers);
+        EXPECT_EQ(rep.info.precision, e.precision);
+        EXPECT_NE(note.find("compute capability 12.0"), std::string::npos) << note;
+      } else {
+        EXPECT_EQ(rep.info.tiers, 0u);
+        EXPECT_EQ(rep.info.precision, MI_PRECISION_BF16);
+        EXPECT_NE(note.find("NVFP4"), std::string::npos) << note;
+        EXPECT_NE(note.find("INT8"), std::string::npos) << note;
+      }
+      ++checked;
+      continue;
+    }
     EXPECT_EQ(rep.info.loadable, e.loadable) << rep.text(MI_FILE_TEXT_NOTE);
     EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), e.quantization);
     EXPECT_EQ(rep.info.tiers, e.tiers);
@@ -805,10 +840,6 @@ TEST(CApiInspect, CommunityFiles) {
     if (e.kind == MI_FILE_KIND_UNKNOWN) {
       EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("distill bundle file"), std::string::npos)
           << rep.text(MI_FILE_TEXT_NOTE);
-    }
-    if (std::string(e.file).find("nvfp4") != std::string::npos) {
-      EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("NVFP4"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
-      EXPECT_NE(rep.text(MI_FILE_TEXT_NOTE).find("INT8"), std::string::npos) << rep.text(MI_FILE_TEXT_NOTE);
     }
     ++checked;
   }

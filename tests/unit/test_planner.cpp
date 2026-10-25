@@ -1190,6 +1190,109 @@ TEST(Planner, TurboTier) {
   EXPECT_TRUE(d.certified);
 }
 
+// NVFP4 (Turbo on compute capability 12.0, NVFP4 plan §4.7, user decisions D1 / D2), on both GPU classes: where the
+// NVFP4 GEMMs run (sm_120 with the sm_120a kernels: nvfp4_native) turbo runs it, high and reference refuse it and auto
+// runs it only with a certificate; elsewhere (sm_89, or a build without the kernels) every tier refuses it, naming the
+// INT8 file.
+TEST(Planner, Nvfp4Tier) {
+  const auto none = [](Precision, AttentionMode) { return CertificateAnswer{false, "", "no certificate file"}; };
+  const auto all = [](AttentionMode) { return true; };
+  const auto no_q8 = [](AttentionMode a) { return a == AttentionMode::kExact; };
+  using O = std::optional<AttentionMode>;
+  constexpr bool kSm120 = true, kOther = false;
+  TierDecision d = resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, none, all, false, kSm120);
+  EXPECT_EQ(d.effective, Tier::kTurbo);
+  EXPECT_EQ(d.precision, Precision::kNvfp4);
+  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
+  EXPECT_FALSE(d.certified);
+  EXPECT_NE(d.reason.find("NVFP4 GEMMs"), std::string::npos) << d.reason;
+  EXPECT_NE(d.reason.find("uncertified (no certificate file)"), std::string::npos) << d.reason;
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, none, no_q8, false, kSm120).attention, AttentionMode::kExact);
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, none, all, true, kSm120).effective, Tier::kTurbo);
+  try {
+    resolve_tier(Tier::kHigh, O{}, Precision::kNvfp4, none, all, false, kSm120);
+    ADD_FAILURE() << "high ran an NVFP4 DiT";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string(e.what()).find("NVFP4, which runs the Turbo tier; use tier turbo"), std::string::npos) << e.what();
+  }
+  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kNvfp4, none, all, false, kSm120), std::invalid_argument);
+  // D2: auto never runs an uncertified NVFP4 DiT.
+  try {
+    resolve_tier(Tier::kAuto, O{}, Precision::kNvfp4, none, all, false, kSm120);
+    ADD_FAILURE() << "auto ran an uncertified NVFP4 DiT";
+  } catch (const std::invalid_argument& e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find("the loaded DiT is NVFP4 (the Turbo tier)"), std::string::npos) << what;
+    EXPECT_NE(what.find("choose tier turbo"), std::string::npos) << what;
+  }
+  EXPECT_THROW(resolve_tier(Tier::kAuto, O{AttentionMode::kQ8Fp8}, Precision::kNvfp4, none, all, false, kSm120),
+               std::invalid_argument);
+  // With a certificate for NVFP4 + q8_fp8 auto runs that.
+  const auto certified = [](Precision p, AttentionMode a) {
+    return CertificateAnswer{p == Precision::kNvfp4 && a == AttentionMode::kQ8Fp8, "/c/nvfp4.mossinfer-cert.json", ""};
+  };
+  d = resolve_tier(Tier::kAuto, O{}, Precision::kNvfp4, certified, all, false, kSm120);
+  EXPECT_EQ(d.effective, Tier::kTurbo);
+  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
+  EXPECT_TRUE(d.certified);
+  EXPECT_EQ(d.certificate, "/c/nvfp4.mossinfer-cert.json");
+  // D1: no FP4 tensor cores (or no sm_120a kernels): every tier refuses, also with a certificate; the default is that.
+  for (const Tier t : {Tier::kAuto, Tier::kReference, Tier::kHigh, Tier::kTurbo}) {
+    for (const bool explicit_arg : {true, false}) {
+      try {
+        if (explicit_arg) {
+          resolve_tier(t, O{}, Precision::kNvfp4, certified, all, false, kOther);
+        } else {
+          resolve_tier(t, O{}, Precision::kNvfp4, certified, all);
+        }
+        ADD_FAILURE() << tier_name(t) << " ran an NVFP4 DiT without the NVFP4 GEMMs";
+      } catch (const std::invalid_argument& e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("RTX 50 GPU (compute capability 12.0)"), std::string::npos) << what;
+        EXPECT_NE(what.find("use the INT8 file"), std::string::npos) << what;
+      }
+    }
+  }
+  // The other precisions do not depend on it.
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, none, all, false, kOther).effective, Tier::kTurbo);
+  EXPECT_EQ(resolve_tier(Tier::kHigh, O{}, Precision::kInt8, none, all, false, kOther).effective, Tier::kHigh);
+  EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, Precision::kInt8, none, all, false, kSm120), std::invalid_argument);
+  EXPECT_STREQ(precision_name(Precision::kNvfp4), "nvfp4");
+}
+
+// NVFP4 GEMMs cost by fraction at the measured rate relative to INT8 (never slower than INT8: the constant is >= 1);
+// keep-list INT8 and bf16 linears by theirs.
+TEST(Planner, Nvfp4DitCostsByFraction) {
+  Scenario sc;
+  sc.size = 1024;
+  sc.lengths = {282, 10};
+  sc.vram_free_gib = 24.0;
+  PlanInputs in = sc.inputs();
+  in.shapes = int8_shapes();
+  const ExecutionPlan int8 = plan(in);
+  in.shapes.dit_precision = Precision::kNvfp4;
+  in.caps.nvfp4_native = true;
+  const ExecutionPlan nvfp4 = plan(in);
+  expect_consistent(nvfp4);
+  EXPECT_EQ(nvfp4.dit.precision, Precision::kNvfp4);
+  EXPECT_LE(nvfp4.dit.compute_s, int8.dit.compute_s);
+  EXPECT_NE(nvfp4.explanation.find("NVFP4"), std::string::npos) << nvfp4.explanation;
+  EXPECT_EQ(mi::json::parse(nvfp4.to_json()).at("dit").at("precision").as_string(), "nvfp4");
+  // Where the NVFP4 GEMMs do not run (a plan made anyway): costed at the INT8 rate.
+  in.caps.nvfp4_native = false;
+  EXPECT_DOUBLE_EQ(plan(in).dit.compute_s, int8.dit.compute_s);
+  in.caps.nvfp4_native = true;
+  // A keep list (90 % NVFP4, 10 % INT8) costs between all-NVFP4 and all-INT8; a bf16 quarter instead costs more.
+  in.shapes.dit_nvfp4_fraction = 0.9;
+  in.shapes.dit_int8_fraction = 0.1;
+  const ExecutionPlan kept = plan(in);
+  EXPECT_GE(kept.dit.compute_s, nvfp4.dit.compute_s);
+  EXPECT_LE(kept.dit.compute_s, int8.dit.compute_s);
+  in.shapes.dit_nvfp4_fraction = 0.75;
+  in.shapes.dit_int8_fraction = 0.0;
+  EXPECT_GT(plan(in).dit.compute_s, kept.dit.compute_s);
+}
+
 TEST(Planner, TierAndAttentionNames) {
   for (const Tier t : {Tier::kReference, Tier::kHigh, Tier::kTurbo, Tier::kAuto}) EXPECT_EQ(parse_tier(tier_name(t)), t);
   for (const AttentionMode a : {AttentionMode::kExact, AttentionMode::kQ8Fp16, AttentionMode::kQ8Fp16F32Acc,

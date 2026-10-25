@@ -175,7 +175,8 @@ void inspect_dit(const weights::SafetensorsFile& header, FileInspection& r) {
                                       planner::Tier::kTurbo};  // by mi_tier
   for (std::size_t t = 0; t < std::size(kTiers); ++t) {
     try {
-      r.tier_reasons[t] = planner::resolve_tier(kTiers[t], std::nullopt, dit->precision, no_certificate, {}).reason;
+      r.tier_reasons[t] =
+          planner::resolve_tier(kTiers[t], std::nullopt, dit->precision, no_certificate, {}, false, kNvfp4Kernels).reason;
       r.info.tiers |= 1u << t;
     } catch (const std::invalid_argument& e) {
       r.tier_reasons[t] = e.what();

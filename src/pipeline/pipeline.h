@@ -474,7 +474,8 @@ std::string dit_lineage(const weights::ModelIndex& index);
 // half-NVFP4 one). Device-free; Pipeline loads a DiT file through it.
 struct DitFileInfo {
   std::unique_ptr<quant::QuantIndex> quant;  // the index the DiT loads from; null when `refusal` is set
-  // Of the block linears: kInt4 when some is INT4, else kInt8 when some is quantized (INT8 or NVFP4), else kBf16.
+  // Of the block linears: kInt4 when some is INT4, else kNvfp4 when some is NVFP4, else kInt8 when some is INT8, else
+  // kBf16.
   planner::Precision precision = planner::Precision::kBf16;
   // moss_dit::describe_linears (e.g. "int8_convrot256", "mixed (210 int4_convrot256, 42 bf16)"): Result::dit_linears.
   std::string linears;
@@ -493,7 +494,8 @@ struct DitFileInfo {
 // Throws std::invalid_argument when `file` exists but is not a regular file ("<file>: not a regular file"),
 // weights::IoError (MI_ERR_IO) when it does not exist (any more: "<file>: no such file") or cannot be read,
 // weights::UnsupportedModelError for another model, container or add-on, weights::IndexError (MI_ERR_MODEL, the message
-// naming the file) for a layout or shape the importer refuses, weights::FormatError for a malformed header. (Pipeline
+// naming the file) for a layout or shape the importer refuses or a file mixing INT4 ConvRot and NVFP4 linears,
+// weights::FormatError for a malformed header. (Pipeline
 // keeps its own std::invalid_argument "DiT file not found: <file>" for a dit_file that does not exist.)
 DitFileInfo inspect_dit_file(const std::filesystem::path& file, const std::function<std::string()>& nvfp4_refusal);
 // The same with the reason already known (e.g. for another device, or "" to index NVFP4 linears).

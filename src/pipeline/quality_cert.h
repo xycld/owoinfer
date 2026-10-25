@@ -1,4 +1,4 @@
-// Quality certificates (P6 step 39, AC21): the evidence that a lossy configuration (an INT8 or W4A4 DiT, 8-bit
+// Quality certificates (P6 step 39, AC21): the evidence that a lossy configuration (an INT8, W4A4 or NVFP4 DiT, 8-bit
 // attention, a quantized text encoder) keeps image quality on a given model, engine numerics and GPU class. The
 // planner's Auto tier may only pick a lossy configuration that has a usable certificate (find_certificate) for the
 // request at hand; Reference needs none.
@@ -43,6 +43,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -73,13 +74,13 @@ struct CertificateError : std::runtime_error {
 };
 
 enum class QualityTier { kReference, kHigh, kTurbo };
-enum class DitPrecision { kBf16, kInt8ConvRot, kW4A4 };
+enum class DitPrecision { kBf16, kInt8ConvRot, kW4A4, kNvfp4 };
 // The exact attention, or one of the 8-bit attention variants (attention_q8::Variant).
 enum class AttentionMode { kExact, kQ8Fp16, kQ8Fp16F32Acc, kQ8Fp8, kQ8Fp8F32Acc };
 enum class TePrecision { kBf16, kInt8ConvRot, kW4A8 };
 
 // Tokens as written in certificates (and accepted by the CLI): "reference" | "high" | "turbo"; "bf16" |
-// "int8_convrot" | "w4a4"; "exact" | "q8_fp16" | "q8_fp16_f32acc" | "q8_fp8" | "q8_fp8_f32acc"; "bf16" |
+// "int8_convrot" | "w4a4" | "nvfp4"; "exact" | "q8_fp16" | "q8_fp16_f32acc" | "q8_fp8" | "q8_fp8_f32acc"; "bf16" |
 // "int8_convrot" | "w4a8". The parsers return nullopt for anything else.
 std::string_view cert_token(QualityTier t);
 std::string_view cert_token(DitPrecision p);
@@ -96,12 +97,19 @@ struct CertConfig {
   AttentionMode attention = AttentionMode::kExact;
   TePrecision te = TePrecision::kBf16;
   bool lora = false;  // runtime LoRAs active: certificates cover the base model only, so never certified
+  // An NVFP4 DiT that keeps some linears INT8 ConvRot (a keep list): its output depends on the INT8 numerics too
+  // (engine_numerics' "int8"). Not a certified dimension of its own: the file's identity fixes the keep list and the
+  // stored numerics carry it, so equality ignores it (a certificate's config is read without it).
+  bool dit_int8_units = false;
 
-  bool operator==(const CertConfig&) const = default;
+  // Every field but dit_int8_units (see above). A new field must be added to tie(), or deliberately left out with a
+  // reason here.
+  auto tie() const { return std::tie(dit, attention, te, lora); }
+  bool operator==(const CertConfig& o) const { return tie() == o.tie(); }
 };
 
-// The tier a configuration belongs to: Reference when everything is bf16 and exact, Turbo with a W4A4 DiT, High
-// otherwise.
+// The tier a configuration belongs to: Reference when everything is bf16 and exact, Turbo with a W4A4 or NVFP4 DiT,
+// High otherwise.
 QualityTier tier_of(const CertConfig& c);
 
 // Engine numerics versions a configuration's output bits depend on, sorted by name. A certificate is usable only when
@@ -113,9 +121,10 @@ QualityTier tier_of(const CertConfig& c);
 //   "elementwise" kernels::kElementwiseNumericsVersion, "fused_gemm" kernels::fused::kFusedGemmVersion and "te"
 //     qwen35_text::kNumericsVersion: always (every configuration runs the bf16 elementwise ops, the bf16 GEMM routing
 //     of the layers kept in bf16, and the text encoder's own op order);
-//   "int8" kernels::quant::kInt8NumericsVersion: when the DiT or the TE is INT8 ConvRot or the TE is W4A8 (its
-//     activations are INT8);
+//   "int8" kernels::quant::kInt8NumericsVersion: when the DiT or the TE is INT8 ConvRot, the TE is W4A8 (its
+//     activations are INT8) or the DiT is NVFP4 with INT8 ConvRot keep-list linears (dit_int8_units);
 //   "w4a4" kernels::quant4::kInt4NumericsVersion: when the DiT is W4A4;
+//   "nvfp4" kernels::nvfp4::kNvfp4NumericsVersion: when the DiT is NVFP4;
 //   "te_w4a8" kernels::quant::kGroupedDecodeVersion: when the TE is W4A8;
 //   "attention_q8" attention_q8::kNumericsVersion: when the attention is not exact.
 using EngineNumerics = std::vector<std::pair<std::string, std::uint64_t>>;

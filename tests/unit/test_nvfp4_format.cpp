@@ -571,11 +571,8 @@ TEST(Nvfp4Support, RefusalMessages) {
   EXPECT_EQ(mi::moss_dit::nvfp4_unsupported_reason(12, 1, true).rfind(need, 0), 0u);  // DGX Spark: no sm_120a image
   EXPECT_EQ(mi::moss_dit::nvfp4_unsupported_reason(-1, 0, false), need + " (no CUDA device)");
   EXPECT_NE(mi::moss_dit::nvfp4_unsupported_reason(12, 0, false).find("use the INT8 file"), std::string::npos);
-  // Until the DiT has NVFP4 sites (N5), an RTX 50 with the kernels refuses too.
-  EXPECT_EQ(mi::moss_dit::nvfp4_unsupported_reason(12, 0, true),
-            mi::moss_dit::kRunsNvfp4Linears ? ""
-                                            : "NVFP4 DiT files are not supported by this version yet; use an INT8 DiT (e.g. "
-                                              "Comfy-Org's int8_convrot file) or convert the bf16 DiT with `moss-infer quantize`");
+  // An RTX 50 with the kernels runs them.
+  EXPECT_EQ(mi::moss_dit::nvfp4_unsupported_reason(12, 0, true), "");
 }
 
 // A MOSS-Image DiT file with NVFP4 block linears, written sparse: the header, the comfy_quant configs and holes (the
@@ -670,7 +667,8 @@ TEST(Nvfp4Support, InspectDitFile) {
 }
 
 // The real load path (Pipeline -> open_dit_file) refuses an NVFP4 DiT as an unsupported model (MI_ERR_MODEL in the C
-// API) with the D1 / N5 message, before the planner, the arena or any weight upload.
+// API) with the D1 message where NVFP4 cannot run, before the planner, the arena or any weight upload. Where it can,
+// the file's scales are validated there instead (the holes' zero tensor scales: an IndexError, MI_ERR_MODEL too).
 TEST(GpuNvfp4Support, PipelineRefusesNvfp4Dit) {
   const fs::path bundle = weights_root() / "sft";
   if (!fs::is_regular_file(bundle / "transformer" / "config.json")) GTEST_SKIP() << "no MOSS-Image bundle at " << bundle;
@@ -687,13 +685,21 @@ TEST(GpuNvfp4Support, PipelineRefusesNvfp4Dit) {
   req.width = req.height = 256;
   req.steps = 1;
   req.decode = false;
+  const std::string why = mi::moss_dit::nvfp4_unsupported_reason();
   try {
     pipe.generate(req);
-    FAIL() << "an NVFP4 DiT was accepted";
+    FAIL() << "an NVFP4 DiT with zero tensor scales was accepted";
   } catch (const mi::weights::UnsupportedModelError& e) {
     const std::string msg = e.what();
+    EXPECT_FALSE(why.empty()) << msg;
     EXPECT_EQ(msg.rfind(mi::util::path_utf8(file) + ": ", 0), 0u) << msg;
-    EXPECT_NE(msg.find(mi::moss_dit::nvfp4_unsupported_reason()), std::string::npos) << msg;
+    EXPECT_NE(msg.find(why), std::string::npos) << msg;
+    RecordProperty("message", msg);
+  } catch (const mi::weights::IndexError& e) {
+    const std::string msg = e.what();
+    EXPECT_TRUE(why.empty()) << msg;
+    EXPECT_EQ(msg.rfind(mi::util::path_utf8(file), 0), 0u) << msg;
+    EXPECT_NE(msg.find("weight_scale_2 is not finite and > 0"), std::string::npos) << msg;
     RecordProperty("message", msg);
   }
 }

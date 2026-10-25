@@ -37,6 +37,10 @@
 // P6c (Turbo tier): an INT4 ConvRot file (convrot_w4a4, quant::IndexOptions::native_int4) keeps its linears packed and
 // runs them on the INT4 GEMMs, any mix of INT4, INT8 and bf16 linears per block; INT4 blocks move about a quarter of
 // the bf16 bytes.
+// NVFP4 (Turbo tier on compute capability 12.0, NVFP4 plan §4.6): a comfy_quant nvfp4 file (our converter's or a
+// community one, usually with INT8 ConvRot keep-list linears) runs its NVFP4 linears on the sm_120a block-scaled GEMMs
+// (kernels/nvfp4), any mix with INT8 and bf16 linears per block; NVFP4 blocks move 0.28 of the bf16 bytes. Elsewhere
+// the model refuses the file (nvfp4_support.h, user decision D1).
 // The fused route of a forward is its own snapshot unless a request pinned one (set_request_route): a pipeline sizes
 // its arena from one snapshot per request and every step of the request then runs it.
 #pragma once
@@ -163,6 +167,14 @@ struct ComputeConfig {
   std::int64_t lora_rank = 0;  // runtime LoRA side branches' max_rank (0: none): the t buffers of a forward
   bool int4 = false;           // some block linear is INT4 (with LoRA side branches: the int4_unpack buffer)
   bool int4_via_int8 = false;  // int4: every INT4 linear runs the INT8 GEMMs on unpacked operands (the same bits)
+  bool nvfp4 = false;          // some block linear is NVFP4 (QuantBlockBuffers::nvfp4_sf; with LoRA: nvfp4_delta)
+  bool nvfp4_up_gate = false;  // some ffn_up_gate is NVFP4: `big` holds its [L, 2F] output (nvfp4_big_cols)
+  bool nvfp4_ffn = false;      // ... in a block whose ffn_down is not NVFP4: the bf16 ffn after it too
+  // Runtime LoRA on NVFP4 sites (nvfp4_big_cols, QuantBlockBuffers::nvfp4_delta): an NVFP4 ffn_up_gate in a block with an
+  // active ffn_up_gate or ffn_down side branch (the 3F `big`), and the widest NVFP4 site with an active side branch
+  // (Δ's columns per token; 0: none).
+  bool nvfp4_lora_ffn = false;
+  std::int64_t nvfp4_delta_cols = 0;
   bool operator==(const ComputeConfig&) const = default;
 };
 
@@ -178,14 +190,17 @@ std::string describe_linears(const quant::QuantIndex* quant);
 bool has_quantized_linears(const quant::QuantIndex* quant);
 // Some block linear of `quant` is INT4 (false for nullptr).
 bool has_int4_linears(const quant::QuantIndex* quant);
-// The fraction of the block GEMMs' weight elements (their FLOPs) that are INT8 / INT4 (0 for nullptr): a mixed file's
-// share.
+// Some block linear of `quant` is NVFP4 (false for nullptr).
+bool has_nvfp4_linears(const quant::QuantIndex* quant);
+// The fraction of the block GEMMs' weight elements (their FLOPs) that are INT8 / INT4 / NVFP4 (0 for nullptr): a mixed
+// file's share. NVFP4 weights count their unpacked K (INT4's stored [N, K/2] count as stored).
 double int8_gemm_fraction(const quant::QuantIndex* quant);
 double int4_gemm_fraction(const quant::QuantIndex* quant);
+double nvfp4_gemm_fraction(const quant::QuantIndex* quant);
 // Runtime LoRA on a quantized DiT:
 //   check_lora_merges: std::invalid_argument when an adapter of `stack` that is merged at load (not a side branch:
-//     LoHa / LoKr / full deltas) targets a block linear stored INT4 in `quant` (merges need bf16 or INT8 ConvRot). For
-//     callers to refuse a stack before they load anything; the model's constructor refuses it too.
+//     LoHa / LoKr / full deltas) targets a block linear stored INT4 or NVFP4 in `quant` (merges need bf16 or INT8
+//     ConvRot). For callers to refuse a stack before they load anything; the model's constructor refuses it too.
 //   int4_side_branch_fraction: the share of the block GEMMs' weight elements that are INT4 and carry an active side
 //     branch of `sb` (those sites run the INT8 LoRA GEMMs, dit_block_quant.h: costed at INT8 speed).
 //   shadowed_by_time_embedding: one message per adapter of `stack` that set_time_embedding's replacement overrides
@@ -218,9 +233,10 @@ class MossDit {
   static std::size_t persistent_bytes(const weights::ModelIndex& index, const Residency& residency);
   // Stack bytes forward() adds to workspace_bytes() for streamed blocks (the device block buffers; 0 if none).
   static std::size_t stream_workspace_bytes(const weights::ModelIndex& index, const Residency& residency);
-  // The config a model loaded from `quant` (nullptr: the bf16 bundle) runs with attention mode `attention`.
+  // The config a model loaded from `quant` (nullptr: the bf16 bundle) runs with attention mode `attention`, and with the
+  // side branches active in `lora` (nullptr: none): what set_lora gives a forward.
   static ComputeConfig compute_config(const quant::QuantIndex* quant, AttentionMode attention,
-                                      Int4Route int4_route = Int4Route::kAuto);
+                                      Int4Route int4_route = Int4Route::kAuto, const lora::SideBranches* lora = nullptr);
   // The INT4 route of the following forwards (default kAuto); the forward stack follows compute_config().
   void set_int4_route(Int4Route route);
   Int4Route int4_route() const { return int4_route_; }
@@ -241,7 +257,8 @@ class MossDit {
           bool direct_io = false, const std::atomic<bool>* cancel = nullptr, const Residency& residency = {},
           const lora::LoraStack* merges = nullptr, const weights::HostFiles* host_files = nullptr);
   // P6: from a single-file DiT (quant::to_model_index): every block linear checked against the spec its GEMM runs
-  // (bf16, int8_convrot256 or int4_convrot256; std::runtime_error naming the linear otherwise). persistent_bytes /
+  // (bf16, int8_convrot256, int4_convrot256 or nvfp4; std::runtime_error naming the linear otherwise; NVFP4 linears
+  // where they cannot run: std::runtime_error with nvfp4_unsupported_reason()). persistent_bytes /
   // stream_workspace_bytes take quant.index. `quant` must outlive the model.
   MossDit(const quant::QuantIndex& quant, runtime::DeviceArena& arena, runtime::StreamSet& streams,
           bool direct_io = false, const std::atomic<bool>* cancel = nullptr, const Residency& residency = {},

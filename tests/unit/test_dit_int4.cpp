@@ -295,7 +295,7 @@ TEST(DitInt4Index, LoraOnInt4File) {
     md::check_lora_merges(loha, &qi);
     ADD_FAILURE() << "a merged adapter on an INT4 linear was accepted";
   } catch (const std::invalid_argument& e) {
-    EXPECT_NE(std::string(e.what()).find("INT4 linears take side-branch adapters only"), std::string::npos) << e.what();
+    EXPECT_NE(std::string(e.what()).find("INT4 and NVFP4 linears take side-branch adapters only"), std::string::npos) << e.what();
   }
   EXPECT_NO_THROW(md::check_lora_merges(loha, nullptr));  // a bf16 DiT merges it
   const mi::lora::LoraStack low = stack_of("low.safetensors", {{o + ".lora_down.weight", w, {4, kDim}, tl::randn(4 * kDim, 5, 0.02f)},

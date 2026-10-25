@@ -77,15 +77,16 @@ enum class DitSource {
   kHostPinned,  // a pinned host copy of the streamed blocks (host private memory: their full size)
 };
 // Precision of the DiT's block linears, from the loaded file (P6): bf16 (the bundle, or a bf16 single file), INT8
-// ConvRot (a file with any INT8 linear; mixed files that keep some linears bf16 count as int8) or INT4 ConvRot (a file
-// with any INT4 linear, the Turbo tier; its INT8 / bf16 linears are costed by fraction).
-enum class Precision { kBf16, kInt8, kInt4 };
+// ConvRot (a file with any INT8 linear; mixed files that keep some linears bf16 count as int8), INT4 ConvRot (a file
+// with any INT4 linear, the Turbo tier; its INT8 / bf16 linears are costed by fraction) or NVFP4 (a file with any NVFP4
+// linear, the Turbo tier on compute capability 12.0; its INT8 keep-list / bf16 linears are costed by fraction).
+enum class Precision { kBf16, kInt8, kInt4, kNvfp4 };
 // Attention kernel of the DiT blocks (moss_dit::AttentionMode, one per attention_q8 variant): exact FA2, or 8-bit
 // (SageAttention-style, lossy).
 enum class AttentionMode { kExact, kQ8Fp16, kQ8Fp16F32Acc, kQ8Fp8, kQ8Fp8F32Acc };
 // Quality tiers (plan §P6): kReference = bf16 weights, exact math; kHigh = INT8 ConvRot GEMMs and/or 8-bit attention;
-// kTurbo = INT4 ConvRot GEMMs (an INT4 DiT file) and 8-bit attention; kAuto = the fastest certified configuration of
-// the loaded model.
+// kTurbo = INT4 ConvRot or NVFP4 GEMMs (an INT4 or NVFP4 DiT file) and 8-bit attention; kAuto = the fastest certified
+// configuration of the loaded model.
 enum class Tier { kReference, kHigh, kTurbo, kAuto };
 enum class TeResidency {
   kStreamed,      // decoder layers stream from the weight files through `buffers` device layer buffers
@@ -97,7 +98,7 @@ enum class VaeDecodeKind { kUntiled, kTiled };
 const char* residency_name(DitResidency r);
 const char* residency_name(TeResidency r);
 const char* source_name(DitSource s);
-const char* precision_name(Precision p);        // "bf16", "int8", "int4"
+const char* precision_name(Precision p);        // "bf16", "int8", "int4", "nvfp4"
 // "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc" (the quality certificates' tokens).
 const char* attention_name(AttentionMode a);
 const char* tier_name(Tier t);                  // "reference", "high", "turbo", "auto"
@@ -113,14 +114,17 @@ bool is_q8(AttentionMode a);  // an 8-bit mode
 //   high       the lossy configuration of the loaded bf16 or INT8 DiT: its precision, 8-bit attention (q8_fp8 unless
 //              `attention` says otherwise; exact when the device lacks the 8-bit kernel and the DiT is INT8). Runs
 //              certified or not (an explicit choice). Refused for a bf16 DiT with exact attention (that is the
-//              Reference tier) and for an INT4 DiT (that is the Turbo tier).
-//   turbo      an INT4 DiT (refused for any other): INT4 GEMMs, 8-bit attention as for high. Runs certified or not
-//              (an explicit choice, reported uncertified without a certificate).
+//              Reference tier) and for an INT4 or NVFP4 DiT (that is the Turbo tier).
+//   turbo      an INT4 or NVFP4 DiT (refused for any other): its 4-bit GEMMs, 8-bit attention as for high. Runs
+//              certified or not (an explicit choice, reported uncertified without a certificate).
 //   auto       with `attention` given: that configuration. Otherwise each lossy configuration of the loaded DiT,
 //              fastest first (8-bit attention q8_fp8, q8_fp16, q8_fp8_f32acc, q8_fp16_f32acc, then exact for a
 //              quantized DiT), that this device runs: the first with a certificate. None: Reference for a bf16 DiT; an
 //              INT8 DiT runs INT8 GEMMs with exact attention, reported uncertified. Auto never runs an uncertified
-//              Turbo configuration: an INT4 DiT without a certificate is refused (choose tier turbo explicitly).
+//              Turbo configuration: an INT4 or NVFP4 DiT without a certificate is refused (choose tier turbo
+//              explicitly; user decision D2 for NVFP4).
+// An NVFP4 DiT where its GEMMs cannot run (nvfp4_native false: no FP4 tensor cores or no sm_120a kernels in the build)
+// is refused for every tier (user decision D1).
 // `certificate` is asked for lossy configurations only (Reference needs none).
 struct CertificateAnswer {
   bool found = false;
@@ -140,9 +144,10 @@ struct TierDecision {
 };
 // Throws std::invalid_argument (naming the conflict) for a refused combination.
 // te_quantized: the text encoder is an INT8 / W4A8 file, a lossy dimension as an INT8 DiT is (reference refused; the
-// exact-attention configuration is a High-tier one).
+// exact-attention configuration is a High-tier one). nvfp4_native: the NVFP4 GEMMs run here (Capabilities::nvfp4_native).
 TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention, Precision dit_precision,
-                          const CertificateLookup& certificate, const AttentionSupported& supported, bool te_quantized = false);
+                          const CertificateLookup& certificate, const AttentionSupported& supported, bool te_quantized = false,
+                          bool nvfp4_native = false);
 
 // Machine throughput the cost model uses. Defaults are conservative for a desktop PC; the pipeline replaces the
 // transfer rates with measured ones (pipeline.h: a probe at first use, cached on disk with the embedding cache, then
@@ -191,6 +196,9 @@ struct ModelShapes {
   double dit_int8_fraction = 1.0;  // kInt8: the INT8 share of the block GEMM FLOPs (< 1 for a mixed file)
   // kInt4: the INT4 share (the INT8 share is then dit_int8_fraction, capped at the rest; the remainder is bf16).
   double dit_int4_fraction = 1.0;
+  // kNvfp4: the NVFP4 share (the INT8 keep-list share is then dit_int8_fraction, capped at the rest; the remainder is
+  // bf16). dit_params counts an NVFP4 weight's unpacked elements (shapes_from_index).
+  double dit_nvfp4_fraction = 1.0;
   // VAE decoder; the pipeline replaces it with Flux2VaeDecoder::persistent_bytes().
   std::size_t vae_bytes = 0;
 };
@@ -280,6 +288,10 @@ struct Capabilities {
   // The GPU runs INT4 tensor-core MMA natively (moss_dit::int4_mma_native: compute capability 8.x). Without it the INT4
   // linears run the INT8 GEMMs on unpacked operands, and are costed at that speed.
   bool int4_mma_native = true;
+  // The NVFP4 GEMMs run here (kernels::nvfp4::available(): compute capability 12.0 and the sm_120a kernels built): they
+  // are costed at their measured rate. Without them an NVFP4 DiT is refused (resolve_tier); a plan made anyway costs
+  // them at the INT8 rate, never faster than measured.
+  bool nvfp4_native = false;
 };
 
 struct Budgets {

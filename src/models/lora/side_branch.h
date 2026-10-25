@@ -118,4 +118,16 @@ void compute_t(const SiteBranch& site, const Tensor& x, const Tensor& t, void* w
 // The LoRA operand of the fused GEMMs for this site and its t (as written by compute_t).
 kernels::lora::LoraSlices lora_slices(const SiteBranch& site, const Tensor& t);
 
+// The LoRA term of the NVFP4 GEMMs (kernels/nvfp4 E1L / E2L, which add a stored Δ in their epilogue): Δ = t · B_sᵀ for
+// every slice of the site, one cuBLASLt GEMM per slice (bf16 in, fp32 accumulation, rounded to bf16 once), into delta
+// (CUDA bf16 [m, site.n] rows, 16-byte aligned, row stride a multiple of 8); the columns no slice covers are zeroed.
+// A slice with two t ranges gathers them into scratch first. natural_order (the ffn_up_gate site): Δ's columns in the
+// stored [hidden | gate] order of the weight instead of the SiTU GEMMs' permuted order B is kept in (B's rows are
+// reordered in scratch: row up_gate_gemm_row(c, F) <- row c). scratch: delta_scratch_bytes(m, site.rank, site.n),
+// 256-byte aligned. Launches only on `stream` (copies, memsets and GEMMs; no allocation, no synchronization).
+std::size_t delta_scratch_bytes(std::int64_t m, std::int64_t rank, std::int64_t n);
+void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta, bool natural_order, void* scratch,
+                   std::size_t scratch_bytes, kernels::Gemm& gemm, void* gemm_ws, std::size_t gemm_ws_bytes,
+                   cudaStream_t stream);
+
 }  // namespace mi::lora

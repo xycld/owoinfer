@@ -722,6 +722,7 @@ TEST(CApi, GenerationFromAPipelineResult) {
     EXPECT_EQ(mi::api::to_precision(p), want);
   }
   EXPECT_EQ(mi::api::to_precision(mi::planner::Precision::kInt4), MI_PRECISION_W4A4);
+  EXPECT_EQ(mi::api::to_precision(mi::planner::Precision::kNvfp4), MI_PRECISION_NVFP4);
   EXPECT_EQ(mi::api::to_precision(mi::planner::Precision::kInt8), MI_PRECISION_INT8);
   // Reference needs no certificate: certified, also in the default decision of a generation cancelled before its tier
   // was resolved.

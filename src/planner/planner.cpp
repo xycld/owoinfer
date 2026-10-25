@@ -50,6 +50,12 @@ constexpr double kInt4GemmSpeedup = 4.0;
 // INT8 + exact 0.224 s vs INT4 via INT8 0.229 s, INT4 on ptxas's emulated INT4 MMA 1.029 s; RTX 4090 Laptop INT8
 // 0.654 s vs INT4 via INT8 0.668 s).
 constexpr double kInt4ViaInt8Speedup = 2.6;
+// NVFP4 GEMMs (sm_120a, quantizers included) relative to the INT8 ConvRot ones; NVFP4 runs on compute capability 12.0
+// only. Measured at the block level (GpuDitNvfp4Speed.BlockRateAndStep1024, RTX 5090, 2026-10-25): a 1024^2 CFG block
+// (8484 rows) of our converter's NVFP4 SFT file 3.98 ms against Comfy-Org's INT8 block 5.21 ms, each less its 2.19 ms
+// GEMM-free part (QK-norm + RoPE, exact attention): 1.68. It includes the unfused SiTU-GLU (the ffn_down quantizer
+// reads the [L, 2F] up_gate output).
+constexpr double kNvfp4SpeedVsInt8 = 1.68;
 constexpr double kQ8Fp8AttentionSpeedup = 1.9;
 constexpr double kQ8Fp16AttentionSpeedup = 1.5;
 constexpr double kQ8F32AccAttentionSpeedup = 1.3;
@@ -235,11 +241,13 @@ class Planner {
       // GEMMs: 2 FLOPs per weight per token (bf16: 2 bytes per weight); attention: QK^T and PV, 2 * L^2 * dim each,
       // per block. P6 paths in bf16-equivalent FLOPs: divided by their measured speedup.
       const double f4 = s_.dit_precision == Precision::kInt4 ? std::clamp(s_.dit_int4_fraction, 0.0, 1.0) : 0.0;
-      const double f8 = std::clamp(s_.dit_int8_fraction, 0.0, 1.0 - f4);
+      const double fn = s_.dit_precision == Precision::kNvfp4 ? std::clamp(s_.dit_nvfp4_fraction, 0.0, 1.0) : 0.0;
+      const double f8 = std::clamp(s_.dit_int8_fraction, 0.0, 1.0 - f4 - fn);
       const double gemm = s_.dit_precision != Precision::kBf16
                               ? 2.0 * static_cast<double>(s_.dit_params) * l *
-                                    ((1.0 - f8 - f4) + f8 / kInt8GemmSpeedup +
-                                     f4 / (in_.caps.int4_mma_native ? kInt4GemmSpeedup : kInt4ViaInt8Speedup))
+                                    ((1.0 - f8 - f4 - fn) + f8 / kInt8GemmSpeedup +
+                                     f4 / (in_.caps.int4_mma_native ? kInt4GemmSpeedup : kInt4ViaInt8Speedup) +
+                                     fn / (kInt8GemmSpeedup * (in_.caps.nvfp4_native ? kNvfp4SpeedVsInt8 : 1.0)))
                               : static_cast<double>(s_.dit_bytes) * l;
       const double attention = 4.0 * l * l * dim * s_.dit_blocks;
       const double attention_speedup = in_.attention == AttentionMode::kExact    ? 1.0
@@ -463,8 +471,9 @@ class Planner {
   std::string precision_text() const {
     std::string t = s_.dit_precision == Precision::kInt4
                         ? (in_.caps.int4_mma_native ? "INT4 ConvRot" : "INT4 ConvRot (on the INT8 GEMMs: no INT4 MMA on this GPU)")
-                    : s_.dit_precision == Precision::kInt8 ? "INT8 ConvRot"
-                                                           : "bf16";
+                    : s_.dit_precision == Precision::kNvfp4 ? "NVFP4"
+                    : s_.dit_precision == Precision::kInt8  ? "INT8 ConvRot"
+                                                            : "bf16";
     return is_q8(in_.attention) ? t + " + 8-bit attention (" + attention_name(in_.attention) + ")" : t;
   }
 
@@ -730,6 +739,12 @@ void dit_shapes(const weights::ModelIndex& index, ModelShapes& s) {
     const std::size_t bytes = static_cast<std::size_t>(g->total_bytes);
     s.dit_bytes += bytes;
     s.dit_params += static_cast<std::size_t>(g->total_params);
+    // An NVFP4 linear (U8 weight [N, K/2] and U8 block scales; no other DiT tensor is U8): N * K parameters.
+    for (const weights::IndexedTensor& t : g->tensors) {
+      if (t.dtype != weights::DType::kU8) continue;
+      if (t.name.ends_with(".weight")) s.dit_params += static_cast<std::size_t>(t.numel());
+      if (t.name.ends_with(".weight_scale")) s.dit_params -= static_cast<std::size_t>(t.numel());
+    }
     if (g->name.rfind("block.", 0) == 0) {
       ++s.dit_blocks;
       s.dit_block_bytes = std::max(s.dit_block_bytes, bytes);
@@ -797,6 +812,7 @@ const char* precision_name(Precision p) {
     case Precision::kBf16: return "bf16";
     case Precision::kInt8: return "int8";
     case Precision::kInt4: return "int4";
+    case Precision::kNvfp4: return "nvfp4";
   }
   return "?";
 }
@@ -848,22 +864,33 @@ AttentionMode parse_attention(std::string_view name) {
 }
 
 TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention, Precision precision,
-                          const CertificateLookup& certificate, const AttentionSupported& supported, bool te_quantized) {
+                          const CertificateLookup& certificate, const AttentionSupported& supported, bool te_quantized,
+                          bool nvfp4_native) {
   TierDecision d;
   d.requested = requested;
   d.precision = precision;
   // Lossy weights fix the configuration's precision: a quantized DiT or text encoder is never the Reference tier, and
-  // an INT4 DiT is always the Turbo tier.
-  const bool int4 = precision == Precision::kInt4;
+  // an INT4 or NVFP4 DiT is always the Turbo tier.
+  const bool nvfp4 = precision == Precision::kNvfp4;
+  const bool int4 = precision == Precision::kInt4 || nvfp4;  // the Turbo tier's 4-bit GEMMs
   const bool int8 = precision != Precision::kBf16 || te_quantized;
-  const std::string weights = std::string(int4 ? "INT4 ConvRot GEMMs" : precision == Precision::kInt8 ? "INT8 ConvRot GEMMs" : "bf16 GEMMs") +
+  const char* const dit = nvfp4 ? "NVFP4" : "INT4 ConvRot";
+  const std::string weights = std::string(nvfp4                               ? "NVFP4 GEMMs"
+                                          : precision == Precision::kInt4 ? "INT4 ConvRot GEMMs"
+                                          : precision == Precision::kInt8 ? "INT8 ConvRot GEMMs"
+                                                                          : "bf16 GEMMs") +
                               (te_quantized ? ", quantized text encoder" : "");
+  if (nvfp4 && !nvfp4_native) {
+    throw std::invalid_argument("the loaded DiT is NVFP4, which needs an RTX 50 GPU (compute capability 12.0) and a build "
+                                "with the sm_120a NVFP4 kernels; use the INT8 file");
+  }
   if (requested == Tier::kTurbo && !int4) {
-    throw std::invalid_argument(std::string("tier turbo runs an INT4 ConvRot DiT (a convrot_w4a4 file loaded as the DiT), "
-                                            "but the loaded DiT is ") + precision_name(precision) + "; use reference, high or auto");
+    throw std::invalid_argument(std::string("tier turbo runs an INT4 ConvRot DiT (a convrot_w4a4 file) or an NVFP4 DiT "
+                                            "loaded as the DiT, but the loaded DiT is ") +
+                                precision_name(precision) + "; use reference, high or auto");
   }
   if (requested == Tier::kHigh && int4) {
-    throw std::invalid_argument("the loaded DiT is INT4 ConvRot, which runs the Turbo tier; use tier turbo");
+    throw std::invalid_argument(std::string("the loaded DiT is ") + dit + ", which runs the Turbo tier; use tier turbo");
   }
   if (attention && is_q8(*attention) && supported && !supported(*attention)) {
     throw std::invalid_argument(std::string("attention ") + attention_name(*attention) +
@@ -925,8 +952,9 @@ TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention
   }
   // Auto never runs an uncertified Turbo configuration.
   const auto turbo_refused = [&](const std::string& reasons) {
-    return std::invalid_argument("the loaded DiT is INT4 ConvRot (the Turbo tier) and no certificate covers it (" + reasons +
-                                 "): auto only selects a certified Turbo configuration; choose tier turbo to run it uncertified");
+    return std::invalid_argument(std::string("the loaded DiT is ") + dit + " (the Turbo tier) and no certificate covers it (" +
+                                 reasons + "): auto only selects a certified Turbo configuration; choose tier turbo to run it "
+                                 "uncertified");
   };
   if (attention) {
     if (int4) {

@@ -343,4 +343,75 @@ kernels::lora::LoraSlices lora_slices(const SiteBranch& site, const Tensor& t) {
   return l;
 }
 
+std::size_t delta_scratch_bytes(std::int64_t m, std::int64_t rank, std::int64_t n) {
+  if (m < 0 || rank < 0 || n < 0) fail("delta_scratch_bytes: negative size");
+  return align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(rank) * 2) +
+         align_up(static_cast<std::size_t>(n) * static_cast<std::size_t>(rank) * 2);
+}
+
+void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta, bool natural_order, void* scratch,
+                   std::size_t scratch_bytes, kernels::Gemm& gemm, void* gemm_ws, std::size_t gemm_ws_bytes,
+                   cudaStream_t stream) {
+  const std::int64_t m = t.rank == 2 ? t.dim(0) : -1, r = site.rank, n = site.n;
+  if (t.device != Device::kCUDA || t.dtype != DType::kBF16 || m < 0 || t.dim(1) != r || t.stride[1] != 1) {
+    fail("compute_delta: t must be CUDA bf16 [m, " + std::to_string(r) + "] rows, got " + t.describe());
+  }
+  if (delta.device != Device::kCUDA || delta.dtype != DType::kBF16 || delta.rank != 2 || delta.dim(0) != m ||
+      delta.dim(1) != n || delta.stride[1] != 1 || delta.stride[0] < n || delta.stride[0] % 8 != 0 ||
+      reinterpret_cast<std::uintptr_t>(delta.data) % 16 != 0) {
+    fail("compute_delta: delta must be CUDA bf16 [" + std::to_string(m) + ", " + std::to_string(n) +
+         "] rows (16-byte aligned, stride a multiple of 8), got " + delta.describe());
+  }
+  if (scratch_bytes < delta_scratch_bytes(m, r, n) || reinterpret_cast<std::uintptr_t>(scratch) % kAlign != 0) {
+    fail("compute_delta: scratch too small or not 256-byte aligned");
+  }
+  if (m == 0) return;
+  constexpr std::size_t kE = sizeof(std::uint16_t);
+  auto* const out = static_cast<std::byte*>(delta.data);
+  const std::size_t pitch = static_cast<std::size_t>(delta.stride[0]) * kE;
+  const auto zero = [&](std::int64_t c0, std::int64_t c1) {
+    if (c1 > c0) {
+      MI_CUDA_CHECK(cudaMemset2DAsync(out + c0 * kE, pitch, 0, static_cast<std::size_t>(c1 - c0) * kE,
+                                      static_cast<std::size_t>(m), stream));
+    }
+  };
+  auto* const tcat = static_cast<std::byte*>(scratch);
+  auto* const bnat = tcat + align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(r) * kE);
+  const auto* const tp = static_cast<const std::byte*>(t.data);
+  const std::size_t tpitch = static_cast<std::size_t>(t.stride[0]) * kE;
+  std::int64_t covered = 0;
+  for (const SiteBranch::Slice& s : site.slices) {
+    zero(covered, s.row0);
+    covered = s.row0 + s.rows;
+    const std::int64_t c = s.cols + s.colsb;
+    Tensor x = Tensor::view(const_cast<std::byte*>(tp) + s.col0 * kE, DType::kBF16, Device::kCUDA, {m, s.cols});
+    x.stride[0] = t.stride[0];
+    if (s.colsb > 0) {
+      const std::size_t cp = static_cast<std::size_t>(c) * kE;
+      MI_CUDA_CHECK(cudaMemcpy2DAsync(tcat, cp, tp + s.col0 * kE, tpitch, static_cast<std::size_t>(s.cols) * kE,
+                                      static_cast<std::size_t>(m), cudaMemcpyDeviceToDevice, stream));
+      MI_CUDA_CHECK(cudaMemcpy2DAsync(tcat + s.cols * kE, cp, tp + s.col0b * kE, tpitch,
+                                      static_cast<std::size_t>(s.colsb) * kE, static_cast<std::size_t>(m),
+                                      cudaMemcpyDeviceToDevice, stream));
+      x = Tensor::view(tcat, DType::kBF16, Device::kCUDA, {m, c});
+    }
+    Tensor b = s.b;
+    if (natural_order) {
+      // GEMM column 8j + 4h + i (h: 0 hidden, 1 gate; i < 4) is weight row h * F + 4j + i (up_gate_gemm_row).
+      if (s.row0 != 0 || s.rows != n || n % 8 != 0) fail("compute_delta: natural_order needs one slice over all columns");
+      const std::size_t group = 4 * static_cast<std::size_t>(c) * kE, half = static_cast<std::size_t>(n / 2) * c * kE;
+      const auto* const bp = static_cast<const std::byte*>(s.b.data);
+      for (int h = 0; h < 2; ++h) {
+        MI_CUDA_CHECK(cudaMemcpy2DAsync(bnat + h * half, group, bp + h * group, 2 * group, group,
+                                        static_cast<std::size_t>(n / 8), cudaMemcpyDeviceToDevice, stream));
+      }
+      b = Tensor::view(bnat, DType::kBF16, Device::kCUDA, {n, c});
+    }
+    Tensor o = Tensor::view(out + s.row0 * kE, DType::kBF16, Device::kCUDA, {m, s.rows});
+    o.stride[0] = delta.stride[0];
+    gemm.linear(o, x, b, nullptr, gemm_ws, gemm_ws_bytes, stream);
+  }
+  zero(covered, n);
+}
+
 }  // namespace mi::lora

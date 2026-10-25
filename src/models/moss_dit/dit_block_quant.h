@@ -1,6 +1,6 @@
 // One MOSS DiT block (_Block.forward, P:136-148) on the quantized compute path (P6 steps 36 and 40): each linear as
-// the loaded file stores it, INT8 ConvRot (G = 256, High tier), INT4 ConvRot (G = 256, Turbo tier) or bf16, plus a
-// choice of attention kernel.
+// the loaded file stores it, INT8 ConvRot (G = 256, High tier), INT4 ConvRot (G = 256, Turbo tier), NVFP4 (Turbo tier
+// on compute capability 12.0) or bf16, plus a choice of attention kernel.
 //   INT8 linear: its input is rotated and quantized per token where it is produced, then an INT8 x INT8 -> INT32
 //   GEMM with the dequantization and the following elementwise op in its epilogue (kernels/quant):
 //     qkv:      rms_norm_modulate_rotate_quantize(x, norm1, scale_a, shift_a) -> int8_gemm
@@ -11,6 +11,19 @@
 //   INT4 x INT4 -> INT32 GEMM): rms_norm_modulate_convrot_quantize_int4 -> int4_gemm / int4_gemm_situ_glu,
 //   convrot_quantize_int4 -> int4_gemm_gated_residual. Numerics: comfy-kitchen's convrot_w4a4_linear (eager
 //   activation quantization, CUDA epilogue order; see kernels/quant4/quant4.h).
+//   NVFP4 linear (kernels/nvfp4, NVFP4 plan §4.6): its input is quantized per token (E2M1 codes, UE4M3 scales per 16,
+//   an f32 scale per token) where it is produced, then the sm_120a block-scaled GEMM with the dequantization and the
+//   following op in its epilogue:
+//     qkv:      rms_norm_modulate_quantize_nvfp4(x, norm1, scale_a, shift_a) -> nvfp4_gemm (E1)
+//     o:        quantize_nvfp4(attn)                                         -> nvfp4_gemm_gated_residual (E2, gate_a)
+//     up_gate:  rms_norm_modulate_quantize_nvfp4(x, norm2, scale_f, shift_f) -> nvfp4_gemm (E1: the [L, 2F] output)
+//     down:     situ_glu_quantize_nvfp4(up_gate output)                      -> nvfp4_gemm_gated_residual (E2, gate_f)
+//   There is no SiTU epilogue yet: the ffn_down quantizer applies SiTU-GLU as it reads the up_gate output. When
+//   ffn_down is not NVFP4 (a keep-list unit) or carries a side branch, kernels::situ_glu materializes the bf16 ffn
+//   first (bit-identical: the fused quantizers equal their unfused kernels bit for bit).
+//   Runtime LoRA on an NVFP4 site: Δ = Σ s_i B_i (A_i x) is stored in bf16 (lora::compute_delta, one cuBLASLt GEMM per
+//   slice) and the E1L / E2L epilogue adds it in fp32 before the bias, gate and SiTU input. Unlike the INT8 / bf16
+//   LoRA GEMMs, Δ is rounded to bf16 once before the add.
 //   bf16 linear: exactly what run_block_fused does for it (cuBLASLt QKV; o / up_gate / down fused or op by op as the
 //   route says), so a file that keeps some linears bf16 runs them as the Reference tier does.
 //   QK-norm + RoPE: the fused kernel (kernels/fused/qk_norm_rope.h), as the bf16 block.
@@ -76,6 +89,17 @@ struct QuantBlockBuffers {
   bool int4_via_int8 = false;
   void* int4_unpack = nullptr;
   std::size_t int4_unpack_bytes = 0;
+  // NVFP4 linears: the swizzled block scales of the GEMM input being quantized (nvfp4_sf_bytes(L), 16-byte aligned).
+  // The codes go where the INT8 input of the same site goes (the attention output's columns or y), the per-token
+  // scales to the start of `scale`.
+  void* nvfp4_sf = nullptr;
+  std::size_t nvfp4_sf_bytes = 0;
+  // Runtime LoRA on NVFP4 sites: Δ, bf16 [>= L * n elements] (the E1L / E2L term) and lora::compute_delta's scratch
+  // (lora::delta_scratch_bytes(L, lora->max_rank(), n)), n the widest NVFP4 site of the block with a side branch (qkv
+  // 3 kDim, o and down kDim, ffn_up_gate 2 kFfnDim; ComputeConfig::nvfp4_delta_cols over the model).
+  Tensor nvfp4_delta;
+  void* nvfp4_scratch = nullptr;
+  std::size_t nvfp4_scratch_bytes = 0;
 };
 
 // Whether INT4 tensor-core MMA (mma.sync .s4, the kernels/quant4 GEMMs) runs natively: compute capability 8.x (Ampere,
@@ -89,15 +113,21 @@ inline constexpr std::size_t kInt4UnpackBytes = std::size_t{2} * 8192 * 3072;
 
 // Big-buffer elements per token for the quantized block over rows of `hw + text_lengths[r]` tokens: kFusedBigCols,
 // unless some block runs ffn_up_gate bf16 (`bf16_up_gate`) and the route gives a run of these rows the op-by-op
-// [up_gate | ffn] layout (then fused_big_cols' kOpByOpBigCols). The INT8 ffn_down input ([L, kFfnDim] int8; INT4:
-// packed [L, kFfnDim / 2]) lives in the part of `big` the FFN does not use.
+// [up_gate | ffn] layout (then fused_big_cols' kOpByOpBigCols), and at least `nvfp4_cols` (nvfp4_big_cols). The INT8
+// ffn_down input ([L, kFfnDim] int8; INT4: packed [L, kFfnDim / 2]) lives in the part of `big` the FFN does not use.
 std::int64_t quant_big_cols(std::int64_t hw, std::span<const std::int64_t> text_lengths, bool bf16_up_gate,
-                            const FusedRouteSnapshot& route);
+                            const FusedRouteSnapshot& route, std::int64_t nvfp4_cols = 0);
+// Big-buffer elements per token NVFP4 ffn_up_gate linears need (0 for none, `nvfp4_up_gate` false): their [L, 2F]
+// output, plus the region after it ([up_gate | ffn], kOpByOpBigCols) when some block uses it (`bf16_ffn`): the bf16
+// ffn of an ffn_down that is not NVFP4 or has a side branch, or the input codes of an ffn_up_gate with a side branch.
+std::int64_t nvfp4_big_cols(bool nvfp4_up_gate, bool bf16_ffn);
+// Bytes of QuantBlockBuffers::nvfp4_sf for L tokens: the swizzled scales of the widest input, [L, kFfnDim].
+std::size_t nvfp4_sf_bytes(std::int64_t l);
 
 // attention_q8 workspace bytes enough for any run of any subset of these rows (0 for kExact).
 std::size_t q8_attention_workspace_bytes(std::int64_t hw, std::span<const std::int64_t> text_lengths, AttentionMode mode);
 
-// The block on run `run` of `a` with weights `w` (any mix of bf16, INT8 and INT4 linears, dit_weights.h), bf16 pairs routed
+// The block on run `run` of `a` with weights `w` (any mix of bf16, INT8, INT4 and NVFP4 linears, dit_weights.h), bf16 pairs routed
 // by `route` as run_block_fused does. Operands 256-byte aligned (arena allocations, kArenaAlign weights). Buffers that
 // do not match (big smaller than quant_big_cols per token, no scale buffer, a q8 workspace too small for the run) are a
 // programming error: std::invalid_argument before any launch.
@@ -105,7 +135,9 @@ std::size_t q8_attention_workspace_bytes(std::int64_t hw, std::span<const std::i
 // kernels/lora (bf16 or INT8 base, whatever the route says), its t computed from the site's bf16 input; for an INT8
 // qkv / ffn_up_gate site that input (the norm output) is materialized and rotated separately, bit-identical to the
 // fused norm + rotate kernel. A block whose q/k/v differ in precision takes no qkv side branch (std::invalid_argument).
-// An active site on an INT4 linear needs the int4_unpack buffer (std::invalid_argument otherwise).
+// An active site on an INT4 linear needs the int4_unpack buffer, NVFP4 linears the nvfp4_sf buffer and an active site
+// on one the nvfp4_delta and nvfp4_scratch buffers (std::invalid_argument otherwise). The NVFP4 GEMMs need
+// kernels::nvfp4::available() (std::logic_error from the first one otherwise).
 void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& a, const BlockRun& run, const QkvGemm& qkv_gemm,
                      const FusedRouteSnapshot& route, AttentionMode attention, cudaStream_t stream, int block = 0);
 

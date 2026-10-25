@@ -18,6 +18,7 @@
 #include "kernels/basic/norm.h"
 #include "kernels/basic/rope.h"
 #include "models/moss_dit/dit_kernels.h"
+#include "models/moss_dit/nvfp4_support.h"
 #include "runtime/pinned_ring.h"
 #include "weights/upload.h"
 
@@ -195,8 +196,15 @@ bool has_int4_linears(const quant::QuantIndex* quant) {
   });
 }
 
+bool has_nvfp4_linears(const quant::QuantIndex* quant) {
+  if (quant == nullptr) return false;
+  return std::any_of(quant->specs.begin(), quant->specs.end(), [](const auto& kv) {
+    return kv.first.rfind("layers.", 0) == 0 && kv.second.format == quant::QuantFormat::kNvfp4;
+  });
+}
+
 namespace {
-// The share of the block GEMMs' weight elements whose spec has format `f`.
+// The share of the block GEMMs' weight elements whose spec has format `f` (NVFP4 weights [N, K/2] count N * K).
 double gemm_fraction(const quant::QuantIndex* quant, quant::QuantFormat f) {
   if (quant == nullptr) return 0.0;
   double part = 0, all = 0;
@@ -205,7 +213,8 @@ double gemm_fraction(const quant::QuantIndex* quant, quant::QuantFormat f) {
       if (t.name.rfind("layers.", 0) != 0 || !t.name.ends_with(".weight") || t.shape.size() != 2) continue;
       const quant::QuantSpec* spec = quant->find_spec(std::string_view(t.name).substr(0, t.name.size() - 7));
       if (spec == nullptr) continue;
-      const double elems = static_cast<double>(t.shape[0]) * static_cast<double>(t.shape[1]);
+      const double elems = static_cast<double>(t.shape[0]) * static_cast<double>(t.shape[1]) *
+                           (spec->format == quant::QuantFormat::kNvfp4 ? 2.0 : 1.0);
       all += elems;
       if (spec->format == f) part += elems;
     }
@@ -216,22 +225,33 @@ double gemm_fraction(const quant::QuantIndex* quant, quant::QuantFormat f) {
 
 double int8_gemm_fraction(const quant::QuantIndex* quant) { return gemm_fraction(quant, quant::QuantFormat::kInt8ConvRot); }
 double int4_gemm_fraction(const quant::QuantIndex* quant) { return gemm_fraction(quant, quant::QuantFormat::kInt4ConvRot); }
+double nvfp4_gemm_fraction(const quant::QuantIndex* quant) { return gemm_fraction(quant, quant::QuantFormat::kNvfp4); }
 
 namespace {
-// The merge refusal for INT4 linears (load time and check_lora_merges).
-std::string int4_merge_message(const std::string& module) {
+// The merge refusal for the 4-bit (INT4 and NVFP4) linears (load time and check_lora_merges).
+std::string packed4_merge_message(const std::string& module) {
   return "mi::moss_dit: cannot merge a LoRA into '" + module +
-         "' (merges need a bf16 or INT8 ConvRot linear; INT4 linears take side-branch adapters only)";
+         "' (merges need a bf16 or INT8 ConvRot linear; INT4 and NVFP4 linears take side-branch adapters only)";
 }
 bool is_int4(const quant::QuantIndex* quant, const std::string& module) {
   const quant::QuantSpec* spec = quant != nullptr ? quant->find_spec(module) : nullptr;
   return spec != nullptr && spec->format == quant::QuantFormat::kInt4ConvRot;
 }
+bool is_nvfp4(const quant::QuantIndex* quant, const std::string& module) {
+  const quant::QuantSpec* spec = quant != nullptr ? quant->find_spec(module) : nullptr;
+  return spec != nullptr && spec->format == quant::QuantFormat::kNvfp4;
+}
+// A 4-bit linear (INT4 or NVFP4): side branches only, no merges.
+bool is_packed4(const quant::QuantIndex* quant, const std::string& module) {
+  return is_int4(quant, module) || is_nvfp4(quant, module);
+}
 }  // namespace
 
 void check_lora_merges(const lora::LoraStack& stack, const quant::QuantIndex* quant) {
   for (const lora::Adapter& a : stack.adapters()) {
-    if (!a.side_branch && is_int4(quant, a.module)) throw std::invalid_argument(int4_merge_message(a.module));
+    if (!a.side_branch && is_packed4(quant, a.module)) {
+      throw std::invalid_argument(packed4_merge_message(a.module));
+    }
   }
 }
 
@@ -270,16 +290,40 @@ std::vector<std::string> shadowed_by_time_embedding(const lora::LoraStack& stack
   return out;
 }
 
-ComputeConfig MossDit::compute_config(const quant::QuantIndex* quant, AttentionMode attention, Int4Route int4_route) {
+ComputeConfig MossDit::compute_config(const quant::QuantIndex* quant, AttentionMode attention, Int4Route int4_route,
+                                      const lora::SideBranches* lora) {
   ComputeConfig c;
   c.attention = attention;
   c.quantized = has_quantized_linears(quant) || attention != AttentionMode::kExact;
   c.int4 = has_int4_linears(quant);
   c.int4_via_int8 = c.int4 && (int4_route == Int4Route::kViaInt8 || (int4_route == Int4Route::kAuto && !int4_mma_native()));
   c.bf16_up_gate = quant == nullptr;
+  c.nvfp4 = has_nvfp4_linears(quant);
   if (quant != nullptr) {
     for (const auto& [module, spec] : quant->specs) {
-      if (module.rfind("layers.", 0) == 0 && module.ends_with(".proj.ffn_up_gate") && !spec.quantized()) c.bf16_up_gate = true;
+      if (module.rfind("layers.", 0) != 0 || !module.ends_with(".proj.ffn_up_gate")) continue;
+      if (!spec.quantized()) c.bf16_up_gate = true;
+      if (spec.format == quant::QuantFormat::kNvfp4) {
+        c.nvfp4_up_gate = true;
+        const std::string down = module.substr(0, module.size() - 11) + "ffn_down";
+        if (!is_nvfp4(quant, down)) c.nvfp4_ffn = true;
+      }
+    }
+  }
+  if (lora != nullptr && lora->any_active()) {
+    c.quantized = true;  // the side branches run on the quantized block path
+    c.lora_rank = lora->max_rank();
+    for (int b = 0; quant != nullptr && b < kLayers; ++b) {
+      const std::string p = "layers." + std::to_string(b) + ".proj.";
+      const bool up = lora->site(b, lora::Site::kUpGate) != nullptr, down = lora->site(b, lora::Site::kDown) != nullptr;
+      const auto widen = [&](lora::Site s, const char* module, std::int64_t n) {
+        if (lora->site(b, s) != nullptr && is_nvfp4(quant, p + module)) c.nvfp4_delta_cols = std::max(c.nvfp4_delta_cols, n);
+      };
+      widen(lora::Site::kQkv, "q", 3 * kDim);  // a QKV side branch needs q, k and v fused (set_lora)
+      widen(lora::Site::kO, "o", kDim);
+      widen(lora::Site::kUpGate, "ffn_up_gate", 2 * kFfnDim);
+      widen(lora::Site::kDown, "ffn_down", kDim);
+      if ((up || down) && is_nvfp4(quant, p + "ffn_up_gate")) c.nvfp4_lora_ffn = true;
     }
   }
   return c;
@@ -393,7 +437,7 @@ MossDit::MergeTarget MossDit::merge_target(const TensorMap& m, const std::string
   } else {
     t.scale = m.at(module + ".weight_scale");
     const quant::QuantSpec* spec = quant_ != nullptr ? quant_->find_spec(module) : nullptr;
-    if (spec == nullptr || spec->format != quant::QuantFormat::kInt8ConvRot) throw std::runtime_error(int4_merge_message(module));
+    if (spec == nullptr || spec->format != quant::QuantFormat::kInt8ConvRot) throw std::runtime_error(packed4_merge_message(module));
     t.group = spec->group;
   }
   return t;
@@ -554,14 +598,10 @@ void MossDit::set_lora(const lora::SideBranches* side_branches) {
   if (side_branches != nullptr) {
     for (int b = 0; b < kLayers; ++b) {
       if (side_branches->site(b, lora::Site::kQkv) == nullptr) continue;
-      if (quant_ != nullptr) {
-        const std::string p = "layers." + std::to_string(b) + ".proj.";
-        const quant::QuantSpec &q = *quant_->find_spec(p + "q"), &k = *quant_->find_spec(p + "k"),
-                               &v = *quant_->find_spec(p + "v");
-        if (q != k || k != v) {
-          throw std::invalid_argument("mi::moss_dit: a LoRA on the QKV of block " + std::to_string(b) +
-                                      ", whose q, k and v differ in precision, is not supported");
-        }
+      if (!detail::qkv_fused(b, quant_)) {
+        throw std::invalid_argument("mi::moss_dit: a LoRA on the QKV of block " + std::to_string(b) +
+                                    ", whose q, k and v differ in precision (or are NVFP4 parts with different tensor scales), is "
+                                    "not supported");
       }
     }
   }
@@ -574,18 +614,15 @@ void MossDit::set_int4_route(Int4Route route) {
   refresh_config(config_.attention);
 }
 
-void MossDit::refresh_config(AttentionMode attention) {
-  config_ = compute_config(quant_, attention, int4_route_);
-  if (lora_ != nullptr && lora_->any_active()) {
-    config_.quantized = true;
-    config_.lora_rank = lora_->max_rank();
-  }
-}
+void MossDit::refresh_config(AttentionMode attention) { config_ = compute_config(quant_, attention, int4_route_, lora_); }
 
 MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quant, runtime::DeviceArena& arena,
                  runtime::StreamSet& streams, bool direct_io, const std::atomic<bool>* cancel, const Residency& residency,
                  const lora::LoraStack* merges, const weights::HostFiles* host_files)
     : arena_(arena), quant_(quant), config_(compute_config(quant, AttentionMode::kExact)), cancel_(cancel) {
+  if (config_.nvfp4) {
+    if (const std::string why = nvfp4_unsupported_reason(); !why.empty()) throw std::runtime_error("mi::moss_dit: " + why);
+  }
   const auto t0 = std::chrono::steady_clock::now();
   gemm_workspace_ = arena.alloc_persistent(kernels::Gemm::kWorkspaceBytes);
   weights::ReaderCache readers(index, direct_io, host_files);
@@ -848,6 +885,13 @@ void MossDit::time_modulation(float timestep, const Tensor& mod, const Tensor& h
   linear(Tensor::view(head.data, DType::kBF16, Device::kCUDA, {1, 2 * kDim}), t.time, head_modulation_, stream);
 }
 
+namespace {
+// Big-buffer columns the NVFP4 ffn_up_gate linears of `config` need.
+std::int64_t nvfp4_cols(const ComputeConfig& config) {
+  return nvfp4_big_cols(config.nvfp4_up_gate, config.nvfp4_ffn || config.nvfp4_lora_ffn);
+}
+}  // namespace
+
 std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
                                      BlockPath path) {
   return workspace_bytes(height, width, text_lengths, path, ComputeConfig{}, nullptr);
@@ -860,7 +904,7 @@ std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, st
       path == BlockPath::kOpByOp ? FusedRouteSnapshot{} : (pinned != nullptr ? *pinned : fused_route_snapshot());
   StackPlan plan(nullptr);
   Activations(plan, total, total, static_cast<std::int64_t>(text_lengths.size()), true,
-              config.quantized ? quant_big_cols(hw, text_lengths, config.bf16_up_gate, route)
+              config.quantized ? quant_big_cols(hw, text_lengths, config.bf16_up_gate, route, nvfp4_cols(config))
                                : big_cols(path, hw, text_lengths, route));
   if (config.quantized) {
     plan.tensor(DType::kF32, {total});
@@ -871,6 +915,13 @@ std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, st
       plan.bytes(lora::t_workspace_bytes(total, config.lora_rank));
     }
     if (config.int4 && (config.lora_rank > 0 || config.int4_via_int8)) plan.bytes(kInt4UnpackBytes);
+    if (config.nvfp4) {
+      plan.bytes(nvfp4_sf_bytes(total));
+      if (config.nvfp4_delta_cols > 0) {
+        plan.tensor(DType::kBF16, {total, config.nvfp4_delta_cols});
+        plan.bytes(lora::delta_scratch_bytes(total, config.lora_rank, config.nvfp4_delta_cols));
+      }
+    }
   }
   TimeScratch{plan};
   return plan.total();
@@ -979,7 +1030,8 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   runtime::StackScope scope(arena_);
   StackPlan plan(&arena_);
   Activations a(plan, total, total, static_cast<std::int64_t>(rows.size()), true,
-                quantized ? quant_big_cols(hw, lengths, config_.bf16_up_gate, route) : big_cols(path_, hw, lengths, route));
+                quantized ? quant_big_cols(hw, lengths, config_.bf16_up_gate, route, nvfp4_cols(config_))
+                          : big_cols(path_, hw, lengths, route));
   // Quantized blocks: per-token activation scales and the 8-bit attention workspace (workspace_bytes' order).
   QuantBlockBuffers qa;
   if (quantized) {
@@ -996,6 +1048,15 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     if (config_.int4 && (config_.lora_rank > 0 || config_.int4_via_int8)) {
       qa.int4_unpack_bytes = kInt4UnpackBytes;
       qa.int4_unpack = plan.bytes(kInt4UnpackBytes);
+    }
+    if (config_.nvfp4) {
+      qa.nvfp4_sf_bytes = nvfp4_sf_bytes(total);
+      qa.nvfp4_sf = plan.bytes(qa.nvfp4_sf_bytes);
+      if (config_.nvfp4_delta_cols > 0) {
+        qa.nvfp4_delta = plan.tensor(DType::kBF16, {total, config_.nvfp4_delta_cols});
+        qa.nvfp4_scratch_bytes = lora::delta_scratch_bytes(total, config_.lora_rank, config_.nvfp4_delta_cols);
+        qa.nvfp4_scratch = plan.bytes(qa.nvfp4_scratch_bytes);
+      }
     }
   }
   // Streamed blocks: device buffers after the activations; the first copies overlap the setup below.
@@ -1105,6 +1166,9 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
       key.addresses.push_back(qa.lora_t.data);
       key.addresses.push_back(qa.lora_workspace);
       key.addresses.push_back(qa.int4_unpack);
+      key.addresses.push_back(qa.nvfp4_sf);
+      key.addresses.push_back(qa.nvfp4_delta.data);
+      key.addresses.push_back(qa.nvfp4_scratch);
     }
     // The block variant, and the LoRA side branches' generation (their set of active sites changes the kernels).
     key.variant = quantized ? 1 + static_cast<std::uint64_t>(config_.attention) : 0;

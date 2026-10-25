@@ -446,6 +446,7 @@ const char* precision_name(mi_precision p) {
     case MI_PRECISION_INT8: return "int8";
     case MI_PRECISION_W4A8: return "w4a8";
     case MI_PRECISION_W4A4: return "w4a4";
+    case MI_PRECISION_NVFP4: return "nvfp4";
     case MI_PRECISION_MAX_ENUM: break;
   }
   return "unknown";

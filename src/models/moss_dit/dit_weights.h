@@ -14,9 +14,10 @@
 // The copied bytes and their device layout are those of the resident upload (same tensor order, kArenaAlign
 // offsets, 256-byte aligned buffers), so streamed and resident forwards are bit-identical (tested).
 // P6: with a quantized index (weights/quant, a single-file DiT) a block's linears are INT8 ConvRot (I8 weight + F32
-// per-row scale), INT4 ConvRot (packed nibbles + F32 per-row scale) or bf16, each as the file stores it; every linear
-// is checked against the spec its GEMM implements (quant::view), and a block's bytes, resident or streamed, are its
-// stored bytes (an INT8 block is about half a bf16 one, an INT4 block about a quarter).
+// per-row scale), INT4 ConvRot (packed nibbles + F32 per-row scale), NVFP4 (packed E2M1 + swizzled UE4M3 block scales;
+// the F32 tensor scale is a host value of the index) or bf16, each as the file stores it; every linear is checked
+// against the spec its GEMM implements (quant::view), and a block's bytes, resident or streamed, are its stored bytes
+// (an INT8 block is about half a bf16 one, an INT4 block about a quarter, an NVFP4 block 0.28 of it).
 #pragma once
 
 #include <cuda_runtime.h>
@@ -87,30 +88,50 @@ struct Int4Linear {
   std::int64_t k() const { return 2 * w.dim(1); }
 };
 
+// An NVFP4 linear as the sm_120a GEMMs consume it (kernels/nvfp4): weight U8 [N, K/2], E2M1 codes two per byte
+// (hi_first, as stored), its UE4M3 block scales in the swizzled layout (U8 [round_up(N, 128), round_up(K/16, 4)]) and
+// the F32 tensor scale (weight_scale_2, the GEMM's w_scale2). Empty when the linear is not NVFP4.
+struct Nvfp4Linear {
+  Tensor w;
+  Tensor sf;
+  float scale2 = 1.0f;
+  bool empty() const { return w.data == nullptr; }
+  std::int64_t k() const { return 2 * w.dim(1); }
+};
+
 // Weight views of one block (P:126-148): norms, fused q/k/v, o, fused up/gate and down projections. Each linear is
-// exactly one of bf16 (the Tensor), INT8 ConvRot (the Int8Linear) or INT4 ConvRot (the Int4Linear). q, k and v share
-// one GEMM: fused (qkv / qkv8 / qkv4) when they share a precision; otherwise (a file that keeps them in different
-// precisions) qkv_split holds each part.
+// exactly one of bf16 (the Tensor), INT8 ConvRot (the Int8Linear), INT4 ConvRot (the Int4Linear) or NVFP4 (the
+// Nvfp4Linear). q, k and v share one GEMM: fused (qkv / qkv8 / qkv4 / qkv_nvfp4) when they share a precision (NVFP4:
+// and a tensor scale, as the parts of a file's fused proj.qkv do); otherwise qkv_split holds each part.
 struct BlockTensors {
   Tensor norm1, norm2, q_norm, k_norm;
   Tensor qkv;  // proj.q/k/v fused along N: [3 * dim, dim]
   Tensor o, up_gate, down;
   Int8Linear qkv8, o8, up_gate8, down8;  // qkv8: [3 * dim, dim] with a [3 * dim] scale
   Int4Linear qkv4, o4, up_gate4, down4;  // qkv4: [3 * dim, dim / 2] with a [3 * dim] scale
+  // qkv_nvfp4: [3 * dim, dim / 2] with the three parts' block scales back to back (whole 128-row tiles: the fused
+  // matrix's swizzled scales)
+  Nvfp4Linear qkv_nvfp4, o_nvfp4, up_gate_nvfp4, down_nvfp4;
   bool qkv_split = false;
   Tensor qkv_part[3];                    // qkv_split: bf16 q, k, v (empty where quantized)
   Int8Linear qkv8_part[3];               // qkv_split: INT8 q, k, v (empty elsewhere)
   Int4Linear qkv4_part[3];               // qkv_split: INT4 q, k, v (empty elsewhere)
+  Nvfp4Linear qkv_nvfp4_part[3];         // qkv_split: NVFP4 q, k, v (empty elsewhere)
 
   // Some linear of the block is INT4.
   bool int4() const {
     return !qkv4.empty() || !o4.empty() || !up_gate4.empty() || !down4.empty() || !qkv4_part[0].empty() ||
            !qkv4_part[1].empty() || !qkv4_part[2].empty();
   }
-  // Some linear of the block is INT8 or INT4.
+  // Some linear of the block is NVFP4.
+  bool nvfp4() const {
+    return !qkv_nvfp4.empty() || !o_nvfp4.empty() || !up_gate_nvfp4.empty() || !down_nvfp4.empty() ||
+           !qkv_nvfp4_part[0].empty() || !qkv_nvfp4_part[1].empty() || !qkv_nvfp4_part[2].empty();
+  }
+  // Some linear of the block is INT8, INT4 or NVFP4.
   bool quantized() const {
-    return int4() || !qkv8.empty() || !o8.empty() || !up_gate8.empty() || !down8.empty() || !qkv8_part[0].empty() ||
-           !qkv8_part[1].empty() || !qkv8_part[2].empty();
+    return int4() || nvfp4() || !qkv8.empty() || !o8.empty() || !up_gate8.empty() || !down8.empty() ||
+           !qkv8_part[0].empty() || !qkv8_part[1].empty() || !qkv8_part[2].empty();
   }
 };
 
@@ -141,13 +162,16 @@ weights::WeightGroup with_front(const weights::WeightGroup& g, const std::vector
 Tensor take(const weights::TensorMap& m, const std::string& name, std::initializer_list<std::int64_t> shape);
 // Weights uploaded back to back (see with_front) viewed as one tensor concatenated along dim 0 (cols 0: 1-D).
 Tensor fuse(const weights::TensorMap& m, const std::vector<std::string>& names, std::int64_t rows, std::int64_t cols);
-// The upload order of block `block`'s group: q, k, v weights (and, when q/k/v share a quantized spec, their scales)
-// first, so the fused QKV weight (and scale) is contiguous.
+// Whether q, k and v of block `block` run as one GEMM: the same spec (NVFP4: and the same tensor scale). Always for
+// the bundle's bf16 layout (quant == nullptr).
+bool qkv_fused(int block, const quant::QuantIndex* quant);
+// The upload order of block `block`'s group: q, k, v weights (and, when q/k/v share a quantized spec, their scales;
+// NVFP4: their block scales) first, so the fused QKV weight (and scale) is contiguous.
 std::vector<std::string> block_front(int block, const quant::QuantIndex* quant);
 // The views of block `block` out of its uploaded group `m` (any device layout of it: resident or a stream buffer).
 // quant == nullptr: the bundle's bf16 layout. Otherwise every linear goes through quant::view with the spec it is
-// stored as, which must be bf16, INT8 ConvRot G = 256 or INT4 ConvRot G = 256 (std::runtime_error naming the linear
-// otherwise).
+// stored as, which must be bf16, INT8 ConvRot G = 256, INT4 ConvRot G = 256 or NVFP4 (std::runtime_error naming the
+// linear otherwise).
 BlockTensors block_views(int block, const weights::TensorMap& m, const quant::QuantIndex* quant);
 }  // namespace detail
 

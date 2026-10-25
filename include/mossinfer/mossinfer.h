@@ -233,12 +233,14 @@ typedef enum mi_block_path {
 /* Quality tier (MI_CAP_TIERS). The weights fix the GEMM precision (an INT8 DiT runs INT8 GEMMs); the tier decides the
  * attention kernel. A refused combination fails mi_generate() with MI_ERR_INVALID_ARGUMENT, naming the conflict. */
 typedef enum mi_tier {
-  /* The fastest certified configuration of the loaded models; else Reference for a bf16 DiT. Refuses an INT4 DiT
-   * without a certificate (choose MI_TIER_TURBO explicitly). */
+  /* The fastest certified configuration of the loaded models; else Reference for a bf16 DiT. Refuses an INT4 or NVFP4
+   * DiT without a certificate (choose MI_TIER_TURBO explicitly). */
   MI_TIER_AUTO = 0,
   MI_TIER_REFERENCE = 1, /* bf16 DiT and text encoder, exact attention; refused for quantized files */
   MI_TIER_HIGH = 2,      /* the loaded DiT's precision plus 8-bit attention (Q8_FP8 unless `attention` says otherwise) */
-  MI_TIER_TURBO = 3,     /* an INT4 DiT file: INT4 GEMMs plus 8-bit attention; refused for any other DiT */
+  /* an INT4 or NVFP4 DiT file: its 4-bit GEMMs plus 8-bit attention; refused for any other DiT. NVFP4 runs on an RTX 50
+   * (compute capability 12.0) only; elsewhere the file is refused with MI_ERR_MODEL. */
+  MI_TIER_TURBO = 3,
   MI_TIER_MAX_ENUM = 0x7fffffff
 } mi_tier;
 
@@ -259,6 +261,9 @@ typedef enum mi_precision {
   MI_PRECISION_INT8 = 1, /* INT8 ConvRot (a DiT with any INT8 linear counts as INT8) */
   MI_PRECISION_W4A8 = 2, /* 4-bit weights, 8-bit activations (text encoder files) */
   MI_PRECISION_W4A4 = 3, /* 4-bit weights and activations: an INT4 DiT (the Turbo tier) */
+  /* 4-bit float weights and activations (E2M1, UE4M3 block scales): an NVFP4 DiT (the Turbo tier on an RTX 50); a DiT
+   * with any NVFP4 linear counts as NVFP4 (its keep-list INT8 linears included) */
+  MI_PRECISION_NVFP4 = 4,
   MI_PRECISION_MAX_ENUM = 0x7fffffff
 } mi_precision;
 
@@ -796,7 +801,7 @@ typedef struct mi_tier_info {
   /* 1 when the tier needs no certificate or a certificate covers it; on the lossy tiers it is 0 with LoRAs, a control
    * adapter or accelerators, but on REFERENCE it stays 1. */
   int32_t certified;
-  mi_precision dit_precision;          /* BF16 or INT8 */
+  mi_precision dit_precision;          /* BF16, INT8, W4A4 or NVFP4 */
   mi_precision text_encoder_precision; /* BF16, INT8 or W4A8 */
   /* Fields after the 32-byte layout (1.0.0). The run is certified: a certificate covers it, or it ran REFERENCE
    * without anything that changes the image. 0 whenever runtime LoRAs (a distill bundle's included), a control
@@ -992,7 +997,7 @@ typedef struct mi_file_info {
   int32_t loadable;
   uint64_t file_bytes;
   int32_t tensor_count;     /* tensors in the safetensors header; 0 when the header cannot be read */
-  /* A loadable DiT: BF16, INT8 or W4A4, as mi_tier_info.dit_precision; a loadable text encoder: BF16, INT8 or W4A8;
+  /* A loadable DiT: BF16, INT8, W4A4 or NVFP4, as mi_tier_info.dit_precision; a loadable text encoder: BF16, INT8 or W4A8;
    * else BF16. */
   mi_precision precision;
   /* A loadable DiT: bit (1u << tier) for each mi_tier the engine accepts for it, with the bundle's bf16 text encoder

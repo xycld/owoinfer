@@ -16,10 +16,6 @@ std::string nvfp4_unsupported_reason(int major, int minor, bool kernels_availabl
     return "NVFP4 needs the sm_120a NVFP4 kernels, which this build of MossInfer does not include (built without "
            "MOSSINFER_NVFP4, CUDA < 12.8 or sm_120); use the INT8 file";
   }
-  if (!kRunsNvfp4Linears) {
-    return "NVFP4 DiT files are not supported by this version yet; use an INT8 DiT (e.g. Comfy-Org's int8_convrot file) "
-           "or convert the bf16 DiT with `moss-infer quantize`";
-  }
   return {};
 }
 

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "backend/cuda_libs.h"
+#include "kernels/nvfp4/nvfp4.h"
 #include "pipeline/quality_cert.h"
 #include "test_util.h"
 #include "util/json.h"
@@ -155,7 +156,10 @@ bool has_key(const EngineNumerics& n, const std::string& k) {
 
 TEST(QualityCert, TokensAndTiers) {
   for (auto t : {QualityTier::kReference, QualityTier::kHigh, QualityTier::kTurbo}) EXPECT_EQ(parse_quality_tier(cert_token(t)), t);
-  for (auto p : {DitPrecision::kBf16, DitPrecision::kInt8ConvRot, DitPrecision::kW4A4}) EXPECT_EQ(parse_dit_precision(cert_token(p)), p);
+  for (auto p : {DitPrecision::kBf16, DitPrecision::kInt8ConvRot, DitPrecision::kW4A4, DitPrecision::kNvfp4}) {
+    EXPECT_EQ(parse_dit_precision(cert_token(p)), p);
+  }
+  EXPECT_EQ(cert_token(DitPrecision::kNvfp4), "nvfp4");
   for (auto a : {AttentionMode::kExact, AttentionMode::kQ8Fp16, AttentionMode::kQ8Fp16F32Acc, AttentionMode::kQ8Fp8,
                  AttentionMode::kQ8Fp8F32Acc}) {
     EXPECT_EQ(parse_attention_mode(cert_token(a)), a);
@@ -170,6 +174,8 @@ TEST(QualityCert, TokensAndTiers) {
   EXPECT_EQ(tier_of({DitPrecision::kBf16, AttentionMode::kQ8Fp16, TePrecision::kBf16, false}), QualityTier::kHigh);
   EXPECT_EQ(tier_of({DitPrecision::kBf16, AttentionMode::kExact, TePrecision::kInt8ConvRot, false}), QualityTier::kHigh);
   EXPECT_EQ(tier_of({DitPrecision::kW4A4, AttentionMode::kQ8Fp8, TePrecision::kW4A8, false}), QualityTier::kTurbo);
+  EXPECT_EQ(tier_of({DitPrecision::kNvfp4, AttentionMode::kQ8Fp8, TePrecision::kBf16, false}), QualityTier::kTurbo);
+  EXPECT_EQ(tier_of({DitPrecision::kNvfp4, AttentionMode::kExact, TePrecision::kBf16, false}), QualityTier::kTurbo);
 
   EXPECT_EQ(gpu_arch_class(8, 9), "sm_89");
   EXPECT_EQ(gpu_arch_class(12, 0), "sm_120");
@@ -277,6 +283,56 @@ TEST(QualityCert, NumericsDependOnTheConfiguration) {
     EXPECT_EQ(uncertifiable_reason(c), "");
   }
   EXPECT_NE(uncertifiable_reason({DitPrecision::kInt8ConvRot, AttentionMode::kExact, TePrecision::kBf16, true}), "");
+}
+
+// NVFP4 (NVFP4 plan §4.7): its own numerics key, plus "int8" when the file keeps INT8 ConvRot linears; the keep-list
+// flag is carried by the numerics (and the file's identity), not by the configuration's equality.
+TEST(QualityCert, Nvfp4Numerics) {
+  const CertConfig ref{};
+  CertConfig all{DitPrecision::kNvfp4, AttentionMode::kQ8Fp8, TePrecision::kBf16, false};
+  CertConfig kept = all;
+  kept.dit_int8_units = true;
+  const EngineNumerics a = engine_numerics(all, 130800), k = engine_numerics(kept, 130800);
+  EXPECT_TRUE(has_key(a, "nvfp4"));
+  EXPECT_FALSE(has_key(a, "int8"));
+  EXPECT_FALSE(has_key(a, "w4a4"));
+  EXPECT_TRUE(has_key(a, "attention_q8"));
+  EXPECT_TRUE(has_key(k, "nvfp4") && has_key(k, "int8"));
+  EXPECT_FALSE(has_key(engine_numerics(ref, 130800), "nvfp4"));
+  for (const auto& [name, v] : a) {
+    if (name == "nvfp4") {
+      EXPECT_EQ(v, mi::kernels::nvfp4::kNvfp4NumericsVersion);
+    }
+  }
+  for (const EngineNumerics& n : {a, k}) {
+    for (std::size_t i = 1; i < n.size(); ++i) EXPECT_LT(n[i - 1].first, n[i].first);
+  }
+  EXPECT_EQ(all, kept);
+  EXPECT_EQ(uncertifiable_reason(kept), "");
+  // dit_int8_units is not an NVFP4 file's alone in effect: an INT8 TE gives "int8" anyway.
+  CertConfig te8 = all;
+  te8.te = TePrecision::kInt8ConvRot;
+  EXPECT_TRUE(has_key(engine_numerics(te8, 130800), "int8"));
+  // A certificate of a keep-list file (written from a report with the flag) round-trips and matches a query with it;
+  // one measured without INT8 units (other numerics) does not.
+  Certificate c = sample();
+  c.config = kept;
+  c.tier = QualityTier::kTurbo;
+  c.model.te.reset();
+  c.numerics = engine_numerics(kept);
+  c.gpu_arch = "sm_120";
+  c.gates = gates_for(QualityTier::kTurbo);
+  ASSERT_EQ(validate_certificate(c), "");
+  const std::vector<Certificate> back = parse_certificates(certificates_json({c}));
+  ASSERT_EQ(back.size(), 1u);
+  EXPECT_EQ(back[0].config.dit, DitPrecision::kNvfp4);
+  EXPECT_EQ(back[0].numerics, c.numerics);
+  const CertificateQuery q{kept, "sm_120", engine_numerics(kept), std::nullopt};
+  EXPECT_EQ(certificate_mismatch(back[0], identity_of(c), q), "");
+  const CertificateQuery q_all{all, "sm_120", engine_numerics(all), std::nullopt};
+  EXPECT_NE(certificate_mismatch(back[0], identity_of(c), q_all).find("other engine numerics"), std::string::npos);
+  const CertificateQuery q_89{kept, "sm_89", engine_numerics(kept), std::nullopt};
+  EXPECT_NE(certificate_mismatch(back[0], identity_of(c), q_89), "");
 }
 
 TEST(QualityCert, CurrentGpuArch) {

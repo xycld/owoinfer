@@ -843,9 +843,35 @@ TEST(DitFileInspect, Int8FileAndMixedFile) {
   });
   const mi::pipeline::DitFileInfo with_scale = mi::pipeline::inspect_dit_file(scaled, "");
   EXPECT_TRUE(with_scale.nvfp4);
+  EXPECT_EQ(with_scale.precision, mi::planner::Precision::kNvfp4);  // any NVFP4 linear: the Turbo precision
   EXPECT_EQ(with_scale.linears, "mixed (251 int8_convrot256, 1 nvfp4)");
   EXPECT_EQ(with_scale.static_input_scales, 1);
   EXPECT_EQ(with_scale.remarks, "1 linears carry a static input_scale; ignored (activations are scaled per token)");
+
+  // INT4 ConvRot and NVFP4 linears in one file: not a supported layout (one 4-bit format per DiT), refused as a model
+  // error whatever the device, never reported as W4A4.
+  const fs::path both = write_int8_dit(dir.path() / "int4_nvfp4.safetensors", [](std::vector<SparseTensor>& ts) {
+    std::erase_if(ts, [](const SparseTensor& t) {
+      return t.name.starts_with("layers.0.proj.o.") || t.name.starts_with("layers.1.proj.o.");
+    });
+    const std::string o = "layers.0.proj.o", o1 = "layers.1.proj.o";
+    ts.push_back({o + ".weight", DType::kU8, {3072, 1536}, ""});
+    ts.push_back({o + ".weight_scale", DType::kF8E4M3, {3072, 192}, ""});
+    ts.push_back({o + ".weight_scale_2", DType::kF32, {}, f32_bytes(1, 1.0f)});
+    ts.push_back(comfy_quant(o, R"({"format": "nvfp4"})"));
+    ts.push_back({o1 + ".weight", DType::kI8, {3072, 1536}, ""});
+    ts.push_back({o1 + ".weight_scale", DType::kF32, {3072}, f32_bytes(3072, 1.0f)});
+    ts.push_back(comfy_quant(o1, R"({"format": "convrot_w4a4", "convrot_groupsize": 256})"));
+  });
+  for (const char* why : {"", "no FP4 tensor cores here"}) {
+    try {
+      mi::pipeline::inspect_dit_file(both, why);
+      ADD_FAILURE() << "an INT4 + NVFP4 file was accepted";
+    } catch (const IndexError& e) {
+      EXPECT_NE(std::string(e.what()).find("mixes INT4 ConvRot (convrot_w4a4) and NVFP4 linears"), std::string::npos)
+          << e.what();
+    }
+  }
 }
 #endif
 
@@ -891,6 +917,12 @@ TEST(DitFileInspect, RealCommunityFiles) {
     EXPECT_TRUE(info.nvfp4);
     EXPECT_EQ(info.quant, nullptr);
     EXPECT_EQ(info.refusal, mi::util::path_utf8(nvfp4) + ": no NVFP4");
+    // Where NVFP4 runs: indexed as the Turbo precision, its INT8 keep-list linears counted apart.
+    const mi::pipeline::DitFileInfo runs = mi::pipeline::inspect_dit_file(nvfp4, "");
+    EXPECT_TRUE(runs.refusal.empty());
+    EXPECT_EQ(runs.precision, mi::planner::Precision::kNvfp4);
+    EXPECT_EQ(runs.linears.rfind("mixed (", 0), 0u) << runs.linears;
+    EXPECT_NE(runs.linears.find(" nvfp4"), std::string::npos) << runs.linears;
     ++checked;
   }
   if (checked == 0) GTEST_SKIP() << "no community DiT file present";

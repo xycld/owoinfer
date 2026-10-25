@@ -49,6 +49,7 @@ mi_precision to_precision(planner::Precision p) {
     case planner::Precision::kBf16: return MI_PRECISION_BF16;
     case planner::Precision::kInt8: return MI_PRECISION_INT8;
     case planner::Precision::kInt4: return MI_PRECISION_W4A4;
+    case planner::Precision::kNvfp4: return MI_PRECISION_NVFP4;
   }
   return MI_PRECISION_BF16;
 }
