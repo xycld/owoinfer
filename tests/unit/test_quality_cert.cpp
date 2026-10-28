@@ -1085,9 +1085,11 @@ TEST(QualityCert, HarnessFixture) {
   }
   for (const mi::json::Value& e : t.at("numerics").as_array()) {
     const mi::json::Value& cfg = e.at("config");
-    const CertConfig conf{*parse_dit_precision(cfg.at("dit_precision").as_string()),
-                          *parse_attention_mode(cfg.at("attention").as_string()),
-                          *parse_te_precision(cfg.at("te_precision").as_string()), false};
+    CertConfig conf{*parse_dit_precision(cfg.at("dit_precision").as_string()),
+                    *parse_attention_mode(cfg.at("attention").as_string()),
+                    *parse_te_precision(cfg.at("te_precision").as_string()), false};
+    // NVFP4 entries name whether the DiT keeps INT8 ConvRot linears (the harness reads it from the file's dtypes).
+    if (const mi::json::Value* units = cfg.find("dit_int8_units")) conf.dit_int8_units = units->as_bool();
     EngineNumerics theirs;
     for (const auto& [k, v] : e.at("numerics").as_object()) theirs.emplace_back(k, static_cast<std::uint64_t>(v.as_int()));
     EXPECT_EQ(theirs, engine_numerics(conf, kFixtureCublasLt))

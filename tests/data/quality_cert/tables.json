@@ -1358,6 +1358,70 @@
     "te_w4a8": 1,
     "w4a4": 1
    }
+  },
+  {
+   "config": {
+    "dit_precision": "nvfp4",
+    "attention": "exact",
+    "te_precision": "bf16",
+    "dit_int8_units": false
+   },
+   "numerics": {
+    "cublaslt": 130800,
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "nvfp4": 1,
+    "te": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "nvfp4",
+    "attention": "exact",
+    "te_precision": "bf16",
+    "dit_int8_units": true
+   },
+   "numerics": {
+    "cublaslt": 130800,
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "int8": 1,
+    "nvfp4": 1,
+    "te": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "nvfp4",
+    "attention": "q8_fp8",
+    "te_precision": "bf16",
+    "dit_int8_units": false
+   },
+   "numerics": {
+    "attention_q8": 1,
+    "cublaslt": 130800,
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "nvfp4": 1,
+    "te": 1
+   }
+  },
+  {
+   "config": {
+    "dit_precision": "nvfp4",
+    "attention": "q8_fp8",
+    "te_precision": "bf16",
+    "dit_int8_units": true
+   },
+   "numerics": {
+    "attention_q8": 1,
+    "cublaslt": 130800,
+    "elementwise": 1,
+    "fused_gemm": 1,
+    "int8": 1,
+    "nvfp4": 1,
+    "te": 1
+   }
   }
  ],
  "prompt_set": {
