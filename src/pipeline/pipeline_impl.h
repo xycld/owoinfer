@@ -45,6 +45,7 @@
 #include "tokenizer/qwen_bpe.h"
 #include "util/path.h"
 #include "util/regular_file.h"
+#include "util/xxh64.h"
 #include "weights/file_reader.h"
 #include "weights/model_index.h"
 #include "weights/quant/quant_model.h"
@@ -243,8 +244,9 @@ inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& fil
 
 // Where the text encoder comes from (P7a): the bundle's bf16 encoder, or a single INT8 / W4A8 file
 // (qwen35_text::QuantTextModel). The tokenizer is always the bundle's. `identity` and `numerics` key the embedding cache:
-// the weights (text_encoder_hash: names, shapes and each file's path, size, mtime and header) and the encoder's numerics
-// (precision and kernel versions), so embeddings of one encoder are never served for another.
+// the weights (text_encoder_hash: names, shapes and each file's path, size, mtime and header; a file source adds its
+// volume and file id) and the encoder's numerics (precision and kernel versions), so embeddings of one encoder are never
+// served for another.
 struct TeSource {
   std::filesystem::path path;  // the bundle's text_encoder directory or the file
   util::FileInfo stamp;        // the file's when it was opened (file only: Impl::check_component_files)
@@ -601,7 +603,12 @@ struct Pipeline::Impl {
       t->stamp = stamp;
       t->model = model_file_errors(path, [&] { return std::make_unique<qwen35_text::QuantTextModel>(path); });
       t->precision = t->model->precision();
-      t->identity = text_encoder_hash(t->model->index());
+      // The file's identity joins its contents' (text_encoder_hash: names, shapes, size, mtime, header): a file
+      // replaced with the same size and mtime (a copy that keeps them) never serves the old file's cached embeddings.
+      Xxh64 h;
+      const std::uint64_t parts[] = {text_encoder_hash(t->model->index()), stamp.volume, stamp.id, stamp.id_high};
+      h.update(parts, sizeof parts);
+      t->identity = h.digest();
       return t;
     });
   }
