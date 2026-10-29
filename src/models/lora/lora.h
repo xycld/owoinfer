@@ -142,9 +142,11 @@ struct FileReport {
 
 // Where low-rank adapters on the block GEMMs go (the request's lora_placement), a fixed rule per module, decided when
 // the stack is parsed:
-//   kDefault     every low-rank block adapter on the side branch, moss-edit-lora files (Moss-Image-Edit) included:
-//                strength changes are instant and loads fast (a DiT file with the adapter baked in, moss-infer
-//                quantize --lora, has no per-step cost)
+//   kDefault     every low-rank block adapter on the side branch (strength changes are instant and loads fast), except
+//                a moss-edit-lora file's (Moss-Image-Edit) on bf16 modules, which are merged (on the GPU at load: about a
+//                second more than the side branch's load, ~5 % faster per step; its strength or placement changes
+//                reload the DiT); an edit adapter on INT8, INT4 or NVFP4 modules stays on the side branch (a DiT file
+//                with the adapter baked in, moss-infer quantize --lora, has no per-step cost)
 //   kMerge       every low-rank block adapter merged (no per-step cost, a slower load; an edit adapter's strength or
 //                placement change reloads the DiT); one on a module that cannot take a merge (INT8 without ConvRot,
 //                INT4, NVFP4) is a LoraError naming the module and its format

@@ -433,10 +433,10 @@ typedef struct mi_image {
 
 /* Where the low-rank adapters of `loras` on the DiT's block GEMMs go (MI_CAP_REFERENCE_IMAGES), a fixed rule per
  * module and base precision:
- *   DEFAULT      every low-rank block adapter on the side branch, edit adapters (moss-edit-lora) included: strength
- *                changes are instant, loads fast, the weights untouched (for INT8 with no per-step cost: a DiT file
- *                with the adapter baked in, quantize --lora)
- *   MERGE        every low-rank block adapter merged: no per-step cost (about 6.5 % faster per step than the side
+ *   DEFAULT      every low-rank block adapter on the side branch (strength changes are instant, loads fast, the
+ *                weights untouched), except an edit adapter's (moss-edit-lora) on bf16 modules: merged, as MERGE (for
+ *                INT8 with no per-step cost: a DiT file with the adapter baked in, quantize --lora)
+ *   MERGE        every low-rank block adapter merged: no per-step cost (about 5 % faster per step than the side
  *                branch on bf16 for the edit adapter), a slower load (bf16: merged on the GPU, about a second
  *                for a rank-64 adapter on every block linear; INT8: requantized on the host, tens of seconds, one
  *                MI_MESSAGE_LORA_WARNING per file, refused with lora_strict; an INT4 / NVFP4 module is MI_ERR_MODEL)
