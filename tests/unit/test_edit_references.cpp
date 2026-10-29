@@ -12,6 +12,7 @@
 // skip without them.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -32,10 +33,15 @@
 #include "models/moss_dit/moss_dit.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_image.h"
+#include "pipeline/report_json.h"
 #include "planner/host_memory.h"
 #include "runtime/device_arena.h"
 #include "runtime/stream_set.h"
+#include "test_util.h"
+#include "util/json.h"
 #include "util/npy.h"
+#include "weights/quant/quant_convert.h"
+#include "weights/safetensors.h"
 #include "weights/test_seams.h"
 
 namespace {
@@ -724,6 +730,113 @@ TEST(GpuEditPipeline, PlanFailureNamesThePlacement) {
     const std::string e = plan_error(p, request(mi::lora::Placement::kMerge));
     EXPECT_NE(e.find("not enough GPU memory"), std::string::npos) << e;
     EXPECT_EQ(e.find("lora_placement"), std::string::npos) << e;
+  }
+}
+
+// A DiT baked with the edit adapter (quant::convert with it as a LoRA, `moss-infer quantize --lora`) is edit-capable:
+// its metadata records the adapter, so reference images run on it without the no-adapter warning, the report and the
+// file's remarks (the plan explanation, inspect's note) name it, and the same adapter passed again as a runtime LoRA is
+// warned about (applied twice; refused with lora_strict). An ordinary INT8 file with references still warns.
+TEST(GpuEditPipeline, BakedEditAdapter) {
+  const fs::path com = "/workspace/Models/community";
+  const fs::path bf16 = com / "comfy-org/moss_image_sft_bf16.safetensors";
+  const fs::path int8 = com / "comfy-org/moss_image_sft_int8_convrot.safetensors";
+  const fs::path te = com / "comfy-org/qwen3.5_9b_int8_convrot.safetensors";
+  const fs::path lora = com / "chinoll/Moss-Image-Edit/adapter_model.safetensors";
+  const fs::path bundle = "/workspace/Models/MOSS-Image/sft";
+  if (!fs::is_regular_file(bf16) || !fs::is_regular_file(int8) || !fs::is_regular_file(te) || !fs::is_regular_file(lora) ||
+      !fs::is_directory(bundle)) {
+    GTEST_SKIP() << "the bf16 and INT8 SFT DiTs, the INT8 text encoder, the edit adapter or the SFT bundle not present";
+  }
+  mi::testing::TempDir dir("baked_edit");
+  const fs::path baked = dir.path() / "sft_int8_edit.safetensors";
+  mi::quant::ConvertOptions co;
+  co.loras = {{lora, 1.0f}};
+  mi::quant::convert(bf16, baked, co);
+  {
+    const mi::weights::SafetensorsFile f(baked);
+    EXPECT_NE(f.metadata().at("mossinfer_lora").find("\"format\": \"moss-edit-lora\""), std::string::npos);
+    const std::string named = mi::pipeline::baked_edit_adapters(f.metadata());
+    EXPECT_EQ(named.rfind("adapter_model.safetensors (strength 1, xxh64 ", 0), 0u) << named;
+    const mi::pipeline::DitFileInfo info = mi::pipeline::inspect_dit_file(baked, std::function<std::string()>());
+    EXPECT_EQ(info.baked_edit, named);
+    EXPECT_NE(info.remarks.find("edit adapter baked in (moss-edit-lora): " + named), std::string::npos) << info.remarks;
+    EXPECT_EQ(mi::pipeline::inspect_dit_file(int8, std::function<std::string()>()).baked_edit, "");
+  }
+
+  auto ref_img = std::make_shared<mi::pipeline::Image>();
+  ref_img->width = ref_img->height = 256;
+  ref_img->channels = 3;
+  ref_img->pixels.resize(256 * 256 * 3);
+  for (std::size_t i = 0; i < ref_img->pixels.size(); ++i) {
+    ref_img->pixels[i] = static_cast<std::uint8_t>(127.5 + 120 * std::sin(0.013 * static_cast<double>(i)));
+  }
+  const auto options = [&](const fs::path& dit, bool strict) {
+    mi::pipeline::PipelineOptions o;
+    o.te_host_pin = mi::planner::TeHostPin::kOff;
+    o.tier = mi::planner::Tier::kHigh;
+    o.attention = mi::planner::AttentionMode::kQ8Fp16;  // runs on every supported GPU
+    o.dit_file = dit;
+    o.text_encoder_file = te;
+    o.embedding_cache = false;
+    o.lora_strict = strict;
+    return o;
+  };
+  const auto request = [&](bool with_lora) {
+    mi::pipeline::Request r;
+    r.model = bundle;
+    r.prompt = "make the sky green";
+    r.negative_prompt = "";
+    r.width = r.height = 256;
+    r.steps = 1;
+    r.cfg = 4.0;
+    r.seed = 3;
+    r.decode = false;
+    r.references.images.push_back(ref_img);
+    if (with_lora) r.loras.push_back({lora, 1.0f});
+    return r;
+  };
+  const auto twice = [](const std::vector<std::string>& warnings) {
+    return std::count_if(warnings.begin(), warnings.end(),
+                         [](const std::string& w) { return w.find("the edit applies twice") != std::string::npos; });
+  };
+  {
+    mi::pipeline::Pipeline p(options(baked, false));
+    const mi::pipeline::Request req = request(false);
+    const mi::pipeline::Result r = p.generate(req);
+    EXPECT_EQ(r.steps_run, 1);
+    EXPECT_EQ(r.references.count, 1);
+    EXPECT_TRUE(r.reference_warnings.empty()) << r.reference_warnings.front();
+    EXPECT_EQ(twice(r.lora_warnings), 0);
+    EXPECT_NE(r.dit_baked_edit.find("adapter_model.safetensors"), std::string::npos);
+    EXPECT_NE(r.plan.explanation.find("edit adapter baked in (moss-edit-lora)"), std::string::npos);
+    const mi::json::Value doc = mi::json::parse("{" + mi::pipeline::report_fields(req, r, "", "") + "}");
+    EXPECT_EQ(doc.at("models").at("dit").at("baked_edit_adapter").as_string(), r.dit_baked_edit);
+
+    // The same adapter again at run time: warned once, references still without the no-adapter warning.
+    const mi::pipeline::Result again = p.generate(request(true));
+    EXPECT_EQ(twice(again.lora_warnings), 1) << ::testing::PrintToString(again.lora_warnings);
+    EXPECT_TRUE(again.reference_warnings.empty());
+  }
+  {
+    mi::pipeline::Pipeline strict(options(baked, true));
+    try {
+      strict.generate(request(true));
+      ADD_FAILURE() << "an edit adapter on a baked DiT ran under lora_strict";
+    } catch (const mi::lora::LoraError& e) {
+      EXPECT_NE(std::string(e.what()).find("the edit applies twice"), std::string::npos) << e.what();
+    }
+  }
+  {
+    // An ordinary INT8 file with references and no adapter: the warning stays; its report has no baked adapter.
+    mi::pipeline::Pipeline p(options(int8, false));
+    const mi::pipeline::Request req = request(false);
+    const mi::pipeline::Result r = p.generate(req);
+    ASSERT_EQ(r.reference_warnings.size(), 1u);
+    EXPECT_NE(r.reference_warnings[0].find("without a moss-edit-lora adapter"), std::string::npos);
+    EXPECT_EQ(r.dit_baked_edit, "");
+    const mi::json::Value doc = mi::json::parse("{" + mi::pipeline::report_fields(req, r, "", "") + "}");
+    EXPECT_EQ(doc.at("models").at("dit").find("baked_edit_adapter"), nullptr);
   }
 }
 

@@ -44,6 +44,7 @@
 #include "runtime/device_arena.h"
 #include "runtime/stream_set.h"
 #include "tokenizer/qwen_bpe.h"
+#include "util/json.h"
 #include "util/path.h"
 #include "util/regular_file.h"
 #include "util/xxh64.h"
@@ -262,7 +263,38 @@ DitFileInfo inspect_dit_file(const weights::SafetensorsFile& header,
     info.remarks = std::to_string(info.static_input_scales) +
                    " linears carry a static input_scale; ignored (activations are scaled per token)";
   }
+  info.baked_edit = baked_edit_adapters(header.metadata());
+  if (!info.baked_edit.empty()) {
+    info.remarks += (info.remarks.empty() ? "" : "; ") + std::string("edit adapter baked in (moss-edit-lora): ") + info.baked_edit;
+  }
   return info;
+}
+
+std::string baked_edit_adapters(const std::map<std::string, std::string>& metadata) {
+  const auto it = metadata.find("mossinfer_lora");
+  if (it == metadata.end()) return {};
+  json::Value v;
+  try {
+    v = json::parse(it->second, json::ParseLimits{1 << 20});
+  } catch (const json::ParseError&) {
+    return {};
+  }
+  if (!v.is_array()) return {};
+  std::string out;
+  for (const json::Value& e : v.as_array()) {
+    if (!e.is_object()) continue;
+    const json::Value* format = e.find("format");
+    if (format == nullptr || !format->is_string() || format->as_string() != "moss-edit-lora") continue;
+    const json::Value* file = e.find("file");
+    const json::Value* strength = e.find("strength");
+    const json::Value* xxh = e.find("xxh64");
+    out += (out.empty() ? "" : ", ") + (file != nullptr && file->is_string() ? file->as_string() : std::string("?"));
+    std::string details;
+    if (strength != nullptr && strength->is_number()) details += "strength " + json_number(strength->as_double());
+    if (xxh != nullptr && xxh->is_string()) details += (details.empty() ? "" : ", ") + std::string("xxh64 ") + xxh->as_string();
+    if (!details.empty()) out += " (" + details + ")";
+  }
+  return out;
 }
 
 DitFileInfo inspect_dit_file(const std::filesystem::path& file, const std::function<std::string()>& nvfp4_refusal) {
@@ -782,6 +814,7 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
   r.dit_source = util::path_utf8(src.path);
   r.dit_linears = src.linears;
   r.dit_format = src.format;
+  r.dit_baked_edit = src.baked_edit;
   if (m.time_embedding) r.time_embedding = util::path_utf8(m.options.time_embedding_file);
   r.gpu_arch = current_gpu_arch();
   if (m.dit_host && m.dit_host_src != &src) {
@@ -985,6 +1018,14 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     for (const lora::FileReport& f : r.loras) {
       for (const std::string& w : f.warnings) r.lora_warnings.push_back(f.file + ": " + w);
       for (const std::string& n : f.notes) r.lora_notes.push_back(f.file + ": " + n);
+      // An edit adapter on a DiT that has one baked in: the edit applies twice (warned; refused with lora_strict).
+      if (f.format == "moss-edit-lora" && !src.baked_edit.empty()) {
+        const std::string why = f.file + ": an edit adapter (moss-edit-lora) on a DiT file that has one baked in (" +
+                                src.baked_edit + "): the edit applies twice; drop the runtime LoRA, or use a DiT "
+                                "without the adapter";
+        if (m.options.lora_strict) throw lora::LoraError(why);
+        r.lora_warnings.push_back(why);
+      }
     }
     if (ctl != nullptr) {
       for (const std::string& mod : m.lora_stack->merge_modules()) {
@@ -1696,7 +1737,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
                           std::to_string(ref_tokens) + " tokens: their keys and values (" + cache +
                           ") computed once per pass, every row attending to them; VAE encoder from " +
                           r.vae_encoder_source + ".";
-    bool edit_adapter = false;
+    bool edit_adapter = !src.baked_edit.empty();  // a DiT file with an edit adapter baked in (quantize --lora)
     for (const lora::FileReport& f : r.loras) edit_adapter = edit_adapter || f.format == "moss-edit-lora";
     if (!edit_adapter) {
       r.reference_warnings.push_back("reference images without a moss-edit-lora adapter: the base model was not trained "

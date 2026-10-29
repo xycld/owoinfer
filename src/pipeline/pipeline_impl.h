@@ -154,6 +154,7 @@ struct DitSource {
   std::string linears;  // moss_dit::describe_linears
   std::string remarks;  // DitFileInfo::remarks (single file only)
   std::string format;   // a GGUF file: what it runs as (gguf_runs_as, e.g. "GGUF Q4_K, runs as INT8 ConvRot"); else ""
+  std::string baked_edit;  // DitFileInfo::baked_edit (single file only)
   // The weight files the DiT is read from, and whether direct I/O gains on them (weights::direct_io_support of each;
   // the first that does not decides), checked once per source.
   std::vector<std::filesystem::path> files;
@@ -266,6 +267,7 @@ inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& fil
   d->precision = info.precision;
   d->linears = std::move(info.linears);
   d->remarks = std::move(info.remarks);
+  d->baked_edit = std::move(info.baked_edit);
   return d;
 }
 

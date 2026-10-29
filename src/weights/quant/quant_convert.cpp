@@ -210,6 +210,7 @@ struct LoraFileInfo {
   int modules;
   int config_alpha_missing = 0;  // moss-edit-lora modules without an alpha (tensor or adapter_config entry)
   std::string first_missing;
+  bool edit = false;  // a moss-edit-lora file (its adapter_config): recorded as "format" in mossinfer_lora
 };
 
 LoraFileInfo load_lora(const LoraInput& in, LoraMap& out) {
@@ -240,7 +241,7 @@ LoraFileInfo load_lora(const LoraInput& in, LoraMap& out) {
   } catch (const QuantError& e) {
     throw weights::FormatError(in.file, "", e.what());
   }
-  LoraFileInfo info{util::path_utf8(in.file.filename()), in.strength, 0, static_cast<int>(mods.size()), 0, {}};
+  LoraFileInfo info{util::path_utf8(in.file.filename()), in.strength, 0, static_cast<int>(mods.size()), 0, {}, edit};
   Xxh64 hash;
   auto read = [&](const weights::TensorInfo& t) {
     std::vector<std::byte> raw(static_cast<std::size_t>(t.nbytes));
@@ -1038,7 +1039,9 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
         for (std::size_t i = 0; i < lora_info.size(); ++i) {
           char s[32];
           std::snprintf(s, sizeof s, "%.9g", static_cast<double>(lora_info[i].strength));
-          j += (i ? ", " : "") + std::string("{\"file\": ") + quote(lora_info[i].file) + ", \"strength\": " + s + ", \"xxh64\": \"" + hex64(lora_info[i].xxh64) + "\"}";
+          // A baked edit adapter is marked (the engine then takes the DiT as edit-capable); other entries as before.
+          j += (i ? ", " : "") + std::string("{\"file\": ") + quote(lora_info[i].file) + ", \"strength\": " + s + ", \"xxh64\": \"" +
+               hex64(lora_info[i].xxh64) + "\"" + (lora_info[i].edit ? ", \"format\": \"moss-edit-lora\"" : "") + "}";
         }
         md["mossinfer_lora"] = j + "]";
       }

@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "models/lora/lora.h"
+#include "pipeline/pipeline.h"
 #include "test_util.h"
 #include "util/checked_math.h"
 #include "util/npy.h"
@@ -1077,6 +1078,13 @@ TEST(QuantConvert, LoraEdgeCasesAndCleanup) {
     std::vector<float> s_ref;
     const auto q_ref = ref_quant(w, kD, kD, s_ref);
     EXPECT_EQ(bytes_i8(mi::quant::read_tensor(m, m.find_linear("layers.0.proj.o")->weight)), q_ref);
+    // The baked edit adapter is recorded (the engine takes the output as edit-capable: pipeline::baked_edit_adapters).
+    const mi::weights::SafetensorsFile f(out);
+    const std::string& baked = f.metadata().at("mossinfer_lora");
+    EXPECT_NE(baked.find("{\"file\": \"edit.safetensors\", \"strength\": 1, \"xxh64\": \""), std::string::npos) << baked;
+    EXPECT_NE(baked.find("\", \"format\": \"moss-edit-lora\"}"), std::string::npos) << baked;
+    const std::string named = mi::pipeline::baked_edit_adapters(f.metadata());
+    EXPECT_EQ(named.rfind("edit.safetensors (strength 1, xxh64 ", 0), 0u) << named;
   }
   fs::remove(out);
 
@@ -1138,6 +1146,13 @@ TEST(QuantConvert, LoraEdgeCasesAndCleanup) {
            R"({"adapter_config":"not json {"})");
   opt.loras = {{dir.path() / "junk.safetensors", 1.0f}};
   EXPECT_EQ(mi::quant::convert(dir.path(), out, opt).lora_modules, 1);
+  {
+    // Not an edit adapter: its entry carries no format, and the output is no edit-capable DiT.
+    const mi::weights::SafetensorsFile f(out);
+    EXPECT_EQ(f.metadata().at("mossinfer_lora").find("format"), std::string::npos);
+    EXPECT_EQ(mi::pipeline::baked_edit_adapters(f.metadata()), "");
+    EXPECT_EQ(mi::pipeline::baked_edit_adapters({{"mossinfer_lora", "not json ["}}), "");
+  }
   {
     const auto m = mi::quant::open_quant_model(out);
     std::vector<float> w = widen(d.w["layers.0.proj.o"]);

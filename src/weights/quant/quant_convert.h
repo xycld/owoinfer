@@ -14,7 +14,9 @@
 // `proj.qkv` (cat along rows) on request. Tensors are ordered like the safetensors library writes them (dtype
 // descending, then name). `__metadata__` keeps the source file's keys except `_quantization_metadata` (and earlier
 // mossinfer_* keys) and adds mossinfer_converter (version and the count of GEMMs per written spec),
-// mossinfer_kept_bf16 (JSON list of the GEMMs left bf16), mossinfer_source_xxh64 and, with LoRAs, mossinfer_lora.
+// mossinfer_kept_bf16 (JSON list of the GEMMs left bf16), mossinfer_source_xxh64 and, with LoRAs, mossinfer_lora (JSON
+// list, per file: file name, strength, xxh64 of its tensors and, for a moss-edit-lora adapter, "format":
+// "moss-edit-lora", which makes the output an edit-capable DiT: pipeline::baked_edit_adapters).
 //
 // NVFP4 output (ConvertOptions::nvfp4, `--format nvfp4`; NVFP4 plan §4.4 and "N3 converter: reproducible output"): the
 // block GEMM units (fused proj.qkv, proj.o, proj.ffn_up_gate, proj.ffn_down) become comfy_quant "nvfp4" with a recipe

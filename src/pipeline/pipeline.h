@@ -432,6 +432,8 @@ struct Result {
   std::string dit_linears;
   // A GGUF DiT file: the format it runs as (e.g. "GGUF Q4_K, runs as INT8 ConvRot"; pipeline/gguf_dit.h); else empty.
   std::string dit_format;
+  // A DiT file with an edit adapter baked in (baked_edit_adapters); else empty.
+  std::string dit_baked_edit;
   std::string time_embedding;  // PipelineOptions::time_embedding_file when a replacement step embedder ran (else empty)
   std::string te_source;     // the bundle's text_encoder directory or PipelineOptions::text_encoder_file
   std::string te_precision;  // qwen35_text::precision_name: "bf16", "int8_convrot", "w4a8"
@@ -537,6 +539,10 @@ struct DitFileInfo {
   int static_input_scales = 0;
   std::string remarks;
   bool nvfp4 = false;   // some linear is NVFP4
+  // baked_edit_adapters of the file's metadata: the moss-edit-lora adapters `moss-infer quantize --lora` merged into it
+  // (empty: none). Such a DiT is edit-capable: reference images run without the no-adapter warning, and an edit adapter
+  // passed again as a runtime LoRA is warned about (refused with lora_strict). The remarks name it too.
+  std::string baked_edit;
   std::string refusal;  // "<file>: <reason>" when nvfp4 and the NVFP4 refusal reason is not empty, else empty
 };
 // `nvfp4_refusal` says why NVFP4 linears cannot run where the file is meant to; it is called only for a file with NVFP4
@@ -550,6 +556,10 @@ struct DitFileInfo {
 // weights::FormatError for a malformed header. (Pipeline
 // keeps its own std::invalid_argument "DiT file not found: <file>" for a dit_file that does not exist.)
 DitFileInfo inspect_dit_file(const std::filesystem::path& file, const std::function<std::string()>& nvfp4_refusal);
+// The edit adapters baked into a DiT file: the entries of its mossinfer_lora metadata (quant::convert) marked "format":
+// "moss-edit-lora", as "<file> (strength <s>, xxh64 <hex>)", comma-separated; "" for none, for a file without the
+// metadata and for metadata that does not parse (it is informational: the weights load as they are).
+std::string baked_edit_adapters(const std::map<std::string, std::string>& metadata);
 // The same with the reason already known (e.g. for another device, or "" to index NVFP4 linears).
 DitFileInfo inspect_dit_file(const std::filesystem::path& file, std::string_view nvfp4_refusal);
 // The same on a header the caller already parsed (messages and reads use header.path(); the header is not read
