@@ -31,8 +31,8 @@
  *
  * Threading
  * - Each engine runs one job at a time: mi_generate(), mi_engine_preload(), mi_engine_release() or a component call
- *   (below). A concurrent one on the same engine fails with MI_ERR_BUSY. Different engines may run concurrently, but they share the GPU and the
- *   memory budgets are per engine.
+ *   (below). A concurrent one on the same engine fails with MI_ERR_BUSY. Different engines may run concurrently, but
+ *   they share the GPU and the memory budgets are per engine.
  * - mi_cancel() is thread-safe and may be called from any thread, including from inside a callback. It stops the job
  *   running on the engine, whichever it is.
  * - Callbacks run on the thread that called mi_generate() (or mi_engine_preload()), synchronously, while the GPU
@@ -1074,9 +1074,9 @@ MOSSINFER_API void mi_file_report_free(mi_file_report* report);
  * running call, mi_run_end() and mi_session_close() return MI_ERR_BUSY and do nothing; mi_engine_free() stays
  * forbidden there.
  *
- * Runs use the engine's tier and attention (mi_engine_params; explicit since 2.0) and are planned as mi_generate() plans
- * the equivalent request, within the engine's mode and budgets. Every image-affecting parameter is explicit; a default
- * is always a fixed constant.
+ * Runs use the engine's tier and attention (mi_engine_params; explicit since 2.0) and are planned as mi_generate()
+ * plans the equivalent request, within the engine's mode and budgets. Every image-affecting parameter is explicit; a
+ * default is always a fixed constant.
  *
  * Conventions (FLOW). x = (1 - sigma) x0 + sigma noise; each output is the DiT's raw output (the velocity), so
  * denoised = x - sigma * out; the DiT's timestep is fp32(sigma * 1000). No shift or multiplier is applied to a call's
@@ -1171,7 +1171,8 @@ MOSSINFER_API mi_status mi_text_params_init(mi_text_params* params, size_t struc
 /* Every prompt in one text-encoder pass, through the embedding cache, planned for the actual token counts.
  * out_conditionings[prompts_count] on MI_OK, none otherwise. A job: mi_cancel() stops it within one layer
  * (MI_CANCELLED). */
-MOSSINFER_API mi_status mi_encode_text(mi_engine* engine, const mi_text_params* params, mi_conditioning** out_conditionings);
+MOSSINFER_API mi_status mi_encode_text(mi_engine* engine, const mi_text_params* params,
+                                       mi_conditioning** out_conditionings);
 /* Foreign conditioning, copied: [S, MI_TEXT_DIM], 1 <= S <= 4096, F32 (rounded to bf16, nearest even) or BF16, host
  * or device (complete before the call). No engine. Used exactly like engine-encoded conditioning; the run's note says
  * it was foreign. */
@@ -1181,7 +1182,8 @@ MOSSINFER_API mi_status mi_conditioning_query(const mi_conditioning* c, mi_condi
 MOSSINFER_API mi_status mi_conditioning_prompt_tokens(const mi_conditioning* c, mi_prompt_tokens* out);
 /* Host BF16 view [S, MI_TEXT_DIM], owned by the conditioning. */
 MOSSINFER_API mi_status mi_conditioning_tensor(const mi_conditioning* c, mi_tensor* out);
-/* NULL is a no-op. mi_run_begin() copies what it needs: a conditioning may be freed while a run that uses it is open. */
+/* NULL is a no-op. mi_run_begin() copies what it needs: a conditioning may be freed while a run that uses it is
+ * open. */
 MOSSINFER_API void mi_conditioning_free(mi_conditioning* c);
 
 /* ---- runs */
@@ -1203,22 +1205,22 @@ typedef enum mi_step_output {
    * row stays at out[2] on every step. A row the call does not evaluate is left untouched: read mi_step_info.rows.
    * Default. */
   MI_STEP_OUTPUT_ROWS = 0,
-  MI_STEP_OUTPUT_GUIDED_VELOCITY = 1, /* MOSS only. out[0]: mi_generate's guidance in velocity space (CFG + SLG) */
-  MI_STEP_OUTPUT_GUIDED_DENOISED = 2, /* MOSS only. out[0]: mi_generate's guidance in denoised space (D = x - v sigma) */
+  MI_STEP_OUTPUT_GUIDED_VELOCITY = 1, /* MOSS only. out[0]: mi_generate's guidance (CFG + SLG), velocity space */
+  MI_STEP_OUTPUT_GUIDED_DENOISED = 2, /* MOSS only. out[0]: the guidance in denoised space (D = x - v sigma) */
   MI_STEP_OUTPUT_MAX_ENUM = 0x7fffffff
 } mi_step_output;
 
 /* One row of a run. A fixed 32-byte layout without struct_size (array element). */
 typedef struct mi_run_row {
   const mi_conditioning* conditioning; /* required */
-  const int32_t* skip_layers;          /* DiT blocks this row skips, unique, in [0, 42); the official uncond row: {22} */
+  const int32_t* skip_layers;          /* DiT blocks it skips, unique, in [0, 42); the official uncond row: {22} */
   size_t skip_layers_count;
   int32_t latent;                      /* the row's latent in the call's batch, 0..latents-1 (default 0) */
   int32_t _reserved0;                  /* must be 0 */
 } mi_run_row;
 
 /* mi_run_params.flags */
-#define MI_RUN_EXACT_SIGMA 0x1u /* refuse a sigma that is not an exact schedule entry (a host's own check); default off */
+#define MI_RUN_EXACT_SIGMA 0x1u /* refuse a sigma that is not an exact schedule entry (a host's check); default off */
 /* This run may make crop calls (area conds: x smaller than the run's size, HOST guidance): its plan reserves the
  * forward workspace's crop bound. mi_run_begin() refuses it (MI_ERR_INVALID_ARGUMENT, naming both counts) when that
  * bound would keep fewer DiT blocks resident than the run without it. Without the flag (default) a crop call that does
@@ -1394,11 +1396,11 @@ MOSSINFER_API mi_status mi_schedule(mi_scheduler scheduler, int32_t steps, doubl
  * (and for MI_SAMPLER_DATASPACE, which the component API does not offer). */
 MOSSINFER_API mi_step_output mi_sampler_prediction(mi_sampler sampler, mi_scheduler scheduler);
 /* mi_generate's initial noise for `seed` (0..2^53-1) and `layout` at width x height into out[128 * h * w]
- * (count = that many floats). */
-MOSSINFER_API mi_status mi_initial_noise(int64_t seed, mi_noise_layout layout, int32_t width, int32_t height, float* out,
-                                         size_t count);
+ * (count >= that many floats). */
+MOSSINFER_API mi_status mi_initial_noise(int64_t seed, mi_noise_layout layout, int32_t width, int32_t height,
+                                         float* out, size_t count);
 /* The pipeline's resize (PIL-exact Lanczos, `mode`) of an RGB or 1-channel image into out[width * height * channels]
- * (out_bytes = that many bytes). */
+ * (out_bytes >= that many bytes). */
 MOSSINFER_API mi_status mi_image_resize(const mi_image* image, int32_t width, int32_t height, mi_resize_mode mode,
                                         uint8_t* out, size_t out_bytes);
 

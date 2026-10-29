@@ -462,7 +462,8 @@ TEST(ComponentApi, TokenCap) {
   // 2048^2 with L = 2 and CFG: 4 rows of 16384 + text tokens each exceed MI_MAX_CALL_TOKENS.
   Cond a(50), b(10);
   const std::int32_t skip22[] = {22};
-  const mi_run_row rows[4] = {{a.c, nullptr, 0, 0, 0}, {b.c, skip22, 1, 0, 0}, {a.c, nullptr, 0, 1, 0}, {b.c, skip22, 1, 1, 0}};
+  const mi_run_row rows[4] = {
+      {a.c, nullptr, 0, 0, 0}, {b.c, skip22, 1, 0, 0}, {a.c, nullptr, 0, 1, 0}, {b.c, skip22, 1, 1, 0}};
   mi_run_params p = run_defaults();
   p.width = p.height = 2048;
   p.rows = rows;
@@ -515,8 +516,8 @@ TEST(ComponentApi, StepArgs) {
 }
 
 TEST(ComponentApi, ScheduleEqualsThePipelines) {
-  constexpr mi_scheduler kSchedulers[] = {MI_SCHEDULER_MOSS,        MI_SCHEDULER_SIMPLE, MI_SCHEDULER_NORMAL,
-                                          MI_SCHEDULER_KARRAS,      MI_SCHEDULER_EXPONENTIAL, MI_SCHEDULER_BETA,
+  constexpr mi_scheduler kSchedulers[] = {MI_SCHEDULER_MOSS,       MI_SCHEDULER_SIMPLE,      MI_SCHEDULER_NORMAL,
+                                          MI_SCHEDULER_KARRAS,     MI_SCHEDULER_EXPONENTIAL, MI_SCHEDULER_BETA,
                                           MI_SCHEDULER_SGM_UNIFORM};
   std::vector<float> buf(10001);
   for (const mi_scheduler k : kSchedulers) {
@@ -524,8 +525,8 @@ TEST(ComponentApi, ScheduleEqualsThePipelines) {
       for (const double shift : {1.0, 3.0, 5.0}) {
         for (const double mult : {1.0, 1000.0}) {
           for (const double strength : {1.0, 0.75, 0.5, 0.1}) {
-            const std::vector<float> want = mi::pipeline::engine_sigmas(mi::api::to_scheduler(k), steps,
-                                                                        mi::pipeline::FlowSampling{shift, mult}, strength);
+            const std::vector<float> want = mi::pipeline::engine_sigmas(
+                mi::api::to_scheduler(k), steps, mi::pipeline::FlowSampling{shift, mult}, strength);
             std::size_t n = 0;
             ASSERT_EQ(mi_schedule(k, steps, shift, mult, strength, nullptr, 0, &n), MI_OK) << last_error();
             ASSERT_EQ(n, want.size());
@@ -554,8 +555,8 @@ TEST(ComponentApi, ScheduleEqualsThePipelines) {
 
 TEST(ComponentApi, SamplerPredictionNoiseAndResize) {
   // SamplerDriver::prediction(): velocity for ab2 on any scheduler and for euler on moss; denoised otherwise.
-  constexpr mi_sampler kSamplers[] = {MI_SAMPLER_EULER,  MI_SAMPLER_AB2,         MI_SAMPLER_EULER_ANCESTRAL,
-                                      MI_SAMPLER_HEUN,   MI_SAMPLER_DPMPP_2M,    MI_SAMPLER_DPMPP_2M_SDE,
+  constexpr mi_sampler kSamplers[] = {MI_SAMPLER_EULER,  MI_SAMPLER_AB2,          MI_SAMPLER_EULER_ANCESTRAL,
+                                      MI_SAMPLER_HEUN,   MI_SAMPLER_DPMPP_2M,     MI_SAMPLER_DPMPP_2M_SDE,
                                       MI_SAMPLER_ER_SDE, MI_SAMPLER_RES_MULTISTEP};
   for (const mi_sampler s : kSamplers) {
     for (int k = MI_SCHEDULER_MOSS; k <= MI_SCHEDULER_SGM_UNIFORM; ++k) {
@@ -572,13 +573,15 @@ TEST(ComponentApi, SamplerPredictionNoiseAndResize) {
   for (const mi_noise_layout layout : {MI_NOISE_LAYOUT_OFFICIAL, MI_NOISE_LAYOUT_BATCH_STREAM}) {
     std::vector<float> got(128 * 24 * 32);
     ASSERT_EQ(mi_initial_noise(1234, layout, 512, 384, got.data(), got.size()), MI_OK) << last_error();
-    const std::vector<float> want = mi::pipeline::initial_noise(
-        layout == MI_NOISE_LAYOUT_OFFICIAL ? mi::pipeline::NoiseLayout::kOfficial : mi::pipeline::NoiseLayout::kBatchStream,
-        1234, 128, 24, 32);
+    const std::vector<float> want =
+        mi::pipeline::initial_noise(layout == MI_NOISE_LAYOUT_OFFICIAL ? mi::pipeline::NoiseLayout::kOfficial
+                                                                       : mi::pipeline::NoiseLayout::kBatchStream,
+                                    1234, 128, 24, 32);
     EXPECT_TRUE(got == want);
   }
   std::vector<float> small(10);
-  EXPECT_EQ(mi_initial_noise(1, MI_NOISE_LAYOUT_OFFICIAL, 512, 512, small.data(), small.size()), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_EQ(mi_initial_noise(1, MI_NOISE_LAYOUT_OFFICIAL, 512, 512, small.data(), small.size()),
+            MI_ERR_INVALID_ARGUMENT);
   EXPECT_EQ(mi_initial_noise(-1, MI_NOISE_LAYOUT_OFFICIAL, 16, 16, small.data(), 2048), MI_ERR_INVALID_ARGUMENT);
   EXPECT_EQ(mi_initial_noise(std::int64_t{1} << 53, MI_NOISE_LAYOUT_OFFICIAL, 16, 16, small.data(), 2048),
             MI_ERR_INVALID_ARGUMENT);
@@ -701,7 +704,8 @@ std::string plan_facts(const std::string& report) {
   const std::size_t from = at + key.size();
   std::string j = report.substr(from, report.find('\n', from) - from);
   j = std::regex_replace(j, std::regex("(free|host private|Arena cap) [0-9.]+ GiB"), "$1 X GiB");
-  return std::regex_replace(j, std::regex("\"(host_private_bytes|arena_cap_bytes|host_limit_bytes)\": ?[0-9]+"), "\"$1\": X");
+  return std::regex_replace(j, std::regex("\"(host_private_bytes|arena_cap_bytes|host_limit_bytes)\": ?[0-9]+"),
+                            "\"$1\": X");
 }
 
 // One engine per test (the SFT bundle, the INT8 DiT, high tier, q8_fp8 attention): 512^2, 6 steps.
@@ -757,7 +761,8 @@ class GpuComponentApi : public ::testing::Test {
   }
 
   // An open session with the request's two conditionings (prompt, negative prompt).
-  void open_and_encode(const mi_gen_params& q, mi_conditioning* conds[2], mi_progress_fn progress = nullptr, void* user = nullptr) {
+  void open_and_encode(const mi_gen_params& q, mi_conditioning* conds[2], mi_progress_fn progress = nullptr,
+                       void* user = nullptr) {
     mi_session_params sp;
     ASSERT_EQ(mi_session_params_init(&sp, sizeof sp), MI_OK);
     sp.plan_request = &q;

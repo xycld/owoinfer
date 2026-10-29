@@ -103,14 +103,19 @@ Tensor to_tensor(const mi_tensor& t, const char* what) {
     case MI_MEMORY_DEVICE: device = Device::kCUDA; break;
     default: unknown(n + ".memory", static_cast<int>(t.memory));
   }
-  if (t.rank < 1 || t.rank > 4) throw std::invalid_argument(n + ".rank must be 1 to 4, not " + std::to_string(t.rank) + ".");
+  if (t.rank < 1 || t.rank > 4) {
+    throw std::invalid_argument(n + ".rank must be 1 to 4, not " + std::to_string(t.rank) + ".");
+  }
   std::int64_t numel = 1;
   for (int i = 0; i < 4; ++i) {
     const std::int64_t d = t.shape[i];
     if (i < t.rank && (d < 1 || d > (std::int64_t{1} << 32))) {
-      throw std::invalid_argument(n + ".shape[" + std::to_string(i) + "] must be positive, not " + std::to_string(d) + ".");
+      throw std::invalid_argument(n + ".shape[" + std::to_string(i) + "] must be positive, not " + std::to_string(d) +
+                                  ".");
     }
-    if (i >= t.rank && d != 0) throw std::invalid_argument(n + ".shape[" + std::to_string(i) + "] must be 0 past the rank.");
+    if (i >= t.rank && d != 0) {
+      throw std::invalid_argument(n + ".shape[" + std::to_string(i) + "] must be 0 past the rank.");
+    }
     if (i < t.rank) numel *= d;
     if (numel > (std::int64_t{1} << 40)) throw std::invalid_argument(n + ": too many elements.");
   }
@@ -133,8 +138,8 @@ std::shared_ptr<const pipeline::Conditioning> to_conditioning(const mi_tensor& e
   if (e.data == nullptr) throw std::invalid_argument("embeddings.data is NULL.");
   if (e.rank != 2 || e.dim(1) != MI_TEXT_DIM || e.dim(0) < 1 || e.dim(0) > 4096 ||
       (e.dtype != DType::kF32 && e.dtype != DType::kBF16)) {
-    throw std::invalid_argument("embeddings: expected f32 or bf16 [1..4096, " + std::to_string(MI_TEXT_DIM) + "], got " +
-                                e.describe() + ".");
+    throw std::invalid_argument("embeddings: expected f32 or bf16 [1..4096, " + std::to_string(MI_TEXT_DIM) +
+                                "], got " + e.describe() + ".");
   }
   std::vector<std::byte> host(e.nbytes());
   if (e.device == Device::kCUDA) {
@@ -170,8 +175,12 @@ pipeline::SessionOptions to_session_options(const mi_session_params& p, pipeline
     util::check_user_path(o.control_adapter, "control_adapter");
     std::error_code ec;
     const fs::file_status st = fs::status(o.control_adapter, ec);
-    if (!fs::exists(st)) throw std::invalid_argument(std::string("control_adapter: file not found: ") + p.control_adapter);
-    if (!fs::is_regular_file(st)) throw std::invalid_argument(std::string("control_adapter: not a regular file: ") + p.control_adapter);
+    if (!fs::exists(st)) {
+      throw std::invalid_argument(std::string("control_adapter: file not found: ") + p.control_adapter);
+    }
+    if (!fs::is_regular_file(st)) {
+      throw std::invalid_argument(std::string("control_adapter: not a regular file: ") + p.control_adapter);
+    }
   }
   o.device = device;
   return o;
@@ -192,7 +201,8 @@ pipeline::RunSpec to_run_spec(const mi_run_params& p, const pipeline::SessionOpt
     default: unknown("output", static_cast<int>(p.output));
   }
   if ((p.flags & ~(MI_RUN_EXACT_SIGMA | MI_RUN_CROPS)) != 0) {
-    throw std::invalid_argument("flags: unknown bits " + std::to_string(p.flags & ~(MI_RUN_EXACT_SIGMA | MI_RUN_CROPS)) + ".");
+    throw std::invalid_argument("flags: unknown bits " +
+                                std::to_string(p.flags & ~(MI_RUN_EXACT_SIGMA | MI_RUN_CROPS)) + ".");
   }
   s.exact_sigma = (p.flags & MI_RUN_EXACT_SIGMA) != 0;
   s.crops = (p.flags & MI_RUN_CROPS) != 0;
@@ -208,18 +218,23 @@ pipeline::RunSpec to_run_spec(const mi_run_params& p, const pipeline::SessionOpt
     const std::string name = "rows[" + std::to_string(k) + "]";
     check_reserved(r._reserved0, name + "._reserved0");
     if (r.conditioning == nullptr) throw std::invalid_argument(name + ".conditioning is NULL.");
-    s.rows.push_back({r.conditioning->c, layer_list(r.skip_layers, r.skip_layers_count, name + ".skip_layers"), r.latent});
+    s.rows.push_back(
+        {r.conditioning->c, layer_list(r.skip_layers, r.skip_layers_count, name + ".skip_layers"), r.latent});
   }
 
   // The schedule.
-  if (p.sigmas == nullptr && p.sigmas_count > 0) throw std::invalid_argument("sigmas: NULL array with a nonzero count.");
+  if (p.sigmas == nullptr && p.sigmas_count > 0) {
+    throw std::invalid_argument("sigmas: NULL array with a nonzero count.");
+  }
   if (p.sigmas != nullptr && p.sigmas_count == 0) throw std::invalid_argument("sigmas: an array with a count of 0.");
   if (p.sigmas_count > pipeline::kMaxRunSigmas) {
     throw std::invalid_argument("sigmas: at most " + std::to_string(pipeline::kMaxRunSigmas) + " values, not " +
                                 std::to_string(p.sigmas_count) + ".");
   }
   if (p.sigmas != nullptr) s.sigmas.assign(p.sigmas, p.sigmas + p.sigmas_count);
-  if (p.steps < 1) throw std::invalid_argument("Steps must be between 1 and " + std::to_string(pipeline::kMaxDenoiseSteps) + ".");
+  if (p.steps < 1) {
+    throw std::invalid_argument("Steps must be between 1 and " + std::to_string(pipeline::kMaxDenoiseSteps) + ".");
+  }
   if (!std::isfinite(p.denoise_strength) || p.denoise_strength < 0 || p.denoise_strength > 1) {
     throw std::invalid_argument("Denoise strength must be between 0 and 1.");
   }
@@ -361,7 +376,9 @@ Generation to_generation(pipeline::RunResult& run, const std::filesystem::path& 
   Generation g = to_generation(q, run.result, false);
   g.component_note = run.note;
   std::string rows = "[";
-  for (std::size_t i = 0; i < run.foreign_rows.size(); ++i) rows += (i ? ", " : "") + std::to_string(run.foreign_rows[i]);
+  for (std::size_t i = 0; i < run.foreign_rows.size(); ++i) {
+    rows += (i ? ", " : "") + std::to_string(run.foreign_rows[i]);
+  }
   rows += "]";
   const std::string component = ",\n \"component\": {\"guidance\": \"" + std::string(guidance_name(run.guidance)) +
                                 "\", \"schedule_matches\": " + (run.schedule_matches ? "true" : "false") +
@@ -369,7 +386,8 @@ Generation to_generation(pipeline::RunResult& run, const std::filesystem::path& 
                                 ", \"foreign_rows\": " + rows + ", \"calls\": " + std::to_string(run.calls) +
                                 ", \"note\": " + pipeline::json_escape(run.note) + "}";
   const std::string end = "\n}\n";  // render_report's closing brace
-  if (g.report_tail.size() >= end.size() && g.report_tail.compare(g.report_tail.size() - end.size(), end.size(), end) == 0) {
+  if (g.report_tail.size() >= end.size() &&
+      g.report_tail.compare(g.report_tail.size() - end.size(), end.size(), end) == 0) {
     g.report_tail.insert(g.report_tail.size() - end.size(), component);
   }
   return g;
@@ -378,8 +396,9 @@ Generation to_generation(pipeline::RunResult& run, const std::filesystem::path& 
 ComponentSession::ComponentSession(PipelineAdapter& adapter, runtime::JobGate& gate, const mi_session_params& params)
     : adapter_(adapter) {
   pipeline::Request plan;
-  if (params.plan_request != nullptr) plan = adapter.session_request(*params.plan_request);
-  else {
+  if (params.plan_request != nullptr) {
+    plan = adapter.session_request(*params.plan_request);
+  } else {
     mi_gen_params g;
     if (mi_gen_params_init(&g, sizeof g) != MI_OK) throw std::logic_error("mi_gen_params_init failed");
     plan = adapter.session_request(g);
@@ -412,7 +431,9 @@ bool ComponentSession::close() {
 
 std::vector<std::shared_ptr<const pipeline::Conditioning>> ComponentSession::encode_text(const mi_text_params& p) {
   check_reserved(p._reserved0, "mi_text_params._reserved0");
-  if (p.prompts_count > 0 && p.prompts == nullptr) throw std::invalid_argument("prompts: NULL array with a nonzero count.");
+  if (p.prompts_count > 0 && p.prompts == nullptr) {
+    throw std::invalid_argument("prompts: NULL array with a nonzero count.");
+  }
   if (p.prompts_count < 1 || p.prompts_count > 8) throw std::invalid_argument("mi_encode_text takes 1 to 8 prompts.");
   std::vector<std::string> prompts;
   for (std::size_t i = 0; i < p.prompts_count; ++i) {
@@ -459,7 +480,9 @@ std::optional<Generation> ComponentSession::end_run() {
 void ComponentSession::vae_encode(const mi_image& image, const mi_tensor& latents) {
   check_reserved(image._reserved0, "image._reserved0");
   if (image.pixels == nullptr) throw std::invalid_argument("image.pixels is NULL.");
-  if (image.channels != 3) throw std::invalid_argument("image.channels must be 3 (RGB), not " + std::to_string(image.channels) + ".");
+  if (image.channels != 3) {
+    throw std::invalid_argument("image.channels must be 3 (RGB), not " + std::to_string(image.channels) + ".");
+  }
   if (image.width < 1 || image.height < 1 || image.width > pipeline::kMaxSide || image.height > pipeline::kMaxSide) {
     throw std::invalid_argument("image size " + std::to_string(image.width) + "x" + std::to_string(image.height) +
                                 ": each side must be 1 to " + std::to_string(pipeline::kMaxSide) + ".");

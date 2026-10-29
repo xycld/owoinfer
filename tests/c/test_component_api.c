@@ -20,16 +20,31 @@ typedef void (*any_fn)(void);
 
 int main(void) {
   /* Every frozen symbol (design §7.4): taking each address makes the link fail if one is missing. */
-  const any_fn symbols[] = {
-      (any_fn)mi_session_params_init, (any_fn)mi_session_open,     (any_fn)mi_session_close,
-      (any_fn)mi_text_params_init,    (any_fn)mi_encode_text,      (any_fn)mi_conditioning_create,
-      (any_fn)mi_conditioning_query,  (any_fn)mi_conditioning_prompt_tokens, (any_fn)mi_conditioning_tensor,
-      (any_fn)mi_conditioning_free,   (any_fn)mi_run_params_init,  (any_fn)mi_run_begin,
-      (any_fn)mi_run_query,           (any_fn)mi_run_sigmas,       (any_fn)mi_run_adopt_staging,
-      (any_fn)mi_run_staging,         (any_fn)mi_step_params_init, (any_fn)mi_denoise_step,
-      (any_fn)mi_run_end,             (any_fn)mi_vae_encode,       (any_fn)mi_vae_decode,
-      (any_fn)mi_schedule,            (any_fn)mi_sampler_prediction, (any_fn)mi_initial_noise,
-      (any_fn)mi_image_resize};
+  const any_fn symbols[] = {(any_fn)mi_session_params_init,
+                            (any_fn)mi_session_open,
+                            (any_fn)mi_session_close,
+                            (any_fn)mi_text_params_init,
+                            (any_fn)mi_encode_text,
+                            (any_fn)mi_conditioning_create,
+                            (any_fn)mi_conditioning_query,
+                            (any_fn)mi_conditioning_prompt_tokens,
+                            (any_fn)mi_conditioning_tensor,
+                            (any_fn)mi_conditioning_free,
+                            (any_fn)mi_run_params_init,
+                            (any_fn)mi_run_begin,
+                            (any_fn)mi_run_query,
+                            (any_fn)mi_run_sigmas,
+                            (any_fn)mi_run_adopt_staging,
+                            (any_fn)mi_run_staging,
+                            (any_fn)mi_step_params_init,
+                            (any_fn)mi_denoise_step,
+                            (any_fn)mi_run_end,
+                            (any_fn)mi_vae_encode,
+                            (any_fn)mi_vae_decode,
+                            (any_fn)mi_schedule,
+                            (any_fn)mi_sampler_prediction,
+                            (any_fn)mi_initial_noise,
+                            (any_fn)mi_image_resize};
   size_t i;
   mi_session_params sp;
   mi_text_params tp;
@@ -68,14 +83,18 @@ int main(void) {
              sigmas[8] == 0.0f,
          "schedule values");
   for (i = 0; i + 1 < count; ++i) expect(sigmas[i] >= sigmas[i + 1], "schedule non-increasing");
-  expect(mi_schedule(MI_SCHEDULER_MOSS, 8, 5.0, 1.0, 0.5, NULL, 0, &count) == MI_OK && count == 5, "strength 0.5 crops");
+  expect(mi_schedule(MI_SCHEDULER_MOSS, 8, 5.0, 1.0, 0.5, NULL, 0, &count) == MI_OK && count == 5,
+         "strength 0.5 crops");
   expect(mi_schedule(MI_SCHEDULER_MOSS, 8, 5.0, 1.0, 0.0, NULL, 0, &count) == MI_OK && count == 0, "strength 0: empty");
   expect(mi_sampler_prediction(MI_SAMPLER_EULER, MI_SCHEDULER_MOSS) == MI_STEP_OUTPUT_GUIDED_VELOCITY, "euler on moss");
-  expect(mi_sampler_prediction(MI_SAMPLER_HEUN, MI_SCHEDULER_KARRAS) == MI_STEP_OUTPUT_GUIDED_DENOISED, "heun on karras");
+  expect(mi_sampler_prediction(MI_SAMPLER_HEUN, MI_SCHEDULER_KARRAS) == MI_STEP_OUTPUT_GUIDED_DENOISED,
+         "heun on karras");
   expect(mi_initial_noise(42, MI_NOISE_LAYOUT_OFFICIAL, 16, 16, noise, 128) == MI_OK, "noise");
-  expect(mi_initial_noise(42, MI_NOISE_LAYOUT_OFFICIAL, 16, 16, noise2, 128) == MI_OK && memcmp(noise, noise2, sizeof noise) == 0,
+  expect(mi_initial_noise(42, MI_NOISE_LAYOUT_OFFICIAL, 16, 16, noise2, 128) == MI_OK &&
+             memcmp(noise, noise2, sizeof noise) == 0,
          "noise is deterministic");
-  expect(mi_initial_noise(43, MI_NOISE_LAYOUT_OFFICIAL, 16, 16, noise2, 128) == MI_OK && memcmp(noise, noise2, sizeof noise) != 0,
+  expect(mi_initial_noise(43, MI_NOISE_LAYOUT_OFFICIAL, 16, 16, noise2, 128) == MI_OK &&
+             memcmp(noise, noise2, sizeof noise) != 0,
          "noise depends on the seed");
 
   /* Without an engine. */

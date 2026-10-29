@@ -38,7 +38,8 @@ std::shared_ptr<const pipeline::Conditioning> to_conditioning(const mi_tensor& e
 
 // The session's options from `params` (a full-size struct), with its plan request (PipelineAdapter::session_request,
 // or the defaults') and the engine's device. Throws std::invalid_argument.
-pipeline::SessionOptions to_session_options(const mi_session_params& params, pipeline::Request plan_request, int device);
+pipeline::SessionOptions to_session_options(const mi_session_params& params, pipeline::Request plan_request,
+                                            int device);
 
 // A run's spec from `params` (a full-size struct) for a session of `options`: the component fields checked here, the
 // fields mi_gen_params shares (sizes, steps, schedule fields, LoRAs, control images, accelerators) read and checked as

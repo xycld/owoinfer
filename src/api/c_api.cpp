@@ -359,7 +359,8 @@ MI_LAYOUT(mi_file_info, lora_unknown_keys, 44);
 MI_LAYOUT(mi_file_info, control_kind_count, 48);
 MI_LAYOUT(mi_file_info, _reserved0, 52);
 // The component API (2.1).
-static_assert(sizeof(mi_memory) == 4 && sizeof(mi_dtype) == 4 && sizeof(mi_guidance) == 4 && sizeof(mi_step_output) == 4,
+static_assert(sizeof(mi_memory) == 4 && sizeof(mi_dtype) == 4 && sizeof(mi_guidance) == 4 &&
+                  sizeof(mi_step_output) == 4,
               "C API enums are 32-bit");
 static_assert(sizeof(mi_tensor) == 56);  // no struct_size, frozen
 MI_LAYOUT(mi_tensor, data, 0);
@@ -1427,12 +1428,14 @@ mi_status mi_session_params_init(mi_session_params* params, size_t struct_size) 
 mi_status mi_session_open(mi_engine* engine, const mi_session_params* params) {
   return guarded([&] {
     require(engine, "engine");
-    mi_session_params p = params != nullptr ? read_input<mi_session_params>(params, std::span(&kSessionParamsSize, 1),
-                                                                            session_params_defaults, "mi_session_params")
-                                            : session_params_defaults();
+    mi_session_params p = params != nullptr
+                              ? read_input<mi_session_params>(params, std::span(&kSessionParamsSize, 1),
+                                                              session_params_defaults, "mi_session_params")
+                              : session_params_defaults();
     mi_gen_params plan{};
     if (p.plan_request != nullptr) {
-      plan = read_input<mi_gen_params>(p.plan_request, kGenParamsSizes, gen_params_defaults, "mi_session_params.plan_request");
+      plan = read_input<mi_gen_params>(p.plan_request, kGenParamsSizes, gen_params_defaults,
+                                       "mi_session_params.plan_request");
       check_reserved(plan);
       p.plan_request = &plan;
     }
@@ -1616,7 +1619,9 @@ mi_status mi_run_staging(mi_engine* engine, mi_tensor* x, mi_tensor* outs, size_
     const SessionRef session(*engine);
     const mi::pipeline::StagingViews v = session->staging();
     if (x != nullptr) *x = mi::api::from_tensor(v.x);
-    for (std::size_t k = 0; k < outs_count && k < static_cast<std::size_t>(v.outputs); ++k) outs[k] = mi::api::from_tensor(v.out[k]);
+    for (std::size_t k = 0; k < outs_count && k < static_cast<std::size_t>(v.outputs); ++k) {
+      outs[k] = mi::api::from_tensor(v.out[k]);
+    }
     if (control != nullptr) *control = mi::api::from_tensor(v.control);
     return MI_OK;
   });
@@ -1679,16 +1684,17 @@ mi_status mi_vae_decode(mi_engine* engine, const mi_tensor* latents, const mi_te
   });
 }
 
-mi_status mi_schedule(mi_scheduler scheduler, int32_t steps, double shift, double flow_multiplier, double denoise_strength,
-                      float* sigmas, size_t capacity, size_t* count) {
+mi_status mi_schedule(mi_scheduler scheduler, int32_t steps, double shift, double flow_multiplier,
+                      double denoise_strength, float* sigmas, size_t capacity, size_t* count) {
   return guarded([&] {
     require(count, "count");
     *count = 0;
     if (steps < 1 || steps > mi::pipeline::kMaxDenoiseSteps) {
-      throw std::invalid_argument("Steps must be between 1 and " + std::to_string(mi::pipeline::kMaxDenoiseSteps) + ".");
+      throw std::invalid_argument("Steps must be between 1 and " + std::to_string(mi::pipeline::kMaxDenoiseSteps) +
+                                  ".");
     }
-    const std::vector<float> s = mi::pipeline::engine_sigmas(mi::api::to_scheduler(scheduler), steps,
-                                                             mi::pipeline::FlowSampling{shift, flow_multiplier}, denoise_strength);
+    const std::vector<float> s = mi::pipeline::engine_sigmas(
+        mi::api::to_scheduler(scheduler), steps, mi::pipeline::FlowSampling{shift, flow_multiplier}, denoise_strength);
     *count = s.size();
     if (sigmas == nullptr) return MI_OK;
     if (capacity < s.size()) {
@@ -1705,29 +1711,38 @@ mi_step_output mi_sampler_prediction(mi_sampler sampler, mi_scheduler scheduler)
   guarded([&] {
     const mi::pipeline::SamplerKind k = mi::api::to_sampler(sampler);
     const mi::pipeline::SchedulerKind s = mi::api::to_scheduler(scheduler);
-    if (k == mi::pipeline::SamplerKind::kDataSpace) throw std::invalid_argument("The dataspace sampler has no step-wise form.");
+    if (k == mi::pipeline::SamplerKind::kDataSpace) {
+      throw std::invalid_argument("The dataspace sampler has no step-wise form.");
+    }
     // SamplerDriver::prediction(): velocity for ab2 and for the official euler (euler on the moss schedule).
-    const bool velocity =
-        k == mi::pipeline::SamplerKind::kAb2 || (k == mi::pipeline::SamplerKind::kEuler && s == mi::pipeline::SchedulerKind::kMoss);
+    const bool velocity = k == mi::pipeline::SamplerKind::kAb2 ||
+                          (k == mi::pipeline::SamplerKind::kEuler && s == mi::pipeline::SchedulerKind::kMoss);
     out = velocity ? MI_STEP_OUTPUT_GUIDED_VELOCITY : MI_STEP_OUTPUT_GUIDED_DENOISED;
     return MI_OK;
   });
   return out;
 }
 
-mi_status mi_initial_noise(int64_t seed, mi_noise_layout layout, int32_t width, int32_t height, float* out, size_t count) {
+mi_status mi_initial_noise(int64_t seed, mi_noise_layout layout, int32_t width, int32_t height, float* out,
+                           size_t count) {
   return guarded([&] {
     require(out, "out");
-    if (seed < 0 || seed >= mi::pipeline::kMaxSeed) throw std::invalid_argument("Seed must be an integer from 0 to 2^53-1.");
+    if (seed < 0 || seed >= mi::pipeline::kMaxSeed) {
+      throw std::invalid_argument("Seed must be an integer from 0 to 2^53-1.");
+    }
     if (width < 16 || height < 16 || width % 16 != 0 || height % 16 != 0 || width > mi::pipeline::kMaxSide ||
         height > mi::pipeline::kMaxSide) {
       throw std::invalid_argument("Width and height must be multiples of 16 from 16 to " +
                                   std::to_string(mi::pipeline::kMaxSide) + ".");
     }
     const std::size_t n = static_cast<std::size_t>(MI_LATENT_CHANNELS) * (height / 16) * (width / 16);
-    if (count < n) throw std::invalid_argument("out: " + std::to_string(count) + " floats, the noise has " + std::to_string(n) + ".");
-    const std::vector<float> noise = mi::pipeline::initial_noise(mi::api::to_noise_layout(layout), static_cast<std::uint64_t>(seed),
-                                                                 MI_LATENT_CHANNELS, height / 16, width / 16);
+    if (count < n) {
+      throw std::invalid_argument("out: " + std::to_string(count) + " floats, the noise has " + std::to_string(n) +
+                                  ".");
+    }
+    const std::vector<float> noise =
+        mi::pipeline::initial_noise(mi::api::to_noise_layout(layout), static_cast<std::uint64_t>(seed),
+                                    MI_LATENT_CHANNELS, height / 16, width / 16);
     std::copy(noise.begin(), noise.end(), out);
     return MI_OK;
   });
@@ -1742,7 +1757,8 @@ mi_status mi_image_resize(const mi_image* image, int32_t width, int32_t height, 
     check_reserved(image->_reserved0, "image._reserved0");
     constexpr int32_t kMaxSide = 16384;  // the image-input side limit
     if (image->channels != 1 && image->channels != 3) {
-      throw std::invalid_argument("image.channels must be 3 (RGB) or 1 (grayscale), not " + std::to_string(image->channels) + ".");
+      throw std::invalid_argument("image.channels must be 3 (RGB) or 1 (grayscale), not " +
+                                  std::to_string(image->channels) + ".");
     }
     if (image->width < 1 || image->height < 1 || image->width > kMaxSide || image->height > kMaxSide || width < 1 ||
         height < 1 || width > kMaxSide || height > kMaxSide) {
@@ -1750,12 +1766,16 @@ mi_status mi_image_resize(const mi_image* image, int32_t width, int32_t height, 
     }
     const mi::pipeline::ResizeMode m = mi::api::to_resize(mode);
     const std::size_t need = static_cast<std::size_t>(width) * height * image->channels;
-    if (out_bytes < need) throw std::invalid_argument("out: " + std::to_string(out_bytes) + " bytes, the image needs " + std::to_string(need) + ".");
+    if (out_bytes < need) {
+      throw std::invalid_argument("out: " + std::to_string(out_bytes) + " bytes, the image needs " +
+                                  std::to_string(need) + ".");
+    }
     mi::pipeline::Image src;
     src.width = image->width;
     src.height = image->height;
     src.channels = image->channels;
-    src.pixels.assign(image->pixels, image->pixels + static_cast<std::size_t>(image->width) * image->height * image->channels);
+    src.pixels.assign(image->pixels,
+                      image->pixels + static_cast<std::size_t>(image->width) * image->height * image->channels);
     const mi::pipeline::Image dst = mi::pipeline::resize_to(src, width, height, m);
     std::copy(dst.pixels.begin(), dst.pixels.end(), out);
     return MI_OK;
