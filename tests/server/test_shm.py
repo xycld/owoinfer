@@ -148,10 +148,9 @@ class ShmTest(unittest.TestCase):
         self.helper.kill()
         self.assertFalse(os.path.exists(shm_path(named[1])))
         self.assertTrue(os.path.exists(shm_path(unnamed[1])))
-        # A server's own sweep leaves regions younger than 10 minutes alone (another PID namespace may own them).
-        self.assertNotIn(unnamed[1], sweep(600))
-        self.assertTrue(os.path.exists(shm_path(unnamed[1])))
-        self.assertIn(unnamed[1], sweep())
+        # A server's own sweep (its 10-minute floor for unproven files) removes it at once: its header proves the dead
+        # pid and this PID namespace.
+        self.assertIn(unnamed[1], sweep(600))
         self.assertFalse(os.path.exists(shm_path(unnamed[1])))
         self.assertNotIn(unnamed[1], sweep())
 

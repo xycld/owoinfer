@@ -55,9 +55,13 @@ void DevicePointerCheck::check(const void* ptr, std::size_t bytes, std::string_v
   if (info->context != nullptr && primary_ != nullptr && info->context != primary_) {
     refuse(what, device_, "belongs to a CUDA context other than the device's primary context");
   }
-  // The whole tensor mapped: through one allocation, or VMM allocations mapped back to back.
-  if (const std::optional<std::size_t> mapped = backend::mapped_device_bytes(ptr, bytes, device_); mapped && *mapped < bytes) {
-    refuse(what, device_, "needs " + std::to_string(bytes) + " bytes, but only " + std::to_string(*mapped) +
+  // The whole tensor mapped: through one allocation, or VMM allocations mapped back to back in one reservation.
+  if (const std::optional<backend::MappedExtent> mapped = backend::mapped_device_bytes(ptr, bytes, device_, primary_);
+      mapped && mapped->bytes < bytes) {
+    if (!mapped->driver_error.empty()) {
+      refuse(what, device_, "could not be checked over its " + std::to_string(bytes) + " bytes (" + mapped->driver_error + ")");
+    }
+    refuse(what, device_, "needs " + std::to_string(bytes) + " bytes, but only " + std::to_string(mapped->bytes) +
                               " are mapped device memory from that address");
   }
 }

@@ -281,28 +281,52 @@ std::optional<PointerInfo> pointer_info(const void* ptr) {
   return out;
 }
 
-std::optional<std::size_t> mapped_device_bytes(const void* ptr, std::size_t want, int device) {
+std::optional<MappedExtent> mapped_device_bytes(const void* ptr, std::size_t want, int device, void* context) {
   const Driver& d = driver();
-  if (!d.ok || d.mem_address_range == nullptr || d.pointer_attributes == nullptr) return std::nullopt;
+  if (!d.ok || d.mem_address_range == nullptr || d.pointer_attributes == nullptr || context == nullptr) return std::nullopt;
+  MappedExtent out;
+  if (const CUresult r = d.push(static_cast<CUcontext>(context)); r != CUDA_SUCCESS) {
+    out.driver_error = "cuCtxPushCurrent: " + error_text(d, r);
+    return out;
+  }
   const CUdeviceptr begin = device_address(ptr);
   CUdeviceptr at = begin;
+  CUdeviceptr reservation = 0;  // the first allocation's RANGE_START_ADDR (its VMM reservation, or itself)
   while (at - begin < want) {
+    // The allocation at `at`: the first one, or the next of the same reservation, of this device and context.
+    unsigned int type = 0, managed = 0;
+    int ordinal = -1;
+    CUcontext ctx = nullptr;
+    CUdeviceptr start = 0;
+    CUpointer_attribute attrs[] = {CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                   CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, CU_POINTER_ATTRIBUTE_CONTEXT,
+                                   CU_POINTER_ATTRIBUTE_IS_MANAGED};
+    void* data[] = {&start, &type, &ordinal, &ctx, &managed};
+    // The first allocation was checked by the caller (pointer_info); its reservation is all this call is for.
+    const unsigned count = at == begin ? 1u : static_cast<unsigned>(std::size(attrs));
+    if (const CUresult r = d.pointer_attributes(count, attrs, data, at); r != CUDA_SUCCESS) {
+      out.driver_error = "cuPointerGetAttributes: " + error_text(d, r);
+      break;
+    }
+    if (at == begin) {
+      reservation = start;
+    } else if (start != reservation || type != CU_MEMORYTYPE_DEVICE || ordinal != device || managed != 0 ||
+               (ctx != nullptr && ctx != static_cast<CUcontext>(context))) {
+      break;
+    }
     CUdeviceptr base = 0;
     std::size_t size = 0;
-    if (d.mem_address_range(&base, &size, at) != CUDA_SUCCESS || size == 0 || base > at || at - base >= size) break;
-    if (at != begin) {
-      // A further allocation: device memory of the same device (a reservation may map another device's memory).
-      unsigned int type = 0;
-      int ordinal = -1;
-      CUpointer_attribute attrs[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL};
-      void* data[] = {&type, &ordinal};
-      if (d.pointer_attributes(2, attrs, data, at) != CUDA_SUCCESS || type != CU_MEMORYTYPE_DEVICE || ordinal != device) {
-        break;
-      }
+    if (const CUresult r = d.mem_address_range(&base, &size, at); r != CUDA_SUCCESS) {
+      if (r != CUDA_ERROR_NOT_FOUND && r != CUDA_ERROR_INVALID_VALUE) out.driver_error = "cuMemGetAddressRange: " + error_text(d, r);
+      break;  // not mapped (or the error named)
     }
+    if (size == 0 || base > at || at - base >= size) break;
     at = base + size;
   }
-  return std::min<std::size_t>(static_cast<std::size_t>(at - begin), want);
+  CUcontext popped = nullptr;
+  d.pop(&popped);
+  out.bytes = std::min<std::size_t>(static_cast<std::size_t>(at - begin), want);
+  return out;
 }
 
 ScopedCurrentContext::ScopedCurrentContext() noexcept {
