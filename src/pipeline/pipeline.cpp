@@ -219,6 +219,33 @@ void check_user_paths(const PipelineOptions& o, const Request& r) {
 
 }  // namespace
 
+namespace detail {
+
+std::size_t denoise_stack_bytes(const DenoiseStack& d, moss_dit::BlockPath path, const moss_dit::ComputeConfig& config,
+                                const moss_dit::FusedRouteSnapshot& route) {
+  const std::int64_t lh = d.height / 16, lw = d.width / 16;
+  const std::size_t lat = latent_bytes_of(d.height, d.width);
+  std::size_t refined_bytes = 0, refine_need = 0;
+  std::int64_t longest = 0;
+  for (const std::int64_t s : d.texts) {
+    refined_bytes += bf16_rows(s, moss_dit::kDim);
+    refine_need += bf16_rows(s, moss_dit::kTextDim);
+    longest = std::max(longest, s);
+  }
+  refine_need += moss_dit::MossDit::encode_text_workspace_bytes(longest);
+  const std::size_t forward_bytes = moss_dit::MossDit::workspace_bytes(lh, lw, d.rows, path, config, &route);
+  // A control adapter's input latents [G * 128, h, w] per latent (moss_dit::InputExtension::extra), next to the latents.
+  const std::size_t latents = static_cast<std::size_t>(d.latents) * lat;
+  const std::size_t control_bytes = static_cast<std::size_t>(d.control_groups) * latents;
+  // A latent preview: the previous latents, the x0 estimate, the preview's scratch and its RGB image.
+  const std::size_t preview_bytes =
+      d.preview ? 2 * lat + align_up(latent_preview::workspace_bytes(lh, lw)) + align_up(image_bytes_of(d.height, d.width)) : 0;
+  return refined_bytes + std::max(refine_need, latents + control_bytes + preview_bytes +
+                                                   std::max(d.loop_bytes + forward_bytes, d.from_image ? lat : 0));
+}
+
+}  // namespace detail
+
 DitFileInfo inspect_dit_file(const weights::SafetensorsFile& header,
                              const std::function<std::string()>& nvfp4_refusal) {
   const std::filesystem::path& file = header.path();
@@ -886,6 +913,231 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
   return {&b, &src, &tes, &vs, ctl, merge_key};
 }
 
+Pipeline::Impl::CallDit Pipeline::Impl::setup_dit_call(const DitSource& src, Result& r) {
+  r.hardware = hardware(*src.index);
+  CallDit d;
+  d.block_path = block_path(r.block_path_note);
+  // One fused route for the whole request: it sizes the denoise workspace and every step runs under it, so a poisoning
+  // meanwhile (another pipeline's failed self-check) applies from the next request on instead of failing a step.
+  d.route = d.block_path == moss_dit::BlockPath::kOpByOp ? moss_dit::FusedRouteSnapshot{} : moss_dit::fused_route_snapshot();
+  d.attention = dit_attention(r.tier.attention);
+  // The side branches run on the quantized block path (its fused LoRA GEMMs; on NVFP4 sites a stored Δ).
+  d.config = moss_dit::MossDit::compute_config(src.quant.get(), d.attention, moss_dit::Int4Route::kAuto, lora_sb.get());
+  return d;
+}
+
+Pipeline::Impl::Planned Pipeline::Impl::plan_call(const CallModels& models, const PlanCall& c,
+                                                  moss_dit::BlockPath block_path, Result& r) {
+  Impl& m = *this;
+  const Bundle& b = *models.b;
+  const DitSource& src = *models.src;
+  const TeSource& tes = *models.tes;
+  const VaeSource& vs = *models.vs;
+  const std::string& merge_key = models.merge_key;
+  const EncoderSource* enc_src = c.encoder;
+  const std::vector<std::int64_t>& te_lengths = c.te_lengths;
+  const bool need_dit = c.need_dit;
+  const bool need_decoder = c.decode_height > 0;
+  const int dec_h = c.decode_height, dec_w = c.decode_width;
+  planner::PlanInputs in;
+  in.shapes = planner::shapes_from_index(b.index, src.quant ? src.index : nullptr, src.precision,
+                                         tes.model ? &tes.model->index() : nullptr, vs.file);
+  in.shapes.dit_bytes = moss_dit::MossDit::persistent_bytes(*src.index);
+  if (src.quant) in.shapes.dit_int8_fraction = moss_dit::int8_gemm_fraction(src.quant.get());
+  if (src.quant) in.shapes.dit_int4_fraction = moss_dit::int4_gemm_fraction(src.quant.get());
+  if (src.quant) in.shapes.dit_nvfp4_fraction = moss_dit::nvfp4_gemm_fraction(src.quant.get());
+  if (src.quant && m.lora_sb) {
+    // INT4 sites with an active LoRA side branch run the INT8 LoRA GEMMs: costed at INT8 speed.
+    const double f = moss_dit::int4_side_branch_fraction(src.quant.get(), *m.lora_sb);
+    in.shapes.dit_int4_fraction -= f;
+    in.shapes.dit_int8_fraction = moss_dit::int8_gemm_fraction(src.quant.get()) + f;
+  }
+  in.shapes.dit_block_bytes = align_up(moss_dit::BlockWeights::block_device_bytes(*src.index));  // the buffers' size
+  // The VAE side of the persistent region: the decoder and the encoder this request uses, plus those an earlier
+  // request left resident (counted in every phase; when that alone makes the request infeasible, plan without them and
+  // recreate the arena, dropping them, below).
+  const std::size_t dec_bytes = flux2_vae::Flux2VaeDecoder::persistent_bytes(*vs.index);
+  const std::size_t needed_vae = (need_decoder ? dec_bytes : 0) + (enc_src != nullptr ? enc_src->persistent : 0);
+  const std::size_t held_vae = (!need_decoder && m.vae ? dec_bytes : 0) +
+                               (enc_src == nullptr && m.encoder && m.encoder_src != nullptr ? m.encoder_src->persistent : 0);
+  in.shapes.vae_bytes = needed_vae + held_vae > 0 ? needed_vae + held_vae : dec_bytes;
+  in.request.height = c.height;
+  in.request.width = c.width;
+  in.request.text_lengths = c.text_lengths;
+  in.request.steps = c.steps;
+  in.request.rows_per_step = c.rows_per_step;
+  in.request.te_lengths = te_lengths;
+  in.request.decode = need_decoder;
+  in.request.te_cached = te_lengths.empty();
+  in.request.weights_cached = m.weights_cached();
+  in.request.dit_weights_cached = m.dit_weights_cached();
+  in.request.vae_resident = needed_vae + held_vae > 0;
+  in.workspaces.text_encoder = [&](planner::TeResidency residency, int buffers) {
+    return m.te_workspace(tes, te_lengths, m.te_options(tes, residency, buffers, false));
+  };
+  in.workspaces.denoise = c.denoise;
+  if (need_decoder) {
+    const std::int64_t dh = dec_h / 16, dw = dec_w / 16;
+    const std::size_t dec_latent = latent_bytes_of(dec_h, dec_w);
+    in.workspaces.decode = dec_latent + flux2_vae::Flux2VaeDecoder::workspace_bytes(vs.config, dh, dw, kDecodeMode);
+    in.workspaces.decode_tiled = [&, dh, dw, dec_latent](std::size_t budget) -> std::optional<planner::TiledDecode> {
+      std::optional<flux2_vae::TilePlan> tp;
+      if (budget == 0) {
+        tp = flux2_vae::Flux2VaeDecoder::plan_tiled_min_memory(vs.config, dh, dw, kDecodeMode, 8);
+      } else if (budget > dec_latent) {
+        tp = flux2_vae::Flux2VaeDecoder::plan_tiled(vs.config, dh, dw, kDecodeMode, budget - dec_latent);
+      }
+      if (!tp) return std::nullopt;
+      return planner::TiledDecode{dec_latent + tp->workspace_bytes, tp->relative_cost, tp->tile};
+    };
+  }
+  in.workspaces.host_buffers = c.host_buffers;
+  // The pristine copies of LoRA-merged modules the DiT keeps on the host (held_host_bytes takes a loaded DiT's out of
+  // the baseline, so they count once).
+  if (!merge_key.empty()) in.workspaces.host_buffers += moss_dit::MossDit::pristine_bytes(*m.lora_stack, src.quant.get());
+  in.caps.te_max_buffers = 2;
+  in.caps.te_ring_bytes = Impl::te_host(tes, m.te_options(tes, planner::TeResidency::kStreamed, 2, false));
+  in.caps.te_host_resident = true;
+  in.caps.te_host_pinned = !tes.pin_failed;
+  in.caps.te_host_pageable = !tes.model;  // a quantized encoder held in RAM is always pinned (te_options)
+  in.caps.te_quantized = tes.model != nullptr;
+  in.caps.te_pin = m.options.te_host_pin;
+  if (tes.pin_failed) {
+    r.te_note = "pinning disabled for this text encoder after a failed pinned allocation (until "
+                "release_device_memory(false) or a restart)";
+  }
+  in.caps.dit_parking = need_dit;
+  in.caps.dit_streaming = need_dit;
+  in.caps.dit_max_buffers = 3;
+  {
+    moss_dit::Residency file;
+    file.resident_blocks = 0;
+    in.caps.dit_ring_bytes = moss_dit::BlockWeights::host_bytes(*src.index, file);
+  }
+  in.caps.dit_host_pinned = true;
+  in.caps.int4_mma_native = moss_dit::int4_mma_native();
+  in.caps.nvfp4_native = src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available();
+  if (m.lora_stack) {
+    for (int bi = 0; bi < moss_dit::kLayers; ++bi) {
+      if (moss_dit::MossDit::block_has_merges(*m.lora_stack, bi)) in.caps.dit_file_source = false;
+    }
+  }
+  in.caps.dit_graph_bytes = block_path == moss_dit::BlockPath::kFusedGraphs ? moss_dit::graph_cache_bytes() : 0;
+  in.hardware = r.hardware;
+  in.budgets.vram_free = runtime::DeviceArena::free_device_bytes() + (m.arena ? m.arena->capacity() : 0);
+  in.budgets.vram_reserve = m.options.vram_reserve;
+  in.budgets.vram_budget = m.options.vram_budget;
+  // The LoRA side branches hold device memory outside the arena, as the context does: it counts against the budget.
+  if (m.lora_sb) in.budgets.context_bytes += m.lora_sb->device_bytes();
+  if (m.control_emb) in.budgets.context_bytes += m.control_emb->device_bytes();
+  const std::size_t held_host = m.held_host_bytes(!te_lengths.empty());
+  // Of it, what the plan counts again (and so would replace): not a soft unload's DiT copy, nor a held DiT's host
+  // memory when this request plans no DiT.
+  std::size_t counted_again = held_host - std::min(held_host, m.dit_host_bytes());
+  if (!need_dit && m.dit) counted_again -= std::min(counted_again, m.dit->host_bytes() + m.dit->pristine_bytes());
+  // What the pipeline holds and the plan counts again would be freed for it: available to the plan too (otherwise a
+  // host-resident text encoder's own copy would count against keeping it on the next request).
+  const std::size_t host_available = planner::host_available_bytes();
+  in.budgets.host_available = host_available == 0 ? 0 : host_available + counted_again;  // 0: unknown
+  in.budgets.host_total = planner::host_total_bytes();
+  in.budgets.host_private_now = r.memory.host_private_start > held_host ? r.memory.host_private_start - held_host : 0;
+  in.budgets.host_budget = m.options.host_ram_budget;
+  in.mode = m.options.mode;
+  in.attention = r.tier.attention;
+  in.cache_disk_spill = m.cache && m.cache->disk_enabled();
+  if (!need_dit) {
+    // No sampling step (denoise strength 0): the DiT is neither loaded nor planned (the planner wants a DiT shape: one
+    // byte, resident).
+    in.shapes.dit_bytes = 1;
+    in.shapes.dit_block_bytes = 0;
+    in.caps.dit_graph_bytes = 0;
+    in.caps.dit_ring_bytes = 0;
+  }
+  bool drop_resident = false;
+  try {
+    r.plan = planner::plan(in);
+  } catch (const planner::BudgetError&) {
+    if (held_vae == 0) throw;
+    in.shapes.vae_bytes = needed_vae > 0 ? needed_vae : dec_bytes;
+    in.request.vae_resident = needed_vae > 0;
+    r.plan = planner::plan(in);
+    drop_resident = true;
+  }
+  // A loaded DiT stays (in its held arena, with its residency) unless the request's own plan saves more than reloading
+  // it costs: no reload churn when request sizes alternate or the free device memory moves a little.
+  bool kept = false;
+  if (need_dit && m.arena && m.dit && m.dit_src == &src && m.dit_merge_key == merge_key && !drop_resident) {
+    const moss_dit::Residency& loaded = m.dit->residency();
+    planner::HeldDit held;
+    held.arena_bytes = m.arena->capacity();
+    held.graph_bytes = m.dit->graph_bytes();
+    if (loaded.streamed()) {
+      held.dit.residency = planner::DitResidency::kStreamed;
+      held.dit.resident_blocks = loaded.resident_blocks;
+      held.dit.buffers = loaded.buffers;
+      held.dit.source = loaded.source == moss_dit::StreamSource::kHostPinned ? planner::DitSource::kHostPinned : planner::DitSource::kFile;
+    }
+    r.plan = planner::prefer_held(in, std::move(r.plan), held, &kept);
+  }
+  return {kept, drop_resident};
+}
+
+void Pipeline::Impl::setup_arena(const planner::ExecutionPlan& plan, bool kept, bool need_dit, bool drop_resident, Result& r) {
+  Impl& m = *this;
+  // A larger existing one is kept (its resident models with it) unless the request needs less than arena_shrink_below
+  // of it and the plan does not keep the loaded DiT.
+  // Without a sampling step a held DiT is kept too (the arena is not shrunk under it).
+  const bool shrink = m.arena && !kept && need_dit &&
+                      static_cast<double>(plan.arena_bytes) < m.options.arena_shrink_below * static_cast<double>(m.arena->capacity());
+  if (!m.arena || m.arena->capacity() < plan.arena_bytes || drop_resident || shrink) m.reset_arena(plan.arena_bytes);
+  m.arena->reset_high_water();
+  r.memory.arena_capacity = std::max(r.memory.arena_capacity, m.arena->capacity());
+  m.sample_memory();
+}
+
+bool Pipeline::Impl::prepare_dit(DitSource& src, const moss_dit::Residency& residency, std::size_t denoise_need,
+                                 const CallDit& d, const std::string& merge_key, const std::atomic<bool>* cancel,
+                                 const moss_dit::LinearInputHook& linear_inputs, Result& r) {
+  Impl& m = *this;
+  Timings& tm = r.timings;
+  const moss_dit::BlockPath block_path = d.block_path;
+  const moss_dit::AttentionMode attention = d.attention;
+  const moss_dit::FusedRouteSnapshot& route = d.route;
+  const int loads_before = r.memory.dit_loads;
+  try {
+    m.ensure_dit(src, residency, denoise_need, cancel, tm, r.dit_load, merge_key.empty() ? nullptr : m.lora_stack.get(),
+                 merge_key);
+  } catch (const moss_dit::Cancelled&) {
+    r.cancelled = true;
+    return false;
+  }
+  m.dit->set_cancel(cancel);
+  if (linear_inputs) m.dit->set_linear_input_hook(linear_inputs);
+  // A DiT read buffered from the weight files: page-cached or cold (the loader's one reader). Direct reads and a soft
+  // unload's host copy bypass the page cache, so they say nothing about it.
+  // Each mode's load rate is kept, buffered ones from a warm cache apart (they price loads and decide the warm mode;
+  // on Windows direct and buffered decide the mode).
+  const moss_dit::LoadStats& ls = m.dit->load_stats();
+  if (r.memory.dit_loads > loads_before && m.learner && r.dit_load.source == "files" && ls.seconds > 0 &&
+      ls.bytes >= kDitLoadMeasureBytes) {
+    const double gbps = static_cast<double>(ls.bytes) / ls.seconds / 1e9;
+    if (m.learner->observe_dit_load_rate(ls.direct, gbps, m.dit_load_warm) && !m.options.hardware) {
+      m.save_profile(m.learner->stored());
+    }
+    if (!ls.direct) m.learner->observe_dit_load(gbps);
+  }
+  if (m.dit->block_path() != block_path) m.dit->set_block_path(block_path);
+  if (m.dit->attention() != attention) m.dit->set_attention(attention);
+  m.dit->set_lora(m.lora_sb.get());
+  m.dit->set_request_route(route);
+  r.block_path = block_path;
+  if (block_path == moss_dit::BlockPath::kFusedGraphs && residency.streamed()) {
+    r.block_path = moss_dit::BlockPath::kFused;  // streamed blocks wait on host-driven copies: never captured
+    if (r.block_path_note.empty()) r.block_path_note = "CUDA graphs need every DiT block resident: blocks ran fused, eagerly";
+  }
+  return true;
+}
+
 // generate(), or with `preload` the same up to the plan and the arena, then the loads of the models the plan keeps.
 Result Pipeline::run(const Request& req, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
@@ -1072,49 +1324,33 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   std::vector<std::int64_t> te_lengths;
   for (const std::size_t i : missing) te_lengths.push_back(static_cast<std::int64_t>(seqs[i].size()));
 
-  // Machine profile and block path (the first call probes and self-checks; both are cached).
-  r.hardware = m.hardware(*src.index);
-  const moss_dit::BlockPath block_path = m.block_path(r.block_path_note);
-  // One fused route for the whole request: it sizes the denoise workspace and every step runs under it, so a poisoning
-  // meanwhile (another pipeline's failed self-check) applies from the next request on instead of failing a step.
-  const moss_dit::FusedRouteSnapshot route =
-      block_path == moss_dit::BlockPath::kOpByOp ? moss_dit::FusedRouteSnapshot{} : moss_dit::fused_route_snapshot();
-  const moss_dit::AttentionMode attention = dit_attention(r.tier.attention);
-  // The side branches run on the quantized block path (its fused LoRA GEMMs; on NVFP4 sites a stored Δ).
-  const moss_dit::ComputeConfig dit_config =
-      moss_dit::MossDit::compute_config(src.quant.get(), attention, moss_dit::Int4Route::kAuto, m.lora_sb.get());
+  // Machine profile and block path (the first call probes and self-checks; both are cached), the request's fused route,
+  // attention and compute config.
+  const Impl::CallDit dit_call = m.setup_dit_call(src, r);
+  const moss_dit::BlockPath block_path = dit_call.block_path;
+  const moss_dit::FusedRouteSnapshot& route = dit_call.route;
 
   // Exact stack need of the phases this request runs, and the plan.
-  const auto latent_bytes_of = [](int H, int W) {
-    return align_up(static_cast<std::size_t>(moss_dit::kLatentChannels) * static_cast<std::size_t>(H / 16) *
-                    static_cast<std::size_t>(W / 16) * sizeof(float));
-  };
-  const auto image_bytes_of = [](int H, int W) { return static_cast<std::size_t>(H) * static_cast<std::size_t>(W) * 3; };
-  const auto bf16_rows = [](std::int64_t s, std::int64_t c) { return align_up(static_cast<std::size_t>(s * c) * 2); };
-  const std::size_t refined_bytes = bf16_rows(sc, moss_dit::kDim) + (g.do_cfg() ? bf16_rows(su, moss_dit::kDim) : 0);
-  const std::size_t refine_need = bf16_rows(sc, moss_dit::kTextDim) + (g.do_cfg() ? bf16_rows(su, moss_dit::kTextDim) : 0) +
-                                  moss_dit::MossDit::encode_text_workspace_bytes(std::max(sc, su));
   const std::vector<std::int64_t> row_lengths = denoise_row_lengths(sc, su, g);
-  // The denoise phase of one pass at H x W: the refined text, then the larger of the refiner and (latents, a latent
-  // preview's buffers, the sampling loop's own buffers and the forward for the loop's largest row set under this
-  // request's route and config). A pass starting from an image also uploads z0 next to the latents before sampling.
+  // The denoise phase of one pass at H x W (denoise_stack_bytes): the prompts' refined texts, the loop's buffers (P6b
+  // step cache: its residual buffers sit below the forwards on the stack, for every distinct row of the loop) and the
+  // forward for the loop's largest row set under this request's route and config.
   const auto denoise_need_of = [&](int H, int W, bool from_image) {
     const std::int64_t lh = H / 16, lw = W / 16;
-    const std::size_t lat = latent_bytes_of(H, W);
-    // P6b step cache: its residual buffers sit below the forwards on the stack, for every distinct row of the loop.
-    const std::size_t loop_buffers =
-        denoise_loop_bytes(lh, lw, sc, su, g, req.sampler) +
-        (req.accel.step_cache_on()
-             ? accel::FirstBlockCache::workspace_bytes(lh, lw, static_cast<int>(row_lengths.size()))
-             : 0);
-    const std::size_t forward_bytes = moss_dit::MossDit::workspace_bytes(lh, lw, row_lengths, block_path, dit_config, &route);
-    // A control adapter's input latents [G * 128, h, w] (moss_dit::InputExtension::extra), next to the latents.
-    const std::size_t control_bytes = ctl != nullptr ? static_cast<std::size_t>(ctl->groups()) * lat : 0;
-    // A latent preview: the previous latents, the x0 estimate, the preview's scratch and its RGB image.
-    const std::size_t preview_bytes =
-        control.on_preview ? 2 * lat + align_up(latent_preview::workspace_bytes(lh, lw)) + align_up(image_bytes_of(H, W)) : 0;
-    return refined_bytes +
-           std::max(refine_need, lat + control_bytes + preview_bytes + std::max(loop_buffers + forward_bytes, from_image ? lat : 0));
+    DenoiseStack d;
+    d.height = H;
+    d.width = W;
+    d.texts = {sc};
+    if (g.do_cfg()) d.texts.push_back(su);
+    d.rows = row_lengths;
+    d.loop_bytes = denoise_loop_bytes(lh, lw, sc, su, g, req.sampler) +
+                   (req.accel.step_cache_on()
+                        ? accel::FirstBlockCache::workspace_bytes(lh, lw, static_cast<int>(row_lengths.size()))
+                        : 0);
+    d.control_groups = ctl != nullptr ? ctl->groups() : 0;
+    d.preview = static_cast<bool>(control.on_preview);
+    d.from_image = from_image;
+    return denoise_stack_bytes(d, block_path, dit_call.config, route);
   };
   std::size_t denoise_need = 0;
   if (sched1.num_steps() > 0) denoise_need = denoise_need_of(H1, W1, img2img);
@@ -1135,75 +1371,31 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   if (hires) consider_decode(H1, W1);
   if (req.decode) consider_decode(H2, W2);
   const bool need_decoder = dec_h > 0;
-  // Exact GroupNorm statistics: the untiled decode and every tiled one the plan may pick from the free VRAM give the
-  // same bytes, so the image does not depend on the memory budget.
-  constexpr flux2_vae::DecodeMode decode_mode = flux2_vae::DecodeMode::reference();
-  static_assert(!decode_mode.torch_group_norm, "torch's GroupNorm cannot be tiled");
 
-  planner::PlanInputs in;
-  in.shapes = planner::shapes_from_index(b.index, src.quant ? src.index : nullptr, src.precision,
-                                         tes.model ? &tes.model->index() : nullptr, vs.file);
-  in.shapes.dit_bytes = moss_dit::MossDit::persistent_bytes(*src.index);
-  if (src.quant) in.shapes.dit_int8_fraction = moss_dit::int8_gemm_fraction(src.quant.get());
-  if (src.quant) in.shapes.dit_int4_fraction = moss_dit::int4_gemm_fraction(src.quant.get());
-  if (src.quant) in.shapes.dit_nvfp4_fraction = moss_dit::nvfp4_gemm_fraction(src.quant.get());
-  if (src.quant && m.lora_sb) {
-    // INT4 sites with an active LoRA side branch run the INT8 LoRA GEMMs: costed at INT8 speed.
-    const double f = moss_dit::int4_side_branch_fraction(src.quant.get(), *m.lora_sb);
-    in.shapes.dit_int4_fraction -= f;
-    in.shapes.dit_int8_fraction = moss_dit::int8_gemm_fraction(src.quant.get()) + f;
-  }
-  in.shapes.dit_block_bytes = align_up(moss_dit::BlockWeights::block_device_bytes(*src.index));  // the buffers' size
-  // The VAE side of the persistent region: the decoder and the encoder this request uses, plus those an earlier
-  // request left resident (counted in every phase; when that alone makes the request infeasible, plan without them and
-  // recreate the arena, dropping them, below).
-  const std::size_t dec_bytes = flux2_vae::Flux2VaeDecoder::persistent_bytes(*vs.index);
-  const std::size_t needed_vae = (need_decoder ? dec_bytes : 0) + (enc_src != nullptr ? enc_src->persistent : 0);
-  const std::size_t held_vae = (!need_decoder && m.vae ? dec_bytes : 0) +
-                               (enc_src == nullptr && m.encoder && m.encoder_src != nullptr ? m.encoder_src->persistent : 0);
-  in.shapes.vae_bytes = needed_vae + held_vae > 0 ? needed_vae + held_vae : dec_bytes;
-  in.request.height = H2;
-  in.request.width = W2;
-  in.request.text_lengths = {sc};
-  if (g.do_cfg()) in.request.text_lengths.push_back(su);
-  {
-    // DiT evaluations (heun: 2 per step); the first pass of a hires fix counted at the target's cost by area.
-    const double area = static_cast<double>(H1) * W1 / (static_cast<double>(H2) * W2);
-    const int steps = (hires ? sched2.num_steps() : 0) + static_cast<int>(std::ceil(sched1.num_steps() * area));
-    in.request.steps = steps * model_calls_per_step(req.sampler);
-  }
-  in.request.rows_per_step = 1 + (g.do_cfg() ? 1 : 0) + (g.slg_scale > 0 && g.slg_layers.any() ? 1 : 0);
-  in.request.te_lengths = te_lengths;
-  in.request.decode = need_decoder;
-  in.request.te_cached = missing.empty();
-  in.request.weights_cached = m.weights_cached();
-  in.request.dit_weights_cached = m.dit_weights_cached();
-  in.request.vae_resident = needed_vae + held_vae > 0;
-  in.workspaces.text_encoder = [&](planner::TeResidency residency, int buffers) {
-    return m.te_workspace(tes, te_lengths, m.te_options(tes, residency, buffers, false));
-  };
   // The hires fix decodes its first pass next to the resident DiT (exact tiling, never parking it), so the DiT is loaded
   // once per request: the smallest tiled decode of the first pass counts in the denoise phase, where the DiT is resident.
   const std::size_t first_decode_need =
       hires ? latent_bytes_of(H1, W1) +
-                  flux2_vae::Flux2VaeDecoder::plan_tiled_min_memory(vs.config, H1 / 16, W1 / 16, decode_mode, 8).workspace_bytes
+                  flux2_vae::Flux2VaeDecoder::plan_tiled_min_memory(vs.config, H1 / 16, W1 / 16, kDecodeMode, 8).workspace_bytes
             : 0;
-  in.workspaces.denoise = std::max({denoise_need, encode_need, first_decode_need});
-  if (need_decoder) {
-    const std::int64_t dh = dec_h / 16, dw = dec_w / 16;
-    const std::size_t dec_latent = latent_bytes_of(dec_h, dec_w);
-    in.workspaces.decode = dec_latent + flux2_vae::Flux2VaeDecoder::workspace_bytes(vs.config, dh, dw, decode_mode);
-    in.workspaces.decode_tiled = [&, dh, dw, dec_latent](std::size_t budget) -> std::optional<planner::TiledDecode> {
-      std::optional<flux2_vae::TilePlan> tp;
-      if (budget == 0) {
-        tp = flux2_vae::Flux2VaeDecoder::plan_tiled_min_memory(vs.config, dh, dw, decode_mode, 8);
-      } else if (budget > dec_latent) {
-        tp = flux2_vae::Flux2VaeDecoder::plan_tiled(vs.config, dh, dw, decode_mode, budget - dec_latent);
-      }
-      if (!tp) return std::nullopt;
-      return planner::TiledDecode{dec_latent + tp->workspace_bytes, tp->relative_cost, tp->tile};
-    };
+  Impl::PlanCall pc;
+  pc.height = H2;
+  pc.width = W2;
+  pc.text_lengths = {sc};
+  if (g.do_cfg()) pc.text_lengths.push_back(su);
+  {
+    // DiT evaluations (heun: 2 per step); the first pass of a hires fix counted at the target's cost by area.
+    const double area = static_cast<double>(H1) * W1 / (static_cast<double>(H2) * W2);
+    const int steps = (hires ? sched2.num_steps() : 0) + static_cast<int>(std::ceil(sched1.num_steps() * area));
+    pc.steps = steps * model_calls_per_step(req.sampler);
   }
+  pc.rows_per_step = 1 + (g.do_cfg() ? 1 : 0) + (g.slg_scale > 0 && g.slg_layers.any() ? 1 : 0);
+  pc.te_lengths = te_lengths;
+  pc.need_dit = need_dit;
+  pc.encoder = enc_src;
+  pc.decode_height = dec_h;
+  pc.decode_width = dec_w;
+  pc.denoise = std::max({denoise_need, encode_need, first_decode_need});
   std::size_t embed_bytes = 0;
   for (const auto& s : seqs) embed_bytes += s.size() * qwen35_text::kHidden * 2;
   {
@@ -1211,102 +1403,17 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     // work of img2img / inpainting / hires (resized images, z0, the upscaled first image).
     const std::size_t lat = std::max(latent_bytes_of(H1, W1), latent_bytes_of(H2, W2));
     const std::size_t img = std::max(image_bytes_of(H1, W1), image_bytes_of(H2, W2));
-    in.workspaces.host_buffers = embed_bytes + 2 * lat + (req.decode ? img : 0) + (control.on_preview ? img : 0);
-    if (req.init_image != nullptr || hires) in.workspaces.host_buffers += 4 * lat + 3 * img;
+    pc.host_buffers = embed_bytes + 2 * lat + (req.decode ? img : 0) + (control.on_preview ? img : 0);
+    if (req.init_image != nullptr || hires) pc.host_buffers += 4 * lat + 3 * img;
   }
-  // The pristine copies of LoRA-merged modules the DiT keeps on the host (held_host_bytes takes a loaded DiT's out of
-  // the baseline, so they count once).
-  if (!merge_key.empty()) in.workspaces.host_buffers += moss_dit::MossDit::pristine_bytes(*m.lora_stack, src.quant.get());
-  in.caps.te_max_buffers = 2;
-  in.caps.te_ring_bytes = Impl::te_host(tes, m.te_options(tes, planner::TeResidency::kStreamed, 2, false));
-  in.caps.te_host_resident = true;
-  in.caps.te_host_pinned = !tes.pin_failed;
-  in.caps.te_host_pageable = !tes.model;  // a quantized encoder held in RAM is always pinned (te_options)
-  in.caps.te_quantized = tes.model != nullptr;
-  in.caps.te_pin = m.options.te_host_pin;
-  if (tes.pin_failed) {
-    r.te_note = "pinning disabled for this text encoder after a failed pinned allocation (until "
-                "release_device_memory(false) or a restart)";
-  }
-  in.caps.dit_parking = need_dit;
-  in.caps.dit_streaming = need_dit;
-  in.caps.dit_max_buffers = 3;
-  {
-    moss_dit::Residency file;
-    file.resident_blocks = 0;
-    in.caps.dit_ring_bytes = moss_dit::BlockWeights::host_bytes(*src.index, file);
-  }
-  in.caps.dit_host_pinned = true;
-  in.caps.int4_mma_native = moss_dit::int4_mma_native();
-  in.caps.nvfp4_native = src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available();
-  if (m.lora_stack) {
-    for (int bi = 0; bi < moss_dit::kLayers; ++bi) {
-      if (moss_dit::MossDit::block_has_merges(*m.lora_stack, bi)) in.caps.dit_file_source = false;
-    }
-  }
-  in.caps.dit_graph_bytes = block_path == moss_dit::BlockPath::kFusedGraphs ? moss_dit::graph_cache_bytes() : 0;
-  in.hardware = r.hardware;
-  in.budgets.vram_free = runtime::DeviceArena::free_device_bytes() + (m.arena ? m.arena->capacity() : 0);
-  in.budgets.vram_reserve = m.options.vram_reserve;
-  in.budgets.vram_budget = m.options.vram_budget;
-  // The LoRA side branches hold device memory outside the arena, as the context does: it counts against the budget.
-  if (m.lora_sb) in.budgets.context_bytes += m.lora_sb->device_bytes();
-  if (m.control_emb) in.budgets.context_bytes += m.control_emb->device_bytes();
   if (ctl_encode) {
     // Control images: per kind its sized RGB copy and encoded latent (at the larger pass size).
-    in.workspaces.host_buffers += req.control.images.size() * (std::max(latent_bytes_of(H1, W1), latent_bytes_of(H2, W2)) +
-                                                                std::max(image_bytes_of(H1, W1), image_bytes_of(H2, W2)));
-  }
-  const std::size_t held_host = m.held_host_bytes(!missing.empty());
-  // Of it, what the plan counts again (and so would replace): not a soft unload's DiT copy, nor a held DiT's host
-  // memory when this request plans no DiT.
-  std::size_t counted_again = held_host - std::min(held_host, m.dit_host_bytes());
-  if (!need_dit && m.dit) counted_again -= std::min(counted_again, m.dit->host_bytes() + m.dit->pristine_bytes());
-  // What the pipeline holds and the plan counts again would be freed for it: available to the plan too (otherwise a
-  // host-resident text encoder's own copy would count against keeping it on the next request).
-  const std::size_t host_available = planner::host_available_bytes();
-  in.budgets.host_available = host_available == 0 ? 0 : host_available + counted_again;  // 0: unknown
-  in.budgets.host_total = planner::host_total_bytes();
-  in.budgets.host_private_now = r.memory.host_private_start > held_host ? r.memory.host_private_start - held_host : 0;
-  in.budgets.host_budget = m.options.host_ram_budget;
-  in.mode = m.options.mode;
-  in.attention = r.tier.attention;
-  in.cache_disk_spill = m.cache && m.cache->disk_enabled();
-  if (!need_dit) {
-    // No sampling step (denoise strength 0): the DiT is neither loaded nor planned (the planner wants a DiT shape: one
-    // byte, resident).
-    in.shapes.dit_bytes = 1;
-    in.shapes.dit_block_bytes = 0;
-    in.caps.dit_graph_bytes = 0;
-    in.caps.dit_ring_bytes = 0;
+    pc.host_buffers += req.control.images.size() * (std::max(latent_bytes_of(H1, W1), latent_bytes_of(H2, W2)) +
+                                                     std::max(image_bytes_of(H1, W1), image_bytes_of(H2, W2)));
   }
   // Throws planner::BudgetError before any heavy work.
-  bool drop_resident = false;
-  try {
-    r.plan = planner::plan(in);
-  } catch (const planner::BudgetError&) {
-    if (held_vae == 0) throw;
-    in.shapes.vae_bytes = needed_vae > 0 ? needed_vae : dec_bytes;
-    in.request.vae_resident = needed_vae > 0;
-    r.plan = planner::plan(in);
-    drop_resident = true;
-  }
-  // A loaded DiT stays (in its held arena, with its residency) unless the request's own plan saves more than reloading
-  // it costs: no reload churn when request sizes alternate or the free device memory moves a little.
-  bool kept = false;
-  if (need_dit && m.arena && m.dit && m.dit_src == &src && m.dit_merge_key == merge_key && !drop_resident) {
-    const moss_dit::Residency& loaded = m.dit->residency();
-    planner::HeldDit held;
-    held.arena_bytes = m.arena->capacity();
-    held.graph_bytes = m.dit->graph_bytes();
-    if (loaded.streamed()) {
-      held.dit.residency = planner::DitResidency::kStreamed;
-      held.dit.resident_blocks = loaded.resident_blocks;
-      held.dit.buffers = loaded.buffers;
-      held.dit.source = loaded.source == moss_dit::StreamSource::kHostPinned ? planner::DitSource::kHostPinned : planner::DitSource::kFile;
-    }
-    r.plan = planner::prefer_held(in, std::move(r.plan), held, &kept);
-  }
+  const Impl::Planned planned = m.plan_call(models, pc, block_path, r);
+  const bool kept = planned.kept, drop_resident = planned.drop_resident;
   r.plan.explanation += "\nQuality: " + r.tier.reason + "; DiT " + r.dit_linears + " from " + r.dit_source + ".";
   if (!src.remarks.empty()) r.plan.explanation += "\nDiT: " + src.remarks + ".";
   if (m.time_embedding) {
@@ -1346,52 +1453,13 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   tm.plan_s = since(t0);
   if (control.on_plan) control.on_plan(plan);
 
-  // The plan's arena. A larger existing one is kept (its resident models with it) unless the request needs less than
-  // arena_shrink_below of it and the plan does not keep the loaded DiT.
-  // Without a sampling step a held DiT is kept too (the arena is not shrunk under it).
-  const bool shrink = m.arena && !kept && need_dit &&
-                      static_cast<double>(plan.arena_bytes) < m.options.arena_shrink_below * static_cast<double>(m.arena->capacity());
-  if (!m.arena || m.arena->capacity() < plan.arena_bytes || drop_resident || shrink) m.reset_arena(plan.arena_bytes);
-  m.arena->reset_high_water();
-  r.memory.arena_capacity = std::max(r.memory.arena_capacity, m.arena->capacity());
-  m.sample_memory();
+  // The plan's arena.
+  m.setup_arena(plan, kept, need_dit, drop_resident, r);
 
   const moss_dit::Residency residency = m.dit_residency(plan.dit);
   // Loads the DiT when it is not resident (first use, or parked / dropped since) and sets this request's options.
   const auto prepare_dit = [&]() {
-    const int loads_before = r.memory.dit_loads;
-    try {
-      m.ensure_dit(src, residency, denoise_need, control.cancel, tm, r.dit_load, merge_key.empty() ? nullptr : m.lora_stack.get(),
-                   merge_key);
-    } catch (const moss_dit::Cancelled&) {
-      r.cancelled = true;
-      return false;
-    }
-    m.dit->set_cancel(control.cancel);
-    if (control.dit_linear_inputs) m.dit->set_linear_input_hook(control.dit_linear_inputs);
-    // A DiT read buffered from the weight files: page-cached or cold (the loader's one reader). Direct reads and a soft
-    // unload's host copy bypass the page cache, so they say nothing about it.
-    // Each mode's load rate is kept, buffered ones from a warm cache apart (they price loads and decide the warm mode;
-    // on Windows direct and buffered decide the mode).
-    const moss_dit::LoadStats& ls = m.dit->load_stats();
-    if (r.memory.dit_loads > loads_before && m.learner && r.dit_load.source == "files" && ls.seconds > 0 &&
-        ls.bytes >= kDitLoadMeasureBytes) {
-      const double gbps = static_cast<double>(ls.bytes) / ls.seconds / 1e9;
-      if (m.learner->observe_dit_load_rate(ls.direct, gbps, m.dit_load_warm) && !m.options.hardware) {
-        m.save_profile(m.learner->stored());
-      }
-      if (!ls.direct) m.learner->observe_dit_load(gbps);
-    }
-    if (m.dit->block_path() != block_path) m.dit->set_block_path(block_path);
-    if (m.dit->attention() != attention) m.dit->set_attention(attention);
-    m.dit->set_lora(m.lora_sb.get());
-    m.dit->set_request_route(route);
-    r.block_path = block_path;
-    if (block_path == moss_dit::BlockPath::kFusedGraphs && residency.streamed()) {
-      r.block_path = moss_dit::BlockPath::kFused;  // streamed blocks wait on host-driven copies: never captured
-      if (r.block_path_note.empty()) r.block_path_note = "CUDA graphs need every DiT block resident: blocks ran fused, eagerly";
-    }
-    return true;
+    return m.prepare_dit(src, residency, denoise_need, dit_call, merge_key, control.cancel, control.dit_linear_inputs, r);
   };
 
   if (preload) {
@@ -1463,7 +1531,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     tm.te_weight_wait_s = st.weight_wait_s;
     tm.te_compute_s = st.compute_s;
     if (m.te->options().source == qwen35_text::WeightSource::kFile && m.learner && !m.options.direct_io) {
-      m.learner->observe_te_stream(planner::weights_cached_from_stream(st.weight_bytes, st.weight_load_s, st.weight_wait_s, in.hardware));
+      m.learner->observe_te_stream(planner::weights_cached_from_stream(st.weight_bytes, st.weight_load_s, st.weight_wait_s, r.hardware));
     }
     m.sample_memory();
     for (std::size_t k = 0; k < missing.size(); ++k) {
@@ -1753,7 +1821,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   };
 
   // 4. VAE decode (P:428-438) of host latents to RGB8: untiled when it fits the arena next to the resident models, else
-  // tiled, with the same bytes either way (decode_mode). Returns false when cancelled (`out` is then cleared).
+  // tiled, with the same bytes either way (kDecodeMode). Returns false when cancelled (`out` is then cleared).
   // `first`: the hires fix's first pass, decoded next to the DiT without parking it (the plan counted its smallest
   // tiling in the denoise phase); its schedule goes to first_pass.decode_schedule. Otherwise the final decode, as planned.
   const auto decode_latents = [&](const std::vector<float>& lat, int H, int W, std::vector<std::uint8_t>& out, bool first) {
@@ -1771,7 +1839,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     m.vae->set_cancel(control.cancel);
     try {
       const std::optional<flux2_vae::TilePlan> used =
-          m.vae->decode_within(latents, rgb, decode_mode, m.arena->available(), stream);
+          m.vae->decode_within(latents, rgb, kDecodeMode, m.arena->available(), stream);
       MI_CUDA_CHECK(cudaStreamSynchronize(stream));
       if (first) {
         r.first_pass.decode_schedule = used ? used->describe() : "untiled";

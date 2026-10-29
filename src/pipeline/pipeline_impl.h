@@ -59,6 +59,36 @@ using Clock = std::chrono::steady_clock;
 
 inline double since(Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); }
 
+// Exact GroupNorm statistics: the untiled decode and every tiled one the plan may pick from the free VRAM give the same
+// bytes, so the image does not depend on the memory budget.
+inline constexpr flux2_vae::DecodeMode kDecodeMode = flux2_vae::DecodeMode::reference();
+static_assert(!kDecodeMode.torch_group_norm, "torch's GroupNorm cannot be tiled");
+
+// Stack bytes of one latent [128, H / 16, W / 16] (F32), of an RGB8 image, and of bf16 rows [s, c].
+inline std::size_t latent_bytes_of(int H, int W) {
+  return runtime::align_up(static_cast<std::size_t>(moss_dit::kLatentChannels) * static_cast<std::size_t>(H / 16) *
+                           static_cast<std::size_t>(W / 16) * sizeof(float));
+}
+inline std::size_t image_bytes_of(int H, int W) { return static_cast<std::size_t>(H) * static_cast<std::size_t>(W) * 3; }
+inline std::size_t bf16_rows(std::int64_t s, std::int64_t c) { return runtime::align_up(static_cast<std::size_t>(s * c) * 2); }
+
+// The denoise phase's stack of one pass at height x width (denoise_stack_bytes): the refined texts, then the larger of
+// the refiner (its inputs and workspace) and the pass's buffers: the latents, a control adapter's input latents, a
+// latent preview's buffers, then the loop's own buffers and the forward for its largest row set. A pass starting from
+// an image uploads z0 next to the latents before sampling instead.
+struct DenoiseStack {
+  int height = 0, width = 0;
+  int latents = 1;                  // the latent batch
+  std::vector<std::int64_t> texts;  // the refined texts' tokens, one buffer each
+  std::vector<std::int64_t> rows;   // the forward's largest row set (each row's text tokens)
+  std::size_t loop_bytes = 0;       // the loop's own buffers below the forward (velocities, sampler state, step cache)
+  int control_groups = 0;           // a control adapter's input groups (0: none)
+  bool preview = false;
+  bool from_image = false;
+};
+std::size_t denoise_stack_bytes(const DenoiseStack& d, moss_dit::BlockPath path, const moss_dit::ComputeConfig& config,
+                                const moss_dit::FusedRouteSnapshot& route);
+
 struct Bundle {
   std::filesystem::path dir;
   weights::ModelIndex index;  // without the components left out for the pipeline's component files
@@ -989,6 +1019,47 @@ struct Pipeline::Impl {
     std::string merge_key;                      // the LoRA files merged into the DiT (empty: none)
   };
   CallModels setup_models(const Request& req, Result& r);
+
+  // The DiT side of a call (setup_dit_call): the machine profile (into r.hardware), the block path, the call's fused
+  // route (one snapshot sizes its workspace and runs every step), the attention and the compute config.
+  struct CallDit {
+    moss_dit::BlockPath block_path = moss_dit::BlockPath::kFused;
+    moss_dit::FusedRouteSnapshot route;
+    moss_dit::AttentionMode attention = moss_dit::AttentionMode::kExact;
+    moss_dit::ComputeConfig config;
+  };
+  CallDit setup_dit_call(const DitSource& src, Result& r);
+
+  // A call's shape as its plan sees it (plan_call); the rest comes from the models, the held state and the machine.
+  struct PlanCall {
+    int height = 0, width = 0;               // the largest pass
+    std::vector<std::int64_t> text_lengths;  // the refined texts' tokens
+    std::vector<std::int64_t> te_lengths;    // the sequences the text encoder runs (empty: none)
+    int steps = 0;                           // DiT evaluations, at the plan size's cost
+    int rows_per_step = 1;
+    bool need_dit = true;
+    const EncoderSource* encoder = nullptr;   // the VAE encoder the call uses (nullptr: none)
+    int decode_height = 0, decode_width = 0;  // the largest decode (0: none)
+    std::size_t denoise = 0;       // the denoise phase's stack: its passes, encodes and a hires fix's first decode
+    std::size_t host_buffers = 0;  // the call's own host buffers
+  };
+  // The call's plan into r.plan (throws planner::BudgetError before any heavy work): planner::plan within the engine's
+  // mode and budgets, without the VAE models an earlier call left resident when they alone make it infeasible
+  // (drop_resident), then planner::prefer_held for a loaded DiT of the same source and merges (kept).
+  struct Planned {
+    bool kept = false;
+    bool drop_resident = false;
+  };
+  Planned plan_call(const CallModels& models, const PlanCall& c, moss_dit::BlockPath block_path, Result& r);
+  // The plan's arena: a larger existing one is kept unless the call needs less than arena_shrink_below of it and the
+  // plan does not keep the loaded DiT.
+  void setup_arena(const planner::ExecutionPlan& plan, bool kept, bool need_dit, bool drop_resident, Result& r);
+  // Loads the DiT when it is not resident (first use, or parked / dropped since) and sets the call's options (cancel
+  // flag, linear-input hook, block path, attention, LoRA side branches, route). False when the load was cancelled
+  // (r.cancelled set).
+  bool prepare_dit(DitSource& src, const moss_dit::Residency& residency, std::size_t denoise_need, const CallDit& d,
+                   const std::string& merge_key, const std::atomic<bool>* cancel, const moss_dit::LinearInputHook& linear_inputs,
+                   Result& r);
 
   // Private host memory the pipeline holds itself across calls (cache contents, text-encoder rings and host copy),
   // which the planner adds on its own and must not count twice. The planner adds the text encoder's share only when
