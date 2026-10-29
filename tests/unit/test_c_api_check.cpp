@@ -248,6 +248,28 @@ TEST_F(GpuCheckAgreement, CheckAgreesWithTheRealCalls) {
          g.reference_images_count = 1;
        },
        true},
+      // The default placement merges the edit adapter into the bf16 DiT: the check plans the merge as the real call
+      // does, resident, and streamed in min_memory from the merged blocks' pinned host copy.
+      {"bf16 high + edit adapter merged by default", {edit_},
+       [&](mi_engine_params& e, mi_gen_params& g) {
+         e.tier = MI_TIER_HIGH;
+         g.loras = &edit;
+         g.loras_count = 1;
+         g.reference_images = &ref;
+         g.reference_images_count = 1;
+       },
+       true},
+      {"bf16 min_memory + edit adapter merged, streamed", {edit_},
+       [&](mi_engine_params& e, mi_gen_params& g) {
+         e.tier = MI_TIER_HIGH;
+         e.mode = MI_MODE_MIN_MEMORY;
+         e.vram_budget_bytes = std::uint64_t{6} << 30;
+         g.loras = &edit;
+         g.loras_count = 1;
+         g.reference_images = &ref;
+         g.reference_images_count = 1;
+       },
+       true},
       {"int4 turbo + LoRA side branch", {int4_, lora_},
        [&](mi_engine_params& e, mi_gen_params& g) {
          e.dit_file = int4_.c_str();
