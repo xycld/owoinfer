@@ -341,6 +341,8 @@ class MossDit {
   static constexpr std::size_t kMaxMergeMemoBytes = std::size_t{1} << 30;
   // Test seam (internal): the memo's cap for every model of the process (default kMaxMergeMemoBytes).
   static void set_merge_memo_cap_for_tests(std::size_t bytes);
+  // Test seam (internal): every merge on the host (merge_on_device declines), for every model of the process.
+  static void set_host_merges_for_tests(bool host);
   const lora::SideBranches* lora() const { return lora_; }
 
   // Control adapters: every following forward embeds [latents | ext->extra] with ext's weight and bias instead of the

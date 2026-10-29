@@ -438,8 +438,14 @@ void MossDit::remerge_into(const lora::PristineWeights& pristine, const lora::Lo
   }
 }
 
+namespace {
+std::atomic<bool> g_host_merges{false};
+}  // namespace
+
+void MossDit::set_host_merges_for_tests(bool host) { g_host_merges.store(host); }
+
 bool MossDit::merge_on_device(const lora::LoraStack& stack, const std::string& module, const MergeTarget& t) {
-  if (t.group != 0 || t.w.dtype != DType::kBF16 || !lora::device_mergeable(stack, module)) return false;
+  if (g_host_merges.load() || t.group != 0 || t.w.dtype != DType::kBF16 || !lora::device_mergeable(stack, module)) return false;
   const bool host = t.w.device != Device::kCUDA;
   runtime::StackScope scope(arena_);
   const std::size_t avail = arena_.available() / runtime::kArenaAlign * runtime::kArenaAlign;
@@ -781,6 +787,9 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
   }, quant, [&](const TensorMap& host) { merge(host); });
   host_bytes_ = BlockWeights::host_bytes(index, residency);
   ring.synchronize();
+  // The merges below run on the legacy stream, which does not order after the engine's non-blocking streams: nothing
+  // queued on the compute stream during the load may still touch the weights they rewrite.
+  if (!device_merges.empty()) MI_CUDA_CHECK(cudaStreamSynchronize(streams.compute()));
   for (const auto& [module, t] : device_merges) {
     check_cancel();
     if (merges->keeps_pristine(module)) {
