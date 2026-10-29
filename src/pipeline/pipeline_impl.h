@@ -1070,6 +1070,11 @@ struct Pipeline::Impl {
   // posterior mean (loaded as needed), on the arena stack with what the resident models leave (encode_within: exact
   // tiling when the untiled encode does not fit, same bytes). The tiling used is appended to pass.encode_schedule.
   std::vector<float> encode_image(const EncoderSource& e, const Image& im, PassReport& pass, Timings& tm);
+  // VAE decode (P:428-438) of host latents [128, H / 16, W / 16] to RGB8 `out` [H, W, 3] by the loaded decoder
+  // (ensure_vae first): untiled when it fits the arena next to the resident models, else tiled, with the same bytes
+  // either way (kDecodeMode). Returns the tiling used (nullopt: untiled). Throws flux2_vae::Cancelled (`cancel`).
+  std::optional<flux2_vae::TilePlan> decode_image(const std::vector<float>& lat, int H, int W, std::vector<std::uint8_t>& out,
+                                                  const std::atomic<bool>* cancel, Timings& tm);
   // Private host memory the pipeline holds itself across calls (cache contents, text-encoder rings and host copy),
   // which the planner adds on its own and must not count twice. The planner adds the text encoder's share only when
   // it runs: on a full embedding-cache hit the encoder's held memory stays in the baseline.

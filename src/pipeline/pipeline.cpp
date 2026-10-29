@@ -1158,6 +1158,32 @@ std::vector<float> Pipeline::Impl::encode_image(const EncoderSource& e, const Im
   return z;
 }
 
+std::optional<flux2_vae::TilePlan> Pipeline::Impl::decode_image(const std::vector<float>& lat, int H, int W,
+                                                               std::vector<std::uint8_t>& out,
+                                                               const std::atomic<bool>* cancel, Timings& tm) {
+  Impl& m = *this;
+  const cudaStream_t stream = streams.compute();
+  runtime::StackScope phase(*m.arena);
+  const Tensor latents = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, H / 16, W / 16});
+  MI_CUDA_CHECK(cudaMemcpyAsync(latents.data, lat.data(), latents.nbytes(), cudaMemcpyHostToDevice, stream));
+  out.resize(image_bytes_of(H, W));
+  const Tensor rgb = Tensor::view(out.data(), DType::kU8, Device::kCPU, {H, W, 3});
+  const auto td = Clock::now();
+  m.vae->set_cancel(cancel);
+  std::optional<flux2_vae::TilePlan> used;
+  try {
+    used = m.vae->decode_within(latents, rgb, kDecodeMode, m.arena->available(), stream);
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+  } catch (const flux2_vae::Cancelled&) {
+    tm.decode_s += since(td);
+    m.sample_memory();
+    throw;
+  }
+  tm.decode_s += since(td);
+  m.sample_memory();
+  return used;
+}
+
 // generate(), or with `preload` the same up to the plan and the arena, then the loads of the models the plan keeps.
 Result Pipeline::run(const Request& req, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
@@ -1830,17 +1856,8 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     } else {
       m.ensure_vae(vs, plan.vae.stack_bytes, plan.dit.park_for_decode, tm);
     }
-    runtime::StackScope phase(*m.arena);
-    const Tensor latents = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, H / 16, W / 16});
-    MI_CUDA_CHECK(cudaMemcpyAsync(latents.data, lat.data(), latents.nbytes(), cudaMemcpyHostToDevice, stream));
-    out.resize(image_bytes_of(H, W));
-    const Tensor rgb = Tensor::view(out.data(), DType::kU8, Device::kCPU, {H, W, 3});
-    const auto td = Clock::now();
-    m.vae->set_cancel(control.cancel);
     try {
-      const std::optional<flux2_vae::TilePlan> used =
-          m.vae->decode_within(latents, rgb, kDecodeMode, m.arena->available(), stream);
-      MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+      const std::optional<flux2_vae::TilePlan> used = m.decode_image(lat, H, W, out, control.cancel, tm);
       if (first) {
         r.first_pass.decode_schedule = used ? used->describe() : "untiled";
       } else {
@@ -1851,8 +1868,6 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
       r.cancelled = true;
       out.clear();
     }
-    tm.decode_s += since(td);
-    m.sample_memory();
     return !r.cancelled;
   };
 
