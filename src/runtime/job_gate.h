@@ -11,8 +11,11 @@
 //   3. the ender waits until no job runs (a job's end clears busy and notifies under the mutex, as its last access);
 //   4. it frees the state (exclusively: the gate counts it as a job), then clears the ending and the open flag.
 // A second ender arriving meanwhile waits for the first ending to complete, then does its own part (nothing when
-// nothing is open any more). An ender on the running job's own thread (from its callback) is refused with Busy and
-// does nothing.
+// nothing is open any more). A run ending also waits for a session call in flight (a begin_run), then ends the run it
+// opened. An ending cancels only the component calls it ends (a run ending a step; a session closing any session or run
+// call); a job outside the session (a generate) is waited for, never cancelled. An ender on the running job's own thread
+// (from its callback) is refused with Busy and does nothing. close_engine() is terminal: it refuses every later job and
+// ender, cancels the job in flight and returns once no job runs and no ender waits, so the gate may then be freed.
 #pragma once
 
 #include <atomic>
@@ -74,10 +77,20 @@ class JobGate {
   bool session_open() const;
   bool run_open() const;
 
+  // Runs `read` under the gate's mutex while a run is open and not ending (Refused otherwise): reads of the run's state
+  // between steps, against the step's own updates made through locked().
+  void read_run(const std::function<void()>& read) const;
+  // Runs `f` under the gate's mutex (the running job's updates of state read_run reads).
+  void locked(const std::function<void()>& f) const;
+
   // The ending sequence above for the open run (end_run) or the session, its run first (end_session). `free_state`
-  // frees what is ended; it runs with no job in flight. Returns false (nothing done) when nothing was open.
+  // frees what is ended; it runs with no job in flight. Returns false (nothing done) when nothing was open, or the gate
+  // was closed meanwhile. end_session frees the session's state even when freeing its run throws.
   bool end_run(const std::function<void()>& free_state);
   bool end_session(const std::function<void()>& free_run, const std::function<void()>& free_session);
+  // mi_engine_free's last step (after end_session): every later begin and ender is refused, the job in flight is
+  // cancelled, and this returns once no job runs and no ender waits on the gate. Busy from the running job's thread.
+  void close_engine();
 
  private:
   void finish_job();
@@ -88,7 +101,10 @@ class JobGate {
   mutable std::mutex mu_;
   std::condition_variable cv_;
   bool busy_ = false;
+  Kind job_kind_ = Kind::kEngine;
   std::thread::id job_thread_;
+  int waiters_ = 0;      // enders inside start_ending
+  bool closed_ = false;  // close_engine()
   bool session_open_ = false;
   bool run_open_ = false;
   bool ending_ = false;

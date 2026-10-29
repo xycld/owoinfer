@@ -6,6 +6,7 @@ JobGate::Job::~Job() { gate_.finish_job(); }
 
 JobGate::Job JobGate::begin(Kind kind) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (closed_) throw Refused("the engine is being freed");
   if (ending_) {
     if (kind == Kind::kEngine) throw Busy("a component run is ending");
     throw Refused(ending_session_ ? "the session is closing" : "the run is ending");
@@ -15,6 +16,7 @@ JobGate::Job JobGate::begin(Kind kind) {
   if (busy_) throw Busy("another call is running on this engine");
   if (kind != Kind::kRun && run_open_) throw Busy("a component run is open: end it first (mi_run_end)");
   busy_ = true;
+  job_kind_ = kind;
   job_thread_ = std::this_thread::get_id();
   cancel_.store(false);
   return Job(*this);
@@ -50,18 +52,45 @@ bool JobGate::run_open() const {
   return run_open_;
 }
 
+void JobGate::read_run(const std::function<void()>& read) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (ending_ && !ending_session_) throw Refused("the run is ending");
+  if (ending_) throw Refused("the session is closing");
+  if (!run_open_) throw Refused("no run is open");
+  read();
+}
+
+void JobGate::locked(const std::function<void()>& f) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  f();
+}
+
 bool JobGate::start_ending(std::unique_lock<std::mutex>& lock, bool session) {
   if (busy_ && job_thread_ == std::this_thread::get_id()) {
     throw Busy(session ? "the session cannot be closed from a callback of its running call"
                        : "the run cannot be ended from a callback of its running call");
   }
-  cv_.wait(lock, [&] { return !ending_; });  // a second ender waits for the first
-  if (!(session ? session_open_ : run_open_)) return false;
+  // While waiting this thread is counted: close_engine() frees the gate only after every waiter has left.
+  ++waiters_;
+  struct Leave {
+    JobGate& g;
+    ~Leave() {
+      --g.waiters_;
+      g.cv_.notify_all();
+    }
+  } leave{*this};
+  // A second ender waits for the first; a run ending also waits for a session call in flight (a begin_run), so the
+  // run that call opens is ended too.
+  cv_.wait(lock, [&] { return closed_ || (!ending_ && !(!session && busy_ && job_kind_ == Kind::kSession)); });
+  if (closed_ || !(session ? session_open_ : run_open_)) return false;
   ending_ = true;
   ending_session_ = session;
-  if (busy_) cancel_.store(true);
+  // Only the component calls the ending ends are cancelled: a run ending cancels a step, a session closing any session
+  // or run call; a job outside the session (a generate) is waited for.
+  if (busy_ && (job_kind_ == Kind::kRun || (session && job_kind_ == Kind::kSession))) cancel_.store(true);
   cv_.wait(lock, [&] { return !busy_; });
   busy_ = true;  // the ender's own job: nothing else starts while it frees
+  job_kind_ = session ? Kind::kSession : Kind::kRun;
   job_thread_ = std::this_thread::get_id();
   return true;
 }
@@ -83,13 +112,11 @@ bool JobGate::end_run(const std::function<void()>& free_state) {
     std::unique_lock<std::mutex> lock(mu_);
     if (!start_ending(lock, false)) return false;
   }
-  try {
-    free_state();
-  } catch (...) {
-    finish_ending(false);
-    throw;
-  }
-  finish_ending(false);
+  struct Finish {
+    JobGate& g;
+    ~Finish() { g.finish_ending(false); }
+  } finish{*this};
+  free_state();
   return true;
 }
 
@@ -100,15 +127,29 @@ bool JobGate::end_session(const std::function<void()>& free_run, const std::func
     if (!start_ending(lock, true)) return false;
     run = run_open_;
   }
+  struct Finish {
+    JobGate& g;
+    ~Finish() { g.finish_ending(true); }
+  } finish{*this};
   try {
     if (run) free_run();
-    free_session();
   } catch (...) {
-    finish_ending(true);
+    free_session();  // the session's own state is freed even when freeing its run throws
     throw;
   }
-  finish_ending(true);
+  free_session();
   return true;
+}
+
+void JobGate::close_engine() {
+  std::unique_lock<std::mutex> lock(mu_);
+  if (busy_ && job_thread_ == std::this_thread::get_id()) {
+    throw Busy("the engine cannot be freed from a callback of its running call");
+  }
+  closed_ = true;
+  if (busy_) cancel_.store(true);
+  cv_.notify_all();
+  cv_.wait(lock, [&] { return !busy_ && waiters_ == 0; });
 }
 
 }  // namespace mi::runtime

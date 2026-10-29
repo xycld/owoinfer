@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -167,6 +168,100 @@ TEST(JobGate, FailedFreeStillEndsTheRun) {
   EXPECT_THROW(g.end_run([] { throw std::runtime_error("cuda"); }), std::runtime_error);
   EXPECT_FALSE(g.run_open());
   JobGate::Job j = g.begin(Kind::kSession);  // usable afterwards
+}
+
+// The review's probe: mi_engine_free (end_session, close_engine, then the gate freed) while another thread's end_run
+// waits for the session's ending. close_engine returns only once that waiter has left the gate (ASan: no use after
+// free; the ASan build of this file runs it).
+TEST(JobGate, CloseEngineWaitsForEveryWaiterBeforeTheFree) {
+  for (int iteration = 0; iteration < 500; ++iteration) {
+    auto g = std::make_unique<JobGate>();
+    open(*g, true);
+    std::atomic<bool> in_free{false}, second_started{false};
+    JobGate* raw = g.get();
+    std::thread first([&] {
+      raw->end_session(
+          [&] {
+            in_free = true;
+            while (!second_started) std::this_thread::yield();
+            for (int k = 0; k < 2000; ++k) std::this_thread::yield();
+          },
+          [] {});
+      raw->close_engine();
+    });
+    while (!in_free) std::this_thread::yield();
+    std::thread second([&] {
+      second_started = true;
+      EXPECT_FALSE(raw->end_run([] {}));  // the session's ending ended the run; or the gate closed
+    });
+    first.join();
+    g.reset();
+    second.join();
+  }
+  JobGate g;
+  open(g, false);
+  g.close_engine();
+  EXPECT_NE(refusal<JobGate::Refused>([&] { JobGate::Job j = g.begin(Kind::kEngine); }).find("being freed"), std::string::npos);
+  EXPECT_FALSE(g.end_session([] {}, [] {}));
+}
+
+// A session closing (or a run ending) waits for a job outside the session (a generate) without cancelling it.
+TEST(JobGate, EndingsNeverCancelAGenerate) {
+  for (const bool session : {true, false}) {
+    JobGate g;
+    open(g, false);
+    std::atomic<bool> started{false}, saw_cancel{false};
+    std::thread generate([&] {
+      JobGate::Job j = g.begin(Kind::kEngine);
+      started = true;
+      for (int k = 0; k < 200; ++k) {
+        if (g.cancel_flag()->load()) saw_cancel = true;
+        std::this_thread::sleep_for(100us);
+      }
+    });
+    while (!started) std::this_thread::yield();
+    if (session) {
+      EXPECT_TRUE(g.end_session([] {}, [] {}));
+    } else {
+      EXPECT_FALSE(g.end_run([] {}));  // no run open: nothing to end, after the generate finished
+    }
+    generate.join();
+    EXPECT_FALSE(saw_cancel);
+  }
+}
+
+// end_run racing a begin_run: the ender waits for the session call in flight and ends the run it opened.
+TEST(JobGate, EndRunEndsTheRunABeginRunInFlightOpens) {
+  for (int iteration = 0; iteration < 100; ++iteration) {
+    JobGate g;
+    open(g, false);
+    std::atomic<bool> started{false}, freed{false};
+    std::thread begin_run([&] {
+      JobGate::Job j = g.begin(Kind::kSession);
+      started = true;
+      std::this_thread::sleep_for(200us);
+      g.open_run();
+    });
+    while (!started) std::this_thread::yield();
+    EXPECT_TRUE(g.end_run([&] { freed = true; }));
+    begin_run.join();
+    EXPECT_TRUE(freed);
+    EXPECT_FALSE(g.run_open());
+  }
+}
+
+TEST(JobGate, ReadRunNeedsAnOpenRunNotEnding) {
+  JobGate g;
+  open(g, false);
+  EXPECT_EQ(refusal<JobGate::Refused>([&] { g.read_run([] {}); }), "no run is open");
+  {
+    JobGate::Job j = g.begin(Kind::kSession);
+    g.open_run();
+  }
+  int reads = 0;
+  g.read_run([&] { ++reads; });
+  EXPECT_EQ(reads, 1);
+  g.end_run([&] { EXPECT_EQ(refusal<JobGate::Refused>([&] { g.read_run([] {}); }), "the run is ending"); });
 }
 
 }  // namespace
