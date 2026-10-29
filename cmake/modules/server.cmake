@@ -51,11 +51,10 @@ if(NOT MOSSINFER_ONLY AND EXISTS ${CMAKE_SOURCE_DIR}/tools/server/main.cpp)
   endif()
 
   # The component API's host loop (examples/c/component_loop.c), C99. Its euler update must round every operation:
-  # no floating-point contraction (MSVC does not contract by default).
+  # the strict-FP options (CMakeLists.txt: no contraction, no fast-math; clang-cl gets /clang:-ffp-contract=off).
   add_executable(mossinfer_example_component ${CMAKE_SOURCE_DIR}/examples/c/component_loop.c)
   set_target_properties(mossinfer_example_component PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
-  target_compile_options(mossinfer_example_component PRIVATE ${_mi_c_warn}
-    $<$<OR:$<C_COMPILER_ID:GNU>,$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>>:-ffp-contract=off>)
+  target_compile_options(mossinfer_example_component PRIVATE ${_mi_c_warn} ${MOSSINFER_STRICT_FP_OPTIONS})
   if(TARGET mossinfer)
     target_link_libraries(mossinfer_example_component PRIVATE mossinfer)
   else()
