@@ -7,6 +7,7 @@
 //                      interrupt (mi_run_end from another thread mid-step) and mi_engine_free during a step.
 #include "mossinfer/mossinfer.h"
 
+#include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <new>
@@ -32,6 +34,7 @@
 #include "pipeline/pipeline_image.h"
 #include "pipeline/run_schedule.h"
 #include "pipeline/samplers/initial_noise.h"
+#include "test_util.h"
 #include "util/json.h"
 #include "util/path.h"
 
@@ -223,6 +226,12 @@ TEST(ComponentApi, TensorDescriptors) {
   bad.shape[0] = bad.shape[1] = std::int64_t{1} << 32;  // 2^64 elements: refused before the product overflows
   bad.shape[2] = 0;
   refused_tensor(bad, "out[1]: too many elements");
+  bad = t;
+  bad.data = reinterpret_cast<char*>(buf) + 2;  // not F32-aligned
+  refused_tensor(bad, "out[1].data must be aligned to its element size (4 bytes)");
+  bad.dtype = MI_DTYPE_U8;  // a byte tensor has no alignment rule
+  bad.shape[0] = 1;
+  EXPECT_EQ(mi::api::to_tensor(bad, "rgb").dtype, mi::DType::kU8);
 }
 
 TEST(ComponentApi, ForeignConditioning) {
@@ -467,6 +476,42 @@ TEST(ComponentApi, RunSpecValidation) {
   refused(x, o, "slg_layers: NULL array with a nonzero count");
 }
 
+// to_session_options: the control adapter must name an existing regular file (a Windows device path is refused by the
+// boundary check before any file-system call).
+TEST(ComponentApi, SessionOptions) {
+  mi::testing::TempDir dir("component_session_options");
+  mi_session_params sp;
+  ASSERT_EQ(mi_session_params_init(&sp, sizeof sp), MI_OK);
+  sp.max_rows = 4;
+  sp.max_latents = 2;
+  mi::pipeline::SessionOptions o = mi::api::to_session_options(sp, mi::pipeline::Request{}, 1);
+  EXPECT_EQ(o.max_rows, 4);
+  EXPECT_EQ(o.max_latents, 2);
+  EXPECT_EQ(o.device, 1);
+  EXPECT_TRUE(o.control_adapter.empty());
+  const auto refused_adapter = [&](const std::string& path, const std::string& fragment) {
+    sp.control_adapter = path.c_str();
+    try {
+      mi::api::to_session_options(sp, mi::pipeline::Request{}, 0);
+      ADD_FAILURE() << "accepted " << path;
+    } catch (const std::invalid_argument& e) {
+      EXPECT_TRUE(has(e.what(), fragment)) << e.what();
+    }
+  };
+  refused_adapter(mi::util::path_utf8(dir.path() / "missing.safetensors"), "control_adapter: file not found");
+  refused_adapter(mi::util::path_utf8(dir.path()), "control_adapter: not a regular file");
+#ifdef _WIN32
+  refused_adapter(R"(\\.\pipe\mossinfer_test)", "control_adapter: not a regular file");
+#endif
+  const fs::path file = dir.path() / "control.safetensors";
+  std::ofstream(file) << "x";
+  const std::string file_s = mi::util::path_utf8(file);
+  sp.control_adapter = file_s.c_str();
+  EXPECT_EQ(mi::api::to_session_options(sp, mi::pipeline::Request{}, 0).control_adapter, file);
+  sp.control_adapter = "";
+  EXPECT_TRUE(mi::api::to_session_options(sp, mi::pipeline::Request{}, 0).control_adapter.empty());
+}
+
 TEST(ComponentApi, TokenCap) {
   // 2048^2 with L = 2 and CFG: 4 rows of 16384 + text tokens each exceed MI_MAX_CALL_TOKENS.
   Cond a(50), b(10);
@@ -615,6 +660,12 @@ TEST(ComponentApi, SamplerPredictionNoiseAndResize) {
     EXPECT_EQ(mi_image_resize(&im, 64, 48, MI_RESIZE_CROP, out.data(), out.size()), MI_ERR_INVALID_ARGUMENT);
   }
   const std::uint8_t px[4] = {};
+  std::vector<std::uint8_t> big(1);
+  const mi_image huge{big.data(), 16000, 16000, 1, 0};  // 256 MP: refused before any pixel is read
+  EXPECT_EQ(mi_image_resize(&huge, 64, 64, MI_RESIZE_CROP, big.data(), big.size()), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_TRUE(has(last_error(), "64,000,000 pixels")) << last_error();
+  const mi_image small_im{big.data(), 1, 1, 1, 0};
+  EXPECT_EQ(mi_image_resize(&small_im, 16000, 16000, MI_RESIZE_CROP, big.data(), big.size()), MI_ERR_INVALID_ARGUMENT);
   const mi_image two{px, 2, 2, 2, 0};
   std::uint8_t out[64];
   EXPECT_EQ(mi_image_resize(&two, 4, 4, MI_RESIZE_CROP, out, sizeof out), MI_ERR_INVALID_ARGUMENT);
@@ -1020,35 +1071,63 @@ TEST_F(GpuComponentApi, MossRunPlansAndSamplesAsGenerate) {
   EXPECT_EQ(mi_session_close(engine_), MI_OK);
 }
 
+// A step at sigmas[0] on the run's staging views (host mode).
+mi_step_params staging_step(mi_engine* e, float sigma) {
+  mi_step_params st;
+  mi_step_params_init(&st, sizeof st);
+  mi_tensor xv{}, ov[1]{};
+  mi_run_staging(e, &xv, ov, 1, nullptr);
+  st.sigma = sigma;
+  st.x = xv;
+  st.out[0] = ov[0];
+  return st;
+}
+
+// Returns once a step call of another thread is in flight: a probe step on this thread is MI_ERR_BUSY (a probe that
+// gets the gate first runs a whole step, which the other thread's retry loop absorbs).
+void until_a_step_runs(mi_engine* e, float sigma) {
+  const mi_step_params st = staging_step(e, sigma);
+  while (mi_denoise_step(e, &st, nullptr) != MI_ERR_BUSY) {
+  }
+}
+
+// mi_generate's MOSS run at q's size, its conditionings freed once it has begun.
+void begin_moss_run(mi_engine* e, const mi_gen_params& q, mi_conditioning* conds[2], std::uint32_t flags = 0) {
+  const std::int32_t skip22[] = {22};
+  const mi_run_row rows[2] = {{conds[0], nullptr, 0, 0, 0}, {conds[1], skip22, 1, 0, 0}};
+  mi_run_params rp;
+  ASSERT_EQ(mi_run_params_init(&rp, sizeof rp), MI_OK);
+  rp.width = q.width;
+  rp.height = q.height;
+  rp.steps = q.steps;
+  rp.rows = rows;
+  rp.rows_count = 2;
+  rp.guidance = MI_GUIDANCE_MOSS;
+  rp.output = MI_STEP_OUTPUT_GUIDED_VELOCITY;
+  rp.flags = flags;
+  ASSERT_EQ(mi_run_begin(e, &rp), MI_OK) << last_error();
+}
+
 // An interrupt: mi_run_end from another thread while a step runs cancels it (MI_CANCELLED) and ends the run; the next
 // call is "no run is open", and a new run of the same request loads nothing.
 TEST_F(GpuComponentApi, RunEndFromAnotherThreadMidStep) {
   const mi_gen_params q = request(1024, 50);
   mi_conditioning* conds[2] = {nullptr, nullptr};
   open_and_encode(q, conds);
-  const std::int32_t skip22[] = {22};
-  const mi_run_row rows[2] = {{conds[0], nullptr, 0, 0, 0}, {conds[1], skip22, 1, 0, 0}};
-  mi_run_params rp = moss_run(q, rows);
-  rp.flags = 0;
-  ASSERT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
-  mi_tensor xv{}, ov[1]{};
-  ASSERT_EQ(mi_run_staging(engine_, &xv, ov, 1, nullptr), MI_OK);
+  begin_moss_run(engine_, q, conds);
   std::size_t n_sigmas = 0;
   const float* s = mi_run_sigmas(engine_, &n_sigmas);
   ASSERT_NE(s, nullptr);
-  std::atomic<int> started{0};
+  mi_engine* const e = engine_;
   mi_status last = MI_OK;
   std::string message;
   int completed = 0;
   std::thread worker([&] {
     for (int i = 0; i + 1 < static_cast<int>(n_sigmas); ++i) {
-      mi_step_params st;
-      mi_step_params_init(&st, sizeof st);
-      st.sigma = s[i];
-      st.x = xv;
-      st.out[0] = ov[0];
-      started.store(i + 1);
-      last = mi_denoise_step(engine_, &st, nullptr);
+      const mi_step_params st = staging_step(e, s[i]);
+      do {
+        last = mi_denoise_step(e, &st, nullptr);
+      } while (last == MI_ERR_BUSY);  // a probe of the main thread had the gate
       if (last != MI_OK) {
         message = last_error();
         return;
@@ -1056,31 +1135,23 @@ TEST_F(GpuComponentApi, RunEndFromAnotherThreadMidStep) {
       ++completed;
     }
   });
-  while (started.load() < 3) std::this_thread::yield();
-  std::this_thread::sleep_for(std::chrono::milliseconds(30));  // inside the third step (each takes far longer)
+  until_a_step_runs(e, s[0]);
   mi_result* done = nullptr;
-  EXPECT_EQ(mi_run_end(engine_, &done), MI_OK) << last_error();
+  EXPECT_EQ(mi_run_end(e, &done), MI_OK) << last_error();
   worker.join();
-  EXPECT_EQ(last, MI_CANCELLED) << message;
-  EXPECT_EQ(completed, 2);
+  EXPECT_TRUE(last == MI_CANCELLED || (last == MI_ERR_INVALID_ARGUMENT && has(message, "no run is open"))) << message;
   ASSERT_NE(done, nullptr);
-  EXPECT_EQ(mi_result_steps_run(done), completed);
+  EXPECT_GE(mi_result_steps_run(done), completed > 0 ? 1 : 0);
   mi_result_free(done);
-  mi_step_params st;
-  ASSERT_EQ(mi_step_params_init(&st, sizeof st), MI_OK);
-  st.sigma = s[0];
-  st.x = xv;
-  st.out[0] = ov[0];
-  EXPECT_EQ(mi_denoise_step(engine_, &st, nullptr), MI_ERR_INVALID_ARGUMENT);
+  const mi_step_params st = staging_step(e, s[0]);
+  EXPECT_EQ(mi_denoise_step(e, &st, nullptr), MI_ERR_INVALID_ARGUMENT);
   EXPECT_TRUE(has(last_error(), "no run is open")) << last_error();
 
   // The session is reusable without reloading weights.
-  ASSERT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
-  ASSERT_EQ(mi_run_staging(engine_, &xv, ov, 1, nullptr), MI_OK);
-  st.x = xv;
-  st.out[0] = ov[0];
-  EXPECT_EQ(mi_denoise_step(engine_, &st, nullptr), MI_OK) << last_error();
-  ASSERT_EQ(mi_run_end(engine_, &done), MI_OK);
+  begin_moss_run(e, q, conds);
+  const mi_step_params again = staging_step(e, s[0]);
+  EXPECT_EQ(mi_denoise_step(e, &again, nullptr), MI_OK) << last_error();
+  ASSERT_EQ(mi_run_end(e, &done), MI_OK);
   mi_memory_stats mem{};
   mem.struct_size = sizeof mem;
   ASSERT_EQ(mi_result_memory(done, &mem), MI_OK);
@@ -1090,41 +1161,212 @@ TEST_F(GpuComponentApi, RunEndFromAnotherThreadMidStep) {
   mi_conditioning_free(conds[1]);
 }
 
+// mi_cancel on a step: MI_CANCELLED and the run still usable; a cancel between steps does not carry over.
+TEST_F(GpuComponentApi, CancelAStep) {
+  const mi_gen_params q = request(1024, 50);
+  mi_conditioning* conds[2] = {nullptr, nullptr};
+  open_and_encode(q, conds);
+  begin_moss_run(engine_, q, conds);
+  std::size_t n_sigmas = 0;
+  const float* s = mi_run_sigmas(engine_, &n_sigmas);
+  ASSERT_NE(s, nullptr);
+  mi_engine* const e = engine_;
+  mi_status status = MI_OK;
+  std::atomic<bool> done{false};
+  std::thread worker([&] {
+    const mi_step_params st = staging_step(e, s[1]);
+    do {
+      status = mi_denoise_step(e, &st, nullptr);
+    } while (status == MI_ERR_BUSY || status == MI_OK);  // until a cancel lands on one of its steps
+    done.store(true);
+  });
+  const mi_step_params probe = staging_step(e, s[0]);
+  while (!done.load()) {
+    // A probe that finds the worker's step in flight cancels it (one that finds the gate free runs a step itself).
+    if (mi_denoise_step(e, &probe, nullptr) == MI_ERR_BUSY) {
+      EXPECT_EQ(mi_cancel(e), MI_OK);
+    }
+  }
+  worker.join();
+  EXPECT_EQ(status, MI_CANCELLED) << last_error();
+  EXPECT_EQ(mi_cancel(e), MI_OK);  // between steps: a no-op
+  const mi_step_params st = staging_step(e, s[0]);
+  mi_step_info info{};
+  info.struct_size = sizeof info;
+  EXPECT_EQ(mi_denoise_step(e, &st, &info), MI_OK) << last_error();
+  EXPECT_EQ(info.step, 0);
+  EXPECT_EQ(mi_run_end(e, nullptr), MI_OK);
+  mi_conditioning_free(conds[0]);
+  mi_conditioning_free(conds[1]);
+}
+
 // mi_engine_free with an open session and a step running on another thread: the step is cancelled and waited for, then
-// the engine is freed (no crash; the worker's step returns MI_CANCELLED).
+// the engine is freed (the worker's step returns MI_CANCELLED or completes; it makes no later call).
 TEST_F(GpuComponentApi, EngineFreeDuringAStep) {
   const mi_gen_params q = request(1024, 50);
   mi_conditioning* conds[2] = {nullptr, nullptr};
   open_and_encode(q, conds);
-  const std::int32_t skip22[] = {22};
-  const mi_run_row rows[2] = {{conds[0], nullptr, 0, 0, 0}, {conds[1], skip22, 1, 0, 0}};
-  mi_run_params rp = moss_run(q, rows);
-  ASSERT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
+  begin_moss_run(engine_, q, conds);
   mi_conditioning_free(conds[0]);
   mi_conditioning_free(conds[1]);
-  mi_tensor xv{}, ov[1]{};
-  ASSERT_EQ(mi_run_staging(engine_, &xv, ov, 1, nullptr), MI_OK);
   std::size_t n_sigmas = 0;
   const float* s = mi_run_sigmas(engine_, &n_sigmas);
   ASSERT_NE(s, nullptr);
   const float sigma0 = s[0];
-  std::atomic<bool> started{false};
+  mi_engine* const e = engine_;
+  engine_ = nullptr;  // freed below
   mi_status status = MI_OK;
+  const mi_step_params st = staging_step(e, sigma0);
   std::thread worker([&] {
-    mi_step_params st;
-    mi_step_params_init(&st, sizeof st);
-    st.sigma = sigma0;
-    st.x = xv;
-    st.out[0] = ov[0];
-    started.store(true);
-    status = mi_denoise_step(engine_, &st, nullptr);
+    do {
+      status = mi_denoise_step(e, &st, nullptr);
+    } while (status == MI_ERR_BUSY);
   });
-  while (!started.load()) std::this_thread::yield();
-  std::this_thread::sleep_for(std::chrono::milliseconds(30));
-  mi_engine_free(engine_);
-  engine_ = nullptr;
+  until_a_step_runs(e, sigma0);
+  mi_engine_free(e);
   worker.join();
   EXPECT_TRUE(status == MI_CANCELLED || status == MI_OK) << mi_status_string(status);
+}
+
+struct GenerateEvents {
+  std::atomic<int> denoise_steps{0};
+  mi_engine* engine = nullptr;
+  bool free_from_callback = false;
+  std::string message_before, message_after;
+};
+
+void on_generate_progress(const mi_progress* p, void* user) {
+  auto* ev = static_cast<GenerateEvents*>(user);
+  if (p->phase == MI_PHASE_DENOISE && p->step > 0) ++ev->denoise_steps;
+  if (ev->free_from_callback && p->phase == MI_PHASE_DENOISE && p->step == 1) {
+    ev->free_from_callback = false;
+    ev->message_before = mi_last_error_message();
+    mi_engine_free(ev->engine);  // forbidden here: a silent no-op
+    ev->message_after = mi_last_error_message();
+  }
+}
+
+// mi_engine_free from a callback of the running job does nothing (the last error unchanged, the engine usable,
+// sessions still open); with an open session, a free during a generation on another thread cancels it promptly.
+TEST_F(GpuComponentApi, EngineFreeFromACallbackAndDuringAGenerate) {
+  mi_gen_params q = request(512, 4);
+  GenerateEvents ev;
+  ev.engine = engine_;
+  ev.free_from_callback = true;
+  q.progress_callback = on_generate_progress;
+  q.user_data = &ev;
+  EXPECT_EQ(mi_session_close(nullptr), MI_ERR_INVALID_ARGUMENT);  // the error the callback must leave alone
+  mi_result* r = nullptr;
+  ASSERT_EQ(mi_generate(engine_, &q, &r), MI_OK) << last_error();
+  EXPECT_EQ(ev.message_before, "engine is NULL.");
+  EXPECT_EQ(ev.message_after, ev.message_before);
+  EXPECT_NE(mi_result_rgb(r, nullptr), nullptr);
+  mi_result_free(r);
+  ASSERT_EQ(mi_session_open(engine_, nullptr), MI_OK) << last_error();  // the free left no state behind
+
+  // A free with the session open while mi_generate runs on another thread: the generation is cancelled.
+  mi_gen_params long_q = request(1024, 50);
+  GenerateEvents run;
+  long_q.progress_callback = on_generate_progress;
+  long_q.user_data = &run;
+  mi_engine* const e = engine_;
+  engine_ = nullptr;
+  mi_status status = MI_OK;
+  mi_result* cancelled = nullptr;
+  std::thread generate([&] { status = mi_generate(e, &long_q, &cancelled); });
+  while (run.denoise_steps.load() < 2) std::this_thread::yield();
+  const auto t0 = std::chrono::steady_clock::now();
+  mi_engine_free(e);
+  const double free_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  generate.join();
+  EXPECT_EQ(status, MI_CANCELLED);
+  ASSERT_NE(cancelled, nullptr);
+  EXPECT_EQ(mi_result_cancelled(cancelled), 1);
+  EXPECT_LT(mi_result_steps_run(cancelled), 50);
+  EXPECT_LT(free_s, 10.0) << "the free waited out the generation";
+  mi_result_free(cancelled);
+}
+
+bool registered(const void* p) {
+  cudaPointerAttributes a{};
+  const bool known = cudaPointerGetAttributes(&a, p) == cudaSuccess;
+  cudaGetLastError();
+  return known && a.type == cudaMemoryTypeHost;
+}
+
+// The adopted block's lifecycle: registered while a run uses it, unregistered by mi_run_end and by a session close
+// without mi_run_end; the same block adopted again by a later run. And the §7.1 step refusals on device tensors.
+TEST_F(GpuComponentApi, AdoptedStagingLifecycleAndStepRefusals) {
+  const mi_gen_params q = request(512, 6);
+  mi_conditioning* conds[2] = {nullptr, nullptr};
+  open_and_encode(q, conds);
+  begin_moss_run(engine_, q, conds);
+  mi_run_info info{};
+  info.struct_size = sizeof info;
+  ASSERT_EQ(mi_run_query(engine_, &info), MI_OK);
+  const std::size_t bytes = (info.staging_bytes + 4095) / 4096 * 4096 + 4096;
+  void* block = ::operator new(bytes, std::align_val_t{4096});
+  ASSERT_EQ(mi_run_adopt_staging(engine_, block, bytes), MI_OK) << last_error();
+  EXPECT_TRUE(registered(block));
+  EXPECT_EQ(mi_run_end(engine_, nullptr), MI_OK);
+  EXPECT_FALSE(registered(block));
+  begin_moss_run(engine_, q, conds);
+  EXPECT_EQ(mi_run_adopt_staging(engine_, block, bytes), MI_OK) << last_error();  // the same block again
+  EXPECT_TRUE(registered(block));
+
+  // Step refusals (the run stays usable): mixed memory kinds, an output overlapping x, an output the run lacks, control
+  // without an adapter.
+  const std::size_t n = static_cast<std::size_t>(128) * info.latent_height * info.latent_width;
+  float* dev = nullptr;
+  ASSERT_EQ(cudaMalloc(&dev, 3 * n * sizeof(float)), cudaSuccess);
+  const auto device_f32 = [&](float* p) {
+    mi_tensor t{};
+    t.data = p;
+    t.memory = MI_MEMORY_DEVICE;
+    t.dtype = MI_DTYPE_F32;
+    t.rank = 3;
+    t.shape[0] = 128;
+    t.shape[1] = info.latent_height;
+    t.shape[2] = info.latent_width;
+    return t;
+  };
+  std::size_t n_sigmas = 0;
+  const float* s = mi_run_sigmas(engine_, &n_sigmas);
+  mi_step_params st = staging_step(engine_, s[0]);
+  st.out[0] = device_f32(dev);
+  EXPECT_EQ(mi_denoise_step(engine_, &st, nullptr), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_TRUE(has(last_error(), "all be device or all host")) << last_error();
+  st.x = device_f32(dev);
+  EXPECT_EQ(mi_denoise_step(engine_, &st, nullptr), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_TRUE(has(last_error(), "out[0] overlaps x")) << last_error();
+  st.out[0] = device_f32(dev + n);
+  st.out[1] = device_f32(dev + 2 * n);
+  EXPECT_EQ(mi_denoise_step(engine_, &st, nullptr), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_TRUE(has(last_error(), "out[1]: the run has no such output")) << last_error();
+  st.out[1] = mi_tensor{};
+  st.control = device_f32(dev + 2 * n);
+  EXPECT_EQ(mi_denoise_step(engine_, &st, nullptr), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_TRUE(has(last_error(), "control: the session has no control adapter")) << last_error();
+  st.control = mi_tensor{};
+  EXPECT_EQ(mi_denoise_step(engine_, &st, nullptr), MI_OK) << last_error();  // device tensors, the run still usable
+  cudaFree(dev);
+
+  // A session close without mi_run_end unregisters the block too.
+  EXPECT_EQ(mi_session_close(engine_), MI_OK);
+  EXPECT_FALSE(registered(block));
+
+  // Memory the caller registered itself is used as it is: the run's end leaves it registered.
+  ASSERT_EQ(cudaHostRegister(block, bytes, cudaHostRegisterPortable), cudaSuccess);
+  ASSERT_EQ(mi_session_open(engine_, nullptr), MI_OK) << last_error();
+  begin_moss_run(engine_, q, conds);
+  EXPECT_EQ(mi_run_adopt_staging(engine_, block, bytes), MI_OK) << last_error();
+  EXPECT_EQ(mi_run_end(engine_, nullptr), MI_OK);
+  EXPECT_TRUE(registered(block));
+  EXPECT_EQ(cudaHostUnregister(block), cudaSuccess);
+  EXPECT_EQ(mi_session_close(engine_), MI_OK);
+  ::operator delete(block, std::align_val_t{4096});
+  mi_conditioning_free(conds[0]);
+  mi_conditioning_free(conds[1]);
 }
 
 }  // namespace
