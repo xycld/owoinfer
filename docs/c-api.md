@@ -88,7 +88,7 @@ The weights load on the first `mi_generate()`, or earlier with `mi_engine_preloa
 
 | `mi_engine_params` field | Default | Meaning |
 |---|---|---|
-| `model_path` | — (required) | bundle directory. The tokenizer and configs always come from it. |
+| `model_path` | — (required) | bundle directory. The tokenizer and configs always come from it. A component that `dit_file`, `text_encoder_file` or `vae_file` replaces needs only its config in its folder: the engine identifies each file as its component by its shapes, then leaves the folder's weights for it unread (a `moss.mossidx` still serves). |
 | `model_format` | `AUTO` | `AUTO`: a directory is an HF bundle, a file is a ComfyUI checkpoint (not supported: `MI_ERR_NOT_SUPPORTED`). `COMFYUI` is reserved and not supported either. |
 | `mode` | `BALANCED` | `MIN_MEMORY` / `BALANCED` / `MAX_SPEED` (planner objective) |
 | `device_index` | 0 | CUDA ordinal |
@@ -101,7 +101,7 @@ The weights load on the first `mi_generate()`, or earlier with `mi_engine_preloa
 | `block_path` | `DEFAULT` (fused) | DiT block implementation: `OP_BY_OP`, `FUSED` or `FUSED_GRAPHS`; all give the same image bits. `FUSED` runs op by op when the startup self-check finds the fused GEMMs not bit-identical on this GPU, and `FUSED_GRAPHS` replays CUDA graphs only when every DiT block is resident. `mi_result_block_path()` reports what ran. |
 | `dit_file` | NULL = the bundle's `transformer/` | single-file DiT: INT8 ConvRot (G = 256), INT4 ConvRot (the `TURBO` tier), NVFP4 (the `TURBO` tier on an RTX 50: compute capability 12.0; refused elsewhere with `MI_ERR_MODEL`), mixed INT8/bf16 or bf16 safetensors in the ComfyUI layout (Comfy-Org and community files, `moss-infer quantize` output) |
 | `text_encoder_file` | NULL = the bundle's `text_encoder/` | INT8 ConvRot or W4A8 Qwen3.5 text encoder. Its embeddings are cached under its own identity. |
-| `vae_file` | NULL = the bundle's `vae/` | single FLUX.2 VAE file, decoded with the bundle's latent statistics |
+| `vae_file` | NULL = the bundle's `vae/` | single FLUX.2 VAE file, decoded with the bundle's latent statistics. Without weights in the bundle's `vae/`, with the file's own (fp32, where the bundle's are rounded to bf16: the image differs slightly from the official pipeline's); img2img with a decoder-only file still needs the bundle's VAE for the encoder. |
 | `tier` | `AUTO` | quality tier, see below |
 | `attention` | `DEFAULT` (the tier's choice) | DiT attention kernel: `EXACT` (FlashAttention-2) or an 8-bit mode |
 | `lora_strict` | 0 | 1: unknown LoRA keys and lossy merges fail the generation with `MI_ERR_MODEL` instead of being reported |

@@ -1354,6 +1354,67 @@ TEST(PipelineEndToEnd, Int8DitFileHighTierAddsQ8Attention) {
   for (const float v : r.latents) ASSERT_TRUE(std::isfinite(v));
 }
 
+// Component files replace the bundle's components: the bundle folder then needs only its configs and tokenizer (its
+// moss.mossidx still serves, without the replaced components). With the bundle's VAE weights there, the image is the
+// full bundle's bit for bit (the same latent statistics); without them the VAE file's own statistics decode the same
+// latents. Without the component files the configs-only folder is refused as before.
+TEST(PipelineEndToEnd, ComponentFilesNeedOnlyTheBundleConfigs) {
+  const fs::path sft = weights_root() / "sft";
+  const fs::path te = "/workspace/Models/community/comfy-org/qwen3.5_9b_int8_convrot.safetensors";
+  const fs::path vae = "/workspace/Models/community/comfy-org/flux2-vae_small.safetensors";
+  if (!fs::is_regular_file(sft / "moss.mossidx") || !fs::is_regular_file(kInt8Dit) || !fs::is_regular_file(te) ||
+      !fs::is_regular_file(vae)) {
+    GTEST_SKIP() << "SFT bundle or component files not present";
+  }
+  mi::testing::TempDir bare("pipe_configs_only"), with_vae("pipe_configs_vae");
+  const auto link = [&](const fs::path& dir, const fs::path& rel) {
+    fs::create_directories((dir / rel).parent_path());
+    fs::create_symlink(sft / rel, dir / rel);
+  };
+  for (const fs::path& dir : {bare.path(), with_vae.path()}) {
+    for (const char* rel : {"model_index.json", "moss.mossidx", "transformer/config.json", "text_encoder/config.json",
+                            "vae/config.json", "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json"}) {
+      link(dir, rel);
+    }
+  }
+  link(with_vae.path(), "vae/diffusion_pytorch_model.safetensors");
+
+  mi::pipeline::Request req;
+  req.prompt = "a lighthouse on a cliff at night";
+  req.height = req.width = 256;
+  req.steps = 3;
+  mi::pipeline::PipelineOptions options;
+  options.dit_file = kInt8Dit;
+  options.text_encoder_file = te;
+  options.vae_file = vae;
+  options.mode = mi::planner::Mode::kMinMemory;  // streamed: little host and device memory
+  mi::pipeline::Pipeline pipe(options);
+  req.model = sft;
+  const mi::pipeline::Result full = pipe.generate(req);
+  ASSERT_FALSE(full.rgb.empty());
+  req.model = with_vae.path();
+  const mi::pipeline::Result a = pipe.generate(req);
+  EXPECT_EQ(a.dit_source, kInt8Dit.string());
+  EXPECT_EQ(a.te_source, te.string());
+  EXPECT_EQ(a.vae_source, vae.string());
+  EXPECT_EQ(bit_mismatches(a.latents, full.latents), 0u);
+  EXPECT_EQ(a.rgb, full.rgb);
+  req.model = bare.path();
+  const mi::pipeline::Result b = pipe.generate(req);
+  EXPECT_EQ(bit_mismatches(b.latents, full.latents), 0u);
+  ASSERT_EQ(b.rgb.size(), full.rgb.size());
+  int max_diff = 0;
+  for (std::size_t i = 0; i < b.rgb.size(); ++i) max_diff = std::max(max_diff, std::abs(int{b.rgb[i]} - int{full.rgb[i]}));
+  EXPECT_GT(max_diff, 0) << "decoded with the file's own (unrounded) latent statistics";
+  EXPECT_LE(max_diff, 8) << "decoded with the file's own (unrounded) latent statistics";
+
+  // Only the text encoder replaced: the DiT's weights are still the bundle's, and missing.
+  mi::pipeline::PipelineOptions te_only;
+  te_only.text_encoder_file = te;
+  mi::pipeline::Pipeline te_pipe(te_only);
+  EXPECT_THROW(te_pipe.generate(req), mi::weights::IndexError);
+}
+
 // Runtime LoRAs on the bf16 SFT DiT (two real files, kohya and PEFT): they change the latents, report as uncertified;
 // a strength change applies without reloading the DiT (side branches in place, merged adapters re-merged from the
 // pristine weights), and strength 0 for every file gives the no-LoRA latents bit for bit. A latent preview reports every step.

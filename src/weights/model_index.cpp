@@ -253,7 +253,8 @@ std::vector<std::string> numbered(const std::string& prefix, std::int64_t n) {
   return v;
 }
 
-void index_text_encoder(ModelIndex& index) {
+// `weights` false: the config is read and checked, no weight file is opened (BuildOptions::skip).
+void index_text_encoder(ModelIndex& index, bool weights) {
   const fs::path cfg_path = index.bundle_dir / "text_encoder" / "config.json";
   json::Value cfg = parse_json_file(cfg_path, kMaxConfigBytes, kMaxConfigValues);
   const json::Value* tc = cfg.find("text_config");
@@ -273,6 +274,7 @@ void index_text_encoder(ModelIndex& index) {
   std::vector<std::string> names{"embed_tokens"};
   for (auto& n : numbered("layers.", static_cast<std::int64_t>(types.size()))) names.push_back(std::move(n));
   names.push_back("final_norm");
+  if (!weights) return;
 
   const std::size_t first = index.groups.size();
   assemble(index, Component::kTextEncoder, load_component_tensors(index, Component::kTextEncoder), names, classify_text_encoder);
@@ -285,7 +287,7 @@ void index_text_encoder(ModelIndex& index) {
   }
 }
 
-void index_transformer(ModelIndex& index) {
+void index_transformer(ModelIndex& index, bool weights) {
   const fs::path cfg_path = index.bundle_dir / "transformer" / "config.json";
   json::Value cfg = parse_json_file(cfg_path, kMaxConfigBytes, kMaxConfigValues);
   const json::Value* nl = cfg.find("num_layers");
@@ -293,6 +295,7 @@ void index_transformer(ModelIndex& index) {
   if (nl->as_int() < 0 || nl->as_int() > kMaxLayers) {
     throw IndexError(path_utf8(cfg_path) + ": num_layers " + std::to_string(nl->as_int()) + " is outside [0, " + std::to_string(kMaxLayers) + "]");
   }
+  if (!weights) return;
   std::vector<std::string> names{"globals", "text_embedder"};
   for (auto& n : numbered("block.", nl->as_int())) names.push_back(std::move(n));
   assemble(index, Component::kTransformer, load_component_tensors(index, Component::kTransformer), names, classify_transformer);
@@ -459,9 +462,9 @@ ModelIndex build_index(const fs::path& bundle_dir, const BuildOptions& options) 
   ModelIndex index;
   index.bundle_dir = bundle_dir;
   try {
-    index_text_encoder(index);
-    index_transformer(index);
-    index_vae(index);
+    index_text_encoder(index, !options.skip.has(Component::kTextEncoder));
+    index_transformer(index, !options.skip.has(Component::kTransformer));
+    if (!options.skip.has(Component::kVae)) index_vae(index);
     if (options.checksum) {
       for (auto& g : index.groups) g.checksum = checksum_group(index, g);
     }
@@ -469,6 +472,24 @@ ModelIndex build_index(const fs::path& bundle_dir, const BuildOptions& options) 
     throw IndexError(path_utf8(bundle_dir) + ": cannot read bundle (" + e.what() + ")");
   }
   return index;
+}
+
+ComponentSet components_to_skip(const fs::path& bundle_dir, ComponentSet replaced) {
+  ComponentSet skip;
+  for (Component c : {Component::kTextEncoder, Component::kTransformer}) {
+    if (replaced.has(c)) skip.add(c);
+  }
+  if (replaced.has(Component::kVae)) {
+    bool weights = false;
+    std::error_code ec;
+    for (fs::directory_iterator it(bundle_dir / component_name(Component::kVae), ec), end; !ec && it != end && !weights; it.increment(ec)) {
+      const std::string n = path_utf8(it->path().filename());
+      weights = ends_with(n, kShardSuffix) || ends_with(n, kShardIndexSuffix);
+    }
+    // A folder that cannot be listed stays indexed: build_index reports it.
+    if (!weights && (!ec || ec == std::errc::no_such_file_or_directory)) skip.add(Component::kVae);
+  }
+  return skip;
 }
 
 void write_index(const ModelIndex& index, const fs::path& path) {
@@ -517,7 +538,7 @@ void write_index(const ModelIndex& index, const fs::path& path) {
   if (ec) throw fs::filesystem_error("cannot rename", tmp, path, ec);
 }
 
-ModelIndex load_index(const fs::path& path, const fs::path& bundle_dir) {
+ModelIndex load_index(const fs::path& path, const fs::path& bundle_dir, ComponentSet skip) {
   ModelIndex index;
   index.bundle_dir = bundle_dir.empty() ? path.parent_path() : bundle_dir;
   if (index.bundle_dir.empty()) index.bundle_dir = ".";
@@ -535,9 +556,24 @@ ModelIndex load_index(const fs::path& path, const fs::path& bundle_dir) {
 
     // The index ships inside a downloaded bundle, so nothing in it is trusted: paths are confined
     // to the bundle before anything is opened, and every size is range-checked before use.
+    // A skipped component's files are dropped unopened (build_index names them "<component>/<file>"); the kept files'
+    // ids are renumbered (stored id -> kept id, -1: dropped).
+    std::vector<std::int64_t> kept_id;
+    const auto skipped_file = [&](std::string_view p) {
+      const std::string_view folder = p.substr(0, p.find('/'));
+      for (Component c : {Component::kTextEncoder, Component::kTransformer, Component::kVae}) {
+        if (skip.has(c) && folder == component_name(c)) return true;
+      }
+      return false;
+    };
     for (const auto& f : doc.at("files").as_array()) {
       IndexedFile file{f.at("path").as_string(), as_u64(f.at("size")), f.at("mtime_ns").as_int()};
       if (!is_plain_relative_path(file.path)) fail("file path '" + file.path + "' is not a plain bundle-relative path");
+      if (skipped_file(file.path)) {
+        kept_id.push_back(-1);
+        continue;
+      }
+      kept_id.push_back(static_cast<std::int64_t>(index.files.size()));
       const fs::path p = index.bundle_dir / path_from_utf8(file.path);
       std::error_code ec;
       if (!fs::is_regular_file(p, ec)) throw StaleIndexError(where + ": file " + file.path + " no longer exists; rebuild with `moss-infer index`");
@@ -547,12 +583,14 @@ ModelIndex load_index(const fs::path& path, const fs::path& bundle_dir) {
       index.files.push_back(std::move(file));
     }
     for (const auto& e : doc.at("excluded").as_array()) {
-      index.excluded.push_back({parse_component(e.at("component").as_string()), e.at("prefix").as_string(),
-                                as_u64(e.at("tensors")), as_u64(e.at("bytes"))});
+      const Component c = parse_component(e.at("component").as_string());
+      if (skip.has(c)) continue;
+      index.excluded.push_back({c, e.at("prefix").as_string(), as_u64(e.at("tensors")), as_u64(e.at("bytes"))});
     }
     for (const auto& gv : doc.at("groups").as_array()) {
       WeightGroup g;
       g.component = parse_component(gv.at("component").as_string());
+      if (skip.has(g.component)) continue;
       g.name = gv.at("name").as_string();
       if (const json::Value* lt = gv.find("layer_type")) g.layer_type = lt->as_string();
       if (const json::Value* cs = gv.find("xxh64")) {
@@ -578,8 +616,9 @@ ModelIndex load_index(const fs::path& path, const fs::path& bundle_dir) {
         const std::uint64_t file_id = as_u64(a[3]);
         t.offset = as_u64(a[4]);
         t.nbytes = as_u64(a[5]);
-        if (file_id >= index.files.size()) fail("tensor '" + t.name + "': bad file id");
-        t.file = static_cast<std::uint32_t>(file_id);
+        if (file_id >= kept_id.size()) fail("tensor '" + t.name + "': bad file id");
+        if (kept_id[file_id] < 0) fail("tensor '" + t.name + "': its file belongs to a component left out");
+        t.file = static_cast<std::uint32_t>(kept_id[file_id]);
         if (t.offset > index.files[t.file].size || t.nbytes > index.files[t.file].size - t.offset) fail("tensor '" + t.name + "': range outside its file");
         const std::optional<std::uint64_t> expect = util::checked_mul(static_cast<std::uint64_t>(*numel), dtype_size(t.dtype));
         if (!expect || t.nbytes != *expect) fail("tensor '" + t.name + "': byte size does not match shape x dtype");
@@ -615,7 +654,7 @@ ModelIndex load_index(const fs::path& path, const fs::path& bundle_dir) {
     // offsets) and classification. Headers are a few tens of KB per file, so this is cheap.
     ModelIndex fresh;
     try {
-      fresh = build_index(index.bundle_dir);
+      fresh = build_index(index.bundle_dir, {.skip = skip});
     } catch (const std::exception& e) {
       fail(std::string("bundle does not validate (") + e.what() + ")");
     }

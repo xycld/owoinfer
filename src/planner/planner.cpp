@@ -1013,32 +1013,19 @@ BudgetError::BudgetError(const std::string& message, std::size_t required_arena_
 
 ModelShapes shapes_from_index(const weights::ModelIndex& index, const weights::ModelIndex* dit_index, Precision dit_precision,
                               const weights::ModelIndex* te_index, const weights::ModelIndex* vae_index) {
-  ModelShapes s = shapes_from_index(index);
+  // Each component from its own index: the bundle's need not hold those given separately (weights::BuildOptions::skip).
+  ModelShapes s;
+  te_shapes(te_index != nullptr ? *te_index : index, s);
+  dit_shapes(dit_index != nullptr ? *dit_index : index, s);
+  for (const weights::WeightGroup* g : (vae_index != nullptr ? *vae_index : index).groups_of(weights::Component::kVae)) {
+    s.vae_bytes += static_cast<std::size_t>(g->total_bytes);
+  }
   s.dit_precision = dit_precision;
-  if (dit_index != nullptr) {
-    ModelShapes d;
-    dit_shapes(*dit_index, d);
-    if (d.dit_blocks == 0) throw std::invalid_argument("DiT index lacks the DiT blocks");
-    s.dit_blocks = d.dit_blocks;
-    s.dit_block_bytes = d.dit_block_bytes;
-    s.dit_bytes = d.dit_bytes;
-    s.dit_dim = d.dit_dim;
-    s.dit_params = d.dit_params;
-  }
-  if (te_index != nullptr) {
-    ModelShapes t;
-    te_shapes(*te_index, t);
-    if (t.te_layers == 0) throw std::invalid_argument("text-encoder index lacks the decoder layers");
-    s.te_layers = t.te_layers;
-    s.te_layer_bytes = t.te_layer_bytes;
-    s.te_stream_bytes = t.te_stream_bytes;
-    s.te_embed_bytes = t.te_embed_bytes;
-  }
-  if (vae_index != nullptr) {
-    std::size_t bytes = 0;
-    for (const weights::WeightGroup* g : vae_index->groups_of(weights::Component::kVae)) bytes += static_cast<std::size_t>(g->total_bytes);
-    if (bytes == 0) throw std::invalid_argument("VAE index lacks the decoder");
-    s.vae_bytes = bytes;
+  if (dit_index != nullptr && s.dit_blocks == 0) throw std::invalid_argument("DiT index lacks the DiT blocks");
+  if (te_index != nullptr && s.te_layers == 0) throw std::invalid_argument("text-encoder index lacks the decoder layers");
+  if (vae_index != nullptr && s.vae_bytes == 0) throw std::invalid_argument("VAE index lacks the decoder");
+  if (s.te_layers == 0 || s.dit_blocks == 0 || s.vae_bytes == 0) {
+    throw std::invalid_argument("model index lacks the text encoder layers, the DiT blocks or the VAE decoder");
   }
   return s;
 }

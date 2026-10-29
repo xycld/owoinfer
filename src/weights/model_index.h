@@ -118,13 +118,34 @@ TensorRoute classify_tensor(Component c, const std::string& name);
 // zero) so two spellings cannot name the same layer.
 bool take_layer_index(std::string_view& rest, int& n);
 
+// A set of components.
+struct ComponentSet {
+  unsigned bits = 0;
+  bool has(Component c) const { return ((bits >> static_cast<unsigned>(c)) & 1u) != 0; }
+  ComponentSet& add(Component c) {
+    bits |= 1u << static_cast<unsigned>(c);
+    return *this;
+  }
+  bool empty() const { return bits == 0; }
+};
+
 struct BuildOptions {
   bool checksum = false;  // read every group's bytes and record XXH64 (full I/O on the group files)
+  // Components left out of the index, their weights taken from elsewhere (a component file): none of their weight
+  // files is opened, so their folders need hold only their configs, which are still read and checked.
+  ComponentSet skip = {};
 };
 
 // Reads safetensors headers and configs only (plus group data when options.checksum).
 // Throws FormatError / IoError / IndexError on malformed or unreadable bundles or unclassified tensors.
 ModelIndex build_index(const std::filesystem::path& bundle_dir, const BuildOptions& options = {});
+
+// What a bundle's index leaves out (BuildOptions::skip) when component files replace the components in `replaced`:
+// the text encoder and the DiT, and the VAE when the bundle's vae folder holds no weights (no *.safetensors, no shard
+// index). A bundle VAE that is there stays indexed: a VAE file is decoded with the bundle's latent statistics
+// (flux2_vae/vae_file.h). The caller identifies each file as its component by its shapes first. Lists one directory,
+// only for a replaced VAE.
+ComponentSet components_to_skip(const std::filesystem::path& bundle_dir, ComponentSet replaced);
 
 void write_index(const ModelIndex& index, const std::filesystem::path& path);
 
@@ -132,7 +153,11 @@ void write_index(const ModelIndex& index, const std::filesystem::path& path);
 // `bundle_dir` (default: the index file's directory), and agreement with build_index(bundle_dir)
 // (configs and safetensors headers are re-read; the index is untrusted input). The result keeps the
 // stored checksums. Throws IndexError, or StaleIndexError when a file changed size or mtime.
-ModelIndex load_index(const std::filesystem::path& path, const std::filesystem::path& bundle_dir = {});
+// `skip`: the stored files ("<component>/..."), groups and exclusions of these components are dropped unread (their
+// files need not exist or be current), and the rest must agree with build_index(bundle_dir, {.skip = skip}): a full
+// index serves a run that replaces components, and an index without a component serves only runs that skip it.
+ModelIndex load_index(const std::filesystem::path& path, const std::filesystem::path& bundle_dir = {},
+                      ComponentSet skip = {});
 
 // XXH64 over the group's tensor bytes in listed order.
 std::uint64_t checksum_group(const ModelIndex& index, const WeightGroup& group);

@@ -104,19 +104,26 @@ std::vector<int> parse_layers(const json::Value& v, const char* name) {
 
 struct Bundle {
   std::filesystem::path dir;
-  weights::ModelIndex index;
+  weights::ModelIndex index;  // without the components left out for the pipeline's component files
   tok::Tokenizer tokenizer;
-  std::uint64_t te_hash = 0;  // embedding-cache identity of the text encoder's weights
+  std::uint64_t te_hash = 0;  // embedding-cache identity of the text encoder's weights (0: not indexed)
 };
 
-std::unique_ptr<Bundle> open_bundle(const std::filesystem::path& dir) {
-  if (!std::filesystem::is_directory(dir)) throw std::invalid_argument("model bundle not found: " + util::path_utf8(dir));
-  weights::check_supported_bundle(dir);  // plain refusal of other models, before any weight file is read
+// The bundle's index without the components in `skip` (weights::BuildOptions::skip; a .mossidx is read the same way)
+// and its tokenizer. The folder has passed check_supported_bundle.
+std::unique_ptr<Bundle> open_bundle(const std::filesystem::path& dir, weights::ComponentSet skip) {
   const std::filesystem::path idx = dir / "moss.mossidx";
-  weights::ModelIndex index = std::filesystem::is_regular_file(idx) ? weights::load_index(idx, dir) : weights::build_index(dir);
+  weights::ModelIndex index = std::filesystem::is_regular_file(idx) ? weights::load_index(idx, dir, skip)
+                                                                    : weights::build_index(dir, {.skip = skip});
   auto b = std::unique_ptr<Bundle>(new Bundle{dir, std::move(index), tok::Tokenizer::load(dir / "tokenizer" / "tokenizer.json"), 0});
-  b->te_hash = text_encoder_hash(b->index);
+  if (!skip.has(weights::Component::kTextEncoder)) b->te_hash = text_encoder_hash(b->index);
   return b;
+}
+
+// The latent statistics a VAE file is decoded (and encoded) with: the bundle's VAE when its index holds it, else
+// nullptr, the file's own (a bundle without VAE weights).
+const weights::ModelIndex* latent_stats(const Bundle& b) {
+  return b.index.find_group(weights::Component::kVae, "decoder") != nullptr ? &b.index : nullptr;
 }
 
 // Where the DiT's weights come from (P6): the bundle's transformer, or a single file (quant::to_model_index; INT8,
@@ -388,8 +395,9 @@ struct TeSource {
 struct VaeSource {
   std::filesystem::path path;
   const weights::ModelIndex* index = nullptr;
-  std::unique_ptr<weights::ModelIndex> own;           // file only
-  const weights::ModelIndex* latent_stats = nullptr;  // file only: the bundle's index
+  const weights::ModelIndex* file = nullptr;          // file only: Impl::vae_file_index
+  // File only: the bundle's index when it holds the bundle's VAE, else nullptr (the file's own statistics).
+  const weights::ModelIndex* latent_stats = nullptr;
   flux2_vae::DecoderConfig config;
 };
 
@@ -896,6 +904,7 @@ struct Pipeline::Impl {
   std::unique_ptr<flux2_vae::Flux2VaeDecoder> vae;
   const VaeSource* vae_src = nullptr;
   std::map<std::string, std::unique_ptr<VaeSource>> vae_sources;
+  std::unique_ptr<weights::ModelIndex> vae_file;  // options.vae_file's index (vae_file_index)
   // img2img's VAE encoder: persistent in the arena next to the decoder once loaded (dropped with the arena).
   std::unique_ptr<flux2_vae_encoder::Flux2VaeEncoder> encoder;
   const EncoderSource* encoder_src = nullptr;
@@ -947,21 +956,35 @@ struct Pipeline::Impl {
     arena.reset();
   }
 
+  // The bundle of a call. The component files are opened first, each identified as its component by its shapes
+  // (open_dit_file, check_supported_text_encoder_file, index_vae_file refuse any other file), and only then are the
+  // components they replace left out of the bundle's index (weights::components_to_skip): their folders need hold only
+  // their configs. The key carries the replaced set, so an index without a component never serves a call that needs it.
   Bundle& bundle(const std::filesystem::path& dir, double& load_s) {
-    const std::string key = util::path_utf8(util::path_key(dir));
+    weights::ComponentSet replaced;
+    if (!options.text_encoder_file.empty()) replaced.add(weights::Component::kTextEncoder);
+    if (!options.dit_file.empty()) replaced.add(weights::Component::kTransformer);
+    if (!options.vae_file.empty()) replaced.add(weights::Component::kVae);
+    const std::string key = util::path_utf8(util::path_key(dir)) + "|" + std::to_string(replaced.bits);
     auto it = bundles.find(key);
     if (it == bundles.end()) {
       const auto t0 = Clock::now();
-      it = bundles.emplace(key, open_bundle(dir)).first;
+      if (!std::filesystem::is_directory(dir)) throw std::invalid_argument("model bundle not found: " + util::path_utf8(dir));
+      weights::check_supported_bundle(dir);  // plain refusal of other models, before any weight file is read
+      if (replaced.has(weights::Component::kTransformer)) dit_source(nullptr, load_s);
+      if (replaced.has(weights::Component::kTextEncoder)) te_source(nullptr, load_s);
+      if (replaced.has(weights::Component::kVae)) vae_file_index();
+      it = bundles.emplace(key, open_bundle(dir, weights::components_to_skip(dir, replaced))).first;
       load_s = since(t0);
     }
     return *it->second;
   }
 
-  // The DiT of this call: options.dit_file, else the bundle's transformer.
-  DitSource& dit_source(const Bundle& b, double& load_s) {
+  // The DiT of this call: options.dit_file (`b` unused, nullptr before the bundle is opened), else the bundle's
+  // transformer.
+  DitSource& dit_source(const Bundle* b, double& load_s) {
     const bool file = !options.dit_file.empty();
-    const std::filesystem::path path = file ? options.dit_file : b.dir;
+    const std::filesystem::path path = file ? options.dit_file : b->dir;
     const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(util::path_key(path));
     auto it = dit_sources.find(key);
     if (it == dit_sources.end()) {
@@ -971,9 +994,9 @@ struct Pipeline::Impl {
         d = open_dit_file(path);
       } else {
         d = std::make_unique<DitSource>();
-        d->path = b.dir / "transformer";
+        d->path = b->dir / "transformer";
         d->cert_path = d->path;
-        d->index = &b.index;
+        d->index = &b->index;
         d->linears = moss_dit::describe_linears(nullptr);
       }
       d->files = dit_files(*d->index);
@@ -984,10 +1007,10 @@ struct Pipeline::Impl {
     return *it->second;
   }
 
-  // The text encoder of this call: options.text_encoder_file, else the bundle's.
-  TeSource& te_source(const Bundle& b, double& load_s) {
+  // The text encoder of this call: options.text_encoder_file (`b` unused, as for dit_source), else the bundle's.
+  TeSource& te_source(const Bundle* b, double& load_s) {
     const bool file = !options.text_encoder_file.empty();
-    const std::filesystem::path path = file ? options.text_encoder_file : b.dir;
+    const std::filesystem::path path = file ? options.text_encoder_file : b->dir;
     const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(util::path_key(path));
     auto it = te_sources.find(key);
     if (it == te_sources.end()) {
@@ -1001,15 +1024,29 @@ struct Pipeline::Impl {
         t->precision = t->model->precision();
         t->identity = text_encoder_hash(t->model->index());
       } else {
-        t->path = b.dir / "text_encoder";
-        t->index = &b.index;
-        t->identity = b.te_hash;
+        t->path = b->dir / "text_encoder";
+        t->index = &b->index;
+        t->identity = b->te_hash;
       }
       t->numerics = qwen35_text::numerics_id(t->precision);
       it = te_sources.emplace(key, std::move(t)).first;
       load_s += since(t0);
     }
     return *it->second;
+  }
+
+  // options.vae_file's index, read once: flux2_vae::index_vae_file refuses a file without a complete FLUX.2 decoder,
+  // decoder_config one whose shapes are no supported decoder's.
+  const weights::ModelIndex& vae_file_index() {
+    if (!vae_file) {
+      if (!std::filesystem::is_regular_file(options.vae_file)) {
+        throw std::invalid_argument("VAE file not found: " + util::path_utf8(options.vae_file));
+      }
+      auto index = std::make_unique<weights::ModelIndex>(flux2_vae::index_vae_file(options.vae_file));
+      flux2_vae::decoder_config(*index);
+      vae_file = std::move(index);
+    }
+    return *vae_file;
   }
 
   // The VAE decoder of this call: options.vae_file, else the bundle's.
@@ -1024,11 +1061,10 @@ struct Pipeline::Impl {
       const auto t0 = Clock::now();
       auto v = std::make_unique<VaeSource>();
       if (file) {
-        if (!std::filesystem::is_regular_file(path)) throw std::invalid_argument("VAE file not found: " + util::path_utf8(path));
         v->path = path;
-        v->own = std::make_unique<weights::ModelIndex>(flux2_vae::index_vae_file(path));
-        v->index = v->own.get();
-        v->latent_stats = &b.index;
+        v->file = &vae_file_index();
+        v->index = v->file;
+        v->latent_stats = latent_stats(b);
       } else {
         v->path = b.dir / "vae";
         v->index = &b.index;
@@ -1058,9 +1094,9 @@ struct Pipeline::Impl {
         }
       }
       if (has_encoder) {
-        e->persistent = flux2_vae_encoder::Flux2VaeEncoder::persistent_bytes(options.vae_file, &b.index);
+        e->latent_stats = latent_stats(b);
+        e->persistent = flux2_vae_encoder::Flux2VaeEncoder::persistent_bytes(options.vae_file, e->latent_stats);
         e->file = options.vae_file;
-        e->latent_stats = &b.index;
       } else {
         e->file = b.dir / "vae" / "diffusion_pytorch_model.safetensors";
         if (!std::filesystem::is_regular_file(e->file)) {
@@ -1675,8 +1711,8 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   } cancel_scope{m};
 
   Bundle& b = m.bundle(req.model, tm.index_load_s);
-  DitSource& src = m.dit_source(b, tm.index_load_s);
-  const TeSource& tes = m.te_source(b, tm.index_load_s);
+  DitSource& src = m.dit_source(&b, tm.index_load_s);
+  const TeSource& tes = m.te_source(&b, tm.index_load_s);
   const VaeSource& vs = m.vae_source(b, tm.index_load_s);
   r.te_source = util::path_utf8(tes.path);
   r.te_precision = qwen35_text::precision_name(tes.precision);
@@ -2121,7 +2157,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
 
   planner::PlanInputs in;
   in.shapes = planner::shapes_from_index(b.index, src.quant ? src.index : nullptr, src.precision,
-                                         tes.model ? &tes.model->index() : nullptr, vs.own.get());
+                                         tes.model ? &tes.model->index() : nullptr, vs.file);
   in.shapes.dit_bytes = moss_dit::MossDit::persistent_bytes(*src.index);
   if (src.quant) in.shapes.dit_int8_fraction = moss_dit::int8_gemm_fraction(src.quant.get());
   if (src.quant) in.shapes.dit_int4_fraction = moss_dit::int4_gemm_fraction(src.quant.get());
