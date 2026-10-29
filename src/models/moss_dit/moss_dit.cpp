@@ -1028,6 +1028,17 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     }
     lengths.push_back(t.dim(0));
   }
+  // An input extension's latents: checked with the rows, before any work is enqueued.
+  if (input_ext_ != nullptr) {
+    const Tensor& e = input_ext_->extra;
+    const std::int64_t c = input_ext_->weight.dim(1) - kLatentChannels;
+    check_device(e, DType::kF32, "input extension extra");
+    if (e.rank != latents.rank || (batched && e.dim(0) != num_latents) || e.dim(e.rank - 3) != c ||
+        e.dim(e.rank - 2) != height || e.dim(e.rank - 1) != width || !e.is_contiguous()) {
+      fail("input extension extra must be a contiguous [" + (batched ? std::to_string(num_latents) + ", " : std::string()) +
+           std::to_string(c) + ", " + std::to_string(height) + ", " + std::to_string(width) + "], got " + e.describe());
+    }
+  }
   const std::vector<std::int64_t> off = token_offsets(height, width, lengths);
   const std::int64_t total = off.back();
   // Past the self-check's longest run the linears would go op by op unchecked: refused instead (a latent batch or many
@@ -1127,16 +1138,6 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   // Per-row RoPE tables (P:250, text length differs per row) and the joint inputs [video_r | text_r] (P:247-252).
   // The video embedding is the same for every row of a latent: computed once, into the latent's first row, and copied
   // to its other rows (one latent: row 0's embedding copied to every other row).
-  if (input_ext_ != nullptr) {
-    const Tensor& e = input_ext_->extra;
-    const std::int64_t c = input_ext_->weight.dim(1) - kLatentChannels;
-    check_device(e, DType::kF32, "input extension extra");
-    if (e.rank != latents.rank || (batched && e.dim(0) != num_latents) || e.dim(e.rank - 3) != c ||
-        e.dim(e.rank - 2) != height || e.dim(e.rank - 1) != width || !e.is_contiguous()) {
-      fail("input extension extra must be a contiguous [" + (batched ? std::to_string(num_latents) + ", " : std::string()) +
-           std::to_string(c) + ", " + std::to_string(height) + ", " + std::to_string(width) + "], got " + e.describe());
-    }
-  }
   // Latent l's [C, h, w] plane of a [L, C, h, w] batch (the tensor itself when not batched).
   const auto plane = [&](const Tensor& t, int l) {
     if (!batched) return t;

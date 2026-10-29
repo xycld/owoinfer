@@ -29,6 +29,9 @@ inline constexpr std::size_t kMaxRunSigmas = 10001;
 // mi_generate's sigmas for one pass: make_schedule(kind, steps, fs) cropped to the tail a denoise strength leaves
 // (strength_start_step, the img2img rule of Pipeline::run); strength 1 is the whole schedule. Empty when no step is
 // left (strength 0). Throws std::invalid_argument as make_schedule, or for a strength outside [0, 1].
+// Two differences from Pipeline::run as it is today, which does not call this function yet: mi_generate ignores the
+// strength without an init image (txt2img always runs the whole schedule), and its dataspace sampler takes
+// dataspace_sigmas instead of make_schedule (no dataspace here: the component API does not offer that sampler).
 std::vector<float> engine_sigmas(SchedulerKind kind, int steps, const FlowSampling& fs, double strength);
 
 // Index of the first position where a and b differ bit for bit (a shorter array differs at its end), or npos when they
