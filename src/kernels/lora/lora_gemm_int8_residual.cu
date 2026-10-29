@@ -25,7 +25,7 @@ void gated_residual(const quant::detail::Problem& p, const quant::Int8Operands& 
       {{}, {reinterpret_cast<const bf16*>(gate), bf16(0), {_0{}, _1{}, p.n}}, {r, bf16(0), {ldr, _1{}, ldr * p.m}}, {}},
       {r, {ldr, _1{}, ldr * p.m}}};
   prm.output_op = K::FusionCallbacks::to_underlying_arguments(prm.problem, cb, nullptr);
-  launch<K>("int8_gemm_gated_residual_lora", prm, stream);
+  launch<K>("int8_gemm_gated_residual_lora", prm, stream, quant::detail::int8_band(p, K::kTileN));
 }
 
 }  // namespace

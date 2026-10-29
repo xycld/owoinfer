@@ -157,6 +157,7 @@ struct SliceParams {
 template <class MmaMain, class MmaLora, class Epilogue, class Swizzle, class Convert>
 struct LoraGemmKernel {
   using FusionCallbacks = typename Epilogue::FusionCallbacks;
+  using TileSwizzle = Swizzle;
   static constexpr int kThreadCount = MmaMain::WarpCount::kCount * 32;
   static constexpr int kTileM = MmaMain::Shape::kM, kTileN = MmaMain::Shape::kN;
   static_assert(MmaLora::WarpCount::kCount * 32 == kThreadCount, "mainloops must use the same threads");
@@ -336,7 +337,8 @@ struct Int8LoraKernel {
   using Tree = TreeOf<typename LTile::Threadblock, typename LTile::Warp>;
   using MmaMain = typename quant::detail::Int8Kernel<Tile, typename quant::detail::Nodes<Tile>::Plain, PermuteB>::GemmBase::Mma;
   using Parts = LoraParts<LTile, Tree>;
-  using Kernel = LoraGemmKernel<MmaMain, typename Parts::Mma, typename Parts::Epilogue, fused::detail::Swizzle, Dequant>;
+  // The plain INT8 GEMMs' tile order (bands of N tiles past the L2 threshold, quant::detail::int8_band).
+  using Kernel = LoraGemmKernel<MmaMain, typename Parts::Mma, typename Parts::Epilogue, quant::detail::BandedSwizzle, Dequant>;
 };
 
 template <class TB, class W>
@@ -384,12 +386,13 @@ void set_slices(const char* op, const LoraSlices& l, std::int64_t m, std::int64_
   p.pt = PT(cutlass::layout::RowMajor(static_cast<int>(l.ldt)));
 }
 
+// band: BandedSwizzle's band (the INT8 kernels: quant::detail::int8_band); 0 for the kernel's swizzle default.
 template <class K>
-void launch(const char* op, typename K::Params& p, cudaStream_t stream) {
-  using Swizzle = typename fused::detail::Swizzle;
+void launch(const char* op, typename K::Params& p, cudaStream_t stream, int band = 0) {
+  using Swizzle = typename K::TileSwizzle;
   Swizzle swizzle;
   p.grid_tiled_shape = swizzle.get_tiled_shape(p.problem, {K::kTileM, K::kTileN, 1}, 1);
-  p.swizzle_log_tile = swizzle.get_log_tile(p.grid_tiled_shape);
+  p.swizzle_log_tile = band > 0 ? band : swizzle.get_log_tile(p.grid_tiled_shape);
   p.problem_shape = {p.problem.m(), p.problem.n(), 1};
   const dim3 grid = swizzle.get_grid_shape(p.grid_tiled_shape);
   constexpr int kSmem = static_cast<int>(sizeof(typename K::SharedStorage));

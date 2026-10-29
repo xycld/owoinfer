@@ -25,7 +25,7 @@ void situ_glu(const quant::detail::Problem& p, const quant::Int8Operands& a, con
   const std::int64_t ldd = 2 * ldo;
   const typename K::FusionCallbacks::Arguments cb{{{}, quant::detail::situ_factor_tables(stream)}, {d, {ldd, _1{}, ldd * p.m}}};
   prm.output_op = K::FusionCallbacks::to_underlying_arguments(prm.problem, cb, nullptr);
-  launch<K>("int8_gemm_situ_glu_lora", prm, stream);
+  launch<K>("int8_gemm_situ_glu_lora", prm, stream, quant::detail::int8_band(p, K::kTileN));
 }
 
 }  // namespace

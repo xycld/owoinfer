@@ -20,7 +20,7 @@ void plain(const quant::detail::Problem& p, const quant::Int8Operands& a, const 
   set_slices<K>("int8_gemm_lora", l, p.m, p.n, prm);
   const typename K::FusionCallbacks::Arguments cb{{{}, {}}, {reinterpret_cast<bf16*>(out), {ldo, _1{}, ldo * p.m}}};
   prm.output_op = K::FusionCallbacks::to_underlying_arguments(prm.problem, cb, nullptr);
-  launch<K>("int8_gemm_lora", prm, stream);
+  launch<K>("int8_gemm_lora", prm, stream, quant::detail::int8_band(p, K::kTileN));
 }
 
 }  // namespace
