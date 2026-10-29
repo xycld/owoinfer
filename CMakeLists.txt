@@ -119,10 +119,10 @@ target_include_directories(mossinfer_core SYSTEM PRIVATE
 target_link_libraries(mossinfer_core PUBLIC CUDA::cudart ${CMAKE_DL_LIBS})  # cuBLASLt: loaded at run time (src/backend/cuda_libs.h)
 set_target_properties(mossinfer_core PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_SEPARABLE_COMPILATION OFF)
 
-# torch_cpu_randn, the INT8 ConvRot quantizer, the LoRA merge and the NVFP4 codec and recipes are bit-exact (and the
-# NVFP4 converter's output reproducible across machines) only if the compiler neither contracts mul+add into FMAs nor
-# applies fast-math. Source options come after CMAKE_CXX_FLAGS on the command line, so these win.
-set(MOSSINFER_STRICT_FP_SOURCES ${CMAKE_SOURCE_DIR}/src/pipeline/rng_torch_compat.cpp
+# torch_cpu_randn, the INT8 ConvRot quantizer, the LoRA merge, the GGUF dequantization and the NVFP4 codec and recipes
+# are bit-exact (and the NVFP4 converter's output reproducible across machines) only if the compiler neither contracts
+# mul+add into FMAs nor applies fast-math. Source options come after CMAKE_CXX_FLAGS on the command line, so these win.
+set(MOSSINFER_STRICT_FP_SOURCES ${CMAKE_SOURCE_DIR}/src/pipeline/rng_torch_compat.cpp ${CMAKE_SOURCE_DIR}/src/weights/gguf.cpp
     ${CMAKE_SOURCE_DIR}/src/weights/quant/quant_codec.cpp ${CMAKE_SOURCE_DIR}/src/weights/quant/quant_convert.cpp
     ${CMAKE_SOURCE_DIR}/src/weights/quant/nvfp4_codec.cpp ${CMAKE_SOURCE_DIR}/src/weights/quant/nvfp4_recipes.cpp)
 # clang-cl maps /fp:precise to -ffp-contract=on (contraction within an expression), so it also gets the clang flag.

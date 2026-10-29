@@ -738,6 +738,11 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
 
   QuantModel model = open_quant_model(input, ModelKind::kDiT);
   if (model.kind != ModelKind::kDiT) fail("only the DiT can be converted");
+  const bool gguf = !model.gguf_types.empty();
+  if (gguf && fp4 != nullptr) fail("NVFP4 output is converted from bf16 weights, not from a GGUF file");
+  for (const auto& [key, value] : options.metadata) {
+    if (!key.starts_with("mossinfer_")) fail("internal: extra metadata key '" + key + "' must start with mossinfer_");
+  }
   check_output_path(input, output, model, options);
   log("input: " + std::to_string(model.linears.size()) + " GEMMs, " + std::to_string(model.tensors.size()) + " other tensors");
 
@@ -925,7 +930,8 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
       for (const auto& [name, count] : spec_counts) specs += (specs.empty() ? "" : ", ") + name + " x" + std::to_string(count);
       if (fp4 == nullptr) {
         md["mossinfer_converter"] = "moss-infer quantize " + std::to_string(kConverterVersion) + " (" + specs +
-                                    "; bf16 inputs quantized round-to-nearest, quantized inputs copied or decoded exactly)";
+                                    (gguf ? "; GGUF input dequantized to fp32, then quantized round-to-nearest or rounded to bf16)"
+                                          : "; bf16 inputs quantized round-to-nearest, quantized inputs copied or decoded exactly)");
       } else {
         md["mossinfer_converter"] = "moss-infer quantize " + std::to_string(kConverterVersion) + " (" + specs + "; nvfp4 recipe " +
                                     recipe_name(fp4->recipe) + ", int8_convrot round-to-nearest)";
@@ -941,6 +947,7 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
       }
       md["mossinfer_kept_bf16"] = kept_json;
       md["mossinfer_source_xxh64"] = source_hex;
+      for (const auto& [key, value] : options.metadata) md[key] = value;
       if (!lora_info.empty()) {
         std::string j = "[";
         for (std::size_t i = 0; i < lora_info.size(); ++i) {
@@ -1094,7 +1101,10 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
         const std::vector<std::byte> src = readers.read(p->weight);
         note_source(p->name + ".weight", src);
         const auto* w16 = reinterpret_cast<const std::uint16_t*>(src.data());
-        if (om.spec.quantized() || lfs) {
+        // A GGUF weight: its rows dequantized to fp32 in place of the bf16 widening.
+        const std::uint32_t gtype = p->encoding == Encoding::kGguf ? model.gguf_types.at(p->weight.name) : 0;
+        const std::uint64_t row_bytes = p->weight.nbytes / static_cast<std::uint64_t>(p->n);
+        if (om.spec.quantized() || lfs || p->encoding == Encoding::kGguf) {
           std::atomic<bool> bad{false};
           parallel_for(p->n, threads, [&](std::int64_t b, std::int64_t e) {
             // Per-thread scratch, reused for every batch of rows.
@@ -1102,7 +1112,11 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
             std::vector<double> acc(lfs ? static_cast<std::size_t>(k) : 0);
             for (std::int64_t r0 = b; r0 < e; r0 += kBatch) {
               const std::int64_t nb = std::min(kBatch, e - r0);
-              for (std::int64_t i = 0; i < nb * k; ++i) rows[static_cast<std::size_t>(i)] = bf16_to_float(w16[r0 * k + i]);
+              if (p->encoding == Encoding::kGguf) {
+                weights::dequantize_gguf_rows(gtype, src.data() + static_cast<std::uint64_t>(r0) * row_bytes, nb, k, rows.data());
+              } else {
+                for (std::int64_t i = 0; i < nb * k; ++i) rows[static_cast<std::size_t>(i)] = bf16_to_float(w16[r0 * k + i]);
+              }
               if (lfs) {
                 for (std::int64_t r = 0; r < nb; ++r) {
                   for (const LoraFactor& f : *lfs) lora_merge_row(rows.data() + r * k, k, f.up.data() + (r0 + r) * f.rank, f.down.data(), f.rank, f.coef, acc.data());
@@ -1143,6 +1157,23 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
     const IndexedTensor& t = model.tensors[i];
     std::vector<std::byte> b = readers.read(t);
     note_source(t.name, b);
+    if (const auto g = model.gguf_types.find(t.name); g != model.gguf_types.end()) {
+      // A GGUF tensor: dequantized, then in its output dtype (BF16 rounded to nearest even, or F32), finite.
+      const std::int64_t k = t.shape.back(), numel = t.numel();
+      std::vector<float> f(static_cast<std::size_t>(numel));
+      weights::dequantize_gguf_rows(g->second, b.data(), numel / k, k, f.data());
+      bool ok = std::all_of(f.begin(), f.end(), [](float x) { return std::isfinite(x); });
+      if (t.dtype == DType::kBF16) {
+        std::vector<std::uint16_t> v(f.size());
+        ok = ok && to_bf16_finite(f.data(), f.size(), v.data());
+        b.resize(v.size() * 2);
+        std::memcpy(b.data(), v.data(), b.size());
+      } else {
+        b.resize(f.size() * 4);
+        std::memcpy(b.data(), f.data(), b.size());
+      }
+      if (!ok) fail("'" + t.name + "' holds non-finite values");
+    }
     const std::string module = t.name.ends_with(".weight") ? t.name.substr(0, t.name.size() - 7) : std::string();
     auto lf = module.empty() ? loras.end() : loras.find(module);
     if (lf != loras.end()) {

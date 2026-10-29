@@ -683,6 +683,7 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
   r.vae_source = util::path_utf8(vs.path);
   r.dit_source = util::path_utf8(src.path);
   r.dit_linears = src.linears;
+  r.dit_format = src.format;
   if (m.time_embedding) r.time_embedding = util::path_utf8(m.options.time_embedding_file);
   r.gpu_arch = current_gpu_arch();
   if (m.dit_host && m.dit_host_src != &src) {

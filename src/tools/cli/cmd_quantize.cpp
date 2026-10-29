@@ -1,4 +1,4 @@
-// `moss-infer quantize`: bf16 (or community-quantized) DiT -> INT8 ConvRot safetensors in ComfyUI's comfy_quant layout,
+// `moss-infer quantize`: bf16, community-quantized or GGUF DiT -> INT8 ConvRot safetensors in ComfyUI's comfy_quant layout,
 // or (--format nvfp4) bf16 DiT -> mixed NVFP4 + INT8 ConvRot (weights/quant/quant_convert.h).
 #include <algorithm>
 #include <charconv>
@@ -24,7 +24,7 @@ namespace mi::cli {
 namespace {
 
 constexpr const char* kUsage =
-    "usage: moss-infer quantize <transformer_dir|bundle_dir|dit.safetensors> -o <out.safetensors>\n"
+    "usage: moss-infer quantize <transformer_dir|bundle_dir|dit.safetensors|dit.gguf> -o <out.safetensors>\n"
     "         [--fuse-qkv] [--keep-bf16 <pattern,...>] [--lora <file> [--lora-scale <s>]]... [--group <G>]\n"
     "         [--comfy-attention-config] [--threads <n>]\n"
     "         [--format int8|nvfp4] [--recipe rtn|mse|gptq|gptq-mse] [--keep <preset|units>] [--calib-model <bundle_dir>]\n"

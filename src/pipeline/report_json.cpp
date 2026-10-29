@@ -188,7 +188,7 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
   // filled by generate(), and where each model came from.
   o << " \"quality\": " << quality_report_json(r.quality) << ",\n";
   o << " \"models\": {\"dit\": {\"source\": " << json_escape(r.dit_source) << ", \"linears\": " << json_escape(r.dit_linears)
-    << ", \"tier\": \"" << planner::tier_name(r.tier.tier) << "\", \"time_embedding\": "
+    << ", \"format\": " << json_escape(r.dit_format) << ", \"tier\": \"" << planner::tier_name(r.tier.tier) << "\", \"time_embedding\": "
     << (r.time_embedding.empty() ? std::string("null") : json_escape(r.time_embedding))
     << "}, \"text_encoder\": {\"source\": " << json_escape(r.te_source) << ", \"precision\": "
     << json_escape(r.te_precision.empty() ? "bf16" : r.te_precision) << ", \"note\": " << json_escape(r.te_note)

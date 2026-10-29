@@ -3,7 +3,9 @@
 // Input: the official bf16 diffusers transformer (directory or bundle root), or any single DiT file open_quant_model
 // reads. bf16 GEMMs are quantized round-to-nearest (quant_codec.h, bit-exact to Comfy-Org's files); already
 // quantized GEMMs are copied (INT8) or decoded exactly (W4A8 / W6A8 / W4A4 -> INT8 grid with their per-row scale),
-// so importing a community file this way is lossless.
+// so importing a community file this way is lossless. A GGUF DiT (open_gguf_dit) is dequantized to fp32
+// (weights/gguf.h) and then treated as bf16 GEMMs are (quantized round-to-nearest, or rounded to bf16 when kept); its
+// other tensors are written BF16 (rope.bands F32), as in Comfy-Org's files.
 //
 // Output, as Comfy-Org's moss_image_*_int8_convrot files: unprefixed official names; per quantized module
 // `<m>.weight` I8 [N, K], `<m>.weight_scale` F32 [N, 1] and `<m>.comfy_quant` (U8 JSON
@@ -126,6 +128,8 @@ struct ConvertOptions {
   std::function<QuantSpec(const QuantLinear&)> policy;
   std::optional<Nvfp4Options> nvfp4;          // NVFP4 output (see the file comment); implies fuse_qkv
   std::function<void(std::string_view)> log;  // progress lines (optional)
+  // Extra __metadata__ entries written after the converter's own (keys must start with mossinfer_).
+  std::map<std::string, std::string> metadata;
 };
 
 struct ConvertStats {

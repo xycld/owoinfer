@@ -394,6 +394,8 @@ struct Result {
   std::string gpu_arch;   // the GPU class of the device ("sm_89")
   std::string dit_source;
   std::string dit_linears;
+  // A GGUF DiT file: the format it runs as (e.g. "GGUF Q4_K, runs as INT8 ConvRot"; pipeline/gguf_dit.h); else empty.
+  std::string dit_format;
   std::string time_embedding;  // PipelineOptions::time_embedding_file when a replacement step embedder ran (else empty)
   std::string te_source;     // the bundle's text_encoder directory or PipelineOptions::text_encoder_file
   std::string te_precision;  // qwen35_text::precision_name: "bf16", "int8_convrot", "w4a8"
