@@ -835,23 +835,16 @@ const char* tier_name(Tier t) {
     case Tier::kReference: return "reference";
     case Tier::kHigh: return "high";
     case Tier::kTurbo: return "turbo";
-    case Tier::kAuto: return "auto";
   }
   return "?";
 }
 
 Tier parse_tier(std::string_view name) {
-  for (const Tier t : {Tier::kReference, Tier::kHigh, Tier::kTurbo, Tier::kAuto}) {
+  for (const Tier t : {Tier::kReference, Tier::kHigh, Tier::kTurbo}) {
     if (name == tier_name(t)) return t;
   }
-  throw std::invalid_argument("tier must be reference, high, turbo or auto, got \"" + std::string(name) + "\"");
+  throw std::invalid_argument("tier must be reference, high or turbo, got \"" + std::string(name) + "\"");
 }
-
-namespace {
-// Fastest first (fp16 accumulation before fp32; e4m3 P·V before fp16).
-constexpr AttentionMode kQ8Order[] = {AttentionMode::kQ8Fp8, AttentionMode::kQ8Fp16, AttentionMode::kQ8Fp8F32Acc,
-                                      AttentionMode::kQ8Fp16F32Acc};
-}  // namespace
 
 AttentionMode parse_attention(std::string_view name) {
   if (name == "q8") return AttentionMode::kQ8Fp8;
@@ -864,10 +857,9 @@ AttentionMode parse_attention(std::string_view name) {
 }
 
 TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention, Precision precision,
-                          const CertificateLookup& certificate, const AttentionSupported& supported, bool te_quantized,
-                          bool nvfp4_native) {
+                          const AttentionSupported& supported, bool te_quantized, bool nvfp4_native) {
   TierDecision d;
-  d.requested = requested;
+  d.tier = requested;
   d.precision = precision;
   // Lossy weights fix the configuration's precision: a quantized DiT or text encoder is never the Reference tier, and
   // an INT4 or NVFP4 DiT is always the Turbo tier.
@@ -887,7 +879,7 @@ TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention
   if (requested == Tier::kTurbo && !int4) {
     throw std::invalid_argument(std::string("tier turbo runs an INT4 ConvRot DiT (a convrot_w4a4 file) or an NVFP4 DiT "
                                             "loaded as the DiT, but the loaded DiT is ") +
-                                precision_name(precision) + "; use reference, high or auto");
+                                precision_name(precision) + "; use reference or high");
   }
   if (requested == Tier::kHigh && int4) {
     throw std::invalid_argument(std::string("the loaded DiT is ") + dit + ", which runs the Turbo tier; use tier turbo");
@@ -896,101 +888,33 @@ TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention
     throw std::invalid_argument(std::string("attention ") + attention_name(*attention) +
                                 " is not supported on this device/build");
   }
-  // The lossy configuration (precision, mode): its certificate decides certified / the reason.
-  const auto ask = [&](AttentionMode mode) { return certificate ? certificate(precision, mode) : CertificateAnswer{}; };
-  const auto lossy_with = [&](AttentionMode mode, const std::string& why, const CertificateAnswer& a) {
-    d.effective = int4 ? Tier::kTurbo : Tier::kHigh;
-    d.attention = mode;
-    d.certified = a.found;
-    d.certificate = a.found ? a.file : std::string();
-    d.reason = why + ": " + weights + ", " + attention_name(mode) + " attention; " +
-               (a.found ? "certified: " + a.file : "uncertified" + (a.reason.empty() ? std::string() : " (" + a.reason + ")"));
+  if (requested == Tier::kReference) {
+    if (int8) {
+      throw std::invalid_argument("tier reference runs bf16 weights exactly, but the loaded DiT or text encoder file is "
+                                  "quantized; load the bundle's bf16 models or use tier high");
+    }
+    if (attention && is_q8(*attention)) {
+      throw std::invalid_argument("tier reference uses exact attention; 8-bit attention belongs to tier high");
+    }
+    d.reason = "Reference tier: bf16 GEMMs, exact attention";
     return d;
-  };
-  const auto lossy = [&](AttentionMode mode, const std::string& why) { return lossy_with(mode, why, ask(mode)); };
-  const auto reference = [&](const std::string& why) {
-    d.effective = Tier::kReference;
-    d.attention = AttentionMode::kExact;
-    d.certified = true;
-    d.reason = why;
-    return d;
-  };
-  switch (requested) {
-    case Tier::kReference:
-      if (int8) {
-        throw std::invalid_argument("tier reference runs bf16 weights exactly, but the loaded DiT or text encoder file is "
-                                    "quantized; load the bundle's bf16 models or use tier high or auto");
-      }
-      if (attention && is_q8(*attention)) {
-        throw std::invalid_argument("tier reference uses exact attention; 8-bit attention belongs to tier high");
-      }
-      return reference("Reference tier: bf16 GEMMs, exact attention");
-    case Tier::kHigh: {
-      AttentionMode mode = attention.value_or(AttentionMode::kQ8Fp8);
-      std::string why = "High tier";
-      if (!attention && supported && !supported(mode)) {
-        mode = AttentionMode::kExact;
-        why += " (this device/build has no 8-bit attention kernel)";
-      }
-      if (!int8 && mode == AttentionMode::kExact) {
-        throw std::invalid_argument("tier high needs an INT8 DiT or 8-bit attention, but the loaded DiT is bf16 and "
-                                    "attention exact: that is the Reference tier");
-      }
-      return lossy(mode, why);
-    }
-    case Tier::kTurbo: {
-      AttentionMode mode = attention.value_or(AttentionMode::kQ8Fp8);
-      std::string why = "Turbo tier";
-      if (!attention && supported && !supported(mode)) {
-        mode = AttentionMode::kExact;
-        why += " (this device/build has no 8-bit attention kernel)";
-      }
-      return lossy(mode, why);
-    }
-    case Tier::kAuto:
-      break;
   }
-  // Auto never runs an uncertified Turbo configuration.
-  const auto turbo_refused = [&](const std::string& reasons) {
-    return std::invalid_argument(std::string("the loaded DiT is ") + dit + " (the Turbo tier) and no certificate covers it (" +
-                                 reasons + "): auto only selects a certified Turbo configuration; choose tier turbo to run it "
-                                 "uncertified");
-  };
-  if (attention) {
-    if (int4) {
-      const CertificateAnswer a = ask(*attention);
-      if (!a.found) throw turbo_refused(std::string(attention_name(*attention)) + ": " + (a.reason.empty() ? "no certificate" : a.reason));
-      return lossy_with(*attention, "auto with attention " + std::string(attention_name(*attention)), a);
-    }
-    if (!int8 && !is_q8(*attention)) return reference("auto: bf16 DiT with exact attention, the Reference tier");
-    return lossy(*attention, "auto with attention " + std::string(attention_name(*attention)));
-  }
-  std::string reasons;
-  std::vector<AttentionMode> candidates;
-  for (const AttentionMode m : kQ8Order) {
-    if (!supported || supported(m)) candidates.push_back(m);
-  }
-  if (int8) candidates.push_back(AttentionMode::kExact);
-  std::string first_reason;
-  bool one_reason = true;
-  for (const AttentionMode m : candidates) {
-    const CertificateAnswer a = ask(m);
-    if (a.found) return lossy_with(m, "auto: the fastest certified configuration", a);
-    const std::string why = a.reason.empty() ? std::string("no certificate") : a.reason;
-    if (reasons.empty()) first_reason = why;
-    one_reason = one_reason && why == first_reason;
-    reasons += (reasons.empty() ? "" : "; ") + std::string(attention_name(m)) + ": " + why;
-  }
-  if (int4 && one_reason && !first_reason.empty()) reasons = "every attention mode: " + first_reason;
-  if (!int8) return reference("auto: no lossy configuration of the loaded bf16 DiT is certified (" + reasons +
-                              "), so the Reference tier: bf16 GEMMs, exact attention");
-  if (int4) throw turbo_refused(reasons);
-  // Quantized files cannot run the reference weights: their own GEMMs, without the separate 8-bit attention toggle.
-  d.effective = Tier::kHigh;
+  // High and Turbo: the tier's default attention (kTierAttention) unless the caller gave one.
+  std::string why = requested == Tier::kTurbo ? "Turbo tier" : "High tier";
   d.attention = AttentionMode::kExact;
-  d.certified = false;
-  d.reason = "auto: the loaded weights are quantized (they fix the GEMM precision) and no configuration of them is "
-             "certified (" + reasons + "): " + weights + ", exact attention, uncertified";
+  if (attention) {
+    d.attention = *attention;
+  } else {
+    const auto it = std::find_if(std::begin(kTierAttention), std::end(kTierAttention),
+                                 [&](AttentionMode m) { return !supported || supported(m); });
+    if (it != std::end(kTierAttention)) d.attention = *it;
+    else why += " (this device/build has no 8-bit attention kernel)";
+  }
+  if (!int8 && d.attention == AttentionMode::kExact) {
+    throw std::invalid_argument("tier high needs an INT8 DiT or 8-bit attention, but the loaded DiT is bf16 and "
+                                "attention exact: that is the Reference tier");
+  }
+  d.reason = why + ": " + weights + ", " + attention_name(d.attention) + " attention";
   return d;
 }
 

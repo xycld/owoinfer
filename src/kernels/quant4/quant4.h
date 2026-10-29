@@ -32,7 +32,7 @@
 namespace mi::kernels::quant4 {
 
 // Numerics version of the INT4 W4A4 path (rotation, quantization, GEMM epilogue): bump on any change to the output
-// bits of an INT4 kernel, which retires the quality certificates measured before it (pipeline/quality_cert.h).
+// bits of an INT4 kernel, reported in the quality object's numerics (pipeline/quality_report.h).
 inline constexpr int kInt4NumericsVersion = 1;
 
 inline constexpr int kConvRotGroup = 256;

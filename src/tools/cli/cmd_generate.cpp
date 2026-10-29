@@ -44,9 +44,9 @@ constexpr const char* kUsage =
     "                           [--eta X] [--s-noise X] [--dataspace <file>] [--no-metadata]\n"
     "                           [--mode min_memory|balanced|max_speed] [--vram-budget GiB] [--vram-reserve MiB]\n"
     "                           [--host-ram-budget GiB] [--cache-dir <dir>] [--then-prompt <text>]...\n"
-    "                           [--direct-io | --buffered-io] [--te-host-pin auto|on|off] [--cert-dir <dir>]...\n"
+    "                           [--direct-io | --buffered-io] [--te-host-pin auto|on|off]\n"
     "                           [--dit-blocks op_by_op|fused|fused_graphs] [--dit <file>] [--te <file>] [--vae <file>]\n"
-    "                           [--tier reference|high|turbo|auto] [--attention auto|exact|q8|q8_fp8|q8_fp16|...]\n"
+    "                           --tier reference|high|turbo [--attention auto|exact|q8|q8_fp8|q8_fp16|...]\n"
     "                           [--preview <preview.png> [--preview-every N]] [--lora <file> [--lora-scale S]]...\n"
     "                           [--lora-strict] [--distill <dir>] [--time-embedding <file>] [--quiet]\n"
     "                           [--init-image <png|jpg> [--strength X] [--mask <png|jpg>] [--resize crop|fit|stretch]]\n"
@@ -64,20 +64,17 @@ constexpr const char* kUsage =
     "layout) instead of the bundle's;\n"
     "--te loads an INT8 ConvRot / W4A8 text encoder file, --vae a FLUX.2 VAE file (e.g. the full decoder); the tokenizer\n"
     "and configs always come from --model. --preview rewrites a latent preview PNG (no VAE) every N steps.\n"
-    "--tier (default auto): reference = bf16 exact; high = the loaded DiT's GEMMs + 8-bit attention; turbo = an INT4\n"
-    "ConvRot or NVFP4 DiT (--dit) + 8-bit attention; auto = the fastest certified configuration of the loaded DiT (else\n"
-    "reference; an INT8 DiT then runs with exact attention, uncertified; an uncertified INT4 or NVFP4 DiT needs --tier\n"
-    "turbo).\n"
-    "Certificates are searched in each --cert-dir, then <cache-dir>/quality_certs/, <dit>.mossinfer-cert.json and the\n"
-    "install tree's share/mossinfer/quality_certs/ (the first usable one wins).\n"
+    "--tier (required): reference = the DiT's bf16 GEMMs, exact attention; high = the loaded DiT's GEMMs (INT8 or bf16)\n"
+    "+ 8-bit attention; turbo = an INT4 ConvRot or NVFP4 DiT (--dit) + 8-bit attention. A tier the loaded models cannot\n"
+    "run is refused with the reason. For everyday use: an INT8 --dit with --tier high.\n"
     "The DiT is loaded with direct I/O (O_DIRECT / FILE_FLAG_NO_BUFFERING) where the file system supports it and its\n"
     "files are not already in the page cache, else buffered; from the page cache, with whichever mode this machine\n"
     "measured faster (the report's \"dit_load\" says which and why);\n"
     "--buffered-io forces buffered DiT loads, --direct-io direct I/O for every weight read (cold-cache behaviour).\n"
     "--te-host-pin (default auto) decides whether a text encoder kept in RAM may be pinned: auto where the machine has\n"
     "clearly the room, on whenever it fits, off never.\n"
-    "--attention overrides the tier's attention kernel: exact (FlashAttention-2) or an 8-bit variant q8_fp8 (= q8),\n"
-    "q8_fp16, q8_fp8_f32acc, q8_fp16_f32acc (lossy).\n"
+    "--attention overrides the tier's attention kernel (high, turbo: q8_fp8, or q8_fp16 on GPUs without FP8): exact\n"
+    "(FlashAttention-2) or an 8-bit variant q8_fp8 (= q8), q8_fp16, q8_fp8_f32acc, q8_fp16_f32acc (lossy).\n"
     "--init-image (PNG or JPEG, EXIF orientation applied) runs img2img: the image is brought to the output size with\n"
     "--resize (default crop: cover and center-crop; fit: fit inside, edge-filled bands; stretch) and the last\n"
     "--strength (default 0.75) of the schedule is sampled from it; strength 1 is txt2img, 0 returns the VAE round trip.\n"
@@ -92,7 +89,7 @@ constexpr const char* kUsage =
     "--time-embedding), lora.safetensors (as --lora, strength 1; a following --lora-scale sets it) and\n"
     "dataspace.safetensors (--sampler dataspace --dataspace <file>), with --cfg 1 and --steps = the file's step codes\n"
     "unless given. --time-embedding replaces the DiT's step embedder and modulation biases, computed in fp32.\n"
-    "Lossy accelerators (off by default; a run with any of them is uncertified): --cfg-truncation X (0..1, default 1 =\n"
+    "Lossy accelerators (off by default; they change the image): --cfg-truncation X (0..1, default 1 =\n"
     "off) drops the negative branch for the steps from X * steps on, counting the steps each pass runs (img2img and the\n"
     "hires pass: their strength-cropped steps); multistep samplers carry one guided step into the first unguided one.\n"
     "--step-cache fbcache reuses the DiT's blocks 1..41 from the last full DiT call while block 0's output residual changed\n"
@@ -224,9 +221,8 @@ void print_summary(const pipeline::Result& r) {
                : r.memory.dit_reloaded                                                ? ", DiT reloaded"
                                                                                       : "",
                moss_dit::block_path_name(r.block_path));
-  std::fprintf(stderr, "tier %s (requested %s): DiT %s, %s attention, text encoder %s%s\n",
-               planner::tier_name(r.tier.effective), planner::tier_name(r.tier.requested), r.dit_linears.c_str(),
-               planner::attention_name(r.tier.attention), r.te_precision.c_str(), r.tier.certified ? "" : ", uncertified");
+  std::fprintf(stderr, "tier %s: DiT %s, %s attention, text encoder %s\n", planner::tier_name(r.tier.tier),
+               r.dit_linears.c_str(), planner::attention_name(r.tier.attention), r.te_precision.c_str());
   if (!r.block_path_note.empty()) std::fprintf(stderr, "%s\n", r.block_path_note.c_str());
   if (r.first_pass.encoded || r.hires.ran) {
     std::fprintf(stderr, "%s: %d of %d steps from step %d", r.image_mode.c_str(), r.first_pass.steps_run,
@@ -379,7 +375,6 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--direct-io") options.direct_io = true;
       else if (f == "--buffered-io") options.dit_load_direct_io = false;
       else if (f == "--te-host-pin") options.te_host_pin = planner::parse_te_host_pin(v);
-      else if (f == "--cert-dir") options.certificate_dirs.push_back(path_arg(v, f));
       else if (f == "--dit-blocks") options.block_path = moss_dit::parse_block_path(v);
       else if (f == "--dit") options.dit_file = path_arg(v, f);
       else if (f == "--te") options.text_encoder_file = path_arg(v, f);
@@ -411,6 +406,10 @@ int cmd_generate(const std::vector<std::string>& args) {
   const auto given = [&](const char* flag) {
     return std::any_of(flags.begin(), flags.end(), [&](const auto& fv) { return fv.first == flag; });
   };
+  if (!given("--tier")) {
+    std::cerr << "moss-infer generate: --tier is required: reference, high or turbo\n" << kUsage;
+    return 2;
+  }
   if (given("--direct-io") && given("--buffered-io")) {
     std::cerr << "moss-infer generate: --direct-io and --buffered-io contradict each other\n" << kUsage;
     return 2;
@@ -509,11 +508,6 @@ int cmd_generate(const std::vector<std::string>& args) {
     pipeline::Result r = pipe.generate(q, control);
     if (!quiet) std::fprintf(stderr, "\n");
     if (r.cancelled) return r;
-    // Lossy and uncertified: always said, --quiet or not.
-    if (r.tier.effective != planner::Tier::kReference && !r.tier.certified) {
-      std::fprintf(stderr, "warning: uncertified %s-tier run (%s): %s\n", planner::tier_name(r.tier.effective),
-                   r.dit_linears.c_str(), r.tier.reason.c_str());
-    }
     if (!png.empty()) {
       const std::vector<pipeline::PngText> text =
           q.save_metadata ? pipeline::generation_text_chunks(pipeline::generation_metadata(q, r)) : std::vector<pipeline::PngText>{};
@@ -526,7 +520,7 @@ int cmd_generate(const std::vector<std::string>& args) {
                    r.control.encodes);
     }
     if (q.accel.active(q.cfg != 1.0)) {
-      std::fprintf(stderr, "warning: lossy accelerators (%s), uncertified: CFG truncated on %d steps, step cache reused %d of %d DiT calls\n",
+      std::fprintf(stderr, "warning: lossy accelerators (%s): CFG truncated on %d steps, step cache reused %d of %d DiT calls\n",
                    q.accel.describe(q.cfg != 1.0).c_str(), r.accel.cfg_truncated_steps, r.accel.cached_calls, r.accel.dit_calls);
     }
     for (const std::string& w : r.accel_warnings) std::fprintf(stderr, "warning: %s\n", w.c_str());

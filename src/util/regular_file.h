@@ -1,8 +1,8 @@
 // Opening a user-supplied path for reading only when it names a regular file. open(2) on a FIFO blocks until a writer
-// appears, and a character device may block or never end, so a model, LoRA, image or certificate path naming one would
-// hang the caller; a directory would fail later with a less clear error. Every reader of such paths opens through here:
+// appears, and a character device may block or never end, so a model, LoRA or image path naming one would hang the
+// caller; a directory would fail later with a less clear error. Every reader of such paths opens through here:
 // weights::FileReader and MappedFile (safetensors files, the supported-model checks, images, hashes) and
-// read_replaceable_file (certificates, caches, the model index).
+// read_replaceable_file (caches, the model index).
 #pragma once
 
 #include <filesystem>
@@ -35,8 +35,8 @@ inline constexpr const char* kLeasedFile = "file is leased by another process (E
 bool windows_path_names_device(std::wstring_view path);
 
 // The boundary check of a user-supplied path, called once where it enters (C API and server fields, CLI arguments, the
-// converter's input and output, the pipeline's options and request, quality_cert's file identity, image and PNG
-// paths) before any std::filesystem call touches it: MSVC's canonical, weakly_canonical and equivalent (and status,
+// converter's input and output, the pipeline's options and request, image and PNG paths) before any std::filesystem
+// call touches it: MSVC's canonical, weakly_canonical and equivalent (and status,
 // exists, file_size on a reparse point) open the path without SECURITY_SQOS_PRESENT. On Windows it throws
 // std::invalid_argument "<what>: not a regular file: <path>" when is_windows_device_path says so; elsewhere it does
 // nothing (POSIX device files are refused where they are opened, open_regular_file).

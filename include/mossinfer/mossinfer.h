@@ -14,7 +14,10 @@
  *   Structs only grow at the end, and the library accepts every size a struct has had (the 0.1.0 sizes and today's):
  *   it reads only the caller's struct_size bytes of an input struct (the later fields keep their defaults) and writes
  *   only struct_size bytes of an output struct. Any other struct_size is rejected with MI_ERR_ABI_MISMATCH.
- *   MI_ABI_VERSION changes when an existing field or function changes meaning.
+ *   MI_ABI_VERSION (the shared library's SONAME) changes when the binary interface does: an exported function is
+ *   removed or changes signature, or a struct field or enum value moves or changes type. A field or value retired
+ *   without such a change stays in place as "reserved"; a behaviour change that callers must act on bumps
+ *   MI_VERSION_MAJOR (2.0: the tier is required, the certificate fields are reserved).
  * - Struct layouts are explicit: every field sits at its natural alignment with no compiler-inserted padding, and the
  *   gaps are named `_reserved*` int32 fields. *_init() zeroes them; input structs with a nonzero one are rejected with
  *   MI_ERR_INVALID_ARGUMENT, output structs get them zeroed. The layouts (64-bit targets) are frozen in docs/c-api.md
@@ -68,10 +71,10 @@ extern "C" {
 
 /* ------------------------------------------------------------------------------------------------ version */
 
-#define MI_VERSION_MAJOR 1
+#define MI_VERSION_MAJOR 2
 #define MI_VERSION_MINOR 0
 #define MI_VERSION_PATCH 0
-/* Incremented on every incompatible change of an existing function, struct field or enum value. */
+/* Incremented on every incompatible change of the binary interface (see the conventions above). */
 #define MI_ABI_VERSION 1
 
 /* What the unset markers of mi_gen_params resolve to (see "Unset markers" below), for a UI to pre-fill its fields. */
@@ -135,7 +138,7 @@ MOSSINFER_API const char* mi_last_error_message(void);
 /* mi_engine_release(): a soft unload that frees the device memory and keeps the engine, optionally with the weights
  * kept in host RAM (keep_host_copy) for a fast reload; mi_result_dit_load() says where a DiT load read from. */
 #define MI_CAP_RELEASE 0x2000u
-/* mi_engine_params.certificate_dirs: extra quality-certificate directories. */
+/* Reserved since 2.0 (never set): it announced mi_engine_params.certificate_dirs, which is now ignored. */
 #define MI_CAP_CERTIFICATE_DIRS 0x4000u
 /* mi_engine_params.te_host_pin: whether a host-resident text encoder may hold a pinned copy. */
 #define MI_CAP_TE_HOST_PIN 0x8000u
@@ -230,16 +233,17 @@ typedef enum mi_block_path {
   MI_BLOCK_PATH_MAX_ENUM = 0x7fffffff
 } mi_block_path;
 
-/* Quality tier (MI_CAP_TIERS). The weights fix the GEMM precision (an INT8 DiT runs INT8 GEMMs); the tier decides the
- * attention kernel. A refused combination fails mi_generate() with MI_ERR_INVALID_ARGUMENT, naming the conflict. */
+/* Quality tier (MI_CAP_TIERS), the caller's choice. The weights fix the GEMM precision (an INT8 DiT runs INT8 GEMMs);
+ * the tier decides the attention kernel. HIGH and TURBO default to Q8_FP8 where the GPU has FP8 (compute capability
+ * 8.9+), else Q8_FP16; mi_engine_params.attention overrides it. A tier the loaded models cannot run fails
+ * mi_generate() with MI_ERR_INVALID_ARGUMENT, naming the reason. */
 typedef enum mi_tier {
-  /* The fastest certified configuration of the loaded models; else Reference for a bf16 DiT. Refuses an INT4 or NVFP4
-   * DiT without a certificate (choose MI_TIER_TURBO explicitly). */
+  /* Reserved since 2.0: mi_engine_create() refuses it with MI_ERR_INVALID_ARGUMENT (choose one of the tiers below). */
   MI_TIER_AUTO = 0,
-  MI_TIER_REFERENCE = 1, /* bf16 DiT and text encoder, exact attention; refused for quantized files */
-  MI_TIER_HIGH = 2,      /* the loaded DiT's precision plus 8-bit attention (Q8_FP8 unless `attention` says otherwise) */
-  /* an INT4 or NVFP4 DiT file: its 4-bit GEMMs plus 8-bit attention; refused for any other DiT. NVFP4 runs on an RTX 50
-   * (compute capability 12.0) only; elsewhere the file is refused with MI_ERR_MODEL. */
+  MI_TIER_REFERENCE = 1, /* the DiT's bf16 GEMMs, exact attention; refused for quantized DiT or text encoder files */
+  MI_TIER_HIGH = 2,      /* the loaded DiT's GEMMs (INT8 or bf16) plus 8-bit attention; refused for a 4-bit DiT */
+  /* a 4-bit DiT (INT4 or NVFP4 file): its 4-bit GEMMs plus 8-bit attention; refused for any other DiT. NVFP4 runs on an
+   * RTX 50 (compute capability 12.0) only; elsewhere the file is refused with MI_ERR_MODEL. */
   MI_TIER_TURBO = 3,
   MI_TIER_MAX_ENUM = 0x7fffffff
 } mi_tier;
@@ -315,7 +319,7 @@ typedef struct mi_engine_params {
   const char* dit_file;            /* single-file DiT: INT8 ConvRot, mixed INT8/bf16 or bf16 (ComfyUI layout) */
   const char* text_encoder_file;   /* INT8 ConvRot or W4A8 Qwen3.5 text encoder */
   const char* vae_file;            /* single FLUX.2 VAE file */
-  mi_tier tier;                    /* default MI_TIER_AUTO */
+  mi_tier tier;                    /* required: REFERENCE, HIGH or TURBO (the default MI_TIER_AUTO is refused) */
   mi_attention attention;          /* default MI_ATTENTION_DEFAULT */
   int32_t lora_strict;             /* unknown LoRA keys and lossy merges fail the generation (MI_ERR_MODEL); default 0 */
   int32_t _reserved2;              /* must be 0 */
@@ -328,10 +332,7 @@ typedef struct mi_engine_params {
    * takes the rest per generation. NULL or "" = none. */
   const char* distill_dir;
   /* Fields after the 136-byte layout (1.0.0). */
-  /* Extra quality-certificate directories (MI_CAP_CERTIFICATE_DIRS), searched first, in order, before
-   * <cache_dir>/quality_certs, the DiT file's sidecar and the install tree's share/mossinfer/quality_certs: the *.json
-   * files in each. UTF-8 paths, at most 16, none NULL or empty; a directory that does not exist is searched as empty.
-   * The array and its strings are copied by mi_engine_create(). Default none (NULL, count 0). */
+  /* Reserved since 2.0: ignored (neither read nor checked). Leave them NULL and 0. */
   const char* const* certificate_dirs;
   size_t certificate_dirs_count;
   mi_direct_io dit_direct_io;      /* default MI_DIRECT_IO_AUTO; see mi_direct_io for its interplay with direct_io */
@@ -540,8 +541,8 @@ typedef struct mi_gen_params {
   /* MI_SAMPLER_DATASPACE's parameters file (UTF-8; required by it, and then it must exist); ignored by the other
    * samplers. Default NULL. */
   const char* dataspace_path;
-  /* Runtime LoRAs (MI_CAP_LORA), applied in order; at most 64. The array is read during mi_generate() only. A result
-   * with LoRAs is uncertified. Default none. */
+  /* Runtime LoRAs (MI_CAP_LORA), applied in order; at most 64. The array is read during mi_generate() only. Default
+   * none. */
   const mi_lora* loras;
   size_t loras_count;
   int32_t include_prompts;          /* the metadata includes the prompt and negative prompt; default 1 (168 bytes: 0) */
@@ -573,7 +574,7 @@ typedef struct mi_gen_params {
   const char* distill_dir;
   /* Fields after the 320-byte layout (1.0.0). A control adapter (MI_CAP_CONTROL): a file pairing a LoRA with a widened
    * DiT input embedder (e.g. the MOSS-Image color/depth control), and its conditioning images. Its LoRA part joins the
-   * runtime LoRAs after `loras`, and a result with a control adapter is uncertified, like any LoRA. Default none. */
+   * runtime LoRAs after `loras`. Default none. */
   const char* control_adapter;      /* UTF-8; NULL or "" = none. The file must exist; mi_generate() reads its format
                                      * (MI_ERR_MODEL when it is not a control adapter) */
   double control_lora_strength;     /* the adapter's LoRA part (the embedder is never scaled); finite; default 1.0 */
@@ -582,8 +583,8 @@ typedef struct mi_gen_params {
    * mi_gen_params_validate() / mi_generate() only. Default none. */
   const mi_control_image* control_images;
   size_t control_images_count;
-  /* Lossy accelerators (MI_CAP_ACCEL), off by default. They change the image, and a result with any of them active is
-   * uncertified (the tier is resolved as without them). They apply to each sampling pass (a hires fix's too).
+  /* Lossy accelerators (MI_CAP_ACCEL), off by default: an explicit opt-in that changes the image (the tier is resolved
+   * as without them). They apply to each sampling pass (a hires fix's too).
    * CFG truncation: classifier-free guidance only on the steps i of a pass with i / steps < cfg_truncation; the later
    * steps run the conditional row alone. [0, 1]; default 1.0 = off. No effect without CFG (cfg 1). */
   double cfg_truncation;
@@ -790,32 +791,27 @@ MOSSINFER_API const char* mi_result_report_json(mi_result* result);
  * MI_ERR_INVALID_ARGUMENT when the result has no image (cancelled). */
 MOSSINFER_API mi_status mi_save_png(mi_result* result, const char* path);
 
-/* The tier that ran (MI_CAP_TIERS). A generation cancelled before its tier was resolved reports requested AUTO,
- * effective REFERENCE, certified 1 and run_certified 0. `certified` is about the tier; whether the run as a whole is
- * certified is `run_certified` (what the report's models.dit.certified shows). */
+/* The tier that ran (MI_CAP_TIERS). A generation cancelled before its tier was resolved reports the engine's tier with
+ * attention EXACT and dit_precision BF16. */
 typedef struct mi_tier_info {
   size_t struct_size;
   mi_tier requested;                   /* mi_engine_params.tier */
-  mi_tier effective;                   /* never MI_TIER_AUTO */
+  mi_tier effective;                   /* the same: the requested tier runs, or the generation is refused */
   mi_attention attention;              /* what ran; never MI_ATTENTION_DEFAULT */
-  /* 1 when the tier needs no certificate or a certificate covers it; on the lossy tiers it is 0 with LoRAs, a control
-   * adapter or accelerators, but on REFERENCE it stays 1. */
-  int32_t certified;
+  int32_t certified;                   /* reserved since 2.0: 0 */
   mi_precision dit_precision;          /* BF16, INT8, W4A4 or NVFP4 */
   mi_precision text_encoder_precision; /* BF16, INT8 or W4A8 */
-  /* Fields after the 32-byte layout (1.0.0). The run is certified: a certificate covers it, or it ran REFERENCE
-   * without anything that changes the image. 0 whenever runtime LoRAs (a distill bundle's included), a control
-   * adapter or lossy accelerators make it uncertified, on every tier. Show this one to the user. */
-  int32_t run_certified;
+  /* Fields after the 32-byte layout (1.0.0). */
+  int32_t run_certified;               /* reserved since 2.0: 0 */
   int32_t _reserved0;
 } mi_tier_info;
 /* `out` has struct_size set by the caller: the current size or the 32-byte one. */
 MOSSINFER_API mi_status mi_result_tier(const mi_result* result, mi_tier_info* out);
 
 typedef enum mi_result_text_kind {
-  MI_TEXT_TIER_REASON = 0,         /* what the tier chose and why */
-  MI_TEXT_CERTIFICATE = 1,         /* the certificate file used; "" for none */
-  MI_TEXT_GPU_ARCH = 2,            /* the GPU class certificates are matched on, e.g. "sm_89" */
+  MI_TEXT_TIER_REASON = 0,         /* what the tier runs, e.g. "High tier: INT8 ConvRot GEMMs, q8_fp8 attention" */
+  MI_TEXT_CERTIFICATE = 1,         /* reserved since 2.0: "" */
+  MI_TEXT_GPU_ARCH = 2,            /* the GPU class, e.g. "sm_89" */
   MI_TEXT_DIT_SOURCE = 3,          /* the bundle's transformer folder, or dit_file */
   MI_TEXT_TEXT_ENCODER_SOURCE = 4, /* the bundle's text_encoder folder, or text_encoder_file */
   MI_TEXT_VAE_SOURCE = 5,          /* the bundle's vae folder, or vae_file */
@@ -866,10 +862,10 @@ typedef struct mi_accel_info {
   int32_t cfg_truncated_steps; /* steps run without the negative branch (CFG truncation) */
   int32_t dit_calls;           /* DiT calls with the step cache on */
   int32_t cached_calls;        /* of them, calls that reused the cache (the blocks after block 0 skipped) */
-  /* The request's settings activate a lossy accelerator (MI_TEXT_ACCELERATORS), so the run is uncertified. It describes
-   * the requested, active settings, not what ran: a run cancelled before sampling still reports 1. */
+  /* The request's settings activate a lossy accelerator (MI_TEXT_ACCELERATORS). It describes the requested, active
+   * settings, not what ran: a run cancelled before sampling still reports 1. */
   int32_t lossy;
-  /* Fields after the 24-byte layout (an earlier 1.1.0 header). The threshold the step cache ran with: the request's,
+  /* Fields after the 24-byte layout (an earlier 2.0.0 header). The threshold the step cache ran with: the request's,
    * or the model's default (MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE says which); 0 with the step cache off. */
   double step_cache_threshold;
 } mi_accel_info;
@@ -992,7 +988,7 @@ typedef struct mi_file_info {
   size_t struct_size;
   mi_file_kind kind;
   /* The engine's loader for that role accepts the file. What depends on the request or the GPU is checked later (a
-   * control image's kind, a LoRA merge on INT4 weights, the tier's certificate). 0 for MI_FILE_KIND_UNKNOWN;
+   * control image's kind, a LoRA merge on INT4 weights). 0 for MI_FILE_KIND_UNKNOWN;
    * MI_FILE_TEXT_NOTE says why not. */
   int32_t loadable;
   uint64_t file_bytes;
@@ -1000,13 +996,10 @@ typedef struct mi_file_info {
   /* A loadable DiT: BF16, INT8, W4A4 or NVFP4, as mi_tier_info.dit_precision; a loadable text encoder: BF16, INT8 or W4A8;
    * else BF16. */
   mi_precision precision;
-  /* A loadable DiT: bit (1u << tier) for each mi_tier the engine accepts for it, with the bundle's bf16 text encoder
-   * (a quantized one refuses MI_TIER_REFERENCE too) and every attention kernel available (on a GPU without the 8-bit
-   * kernels HIGH and TURBO fall back to exact attention, and HIGH on a bf16 DiT is refused). No certificate is looked
-   * up (they are matched to the GPU and the package), so the tiers and mi_file_report_tier_reason() are the decisions
-   * without one: MI_TIER_AUTO runs REFERENCE on a bf16 DiT and exact attention on an INT8 one, and is refused for an
-   * INT4 DiT. With a certificate for the GPU, AUTO may run a lossy configuration instead (docs/integration.md,
-   * "Shipped certificates"). 0 otherwise. */
+  /* A loadable DiT: bit (1u << tier) for each mi_tier mi_generate() accepts for it, with the bundle's bf16 text encoder
+   * (a quantized one refuses MI_TIER_REFERENCE too) and no explicit attention: the same decision generate makes, on
+   * every GPU the engine supports (an NVFP4 DiT is judged for an RTX 50, the only GPU that loads it). Bit 0
+   * (MI_TIER_AUTO) is never set. 0 otherwise. */
   uint32_t tiers;
   int32_t lora_rank;            /* LoRA, control adapter: the largest rank of its low-rank adapters; 0 without */
   /* adapters on the DiT, as mi_lora_report.adapters (a fused qkv adapter counts as three) */
@@ -1049,8 +1042,9 @@ MOSSINFER_API const char* mi_file_report_text(const mi_file_report* report, mi_f
  * (and MI_TEXT_CONTROL_KINDS) use. Owned by the report. NULL for a NULL report or an index out of range. */
 MOSSINFER_API const char* mi_file_report_control_kind(const mi_file_report* report, int32_t index);
 /* The engine's tier decision for a loadable DiT: what `tier` would run (e.g. "High tier: INT8 ConvRot GEMMs, q8_fp8
- * attention; uncertified (...)") when mi_file_info.tiers has its bit, else why the engine refuses it; for other files,
- * why there is no tier. Owned by the report. NULL for a NULL report or an unknown tier. */
+ * attention"; on a GPU without FP8 the default attention is q8_fp16) when mi_file_info.tiers has its bit, else why the
+ * engine refuses it (MI_TIER_AUTO: reserved); for other files, why there is no tier. Owned by the report. NULL for a
+ * NULL report or an unknown tier. */
 MOSSINFER_API const char* mi_file_report_tier_reason(const mi_file_report* report, mi_tier tier);
 /* NULL is a no-op. */
 MOSSINFER_API void mi_file_report_free(mi_file_report* report);

@@ -25,7 +25,6 @@
 #include "pipeline/accel/accel.h"
 #include "pipeline/accel/accel_kernels.h"
 #include "pipeline/pipeline.h"
-#include "pipeline/quality_cert.h"
 #include "pipeline/report_json.h"
 #include "pipeline/sampler.h"
 #include "pipeline/samplers/schedules.h"
@@ -750,9 +749,9 @@ TEST_F(GpuAccelDit, CfgTruncationRunsCondAloneAfterThePoint) {
 }
 
 // The whole pipeline on an INT8 DiT file (High tier) with a runtime LoRA: accelerator options at their off values give
-// the default request's bits; a cache that never reuses changes nothing either; CFG truncation and reuses are counted,
-// reported and make the run uncertified.
-TEST(GpuAccelPipeline, Int8LoraOffIsExactOnIsReportedUncertified) {
+// the default request's bits; a cache that never reuses changes nothing either; CFG truncation and reuses are counted
+// and reported.
+TEST(GpuAccelPipeline, Int8LoraOffIsExactOnIsReported) {
   const fs::path int8 = "/workspace/Models/community/comfy-org/moss_image_sft_int8_convrot.safetensors";
   const fs::path peft = "/workspace/Models/community/axiomofmind/Moss-image-beauty-lora/pytorch_lora_weights.safetensors";
   if (!fs::is_regular_file(weights_root() / "sft" / "moss.mossidx") || !fs::is_regular_file(int8) || !fs::is_regular_file(peft)) {
@@ -786,7 +785,6 @@ TEST(GpuAccelPipeline, Int8LoraOffIsExactOnIsReportedUncertified) {
   EXPECT_EQ(GpuAccelDit::mismatches(nr.latents, base.latents), 0u);
   EXPECT_EQ(nr.accel.dit_calls, 10);
   EXPECT_EQ(nr.accel.cached_calls, 0);
-  EXPECT_FALSE(nr.tier.certified);
   EXPECT_NE(nr.tier.reason.find("lossy accelerators"), std::string::npos);
 
   mi::pipeline::Request on = req;
@@ -800,44 +798,14 @@ TEST(GpuAccelPipeline, Int8LoraOffIsExactOnIsReportedUncertified) {
   EXPECT_EQ(static_cast<int>(r.accel.cached_steps.size()), r.accel.cached_calls);
   EXPECT_GT(GpuAccelDit::mismatches(r.latents, base.latents), 0u);
   for (const float v : r.latents) ASSERT_TRUE(std::isfinite(v));
-  EXPECT_FALSE(r.tier.certified);
+  EXPECT_NE(r.tier.reason.find("lossy accelerators"), std::string::npos);
   std::printf("[accel pipeline] int8 + LoRA, 10 steps: fbcache 0.3 reused %d of %d calls (steps", r.accel.cached_calls,
               r.accel.dit_calls);
   for (const int s : r.accel.cached_steps) std::printf(" %d", s);
   std::printf("), denoise %.2f s vs %.2f s plain (dev)\n", r.timings.denoise_s, base.timings.denoise_s);
   const mi::json::Value rep = mi::json::parse("{" + mi::pipeline::report_fields(on, r, "", "") + "}");
   EXPECT_TRUE(rep.at("accelerators").at("lossy").as_bool());
-  EXPECT_FALSE(rep.at("models").at("dit").at("certified").as_bool());
-}
-
-// A passing certificate fixture for `dit` with config `cfg` (the pipeline's quality tests' recipe).
-mi::pipeline::Certificate cert_fixture(const fs::path& dit, mi::pipeline::QualityTier tier, const mi::pipeline::CertConfig& cfg) {
-  using namespace mi::pipeline;
-  Certificate c;
-  c.tier = tier;
-  c.config = cfg;
-  c.model.dit = identify_component(dit, true);
-  c.numerics = engine_numerics(c.config);
-  c.gpu_arch = current_gpu_arch();
-  c.prompt_set = std::string(kCertPromptSetId);
-  c.prompts = kCertPrompts;
-  c.prompt_set_sha256 = std::string(kCertPromptSetSha256Base);
-  c.scope = CertScope{1024 * 1024, {"euler"}, 1, 50, false};
-  c.date = "2026-10-22T00:00:00Z";
-  for (const GateSpec& gs : required_gates(tier)) {
-    Gate gt;
-    gt.name = std::string(gs.name);
-    gt.op = gs.op;
-    gt.threshold = gs.limit;
-    gt.value = gs.op == GateOp::kLe ? gs.limit * 0.5 : (gs.limit > 0 ? gs.limit + 0.5 * (1 - gs.limit) : gs.limit * 0.5);
-    if (gt.name.ends_with("_count")) gt.value = std::floor(gt.value);  // whole prompts
-    gt.pass = true;
-    c.gates.push_back(gt);
-  }
-  c.passed = true;
-  c.info = {{"same_seed.ocr_prompts", 3}, {"reference.ocr_prompts", 3}, {"official_images", 23}, {"drift_lpips", kDriftLpips},
-            {"drift_dino", kDriftDino}};
-  return c;
+  EXPECT_EQ(rep.at("models").at("dit").at("tier").as_string(), "high");
 }
 
 std::size_t count_of(const std::string& s, const std::string& what) {
@@ -846,26 +814,16 @@ std::size_t count_of(const std::string& s, const std::string& what) {
   return n;
 }
 
-// Tier auto with accelerators: resolved as without them (certified INT8 keeps the High tier and its 8-bit attention; a
-// certified INT4 file runs Turbo instead of being refused; the bf16 bundle stays Reference), then uncertified with one
-// accelerator reason. On the INT4 DiT a cache that never reuses is exact, and reuses run.
-TEST(GpuAccelPipeline, AutoTierIgnoresAcceleratorsAndInt4Caches) {
+// Each tier with accelerators: resolved as without them (the bf16 bundle stays Reference, the INT8 file keeps High and
+// its 8-bit attention, the INT4 file runs Turbo), with one accelerator remark. On the INT4 DiT a cache that never reuses
+// is exact, and reuses run.
+TEST(GpuAccelPipeline, TiersIgnoreAcceleratorsAndInt4Caches) {
   using namespace mi::pipeline;
   const fs::path int8 = "/workspace/Models/community/comfy-org/moss_image_sft_int8_convrot.safetensors";
   const fs::path int4 = "/workspace/Models/community/toxicdog/moss_image_sft_int4_convrot.safetensors";
   if (!fs::is_regular_file(weights_root() / "sft" / "moss.mossidx") || !fs::is_regular_file(int8) || !fs::is_regular_file(int4)) {
     GTEST_SKIP() << "SFT bundle, INT8 or INT4 DiT not present";
   }
-  mi::testing::TempDir dir("accel_cert");
-  const fs::path certs = dir.path() / "cache" / "quality_certs";
-  fs::create_directories(certs);
-  const Certificate c8 = cert_fixture(int8, QualityTier::kHigh, {DitPrecision::kInt8ConvRot, AttentionMode::kQ8Fp8, TePrecision::kBf16, false});
-  const Certificate c4 = cert_fixture(int4, QualityTier::kTurbo, {DitPrecision::kW4A4, AttentionMode::kQ8Fp8, TePrecision::kBf16, false});
-  ASSERT_EQ(validate_certificate(c8), "");
-  ASSERT_EQ(validate_certificate(c4), "");
-  ASSERT_TRUE(write_certificate_file(certs / "int8.json", {c8}));
-  ASSERT_TRUE(write_certificate_file(certs / "int4.json", {c4}));
-
   Request req;
   req.model = weights_root() / "sft";
   req.prompt = "portrait of a woman in a garden, soft light";
@@ -877,42 +835,39 @@ TEST(GpuAccelPipeline, AutoTierIgnoresAcceleratorsAndInt4Caches) {
   fast.accel.step_cache_threshold = 0.5;
   fast.accel.cfg_truncation = 0.8;
   const auto check = [&](const Result& off, const Result& on, const char* what) {
-    EXPECT_EQ(on.tier.effective, off.tier.effective) << what;
+    EXPECT_EQ(on.tier.tier, off.tier.tier) << what;
     EXPECT_EQ(on.tier.attention, off.tier.attention) << what;
     EXPECT_EQ(on.tier.precision, off.tier.precision) << what;
-    EXPECT_FALSE(on.tier.certified) << what;
-    EXPECT_TRUE(on.tier.certificate.empty()) << what;
     EXPECT_EQ(count_of(on.tier.reason, "accelerator"), 1u) << what << ": " << on.tier.reason;
-    EXPECT_EQ(on.quality.reason, on.tier.reason) << what;
-    std::printf("[accel tier] %s: %s / %s, reason: %s\n", what, mi::planner::tier_name(on.tier.effective),
+    EXPECT_EQ(count_of(off.tier.reason, "accelerator"), 0u) << what << ": " << off.tier.reason;
+    std::printf("[accel tier] %s: %s / %s, reason: %s\n", what, mi::planner::tier_name(on.tier.tier),
                 mi::planner::attention_name(on.tier.attention), on.tier.reason.c_str());
   };
   {
     Pipeline pipe;
     const Result off = pipe.generate(req), on = pipe.generate(fast);
-    EXPECT_EQ(off.tier.effective, mi::planner::Tier::kReference);
+    EXPECT_EQ(off.tier.tier, mi::planner::Tier::kReference);
     check(off, on, "bf16 bundle");
   }
   {
     PipelineOptions o;
     o.dit_file = int8;
-    o.cache_dir = dir.path() / "cache";
+    o.tier = mi::planner::Tier::kHigh;
     o.embedding_cache = false;
     Pipeline pipe(o);
     const Result off = pipe.generate(req), on = pipe.generate(fast);
-    EXPECT_EQ(off.tier.effective, mi::planner::Tier::kHigh);
+    EXPECT_EQ(off.tier.tier, mi::planner::Tier::kHigh);
     EXPECT_EQ(off.tier.attention, mi::planner::AttentionMode::kQ8Fp8);
-    EXPECT_TRUE(off.tier.certified);
     check(off, on, "int8 file");
   }
   {
     PipelineOptions o;
     o.dit_file = int4;
-    o.cache_dir = dir.path() / "cache";
+    o.tier = mi::planner::Tier::kTurbo;
     o.embedding_cache = false;
     Pipeline pipe(o);
     const Result off = pipe.generate(req);
-    EXPECT_EQ(off.tier.effective, mi::planner::Tier::kTurbo);
+    EXPECT_EQ(off.tier.tier, mi::planner::Tier::kTurbo);
     Result on;
     ASSERT_NO_THROW(on = pipe.generate(fast));
     check(off, on, "int4 file");

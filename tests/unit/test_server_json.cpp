@@ -90,8 +90,8 @@ TEST(ServerJson, NumbersMatchThePipelineAndIgnoreTheLocale) {
 }
 
 // tools/server/names.h: every protocol name is the pipeline's own spelling, and maps to the C value of the pipeline
-// value (the C enums keep the pipeline's order; mi_tier starts with AUTO, mi_attention with DEFAULT = unset). Each C
-// value appears once.
+// value (the C enums keep the pipeline's order; mi_tier starts with the reserved AUTO, which has no name, mi_attention
+// with DEFAULT = unset). Each C value appears once.
 TEST(ServerJson, EnumNamesAreThePipelines) {
   namespace p = mi::pipeline;
   int i = 0;
@@ -122,15 +122,14 @@ TEST(ServerJson, EnumNamesAreThePipelines) {
     EXPECT_EQ(p::noise_source_name(p::parse_noise_source(n.name)), n.name);
   }
   EXPECT_EQ(i, 3);
-  const mi::planner::Tier tiers[] = {mi::planner::Tier::kAuto, mi::planner::Tier::kReference, mi::planner::Tier::kHigh,
-                                     mi::planner::Tier::kTurbo};
+  const mi::planner::Tier tiers[] = {mi::planner::Tier::kReference, mi::planner::Tier::kHigh, mi::planner::Tier::kTurbo};
   i = 0;
   for (const auto& n : mi::server::kTierNames) {
-    EXPECT_EQ(static_cast<int>(n.value), i);
+    EXPECT_EQ(static_cast<int>(n.value), i + 1);  // after MI_TIER_AUTO
     EXPECT_EQ(mi::planner::parse_tier(n.name), tiers[i]) << n.name;
     EXPECT_EQ(mi::planner::tier_name(tiers[i++]), n.name);
   }
-  EXPECT_EQ(i, 4);
+  EXPECT_EQ(i, 3);
   i = 0;
   for (const auto& n : mi::server::kAttentionNames) {
     EXPECT_EQ(static_cast<int>(n.value), i++);

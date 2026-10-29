@@ -1,6 +1,5 @@
 // P6b algorithmic accelerators: opt-in, lossy (they change the image), off by default. With every accelerator off the
-// sampling loop runs exactly as without this module (bit-identical output). A run with any of them on is uncertified:
-// quality certificates are measured with accelerators off (pipeline/quality_cert.h CertScope::accelerators).
+// sampling loop runs exactly as without this module (bit-identical output).
 //
 // CFG truncation (Options::cfg_truncation = c in [0, 1]; 1 = off): classifier-free guidance only for the steps i with
 // i / num_steps < c (the guidance windows' step-index convention, pipeline/sampler.h); the later steps run the cond row

@@ -28,7 +28,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_image.h"
 #include "pipeline/png_writer.h"
-#include "pipeline/quality_cert.h"
+#include "pipeline/quality_report.h"
 #include "pipeline/report_json.h"
 #include "pipeline/sampler.h"
 #include "planner/planner.h"
@@ -152,7 +152,9 @@ pipeline::NoiseSource to_noise_source(mi_noise_source s) {
 
 planner::Tier to_tier(mi_tier t) {
   switch (t) {
-    case MI_TIER_AUTO: return planner::Tier::kAuto;
+    case MI_TIER_AUTO:  // reserved since 2.0: the caller chooses
+      throw std::invalid_argument("tier is required: choose MI_TIER_REFERENCE, MI_TIER_HIGH or MI_TIER_TURBO "
+                                  "(reference | high | turbo).");
     case MI_TIER_REFERENCE: return planner::Tier::kReference;
     case MI_TIER_HIGH: return planner::Tier::kHigh;
     case MI_TIER_TURBO: return planner::Tier::kTurbo;
@@ -227,9 +229,8 @@ mi_tier from_tier(planner::Tier t) {
     case planner::Tier::kReference: return MI_TIER_REFERENCE;
     case planner::Tier::kHigh: return MI_TIER_HIGH;
     case planner::Tier::kTurbo: return MI_TIER_TURBO;
-    case planner::Tier::kAuto: return MI_TIER_AUTO;
   }
-  return MI_TIER_AUTO;
+  return MI_TIER_REFERENCE;
 }
 
 mi_attention from_attention(planner::AttentionMode a) {
@@ -608,20 +609,7 @@ pipeline::PipelineOptions to_options(const mi_engine_params& p) {
   o.tier = to_tier(p.tier);
   o.attention = to_attention(p.attention);
   o.lora_strict = p.lora_strict != 0;
-  // Certificate directories: copied, in order; the engine searches a missing one as empty.
-  if (p.certificate_dirs_count > 0 && p.certificate_dirs == nullptr) {
-    throw std::invalid_argument("certificate_dirs: NULL array with a nonzero count.");
-  }
-  if (p.certificate_dirs_count > kMaxCertificateDirs) {
-    throw std::invalid_argument("certificate_dirs: at most " + std::to_string(kMaxCertificateDirs) + " entries (got " +
-                                std::to_string(p.certificate_dirs_count) + ").");
-  }
-  for (std::size_t i = 0; i < p.certificate_dirs_count; ++i) {
-    if (!given(p.certificate_dirs[i])) {
-      throw std::invalid_argument("certificate_dirs[" + std::to_string(i) + "] is empty; pass a directory.");
-    }
-    o.certificate_dirs.push_back(user_path(p.certificate_dirs[i], "certificate_dirs[" + std::to_string(i) + "]"));
-  }
+  // certificate_dirs / certificate_dirs_count: reserved since 2.0, ignored.
   switch (p.dit_direct_io) {
     case MI_DIRECT_IO_AUTO: o.dit_load_direct_io = std::nullopt; break;  // adaptive
     case MI_DIRECT_IO_BUFFERED: o.dit_load_direct_io = false; break;
@@ -751,16 +739,13 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
 
   const planner::TierDecision& td = r.tier;
   g.tier.struct_size = sizeof g.tier;
-  g.tier.requested = from_tier(td.requested);
-  g.tier.effective = from_tier(td.effective);
+  g.tier.requested = from_tier(td.tier);
+  g.tier.effective = from_tier(td.tier);  // the caller's tier runs, or is refused
   g.tier.attention = from_attention(td.attention);
-  // Reference needs no certificate: certified, also for the default decision of a generation cancelled before it.
-  g.tier.certified = td.certified || td.effective == planner::Tier::kReference ? 1 : 0;
-  g.tier.run_certified = td.certified ? 1 : 0;  // the run's, as the report's models.dit.certified
+  // certified and run_certified: reserved since 2.0, 0 (the zeroed struct).
   g.tier.dit_precision = to_precision(td.precision);
   g.tier.text_encoder_precision = te_precision(r.te_precision);
   g.tier_reason = td.reason;
-  g.certificate = td.certificate;
   g.gpu_arch = r.gpu_arch;
   g.dit_source = r.dit_source;
   g.te_source = r.te_source;

@@ -652,32 +652,19 @@ class Server {
     if (dit_file) e.dit_file = dit_file->c_str();
     if (te_file) e.text_encoder_file = te_file->c_str();
     if (vae_file) e.vae_file = vae_file->c_str();
-    if (const auto v = p.name("tier", mi::server::kTierNames)) e.tier = *v;
+    const std::optional<mi_tier> tier = p.name("tier", mi::server::kTierNames);
     if (const auto v = p.name("attention", mi::server::kAttentionNames)) e.attention = *v;
     if (const auto v = p.boolean("lora_strict")) e.lora_strict = *v ? 1 : 0;
     const std::optional<std::string> te = p.path("time_embedding_file");
     const std::optional<std::string> distill = p.path("distill");
     if (te) e.time_embedding_file = te->c_str();
     if (distill) e.distill_dir = distill->c_str();
-    // The engine copies the directories; these live until mi_engine_create() returns. Its own checks count them.
-    std::vector<std::string> cert_dirs;
-    std::vector<const char*> cert_ptrs;
-    if (const Value* v = p.find("certificate_dirs")) {
-      constexpr const char* kWhat = "an array of non-empty directory paths";
-      if (!v->is_array()) throw RequestError("invalid_params", std::string("\"certificate_dirs\" must be ") + kWhat);
-      for (const Value& d : v->as_array()) {
-        if (!d.is_string() || d.as_string().empty() || d.as_string().find('\0') != std::string::npos) {
-          throw RequestError("invalid_params", "\"certificate_dirs[" + std::to_string(cert_dirs.size()) + "]\" must be a " +
-                                                   "non-empty path without NUL characters (" + kWhat + ")");
-        }
-        cert_dirs.push_back(d.as_string());
-      }
-      for (const std::string& d : cert_dirs) cert_ptrs.push_back(d.c_str());
-      e.certificate_dirs = cert_ptrs.data();
-      e.certificate_dirs_count = cert_ptrs.size();
-    }
+    // "certificate_dirs": reserved since 2.0, accepted and ignored.
     if (const auto v = p.name("dit_direct_io", mi::server::kDitDirectIoNames)) e.dit_direct_io = *v;
     if (const auto v = p.name("te_host_pin", mi::server::kTeHostPinNames)) e.te_host_pin = *v;
+    // Required since 2.0 (the C API refuses MI_TIER_AUTO); checked once every parameter is valid.
+    if (!tier) throw RequestError("invalid_params", "\"tier\" is required: reference, high or turbo");
+    e.tier = *tier;
     // The old engine goes first: two engines would hold two arenas.
     join_worker();
     mi_engine_free(engine_);
@@ -1121,7 +1108,7 @@ class Server {
           what += (what.empty() ? "" : ", ") + std::string("step cache reused ") + std::to_string(a.cached_calls) + " of " +
                   std::to_string(a.dit_calls) + " DiT calls";
         }
-        add("lossy accelerators (" + active + "), uncertified: " + what);
+        add("lossy accelerators (" + active + "): " + what);
       }
       // What the engine says about the accelerators for this model (a threshold that moves the base model's
       // composition, a cache that never engaged).
@@ -1248,12 +1235,6 @@ class Server {
     if (r != nullptr && preload) {
       // What the preload loaded, without parsing the report (which has both too).
       done += ",\"preload_note\":" + str(mi_result_text(r, MI_TEXT_PRELOAD_NOTE)) + ",\"dit_load\":" + dit_load_json(r);
-    }
-    if (r != nullptr) {
-      // Whether the run as a whole is certified (the report's models.dit.certified), without parsing the report.
-      mi_tier_info t{};
-      t.struct_size = sizeof t;
-      if (mi_result_tier(r, &t) == MI_OK) done += std::string(",\"certified\":") + tf(t.run_certified != 0);
     }
     done += ",\"warnings\":" + warnings_json(r, w.params);
     mi_result_free(r);

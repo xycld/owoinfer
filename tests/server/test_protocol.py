@@ -266,12 +266,12 @@ class CpuProtocolTest(ProtocolTestBase):
                                                "lora": True, "tiers": True, "samplers": True,
                                                "image_input": True, "hires": True, "distill": True,
                                                "system_cuda": True, "control": True, "accel": True,
-                                               "preload": True, "release": True, "certificate_dirs": True,
+                                               "preload": True, "release": True, "certificate_dirs": False,
                                                "te_host_pin": True, "progress_fraction": True, "inspect": True})
         self.assertEqual(set(res["values"]), {"mode", "block_path", "tier", "attention", "dit_direct_io", "te_host_pin",
                                               "sampler", "scheduler", "noise_layout", "noise_source", "resize",
                                               "mask_encoding", "step_cache"})
-        self.assertEqual(res["values"]["tier"], ["auto", "reference", "high", "turbo"])
+        self.assertEqual(res["values"]["tier"], ["reference", "high", "turbo"])  # exactly the accepted names
         self.assertEqual(res["values"]["mode"], ["min_memory", "balanced", "max_speed"])
         probe = res["probe"]
         self.assertGreaterEqual(probe["device_count"], probe["supported_device_count"])
@@ -343,35 +343,44 @@ class CpuProtocolTest(ProtocolTestBase):
         # Every valid value (and null, the default) passes the server and reaches the engine's own checks.
         missing = os.path.join(self.tmp, "missing")
         for i, path in enumerate(("default", "op_by_op", "fused", "fused_graphs", None)):
-            r = self.server.call("load", {"model": missing, "block_path": path}, id=20 + i)
+            r = self.server.call("load", {"model": missing, "tier": "reference", "block_path": path}, id=20 + i)
             self.assertError(r, "invalid_argument", 20 + i)
             self.assertIn("not found", r["error"]["message"])
         self.assertEqual(self.server.call("status")["result"], {"state": "unloaded"})
 
     def test_p6_load_params(self):
         missing = os.path.join(self.tmp, "missing")
-        bad = [({"tier": "fast"}, "tier"), ({"tier": 1}, "tier"), ({"attention": "q8"}, "attention"),
-               ({"attention": "auto"}, "attention"), ({"lora_strict": 1}, "lora_strict"), ({"dit_file": 5}, "dit_file"),
+        bad = [({"tier": "fast"}, "tier"), ({"tier": 1}, "tier"), ({"tier": "auto"}, "tier"),
+               ({"attention": "q8"}, "attention"), ({"attention": "auto"}, "attention"),
+               ({"lora_strict": 1}, "lora_strict"), ({"dit_file": 5}, "dit_file"),
                ({"text_encoder_file": ["x"]}, "text_encoder_file"), ({"vae_file": "a\u0000b"}, "vae_file")]
         for i, (params, name) in enumerate(bad):
             r = self.server.call("load", dict(params, model=missing), id=i)
             self.assertError(r, "invalid_params", i)
             self.assertIn(name, r["error"]["message"])
+        # The tier is required (2.0): without one, or null, the load is invalid_params naming the choices.
+        for i, params in enumerate(({}, {"tier": None}, {"attention": "q8_fp8"})):
+            r = self.server.call("load", dict(params, model=missing), id="none%d" % i)
+            self.assertError(r, "invalid_params", "none%d" % i)
+            self.assertIn('"tier" is required: reference, high or turbo', r["error"]["message"])
         # Every name passes the server and reaches the engine's own checks (here: the missing bundle).
-        for i, tier in enumerate(("auto", "reference", "high", "turbo")):
+        for i, tier in enumerate(("reference", "high", "turbo")):
             r = self.server.call("load", {"model": missing, "tier": tier}, id="t%d" % i)
             self.assertError(r, "invalid_argument", "t%d" % i)
+            self.assertIn("not found", r["error"]["message"])
         for i, att in enumerate(("default", "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc")):
-            r = self.server.call("load", {"model": missing, "attention": att, "lora_strict": True}, id="a%d" % i)
+            r = self.server.call("load", {"model": missing, "tier": "high", "attention": att, "lora_strict": True},
+                                 id="a%d" % i)
             self.assertError(r, "invalid_argument", "a%d" % i)
             self.assertIn("not found", r["error"]["message"])
         # Component files must exist (checked before CUDA); "" means the bundle's.
         bundle = self.fake_bundle()
         for key in ("dit_file", "text_encoder_file", "vae_file"):
-            r = self.server.call("load", {"model": bundle, key: missing}, id=key)
+            r = self.server.call("load", {"model": bundle, "tier": "high", key: missing}, id=key)
             self.assertError(r, "invalid_argument", key)
             self.assertIn(key, r["error"]["message"])
-        r = self.server.call("load", {"model": bundle, "dit_file": "", "vram_budget_bytes": 1000}, id="empty")
+        r = self.server.call("load", {"model": bundle, "tier": "reference", "dit_file": "", "vram_budget_bytes": 1000},
+                             id="empty")
         self.assertError(r, "invalid_argument", "empty")
         self.assertIn("vram_budget_bytes", r["error"]["message"])
         self.assertEqual(self.server.call("status")["result"], {"state": "unloaded"})
@@ -440,15 +449,16 @@ class CpuProtocolTest(ProtocolTestBase):
         for i, params in enumerate(({"time_embedding_file": 5}, {"distill": ["x"]}, {"distill": "a\u0000b"},
                                     {"distill": ""}, {"time_embedding_file": ""})):
             self.assertError(self.server.call("load", dict(params, model=bundle), id=i), "invalid_params", i)
-        r = self.server.call("load", {"model": bundle, "time_embedding_file": missing}, id="te")
+        r = self.server.call("load", {"model": bundle, "tier": "reference", "time_embedding_file": missing}, id="te")
         self.assertError(r, "invalid_argument", "te")
         self.assertIn("time_embedding_file", r["error"]["message"])
-        r = self.server.call("load", {"model": bundle, "distill": missing}, id="d")
+        r = self.server.call("load", {"model": bundle, "tier": "reference", "distill": missing}, id="d")
         self.assertError(r, "invalid_argument", "d")
         self.assertIn("distill: not a directory", r["error"]["message"])
         empty = os.path.join(self.tmp, "empty_bundle")
         os.makedirs(empty)
-        self.assertError(self.server.call("load", {"model": bundle, "distill": empty}, id="e"), "model", "e")
+        self.assertError(self.server.call("load", {"model": bundle, "tier": "reference", "distill": empty}, id="e"),
+                         "model", "e")
         self.assertEqual(self.server.call("status")["result"], {"state": "unloaded"})
 
     def test_p7b_generate_params(self):
@@ -608,35 +618,28 @@ class CpuProtocolTest(ProtocolTestBase):
     def test_load_params_11(self):
         missing = os.path.join(self.tmp, "missing")
         bundle = self.fake_bundle()
-        certs = os.path.join(self.tmp, "certs")
-        bad = [({"certificate_dirs": certs}, '"certificate_dirs" must be an array'),
-               ({"certificate_dirs": [certs, ""]}, '"certificate_dirs[1]" must be a non-empty path'),
-               ({"certificate_dirs": [5]}, '"certificate_dirs[0]" must be a non-empty path'),
-               ({"certificate_dirs": ["a\u0000b"]}, '"certificate_dirs[0]" must be a non-empty path without NUL'),
-               ({"dit_direct_io": "on"}, '"dit_direct_io" must be "auto", "buffered" or "direct"'),
+        bad = [({"dit_direct_io": "on"}, '"dit_direct_io" must be "auto", "buffered" or "direct"'),
                ({"dit_direct_io": True}, '"dit_direct_io" must be a string'),
                ({"te_host_pin": "pinned"}, '"te_host_pin" must be "auto", "on" or "off"'),
                ({"te_host_pin": 1}, '"te_host_pin" must be a string')]
         for i, (params, message) in enumerate(bad):
-            r = self.server.call("load", dict(params, model=missing), id=i)
+            r = self.server.call("load", dict(params, model=missing, tier="reference"), id=i)
             self.assertError(r, "invalid_params", i)
             self.assertIn(message, r["error"]["message"])
         # Every valid value passes the server and reaches the engine's own checks (here: the missing bundle); an
-        # absent or null parameter is the default.
-        for i, extra in enumerate(({"certificate_dirs": []}, {"certificate_dirs": [certs, missing]},
-                                   {"certificate_dirs": None}, {"dit_direct_io": "auto"}, {"dit_direct_io": "buffered"},
-                                   {"dit_direct_io": "direct", "direct_io": True}, {"te_host_pin": "auto"},
-                                   {"te_host_pin": "on"}, {"te_host_pin": "off"}, {"dit_direct_io": None})):
-            r = self.server.call("load", dict(extra, model=missing), id="ok%d" % i)
+        # absent or null parameter is the default. "certificate_dirs" is reserved since 2.0: accepted and ignored.
+        for i, extra in enumerate(({"certificate_dirs": []}, {"certificate_dirs": ["/certs", ""]},
+                                   {"certificate_dirs": "x"}, {"certificate_dirs": None}, {"dit_direct_io": "auto"},
+                                   {"dit_direct_io": "buffered"}, {"dit_direct_io": "direct", "direct_io": True},
+                                   {"te_host_pin": "auto"}, {"te_host_pin": "on"}, {"te_host_pin": "off"},
+                                   {"dit_direct_io": None})):
+            r = self.server.call("load", dict(extra, model=missing, tier="reference"), id="ok%d" % i)
             self.assertError(r, "invalid_argument", "ok%d" % i)
             self.assertIn("not found", r["error"]["message"])
-        # The engine counts the directories (at most 16; a missing one is searched as empty), before CUDA.
-        r = self.server.call("load", {"model": bundle, "certificate_dirs": [certs] * 17}, id="many")
-        self.assertError(r, "invalid_argument", "many")
-        self.assertIn("certificate_dirs: at most 16 entries (got 17)", r["error"]["message"])
-        r = self.server.call("load", {"model": bundle, "certificate_dirs": [certs] * 16, "dit_direct_io": "buffered",
-                                      "te_host_pin": "off", "vram_budget_bytes": 1000}, id="16")
-        self.assertError(r, "invalid_argument", "16")
+        r = self.server.call("load", {"model": bundle, "tier": "high", "certificate_dirs": [missing] * 17,
+                                      "dit_direct_io": "buffered", "te_host_pin": "off", "vram_budget_bytes": 1000},
+                             id="17")
+        self.assertError(r, "invalid_argument", "17")
         self.assertIn("vram_budget_bytes", r["error"]["message"])
         self.assertEqual(self.server.call("status")["result"], {"state": "unloaded"})
 
@@ -680,17 +683,18 @@ class CpuProtocolTest(ProtocolTestBase):
 
     def test_load_errors_are_engine_statuses(self):
         missing = os.path.join(self.tmp, "missing")
-        r = self.server.call("load", {"model": missing}, id="a")
+        r = self.server.call("load", {"model": missing, "tier": "reference"}, id="a")
         self.assertError(r, "invalid_argument", "a")
         self.assertIn("not found", r["error"]["message"])
         partial = os.path.join(self.tmp, "partial")
         os.makedirs(os.path.join(partial, "transformer"))
-        self.assertError(self.server.call("load", {"model": partial}, id="b"), "model", "b")
+        self.assertError(self.server.call("load", {"model": partial, "tier": "reference"}, id="b"), "model", "b")
         ckpt = os.path.join(self.tmp, "moss.safetensors")
         open(ckpt, "wb").close()
-        self.assertError(self.server.call("load", {"model": ckpt}, id="c"), "not_supported", "c")
+        self.assertError(self.server.call("load", {"model": ckpt, "tier": "reference"}, id="c"), "not_supported", "c")
         # Checked before CUDA is touched: a fake bundle with an invalid budget.
-        r = self.server.call("load", {"model": self.fake_bundle(), "vram_budget_bytes": 1000}, id="d")
+        r = self.server.call("load", {"model": self.fake_bundle(), "tier": "reference", "vram_budget_bytes": 1000},
+                             id="d")
         self.assertError(r, "invalid_argument", "d")
         self.assertIn("vram_budget_bytes", r["error"]["message"])
         self.assertEqual(self.server.call("status")["result"]["state"], "unloaded")
@@ -709,7 +713,7 @@ class CpuProtocolTest(ProtocolTestBase):
             for v in names:
                 if param in load_params:
                     # Through the server to the engine's own checks (here: the missing bundle).
-                    r = self.server.call("load", {"model": missing, param: v}, id=v)
+                    r = self.server.call("load", dict({"model": missing, "tier": "high"}, **{param: v}), id=v)
                     self.assertError(r, "invalid_argument", v)
                     self.assertIn("not found", r["error"]["message"])
                 else:
@@ -732,9 +736,10 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertEqual((r["kind"], r["loadable"], r["precision"], r["quantization"]), ("dit", True, "bf16", "bf16"))
         self.assertEqual(r["file_bytes"], os.path.getsize(dit))
         self.assertEqual(r["tensors"], 42 * 2 + 2 + 4)
-        self.assertEqual(r["tiers"], ["auto", "reference", "high"])
-        self.assertEqual(set(r["tier_reasons"]), {"auto", "reference", "high", "turbo"})
-        self.assertIn("Reference", r["tier_reasons"]["auto"])
+        self.assertEqual(r["tiers"], ["reference", "high"])
+        self.assertEqual(set(r["tier_reasons"]), {"reference", "high", "turbo"})  # no auto, no certificates
+        self.assertEqual(r["tier_reasons"]["reference"], "Reference tier: bf16 GEMMs, exact attention")
+        self.assertEqual(r["tier_reasons"]["high"], "High tier: bf16 GEMMs, q8_fp8 attention")
         self.assertIn("INT4", r["tier_reasons"]["turbo"])
         self.assertNotIn("control_kinds", r)
 
@@ -871,8 +876,8 @@ class CpuProtocolTest(ProtocolTestBase):
         try:
             self.assertEqual(server.call("hello", {"protocol_version": 1})["result"]["protocol_version"], 1)
             self.assert_protocol_fd_private(server)
-            self.assertEqual(server.call("load", {"model": os.path.join(self.tmp, "missing")})["error"]["code"],
-                             "invalid_argument")
+            load = {"model": os.path.join(self.tmp, "missing"), "tier": "reference"}
+            self.assertEqual(server.call("load", load)["error"]["code"], "invalid_argument")
             self.assertEqual(server.call("status")["result"], {"state": "unloaded"})
             self.assertEqual(server.call("shutdown", id="bye"), {"id": "bye", "result": {}})
             self.assertEqual(server.proc.wait(timeout=TIMEOUT), 0)
@@ -951,11 +956,11 @@ class CpuProtocolTest(ProtocolTestBase):
 
 @unittest.skipUnless(GPU, "set MOSSINFER_GPU_TESTS=1 (and hold the GPU lock) for the GPU tests")
 class GpuProtocolTest(ProtocolTestBase):
-    def load_base(self):
+    def load_base(self, tier="reference"):
         base = os.path.join(WEIGHTS, "base")
         if not os.path.isdir(os.path.join(base, "transformer")):
             self.skipTest("weights not present: " + base)
-        r = self.server.call("load", {"model": base, "mode": "balanced", "block_path": "fused"})
+        r = self.server.call("load", {"model": base, "tier": tier, "mode": "balanced", "block_path": "fused"})
         self.assertIn("result", r, r)
         self.assertEqual(r["result"]["model"], base)
         return base
@@ -1114,7 +1119,9 @@ class GpuProtocolTest(ProtocolTestBase):
         done = self.wait_done(gid, events)
         self.assertEqual(done["status"], "ok", done)
         self.assertEqual(done["image"], out)
-        self.assertIs(done["certified"], done["report"]["models"]["dit"]["certified"])
+        self.assertNotIn("certified", done)
+        self.assertEqual(done["report"]["models"]["dit"]["tier"], "reference")
+        self.assertEqual(done["report"]["quality"]["config"]["attention"], "exact")
         with open(out, "rb") as f:
             self.assertEqual(f.read(8), b"\x89PNG\r\n\x1a\n")
         report = done["report"]
@@ -1156,6 +1163,32 @@ class GpuProtocolTest(ProtocolTestBase):
         self.assertIn("NUL", r["error"]["message"])
         self.assertEqual(self.server.call("shutdown")["result"], {})
         self.assertEqual(self.server.proc.wait(timeout=TIMEOUT), 0)
+
+    def test_tier_high_runs_8bit_attention(self):
+        """The tier is the caller's: high on the bf16 bundle runs its bf16 GEMMs with the tier's default 8-bit attention
+        (q8_fp8 with FP8, else q8_fp16); an explicit exact attention makes it the Reference configuration, refused with
+        the reason."""
+        base = self.load_base(tier="high")
+        out = os.path.join(self.tmp, "high.png")
+        events = []
+        request = {"prompt": "a red apple", "width": 256, "height": 256, "steps": 2, "output": out}
+        gid = self.server.send("generate", request, id="h")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "ok", done)
+        q = done["report"]["quality"]
+        self.assertEqual(q["tier"], "high")
+        self.assertIn(q["config"]["attention"], ("q8_fp8", "q8_fp16"), q)
+        self.assertEqual(q["config"]["dit_precision"], "bf16")
+        print("[server] tier high on the bf16 bundle: %s attention" % q["config"]["attention"])
+        r = self.server.call("load", {"model": base, "tier": "high", "attention": "exact"})
+        self.assertIn("result", r, r)
+        gid = self.server.send("generate", request, id="hx")
+        self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "error", done)
+        self.assertEqual(done["error"]["code"], "invalid_argument", done)
+        self.assertIn("that is the Reference tier", done["error"]["message"])
 
     def test_p6_preview_sampler_metadata(self):
         self.load_base()
@@ -1289,17 +1322,16 @@ class GpuProtocolTest(ProtocolTestBase):
         accel = done["report"]["accelerators"]
         self.assertTrue(accel["lossy"], accel)
         self.assertGreater(accel["step_cache_calls"], 0, accel)
-        self.assertFalse(done["report"]["models"]["dit"]["certified"], done["report"]["models"])
-        self.assertIn("uncertified", done["report"]["quality"]["reason"])
+        self.assertEqual(done["report"]["quality"]["config"]["lora"], "active")  # the control adapter's LoRA part
         lossy = [w for w in done["warnings"] if w.startswith("lossy accelerators (")]
         self.assertEqual(len(lossy), 1, done["warnings"])
         self.assertIn("step_cache fbcache 0.5", lossy[0])
         self.assertIn("step cache reused", lossy[0])
         self.assertNotIn("CFG truncated", lossy[0])  # only the active accelerators
-        self.assertIs(done["certified"], False)
+        self.assertNotIn("uncertified", lossy[0])
+        self.assertNotIn("certified", done)
         print("[server] control %s, %d encodes; %s" % (control["kinds"], control["encodes"], lossy[0]))
-        # Settings without effect: a threshold without the step cache, CFG truncation at CFG 1. Nothing lossy ran, the
-        # bf16 bundle ran Reference: certified.
+        # Settings without effect: a threshold without the step cache, CFG truncation at CFG 1. Nothing lossy ran.
         gid = self.server.send("generate", {"prompt": "a cat", "width": 256, "height": 256, "steps": 2, "cfg": 1,
                                             "cfg_truncation": 0.5, "step_cache_threshold": 0.1, "output": out}, id="noop")
         self.assertEqual(self.server.response(gid, events=events)["result"], {"accepted": True})
@@ -1308,8 +1340,7 @@ class GpuProtocolTest(ProtocolTestBase):
         self.assertIn('step_cache_threshold has no effect without step_cache "fbcache"', done["warnings"])
         self.assertIn("cfg_truncation has no effect without CFG (cfg 1)", done["warnings"])
         self.assertFalse(any(w.startswith("lossy accelerators") for w in done["warnings"]), done["warnings"])
-        self.assertIs(done["certified"], True)
-        self.assertIs(done["certified"], done["report"]["models"]["dit"]["certified"])
+        self.assertFalse(done["report"]["accelerators"]["lossy"], done["report"]["accelerators"])
         # A kind the adapter does not have fails in "done", in the protocol's names.
         gid = self.server.send("generate", {"prompt": "a cat", "width": 256, "height": 256, "steps": 2, "output": out,
                                             "control": {"adapter": adapter, "images": [{"kind": "canny", "path": depth}]}},

@@ -13,7 +13,6 @@
 // descending, then name). `__metadata__` keeps the source file's keys except `_quantization_metadata` (and earlier
 // mossinfer_* keys) and adds mossinfer_converter (version and the count of GEMMs per written spec),
 // mossinfer_kept_bf16 (JSON list of the GEMMs left bf16), mossinfer_source_xxh64 and, with LoRAs, mossinfer_lora.
-// No certificate reference is written: quality certificates come from a separate harness and live next to the file.
 //
 // NVFP4 output (ConvertOptions::nvfp4, `--format nvfp4`; NVFP4 plan §4.4 and "N3 converter: reproducible output"): the
 // block GEMM units (fused proj.qkv, proj.o, proj.ffn_up_gate, proj.ffn_down) become comfy_quant "nvfp4" with a recipe

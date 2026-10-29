@@ -34,7 +34,7 @@
 namespace mi::kernels::quant {
 
 // Numerics version of the INT8 ConvRot path (rotation order, quantization, GEMM epilogues): bump on any change to the
-// output bits, which retires the quality certificates measured before it (pipeline/quality_cert.h).
+// output bits, reported in the quality object's numerics (pipeline/quality_report.h).
 inline constexpr std::uint32_t kInt8NumericsVersion = 1;
 
 // Rotation group (every ConvRot file uses 256); rotated inputs need K % kConvRotGroup == 0.

@@ -1,6 +1,5 @@
 // Whole-file reads of the small files the engine replaces atomically while others may read them (rename_replace.h):
-// the hardware profile with the fused self-check, quality certificates and their hash cache, the embedding cache's
-// entries and the model index. A reader must not mistake a replace in flight for a missing or broken file (a planner
+// the hardware profile with the fused self-check, the embedding cache's entries and the model index. A reader must not mistake a replace in flight for a missing or broken file (a planner
 // that sees "no profile" measures again and may overwrite a learned one).
 //
 // POSIX: one plain read (a rename never disturbs an open or an opening reader). Windows: the reader opens with

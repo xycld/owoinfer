@@ -412,7 +412,7 @@ std::vector<Candidate> cublaslt_candidates(CudaLibPolicy policy, const Environme
     out.push_back(Candidate{std::move(file), "env"});
     return out;
   }
-  // auto: the package's own copy first (reproducible results, certificates that apply); a package without one (the
+  // auto: the package's own copy first (reproducible results); a package without one (the
   // system-CUDA variant) falls through to a compatible system copy.
   const std::vector<Candidate> bundled = cublaslt_bundled_candidates(module_dir, os, cuda_major);
   if (policy != CudaLibPolicy::kSystem) {

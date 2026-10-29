@@ -43,8 +43,6 @@ struct ModelError : std::runtime_error {
 inline constexpr std::size_t kMaxLoras = 64;
 // At most this many control images per generation (one per kind; the published adapters have two).
 inline constexpr std::size_t kMaxControlImages = 16;
-// At most this many extra certificate directories per engine (mi_engine_params.certificate_dirs).
-inline constexpr std::size_t kMaxCertificateDirs = 16;
 
 // One finished generate() call, in C-API terms.
 struct Generation {
@@ -65,7 +63,7 @@ struct Generation {
   std::vector<std::pair<std::string, std::string>> png_text;
   mi_tier_info tier{};
   // mi_result_text() kinds.
-  std::string tier_reason, certificate, gpu_arch, dit_source, te_source, vae_source, quality_json;
+  std::string tier_reason, gpu_arch, dit_source, te_source, vae_source, quality_json;
   mi_prompt_tokens tokens[2]{};  // the prompt, the negative prompt
   std::vector<mi_lora_report> loras;
   std::vector<std::string> lora_files;

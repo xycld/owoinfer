@@ -628,7 +628,7 @@ TEST(MappedFile, EmptyAndMissingFiles) {
 #ifndef _WIN32
 // A FIFO given as a weight file is refused at once (an open(2) of one blocks until a writer appears), buffered and
 // direct: by FileReader (so SafetensorsFile), MappedFile, direct_io_support, page_cache_fraction and
-// read_replaceable_file (certificates, caches). error_within fails the test instead of hanging on a regression.
+// read_replaceable_file (caches). error_within fails the test instead of hanging on a regression.
 TEST(FileReader, RefusesFifoPromptly) {
   TempDir dir("fr_fifo");
   const auto fifo = dir.path() / "model.safetensors";

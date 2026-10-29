@@ -1144,106 +1144,63 @@ TEST(Planner, Int4DitStreamsLessAndCostsLeast) {
 }
 
 TEST(Planner, TurboTier) {
-  const auto none = [](Precision, AttentionMode) { return CertificateAnswer{false, "", "not certifiable"}; };
   const auto all = [](AttentionMode) { return true; };
   const auto no_q8 = [](AttentionMode a) { return a == AttentionMode::kExact; };
   using O = std::optional<AttentionMode>;
-  // Explicit turbo on an INT4 DiT: INT4 GEMMs + q8_fp8 attention, uncertified, said so.
-  TierDecision d = resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, none, all);
-  EXPECT_EQ(d.effective, Tier::kTurbo);
+  // Turbo on an INT4 DiT: INT4 GEMMs + q8_fp8 attention, said so.
+  TierDecision d = resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, all);
+  EXPECT_EQ(d.tier, Tier::kTurbo);
   EXPECT_EQ(d.precision, Precision::kInt4);
   EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
-  EXPECT_FALSE(d.certified);
-  EXPECT_NE(d.reason.find("INT4 ConvRot GEMMs"), std::string::npos) << d.reason;
-  EXPECT_NE(d.reason.find("uncertified (not certifiable)"), std::string::npos) << d.reason;
-  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, none, no_q8).attention, AttentionMode::kExact);
-  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{AttentionMode::kExact}, Precision::kInt4, none, all).attention, AttentionMode::kExact);
-  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, none, all, true).effective, Tier::kTurbo);  // + quantized TE
-  // Turbo needs an INT4 DiT; an INT4 DiT is never Reference or High.
+  EXPECT_EQ(d.reason, "Turbo tier: INT4 ConvRot GEMMs, q8_fp8 attention");
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, no_q8).attention, AttentionMode::kExact);
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{AttentionMode::kExact}, Precision::kInt4, all).attention, AttentionMode::kExact);
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, all, true).tier, Tier::kTurbo);  // + quantized TE
+  // Turbo needs a 4-bit DiT; a 4-bit DiT is never Reference or High.
   for (const Precision p : {Precision::kBf16, Precision::kInt8}) {
-    EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, p, none, all), std::invalid_argument);
+    EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, p, all), std::invalid_argument);
   }
-  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kInt4, none, all), std::invalid_argument);
-  EXPECT_THROW(resolve_tier(Tier::kHigh, O{}, Precision::kInt4, none, all), std::invalid_argument);
-  // Auto never runs an uncertified Turbo configuration: refused, naming the way out.
+  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kInt4, all), std::invalid_argument);
   try {
-    resolve_tier(Tier::kAuto, O{}, Precision::kInt4, none, all);
-    ADD_FAILURE() << "auto ran an uncertified INT4 DiT";
+    resolve_tier(Tier::kHigh, O{}, Precision::kInt4, all);
+    ADD_FAILURE() << "high ran an INT4 DiT";
   } catch (const std::invalid_argument& e) {
-    EXPECT_NE(std::string(e.what()).find("tier turbo"), std::string::npos) << e.what();
+    EXPECT_NE(std::string(e.what()).find("use tier turbo"), std::string::npos) << e.what();
   }
-  EXPECT_THROW(resolve_tier(Tier::kAuto, O{AttentionMode::kExact}, Precision::kInt4, none, all), std::invalid_argument);
-  // With a certificate auto picks the fastest certified Turbo configuration.
-  std::vector<AttentionMode> order;
-  const auto fp16_only = [&](Precision p, AttentionMode a) {
-    order.push_back(a);
-    return CertificateAnswer{p == Precision::kInt4 && a == AttentionMode::kQ8Fp16, "/c/t.mossinfer-cert.json", ""};
-  };
-  d = resolve_tier(Tier::kAuto, O{}, Precision::kInt4, fp16_only, all);
-  EXPECT_EQ(d.effective, Tier::kTurbo);
-  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp16);
-  EXPECT_TRUE(d.certified);
-  EXPECT_EQ(d.certificate, "/c/t.mossinfer-cert.json");
-  EXPECT_EQ(order, (std::vector<AttentionMode>{AttentionMode::kQ8Fp8, AttentionMode::kQ8Fp16}));
-  d = resolve_tier(Tier::kAuto, O{AttentionMode::kQ8Fp16}, Precision::kInt4, fp16_only, all);
-  EXPECT_EQ(d.effective, Tier::kTurbo);
-  EXPECT_TRUE(d.certified);
 }
 
-// NVFP4 (Turbo on compute capability 12.0, NVFP4 plan §4.7, user decisions D1 / D2), on both GPU classes: where the
-// NVFP4 GEMMs run (sm_120 with the sm_120a kernels: nvfp4_native) turbo runs it, high and reference refuse it and auto
-// runs it only with a certificate; elsewhere (sm_89, or a build without the kernels) every tier refuses it, naming the
-// INT8 file.
+// NVFP4 (Turbo on compute capability 12.0, NVFP4 plan §4.7, user decision D1), on both GPU classes: where the NVFP4
+// GEMMs run (sm_120 with the sm_120a kernels: nvfp4_native) turbo runs it, high and reference refuse it; elsewhere
+// (sm_89, or a build without the kernels) every tier refuses it, naming the INT8 file.
 TEST(Planner, Nvfp4Tier) {
-  const auto none = [](Precision, AttentionMode) { return CertificateAnswer{false, "", "no certificate file"}; };
   const auto all = [](AttentionMode) { return true; };
   const auto no_q8 = [](AttentionMode a) { return a == AttentionMode::kExact; };
   using O = std::optional<AttentionMode>;
   constexpr bool kSm120 = true, kOther = false;
-  TierDecision d = resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, none, all, false, kSm120);
-  EXPECT_EQ(d.effective, Tier::kTurbo);
+  TierDecision d = resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, all, false, kSm120);
+  EXPECT_EQ(d.tier, Tier::kTurbo);
   EXPECT_EQ(d.precision, Precision::kNvfp4);
   EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
-  EXPECT_FALSE(d.certified);
-  EXPECT_NE(d.reason.find("NVFP4 GEMMs"), std::string::npos) << d.reason;
-  EXPECT_NE(d.reason.find("uncertified (no certificate file)"), std::string::npos) << d.reason;
-  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, none, no_q8, false, kSm120).attention, AttentionMode::kExact);
-  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, none, all, true, kSm120).effective, Tier::kTurbo);
+  EXPECT_EQ(d.reason, "Turbo tier: NVFP4 GEMMs, q8_fp8 attention");
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, no_q8, false, kSm120).attention, AttentionMode::kExact);
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{AttentionMode::kQ8Fp16}, Precision::kNvfp4, all, false, kSm120).attention,
+            AttentionMode::kQ8Fp16);
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, all, true, kSm120).tier, Tier::kTurbo);
   try {
-    resolve_tier(Tier::kHigh, O{}, Precision::kNvfp4, none, all, false, kSm120);
+    resolve_tier(Tier::kHigh, O{}, Precision::kNvfp4, all, false, kSm120);
     ADD_FAILURE() << "high ran an NVFP4 DiT";
   } catch (const std::invalid_argument& e) {
     EXPECT_NE(std::string(e.what()).find("NVFP4, which runs the Turbo tier; use tier turbo"), std::string::npos) << e.what();
   }
-  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kNvfp4, none, all, false, kSm120), std::invalid_argument);
-  // D2: auto never runs an uncertified NVFP4 DiT.
-  try {
-    resolve_tier(Tier::kAuto, O{}, Precision::kNvfp4, none, all, false, kSm120);
-    ADD_FAILURE() << "auto ran an uncertified NVFP4 DiT";
-  } catch (const std::invalid_argument& e) {
-    const std::string what = e.what();
-    EXPECT_NE(what.find("the loaded DiT is NVFP4 (the Turbo tier)"), std::string::npos) << what;
-    EXPECT_NE(what.find("choose tier turbo"), std::string::npos) << what;
-  }
-  EXPECT_THROW(resolve_tier(Tier::kAuto, O{AttentionMode::kQ8Fp8}, Precision::kNvfp4, none, all, false, kSm120),
-               std::invalid_argument);
-  // With a certificate for NVFP4 + q8_fp8 auto runs that.
-  const auto certified = [](Precision p, AttentionMode a) {
-    return CertificateAnswer{p == Precision::kNvfp4 && a == AttentionMode::kQ8Fp8, "/c/nvfp4.mossinfer-cert.json", ""};
-  };
-  d = resolve_tier(Tier::kAuto, O{}, Precision::kNvfp4, certified, all, false, kSm120);
-  EXPECT_EQ(d.effective, Tier::kTurbo);
-  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
-  EXPECT_TRUE(d.certified);
-  EXPECT_EQ(d.certificate, "/c/nvfp4.mossinfer-cert.json");
-  // D1: no FP4 tensor cores (or no sm_120a kernels): every tier refuses, also with a certificate; the default is that.
-  for (const Tier t : {Tier::kAuto, Tier::kReference, Tier::kHigh, Tier::kTurbo}) {
+  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kNvfp4, all, false, kSm120), std::invalid_argument);
+  // D1: no FP4 tensor cores (or no sm_120a kernels): every tier refuses; the default is that.
+  for (const Tier t : {Tier::kReference, Tier::kHigh, Tier::kTurbo}) {
     for (const bool explicit_arg : {true, false}) {
       try {
         if (explicit_arg) {
-          resolve_tier(t, O{}, Precision::kNvfp4, certified, all, false, kOther);
+          resolve_tier(t, O{}, Precision::kNvfp4, all, false, kOther);
         } else {
-          resolve_tier(t, O{}, Precision::kNvfp4, certified, all);
+          resolve_tier(t, O{}, Precision::kNvfp4, all);
         }
         ADD_FAILURE() << tier_name(t) << " ran an NVFP4 DiT without the NVFP4 GEMMs";
       } catch (const std::invalid_argument& e) {
@@ -1254,9 +1211,9 @@ TEST(Planner, Nvfp4Tier) {
     }
   }
   // The other precisions do not depend on it.
-  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, none, all, false, kOther).effective, Tier::kTurbo);
-  EXPECT_EQ(resolve_tier(Tier::kHigh, O{}, Precision::kInt8, none, all, false, kOther).effective, Tier::kHigh);
-  EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, Precision::kInt8, none, all, false, kSm120), std::invalid_argument);
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, all, false, kOther).tier, Tier::kTurbo);
+  EXPECT_EQ(resolve_tier(Tier::kHigh, O{}, Precision::kInt8, all, false, kOther).tier, Tier::kHigh);
+  EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, Precision::kInt8, all, false, kSm120), std::invalid_argument);
   EXPECT_STREQ(precision_name(Precision::kNvfp4), "nvfp4");
 }
 
@@ -1294,90 +1251,67 @@ TEST(Planner, Nvfp4DitCostsByFraction) {
 }
 
 TEST(Planner, TierAndAttentionNames) {
-  for (const Tier t : {Tier::kReference, Tier::kHigh, Tier::kTurbo, Tier::kAuto}) EXPECT_EQ(parse_tier(tier_name(t)), t);
+  for (const Tier t : {Tier::kReference, Tier::kHigh, Tier::kTurbo}) EXPECT_EQ(parse_tier(tier_name(t)), t);
   for (const AttentionMode a : {AttentionMode::kExact, AttentionMode::kQ8Fp16, AttentionMode::kQ8Fp16F32Acc,
                                 AttentionMode::kQ8Fp8, AttentionMode::kQ8Fp8F32Acc}) {
     EXPECT_EQ(parse_attention(attention_name(a)), a);
   }
   EXPECT_EQ(parse_attention("q8"), AttentionMode::kQ8Fp8);
   EXPECT_THROW(parse_tier("fast"), std::invalid_argument);
+  // "auto" is no tier since 2.0: the refusal names the choices.
+  try {
+    parse_tier("auto");
+    ADD_FAILURE() << "parse_tier accepted auto";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string(e.what()).find("reference, high or turbo"), std::string::npos) << e.what();
+  }
   EXPECT_THROW(parse_attention("fp8"), std::invalid_argument);
 }
 
 TEST(Planner, ResolveTier) {
-  const auto none = [](Precision, AttentionMode) { return CertificateAnswer{false, "", "no certificate file"}; };
   const auto all = [](AttentionMode) { return true; };
   const auto no_q8 = [](AttentionMode a) { return a == AttentionMode::kExact; };
+  const auto no_fp8 = [](AttentionMode a) { return a == AttentionMode::kExact || a == AttentionMode::kQ8Fp16 ||
+                                                   a == AttentionMode::kQ8Fp16F32Acc; };  // sm_80 / sm_86
   using O = std::optional<AttentionMode>;
-  // Reference: the default bf16 bundle with tier auto, no lookup needed.
-  int asked = 0;
-  const auto counting = [&](Precision, AttentionMode) {
-    ++asked;
-    return CertificateAnswer{};
-  };
-  TierDecision d = resolve_tier(Tier::kReference, O{}, Precision::kBf16, counting, all);
-  EXPECT_EQ(d.effective, Tier::kReference);
+  // Reference: bf16 GEMMs, exact attention.
+  TierDecision d = resolve_tier(Tier::kReference, O{}, Precision::kBf16, all);
+  EXPECT_EQ(d.tier, Tier::kReference);
   EXPECT_EQ(d.attention, AttentionMode::kExact);
-  EXPECT_TRUE(d.certified);
-  EXPECT_EQ(asked, 0);
-  d = resolve_tier(Tier::kAuto, O{}, Precision::kBf16, none, all);
-  EXPECT_EQ(d.effective, Tier::kReference);
-  EXPECT_EQ(d.attention, AttentionMode::kExact);
-  EXPECT_NE(d.reason.find("no certificate file"), std::string::npos) << d.reason;
-  // Refusals.
-  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kInt8, none, all), std::invalid_argument);
-  EXPECT_THROW(resolve_tier(Tier::kReference, O{AttentionMode::kQ8Fp8}, Precision::kBf16, none, all), std::invalid_argument);
-  EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, Precision::kInt8, none, all), std::invalid_argument);
-  EXPECT_THROW(resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kBf16, none, all), std::invalid_argument);
-  EXPECT_THROW(resolve_tier(Tier::kHigh, O{AttentionMode::kQ8Fp8}, Precision::kInt8, none, no_q8), std::invalid_argument);
-  // High: INT8 + q8_fp8 by default, runs uncertified (explicit), exact when forced or without the kernel.
-  d = resolve_tier(Tier::kHigh, O{}, Precision::kInt8, none, all);
-  EXPECT_EQ(d.effective, Tier::kHigh);
+  EXPECT_EQ(d.reason, "Reference tier: bf16 GEMMs, exact attention");
+  EXPECT_EQ(resolve_tier(Tier::kReference, O{AttentionMode::kExact}, Precision::kBf16, all).tier, Tier::kReference);
+  // Refusals (capability facts, each with its reason).
+  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kInt8, all), std::invalid_argument);
+  EXPECT_THROW(resolve_tier(Tier::kReference, O{AttentionMode::kQ8Fp8}, Precision::kBf16, all), std::invalid_argument);
+  EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, Precision::kInt8, all), std::invalid_argument);
+  EXPECT_THROW(resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kBf16, all), std::invalid_argument);
+  EXPECT_THROW(resolve_tier(Tier::kHigh, O{AttentionMode::kQ8Fp8}, Precision::kInt8, no_q8), std::invalid_argument);
+  EXPECT_THROW(resolve_tier(Tier::kHigh, O{}, Precision::kBf16, no_q8), std::invalid_argument);  // no 8-bit kernel
+  // High: the loaded DiT's GEMMs + q8_fp8 by default, q8_fp16 without FP8, exact when asked for or (INT8 DiT) without
+  // any 8-bit kernel.
+  d = resolve_tier(Tier::kHigh, O{}, Precision::kInt8, all);
+  EXPECT_EQ(d.tier, Tier::kHigh);
   EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
-  EXPECT_FALSE(d.certified);
-  EXPECT_EQ(resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kInt8, none, all).attention, AttentionMode::kExact);
-  EXPECT_EQ(resolve_tier(Tier::kHigh, O{}, Precision::kInt8, none, no_q8).attention, AttentionMode::kExact);
-  EXPECT_EQ(resolve_tier(Tier::kHigh, O{}, Precision::kBf16, none, all).attention, AttentionMode::kQ8Fp8);  // bf16 + q8
-  // Auto on an INT8 DiT: the fastest certified configuration; none certified: exact attention, uncertified.
-  d = resolve_tier(Tier::kAuto, O{}, Precision::kInt8, none, all);
-  EXPECT_EQ(d.effective, Tier::kHigh);
+  EXPECT_EQ(d.reason, "High tier: INT8 ConvRot GEMMs, q8_fp8 attention");
+  EXPECT_EQ(resolve_tier(Tier::kHigh, O{}, Precision::kInt8, no_fp8).attention, AttentionMode::kQ8Fp16);
+  EXPECT_EQ(resolve_tier(Tier::kHigh, O{}, Precision::kBf16, no_fp8).attention, AttentionMode::kQ8Fp16);
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, no_fp8).attention, AttentionMode::kQ8Fp16);
+  EXPECT_EQ(resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kInt8, all).attention, AttentionMode::kExact);
+  d = resolve_tier(Tier::kHigh, O{}, Precision::kInt8, no_q8);
   EXPECT_EQ(d.attention, AttentionMode::kExact);
-  EXPECT_FALSE(d.certified);
-  const auto exact_only = [](Precision p, AttentionMode a) {
-    return CertificateAnswer{p == Precision::kInt8 && a == AttentionMode::kExact, "/c/x.mossinfer-cert.json", "mismatch"};
-  };
-  d = resolve_tier(Tier::kAuto, O{}, Precision::kInt8, exact_only, all);
-  EXPECT_EQ(d.attention, AttentionMode::kExact);
-  EXPECT_TRUE(d.certified);
-  EXPECT_EQ(d.certificate, "/c/x.mossinfer-cert.json");
-  EXPECT_NE(d.reason.find("certified: /c/x.mossinfer-cert.json"), std::string::npos) << d.reason;
-  std::vector<AttentionMode> order;
-  const auto fp16_only = [&](Precision, AttentionMode a) {
-    order.push_back(a);
-    return CertificateAnswer{a == AttentionMode::kQ8Fp16, "f", ""};
-  };
-  d = resolve_tier(Tier::kAuto, O{}, Precision::kInt8, fp16_only, all);
-  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp16);
-  EXPECT_EQ(order, (std::vector<AttentionMode>{AttentionMode::kQ8Fp8, AttentionMode::kQ8Fp16}));  // fastest first
-  // Auto on a bf16 DiT with a certified 8-bit attention: High (bf16 GEMMs + q8).
-  d = resolve_tier(Tier::kAuto, O{}, Precision::kBf16, fp16_only, all);
-  EXPECT_EQ(d.effective, Tier::kHigh);
-  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp16);
-  // Unsupported variants are never candidates.
-  order.clear();
-  d = resolve_tier(Tier::kAuto, O{}, Precision::kInt8, fp16_only, no_q8);
-  EXPECT_EQ(order, (std::vector<AttentionMode>{AttentionMode::kExact}));
-  // A quantized text encoder is a lossy dimension: never Reference; with a bf16 DiT and exact attention it is High.
-  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kBf16, none, all, true), std::invalid_argument);
-  d = resolve_tier(Tier::kAuto, O{}, Precision::kBf16, none, all, true);
-  EXPECT_EQ(d.effective, Tier::kHigh);
-  EXPECT_EQ(d.attention, AttentionMode::kExact);
-  EXPECT_FALSE(d.certified);
-  EXPECT_EQ(resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kBf16, none, all, true).effective, Tier::kHigh);
-  // Auto with a forced attention runs that configuration.
-  d = resolve_tier(Tier::kAuto, O{AttentionMode::kQ8Fp8F32Acc}, Precision::kInt8, none, all);
+  EXPECT_NE(d.reason.find("no 8-bit attention kernel"), std::string::npos) << d.reason;
+  d = resolve_tier(Tier::kHigh, O{}, Precision::kBf16, all);  // bf16 GEMMs + q8
+  EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
+  EXPECT_EQ(d.reason, "High tier: bf16 GEMMs, q8_fp8 attention");
+  // An explicit attention overrides the default; an empty `supported` runs every kernel.
+  d = resolve_tier(Tier::kHigh, O{AttentionMode::kQ8Fp8F32Acc}, Precision::kInt8, all);
   EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8F32Acc);
-  EXPECT_EQ(d.effective, Tier::kHigh);
+  EXPECT_EQ(resolve_tier(Tier::kHigh, O{}, Precision::kInt8, {}).attention, AttentionMode::kQ8Fp8);
+  // A quantized text encoder is a lossy dimension: never Reference; with a bf16 DiT and exact attention it is High.
+  EXPECT_THROW(resolve_tier(Tier::kReference, O{}, Precision::kBf16, all, true), std::invalid_argument);
+  d = resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kBf16, all, true);
+  EXPECT_EQ(d.tier, Tier::kHigh);
+  EXPECT_NE(d.reason.find("quantized text encoder"), std::string::npos) << d.reason;
 }
 
 TEST(PlannerHostMemory, ReportsPrivateMemory) {

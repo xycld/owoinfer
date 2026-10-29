@@ -56,9 +56,11 @@ mi_gen_params gen_defaults() {
   return p;
 }
 
+// The defaults plus the one field a caller must set since 2.0: the tier.
 mi_engine_params engine_defaults() {
   mi_engine_params p;
   EXPECT_EQ(mi_engine_params_init(&p, sizeof p), MI_OK);
+  p.tier = MI_TIER_REFERENCE;
   return p;
 }
 
@@ -93,7 +95,7 @@ TEST(CApi, VersionAndAbi) {
   // P6: preview, component files, LoRA, tiers and the extended samplers; a ComfyUI file as model_path is not.
   EXPECT_EQ(mi_capabilities(), MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS |
                                   MI_CAP_IMAGE_INPUT | MI_CAP_HIRES | MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL |
-                                  MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE | MI_CAP_CERTIFICATE_DIRS |
+                                  MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE |
                                   MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT);
   EXPECT_EQ(mi_capabilities() & MI_CAP_COMFYUI_MODELS, 0u);
   EXPECT_EQ(MI_CAP_PREVIEW | MI_CAP_COMFYUI_MODELS | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS, 0x3fu);
@@ -105,7 +107,8 @@ TEST(CApi, VersionAndAbi) {
   EXPECT_EQ(MI_CAP_ACCEL, 0x800u);
   EXPECT_EQ(MI_CAP_PRELOAD, 0x1000u);
   EXPECT_EQ(MI_CAP_RELEASE, 0x2000u);
-  EXPECT_EQ(MI_CAP_CERTIFICATE_DIRS, 0x4000u);
+  EXPECT_EQ(MI_CAP_CERTIFICATE_DIRS, 0x4000u);  // reserved since 2.0: never set
+  EXPECT_EQ(mi_capabilities() & MI_CAP_CERTIFICATE_DIRS, 0u);
   EXPECT_EQ(MI_CAP_TE_HOST_PIN, 0x8000u);
   EXPECT_EQ(MI_CAP_PROGRESS_FRACTION, 0x10000u);
   EXPECT_EQ(MI_CAP_INSPECT, 0x20000u);
@@ -187,7 +190,8 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_EQ(g.step_cache_threshold, 0.0);  // unset: Options::step_cache_threshold
   EXPECT_FALSE(q.accel.step_cache_threshold.has_value());
 
-  const mi_engine_params e = engine_defaults();
+  mi_engine_params e;
+  ASSERT_EQ(mi_engine_params_init(&e, sizeof e), MI_OK);
   const mi::pipeline::PipelineOptions o;
   EXPECT_EQ(e.struct_size, sizeof(mi_engine_params));
   EXPECT_EQ(e.model_path, nullptr);
@@ -208,8 +212,7 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_EQ(e.text_encoder_file, nullptr);
   EXPECT_EQ(e.vae_file, nullptr);
   EXPECT_TRUE(o.dit_file.empty() && o.text_encoder_file.empty() && o.vae_file.empty());
-  EXPECT_EQ(e.tier, MI_TIER_AUTO);
-  EXPECT_EQ(o.tier, mi::planner::Tier::kAuto);
+  EXPECT_EQ(e.tier, MI_TIER_AUTO);  // reserved since 2.0: the caller must choose (refused below)
   EXPECT_EQ(e.attention, MI_ATTENTION_DEFAULT);
   EXPECT_FALSE(o.attention.has_value());
   EXPECT_EQ(e.lora_strict, o.lora_strict ? 1 : 0);
@@ -217,9 +220,9 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_EQ(e.time_embedding_file, nullptr);
   EXPECT_TRUE(o.time_embedding_file.empty());
   EXPECT_EQ(e.distill_dir, nullptr);
-  // 1.1 fields: no extra certificate directories, the adaptive DiT load, the automatic pin policy.
+  // 2.0 fields: the reserved certificate_dirs, the adaptive DiT load, the automatic pin policy.
   EXPECT_EQ(e.certificate_dirs, nullptr);
-  EXPECT_EQ(e.certificate_dirs_count, o.certificate_dirs.size());
+  EXPECT_EQ(e.certificate_dirs_count, 0u);
   EXPECT_EQ(e.dit_direct_io, MI_DIRECT_IO_AUTO);
   EXPECT_FALSE(o.dit_load_direct_io.has_value());
   EXPECT_EQ(e.te_host_pin, MI_TE_HOST_PIN_AUTO);
@@ -249,12 +252,21 @@ TEST(CApi, DefaultsMirrorThePipeline) {
   EXPECT_EQ(r.accel.step_cache, q.accel.step_cache);
   EXPECT_EQ(r.accel.step_cache_threshold, q.accel.step_cache_threshold);  // unset <-> unset (the model's default)
   EXPECT_FALSE(r.accel.step_cache_threshold.has_value());
-  const mi::pipeline::PipelineOptions ro = mi::api::to_options(e);
+  // The default tier is refused, naming the choices; with one chosen the rest maps to the pipeline's defaults.
+  try {
+    mi::api::to_options(e);
+    ADD_FAILURE() << "MI_TIER_AUTO was accepted";
+  } catch (const std::invalid_argument& ex) {
+    EXPECT_NE(std::string(ex.what()).find("tier is required"), std::string::npos) << ex.what();
+    EXPECT_NE(std::string(ex.what()).find("reference | high | turbo"), std::string::npos) << ex.what();
+  }
+  mi_engine_params chosen = e;
+  chosen.tier = MI_TIER_REFERENCE;
+  const mi::pipeline::PipelineOptions ro = mi::api::to_options(chosen);
   EXPECT_EQ(ro.tier, o.tier);
   EXPECT_EQ(ro.attention, o.attention);
   EXPECT_EQ(ro.lora_strict, o.lora_strict);
   EXPECT_EQ(ro.block_path, o.block_path);
-  EXPECT_EQ(ro.certificate_dirs, o.certificate_dirs);
   EXPECT_EQ(ro.dit_load_direct_io, o.dit_load_direct_io);
   EXPECT_EQ(ro.te_host_pin, o.te_host_pin);
   EXPECT_EQ(ro.direct_io, o.direct_io);
@@ -315,13 +327,17 @@ TEST(CApi, EnumsMapToThePipeline) {
     EXPECT_NE(last_error().find(std::string(b.field) + ": unknown value"), std::string::npos) << last_error();
   }
 
-  // Engine enums: tier (C order AUTO first) and attention (DEFAULT = unset).
-  const mi::planner::Tier tiers[] = {mi::planner::Tier::kAuto, mi::planner::Tier::kReference, mi::planner::Tier::kHigh,
-                                     mi::planner::Tier::kTurbo};
-  for (int i = 0; i < 4; ++i) {
+  // Engine enums: tier (C order: the reserved AUTO, refused, then the tiers) and attention (DEFAULT = unset).
+  const mi::planner::Tier tiers[] = {mi::planner::Tier::kReference, mi::planner::Tier::kHigh, mi::planner::Tier::kTurbo};
+  for (int i = 1; i < 4; ++i) {
     mi_engine_params e = engine_defaults();
     e.tier = static_cast<mi_tier>(i);
-    EXPECT_EQ(mi::api::to_options(e).tier, tiers[i]) << i;
+    EXPECT_EQ(mi::api::to_options(e).tier, tiers[i - 1]) << i;
+  }
+  {
+    mi_engine_params e = engine_defaults();
+    e.tier = MI_TIER_AUTO;
+    EXPECT_THROW(mi::api::to_options(e), std::invalid_argument);
   }
   EXPECT_FALSE(mi::api::to_options(engine_defaults()).attention.has_value());
   const char* attentions[] = {"exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc"};
@@ -510,7 +526,6 @@ TEST(CApi, PathFieldsRefuseDevicePaths) {
     EXPECT_NE(last_error().find(field + ": not a regular file: " + kPipe), std::string::npos)
         << field << ": " << last_error();
   };
-  const char* certificate_dirs[] = {kPipe};
   const std::pair<const char*, std::function<void(mi_engine_params&)>> engine_fields[] = {
       {"model_path", [&](mi_engine_params& e) { e.model_path = kPipe; }},
       {"cache_dir", [&](mi_engine_params& e) { e.cache_dir = kPipe; }},
@@ -518,9 +533,7 @@ TEST(CApi, PathFieldsRefuseDevicePaths) {
       {"text_encoder_file", [&](mi_engine_params& e) { e.text_encoder_file = kPipe; }},
       {"vae_file", [&](mi_engine_params& e) { e.vae_file = kPipe; }},
       {"time_embedding_file", [&](mi_engine_params& e) { e.time_embedding_file = kPipe; }},
-      {"distill_dir", [&](mi_engine_params& e) { e.distill_dir = kPipe; }},
-      {"certificate_dirs[0]",
-       [&](mi_engine_params& e) { e.certificate_dirs = certificate_dirs, e.certificate_dirs_count = 1; }}};
+      {"distill_dir", [&](mi_engine_params& e) { e.distill_dir = kPipe; }}};
   for (const auto& [field, set] : engine_fields) {
     mi_engine_params e = engine_defaults();
     e.model_path = bundle.c_str();
@@ -587,7 +600,7 @@ TEST(CApi, ComponentFiles) {
   EXPECT_EQ(o.dit_file, dit);
   EXPECT_TRUE(o.text_encoder_file.empty());
   EXPECT_TRUE(o.vae_file.empty());
-  // Unknown tier / attention values fail mi_engine_create before CUDA.
+  // Unknown tier / attention values and the reserved MI_TIER_AUTO fail mi_engine_create before CUDA.
   e = engine_defaults();
   e.model_path = bundle.c_str();
   e.tier = MI_TIER_MAX_ENUM;
@@ -595,6 +608,11 @@ TEST(CApi, ComponentFiles) {
   EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT);
   EXPECT_NE(last_error().find("tier: unknown value"), std::string::npos) << last_error();
   e.tier = MI_TIER_AUTO;
+  EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("tier is required: choose MI_TIER_REFERENCE, MI_TIER_HIGH or MI_TIER_TURBO"),
+            std::string::npos)
+      << last_error();
+  e.tier = MI_TIER_HIGH;
   e.attention = static_cast<mi_attention>(6);
   EXPECT_EQ(mi_engine_create(&e, &engine), MI_ERR_INVALID_ARGUMENT);
   EXPECT_NE(last_error().find("attention: unknown value 6"), std::string::npos) << last_error();
@@ -614,13 +632,10 @@ TEST(CApi, GenerationFromAPipelineResult) {
   r.width = r.height = 16;
   r.rgb.assign(16 * 16 * 3, 7);
   r.seed = 42;
-  r.tier.requested = mi::planner::Tier::kAuto;
-  r.tier.effective = mi::planner::Tier::kHigh;
+  r.tier.tier = mi::planner::Tier::kHigh;
   r.tier.precision = mi::planner::Precision::kInt8;
   r.tier.attention = mi::planner::AttentionMode::kQ8Fp8;
-  r.tier.certified = true;
-  r.tier.certificate = "/models/moss_int8.mossinfer-cert.json";
-  r.tier.reason = "auto: certified q8_fp8";
+  r.tier.reason = "High tier: INT8 ConvRot GEMMs, q8_fp8 attention";
   r.gpu_arch = "sm_89";
   r.dit_source = "/models/moss_int8.safetensors";
   r.te_source = "/models/te_w4a8.safetensors";
@@ -652,14 +667,14 @@ TEST(CApi, GenerationFromAPipelineResult) {
     const mi::api::Generation g = mi::api::to_generation(q, copy, include_prompts);
     EXPECT_EQ(g.rgb.size(), 16u * 16 * 3);
     EXPECT_EQ(g.tier.struct_size, sizeof(mi_tier_info));
-    EXPECT_EQ(g.tier.requested, MI_TIER_AUTO);
+    EXPECT_EQ(g.tier.requested, MI_TIER_HIGH);
     EXPECT_EQ(g.tier.effective, MI_TIER_HIGH);
     EXPECT_EQ(g.tier.attention, MI_ATTENTION_Q8_FP8);
-    EXPECT_EQ(g.tier.certified, 1);
+    EXPECT_EQ(g.tier.certified, 0);  // reserved since 2.0
+    EXPECT_EQ(g.tier.run_certified, 0);
     EXPECT_EQ(g.tier.dit_precision, MI_PRECISION_INT8);
     EXPECT_EQ(g.tier.text_encoder_precision, MI_PRECISION_W4A8);
     EXPECT_EQ(g.tier_reason, r.tier.reason);
-    EXPECT_EQ(g.certificate, r.tier.certificate);
     EXPECT_EQ(g.gpu_arch, "sm_89");
     EXPECT_EQ(g.dit_source, r.dit_source);
     EXPECT_EQ(g.te_source, r.te_source);
@@ -724,21 +739,18 @@ TEST(CApi, GenerationFromAPipelineResult) {
   EXPECT_EQ(mi::api::to_precision(mi::planner::Precision::kInt4), MI_PRECISION_W4A4);
   EXPECT_EQ(mi::api::to_precision(mi::planner::Precision::kNvfp4), MI_PRECISION_NVFP4);
   EXPECT_EQ(mi::api::to_precision(mi::planner::Precision::kInt8), MI_PRECISION_INT8);
-  // Reference needs no certificate: certified, also in the default decision of a generation cancelled before its tier
-  // was resolved.
+  // A generation cancelled before its tier was resolved: the engine's tier (the pipeline fills it in first), exact.
   mi::pipeline::Result early;
   early.cancelled = true;
-  ASSERT_FALSE(early.tier.certified);
+  early.tier.tier = mi::planner::Tier::kTurbo;
   const mi::api::Generation e = mi::api::to_generation(q, early, true);
-  EXPECT_EQ(e.tier.requested, MI_TIER_AUTO);
-  EXPECT_EQ(e.tier.effective, MI_TIER_REFERENCE);
+  EXPECT_EQ(e.tier.requested, MI_TIER_TURBO);
+  EXPECT_EQ(e.tier.effective, MI_TIER_TURBO);
   EXPECT_EQ(e.tier.attention, MI_ATTENTION_EXACT);
-  EXPECT_EQ(e.tier.certified, 1);
+  EXPECT_EQ(e.tier.certified, 0);
+  EXPECT_EQ(e.tier.run_certified, 0);
+  EXPECT_EQ(e.tier_reason, "");
   EXPECT_TRUE(e.png_text.empty());
-  // An uncertified lossy run stays uncertified.
-  copy = r;
-  copy.tier.certified = false;
-  EXPECT_EQ(mi::api::to_generation(q, copy, true).tier.certified, 0);
 }
 
 // mi_write_png: RGB8 to an atomic PNG without metadata.
@@ -1725,7 +1737,7 @@ TEST(CApi, ImageResultFromAPipelineResult) {
   r.timings.encode_s = 0.5;
   r.timings.image_ops_s = 0.125;
   r.tier.precision = mi::planner::Precision::kInt4;
-  r.tier.effective = mi::planner::Tier::kTurbo;
+  r.tier.tier = mi::planner::Tier::kTurbo;
   const mi::api::Generation g = mi::api::to_generation(q, r, true);
   EXPECT_EQ(g.image.struct_size, sizeof(mi_image_info));
   EXPECT_EQ(g.image.mode, MI_IMAGE_MODE_INPAINT);
@@ -2081,9 +2093,10 @@ TEST(CApi, ControlAndAcceleratorResults) {
   mi_result_free(res);
 }
 
-// mi_tier_info.certified is about the tier (1 on REFERENCE, whatever else ran); run_certified is the run's, the
-// report's models.dit.certified. The 1.0.0 size (32 bytes) gets its 32 bytes.
-TEST(CApi, TierRunCertified) {
+// mi_tier_info since 2.0: the tier that ran (requested = effective), attention and precisions; certified and
+// run_certified are reserved and written as 0, and the report has no "certified". The 1.0.0 size (32 bytes) gets its
+// 32 bytes.
+TEST(CApi, TierInfoReservedFields) {
   const auto tier_of = [](const mi::pipeline::Request& q, mi::pipeline::Result r) {
     mi_result* res = mi::api::new_result(mi::api::to_generation(q, r, true));
     mi_tier_info t;
@@ -2091,54 +2104,42 @@ TEST(CApi, TierRunCertified) {
     t.struct_size = sizeof t;
     EXPECT_EQ(mi_result_tier(res, &t), MI_OK) << last_error();
     const mi::json::Value doc = mi::json::parse(mi_result_report_json(res));
-    EXPECT_EQ(doc.at("models").at("dit").at("certified").as_bool(), t.run_certified == 1);
+    EXPECT_EQ(doc.at("models").at("dit").find("certified"), nullptr);
+    EXPECT_EQ(doc.at("models").at("dit").at("tier").as_string(), mi::planner::tier_name(r.tier.tier));
+    EXPECT_STREQ(mi_result_text(res, MI_TEXT_CERTIFICATE), "");
+    EXPECT_EQ(t.certified, 0);
+    EXPECT_EQ(t.run_certified, 0);
     EXPECT_EQ(t._reserved0, 0);
     mi_result_free(res);
     return t;
   };
   mi::pipeline::Request q;
   q.prompt = "a cat";
-  // REFERENCE with a LoRA: the pipeline marks the run uncertified.
   q.loras = {{"/loras/style.safetensors", 1.0f}};
   mi::pipeline::Result r;
-  r.tier.requested = mi::planner::Tier::kAuto;
-  r.tier.effective = mi::planner::Tier::kReference;
+  r.tier.tier = mi::planner::Tier::kReference;
   r.tier.attention = mi::planner::AttentionMode::kExact;
-  r.tier.certified = false;
-  r.tier.reason = "auto: Reference; runtime LoRAs active: uncertified (certificates cover the base model only)";
+  r.tier.reason = "Reference tier: bf16 GEMMs, exact attention; runtime LoRAs active";
   mi::lora::FileReport f;
   f.file = "/loras/style.safetensors";
   r.loras = {f};
   mi_tier_info t = tier_of(q, r);
+  EXPECT_EQ(t.requested, MI_TIER_REFERENCE);
   EXPECT_EQ(t.effective, MI_TIER_REFERENCE);
-  EXPECT_EQ(t.certified, 1);
-  EXPECT_EQ(t.run_certified, 0);
-  // HIGH, certified, nothing else: both 1.
+  EXPECT_EQ(t.attention, MI_ATTENTION_EXACT);
   mi::pipeline::Request plain;
   plain.prompt = "a cat";
   mi::pipeline::Result h;
-  h.tier.effective = mi::planner::Tier::kHigh;
+  h.tier.tier = mi::planner::Tier::kHigh;
   h.tier.precision = mi::planner::Precision::kInt8;
   h.tier.attention = mi::planner::AttentionMode::kQ8Fp8;
-  h.tier.certified = true;
-  h.tier.certificate = "/models/moss_int8.mossinfer-cert.json";
   t = tier_of(plain, h);
+  EXPECT_EQ(t.requested, MI_TIER_HIGH);
   EXPECT_EQ(t.effective, MI_TIER_HIGH);
-  EXPECT_EQ(t.certified, 1);
-  EXPECT_EQ(t.run_certified, 1);
-  // REFERENCE, nothing else: both 1. HIGH uncertified (e.g. accelerators): both 0.
-  mi::pipeline::Result ref;
-  ref.tier.effective = mi::planner::Tier::kReference;
-  ref.tier.certified = true;
-  t = tier_of(plain, ref);
-  EXPECT_EQ(t.certified, 1);
-  EXPECT_EQ(t.run_certified, 1);
-  h.tier.certified = false;
-  t = tier_of(plain, h);
-  EXPECT_EQ(t.certified, 0);
-  EXPECT_EQ(t.run_certified, 0);
-  // The 1.0.0 mi_tier_info: 32 bytes written, run_certified untouched; any other size is a mismatch.
-  mi_result* res = mi::api::new_result(mi::api::to_generation(plain, ref, true));
+  EXPECT_EQ(t.attention, MI_ATTENTION_Q8_FP8);
+  EXPECT_EQ(t.dit_precision, MI_PRECISION_INT8);
+  // The 1.0.0 mi_tier_info: 32 bytes written; any other size is a mismatch.
+  mi_result* res = mi::api::new_result(mi::api::to_generation(plain, h, true));
   alignas(mi_tier_info) unsigned char buf[sizeof(mi_tier_info)];
   std::memset(buf, 0x5a, sizeof buf);
   const std::size_t old = 32;
@@ -2152,22 +2153,14 @@ TEST(CApi, TierRunCertified) {
   mi_result_free(res);
 }
 
-// The 1.1 engine fields: certificate_dirs (copied, in order), dit_direct_io and te_host_pin map to PipelineOptions;
-// bad values fail mi_engine_create() before CUDA.
+// The trailing engine fields: certificate_dirs (reserved since 2.0: ignored, never read), dit_direct_io and
+// te_host_pin map to PipelineOptions; bad values fail mi_engine_create() before CUDA.
 TEST(CApi, EngineParams110Fields) {
   mi_engine_params e = engine_defaults();
-  const std::string umlaut = "/certs/\xc3\xa4rger";  // UTF-8 "/certs/ärger"
-  const char* dirs[] = {"/certs/first", umlaut.c_str(), "relative/dir"};
-  e.certificate_dirs = dirs;
-  e.certificate_dirs_count = 3;
-  mi::pipeline::PipelineOptions o = mi::api::to_options(e);
-  ASSERT_EQ(o.certificate_dirs.size(), 3u);
-  EXPECT_EQ(mi::util::path_utf8(o.certificate_dirs[0]), "/certs/first");
-  EXPECT_EQ(mi::util::path_utf8(o.certificate_dirs[1]), umlaut);
-  EXPECT_EQ(mi::util::path_utf8(o.certificate_dirs[2]), "relative/dir");
-  e.certificate_dirs_count = 0;  // a count of 0 reads nothing
-  e.certificate_dirs = nullptr;
-  EXPECT_TRUE(mi::api::to_options(e).certificate_dirs.empty());
+  e.certificate_dirs = nullptr;  // a count without an array is not read
+  e.certificate_dirs_count = 17;
+  EXPECT_NO_THROW(mi::api::to_options(e));
+  e.certificate_dirs_count = 0;
 
   const std::pair<mi_direct_io, std::optional<bool>> io[] = {
       {MI_DIRECT_IO_AUTO, std::nullopt}, {MI_DIRECT_IO_BUFFERED, false}, {MI_DIRECT_IO_DIRECT, true}};
@@ -2193,24 +2186,12 @@ TEST(CApi, EngineParams110Fields) {
   mi::testing::TempDir dir("c_api_engine_110");
   make_fake_bundle(dir.path() / "bundle");
   const std::string bundle = mi::util::path_utf8(dir.path() / "bundle");
-  const char* with_empty[] = {"/certs/a", ""};
-  const char* with_null[] = {nullptr};
-  std::vector<std::string> many(17, "/certs/x");
-  std::vector<const char*> many_ptrs;
-  for (const std::string& s : many) many_ptrs.push_back(s.c_str());
   struct Case {
     const char* what;
     std::function<void(mi_engine_params&)> edit;
     const char* message;
   };
   const std::vector<Case> cases = {
-      {"NULL array", [](mi_engine_params& p) { p.certificate_dirs_count = 1; }, "certificate_dirs: NULL array"},
-      {"empty dir", [&](mi_engine_params& p) { p.certificate_dirs = with_empty; p.certificate_dirs_count = 2; },
-       "certificate_dirs[1] is empty"},
-      {"NULL dir", [&](mi_engine_params& p) { p.certificate_dirs = with_null; p.certificate_dirs_count = 1; },
-       "certificate_dirs[0] is empty"},
-      {"17 dirs", [&](mi_engine_params& p) { p.certificate_dirs = many_ptrs.data(); p.certificate_dirs_count = 17; },
-       "certificate_dirs: at most 16 entries (got 17)"},
       {"dit_direct_io 3", [](mi_engine_params& p) { p.dit_direct_io = static_cast<mi_direct_io>(3); },
        "dit_direct_io: unknown value 3"},
       {"dit_direct_io MAX_ENUM", [](mi_engine_params& p) { p.dit_direct_io = MI_DIRECT_IO_MAX_ENUM; },
@@ -2229,13 +2210,8 @@ TEST(CApi, EngineParams110Fields) {
     EXPECT_NE(last_error().find(c.message), std::string::npos) << c.what << ": " << last_error();
     EXPECT_EQ(engine, nullptr);
   }
-  // 16 directories are accepted.
-  e.certificate_dirs = many_ptrs.data();
-  e.certificate_dirs_count = 16;
-  EXPECT_EQ(mi::api::to_options(e).certificate_dirs.size(), 16u);
-
   // The 1.0.0 mi_engine_params (136 bytes): init fills only that prefix; create reads only the prefix, so the garbage
-  // tail (an unknown dit_direct_io, a count without an array) is never seen and the next check is reached.
+  // tail (an unknown dit_direct_io) is never seen and the next check is reached.
   constexpr std::size_t kEngine100 = 136;
   mi_engine_params old;
   std::memset(&old, 0x5a, sizeof old);
@@ -2874,20 +2850,15 @@ TEST_F(GpuCApi, SamplerPreviewMetadataAndTier) {
   tier.struct_size = sizeof tier;
   ASSERT_EQ(mi_result_tier(r, &tier), MI_OK) << last_error();
   EXPECT_EQ(tier.struct_size, sizeof tier);
-  EXPECT_EQ(tier.requested, MI_TIER_AUTO);
-  EXPECT_NE(tier.effective, MI_TIER_AUTO);
-  EXPECT_NE(tier.attention, MI_ATTENTION_DEFAULT);
+  EXPECT_EQ(tier.requested, MI_TIER_REFERENCE);
+  EXPECT_EQ(tier.effective, MI_TIER_REFERENCE);
+  EXPECT_EQ(tier.attention, MI_ATTENTION_EXACT);
   EXPECT_EQ(tier.dit_precision, MI_PRECISION_BF16);  // the bundle's DiT
   EXPECT_EQ(tier.text_encoder_precision, MI_PRECISION_BF16);
-  if (tier.effective == MI_TIER_REFERENCE) {
-    EXPECT_EQ(tier.attention, MI_ATTENTION_EXACT);
-    EXPECT_EQ(tier.certified, 1);
-    EXPECT_EQ(tier.run_certified, 1);  // no LoRA, control adapter or accelerator
-  }
-  const char* reason = mi_result_text(r, MI_TEXT_TIER_REASON);
-  ASSERT_NE(reason, nullptr);
-  std::printf("[c_api] tier auto -> effective %d, attention %d, certified %d: %s\n", tier.effective, tier.attention,
-              tier.certified, reason);
+  EXPECT_EQ(tier.certified, 0);  // reserved since 2.0
+  EXPECT_EQ(tier.run_certified, 0);
+  EXPECT_STREQ(mi_result_text(r, MI_TEXT_TIER_REASON), "Reference tier: bf16 GEMMs, exact attention");
+  EXPECT_STREQ(mi_result_text(r, MI_TEXT_CERTIFICATE), "");
   EXPECT_STRNE(mi_result_text(r, MI_TEXT_DIT_SOURCE), "");
   EXPECT_STRNE(mi_result_text(r, MI_TEXT_GPU_ARCH), "");
   EXPECT_NO_THROW(mi::json::parse(mi_result_text(r, MI_TEXT_QUALITY_JSON)));
@@ -3163,14 +3134,10 @@ TEST_F(GpuCApi, ControlAdapterDepth) {
   EXPECT_NE(std::string(mi_result_text(r, MI_TEXT_CONTROL_KINDS)).find("depth"), std::string::npos);
   EXPECT_EQ(std::string(mi_result_text(r, MI_TEXT_CONTROL_ADAPTER)), adapter);
   EXPECT_EQ(mi_result_lora_count(r), 0);  // the adapter's LoRA part is reported with the control
-  // A control adapter is a LoRA: the run is uncertified (mi_tier_info.certified describes the tier: 1 on Reference).
+  // A control adapter is a LoRA: the quality object and the tier reason say so.
   const mi::json::Value doc = mi::json::parse(mi_result_report_json(r));
-  EXPECT_FALSE(doc.at("models").at("dit").at("certified").as_bool());
-  mi_tier_info tier{};
-  tier.struct_size = sizeof tier;
-  ASSERT_EQ(mi_result_tier(r, &tier), MI_OK);
-  EXPECT_EQ(tier.run_certified, 0);
-  EXPECT_NE(std::string(mi_result_text(r, MI_TEXT_TIER_REASON)).find("uncertified"), std::string::npos);
+  EXPECT_EQ(doc.at("quality").at("config").at("lora").as_string(), "active");
+  EXPECT_NE(std::string(mi_result_text(r, MI_TEXT_TIER_REASON)).find("runtime LoRAs active"), std::string::npos);
   std::size_t bytes = 0;
   EXPECT_NE(mi_result_rgb(r, &bytes), nullptr);
   EXPECT_EQ(bytes, std::size_t{256 * 256 * 3});
@@ -3186,7 +3153,7 @@ TEST_F(GpuCApi, ControlAdapterDepth) {
   EXPECT_EQ(r, nullptr);
 }
 
-// CFG truncation and the FBCache step cache with a permissive threshold: what they skipped, and uncertified.
+// CFG truncation and the FBCache step cache with a permissive threshold: what they skipped, and said so.
 TEST_F(GpuCApi, Accelerators) {
   mi_gen_params p = small_request(6);
   p.cfg = 3.0;
@@ -3207,12 +3174,11 @@ TEST_F(GpuCApi, Accelerators) {
   EXPECT_EQ(count == 0, steps == nullptr);
   EXPECT_LE(count, static_cast<std::size_t>(a.cached_calls));
   const mi::json::Value doc = mi::json::parse(mi_result_report_json(r));
-  EXPECT_FALSE(doc.at("models").at("dit").at("certified").as_bool());
   EXPECT_TRUE(doc.at("accelerators").at("lossy").as_bool());
   mi_tier_info tier{};
   tier.struct_size = sizeof tier;
   ASSERT_EQ(mi_result_tier(r, &tier), MI_OK);
-  EXPECT_EQ(tier.run_certified, 0);
+  EXPECT_EQ(tier.effective, MI_TIER_REFERENCE);  // the tier is resolved as without them
   EXPECT_NE(std::string(mi_result_text(r, MI_TEXT_TIER_REASON)).find("lossy accelerators"), std::string::npos);
   std::string list;
   for (std::size_t i = 0; i < count; ++i) list += (i ? "," : "") + std::to_string(steps[i]);
@@ -3283,13 +3249,15 @@ TEST_F(GpuCApiModels, DistillBundle) {
   mi_result_free(r);
 }
 
-// An INT4 DiT: tier AUTO refuses it without a certificate; tier TURBO runs it, reported as W4A4.
+// An INT4 DiT: tier HIGH refuses it with the reason (mi_generate, MI_ERR_INVALID_ARGUMENT); tier TURBO runs it,
+// reported as W4A4 with the tier's default attention.
 TEST_F(GpuCApiModels, TurboInt4) {
   if (!fs::is_regular_file(int4_dit_file())) GTEST_SKIP() << "no INT4 DiT file";
   const std::string dit = mi::util::path_utf8(int4_dit_file());
   mi_engine_params e = engine_defaults();
   e.model_path = model_.c_str();
   e.dit_file = dit.c_str();
+  e.tier = MI_TIER_HIGH;
   ASSERT_EQ(mi_engine_create(&e, &engine_), MI_OK) << last_error();
   mi_gen_params p;
   ASSERT_EQ(mi_gen_params_init(&p, sizeof p), MI_OK);
@@ -3297,19 +3265,9 @@ TEST_F(GpuCApiModels, TurboInt4) {
   p.width = p.height = 256;
   p.steps = 2;
   mi_result* r = nullptr;
-  const mi_status auto_status = mi_generate(engine_, &p, &r);
-  std::printf("[c_api] INT4 + tier auto: %s: %s\n", mi_status_string(auto_status),
-              auto_status == MI_OK ? "certified" : mi_last_error_message());
-  // Refused unless a certificate covers the INT4 path (next to the DiT; the test sets no cache directory).
-  fs::path cert = int4_dit_file();
-  cert += ".mossinfer-cert.json";
-  if (!fs::exists(cert)) {
-    EXPECT_EQ(auto_status, MI_ERR_INVALID_ARGUMENT);
-    EXPECT_NE(last_error().find("choose tier turbo"), std::string::npos) << last_error();
-    EXPECT_EQ(r, nullptr);
-  }
-  mi_result_free(r);
-  r = nullptr;
+  EXPECT_EQ(mi_generate(engine_, &p, &r), MI_ERR_INVALID_ARGUMENT);
+  EXPECT_NE(last_error().find("use tier turbo"), std::string::npos) << last_error();
+  EXPECT_EQ(r, nullptr);
   mi_engine_free(engine_);
   engine_ = nullptr;
   e.tier = MI_TIER_TURBO;
@@ -3321,8 +3279,8 @@ TEST_F(GpuCApiModels, TurboInt4) {
   EXPECT_EQ(tier.requested, MI_TIER_TURBO);
   EXPECT_EQ(tier.effective, MI_TIER_TURBO);
   EXPECT_EQ(tier.dit_precision, MI_PRECISION_W4A4);
-  std::printf("[c_api] turbo: attention %d, certified %d: %s\n", tier.attention, tier.certified,
-              mi_result_text(r, MI_TEXT_TIER_REASON));
+  EXPECT_NE(tier.attention, MI_ATTENTION_EXACT);
+  std::printf("[c_api] turbo: attention %d: %s\n", tier.attention, mi_result_text(r, MI_TEXT_TIER_REASON));
   mi_result_free(r);
 }
 

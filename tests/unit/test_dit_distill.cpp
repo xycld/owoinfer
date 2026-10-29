@@ -253,7 +253,7 @@ TEST(DitDistillPipeline, GenerationsComplete) {
     check(p.generate(q), 4, "akhaliq 4-step LoRA");
   }
   {
-    // The Turbo tier: the INT4 DiT, chosen explicitly (uncertified).
+    // The Turbo tier: the INT4 DiT, chosen explicitly.
     mi::pipeline::PipelineOptions o;
     o.dit_file = int4_file();
     o.tier = mi::planner::Tier::kTurbo;
@@ -262,9 +262,8 @@ TEST(DitDistillPipeline, GenerationsComplete) {
     q.steps = 6;
     const mi::pipeline::Result r = p.generate(q);
     check(r, 6, "INT4 Turbo tier");
-    EXPECT_EQ(r.tier.effective, mi::planner::Tier::kTurbo);
+    EXPECT_EQ(r.tier.tier, mi::planner::Tier::kTurbo);
     EXPECT_EQ(r.tier.precision, mi::planner::Precision::kInt4);
-    EXPECT_FALSE(r.tier.certified);
     EXPECT_EQ(r.dit_linears, "int4_convrot256");
     // A merged (LoHa) adapter on an INT4 linear is refused before anything loads.
     const fs::path loha = fs::temp_directory_path() / ("mossinfer_test_dit_distill_loha_" + std::to_string(std::random_device{}()) +
@@ -279,9 +278,10 @@ TEST(DitDistillPipeline, GenerationsComplete) {
     EXPECT_THROW(p.generate(ql), std::invalid_argument);
     fs::remove(loha);
     EXPECT_EQ(p.generate(q).steps_run, 6);  // still usable
-    // Auto does not run it.
+    // Tier high does not run it.
     mi::pipeline::PipelineOptions a;
     a.dit_file = int4_file();
+    a.tier = mi::planner::Tier::kHigh;
     mi::pipeline::Pipeline pa(a);
     EXPECT_THROW(pa.generate(q), std::invalid_argument);
   }

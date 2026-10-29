@@ -64,7 +64,7 @@ enum class AttentionMode {
   kQ8Fp8,         //   e4m3, fp16 accumulation per tile flushed into fp32 (SageAttention2++; the High tier's default)
   kQ8Fp8F32Acc,   //   e4m3, fp32 accumulation
 };
-// "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc" (the quality certificates' tokens).
+// "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc" (the report's tokens).
 const char* attention_mode_name(AttentionMode m);
 // One of those names, or "q8" (= q8_fp8); throws std::invalid_argument otherwise.
 AttentionMode parse_attention_mode(std::string_view name);

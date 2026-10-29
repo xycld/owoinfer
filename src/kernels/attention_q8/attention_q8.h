@@ -69,7 +69,7 @@
 namespace mi::attention_q8 {
 
 // Numerics version of every variant (quantization, tiling, accumulation order): bump on any change to the output bits,
-// which retires the quality certificates measured before it (pipeline/quality_cert.h).
+// reported in the quality object's numerics (pipeline/quality_report.h).
 inline constexpr std::uint32_t kNumericsVersion = 1;
 
 enum class Variant { kInt8Fp16, kInt8Fp16F32Acc, kInt8Fp8, kInt8Fp8F32Acc };

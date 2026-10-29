@@ -84,10 +84,10 @@ enum class Precision { kBf16, kInt8, kInt4, kNvfp4 };
 // Attention kernel of the DiT blocks (moss_dit::AttentionMode, one per attention_q8 variant): exact FA2, or 8-bit
 // (SageAttention-style, lossy).
 enum class AttentionMode { kExact, kQ8Fp16, kQ8Fp16F32Acc, kQ8Fp8, kQ8Fp8F32Acc };
-// Quality tiers (plan §P6): kReference = bf16 weights, exact math; kHigh = INT8 ConvRot GEMMs and/or 8-bit attention;
-// kTurbo = INT4 ConvRot or NVFP4 GEMMs (an INT4 or NVFP4 DiT file) and 8-bit attention; kAuto = the fastest certified
-// configuration of the loaded model.
-enum class Tier { kReference, kHigh, kTurbo, kAuto };
+// Quality tiers (plan §P6), always the caller's choice: kReference = the DiT's bf16 GEMMs with exact attention; kHigh =
+// the loaded DiT's GEMMs (INT8 or bf16) with 8-bit attention; kTurbo = a 4-bit DiT (INT4 ConvRot or NVFP4) with 8-bit
+// attention.
+enum class Tier { kReference, kHigh, kTurbo };
 enum class TeResidency {
   kStreamed,      // decoder layers stream from the weight files through `buffers` device layer buffers
   kHostResident,  // decoder layers held in host private memory and streamed to the device from there
@@ -99,55 +99,40 @@ const char* residency_name(DitResidency r);
 const char* residency_name(TeResidency r);
 const char* source_name(DitSource s);
 const char* precision_name(Precision p);        // "bf16", "int8", "int4", "nvfp4"
-// "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc" (the quality certificates' tokens).
+// "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc" (the report's tokens).
 const char* attention_name(AttentionMode a);
-const char* tier_name(Tier t);                  // "reference", "high", "turbo", "auto"
-// "reference" / "high" / "turbo" / "auto"; throws std::invalid_argument otherwise.
+const char* tier_name(Tier t);                  // "reference", "high", "turbo"
+// "reference" / "high" / "turbo"; throws std::invalid_argument (naming the choices) otherwise.
 Tier parse_tier(std::string_view name);
 // An attention_name(), or "q8" (= q8_fp8); throws std::invalid_argument otherwise.
 AttentionMode parse_attention(std::string_view name);
 bool is_q8(AttentionMode a);  // an 8-bit mode
 
-// The quality tier a request runs (P4b/P6), decided before planning from what is loaded. The weights fix the GEMM
-// precision (an INT8 DiT runs INT8 GEMMs; its weights are not the reference); the tier decides the attention kernel:
+// What the caller's tier runs with what is loaded (P4b/P6), decided before planning. The weights fix the GEMM precision
+// (an INT8 DiT runs INT8 GEMMs; its weights are not the reference); the tier decides the attention kernel. An unset
+// `attention` takes the tier's default, the first of kTierAttention this device/build runs (q8_fp8, else q8_fp16: FP8
+// needs compute capability 8.9); a given `attention` overrides it. The result never depends on the request's size.
 //   reference  bf16 DiT and text encoder, exact attention. Refused for quantized weights and with an 8-bit attention.
-//   high       the lossy configuration of the loaded bf16 or INT8 DiT: its precision, 8-bit attention (q8_fp8 unless
-//              `attention` says otherwise; exact when the device lacks the 8-bit kernel and the DiT is INT8). Runs
-//              certified or not (an explicit choice). Refused for a bf16 DiT with exact attention (that is the
+//   high       the loaded bf16 or INT8 DiT's GEMMs with 8-bit attention (exact only when asked for, or for an INT8 DiT
+//              when the device/build has no 8-bit kernel). Refused for a bf16 DiT with exact attention (that is the
 //              Reference tier) and for an INT4 or NVFP4 DiT (that is the Turbo tier).
-//   turbo      an INT4 or NVFP4 DiT (refused for any other): its 4-bit GEMMs, 8-bit attention as for high. Runs
-//              certified or not (an explicit choice, reported uncertified without a certificate).
-//   auto       with `attention` given: that configuration. Otherwise each lossy configuration of the loaded DiT,
-//              fastest first (8-bit attention q8_fp8, q8_fp16, q8_fp8_f32acc, q8_fp16_f32acc, then exact for a
-//              quantized DiT), that this device runs: the first with a certificate. None: Reference for a bf16 DiT; an
-//              INT8 DiT runs INT8 GEMMs with exact attention, reported uncertified. Auto never runs an uncertified
-//              Turbo configuration: an INT4 or NVFP4 DiT without a certificate is refused (choose tier turbo
-//              explicitly; user decision D2 for NVFP4).
+//   turbo      an INT4 or NVFP4 DiT (refused for any other): its 4-bit GEMMs, attention as for high.
 // An NVFP4 DiT where its GEMMs cannot run (nvfp4_native false: no FP4 tensor cores or no sm_120a kernels in the build)
-// is refused for every tier (user decision D1).
-// `certificate` is asked for lossy configurations only (Reference needs none).
-struct CertificateAnswer {
-  bool found = false;
-  std::string file;    // where the certificate is
-  std::string reason;  // why none was found
-};
-using CertificateLookup = std::function<CertificateAnswer(Precision dit, AttentionMode attention)>;
+// is refused for every tier, and so is an 8-bit `attention` the device/build does not run.
 using AttentionSupported = std::function<bool(AttentionMode attention)>;
 struct TierDecision {
-  Tier requested = Tier::kAuto;
-  Tier effective = Tier::kReference;
+  Tier tier = Tier::kReference;
   Precision precision = Precision::kBf16;
   AttentionMode attention = AttentionMode::kExact;
-  bool certified = false;   // a certificate covers what runs (Reference: true, needs none)
-  std::string certificate;  // its file (empty for Reference and uncertified runs)
-  std::string reason;       // what was chosen and why, for the launcher and the report
+  std::string reason;  // what runs, e.g. "High tier: INT8 ConvRot GEMMs, q8_fp8 attention"
 };
-// Throws std::invalid_argument (naming the conflict) for a refused combination.
+// A tier's default attention kernels, in order of preference.
+inline constexpr AttentionMode kTierAttention[] = {AttentionMode::kQ8Fp8, AttentionMode::kQ8Fp16};
+// Throws std::invalid_argument (naming the conflict) for a refused combination. An empty `supported` runs every kernel.
 // te_quantized: the text encoder is an INT8 / W4A8 file, a lossy dimension as an INT8 DiT is (reference refused; the
 // exact-attention configuration is a High-tier one). nvfp4_native: the NVFP4 GEMMs run here (Capabilities::nvfp4_native).
-TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention, Precision dit_precision,
-                          const CertificateLookup& certificate, const AttentionSupported& supported, bool te_quantized = false,
-                          bool nvfp4_native = false);
+TierDecision resolve_tier(Tier tier, std::optional<AttentionMode> attention, Precision dit_precision,
+                          const AttentionSupported& supported, bool te_quantized = false, bool nvfp4_native = false);
 
 // Machine throughput the cost model uses. Defaults are conservative for a desktop PC; the pipeline replaces the
 // transfer rates with measured ones (pipeline.h: a probe at first use, cached on disk with the embedding cache, then

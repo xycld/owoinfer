@@ -47,6 +47,7 @@ int main(int argc, char** argv) {
 
   mi_engine_params_init(&ep, sizeof ep);
   ep.model_path = argv[1];
+  ep.tier = MI_TIER_REFERENCE; /* required: the bundle's bf16 models, exact */
   status = mi_engine_create(&ep, &engine);
   if (status != MI_OK) return fail("mi_engine_create", status);
 

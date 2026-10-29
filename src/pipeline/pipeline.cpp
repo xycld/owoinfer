@@ -37,7 +37,7 @@
 #include "models/qwen35_text/text_encoder.h"
 #include "pipeline/embedding_cache.h"
 #include "pipeline/hardware_profile.h"
-#include "pipeline/quality_cert.h"
+#include "pipeline/quality_report.h"
 #include "pipeline/report_json.h"
 #include "pipeline/rng_torch_compat.h"
 #include "planner/host_memory.h"
@@ -123,16 +123,11 @@ std::unique_ptr<Bundle> open_bundle(const std::filesystem::path& dir) {
 // mixed or bf16). `index` is what MossDit and the planner read: the bundle's index or quant->index.
 struct DitSource {
   std::filesystem::path path;  // the bundle's transformer directory or the file
-  std::filesystem::path cert_path;  // what certificates identify: the file, or the bundle's transformer directory
   const weights::ModelIndex* index = nullptr;
   std::unique_ptr<quant::QuantIndex> quant;  // single file only
   planner::Precision precision = planner::Precision::kBf16;
   std::string linears;  // moss_dit::describe_linears
   std::string remarks;  // DitFileInfo::remarks (single file only)
-  // Certificate searches per configuration and request scope, and the identity they computed (hashes are cached in
-  // <cache_dir>/file_hashes.json by quality_cert).
-  std::map<std::string, planner::CertificateAnswer> certificates;
-  std::optional<ModelIdentity> identity;
   // The weight files the DiT is read from, and whether direct I/O gains on them (weights::direct_io_support of each;
   // the first that does not decides), checked once per source.
   std::vector<std::filesystem::path> files;
@@ -238,61 +233,11 @@ std::vector<std::filesystem::path> dit_files(const weights::ModelIndex& index) {
   return out;
 }
 
-// The enums share their order (static_asserts): planner / moss_dit / quality-certificate attention modes.
+// The enums share their order (static_asserts): planner / moss_dit attention modes.
 static_assert(static_cast<int>(planner::AttentionMode::kQ8Fp8F32Acc) == static_cast<int>(moss_dit::AttentionMode::kQ8Fp8F32Acc) &&
               static_cast<int>(planner::AttentionMode::kQ8Fp16) == static_cast<int>(moss_dit::AttentionMode::kQ8Fp16) &&
-              static_cast<int>(planner::AttentionMode::kQ8Fp8) == static_cast<int>(AttentionMode::kQ8Fp8) &&
-              static_cast<int>(planner::AttentionMode::kQ8Fp16F32Acc) == static_cast<int>(AttentionMode::kQ8Fp16F32Acc) &&
-              static_cast<int>(planner::AttentionMode::kExact) == 0 && static_cast<int>(AttentionMode::kExact) == 0 &&
-              static_cast<int>(moss_dit::AttentionMode::kExact) == 0);
+              static_cast<int>(planner::AttentionMode::kExact) == 0 && static_cast<int>(moss_dit::AttentionMode::kExact) == 0);
 moss_dit::AttentionMode dit_attention(planner::AttentionMode a) { return static_cast<moss_dit::AttentionMode>(a); }
-
-// int8_units: the DiT keeps some linears INT8 ConvRot (an NVFP4 file's keep list: CertConfig::dit_int8_units).
-CertConfig cert_config(planner::Precision precision, planner::AttentionMode mode, qwen35_text::Precision te, bool lora,
-                       bool int8_units) {
-  CertConfig c;
-  c.lora = lora;  // runtime LoRAs: certificates cover the base model only, so this never matches one
-  c.dit = precision == planner::Precision::kInt8    ? DitPrecision::kInt8ConvRot
-          : precision == planner::Precision::kInt4  ? DitPrecision::kW4A4
-          : precision == planner::Precision::kNvfp4 ? DitPrecision::kNvfp4
-                                                    : DitPrecision::kBf16;
-  c.dit_int8_units = precision == planner::Precision::kNvfp4 && int8_units;
-  c.attention = static_cast<AttentionMode>(mode);
-  c.te = te == qwen35_text::Precision::kInt8   ? TePrecision::kInt8ConvRot
-         : te == qwen35_text::Precision::kW4A8 ? TePrecision::kW4A8
-                                               : TePrecision::kBf16;
-  return c;
-}
-
-// The one place certificates are searched (pipeline/quality_cert.h): the DiT as loaded (its file or the bundle's
-// transformer directory) and the separately loaded text encoder file (empty for the bundle's bf16 encoder), for
-// configuration `cfg` and the request's scope. `identity` receives the models' full identity when it was computed.
-planner::CertificateAnswer search_certificate(const std::filesystem::path& dit, const std::filesystem::path& te,
-                                              const CertConfig& cfg, const std::string& gpu_arch, const GenerationScope& scope,
-                                              const std::filesystem::path& cache_dir,
-                                              const std::vector<std::filesystem::path>& extra_dirs,
-                                              std::optional<ModelIdentity>& identity) {
-  planner::CertificateAnswer a;
-  if (const std::string why = uncertifiable_reason(cfg); !why.empty()) {
-    a.reason = why;
-    return a;
-  }
-  try {
-    std::optional<ModelIdentity> id;
-    const CertificateSearch found =
-        find_certificate(dit, te, CertificateQuery{cfg, gpu_arch, engine_numerics(cfg), scope}, cache_dir, &id, extra_dirs);
-    if (id) identity = std::move(id);
-    a.found = found.certificate.has_value();
-    a.file = a.found ? util::path_utf8(found.file) : std::string();
-    a.reason = found.reason;
-    if (!a.found) {
-      if (const std::string note = install_certificate_note(); !note.empty()) a.reason += "; " + note;
-    }
-  } catch (const std::exception& e) {
-    a.reason = e.what();
-  }
-  return a;
-}
 
 // A file's size and modification time, for keys of state built from its contents: a file replaced under the same
 // path gets another stamp (empty when it cannot be read; the load that follows reports why).
@@ -305,7 +250,7 @@ std::string file_stamp(const std::filesystem::path& p) {
   return std::to_string(size) + "@" + std::to_string(mtime.time_since_epoch().count());
 }
 
-// Bytes of a weight file, or of the *.safetensors files directly inside a directory (as quality_cert identifies them).
+// Bytes of a weight file, or of the *.safetensors files directly inside a directory.
 std::uint64_t weight_bytes(const std::filesystem::path& p) {
   std::error_code ec;
   if (std::filesystem::is_regular_file(p, ec)) return std::filesystem::file_size(p, ec);
@@ -339,7 +284,6 @@ void check_option_paths(const PipelineOptions& o) {
       {&o.vae_file, "vae_file"},
       {&o.time_embedding_file, "time_embedding_file"}};
   for (const auto& [path, what] : paths) util::check_user_path(*path, what);
-  for (const std::filesystem::path& d : o.certificate_dirs) util::check_user_path(d, "certificate_dirs");
 }
 
 void check_user_paths(const PipelineOptions& o, const Request& r) {
@@ -358,7 +302,6 @@ std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file) {
   if (!info.refusal.empty()) throw weights::UnsupportedModelError(info.refusal);
   auto d = std::make_unique<DitSource>();
   d->path = file;
-  d->cert_path = file;
   d->quant = std::move(info.quant);
   d->index = &d->quant->index;
   d->precision = info.precision;
@@ -795,7 +738,7 @@ Request request_from_parameters(const json::Value& doc) {
 GenerationMetadata generation_metadata(const Request& q, const Result& r) {
   GenerationMetadata m;
   m.engine_version = std::to_string(MI_VERSION_MAJOR) + "." + std::to_string(MI_VERSION_MINOR) + "." + std::to_string(MI_VERSION_PATCH);
-  m.tier = planner::tier_name(r.tier.effective);
+  m.tier = planner::tier_name(r.tier.tier);
   const auto name = [](const std::string& p) { return util::path_utf8(util::path_from_utf8(p).filename()); };
   m.models.push_back({"bundle", util::path_utf8(util::path_key(q.model).filename()), ""});
   if (!r.dit_source.empty()) m.models.push_back({"dit", name(r.dit_source), ""});
@@ -972,7 +915,6 @@ struct Pipeline::Impl {
       } else {
         d = std::make_unique<DitSource>();
         d->path = b.dir / "transformer";
-        d->cert_path = d->path;
         d->index = &b.index;
         d->linears = moss_dit::describe_linears(nullptr);
       }
@@ -1302,7 +1244,7 @@ struct Pipeline::Impl {
     bool changed = false;
     const std::vector<double>& steps = r.timings.step_s;
     // Compute rates are learned from the Reference numerics only: the P6 paths' speedups are cost-model constants.
-    const bool reference = r.tier.effective == planner::Tier::kReference;
+    const bool reference = r.tier.tier == planner::Tier::kReference;
     if (reference && steps.size() >= 3 && r.plan.dit.compute_s > 0) {
       std::vector<double> sorted(steps.begin() + 1, steps.end());  // the first step pays warm-up (GEMM plans)
       std::sort(sorted.begin(), sorted.end());
@@ -1636,6 +1578,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   check_user_paths(m.options, req);
   validate(req);
   Result r;
+  r.tier.tier = m.options.tier;  // what a run cancelled before the tier is resolved reports
   Timings& tm = r.timings;
   m.mem = &r.memory;
   r.memory.free_at_start = m.free_at_start;
@@ -1747,46 +1690,13 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   const bool lora_requested = !loras.empty();
   {
     // Quality tier from what is loaded, before anything heavy (its refusals throw std::invalid_argument here, ahead of
-    // the LoRA files too). Certificates (pipeline/quality_cert.h) are searched for the lossy configurations of this DiT,
-    // once per configuration and scope while the source is loaded; runtime LoRAs are never certified, so with LoRAs
-    // nothing is searched (and nothing LoRA-specific is cached).
+    // the LoRA files too). The lossy accelerators are an explicit speed opt-in: the tier is resolved without them.
     const std::filesystem::path te_file = tes.model ? tes.path : std::filesystem::path();
-    const bool int8_units = moss_dit::int8_gemm_fraction(src.quant.get()) > 0;
-    GenerationScope scope;
-    scope.pixels = std::int64_t{req.width} * req.height;
-    scope.sampler = sampler_name(req.sampler);
-    scope.steps = req.steps;
-    // Sampling settings the certificate scope cannot express yet (and runs starting from an image: img2img,
-    // inpainting, the hires fix) count as an accelerator outside it (out of scope).
-    scope.accelerators = req.scheduler != SchedulerKind::kMoss || req.flow_multiplier != 1.0 || req.eta != 1.0 ||
-                         req.s_noise != 1.0 || req.noise_source != NoiseSource::kPhilox ||
-                         req.noise_layout != NoiseLayout::kOfficial || req.init_image != nullptr || req.hires.enabled();
-    // The P6b accelerators are an explicit speed opt-in: the tier is resolved as if they were off (they never make auto
-    // pick a slower tier or refuse), and the run is marked uncertified below.
-    const auto lookup = [&](planner::Precision precision, planner::AttentionMode mode) {
-      const CertConfig cfg = cert_config(precision, mode, tes.precision, lora_requested, int8_units);
-      if (lora_requested) return planner::CertificateAnswer{false, "", uncertifiable_reason(cfg)};
-      const std::string key = std::string(planner::attention_name(mode)) + "|" + util::path_utf8(te_file) + "|" +
-                              qwen35_text::precision_name(tes.precision) + "|" + std::to_string(scope.pixels) + "|" +
-                              scope.sampler + "|" + std::to_string(scope.steps) + (scope.accelerators ? "|acc" : "");
-      auto it = src.certificates.find(key);
-      if (it == src.certificates.end()) {
-        it = src.certificates
-                 .emplace(key, search_certificate(src.cert_path, te_file, cfg, r.gpu_arch, scope, m.options.cache_dir,
-                                                  m.options.certificate_dirs, src.identity))
-                 .first;
-      }
-      return it->second;
-    };
     const auto supported = [](planner::AttentionMode mode) { return moss_dit::attention_supported(dit_attention(mode)); };
-    r.tier = planner::resolve_tier(m.options.tier, m.options.attention, src.precision, lookup, supported,
+    r.tier = planner::resolve_tier(m.options.tier, m.options.attention, src.precision, supported,
                                    tes.precision != qwen35_text::Precision::kBF16,
                                    src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available());
-    if (lora_requested) {
-      r.tier.certified = false;
-      r.tier.certificate.clear();
-      r.tier.reason += "; runtime LoRAs active: uncertified (certificates cover the base model only)";
-    }
+    if (lora_requested) r.tier.reason += "; runtime LoRAs active";
     if (req.accel.step_cache_on()) {
       // An unset threshold takes the model's default (0.02 on the base model, told apart by its DiT's input embedder:
       // dit_lineage; 0.03 otherwise); one the user set stands.
@@ -1797,28 +1707,21 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
       r.accel_warnings.push_back(std::move(w));
     }
     if (req.accel.active(req.cfg != 1.0)) {
-      // P6b: certificates are measured with accelerators off (the Reference tier's exactness does not hold either). The
-      // tier above was chosen without them; this is the run's one accelerator reason.
-      r.tier.certified = false;
-      r.tier.certificate.clear();
+      // P6b: the tier above was chosen without them (the Reference tier's exactness does not hold with them either).
       accel::Options ran = req.accel;
       if (ran.step_cache_on()) ran.step_cache_threshold = r.accel.step_cache_threshold;
-      r.tier.reason += "; lossy accelerators active (" + ran.describe(req.cfg != 1.0) + "): this run is uncertified";
+      r.tier.reason += "; lossy accelerators active (" + ran.describe(req.cfg != 1.0) + ")";
     }
-    // The report's quality object (quality_report_json): what ran, why, and the models it ran.
+    // The report's quality object (quality_report_json): what ran and the models it ran.
     QualityReport& q = r.quality;
-    q.config = cert_config(r.tier.precision, r.tier.attention, tes.precision, lora_requested, int8_units);
+    q.tier = r.tier.tier;
+    q.config = {r.tier.precision, r.tier.attention, tes.precision, lora_requested,
+                src.precision == planner::Precision::kNvfp4 && moss_dit::int8_gemm_fraction(src.quant.get()) > 0};
     q.gpu_arch = r.gpu_arch;
-    q.reason = r.tier.reason;
-    q.certificate = r.tier.certificate.empty() ? std::filesystem::path() : util::path_from_utf8(r.tier.certificate);
-    q.dit = src.cert_path;
-    q.dit_bytes = weight_bytes(src.cert_path);
+    q.dit = src.path;
+    q.dit_bytes = weight_bytes(src.path);
     q.te = te_file;
     q.te_bytes = te_file.empty() ? 0 : weight_bytes(te_file);
-    if (src.identity) {
-      q.dit_identity = src.identity->dit;
-      q.te_identity = src.identity->te;
-    }
   }
   // Runtime LoRAs: the stack is kept while its files (paths, sizes and modification times) and the DiT source stay the
   // same; a file replaced under the same path loads anew, and so do its merges and their memo. A strength change

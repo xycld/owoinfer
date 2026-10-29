@@ -13,7 +13,7 @@
 
 #include "core/cuda_check.h"
 #include "kernels/basic/gram.h"
-#include "pipeline/quality_cert.h"
+#include "pipeline/quality_report.h"
 #include "util/xxh64.h"
 
 namespace mi::pipeline {
@@ -168,7 +168,7 @@ quant::HessianSource nvfp4_hessian_source(CalibrationOptions options) {
       cap.calibration = "{\"set\": " + jstr(kNvfp4CalibrationSetId) + ", \"set_xxh64\": " + jstr(hex64(nvfp4_calibration_set_xxh64())) +
                         ", \"prompts\": [" + ids + "], \"size\": [" + std::to_string(kCalibSize) + ", " + std::to_string(kCalibSize) +
                         "], \"steps\": " + std::to_string(kCalibSteps) + ", \"capture_steps\": [" + steps_json + "], \"rows\": \"cond and uncond\"}";
-      cap.capture_class = "{\"gpu_arch\": " + jstr(gpu_arch) + ", \"te\": \"bf16\", \"numerics\": " + numerics_object(engine_numerics(CertConfig{})) +
+      cap.capture_class = "{\"gpu_arch\": " + jstr(gpu_arch) + ", \"te\": \"bf16\", \"numerics\": " + numerics_object(engine_numerics(RunConfig{})) +
                           ", \"gram\": " + std::to_string(kernels::kGramNumericsVersion) + ", \"dit_blocks\": \"bf16 op_by_op\"}";
       if (cap.calibration.size() > quant::kMaxCaptureStringBytes || cap.capture_class.size() > quant::kMaxCaptureStringBytes) {
         throw std::logic_error("calibration: capture strings longer than quant::kMaxCaptureStringBytes");
@@ -236,7 +236,7 @@ quant::HessianSource nvfp4_hessian_source(CalibrationOptions options) {
     }
 
     if (gpu_arch != "sm_120") {
-      log("note: captured on " + gpu_arch + "; certified NVFP4 conversions are captured on sm_120 (the only class that runs NVFP4)");
+      log("note: captured on " + gpu_arch + "; the published NVFP4 conversions are captured on sm_120 (the only class that runs NVFP4)");
     }
     return cap;
   };

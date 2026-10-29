@@ -441,7 +441,6 @@ TEST(GpuControlPipeline, ControlRunsAndLeavesNoState) {
     EXPECT_EQ(a.loras.size(), 0u);      // the control's LoRA part is reported with the control
     EXPECT_TRUE(a.lora_notes.empty());  // and so are its notes
     EXPECT_FALSE(a.control.lora.notes.empty());
-    EXPECT_FALSE(a.tier.certified);
 
     // Control off: restored in place.
     const pl::Result off = pipe.generate(req);

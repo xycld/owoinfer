@@ -40,8 +40,8 @@
 namespace mi::kernels::nvfp4 {
 
 // Numerics version of the NVFP4 path (activation quantizers, GEMM configurations, epilogue order): bump on any change
-// to the output bits, including a CUTLASS update, which retires the quality certificates measured before it
-// (pipeline/quality_cert.h). Version 1 is defined by the N4 kernels: the quantizers above and the epilogues with
+// to the output bits, including a CUTLASS update, reported in the quality object's numerics
+// (pipeline/quality_report.h). Version 1 is defined by the N4 kernels: the quantizers above and the epilogues with
 // explicit _rn operations (no FMA contraction), in the order documented here.
 inline constexpr std::uint32_t kNvfp4NumericsVersion = 1;
 

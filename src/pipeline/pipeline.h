@@ -21,13 +21,12 @@
 // here, each in the cuBLASLt configurations it validated (the others run op by op); otherwise op by op, and Result
 // says why.
 // P6: the DiT can come from a single file (PipelineOptions::dit_file: an INT8 ConvRot or bf16 safetensors in the
-// ComfyUI layout) while the tokenizer, configs, text encoder and VAE come from the bundle. A quality tier
-// (PipelineOptions::tier, planner::resolve_tier) decides the lossy toggles from what is loaded: an INT8 DiT runs the
+// ComfyUI layout) while the tokenizer, configs, text encoder and VAE come from the bundle. The caller's quality tier
+// (PipelineOptions::tier, planner::resolve_tier) decides the lossy toggles with what is loaded: an INT8 DiT runs the
 // High tier's INT8 GEMMs, plus 8-bit attention when the tier asks for it. Streamed INT8 blocks move about half the
 // bytes, and the plan counts the INT8 sizes. Each request takes one fused-route snapshot, sizes its arena from it and
-// runs every step under it. With every P6/P7 option off (the bundle's models, tier reference or an uncertified auto,
-// exact attention, no LoRA, the moss scheduler with euler and the official noise) the output is bit-identical to P5;
-// tier auto picks a lossy configuration only when a certificate covers it.
+// runs every step under it. With every P6/P7 option off (the bundle's models, tier reference, exact attention, no LoRA,
+// the moss scheduler with euler and the official noise) the output is bit-identical to P5.
 // P7b: img2img, inpainting and the hires fix (Request::init_image, mask, hires; pipeline_image.h for the host side):
 // the VAE encoder (flux2_vae_encoder) sits next to the decoder in the arena's persistent region and the plan counts it
 // in every phase; each encode runs on the stack with the room the resident models leave (exact tiling as needed), the
@@ -51,7 +50,7 @@
 #include "pipeline/accel/accel.h"
 #include "pipeline/pipeline_image.h"
 #include "pipeline/png_writer.h"
-#include "pipeline/quality_cert.h"
+#include "pipeline/quality_report.h"
 #include "pipeline/sampler.h"
 #include "pipeline/samplers/initial_noise.h"
 #include "tokenizer/prompt_tokens.h"
@@ -102,7 +101,7 @@ struct Request {
   bool save_metadata = true;  // front ends: write the generation settings into the PNG (png_writer.h)
   // Runtime LoRAs (models/lora), applied in order with their strengths: low-rank adapters on the block GEMMs run as
   // side branches (a strength change between requests is instant); the others are merged into the DiT at load (a
-  // strength change re-merges them from the pristine weights kept on the host). Results are uncertified.
+  // strength change re-merges them from the pristine weights kept on the host).
   std::vector<lora::LoraSpec> loras;
   // img2img (roadmap P7b, diffusers' img2img / inpainting convention). init_image (null: none): RGB (3 channels), any
   // size up to kMaxInputSide per side and kMaxInputPixels, shared (a request copy does not copy the pixels); it is
@@ -149,7 +148,7 @@ struct Request {
   // fed as its kind's control latent (clean, the same for every CFG row) on the steps i of a pass with
   // start <= i / steps < end; a kind without an image, or outside its window, gets the zero latent (no control).
   // Works with every tier, streaming, sampler, img2img / inpainting and the hires fix (the images are encoded again at
-  // the hires size). Results are uncertified, like any LoRA.
+  // the hires size).
   struct ControlImage {
     std::string kind;                    // one of the adapter's kinds (its control_channels, e.g. "color", "depth")
     std::shared_ptr<const Image> image;  // RGB, or grayscale (replicated to RGB: a depth map, near = white)
@@ -163,8 +162,7 @@ struct Request {
     bool enabled() const { return !adapter.empty(); }
   } control;
   // P6b opt-in accelerators (pipeline/accel/accel.h): CFG truncation and step caching, lossy and off by default. The
-  // tier is resolved as without them (tier auto picks what it would pick anyway); any of them active then makes the run
-  // uncertified. They apply to each sampling pass (a hires fix's too).
+  // tier is resolved as without them. They apply to each sampling pass (a hires fix's too).
   accel::Options accel;
 };
 
@@ -246,12 +244,9 @@ struct PipelineOptions {
   // whose allocation fails falls back to streaming (Result::te_note says so).
   planner::TeHostPin te_host_pin = planner::TeHostPin::kAuto;
   // Quality tier and attention kernel (planner::resolve_tier: what each tier runs and refuses; unset attention: the
-  // tier's choice). Certificates (pipeline/quality_cert.h) are looked up once per configuration while the DiT source
-  // is loaded, in certificate_files()' order: each of certificate_dirs, <cache_dir>/quality_certs, the DiT's sidecar,
-  // then the install tree's <prefix>/share/mossinfer/quality_certs.
-  planner::Tier tier = planner::Tier::kAuto;
+  // tier's default). The public interfaces (C API, CLI, moss-server) make the caller choose the tier.
+  planner::Tier tier = planner::Tier::kReference;
   std::optional<planner::AttentionMode> attention;
-  std::vector<std::filesystem::path> certificate_dirs;  // extra certificate directories, searched first, in order
 };
 
 struct Timings {
@@ -388,12 +383,11 @@ struct Result {
   // PipelineOptions::block_path (empty when it does not).
   moss_dit::BlockPath block_path = moss_dit::BlockPath::kFused;
   std::string block_path_note;
-  // P6: the tier that ran (requested and effective tier, DiT precision, attention mode, certificate, reason), the DiT's
-  // source (the bundle's transformer directory or PipelineOptions::dit_file) and its block linears
-  // (moss_dit::describe_linears).
+  // P6: the tier that ran (tier, DiT precision, attention mode, what runs), the DiT's source (the bundle's transformer
+  // directory or PipelineOptions::dit_file) and its block linears (moss_dit::describe_linears).
   planner::TierDecision tier;
-  QualityReport quality;  // the report's "quality" object (pipeline/quality_cert.h)
-  std::string gpu_arch;   // quality_cert's GPU class of the device ("sm_89")
+  QualityReport quality;  // the report's "quality" object (pipeline/quality_report.h)
+  std::string gpu_arch;   // the GPU class of the device ("sm_89")
   std::string dit_source;
   std::string dit_linears;
   std::string time_embedding;  // PipelineOptions::time_embedding_file when a replacement step embedder ran (else empty)

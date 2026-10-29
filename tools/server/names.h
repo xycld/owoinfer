@@ -68,7 +68,6 @@ inline constexpr Name<mi_block_path> kBlockPathNames[] = {
 };
 
 inline constexpr Name<mi_tier> kTierNames[] = {
-    {"auto", MI_TIER_AUTO},
     {"reference", MI_TIER_REFERENCE},
     {"high", MI_TIER_HIGH},
     {"turbo", MI_TIER_TURBO},

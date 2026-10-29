@@ -133,8 +133,8 @@ if(MOSSINFER_SHARED)
   configure_package_config_file(${CMAKE_SOURCE_DIR}/cmake/MossInferConfig.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/MossInferConfig.cmake INSTALL_DESTINATION ${MOSSINFER_INSTALL_CMAKEDIR}
     PATH_VARS CMAKE_INSTALL_BINDIR)
-  # From 1.0, releases with the same MAJOR are source and binary compatible (additions are trailing struct fields,
-  # versioned by struct_size), so any 1.x at or above the requested version satisfies a request.
+  # Releases with the same MAJOR are source and binary compatible (additions are trailing struct fields,
+  # versioned by struct_size), so any x.y at or above the requested x.z satisfies a request (2.0: not 1.x).
   write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/MossInferConfigVersion.cmake
     VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
   install(FILES ${CMAKE_CURRENT_BINARY_DIR}/MossInferConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/MossInferConfigVersion.cmake
@@ -159,42 +159,6 @@ install(FILES ${CMAKE_SOURCE_DIR}/third_party/flash-attention/LICENSE ${CMAKE_SO
 install(FILES ${CMAKE_SOURCE_DIR}/third_party/sageattention/LICENSE ${CMAKE_SOURCE_DIR}/third_party/sageattention/VENDORED.md
         DESTINATION ${MOSSINFER_INSTALL_DOCDIR}/third_party/sageattention)
 unset(_mi_file)
-
-# Quality certificates: every *.mossinfer-cert.json of the source tree's data/quality_certs/ (none yet: the directory may
-# be missing) goes to share/mossinfer/quality_certs/, the directory the engine searches last
-# (src/pipeline/quality_cert.cpp install_certificate_dir: <the libmossinfer / executable directory>/../share/mossinfer/
-# quality_certs, for a lib/, lib64/ or bin/ directory). The default component, so both the full package and the
-# system-CUDA variant (`--component Unspecified`) carry them. The files are listed when installing, so new certificates
-# need no reconfigure. MOSSINFER_QUALITY_CERTS_SOURCE in the install's environment names another source directory
-# (a packager's own certificates; tests/server/test_install_tree.py): one path, never split into a list (on Windows its
-# backslashes become slashes). Symbolic links are skipped with a warning: a package carries regular files only
-# (check_package.py fails on a link there).
-set(MOSSINFER_QUALITY_CERTS_DIR ${CMAKE_SOURCE_DIR}/data/quality_certs CACHE PATH
-    "Directory whose *.mossinfer-cert.json files are installed to share/mossinfer/quality_certs")
-install(CODE "
-  set(_mi_certs [==[${MOSSINFER_QUALITY_CERTS_DIR}]==])
-  if(DEFINED ENV{MOSSINFER_QUALITY_CERTS_SOURCE})
-    set(_mi_certs \"\$ENV{MOSSINFER_QUALITY_CERTS_SOURCE}\")
-    if(CMAKE_HOST_WIN32)
-      string(REPLACE \"\\\\\" \"/\" _mi_certs \"\${_mi_certs}\")
-    endif()
-  endif()
-  if(IS_DIRECTORY \"\${_mi_certs}\")
-    file(GLOB _mi_found LIST_DIRECTORIES false \"\${_mi_certs}/*.mossinfer-cert.json\")
-    set(_mi_cert_files \"\")
-    foreach(_mi_f IN LISTS _mi_found)
-      if(IS_SYMLINK \"\${_mi_f}\")
-        message(WARNING \"quality certificate \${_mi_f} not installed: a symbolic link (a package carries regular files)\")
-      else()
-        list(APPEND _mi_cert_files \"\${_mi_f}\")
-      endif()
-    endforeach()
-    if(_mi_cert_files)
-      list(SORT _mi_cert_files)
-      file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/share/mossinfer/quality_certs\" TYPE FILE FILES \${_mi_cert_files})
-    endif()
-  endif()
-")
 
 # Executables are defined after the fragments (moss-infer in CMakeLists.txt, moss-server in server.cmake), so their
 # install rules run at the end of the directory.

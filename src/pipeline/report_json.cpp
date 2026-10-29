@@ -11,7 +11,7 @@
 
 #include "models/moss_dit/moss_dit.h"
 #include "pipeline/pipeline.h"
-#include "pipeline/quality_cert.h"
+#include "pipeline/quality_report.h"
 #include "pipeline/sampler.h"
 #include "planner/planner.h"
 #include "util/path.h"
@@ -171,7 +171,7 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
     for (std::size_t i = 0; i < v.size(); ++i) out += (i ? ", " : "") + json_escape(v[i]);
     return out + "]";
   };
-  // P6b: the lossy accelerators that ran (an active one makes the run uncertified) and what they skipped.
+  // P6b: the lossy accelerators that ran and what they skipped.
   const accel::Stats& ac = r.accel;
   accel::Options ran = q.accel;  // the threshold that ran (an unset one: the model's default the pipeline filled in)
   if (ran.step_cache_on() && ac.step_cache_threshold > 0) ran.step_cache_threshold = ac.step_cache_threshold;
@@ -184,13 +184,11 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
   // Every call's relative change of block 0 (null where there was nothing to compare with): what the threshold saw.
   for (std::size_t i = 0; i < ac.step_cache_diffs.size(); ++i) o << (i ? ", " : "") << num(ac.step_cache_diffs[i]);
   o << "], \"warnings\": " << strings(r.accel_warnings) << "},\n";
-  // P6: the quality object in the certificates' vocabulary (pipeline/quality_cert.h: tier, config, engine numerics, GPU
-  // class, reason, certificate, models), filled by generate(), and where each model came from.
-  const planner::TierDecision& td = r.tier;
+  // P6: the quality object (pipeline/quality_report.h: tier, config, engine numerics, cuBLASLt, GPU class, models),
+  // filled by generate(), and where each model came from.
   o << " \"quality\": " << quality_report_json(r.quality) << ",\n";
   o << " \"models\": {\"dit\": {\"source\": " << json_escape(r.dit_source) << ", \"linears\": " << json_escape(r.dit_linears)
-    << ", \"tier_requested\": \"" << planner::tier_name(td.requested) << "\", \"tier_effective\": \""
-    << planner::tier_name(td.effective) << "\", \"certified\": " << tf(td.certified) << ", \"time_embedding\": "
+    << ", \"tier\": \"" << planner::tier_name(r.tier.tier) << "\", \"time_embedding\": "
     << (r.time_embedding.empty() ? std::string("null") : json_escape(r.time_embedding))
     << "}, \"text_encoder\": {\"source\": " << json_escape(r.te_source) << ", \"precision\": "
     << json_escape(r.te_precision.empty() ? "bf16" : r.te_precision) << ", \"note\": " << json_escape(r.te_note)

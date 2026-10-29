@@ -275,8 +275,9 @@ TEST(CApiInspect, Bf16Dit) {
   EXPECT_EQ(rep.info.file_bytes, fs::file_size(dir.path() / "dit.safetensors"));
   EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "bf16");
   EXPECT_EQ(rep.text(MI_FILE_TEXT_NOTE), "");
-  EXPECT_EQ(rep.info.tiers, bit(MI_TIER_AUTO) | bit(MI_TIER_REFERENCE) | bit(MI_TIER_HIGH));
-  EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("Reference"), std::string::npos) << rep.tier_reason(MI_TIER_AUTO);
+  EXPECT_EQ(rep.info.tiers, bit(MI_TIER_REFERENCE) | bit(MI_TIER_HIGH));
+  EXPECT_EQ(rep.tier_reason(MI_TIER_REFERENCE), "Reference tier: bf16 GEMMs, exact attention");
+  EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("reserved since 2.0"), std::string::npos) << rep.tier_reason(MI_TIER_AUTO);
   EXPECT_NE(rep.tier_reason(MI_TIER_HIGH).find("bf16 GEMMs, q8_fp8 attention"), std::string::npos);
   EXPECT_NE(rep.tier_reason(MI_TIER_TURBO).find("tier turbo runs an INT4 ConvRot DiT"), std::string::npos);
   EXPECT_EQ(rep.info.lora_adapters, 0);
@@ -292,10 +293,11 @@ TEST(CApiInspect, QuantizedDits) {
     EXPECT_EQ(rep.info.loadable, 1) << rep.text(MI_FILE_TEXT_NOTE);
     EXPECT_EQ(rep.info.precision, MI_PRECISION_INT8);
     EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "int8_convrot256");
-    EXPECT_EQ(rep.info.tiers, bit(MI_TIER_AUTO) | bit(MI_TIER_HIGH));
+    EXPECT_EQ(rep.info.tiers, bit(MI_TIER_HIGH));
     EXPECT_NE(rep.tier_reason(MI_TIER_REFERENCE).find("quantized"), std::string::npos)
         << rep.tier_reason(MI_TIER_REFERENCE);
-    EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("INT8 ConvRot GEMMs, exact attention, uncertified"), std::string::npos)
+    EXPECT_EQ(rep.tier_reason(MI_TIER_HIGH), "High tier: INT8 ConvRot GEMMs, q8_fp8 attention");
+    EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("reserved since 2.0"), std::string::npos)
         << rep.tier_reason(MI_TIER_AUTO);
   }
   {
@@ -304,8 +306,8 @@ TEST(CApiInspect, QuantizedDits) {
     EXPECT_EQ(rep.info.precision, MI_PRECISION_W4A4);
     EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "int4_convrot256");
     EXPECT_EQ(rep.info.tiers, bit(MI_TIER_TURBO));
-    EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("choose tier turbo"), std::string::npos)
-        << rep.tier_reason(MI_TIER_AUTO);
+    EXPECT_NE(rep.tier_reason(MI_TIER_HIGH).find("use tier turbo"), std::string::npos)
+        << rep.tier_reason(MI_TIER_HIGH);
     EXPECT_NE(rep.tier_reason(MI_TIER_TURBO).find("Turbo tier: INT4 ConvRot GEMMs"), std::string::npos);
   }
   {
@@ -439,8 +441,8 @@ TEST(CApiInspect, Nvfp4Dit) {
     EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "nvfp4");
     EXPECT_EQ(rep.info.tiers, 1u << MI_TIER_TURBO);
     EXPECT_NE(note.find("compute capability 12.0"), std::string::npos) << note;
-    EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("the loaded DiT is NVFP4 (the Turbo tier)"), std::string::npos)
-        << rep.tier_reason(MI_TIER_AUTO);
+    EXPECT_NE(rep.tier_reason(MI_TIER_TURBO).find("Turbo tier: NVFP4 GEMMs"), std::string::npos)
+        << rep.tier_reason(MI_TIER_TURBO);
   } else {
     EXPECT_NE(note.find("NVFP4"), std::string::npos) << note;
     EXPECT_NE(note.find("INT8"), std::string::npos) << note;
@@ -783,7 +785,7 @@ TEST(CApiInspect, CommunityFiles) {
   };
   const Expect files[] = {
       {"comfy-org/moss_image_sft_int8_convrot.safetensors", MI_FILE_KIND_DIT, 1, "int8_convrot256",
-       bit(MI_TIER_AUTO) | bit(MI_TIER_HIGH), MI_PRECISION_INT8},
+       bit(MI_TIER_HIGH), MI_PRECISION_INT8},
       {"toxicdog/moss_image_sft_int4_convrot.safetensors", MI_FILE_KIND_DIT, 1, "int4_convrot256", bit(MI_TIER_TURBO),
        MI_PRECISION_W4A4},
       {"tsolful/moss_image_sft_W4A8_GPTQ.safetensors", MI_FILE_KIND_DIT, 0, "", 0, MI_PRECISION_BF16},  // to quantize
@@ -810,7 +812,7 @@ TEST(CApiInspect, CommunityFiles) {
     const Report rep(c / e.file);
     EXPECT_EQ(rep.info.kind, e.kind);
     if (std::string(e.file).find("nvfp4") != std::string::npos) {
-      // With the NVFP4 kernels in the build: Turbo only (auto needs a certificate); without them: D1's refusal.
+      // With the NVFP4 kernels in the build: Turbo only; without them: D1's refusal.
       const std::string note = rep.text(MI_FILE_TEXT_NOTE);
       if (rep.info.loadable == 1) {
         EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION).rfind("mixed (", 0), 0u) << rep.text(MI_FILE_TEXT_QUANTIZATION);

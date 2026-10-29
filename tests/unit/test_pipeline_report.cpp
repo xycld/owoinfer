@@ -50,17 +50,16 @@ mi::pipeline::Result sample_result() {
   r.dit_stream.stall_s = 0.125;
   r.dit_stream.stalls = 4;
   r.dit_stream.steps = {{20.0, 0.75, 0.0625, 2}, {24.0, 1.0, 0.0, 0}};
-  r.tier.requested = mi::planner::Tier::kHigh;
-  r.tier.effective = mi::planner::Tier::kHigh;
+  r.tier.tier = mi::planner::Tier::kHigh;
   r.tier.precision = mi::planner::Precision::kInt8;
   r.tier.attention = mi::planner::AttentionMode::kQ8Fp8;
   r.tier.reason = "High tier: test";
   r.gpu_arch = "sm_89";
-  r.quality.config.dit = mi::pipeline::DitPrecision::kInt8ConvRot;
-  r.quality.config.attention = mi::pipeline::AttentionMode::kQ8Fp8;
-  r.quality.config.te = mi::pipeline::TePrecision::kW4A8;
+  r.quality.tier = mi::planner::Tier::kHigh;
+  r.quality.config.dit = mi::planner::Precision::kInt8;
+  r.quality.config.attention = mi::planner::AttentionMode::kQ8Fp8;
+  r.quality.config.te = mi::qwen35_text::Precision::kW4A8;
   r.quality.gpu_arch = "sm_89";
-  r.quality.reason = "High tier: test";
   r.quality.dit = "/m/dit.safetensors";
   r.quality.dit_bytes = 123;
   r.dit_source = "/m/dit.safetensors";
@@ -97,14 +96,14 @@ TEST(PipelineReport, FieldsAreValidJsonWithEveryKey) {
   EXPECT_EQ(doc.at("request").at("slg_layers").as_array().size(), 2u);
   EXPECT_EQ(doc.at("dit_blocks").at("path").as_string(), "op_by_op");
   EXPECT_EQ(doc.at("dit_blocks").at("note").as_string(), "fused self-check failed");
-  // P6: the quality object in the certificates' vocabulary, and the DiT's source.
+  // P6: the quality object (what ran), and the DiT's source.
   const mi::json::Value& q = doc.at("quality");
   EXPECT_EQ(q.at("tier").as_string(), "high");
   EXPECT_EQ(q.at("config").at("dit_precision").as_string(), "int8_convrot");
   EXPECT_EQ(q.at("config").at("attention").as_string(), "q8_fp8");
   EXPECT_EQ(q.at("gpu_arch").as_string(), "sm_89");
-  EXPECT_EQ(q.at("reason").as_string(), "High tier: test");
-  EXPECT_TRUE(q.at("certificate").is_null());
+  EXPECT_EQ(q.find("reason"), nullptr);
+  EXPECT_EQ(q.find("certificate"), nullptr);
   EXPECT_NE(q.at("numerics").find("elementwise"), nullptr);
   // The cuBLASLt copy the process uses, next to the numerics it is part of (images stay traceable to it).
   const mi::backend::CublasLtStatus lt = mi::backend::cublaslt_status();
@@ -120,9 +119,8 @@ TEST(PipelineReport, FieldsAreValidJsonWithEveryKey) {
   EXPECT_EQ(q.at("config").at("te_precision").as_string(), "w4a8");
   EXPECT_EQ(doc.at("models").at("dit").at("source").as_string(), "/m/dit.safetensors");
   EXPECT_EQ(doc.at("models").at("dit").at("linears").as_string(), "int8_convrot256");
-  EXPECT_EQ(doc.at("models").at("dit").at("tier_requested").as_string(), "high");
-  EXPECT_EQ(doc.at("models").at("dit").at("tier_effective").as_string(), "high");
-  EXPECT_FALSE(doc.at("models").at("dit").at("certified").as_bool());
+  EXPECT_EQ(doc.at("models").at("dit").at("tier").as_string(), "high");
+  EXPECT_EQ(doc.at("models").at("dit").find("certified"), nullptr);
   EXPECT_TRUE(doc.at("tokens").at("prompt").at("truncated").as_bool());
   EXPECT_EQ(doc.at("tokens").at("prompt").at("dropped").as_int(), 5);
   ASSERT_EQ(doc.at("loras").as_array().size(), 1u);

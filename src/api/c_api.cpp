@@ -681,7 +681,7 @@ const char* mi_last_error_message(void) {
 uint32_t mi_capabilities(void) {
   return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS | MI_CAP_IMAGE_INPUT | MI_CAP_HIRES |
          MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL | MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE |
-         MI_CAP_CERTIFICATE_DIRS | MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT;
+         MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT;  // MI_CAP_CERTIFICATE_DIRS: reserved since 2.0
 }
 
 mi_status mi_probe(mi_probe_info* info) {
@@ -995,7 +995,7 @@ const char* mi_result_text(const mi_result* result, mi_result_text_kind kind) {
   return get(result, static_cast<const char*>(nullptr), [&](const mi::api::Generation& g) -> const char* {
     switch (kind) {
       case MI_TEXT_TIER_REASON: return g.tier_reason.c_str();
-      case MI_TEXT_CERTIFICATE: return g.certificate.c_str();
+      case MI_TEXT_CERTIFICATE: return "";  // reserved since 2.0
       case MI_TEXT_GPU_ARCH: return g.gpu_arch.c_str();
       case MI_TEXT_DIT_SOURCE: return g.dit_source.c_str();
       case MI_TEXT_TEXT_ENCODER_SOURCE: return g.te_source.c_str();

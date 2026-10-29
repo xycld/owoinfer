@@ -102,11 +102,14 @@ static int png_has_text(const char* path) {
   return found;
 }
 
-/* With a bundle (argv[1]) and a PNG path (argv[2]): a generation from the 0.1-layout structs keeps the 0.1.0
- * behaviour, a PNG without metadata. Prints the skip marker without weights or a supported GPU. */
+/* With a bundle (argv[1]) and a PNG path (argv[2]): a generation from the 0.1-layout mi_gen_params keeps the 0.1.0
+ * behaviour, a PNG without metadata. The 0.1 mi_engine_params (80 bytes) has no tier field, so since 2.0 (the tier is
+ * required) it creates no engine; the engine comes from today's struct. Prints the skip marker without weights or a
+ * supported GPU. */
 static void generate_old(const char* bundle, const char* png) {
   guarded_engine e;
   guarded_gen g;
+  mi_engine_params current;
   mi_engine* engine = NULL;
   mi_result* result = NULL;
   mi_probe_info probe;
@@ -116,12 +119,21 @@ static void generate_old(const char* bundle, const char* png) {
     printf("MOSSINFER_TEST_SKIPPED: no supported CUDA device\n");
     return;
   }
-  memset(&e, 0x5a, sizeof e);
-  expect(mi_engine_params_init((mi_engine_params*)&e.p, sizeof e.p) == MI_OK, "engine init (80)");
-  e.p.model_path = bundle;
-  if (mi_engine_create((const mi_engine_params*)&e.p, &engine) != MI_OK) {
+  expect(mi_engine_params_init(&current, sizeof current) == MI_OK, "engine init (current)");
+  current.model_path = bundle;
+  current.tier = MI_TIER_REFERENCE;
+  if (mi_engine_create(&current, &engine) != MI_OK) {
     printf("MOSSINFER_TEST_SKIPPED: no MOSS-Image bundle at %s (%s)\n", bundle, mi_last_error_message());
     return;
+  }
+  {
+    mi_engine* old = NULL;
+    memset(&e, 0x5a, sizeof e);
+    expect(mi_engine_params_init((mi_engine_params*)&e.p, sizeof e.p) == MI_OK, "engine init (80)");
+    e.p.model_path = bundle;
+    expect(mi_engine_create((const mi_engine_params*)&e.p, &old) == MI_ERR_INVALID_ARGUMENT &&
+               strstr(mi_last_error_message(), "tier is required") != NULL && old == NULL,
+           "a 0.1 mi_engine_params (no tier field) is refused: the tier is required");
   }
   memset(&g, 0x5a, sizeof g);
   expect(mi_gen_params_init((mi_gen_params*)&g.p, sizeof g.p) == MI_OK, "gen init (168)");

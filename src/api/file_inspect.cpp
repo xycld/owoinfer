@@ -168,18 +168,16 @@ void inspect_dit(const weights::SafetensorsFile& header, FileInspection& r) {
   describe_dit_linears(*dit, r);
   r.info.loadable = 1;
   r.info.precision = to_precision(dit->precision);
-  const planner::CertificateLookup no_certificate = [](planner::Precision, planner::AttentionMode) {
-    return planner::CertificateAnswer{false, "", "no certificate looked up"};
-  };
-  constexpr planner::Tier kTiers[] = {planner::Tier::kAuto, planner::Tier::kReference, planner::Tier::kHigh,
-                                      planner::Tier::kTurbo};  // by mi_tier
-  for (std::size_t t = 0; t < std::size(kTiers); ++t) {
+  r.tier_reasons[MI_TIER_AUTO] = "MI_TIER_AUTO is reserved since 2.0: choose reference, high or turbo";
+  constexpr std::pair<mi_tier, planner::Tier> kTiers[] = {{MI_TIER_REFERENCE, planner::Tier::kReference},
+                                                          {MI_TIER_HIGH, planner::Tier::kHigh},
+                                                          {MI_TIER_TURBO, planner::Tier::kTurbo}};
+  for (const auto& [c, t] : kTiers) {
     try {
-      r.tier_reasons[t] =
-          planner::resolve_tier(kTiers[t], std::nullopt, dit->precision, no_certificate, {}, false, kNvfp4Kernels).reason;
-      r.info.tiers |= 1u << t;
+      r.tier_reasons[c] = planner::resolve_tier(t, std::nullopt, dit->precision, {}, false, kNvfp4Kernels).reason;
+      r.info.tiers |= 1u << c;
     } catch (const std::invalid_argument& e) {
-      r.tier_reasons[t] = e.what();
+      r.tier_reasons[c] = e.what();
     }
   }
 }
