@@ -8,7 +8,11 @@
 //                       and 4 against single images (and the other numerics), crop calls, control per run and per call,
 //                       a runtime LoRA, img2img through mi_vae_encode, foreign conditioning, ComfyUI's FLOW
 //                       convention, cancels, the ending race, device buffers after a failed step, the batch and crop
-//                       residency refusals, the VAE oracle against ComfyUI's VAE.
+//                       residency refusals, the VAE oracle against ComfyUI's VAE; GUIDED_DENOISED on moss against the
+//                       host's denoised combine, DPM2 and UniPC-style host loops, the step cache at L = 2, abandon /
+//                       cancel / failure then a new run, and planning and memory (the plan JSON in balanced and in
+//                       min_memory, arena creations and DiT loads over 512^2 / 768^2 / 512^2, the device peak, the
+//                       session's max_rows and max_latents not changing a run's plan).
 // Runs under the sanitizers: MOSS_RACE_ITERATIONS=1000 with ASan / TSan builds (EndingRaceIterations, the cancels),
 // MOSS_FREE_AFTER_FAIL=1 under compute-sanitizer memcheck (DeviceBuffersIdleAfterAFailedStep).
 // This file's host arithmetic must round every fp32 operation separately (CMakeLists.txt: strict FP sources).
@@ -22,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -30,6 +35,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2285,6 +2291,459 @@ TEST_F(GpuComponentRuns, VaeOracleAgainstComfyUi) {
   EXPECT_GT(transposed_err, 10 * encode_err);
   EXPECT_LT(mean_abs, 1.0);
   EXPECT_LE(max_abs, 16);
+}
+
+
+// ---------------------------------------------------------------- §7.2 additions
+
+// GUIDED_DENOISED on the moss scheduler: the engine's guidance in denoised space, sampled with euler's denoised form,
+// equals the host's per-op denoised combine (D = x - v sigma per row, Du + (Dc - Du) g) of the ROWS outputs, bit for
+// bit; and it is a sample of the same image as mi_generate's euler on moss (velocity form): within rounding (measured
+// on the dev box: a mean of 1.9 RGB levels).
+TEST_F(GpuComponentRuns, GuidedDenoisedOnMossEqualsTheHostsCombine) {
+  const mi_gen_params q = request();
+  const std::vector<std::uint8_t> ref = generate(engine_, q);
+  ASSERT_EQ(open_session(engine_), MI_OK) << last_error();
+  const Conds conds = encode(engine_, {q.prompt, q.negative_prompt});
+  const std::vector<mi_run_row> rows = {row(conds[0]), row(conds[1], kSkip22, 1)};
+  const Vec x0 = noise(q.seed);
+  const auto run = [&](mi_step_output output) {
+    const mi_run_params rp = run_params(rows, MI_GUIDANCE_MOSS, output, q.steps);
+    EXPECT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
+    const Vec s = run_sigmas(engine_);
+    Vec x;
+    {
+      Exchange ex(engine_, Mode::kHost);
+      const Model m = output == MI_STEP_OUTPUT_ROWS ? moss_rows(ex, false, 3.0, 0.0) : guided(ex);
+      x = sample(MI_SAMPLER_EULER, false, s.data(), s.size(), start_latents(x0, s[0]), m);
+    }
+    end_run(engine_);
+    return x;
+  };
+  const Vec engine_combine = run(MI_STEP_OUTPUT_GUIDED_DENOISED);
+  const Vec host_combine = run(MI_STEP_OUTPUT_ROWS);
+  EXPECT_EQ(differing(engine_combine, host_combine), 0u) << "GUIDED_DENOISED differs from the host's denoised combine";
+  const std::vector<std::uint8_t> rgb = decode(engine_, engine_combine);
+  ASSERT_EQ(rgb.size(), ref.size());
+  double sum = 0;
+  for (std::size_t i = 0; i < rgb.size(); ++i) sum += std::abs(static_cast<int>(rgb[i]) - static_cast<int>(ref[i]));
+  // The two forms differ by rounding only (the denoised form divides by sigma): a few levels on average.
+  EXPECT_LT(sum / static_cast<double>(rgb.size()), 4.0) << "the denoised-form sample is not mi_generate's image";
+}
+
+// Arbitrary sigma (design §7.2): a DPM2 host loop (a midpoint call per step, at exp of the log-sigmas' mean) and a
+// UniPC-style predictor-corrector of order 2 (a multistep predictor and a corrector that reuses the next call's
+// evaluation: one call per step, on the schedule) run with no error and no flag. The off-schedule calls are counted;
+// the samples are finite.
+TEST_F(GpuComponentRuns, Dpm2AndUniPcHostLoops) {
+  ASSERT_EQ(open_session(engine_), MI_OK) << last_error();
+  const mi_gen_params q = request(8);
+  const Conds conds = encode(engine_, {q.prompt, q.negative_prompt});
+  const std::vector<mi_run_row> rows = {row(conds[0]), row(conds[1], kSkip22, 1)};
+  mi_run_params rp = run_params(rows, MI_GUIDANCE_MOSS, MI_STEP_OUTPUT_GUIDED_DENOISED, q.steps);
+  rp.flags = 0;  // off-schedule calls allowed
+  const auto finite = [](const Vec& v) { return std::all_of(v.begin(), v.end(), [](float f) { return std::isfinite(f); }); };
+
+  // DPM2 (k-diffusion's sample_dpm_2 on a denoised prediction).
+  ASSERT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
+  Vec s = run_sigmas(engine_);
+  Vec x;
+  {
+    Exchange ex(engine_, Mode::kHost);
+    const Model m = guided(ex);
+    x = start_latents(noise(q.seed), s[0]);
+    Vec d1, d2, x2(x.size());
+    for (std::size_t i = 0; i + 1 < s.size(); ++i) {
+      const float si = s[i], sn = s[i + 1];
+      m(x, si, -1, d1);
+      if (sn == 0.0f) {
+        for (std::size_t k = 0; k < x.size(); ++k) x[k] = x[k] + ((x[k] - d1[k]) / si) * (sn - si);
+        continue;
+      }
+      const float mid = static_cast<float>(std::exp(0.5 * (std::log(static_cast<double>(si)) + std::log(static_cast<double>(sn)))));
+      for (std::size_t k = 0; k < x.size(); ++k) x2[k] = x[k] + ((x[k] - d1[k]) / si) * (mid - si);
+      m(x2, mid, -1, d2);
+      for (std::size_t k = 0; k < x.size(); ++k) x[k] = x[k] + ((x2[k] - d2[k]) / mid) * (sn - si);
+    }
+  }
+  mi::json::Value comp = component_of(end_run(engine_));
+  EXPECT_EQ(comp.at("calls").as_int(), 2 * q.steps - 1);
+  EXPECT_EQ(comp.at("off_schedule_calls").as_int(), q.steps - 1);  // the midpoints; the last step has none
+  EXPECT_TRUE(finite(x));
+
+  // UniPC-style, in the flow parametrization: alpha = 1 - s, lambda = log(alpha / s). Predictor: DPM-Solver++(2M)
+  // from the last two predictions; corrector: the trapezoid of this step's prediction and the next point's (the next
+  // call's evaluation, at the predicted x), applied to x before the next step. The first step (s = 1) and the last (to
+  // 0) are first order.
+  ASSERT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
+  s = run_sigmas(engine_);
+  {
+    Exchange ex(engine_, Mode::kHost);
+    const Model m = guided(ex);
+    x = start_latents(noise(q.seed), s[0]);
+    const auto lambda = [](double sig) { return std::log((1.0 - sig) / sig); };
+    Vec d, d_prev, x_prev;
+    double h_prev = 0;
+    m(x, s[0], -1, d);
+    for (std::size_t i = 0; i + 1 < s.size(); ++i) {
+      const double si = s[i], sn = s[i + 1];
+      Vec xn(x.size());
+      if (sn == 0.0) {
+        xn = d;
+      } else if (si >= 1.0) {
+        for (std::size_t k = 0; k < x.size(); ++k) xn[k] = x[k] + static_cast<float>((x[k] - d[k]) / si * (sn - si));
+      } else {
+        const double h = lambda(sn) - lambda(si);
+        const double a = sn / si, b = (1.0 - sn) * std::expm1(-h);
+        const bool second = !d_prev.empty() && h_prev > 0;  // a previous step in lambda (not the first-order s = 1 one)
+        const double r = second ? h_prev / h : 1.0;
+        for (std::size_t k = 0; k < x.size(); ++k) {
+          const double dd = second ? (1.0 + 1.0 / (2.0 * r)) * d[k] - (1.0 / (2.0 * r)) * d_prev[k] : d[k];
+          xn[k] = static_cast<float>(a * x[k] - b * dd);
+        }
+        h_prev = h;
+      }
+      d_prev = d;
+      x_prev = x;
+      if (sn == 0.0) {
+        x = xn;
+        break;
+      }
+      m(xn, s[i + 1], static_cast<int>(i + 1), d);  // the next point's evaluation, used by the corrector and the next step
+      if (si < 1.0) {
+        const double h = lambda(sn) - lambda(si);
+        const double a = sn / si, b = (1.0 - sn) * std::expm1(-h);
+        for (std::size_t k = 0; k < x.size(); ++k) {
+          xn[k] = static_cast<float>(a * x_prev[k] - b * 0.5 * (static_cast<double>(d_prev[k]) + d[k]));
+        }
+      }
+      x = xn;
+    }
+  }
+  comp = component_of(end_run(engine_));
+  EXPECT_EQ(comp.at("calls").as_int(), q.steps);
+  EXPECT_EQ(comp.at("off_schedule_calls").as_int(), 0);
+  EXPECT_TRUE(finite(x));
+}
+
+// The step cache at L = 2 (design §7.2): residuals per latent, and two rows with the same text on different latents in
+// separate slots. Two identical images in one run reuse exactly as the image alone (the same cached calls, each image
+// its single run's bits); two different images swapped between the latents swap their outputs bit for bit with the
+// same cached calls (shared slots would hand one image's residual to the other).
+TEST_F(GpuComponentRuns, StepCacheAtTwoLatents) {
+  ASSERT_EQ(open_session(engine_, 2, 2), MI_OK) << last_error();
+  const Conds conds = encode(engine_, {"a red apple on a wooden table, studio light"});
+  const Vec a = noise(7), b = noise(8);
+  const auto run = [&](const std::vector<mi_run_row>& rows, const Vec& x0, std::vector<int>& cached) {
+    mi_run_params rp = run_params(rows, MI_GUIDANCE_HOST, MI_STEP_OUTPUT_ROWS, 8);
+    rp.step_cache = MI_STEP_CACHE_FBCACHE;
+    rp.step_cache_threshold = 0.9;  // reuses whatever it may
+    EXPECT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
+    const Vec s = run_sigmas(engine_);
+    Vec x;
+    {
+      Exchange ex(engine_, Mode::kHost);
+      int step = 0;
+      const Model m = [&](const Vec& xx, float sigma, int, Vec& pred) {
+        Call c;
+        c.sigma = sigma;
+        ASSERT_EQ(ex.call(c, xx), MI_OK) << last_error();
+        if (ex.last().cached) cached.push_back(step);
+        ++step;
+        pred.clear();
+        for (int k = 0; k < ex.info().outputs; ++k) pred.insert(pred.end(), ex.out(k).begin(), ex.out(k).end());
+      };
+      x = sample(MI_SAMPLER_EULER, true, s.data(), s.size(), start_latents(x0, s[0]), m);
+    }
+    end_run(engine_);
+    return x;
+  };
+  std::vector<int> cached_single, cached_same, cached_ab, cached_ba;
+  const Vec single = run({row(conds[0])}, a, cached_single);
+  EXPECT_FALSE(cached_single.empty()) << "the threshold reused nothing: the test shows nothing";
+  const std::vector<mi_run_row> two = {row(conds[0]), row(conds[0], nullptr, 0, 1)};
+  const Vec same = run(two, concat({a, a}), cached_same);
+  EXPECT_EQ(cached_same, cached_single);
+  EXPECT_EQ(differing(slice(same, 0), single), 0u) << "latent 0 differs from the image alone";
+  EXPECT_EQ(differing(slice(same, 1), single), 0u) << "latent 1 differs from the image alone";
+  const Vec ab = run(two, concat({a, b}), cached_ab);
+  const Vec ba = run(two, concat({b, a}), cached_ba);
+  EXPECT_FALSE(cached_ab.empty());
+  EXPECT_EQ(cached_ab, cached_ba);
+  EXPECT_GT(differing(slice(ab, 0), slice(ab, 1)), 0u);
+  EXPECT_EQ(differing(slice(ab, 0), slice(ba, 1)), 0u) << "image a depends on its latent slot";
+  EXPECT_EQ(differing(slice(ab, 1), slice(ba, 0)), 0u) << "image b depends on its latent slot";
+}
+
+// Interrupts (design §7.2): a run abandoned between calls, a run whose step was cancelled mid-forward, and a run whose
+// call failed (a bad shape), each ended with mi_run_end; then a new mi_run_begin of the same request loads nothing
+// (dit_loads 0) and gives mi_generate's bits.
+TEST_F(GpuComponentRuns, AbandonCancelOrFailThenRebeginEqualsGenerate) {
+  const mi_gen_params q = request();
+  const std::vector<std::uint8_t> ref = generate(engine_, q);
+  ASSERT_EQ(open_session(engine_), MI_OK) << last_error();
+  const Conds conds = encode(engine_, {q.prompt, q.negative_prompt});
+  const std::vector<mi_run_row> rows = {row(conds[0]), row(conds[1], kSkip22, 1)};
+  const mi_run_params rp = run_params(rows, MI_GUIDANCE_MOSS, MI_STEP_OUTPUT_GUIDED_VELOCITY, q.steps);
+  const Vec x0 = noise(q.seed);
+  for (const char* how : {"abandoned", "cancelled", "failed"}) {
+    SCOPED_TRACE(how);
+    ASSERT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
+    {
+      const Vec s = run_sigmas(engine_);
+      Exchange ex(engine_, Mode::kHost);
+      Vec x = start_latents(x0, s[0]), pred;
+      const Model m = guided(ex);
+      for (int i = 0; i < 2; ++i) {  // two steps, then the interruption
+        m(x, s[static_cast<std::size_t>(i)], -1, pred);
+        const float h = static_cast<float>(static_cast<double>(s[static_cast<std::size_t>(i) + 1]) -
+                                           static_cast<double>(s[static_cast<std::size_t>(i)]));
+        for (std::size_t k = 0; k < x.size(); ++k) x[k] = x[k] + h * pred[k];
+      }
+      Call c;
+      c.sigma = s[2];
+      if (std::string(how) == "cancelled") {
+        // A canceller repeats mi_cancel until the step it races returns cancelled (a cancel between calls is a no-op).
+        std::atomic<bool> stop{false};
+        std::thread canceller([&] {
+          while (!stop.load()) {
+            mi_cancel(engine_);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+          }
+        });
+        mi_status st = MI_OK;
+        for (int attempt = 0; attempt < 100 && st != MI_CANCELLED; ++attempt) st = ex.call(c, x);
+        stop.store(true);
+        canceller.join();
+        EXPECT_EQ(st, MI_CANCELLED);
+      } else if (std::string(how) == "failed") {
+        mi_tensor xv{}, ov[MI_MAX_ROWS]{};
+        ASSERT_EQ(mi_run_staging(engine_, &xv, ov, MI_MAX_ROWS, nullptr), MI_OK);
+        mi_step_params st;
+        ASSERT_EQ(mi_step_params_init(&st, sizeof st), MI_OK);
+        st.sigma = s[2];
+        st.x = xv;
+        st.x.shape[2] = kLat + 1;  // wider than the run
+        st.out[0] = ov[0];
+        EXPECT_EQ(mi_denoise_step(engine_, &st, nullptr), MI_ERR_INVALID_ARGUMENT);
+      }
+    }
+    end_run(engine_);
+    ASSERT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
+    const Vec s = run_sigmas(engine_);
+    Vec x;
+    {
+      Exchange ex(engine_, Mode::kHost);
+      x = sample(MI_SAMPLER_EULER, true, s.data(), s.size(), start_latents(x0, s[0]), guided(ex));
+    }
+    mi_result* r = nullptr;
+    end_run(engine_, &r);
+    mi_memory_stats mem{};
+    mem.struct_size = sizeof mem;
+    ASSERT_EQ(mi_result_memory(r, &mem), MI_OK);
+    mi_result_free(r);
+    EXPECT_EQ(mem.dit_loads, 0);
+    EXPECT_EQ(differing(decode(engine_, x), ref), 0u) << "RGB bytes differ from mi_generate's after the interruption";
+  }
+}
+
+// ---------------------------------------------------------------- planning and memory
+
+// The plan JSON of a report without live machine state, which moves between any two calls.
+std::string plan_facts(const std::string& report) {
+  const std::string key = "\n \"plan\": ";
+  const std::size_t at = report.find(key);
+  if (at == std::string::npos) return "no plan";
+  const std::size_t from = at + key.size();
+  std::string j = report.substr(from, report.find('\n', from) - from);
+  j = std::regex_replace(j, std::regex("(free|host private|Arena cap) [0-9.]+ GiB"), "$1 X GiB");
+  return std::regex_replace(j, std::regex("\"(host_private_bytes|arena_cap_bytes|host_limit_bytes)\": ?[0-9]+"),
+                            "\"$1\": X");
+}
+
+// The plan's decisions: its JSON without the time estimates and the explanation, which follow the transfer rates the
+// engine learns from every job (a streamed plan's copy time moves between two calls).
+void dump_decisions(const mi::json::Value& v, std::string& out) {
+  if (v.is_object()) {
+    out += "{";
+    for (const auto& [k, m] : v.as_object()) {
+      if (k == "time_s" || k == "explanation" || k == "transfer_s_per_step" || k == "compute_s_per_step" ||
+          k == "expected_hidden" || k == "arena_cap_bytes" || k == "host_private_bytes" || k == "host_limit_bytes") {
+        continue;
+      }
+      out += k + ":";
+      dump_decisions(m, out);
+      out += ",";
+    }
+    out += "}";
+  } else if (v.is_array()) {
+    out += "[";
+    for (const mi::json::Value& e : v.as_array()) {
+      dump_decisions(e, out);
+      out += ",";
+    }
+    out += "]";
+  } else if (v.is_string()) {
+    out += "\"" + v.as_string() + "\"";
+  } else if (v.is_bool()) {
+    out += v.as_bool() ? "true" : "false";
+  } else if (v.is_null()) {
+    out += "null";
+  } else {
+    out += std::to_string(v.as_double());
+  }
+}
+
+std::string plan_decisions(const std::string& report) {
+  std::string out;
+  dump_decisions(mi::json::parse(report).at("plan"), out);
+  return out;
+}
+
+struct Facts {
+  std::string plan, decisions;
+  std::int64_t arena_creations = -1, dit_loads = -1;
+  std::uint64_t arena_bytes = 0, device_peak = 0;
+};
+
+Facts facts_of(mi_result* r) {
+  Facts f;
+  const std::string report = r != nullptr ? mi_result_report_json(r) : "";
+  f.plan = plan_facts(report);
+  if (r == nullptr) return f;
+  f.decisions = plan_decisions(report);
+  const mi::json::Value mem = mi::json::parse(report).at("memory_gib");
+  f.arena_creations = mem.at("arena_creations").as_int();
+  mi_memory_stats m{};
+  m.struct_size = sizeof m;
+  EXPECT_EQ(mi_result_memory(r, &m), MI_OK);
+  f.dit_loads = m.dit_loads;
+  f.arena_bytes = m.arena_capacity_bytes;
+  f.device_peak = m.device_peak_bytes;
+  mi_result_free(r);
+  return f;
+}
+
+Facts generate_facts(mi_engine* e, const mi_gen_params& q) {
+  mi_result* r = nullptr;
+  EXPECT_EQ(mi_generate(e, &q, &r), MI_OK) << last_error();
+  return facts_of(r);
+}
+
+// The MOSS run equivalent to `q` (the request's size and steps), sampled in host staging; its result's facts.
+Facts run_facts(mi_engine* e, const mi_gen_params& q) {
+  const Conds conds = encode(e, {q.prompt, q.negative_prompt});
+  const std::vector<mi_run_row> rows = {row(conds[0]), row(conds[1], kSkip22, 1)};
+  mi_run_params rp = run_params(rows, MI_GUIDANCE_MOSS, MI_STEP_OUTPUT_GUIDED_VELOCITY, q.steps);
+  rp.width = q.width;
+  rp.height = q.height;
+  EXPECT_EQ(mi_run_begin(e, &rp), MI_OK) << last_error();
+  const Vec s = run_sigmas(e);
+  {
+    Exchange ex(e, Mode::kHost);
+    sample(MI_SAMPLER_EULER, true, s.data(), s.size(),
+           start_latents(noise(q.seed, q.width, q.height), s[0]), guided(ex));
+  }
+  mi_result* r = nullptr;
+  end_run(e, &r);
+  return facts_of(r);
+}
+
+mi_status open_planned(mi_engine* e, const mi_gen_params* plan, int max_rows = 3, int max_latents = 1) {
+  mi_session_params sp;
+  EXPECT_EQ(mi_session_params_init(&sp, sizeof sp), MI_OK);
+  sp.plan_request = plan;
+  sp.max_rows = max_rows;
+  sp.max_latents = max_latents;
+  return mi_session_open(e, &sp);
+}
+
+// With max_rows = 8 and max_latents = 4 at the session, a 2-row run plans exactly as with max_rows = 2: the same plan
+// JSON and arena (the session's bounds size only the pinned staging, which follows each run's own rows).
+TEST_F(GpuComponentRuns, SessionBoundsDoNotChangeTheRunsPlan) {
+  const mi_gen_params q = request();
+  generate_facts(engine_, q);  // the held state both sessions plan against
+  ASSERT_EQ(open_planned(engine_, &q, 8, 4), MI_OK) << last_error();
+  const Facts wide = run_facts(engine_, q);
+  ASSERT_EQ(mi_session_close(engine_), MI_OK);
+  ASSERT_EQ(open_planned(engine_, &q, 2, 1), MI_OK) << last_error();
+  const Facts narrow = run_facts(engine_, q);
+  EXPECT_EQ(wide.plan, narrow.plan);
+  EXPECT_EQ(wide.arena_bytes, narrow.arena_bytes);
+  EXPECT_NE(wide.plan, "no plan");
+}
+
+// Planning and memory against mi_generate on fresh engines (design §7.2): over three images at 512^2, 768^2, 512^2,
+// each run's arena creations and DiT loads equal mi_generate's for the same image, its plan JSON too, and its device
+// peak is at most mi_generate's (host staging: no device buffers of the host's; 64 MiB of slack for the free-memory
+// measurement), with plan_request = the first image's request; with plan_request at the default 1024^2, at most one
+// extra arena creation before the first run (the arena, and so the peak, then follows the 1024^2 plan). The first image is compared for its DiT loads and peak only: its arena was created by
+// mi_encode_text, and mi_generate's first plan runs the text encoder where the run plans an embedding-cache hit. Then
+// min_memory with a small budget (the DiT streamed): the run's plan decisions equal mi_generate's (the plan JSON
+// without the time estimates, which follow the transfer rates learned from every job).
+TEST_F(GpuComponentRuns, PlanningAndMemoryEqualGenerate) {
+  release_shared();
+  const int sizes[] = {512, 768, 512};
+  const auto request_at = [](int size) {
+    mi_gen_params q = request(4);
+    q.width = q.height = size;
+    return q;
+  };
+  std::vector<Facts> gen;
+  {
+    mi_engine* e = create(kInt8, MI_TIER_HIGH, MI_ATTENTION_Q8_FP8);
+    ASSERT_NE(e, nullptr);
+    for (const int size : sizes) gen.push_back(generate_facts(e, request_at(size)));
+    mi_engine_free(e);
+  }
+  const mi_gen_params first = request_at(sizes[0]);
+  for (const bool matched : {true, false}) {
+    SCOPED_TRACE(matched ? "plan_request = the first image" : "plan_request = the defaults (1024^2)");
+    mi_engine* e = create(kInt8, MI_TIER_HIGH, MI_ATTENTION_Q8_FP8);
+    ASSERT_NE(e, nullptr);
+    ASSERT_EQ(open_planned(e, matched ? &first : nullptr), MI_OK) << last_error();
+    std::int64_t gen_creations = 0, run_creations = 0;
+    for (std::size_t i = 0; i < 3; ++i) {
+      SCOPED_TRACE("image " + std::to_string(i) + " at " + std::to_string(sizes[i]));
+      const Facts run = run_facts(e, request_at(sizes[i]));
+      gen_creations += gen[i].arena_creations;
+      run_creations += run.arena_creations;
+      std::printf("[plan] %s, image %zu at %d: arena creations %lld / %lld, DiT loads %lld / %lld, device peak %.3f / "
+                  "%.3f GiB (run / generate)\n", matched ? "matched" : "default plan_request", i, sizes[i],
+                  static_cast<long long>(run.arena_creations), static_cast<long long>(gen[i].arena_creations),
+                  static_cast<long long>(run.dit_loads), static_cast<long long>(gen[i].dit_loads),
+                  static_cast<double>(run.device_peak) / (1 << 30), static_cast<double>(gen[i].device_peak) / (1 << 30));
+      EXPECT_EQ(run.dit_loads, gen[i].dit_loads);
+      if (matched && i > 0) {
+        // The first image's arena was created by mi_encode_text (outside the run's result), and mi_generate's first
+        // plan runs the text encoder where the run's plans an embedding-cache hit: from the second image on, both
+        // plan against the same held state.
+        EXPECT_EQ(run.arena_creations, gen[i].arena_creations);
+        EXPECT_EQ(run.plan, gen[i].plan);
+      }
+      if (matched) {
+        // The session's arena follows plan_request until a run reshapes it: with the 1024^2 default it is larger than
+        // a 512^2 generate's.
+        EXPECT_LE(run.device_peak, gen[i].device_peak + (std::uint64_t{64} << 20));
+      }
+    }
+    EXPECT_LE(run_creations, gen_creations + (matched ? 0 : 1));
+    EXPECT_EQ(mi_session_close(e), MI_OK);
+    mi_engine_free(e);
+  }
+
+  mi_engine* e = create(kInt8, MI_TIER_HIGH, MI_ATTENTION_Q8_FP8, std::uint64_t{6} << 30, MI_BLOCK_PATH_DEFAULT,
+                        MI_MODE_MIN_MEMORY);
+  ASSERT_NE(e, nullptr);
+  const mi_gen_params q = request(4);
+  generate_facts(e, q);  // loads, fills the embedding cache: the held state both plan against
+  const Facts g = generate_facts(e, q);
+  EXPECT_NE(g.plan.find("\"streamed\""), std::string::npos) << g.plan;
+  ASSERT_EQ(open_planned(e, &q), MI_OK) << last_error();
+  const Facts r = run_facts(e, q);
+  EXPECT_EQ(r.decisions, g.decisions);
+  EXPECT_EQ(mi_session_close(e), MI_OK);
+  mi_engine_free(e);
 }
 
 }  // namespace
