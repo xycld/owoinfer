@@ -859,7 +859,7 @@ class CpuProtocolTest(ProtocolTestBase):
             self.assertEqual((answers[i]["result"]["kind"], answers[i]["result"]["loadable"]), ("dit", True))
         for i in set(ids) - set(done):
             self.assertError(answers[i], "busy", i)
-            self.assertIn("inspects or checks are running", answers[i]["error"]["message"])
+            self.assertIn("inspects are running", answers[i]["error"]["message"])
         self.assertEqual(s.proc.wait(timeout=TIMEOUT), 0)
 
     def test_inspect_slot_free_once_answered(self):
@@ -1243,6 +1243,21 @@ class GpuProtocolTest(ProtocolTestBase):
         done = self.wait_done(gid, events)
         self.assertEqual(done["status"], "error", done)
         self.assertEqual(r["error"], done["error"])
+        # While a job runs: a check runs beside it, except one whose images exceed 16 MP (a 5000x5000 PNG header).
+        self.assertIn("result", self.server.call("load", {"model": base, "tier": "reference"}))
+        big = os.path.join(self.tmp, "big.png")
+        with open(big, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + struct.pack(">I4sII", 13, b"IHDR", 5000, 5000) + b"\x08\x02\x00\x00\x00")
+        gid = self.server.send("generate", dict(request, steps=8, output=out), id="g")
+        self.server.response(gid, events=events)
+        running = self.server.call("status")["result"]["state"] == "generating"  # it loads the DiT first: seconds
+        busy = self.server.call("check", {"load": {"model": base, "tier": "reference"},
+                                          "generate": dict(request, init_image=big)}, id="c1")
+        if running:
+            self.assertError(busy, "busy", "c1")
+        r = self.server.call("check", {"load": {"model": base, "tier": "reference"}, "generate": request}, id="c2")
+        self.assertEqual((r["result"]["ok"], r["result"]["planned"]), (True, True), r)
+        self.assertEqual(self.wait_done(gid, events)["status"], "ok")
 
     def test_tier_high_runs_8bit_attention(self):
         """The tier is the caller's: high on the bf16 bundle runs its bf16 GEMMs with the tier's default 8-bit attention

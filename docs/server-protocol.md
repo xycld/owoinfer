@@ -179,6 +179,8 @@ Creates the engine. A loaded engine is released first, because two engines would
 
 `te_host_pin` takes the pipeline's spellings (`te_host_pin_name()`); `dit_direct_io` has the server's own.
 
+Since 2.x, `load` checks its parameters before it looks at the server's state: a malformed `load` is `invalid_params` even while a job runs (it was `busy` before).
+
 ### `generate`
 
 Starts one generation and **answers at once** with `{"accepted": true}`. Progress then arrives as events. The outcome, including the image path and the report, arrives in the `done` event with the same `id`. Only one generation runs at a time; another `generate` meanwhile gets `busy`.
@@ -419,7 +421,7 @@ The result depends only on the file's content and the engine's version and build
 
 ### `check`
 
-Params: `load` (object: `load`'s params) and `generate` (object: `generate`'s params, `output` optional), both required. A dry run of that `load` and then that `generate` (`mi_check()`, [c-api.md](c-api.md#check)): the same checks, model headers, tier, LoRA placement, image inputs and plan within the budgets, without loading weights or writing anything (no GGUF conversion, cache folder or hardware profile). It touches no engine of the server's: it works in every state, plans as a new engine against the device's free memory now (memory a loaded engine holds counts as used: `unload` or `release` first for the replacing engine's view), and runs on a thread of its own like `inspect` (they share the two slots; match the response by `id`).
+Params: `load` (object: `load`'s params) and `generate` (object: `generate`'s params, `output` optional), both required. A dry run of that `load` and then that `generate` (`mi_check()`, [c-api.md](c-api.md#check)): the same checks, model headers, tier, LoRA placement, image inputs and plan within the budgets, without loading weights or writing anything (no GGUF conversion, cache folder or hardware profile). It touches no engine of the server's: it works in every state, plans as a new engine against the device's free memory now (memory a loaded engine holds counts as used: `unload` or `release` first for the replacing engine's view), and runs on a thread of its own like `inspect`, in a slot of its own: one check at a time (match the response by `id`). While a job runs, a check whose images (`init_image`, `mask`, `control` and `references` paths, by their PNG / JPEG headers) exceed 16 MP in all is answered `busy`: their decode would compete with the job.
 
 ```
 >> {"id": 7, "method": "check", "params": {"load": {"model": "/models/MOSS-Image/sft", "tier": "high",
@@ -432,7 +434,7 @@ Params: `load` (object: `load`'s params) and `generate` (object: `generate`'s pa
     "notes": [], "gguf_convert_seconds": 0}}
 ```
 
-A refusal is a result: `ok` false, `refused_by` `"load"` or `"generate"`, and `error` the `{code, message}` that request (or its `done` event) would carry, the first one in the order the requests run. `warnings` are what `done.warnings` would say about LoRAs, control, references and accelerators; `notes` what the check could not know as the real run does (no stored hardware profile: default rates; the fused self-check not run yet; the embedding cache's folder not read) and a GGUF `dit_file` not converted yet (then `ok` true, `planned` false, `plan` null and `gguf_convert_seconds` its estimate: the first `generate` or `preload` converts it, and the rest is checked after that). Errors: `invalid_params` for a missing `load` or `generate` or an unknown param; `busy` beyond two running inspects or checks.
+A refusal is a result: `ok` false, `refused_by` `"load"` or `"generate"`, and `error` the `{code, message}` that request (or its `done` event) would carry, the first one in the order the requests run. `warnings` are what `done.warnings` would say about LoRAs, control, references and accelerators; `notes` what the check could not know as the real run does (no stored hardware profile: default rates; the fused self-check not run yet; the embedding cache's folder not read) and a GGUF `dit_file` not converted yet (then `ok` true, `planned` false, `plan` null and `gguf_convert_seconds` its estimate: everything that does not size the DiT is checked, the conversion's own refusals included; the plan follows the first `generate` or `preload`, which converts it). Notes come with refusals too. Errors: `invalid_params` for a missing `load` or `generate` or an unknown param; `busy` while another check runs, or for the images above.
 
 ### `unload`
 

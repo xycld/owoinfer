@@ -1,6 +1,7 @@
 #include "pipeline/gguf_dit.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <map>
@@ -19,6 +20,12 @@
 #include "weights/quant/quant_convert.h"
 #include "weights/safetensors.h"
 #include "weights/supported_model.h"
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace mi::pipeline {
 
@@ -196,7 +203,7 @@ void require_cache_dir(const quant::QuantSpec& target, const fs::path& cache_dir
 struct CacheEntry {
   Identity id;
   std::string key, source, name;
-  fs::path dir, out;
+  fs::path dir, out, lock;
 };
 CacheEntry cache_entry(const fs::path& file, const quant::QuantSpec& target, const fs::path& cache_dir) {
   const std::string target_name = quant::describe(target);
@@ -216,7 +223,23 @@ CacheEntry cache_entry(const fs::path& file, const quant::QuantSpec& target, con
   c.dir = cache_dir / "gguf";
   c.name = safe_stem(file) + "." + target_name + "." + c.key + std::string(kExtension);
   c.out = c.dir / util::path_from_utf8(c.name);
+  c.lock = c.dir / util::path_from_utf8(c.name + ".lock");
   return c;
+}
+
+// The process may create entries in (a directory) or open for writing (a file) `p` (plan-only checks: nothing is
+// created; the real calls find out by trying).
+bool writable(const fs::path& p) {
+#ifdef _WIN32
+  return _waccess(p.c_str(), 2) == 0;
+#else
+  return ::access(p.c_str(), W_OK | (util::file_info(p).directory() ? X_OK : 0)) == 0;
+#endif
+}
+
+// gguf_converted_file's shared lock can be taken: its lock file exists writable, or its folder can take a new file.
+bool lock_creatable(const CacheEntry& c) {
+  return util::file_info(c.lock).exists() ? writable(c.lock) : writable(c.dir);
 }
 
 std::uint64_t converted_bytes(const quant::QuantModel& model, const quant::QuantSpec& target) {
@@ -230,15 +253,51 @@ std::uint64_t converted_bytes(const quant::QuantModel& model, const quant::Quant
 
 }  // namespace
 
-std::optional<fs::path> gguf_cached_file(const fs::path& file, const quant::QuantSpec& target, const fs::path& cache_dir) {
-  require_cache_dir(target, cache_dir);
-  const CacheEntry c = cache_entry(file, target, cache_dir);
-  if (util::file_info(c.out).regular() && cache_metadata(c.out, "mossinfer_gguf_key") == c.key) return c.out;
-  return std::nullopt;
+std::string gguf_unlocked_remark() {
+  return "the GGUF cache folder is read-only: its converted copy is used without the shared lock (a sweep by another "
+         "process could remove it meanwhile)";
 }
 
-std::uint64_t gguf_converted_bytes(const fs::path& file, const quant::QuantSpec& target) {
-  return converted_bytes(quant::open_gguf_dit(weights::GgufFile(file)), target);
+std::optional<fs::path> gguf_cached_file(const fs::path& file, const quant::QuantSpec& target, const fs::path& cache_dir,
+                                         bool* unlocked) {
+  require_cache_dir(target, cache_dir);
+  const CacheEntry c = cache_entry(file, target, cache_dir);
+  if (!util::file_info(c.out).regular() || cache_metadata(c.out, "mossinfer_gguf_key") != c.key) return std::nullopt;
+  if (unlocked != nullptr) *unlocked = !lock_creatable(c);
+  return c.out;
+}
+
+GgufPendingConversion gguf_pending_conversion(const fs::path& file, const GgufDitInfo& info, const quant::QuantSpec& target,
+                                              const fs::path& cache_dir) {
+  require_cache_dir(target, cache_dir);
+  const CacheEntry c = cache_entry(file, target, cache_dir);
+  // gguf_converted_file's steps before the conversion, in its order: the folder, the lock file, the free space.
+  fs::path existing = c.dir;
+  while (!util::file_info(existing).exists() && existing.has_parent_path() && existing.parent_path() != existing) {
+    existing = existing.parent_path();
+  }
+  const util::FileInfo at = util::file_info(existing);
+  if (!at.directory() || (existing != c.dir && !writable(existing))) {
+    throw weights::IoError(util::path_utf8(c.dir) + ": cannot create the GGUF cache directory");
+  }
+  if (existing == c.dir && !lock_creatable(c)) {
+    throw weights::IoError(util::path_utf8(c.lock) + ": cannot create or lock the GGUF cache entry's lock file");
+  }
+  const quant::QuantModel model = quant::open_gguf_dit(weights::GgufFile(file));
+  GgufPendingConversion p;
+  p.runs_as = gguf_runs_as(info, target);
+  p.target = target;
+  for (const quant::QuantLinear& l : model.linears) p.gemms.push_back(l.name);
+  p.converted_bytes = converted_bytes(model, target);
+  p.seconds = gguf_conversion_seconds(p.converted_bytes);
+  const std::uint64_t need = kSpaceMargin + p.converted_bytes;
+  std::error_code ec;
+  const fs::space_info space = fs::space(existing, ec);
+  if (!ec && space.available < need) {
+    throw weights::IoError(util::path_utf8(c.dir) + ": the converted DiT needs " + std::to_string(need >> 20) + " MiB free, " +
+                           std::to_string(space.available >> 20) + " MiB are available");
+  }
+  return p;
 }
 
 double gguf_conversion_seconds(std::uint64_t bytes) {
@@ -261,13 +320,20 @@ GgufCachedFile gguf_converted_file(const fs::path& file, const GgufDitInfo& info
   const fs::path resolved_dir = util::resolved_path(dir);
   const std::string& name = c.name;
   const fs::path& out = c.out;
-  const fs::path lock_path = dir / util::path_from_utf8(name + ".lock");
+  const fs::path& lock_path = c.lock;
   const auto valid = [&] { return util::file_info(out).regular() && cache_metadata(out, "mossinfer_gguf_key") == key; };
 
   GgufCachedFile r;
   r.path = out;
   for (;;) {
-    r.lock = take_lock(lock_path, util::FileLock::Mode::kShared, hooks);
+    try {
+      r.lock = take_lock(lock_path, util::FileLock::Mode::kShared, hooks);
+    } catch (const weights::IoError&) {
+      // A read-only cache folder: a valid entry is used without the lock (gguf_unlocked_remark); a conversion cannot be.
+      if (r.converted || !valid()) throw;
+      r.unlocked = true;
+      return r;
+    }
     if (valid()) {
       // Only after a conversion published: a cache-hit load probes no recorded source (on Windows a \\nas\... source
       // would contact that host on every load).

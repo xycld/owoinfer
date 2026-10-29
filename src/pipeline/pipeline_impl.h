@@ -146,6 +146,8 @@ inline std::string file_key(const std::filesystem::path& file) { return "file:" 
 // Where the DiT's weights come from (P6): the bundle's transformer, or a single file (quant::to_model_index; INT8,
 // mixed or bf16). `index` is what MossDit and the planner read: the bundle's index or quant->index.
 struct DitSource {
+  // Plan-only: a GGUF file the cache has not converted (open_dit_file's stand-in): the check stops before the DiT's sizing.
+  std::optional<GgufPendingConversion> pending;
   std::filesystem::path path;  // the bundle's transformer directory or the file
   util::FileInfo stamp;        // the file's when it was opened (single file only: Impl::check_component_files)
   const weights::ModelIndex* index = nullptr;
@@ -234,7 +236,8 @@ inline void check_layers(const std::vector<int>& layers, const char* name) {
 }
 
 // plan_only (PipelineOptions::plan_only): a GGUF file's converted copy is only looked up (gguf_cached_file), never
-// made: without one, GgufNotConverted.
+// made. Without one, the source is a stand-in for the checks that do not size the DiT (DitSource::pending): the
+// converted file's precision and per-module specs (every block GEMM in the target format), an empty index.
 inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file, planner::Tier tier,
                                                 const std::filesystem::path& cache_dir,
                                                 const GgufConvertHooks& hooks = {}, bool plan_only = false) {
@@ -251,11 +254,19 @@ inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& fil
     GgufCachedFile converted;
     if (plan_only) {
       const std::optional<std::filesystem::path> cached =
-          model_file_errors(file, [&] { return gguf_cached_file(file, target, cache_dir); });
+          model_file_errors(file, [&] { return gguf_cached_file(file, target, cache_dir, &converted.unlocked); });
       if (!cached) {
-        const std::uint64_t bytes = model_file_errors(file, [&] { return gguf_converted_bytes(file, target); });
-        throw GgufNotConverted(util::path_utf8(file) + ": the first load converts the GGUF DiT into the cache directory",
-                               gguf_runs_as(g, target), bytes, gguf_conversion_seconds(bytes));
+        auto d = std::make_unique<DitSource>();
+        d->pending = model_file_errors(file, [&] { return gguf_pending_conversion(file, g, target, cache_dir); });
+        d->quant = std::make_unique<quant::QuantIndex>();
+        for (const std::string& m : d->pending->gemms) d->quant->specs[m] = target;
+        d->index = &d->quant->index;
+        d->precision = target.quantized() ? planner::Precision::kInt8 : planner::Precision::kBf16;
+        d->linears = moss_dit::describe_linears(d->quant.get());
+        d->path = file;
+        d->stamp = stamp;
+        d->format = d->pending->runs_as;
+        return d;
       }
       converted.path = *cached;
     } else {
@@ -268,6 +279,7 @@ inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& fil
     d->format = gguf_runs_as(g, target);
     d->remarks = d->format + " (converted copy: " + util::path_utf8(converted.path) + ")" +
                  (d->remarks.empty() ? "" : "; " + d->remarks);
+    if (converted.unlocked) d->remarks += "; " + gguf_unlocked_remark();
     return d;
   }
   DitFileInfo info = inspect_dit_file(file, [] { return moss_dit::nvfp4_unsupported_reason(); });

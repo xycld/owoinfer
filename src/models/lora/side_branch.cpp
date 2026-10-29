@@ -278,6 +278,18 @@ SideBranches::SideBranches(const LoraStack& stack, LayoutOnly) : stack_(&stack),
       if (!std::isfinite(v)) fail("coefficient strength * alpha / rank of '" + stack.adapters()[c.adapter].source + "' is not finite");
       if (v != 0.0f) en.active = true;
     }
+    // The factors the upload reads, read and dropped: a file that fails to read fails here as it would there.
+    for (std::size_t g = 0; g < sp.shared_first.size(); ++g) static_cast<void>(stack.read(stack.adapters()[sp.shared_first[g]].parts[0]));
+    for (const SlicePlan& sl : sp.slices) {
+      for (const std::size_t i : sl.shared_parts) {
+        if (i != SIZE_MAX) static_cast<void>(stack.read(stack.adapters()[i].parts[1], stack.adapters()[i].row0, stack.adapters()[i].n));
+      }
+      for (const Run& r : sl.own) {
+        const Adapter& a = stack.adapters()[r.adapter];
+        static_cast<void>(stack.read(a.parts[0]));
+        static_cast<void>(stack.read(a.parts[1], a.row0, a.n));
+      }
+    }
   }
 }
 

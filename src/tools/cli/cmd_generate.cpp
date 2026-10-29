@@ -260,22 +260,40 @@ void print_summary(const pipeline::Result& r) {
 // `moss-infer check`: the generate command's options and request, through a plan-only pipeline (Pipeline::check):
 // the same checks and plan as the generation, nothing loaded or written. The verdict as one JSON object on stdout, the
 // plan, the estimate, warnings and notes on stderr (unless quiet). 0 when accepted, 1 when refused.
-int run_check(pipeline::PipelineOptions options, const pipeline::Request& req, bool preview, bool quiet) {
+// A refusal found before run_check (an image that does not decode, a --params file that does not read): the same verdict.
+int check_refused(const std::string& message, bool quiet) {
+  std::cout << "{\"ok\": false, \"refused_by\": \"generate\", \"message\": " << pipeline::json_escape(message)
+            << ", \"planned\": false, \"tier\": \"\", \"estimate\": null, \"gguf_convert_s\": 0, \"plan\": null, "
+               "\"warnings\": [], \"notes\": []}\n";
+  if (!quiet) std::fprintf(stderr, "check: refused by the generate: %s\n", message.c_str());
+  return 1;
+}
+
+int run_check(pipeline::PipelineOptions options, const pipeline::Request& req, const std::vector<std::string>& then_prompts,
+              bool preview, bool quiet) {
   options.plan_only = true;
   std::string refused_by, message;
   std::optional<pipeline::Result> r;
-  std::optional<pipeline::GgufNotConverted> gguf;
+  std::vector<std::string> warnings, notes;
   std::string estimate_json = "null";
   try {
-    refused_by = "generate";  // generate validates the request before it creates the pipeline
+    refused_by = "generate";  // generate validates the request (and its follow-up prompts) before it creates the pipeline
     pipeline::validate(req);
+    for (const std::string& p : then_prompts) {
+      pipeline::Request f = req;
+      f.prompt = p;
+      pipeline::validate(f);
+    }
     refused_by = "engine";
     pipeline::Pipeline pipe(options);
     refused_by = "generate";
     pipeline::GenerateControl control;
     if (preview) control.on_preview = [](const pipeline::PreviewImage&) {};
-    try {
-      r = pipe.check(req, control);
+    r = pipe.check(req, control, notes);
+    for (const auto* w : {&r->lora_warnings, &r->control.lora.warnings, &r->reference_warnings, &r->accel_warnings}) {
+      warnings.insert(warnings.end(), w->begin(), w->end());
+    }
+    if (!r->gguf_pending) {
       const planner::HardwareProfile rates = api::stored_rates(options.cache_dir);
       const api::Estimate e = api::estimate_of(
           api::generate_segments(r->plan, rates, api::HeldModels{}, api::model_bytes(req.model, options.text_encoder_file, options.vae_file),
@@ -283,26 +301,12 @@ int run_check(pipeline::PipelineOptions options, const pipeline::Request& req, b
           r->plan, rates);
       estimate_json = api::estimate_json(e);
       if (!quiet) std::fprintf(stderr, "%s\n%s\n", r->plan.explanation.c_str(), api::estimate_text(e).c_str());
-    } catch (const pipeline::GgufNotConverted& g) {
-      gguf = g;
     }
     refused_by.clear();
   } catch (const std::exception& e) {
     message = e.what();
   }
-  std::vector<std::string> warnings, notes;
-  if (r) {
-    for (const auto* w : {&r->lora_warnings, &r->control.lora.warnings, &r->reference_warnings, &r->accel_warnings}) {
-      warnings.insert(warnings.end(), w->begin(), w->end());
-    }
-    notes = r->plan_only_notes;
-  }
-  if (gguf) {
-    char b[160];
-    std::snprintf(b, sizeof b, " (%s, %.1f GB; about %.0f s); the text encoder, VAE, LoRA and plan checks follow the conversion",
-                  gguf->runs_as.c_str(), static_cast<double>(gguf->converted_bytes) / 1e9, gguf->seconds);
-    notes.push_back(gguf->what() + std::string(b));
-  }
+  const bool planned = r && !r->gguf_pending;
   const auto list = [](const std::vector<std::string>& v) {
     std::string s;
     for (const std::string& x : v) s += (s.empty() ? "" : ", ") + pipeline::json_escape(x);
@@ -310,10 +314,10 @@ int run_check(pipeline::PipelineOptions options, const pipeline::Request& req, b
   };
   std::string doc = "{\"ok\": " + std::string(refused_by.empty() ? "true" : "false") +
                     ", \"refused_by\": " + (refused_by.empty() ? "null" : pipeline::json_escape(refused_by)) +
-                    ", \"message\": " + pipeline::json_escape(message) + ", \"planned\": " + (r ? "true" : "false") +
-                    ", \"tier\": " + pipeline::json_escape(r ? r->tier.reason : "") + ", \"estimate\": " + estimate_json +
-                    ", \"gguf_convert_s\": " + pipeline::json_number(gguf ? gguf->seconds : 0.0) +
-                    ", \"plan\": " + (r ? r->plan.to_json() : "null") + ", \"warnings\": " + list(warnings) +
+                    ", \"message\": " + pipeline::json_escape(message) + ", \"planned\": " + (planned ? "true" : "false") +
+                    ", \"tier\": " + pipeline::json_escape(planned ? r->tier.reason : "") + ", \"estimate\": " + estimate_json +
+                    ", \"gguf_convert_s\": " + pipeline::json_number(r && r->gguf_pending ? r->gguf_pending->seconds : 0.0) +
+                    ", \"plan\": " + (planned ? r->plan.to_json() : "null") + ", \"warnings\": " + list(warnings) +
                     ", \"notes\": " + list(notes) + "}";
   std::cout << doc << "\n";
   if (!quiet) {
@@ -360,8 +364,13 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
     if (f == "--params") params = path_arg(v, f);  // a stream works too (process substitution)
   }
   if (!params.empty()) {
-    pdoc = json::parse(read_file(params));
-    req = pipeline::request_from_parameters(pdoc);
+    try {
+      pdoc = json::parse(read_file(params));
+      req = pipeline::request_from_parameters(pdoc);
+    } catch (const std::exception& e) {
+      if (check) return check_refused(e.what(), false);
+      throw;
+    }
     pobj = pdoc.find("parameters") != nullptr ? pdoc.find("parameters") : &pdoc;
   }
   // A key the parameters file sets: front-end defaults never override it.
@@ -558,17 +567,20 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
       req.references.images.push_back(std::make_shared<const pipeline::Image>(pipeline::load_image(p, 3)));
     }
   } catch (const std::invalid_argument& e) {
+    if (check) return check_refused(e.what(), quiet);  // the request's own refusals: the verdict, not a usage error
     std::cerr << "moss-infer generate: " << e.what() << "\n" << kUsage;
     return 2;
   } catch (const std::out_of_range&) {
+    if (check) return check_refused("--hires out of range", quiet);
     std::cerr << "moss-infer generate: --hires out of range\n" << kUsage;
     return 2;
   } catch (const std::runtime_error& e) {
+    if (check) return check_refused(e.what(), quiet);
     std::cerr << "moss-infer generate: " << e.what() << "\n";
     return 1;
   }
   req.decode = !out_png.empty() || (check && out_latent.empty());  // check: a PNG unless only --latent-out is given
-  if (check) return run_check(options, req, !preview_png.empty(), quiet);
+  if (check) return run_check(options, req, then_prompts, !preview_png.empty(), quiet);
   pipeline::validate(req);
   for (const std::string& p : then_prompts) {
     pipeline::Request f = req;
@@ -587,6 +599,7 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
   api::JobShape shape;
   control.on_plan = [&](const planner::ExecutionPlan& plan) {
     if (quiet) return;
+    if (!rates.measured) rates = api::stored_rates(options.cache_dir);  // the first generate's probe, once stored
     const api::Estimate e = api::estimate_of(api::generate_segments(plan, rates, held, model_bytes, shape), plan, rates);
     std::fprintf(stderr, "%s\n%s\n", plan.explanation.c_str(), api::estimate_text(e).c_str());
   };

@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <filesystem>
+#include <fstream>
 #include <list>
 #include <mutex>
 #include <optional>
@@ -607,6 +609,8 @@ class Server {
     std::atomic<bool> done{false};
   };
   static constexpr std::size_t kMaxInspects = 2;
+  // The images a check may decode while a job runs (the decode's host memory and time next to the job's).
+  static constexpr std::uint64_t kCheckPixelsBusy = 16'000'000;
 
   // A job runs on the worker (its id is job_->id).
   bool generating() const { return running_.load(); }
@@ -992,7 +996,7 @@ class Server {
     p.only({"path"});
     const std::optional<std::string> path = p.path("path");
     if (!path) throw RequestError("invalid_params", "\"path\" (the file to inspect) is required");
-    return on_thread(id, "inspect", [file = *path] { return inspect_json(file); });
+    return on_thread(inspections_, kMaxInspects, id, "inspect", [file = *path] { return inspect_json(file); });
   }
 
   // check: load's and generate's parameters checked by mi_check() (no engine of the server's is touched), on its own
@@ -1001,10 +1005,79 @@ class Server {
     p.only({"load", "generate"});
     if (p.find("load") == nullptr) throw RequestError("invalid_params", "\"load\" (load's parameters) is required");
     if (p.find("generate") == nullptr) throw RequestError("invalid_params", "\"generate\" (generate's parameters) is required");
+    // A check decodes its image inputs: next to a running job, only up to kCheckPixelsBusy pixels in all.
+    if (generating()) {
+      const std::uint64_t pixels = image_pixels(*p.find("generate"));
+      if (pixels > kCheckPixelsBusy) {
+        throw RequestError("busy", "a job is running and this check would decode " + std::to_string(pixels / 1000000) +
+                                       " MP of images (at most " + std::to_string(kCheckPixelsBusy / 1000000) +
+                                       " MP while a job runs); send it again after the job's done event");
+      }
+    }
     // The parameters are read on the thread: Params point into the request line's document.
     auto doc = std::make_shared<Value>(*p.find("load"));
     auto gen = std::make_shared<Value>(*p.find("generate"));
-    return on_thread(id, "check", [this, doc, gen] { return check_json(Params(doc.get()), Params(gen.get())); });
+    return on_thread(checks_, 1, id, "check", [this, doc, gen] { return check_json(Params(doc.get()), Params(gen.get())); });
+  }
+
+  // Pixels of the images a check would decode (generate's init_image, mask, control.images[].path,
+  // references.images[]), from the PNG / JPEG headers; a file that is neither (or unreadable) counts 0: its decode
+  // fails at once.
+  static std::uint64_t image_pixels(const Value& gen) {
+    std::vector<std::string> paths;
+    const auto add = [&](const Value* v) {
+      if (v != nullptr && v->is_string()) paths.push_back(v->as_string());
+    };
+    if (!gen.is_object()) return 0;
+    add(gen.find("init_image"));
+    add(gen.find("mask"));
+    if (const Value* c = gen.find("control"); c != nullptr && c->is_object()) {
+      if (const Value* im = c->find("images"); im != nullptr && im->is_array()) {
+        for (const Value& e : im->as_array()) {
+          if (e.is_object()) add(e.find("path"));
+        }
+      }
+    }
+    if (const Value* r = gen.find("references"); r != nullptr && r->is_object()) {
+      if (const Value* im = r->find("images"); im != nullptr && im->is_array()) {
+        for (const Value& e : im->as_array()) add(&e);
+      }
+    }
+    std::uint64_t total = 0;
+    for (const std::string& p : paths) total += image_header_pixels(p);
+    return total;
+  }
+
+  // width * height from a PNG's IHDR or a JPEG's first SOF marker; 0 when neither is found in the first 64 KiB.
+  static std::uint64_t image_header_pixels(const std::string& path_utf8) {
+    // A regular file only (never a device or a pipe, whose read could block the request loop).
+    const std::filesystem::path path(std::u8string(path_utf8.begin(), path_utf8.end()));
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) return 0;
+    std::ifstream f(path, std::ios::binary);
+    std::string b(std::size_t{64} << 10, '\0');
+    f.read(b.data(), static_cast<std::streamsize>(b.size()));
+    b.resize(static_cast<std::size_t>(f.gcount()));
+    const auto byte = [&](std::size_t i) { return static_cast<std::uint64_t>(static_cast<unsigned char>(b[i])); };
+    const auto be = [&](std::size_t i, int n) {
+      std::uint64_t v = 0;
+      for (int k = 0; k < n; ++k) v = (v << 8) | byte(i + static_cast<std::size_t>(k));
+      return v;
+    };
+    if (b.size() >= 24 && b.compare(0, 8, "\x89PNG\r\n\x1a\n") == 0) return be(16, 4) * be(20, 4);
+    if (b.size() < 4 || byte(0) != 0xFF || byte(1) != 0xD8) return 0;
+    for (std::size_t i = 2; i + 9 < b.size();) {
+      if (byte(i) != 0xFF) return 0;
+      const std::uint64_t marker = byte(i + 1);
+      if (marker == 0xFF) {
+        ++i;
+        continue;
+      }
+      const bool sof = marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
+      if (sof) return be(i + 5, 2) * be(i + 7, 2);
+      i += 2 + static_cast<std::size_t>(be(i + 2, 2));
+    }
+    return 0;
   }
 
   // check's result: the first refusal of load then generate, as each would answer it, else the plan.
@@ -1072,17 +1145,19 @@ class Server {
   }
 
   // Runs `answer` (the result object, or a RequestError) on a thread of its own and sends its response from there:
-  // inspect and check, at most kMaxInspects at a time.
+  // inspects (at most kMaxInspects at a time) and checks (one at a time), each kind in its own `slots`.
   template <class F>
-  std::optional<std::string> on_thread(const std::string& id, const char* what, F answer) {
-    inspections_.remove_if([](const std::unique_ptr<Inspection>& i) {
+  std::optional<std::string> on_thread(std::list<std::unique_ptr<Inspection>>& slots, std::size_t max, const std::string& id,
+                                       const char* what, F answer) {
+    slots.remove_if([](const std::unique_ptr<Inspection>& i) {
       if (!i->done.load()) return false;
       i->thread.join();  // it has sent its answer: only returning is left
       return true;
     });
-    if (inspections_.size() >= kMaxInspects) {
-      throw RequestError("busy", std::to_string(kMaxInspects) + " inspects or checks are running; send it again after "
-                                 "one answers");
+    if (slots.size() >= max) {
+      throw RequestError("busy", max == 1 ? std::string("a ") + what + " is running; send it again after it answers"
+                                          : std::to_string(max) + " " + what + "s are running; send it again after one "
+                                                                                "answers");
     }
     auto slot = std::make_unique<Inspection>();
     Inspection* s = slot.get();
@@ -1110,13 +1185,15 @@ class Server {
         // The protocol stream is unusable (emit's lock failed): nothing to answer on.
       }
     });
-    inspections_.push_back(std::move(slot));
+    slots.push_back(std::move(slot));
     return std::nullopt;
   }
 
   void join_inspections() {
-    for (const std::unique_ptr<Inspection>& i : inspections_) i->thread.join();
-    inspections_.clear();
+    for (auto* slots : {&inspections_, &checks_}) {
+      for (const std::unique_ptr<Inspection>& i : *slots) i->thread.join();
+      slots->clear();
+    }
   }
 
   // inspect's result object for `path`.
@@ -1421,6 +1498,7 @@ class Server {
   std::unique_ptr<Job> job_;
   std::thread worker_;
   std::list<std::unique_ptr<Inspection>> inspections_;  // the main thread's: started, reaped and joined there
+  std::list<std::unique_ptr<Inspection>> checks_;       // the same for check (one at a time)
   std::atomic<bool> running_{false};
   // A release's cancel relay (run_release): woken by request_cancel() and by the release's end.
   std::mutex relay_mu_;

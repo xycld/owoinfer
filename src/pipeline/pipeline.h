@@ -48,6 +48,7 @@
 
 #include "models/lora/side_branch.h"
 #include "pipeline/accel/accel.h"
+#include "pipeline/gguf_dit.h"
 #include "pipeline/pipeline_image.h"
 #include "pipeline/png_writer.h"
 #include "pipeline/quality_report.h"
@@ -285,7 +286,7 @@ struct PipelineOptions {
   std::optional<planner::AttentionMode> attention;
   // Internal (mi_check, `moss-infer check`): a pipeline made for Pipeline::check alone. It reads what a generate()
   // reads before its first heavy step (headers, indexes, LoRA and control files, the stored hardware profile) and
-  // writes nothing: no GGUF conversion (an unconverted GGUF DiT throws GgufNotConverted), no hardware probe or fused
+  // writes nothing: no GGUF conversion (an unconverted GGUF DiT: Result::gguf_pending), no hardware probe or fused
   // self-check (the stored results, else the planner's default rates and the route without validated fused
   // configurations), no embedding-cache folder (its disk entries are not read: the text encoder is planned to run),
   // and no upload (LoRA side branches and a control embedder are planned by their sizes).
@@ -426,8 +427,9 @@ struct Result {
   std::string decode_schedule;
   planner::ExecutionPlan plan;
   planner::HardwareProfile hardware;  // the transfer rates the plan was made with
-  // Pipeline::check: what the plan-only pipeline could not know as a generate() would (PipelineOptions::plan_only).
-  std::vector<std::string> plan_only_notes;
+  // Pipeline::check of an unconverted GGUF DiT: the conversion the first load runs; the check stopped before sizing
+  // the DiT (no plan, no tier reason).
+  std::optional<GgufPendingConversion> gguf_pending;
   // DiT block path the denoise ran (fused_graphs only when every block was resident), and why it differs from
   // PipelineOptions::block_path (empty when it does not).
   moss_dit::BlockPath block_path = moss_dit::BlockPath::kFused;
@@ -690,10 +692,13 @@ class Pipeline {
 
   // A plan-only pipeline's (PipelineOptions::plan_only) dry run of generate(request, control): the same checks, model
   // sources, tier, LoRA stack, workspaces and plan, with the same exceptions, then it returns before the first phase
-  // (Result: plan, hardware, tier, sources, LoRA reports, warnings, plan_only_notes; no image, no timings of phases).
-  // `control` is read for what shapes the plan (on_preview); its callbacks are not called. std::logic_error on a
-  // pipeline that is not plan-only.
-  Result check(const Request& request, const GenerateControl& control = {});
+  // (Result: plan, hardware, tier, sources, LoRA reports, warnings; no image, no timings of phases). An unconverted GGUF
+  // DiT returns before the DiT's sizing (Result::gguf_pending, no plan). `notes` receives, also when it throws, what
+  // the check could not know as generate() would (default rates, the fused self-check not run, the embedding cache's
+  // folder not read) and a pending GGUF conversion. `control` is read for what shapes the plan (on_preview); its
+  // callbacks are not called. A pipeline may check any number of requests. std::logic_error on a pipeline that is not
+  // plan-only.
+  Result check(const Request& request, const GenerateControl& control, std::vector<std::string>& notes);
 
  private:
   friend class Session;  // the component session (pipeline/session.h) drives the same state

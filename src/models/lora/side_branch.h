@@ -65,7 +65,8 @@ class SideBranches {
   SideBranches(const SideBranches&) = delete;
   SideBranches& operator=(const SideBranches&) = delete;
 
-  // The layout `stack` would get, without reading a factor or allocating anything (a plan-only pipeline: mi_check):
+  // The layout `stack` would get, without allocating anything (a plan-only pipeline: mi_check); every factor the upload
+  // reads is read too (and dropped), so a file that fails to read fails here as well:
   // site() (null or not; a branch it returns has no tensors), any_active(), max_rank() and device_bytes() answer as for
   // the uploaded object, with the same refusal of a non-finite coefficient; update_strengths() is refused.
   struct LayoutOnly {};

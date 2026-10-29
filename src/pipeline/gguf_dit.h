@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "util/regular_file.h"
 
@@ -68,7 +69,13 @@ struct GgufCachedFile {
   std::filesystem::path path;
   util::FileLock lock;     // "<path>.lock" held shared: keep it while the file is in use (no sweep removes the file)
   bool converted = false;  // this call converted it
+  // A read-only cache folder (the lock file cannot be created) holding a valid entry: it is used without the lock, so a
+  // sweep by another process could remove it meanwhile (gguf_unlocked_remark says so).
+  bool unlocked = false;
 };
+
+// The DiT source's remark for a converted copy used without its lock (GgufCachedFile::unlocked).
+std::string gguf_unlocked_remark();
 
 // The converted file of `file` for `target` in <cache_dir>/gguf/, converted now when the cache has none for this
 // identity: into a temporary file created exclusively there first, converted, read back, checked against a GGUF that
@@ -81,25 +88,28 @@ GgufCachedFile gguf_converted_file(const std::filesystem::path& file, const Gguf
                                    const GgufConvertHooks& hooks = {});
 
 // A plan-only pipeline (PipelineOptions::plan_only, mi_check) never converts: gguf_cached_file finds the converted
-// file read-only (no folder, lock or sweep), and without one the open throws GgufNotConverted, with what the first
-// load's conversion would write and an estimate of its time.
-struct GgufNotConverted : std::runtime_error {
-  GgufNotConverted(const std::string& message, std::string format, std::uint64_t bytes, double estimate_s)
-      : std::runtime_error(message), runs_as(std::move(format)), converted_bytes(bytes), seconds(estimate_s) {}
+// file read-only (no folder, lock or sweep); without one, gguf_pending_conversion says what the first load's
+// conversion would write, after refusing what would stop that conversion before it starts.
+struct GgufPendingConversion {
   std::string runs_as;                // gguf_runs_as
+  quant::QuantSpec target;            // the converted file's format
+  std::vector<std::string> gemms;     // the block GEMM modules it converts to `target` (the other tensors stay bf16)
   std::uint64_t converted_bytes = 0;  // the converted file's size (the cache directory needs this much free)
   double seconds = 0;                 // estimated conversion time on this machine (gguf_conversion_seconds)
 };
 
 // The converted file of `file` for `target` that gguf_converted_file would use, when the cache already holds it (a
 // valid entry for the GGUF's current identity); nullopt otherwise. Reads only: no folder is created, no lock taken.
+// `unlocked` (optional) receives whether gguf_converted_file would use it without its lock (a read-only folder).
 // Throws std::invalid_argument for an empty cache_dir (as gguf_converted_file).
 std::optional<std::filesystem::path> gguf_cached_file(const std::filesystem::path& file, const quant::QuantSpec& target,
-                                                      const std::filesystem::path& cache_dir);
+                                                      const std::filesystem::path& cache_dir, bool* unlocked = nullptr);
 
-// Bytes of the converted file of `file` for `target` (the GEMMs' weights and scales, the other tensors), as
-// gguf_converted_file's free-space check counts them (without its margin).
-std::uint64_t gguf_converted_bytes(const std::filesystem::path& file, const quant::QuantSpec& target);
+// The conversion gguf_converted_file would run for a cache without the entry, without running it: weights::IoError
+// with gguf_converted_file's message when it would stop before converting (the cache folder cannot be created, its
+// lock file cannot be created, too little free space); else what it would write.
+GgufPendingConversion gguf_pending_conversion(const std::filesystem::path& file, const GgufDitInfo& info,
+                                              const quant::QuantSpec& target, const std::filesystem::path& cache_dir);
 
 // A rough conversion time for `converted_bytes` of output on this machine: the converter's throughput measured on a
 // 32-thread laptop CPU (about 32 s for the 5.4 GB INT8 file), scaled by the hardware threads.

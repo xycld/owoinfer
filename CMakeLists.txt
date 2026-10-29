@@ -210,5 +210,8 @@ if(MOSSINFER_TESTS)
     add_test(NAME cli_generate_requires_tier
              COMMAND ${CMAKE_COMMAND} -DMOSS_INFER=$<TARGET_FILE:moss-infer> -P ${CMAKE_SOURCE_DIR}/tests/cli/generate_requires_tier.cmake)
     set_tests_properties(cli_generate_requires_tier PROPERTIES LABELS cpu)
+    add_test(NAME cli_check_verdict
+             COMMAND ${CMAKE_COMMAND} -DMOSS_INFER=$<TARGET_FILE:moss-infer> -P ${CMAKE_SOURCE_DIR}/tests/cli/check_verdict.cmake)
+    set_tests_properties(cli_check_verdict PROPERTIES LABELS cpu)
   endif()
 endif()

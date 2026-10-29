@@ -137,8 +137,8 @@ class PipelineAdapter {
   Generation generate(const mi_gen_params& params, const std::atomic<bool>& cancel);
   // A plan-only engine's dry run of generate(params) (pipeline::Pipeline::check): the same request conversion and checks,
   // with the same exceptions, then the plan, its time estimate on this new engine and what it would warn about into
-  // `out`. A GGUF DiT not converted yet is no exception: out.info.planned stays 0, gguf_convert_seconds and a note say
-  // so.
+  // `out` (its notes also when it throws). A GGUF DiT not converted yet is no refusal: everything that does not size
+  // the DiT is checked, out.info.planned stays 0, gguf_convert_seconds and a note say so.
   void check(const mi_gen_params& params, CheckFindings& out);
   // Pipeline::preload of `params` (prompt optional): the plan callback once after planning, before any load; a progress
   // callback (step 0) before each load step, in the pipeline's order (PreloadOptions::on_phase).

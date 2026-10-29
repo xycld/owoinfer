@@ -1135,8 +1135,9 @@ typedef struct mi_check_info {
   mi_status status;
   mi_check_stage stage;
   /* The request was planned: the fields below and the plan texts are set. 0 when refused before planning, and with
-   * status MI_OK for a GGUF dit_file not converted yet (gguf_convert_seconds > 0): the first load converts it, and the
-   * text encoder, VAE, LoRA and plan checks follow the conversion. */
+   * status MI_OK for a GGUF dit_file not converted yet (gguf_convert_seconds > 0): everything that does not size the DiT
+   * was checked (the conversion's own preconditions, the text encoder, VAE, tier, LoRAs, images, tokens); the
+   * workspaces and the plan follow the first load's conversion. */
   int32_t planned;
   int32_t dit_streamed;        /* the plan streams DiT blocks every step */
   int32_t dit_parked;          /* the plan evicts the DiT for the text encoder or the decode, and reloads it */
@@ -1178,8 +1179,8 @@ typedef enum mi_check_text_kind {
  * control adapter's files, the distill bundle), the tier, the LoRA placement, the image inputs (decoded), the token
  * counts and the plan within the budgets against the device's free memory now, and the job's time estimate. Loads no
  * weights and writes nothing: no GGUF conversion, cache folder, hardware probe or profile (a stored profile is read).
- * It initializes CUDA on the device as mi_engine_create() does (the device's primary context) and allocates no
- * device memory. The plan is a new engine's: memory other engines hold, in this process too, counts as used.
+ * It initializes CUDA on the device as mi_engine_create() does and allocates no device buffers; the CUDA primary
+ * context (and its memory) stays initialized for the process. The plan is a new engine's: memory other engines hold, in this process too, counts as used.
  * Returns MI_OK with *out_report set (release it with mi_check_report_free()) whatever the verdict: a refusal is in
  * the report (status, stage, message). Fails only for NULL arguments (MI_ERR_INVALID_ARGUMENT) and unknown struct
  * sizes (MI_ERR_ABI_MISMATCH). mi_last_error_message() is unchanged on MI_OK. Thread-safe (each call has its own

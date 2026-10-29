@@ -81,6 +81,8 @@ EmbedderWeights read_embedder(const ControlFile& file);
 class DeviceEmbedder {
  public:
   explicit DeviceEmbedder(const EmbedderWeights& w);
+  // The constructor's check of `w` before it allocates (std::invalid_argument): a plan-only pipeline runs it alone.
+  static void check(const EmbedderWeights& w);
   static std::size_t device_bytes(std::int64_t out_features, std::int64_t in_features);
   std::size_t device_bytes() const { return buf_.size(); }
   Tensor weight() const;  // CUDA bf16 [out_features, in_features]

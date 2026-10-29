@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test_util.h"
@@ -372,23 +374,177 @@ TEST_F(GpuCheckAgreement, CheckAgreesWithTheRealCalls) {
   EXPECT_GE(ran, 10);
 }
 
-// A GGUF DiT the cache has not converted: the check reports the conversion and writes nothing (no folder, no lock).
-TEST_F(GpuCheckAgreement, GgufNotConvertedWritesNothing) {
+// The plans of a real run and a check agree on what the memory depends on.
+void expect_same_plan(const std::string& real_json, const std::string& check_json) {
+  ASSERT_FALSE(real_json.empty());
+  ASSERT_FALSE(check_json.empty());
+  const mi::json::Value a = mi::json::parse(real_json), b = mi::json::parse(check_json);
+  for (const char* k : {"dit.residency", "dit.precision", "dit.attention", "dit.resident_blocks", "dit.device_bytes",
+                        "text_encoder.residency", "vae.tiled", "peaks.text_encoder", "peaks.denoise", "peaks.decode",
+                        "arena_bytes"}) {
+    EXPECT_EQ(scalar(member(a, k)), scalar(member(b, k))) << k;
+  }
+}
+
+// A GGUF DiT through the check before and after its conversion (leejet's Q4_K, converted once here into a temporary
+// cache: about 35 s and 5.4 GB). Unconverted, everything that does not size the DiT is checked: high + exact
+// attention (the INT8 target runs it) is accepted with the conversion noted and nothing written; a VAE file passed as a
+// LoRA is refused, and a cache folder that cannot be created too, each as the real call refuses it. Converted, the
+// check plans it as the real run did (a cache hit, read without the lock); a read-only cache with the entry but no lock
+// file serves both (the real load without its lock, with the remark in both plans).
+TEST_F(GpuCheckAgreement, GgufBeforeAndAfterItsConversion) {
   if (!fs::is_regular_file(mi::util::path_from_utf8(gguf_))) GTEST_SKIP() << "no GGUF DiT";
+  if (!fs::is_regular_file(mi::util::path_from_utf8(vae_))) GTEST_SKIP() << "no VAE file";
   mi::testing::TempDir dir("check_gguf");
   const std::string cache = mi::util::path_utf8(dir.path() / "cache");
   mi_engine_params e = engine_defaults();
   e.model_path = sft_.c_str();
   e.dit_file = gguf_.c_str();
   e.tier = MI_TIER_HIGH;
+  e.attention = MI_ATTENTION_EXACT;
   e.cache_dir = cache.c_str();
-  const Checked c = run_check(e, gen_defaults());
-  EXPECT_EQ(c.info.status, MI_OK) << c.message;
-  EXPECT_EQ(c.info.planned, 0);
-  EXPECT_GT(c.info.gguf_convert_seconds, 1);
-  EXPECT_NE(c.notes.find("the first load converts"), std::string::npos) << c.notes;
-  EXPECT_TRUE(c.plan_json.empty());
+  e.embedding_cache = 0;
+  mi_gen_params g = gen_defaults();
+  g.width = g.height = 256;
+  g.steps = 2;
+  const mi_lora not_a_lora{vae_.c_str(), 1.0};
+  mi_gen_params with_vae_lora = g;
+  with_vae_lora.loras = &not_a_lora;
+  with_vae_lora.loras_count = 1;
+
+  const Checked pending = run_check(e, g);
+  EXPECT_EQ(pending.info.status, MI_OK) << pending.message;
+  EXPECT_EQ(pending.info.planned, 0);
+  EXPECT_GT(pending.info.gguf_convert_seconds, 1);
+  EXPECT_NE(pending.notes.find("the first load converts"), std::string::npos) << pending.notes;
+  EXPECT_TRUE(pending.plan_json.empty());
+  const Checked pending_lora = run_check(e, with_vae_lora);
+  EXPECT_EQ(pending_lora.info.status, MI_ERR_MODEL) << pending_lora.message;
   EXPECT_FALSE(fs::exists(dir.path() / "cache")) << "the check created the cache folder";
+
+  // A cache folder under a read-only parent: the conversion's own refusal, before any work.
+  {
+    const fs::path ro = dir.path() / "ro";
+    fs::create_directories(ro);
+    fs::permissions(ro, fs::perms::owner_read | fs::perms::owner_exec);
+    const std::string blocked = mi::util::path_utf8(ro / "cache");
+    mi_engine_params b = e;
+    b.cache_dir = blocked.c_str();
+    const Checked c = run_check(b, g);
+    const Real real = run_real(b, g);
+    fs::permissions(ro, fs::perms::owner_all);
+    EXPECT_EQ(real.status, MI_ERR_IO) << real.message;
+    EXPECT_EQ(c.info.status, real.status);
+    EXPECT_EQ(c.message, real.message);
+  }
+
+  // The real calls convert; the check, now a cache hit, plans as they did.
+  const Real real = run_real(e, g);
+  ASSERT_EQ(real.status, MI_OK) << real.message;
+  const Real real_lora = run_real(e, with_vae_lora);
+  EXPECT_EQ(real_lora.status, pending_lora.info.status);
+  EXPECT_EQ(real_lora.message, pending_lora.message);
+  const Checked hit = run_check(e, g);
+  EXPECT_EQ(hit.info.status, MI_OK) << hit.message;
+  EXPECT_EQ(hit.info.planned, 1);
+  EXPECT_EQ(hit.info.gguf_convert_seconds, 0);
+  expect_same_plan(real.plan_json, hit.plan_json);
+
+  // A read-only cache folder holding the entry without its lock file.
+  const fs::path gguf_dir = dir.path() / "cache" / "gguf";
+  for (const auto& entry : fs::directory_iterator(gguf_dir)) {
+    if (entry.path().extension() == ".lock") fs::remove(entry.path());
+  }
+  fs::permissions(gguf_dir, fs::perms::owner_read | fs::perms::owner_exec);
+  const Real ro_real = run_real(e, g);
+  const Checked ro_check = run_check(e, g);
+  fs::permissions(gguf_dir, fs::perms::owner_all);
+  ASSERT_EQ(ro_real.status, MI_OK) << ro_real.message;
+  EXPECT_EQ(ro_check.info.status, MI_OK) << ro_check.message;
+  expect_same_plan(ro_real.plan_json, ro_check.plan_json);
+  const std::string remark = "used without the shared lock";
+  EXPECT_NE(member(mi::json::parse(ro_real.plan_json), "explanation").as_string().find(remark), std::string::npos);
+  EXPECT_NE(member(mi::json::parse(ro_check.plan_json), "explanation").as_string().find(remark), std::string::npos);
+}
+
+// A cold check (no stored hardware profile; the fused self-check not run when this is the process's first DiT work)
+// against the real run after it: the same verdict, and a plan at least as large (the op-by-op route's workspace).
+TEST_F(GpuCheckAgreement, ColdCheckIsConservative) {
+  mi_engine_params e = engine_defaults();
+  e.model_path = sft_.c_str();
+  e.dit_file = int8_.c_str();
+  e.tier = MI_TIER_HIGH;
+  e.embedding_cache = 0;
+  mi_gen_params g = gen_defaults();
+  g.width = g.height = 512;
+  g.steps = 2;
+  const Checked c = run_check(e, g);
+  const Real real = run_real(e, g);
+  ASSERT_EQ(real.status, MI_OK) << real.message;
+  ASSERT_EQ(c.info.status, MI_OK) << c.message;
+  EXPECT_NE(c.notes.find("transfer rates: the planner's defaults"), std::string::npos) << c.notes;
+  const mi::json::Value a = mi::json::parse(real.plan_json);
+  EXPECT_GE(c.info.arena_bytes, static_cast<std::uint64_t>(member(a, "arena_bytes").as_double()));
+  EXPECT_EQ(scalar(member(a, "dit.residency")), scalar(member(mi::json::parse(c.plan_json), "dit.residency")));
+}
+
+// A check with a fresh cache_dir writes nothing there (no hardware profile, no embedding folder), and keeps no device
+// memory: after the first (which may create the process's CUDA context), another changes the free memory by noise only.
+TEST_F(GpuCheckAgreement, WritesNothingAndKeepsNoDeviceMemory) {
+  mi::testing::TempDir dir("check_fresh_cache");
+  const std::string cache = mi::util::path_utf8(dir.path());
+  mi_engine_params e = engine_defaults();
+  e.model_path = sft_.c_str();
+  e.dit_file = int8_.c_str();
+  e.tier = MI_TIER_HIGH;
+  e.cache_dir = cache.c_str();
+  const mi_gen_params g = gen_defaults();
+  ASSERT_EQ(run_check(e, g).info.status, MI_OK);
+  EXPECT_TRUE(fs::is_empty(dir.path())) << "the check wrote into cache_dir";
+  const auto free_bytes = [] {
+    mi_device_info d{};
+    d.struct_size = sizeof d;
+    EXPECT_EQ(mi_probe_device(0, &d), MI_OK);
+    return d.free_memory_bytes;
+  };
+  const std::uint64_t before = free_bytes();
+  ASSERT_EQ(run_check(e, g).info.status, MI_OK);
+  const std::uint64_t after = free_bytes();
+  // Other processes share the GPU: allow their noise, far below any model or arena.
+  EXPECT_LT(before > after ? before - after : 0, std::uint64_t{64} << 20);
+  EXPECT_TRUE(fs::is_empty(dir.path()));
+}
+
+// A check while a generation runs on another engine of the process (another thread): both complete, the check with
+// its own (new-engine) verdict.
+TEST_F(GpuCheckAgreement, CheckDuringAGeneration) {
+  mi_engine_params e = engine_defaults();
+  e.model_path = sft_.c_str();
+  e.dit_file = int8_.c_str();
+  e.tier = MI_TIER_HIGH;
+  mi_engine* engine = nullptr;
+  ASSERT_EQ(mi_engine_create(&e, &engine), MI_OK) << last_error();
+  mi_gen_params g = gen_defaults();
+  g.width = g.height = 512;
+  g.steps = 8;
+  std::atomic<bool> started{false};
+  g.user_data = &started;
+  g.progress_callback = [](const mi_progress*, void* user) { static_cast<std::atomic<bool>*>(user)->store(true); };
+  mi_status generated = MI_ERR_INTERNAL;
+  std::thread t([&] {
+    mi_result* r = nullptr;
+    generated = mi_generate(engine, &g, &r);
+    mi_result_free(r);
+  });
+  while (!started.load()) std::this_thread::yield();
+  mi_gen_params small = gen_defaults();
+  small.width = small.height = 256;
+  const Checked c = run_check(e, small);
+  t.join();
+  mi_engine_free(engine);
+  EXPECT_EQ(generated, MI_OK);
+  EXPECT_EQ(c.info.status, MI_OK) << c.message;
+  EXPECT_EQ(c.info.planned, 1);
 }
 
 }  // namespace

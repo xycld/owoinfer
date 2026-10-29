@@ -1028,16 +1028,13 @@ void PipelineAdapter::check(const mi_gen_params& params, CheckFindings& out) {
     control.preview_every = params.preview_interval;
     control.on_preview = [](const pipeline::PreviewImage&) {};
   }
-  pipeline::Result r;
-  try {
-    r = model_errors([&] { return impl_->pipe->check(q, control); });
-  } catch (const pipeline::GgufNotConverted& e) {
-    out.info.gguf_convert_seconds = e.seconds;
-    char size[32];
-    std::snprintf(size, sizeof size, "%.1f GB", static_cast<double>(e.converted_bytes) / 1e9);
-    out.notes.push_back(std::string(e.what()) + " (" + e.runs_as + ", " + size + "; about " +
-                        std::to_string(static_cast<long>(std::lround(e.seconds))) +
-                        " s); the text encoder, VAE, LoRA and plan checks follow the conversion");
+  // The notes reach `out` also when the check refuses (Pipeline::check fills them before it rethrows).
+  const pipeline::Result r = model_errors([&] { return impl_->pipe->check(q, control, out.notes); });
+  for (const std::vector<std::string>* w : {&r.lora_warnings, &r.control.lora.warnings, &r.reference_warnings, &r.accel_warnings}) {
+    out.warnings.insert(out.warnings.end(), w->begin(), w->end());
+  }
+  if (r.gguf_pending) {  // stopped before the DiT's sizing: no plan
+    out.info.gguf_convert_seconds = r.gguf_pending->seconds;
     return;
   }
   const planner::ExecutionPlan& plan = r.plan;
@@ -1064,10 +1061,6 @@ void PipelineAdapter::check(const mi_gen_params& params, CheckFindings& out) {
   out.explanation = plan.explanation;
   out.plan_json = with_estimate(plan.to_json(), e);
   out.tier_reason = r.tier.reason;
-  for (const std::vector<std::string>* w : {&r.lora_warnings, &r.control.lora.warnings, &r.reference_warnings, &r.accel_warnings}) {
-    out.warnings.insert(out.warnings.end(), w->begin(), w->end());
-  }
-  out.notes = r.plan_only_notes;
 }
 
 Generation PipelineAdapter::preload(const mi_gen_params& params, const std::atomic<bool>& cancel) {

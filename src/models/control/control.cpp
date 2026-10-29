@@ -145,13 +145,17 @@ std::size_t DeviceEmbedder::device_bytes(std::int64_t out_features, std::int64_t
 }
 
 DeviceEmbedder::DeviceEmbedder(const EmbedderWeights& w)
-    : buf_(device_bytes(w.out_features, w.in_features)), out_(w.out_features), in_(w.in_features) {
-  if (w.w.size() != static_cast<std::size_t>(out_ * in_) || w.bias.size() != static_cast<std::size_t>(out_)) {
-    throw std::invalid_argument("mi::control::DeviceEmbedder: weight / bias sizes do not match");
-  }
+    : buf_((check(w), device_bytes(w.out_features, w.in_features))), out_(w.out_features), in_(w.in_features) {
   const std::size_t wb = w.w.size() * 2;
   buf_.upload(w.w.data(), wb);
   buf_.upload(w.bias.data(), w.bias.size() * 2, (wb + 255) / 256 * 256);
+}
+
+void DeviceEmbedder::check(const EmbedderWeights& w) {
+  if (w.w.size() != static_cast<std::size_t>(w.out_features * w.in_features) ||
+      w.bias.size() != static_cast<std::size_t>(w.out_features)) {
+    throw std::invalid_argument("mi::control::DeviceEmbedder: weight / bias sizes do not match");
+  }
 }
 
 Tensor DeviceEmbedder::weight() const { return Tensor::view(buf_.get(), DType::kBF16, Device::kCUDA, {out_, in_}); }

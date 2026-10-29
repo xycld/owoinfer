@@ -789,25 +789,44 @@ ReleaseReport Pipeline::release_device_memory(bool keep_host_copy, const std::at
 
 Result Pipeline::generate(const Request& req, const GenerateControl& control) { return run(req, control, false); }
 
-Result Pipeline::check(const Request& req, const GenerateControl& control) {
-  if (!impl_->options.plan_only) throw std::logic_error("Pipeline::check needs a plan-only pipeline (PipelineOptions::plan_only)");
+Result Pipeline::check(const Request& req, const GenerateControl& control, std::vector<std::string>& notes) {
+  Impl& m = *impl_;
+  if (!m.options.plan_only) throw std::logic_error("Pipeline::check needs a plan-only pipeline (PipelineOptions::plan_only)");
   // Only what shapes the plan: the preview's buffers count in the denoise phase.
   GenerateControl c;
   if (control.on_preview) c.on_preview = [](const PreviewImage&) {};
   c.preview_every = control.preview_every;
-  Result r = run(req, c, false);
-  if (!r.hardware.measured) {
-    r.plan_only_notes.push_back("transfer rates: the planner's defaults (no hardware profile stored" +
-                                std::string(impl_->options.cache_dir.empty() ? ": no cache_dir" : " in cache_dir yet") +
-                                "); the first generate measures them");
+  notes.clear();
+  // What the check could not know, also for a refusal (a budget refusal sized without the fused self-check).
+  const auto add_notes = [&] {
+    if (m.learner && !m.options.hardware && !m.learner->current().measured) {
+      notes.push_back("transfer rates: the planner's defaults (no hardware profile stored" +
+                      std::string(m.options.cache_dir.empty() ? ": no cache_dir" : " in cache_dir yet") +
+                      "); the first generate measures them");
+    }
+    if (m.fused_check && m.fused_check->detail == kFusedCheckNotRun && m.options.block_path != moss_dit::BlockPath::kOpByOp) {
+      notes.push_back("fused self-check: not run in this process yet; the denoise workspace is sized for the op-by-op "
+                      "route (larger than the fused one): the plan, and a budget refusal, may be conservative");
+    }
+    if (m.options.embedding_cache && !m.options.cache_dir.empty()) {
+      notes.push_back("embedding cache: its folder is not read; the text encoder is planned to run");
+    }
+  };
+  Result r;
+  try {
+    r = run(req, c, false);
+  } catch (...) {
+    add_notes();
+    throw;
   }
-  if (impl_->fused_check && impl_->fused_check->detail == kFusedCheckNotRun &&
-      impl_->options.block_path != moss_dit::BlockPath::kOpByOp) {
-    r.plan_only_notes.push_back("fused self-check: not run in this process yet; the denoise workspace is sized for the "
-                                "op-by-op route (larger than the fused one: a conservative plan)");
-  }
-  if (impl_->options.embedding_cache && !impl_->options.cache_dir.empty()) {
-    r.plan_only_notes.push_back("embedding cache: its folder is not read; the text encoder is planned to run");
+  add_notes();
+  if (r.gguf_pending) {
+    char b[160];
+    std::snprintf(b, sizeof b, "%.1f GB; about %.0f s", static_cast<double>(r.gguf_pending->converted_bytes) / 1e9,
+                  r.gguf_pending->seconds);
+    notes.push_back(util::path_utf8(m.options.dit_file) + ": the first load converts the GGUF DiT into the cache directory (" +
+                    r.gguf_pending->runs_as + ", " + b + "); the checks that size the DiT (workspaces, the plan) follow "
+                    "the conversion");
   }
   return r;
 }
@@ -874,8 +893,10 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
       if (m.dit) m.dit->set_input_extension(nullptr);
       m.control_emb.reset();
       std::unique_ptr<control::DeviceEmbedder> e;
+      m.control_plan_bytes = 0;
       if (m.options.plan_only) {
-        m.control_plan_bytes = bytes;  // planned by its size, never uploaded
+        control::DeviceEmbedder::check(ew);  // the upload's own check; planned by its size, never uploaded
+        m.control_plan_bytes = bytes;
       } else {
         if (m.arena && runtime::DeviceArena::free_device_bytes() < bytes + m.options.vram_reserve) m.release_arena();
         try {
@@ -904,6 +925,7 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
   } else {
     if (m.dit) m.dit->set_input_extension(nullptr);
     m.control_emb.reset();
+    m.control_plan_bytes = 0;
     m.control_file.reset();
     m.control_key.clear();
   }
@@ -1024,7 +1046,11 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
         }
       }
       if (changed) {
-        m.lora_sb->update_strengths(*m.lora_stack);  // between forwards: nothing reads them now
+        if (m.options.plan_only) {
+          m.lora_sb = std::make_unique<lora::SideBranches>(*m.lora_stack, lora::SideBranches::LayoutOnly{});
+        } else {
+          m.lora_sb->update_strengths(*m.lora_stack);  // between forwards: nothing reads them now
+        }
         // Merged adapters: re-merged from the pristine weights kept at load, in place (no reload).
         // A model merged without pristine copies (an edit adapter's blocks) is reloaded instead (its key cleared).
         if (m.dit && m.dit_merge_key == files && !m.dit->can_remerge()) m.dit_merge_key.clear();
@@ -1102,7 +1128,9 @@ Pipeline::Impl::CallDit Pipeline::Impl::setup_dit_call(const DitSource& src, Res
   // meanwhile (another pipeline's failed self-check) applies from the next request on instead of failing a step.
   d.route = d.block_path == moss_dit::BlockPath::kOpByOp ? moss_dit::FusedRouteSnapshot{} : moss_dit::fused_route_snapshot();
   // Plan-only: the check found is not installed (process state); the route is sized as installing it would make it.
-  if (options.plan_only && d.block_path != moss_dit::BlockPath::kOpByOp && fused_check) {
+  // A poisoned route (a failed check installed: generation set, nothing validated) stays op by op.
+  const bool poisoned = d.route.generation > 0 && d.route.validated.empty();
+  if (options.plan_only && d.block_path != moss_dit::BlockPath::kOpByOp && fused_check && !poisoned) {
     d.route.validated.insert(d.route.validated.end(), fused_check->validated.begin(), fused_check->validated.end());
   }
   d.attention = dit_attention(r.tier.attention);
@@ -1649,6 +1677,13 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
 
   // Machine profile and block path (the first call probes and self-checks; both are cached), the request's fused route,
   // attention and compute config.
+  if (src.pending) {
+    // Pipeline::check of an unconverted GGUF DiT: everything above ran; what follows sizes the DiT.
+    r.gguf_pending = src.pending;
+    tm.total_s = since(t_total);
+    m.mem = nullptr;
+    return r;
+  }
   const Impl::CallDit dit_call = m.setup_dit_call(src, r);
   const moss_dit::BlockPath block_path = dit_call.block_path;
   const moss_dit::FusedRouteSnapshot& route = dit_call.route;
