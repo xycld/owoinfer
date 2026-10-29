@@ -1192,7 +1192,7 @@ class GpuProtocolTest(ProtocolTestBase):
         done = self.wait_done(gid, events)
         self.assertEqual(done["status"], "error", done)
         self.assertEqual(done["error"]["code"], "invalid_argument", done)
-        self.assertIn("that is the Reference tier", done["error"]["message"])
+        self.assertIn("is the Reference configuration; use tier reference", done["error"]["message"])
 
     def test_p6_preview_sampler_metadata(self):
         self.load_base()
