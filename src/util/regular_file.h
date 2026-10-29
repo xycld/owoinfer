@@ -203,8 +203,8 @@ bool make_directories(const std::filesystem::path& dir);
 // Sets the modification time of `path` to now, or deletes it: a file in the folder whose resolved_path is `dir` (a
 // cache folder, resolved once). Windows: through one handle opened without following a final reparse point
 // (FILE_FLAG_OPEN_REPARSE_POINT, kUserPathSqos) that must be a plain regular file (no reparse point) whose final
-// path's folder is `dir`: SetFileTime, or SetFileInformationByHandle(FileDispositionInfo). POSIX: utimensat(2) /
-// unlink(2) of the path. False when refused or failed.
+// path's folder is `dir`: SetFileTime, or SetFileInformationByHandle(FileDispositionInfo). POSIX: utimensat(2) with
+// AT_SYMLINK_NOFOLLOW / unlink(2) of the path. False when refused or failed.
 bool touch_file_in(const std::filesystem::path& dir, const std::filesystem::path& path);
 bool remove_file_in(const std::filesystem::path& dir, const std::filesystem::path& path);
 

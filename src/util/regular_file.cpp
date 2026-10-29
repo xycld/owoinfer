@@ -621,7 +621,7 @@ bool list_directory(const std::filesystem::path& dir, std::vector<DirEntry>& out
 }
 
 bool touch_file_in(const std::filesystem::path&, const std::filesystem::path& path) {
-  return ::utimensat(AT_FDCWD, path.c_str(), nullptr, 0) == 0;
+  return ::utimensat(AT_FDCWD, path.c_str(), nullptr, AT_SYMLINK_NOFOLLOW) == 0;  // a link is never followed out
 }
 
 bool remove_file_in(const std::filesystem::path&, const std::filesystem::path& path) {
