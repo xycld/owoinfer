@@ -92,6 +92,8 @@ struct Generation {
   // mi_result_text() kinds.
   std::string dit_load_note, te_note, preload_note, step_cache_threshold_source;
   std::string component_note;  // MI_TEXT_COMPONENT_NOTE: mi_run_end()'s results only
+  std::string references_json;                  // MI_TEXT_REFERENCES ("" without reference images)
+  std::vector<std::string> reference_warnings;  // MI_MESSAGE_REFERENCE_WARNING
 };
 
 // The pipeline request of `params` (a full-size struct): the unset markers resolved (mossinfer.h), a distill bundle

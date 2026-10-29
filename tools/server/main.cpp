@@ -8,6 +8,7 @@
 // unusable), so anything else printing to stdout (the engine, a library) never reaches the protocol stream.
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -145,7 +146,8 @@ std::string protocol_names(std::string message) {
       {"hires_width / hires_height", "hires"}, {"hires_width and hires_height", "hires width and height"},
       {"with MI_MASK_BINARY01", "with mask_encoding \"binary01\""},
       // "control_images[0].image_path" -> "control.images[0].path".
-      {"control_images", "control.images"}, {".image_path", ".path"}, {"control_adapter", "control.adapter"},
+      {"control_images", "control.images"}, {"reference_images", "references.images"},
+      {"reference_max_edge", "references.max_edge"}, {".image_path", ".path"}, {"control_adapter", "control.adapter"},
       {"control_lora_strength", "control.lora_strength"}};
   for (const auto& [from, to] : kRenames) {
     for (std::size_t at = 0; (at = message.find(from, at)) != std::string::npos;) {
@@ -415,6 +417,42 @@ class Params {
     if (!have_adapter) throw RequestError("invalid_params", "\"" + k0 + ".adapter\" (the control adapter file) is required");
     return c;
   }
+  // `references`: {"images": [path, ...] (1 or more, in order), "max_edge": integer (optional)}.
+  struct References {
+    std::vector<std::string> images;
+    std::optional<std::int64_t> max_edge;
+  };
+  std::optional<References> references(std::string_view key) const {
+    const Value* v = find(key);
+    if (v == nullptr) return std::nullopt;
+    const std::string k0(key);
+    if (!v->is_object()) throw bad(key, "an object {\"images\", \"max_edge\"?}");
+    References r;
+    bool have_images = false;
+    for (const auto& [k, m] : v->as_object()) {
+      if (k == "images") {
+        if (have_images) throw RequestError("invalid_params", "\"" + k0 + "\" has \"images\" more than once");
+        have_images = true;
+        if (!m.is_array() || m.as_array().empty()) throw bad(k0 + ".images", "a non-empty array of image paths");
+        for (const Value& e : m.as_array()) {
+          const std::string item = k0 + ".images[" + std::to_string(r.images.size()) + "]";
+          if (!e.is_string() || e.as_string().empty()) throw bad(item, "a non-empty string (an image file)");
+          if (e.as_string().find('\0') != std::string::npos) throw bad(item, "a string without NUL characters");
+          r.images.push_back(e.as_string());
+        }
+      } else if (k == "max_edge") {
+        if (r.max_edge) throw RequestError("invalid_params", "\"" + k0 + "\" has \"max_edge\" more than once");
+        if (!m.is_number() || m.as_double() != std::floor(m.as_double()) || m.as_double() < 16 || m.as_double() > 2048) {
+          throw bad(k0 + ".max_edge", "an integer from 16 to 2048");
+        }
+        r.max_edge = static_cast<std::int64_t>(m.as_double());
+      } else {
+        throw RequestError("invalid_params", "\"" + k0 + "\" has an unknown member \"" + k + "\"");
+      }
+    }
+    if (!have_images) throw RequestError("invalid_params", "\"" + k0 + ".images\" is required");
+    return r;
+  }
 
  private:
   static RequestError bad(std::string_view key, const std::string& what) {
@@ -616,6 +654,7 @@ class Server {
            ",\"release\":" + tf(caps & MI_CAP_RELEASE) + ",\"certificate_dirs\":" + tf(caps & MI_CAP_CERTIFICATE_DIRS) +
            ",\"te_host_pin\":" + tf(caps & MI_CAP_TE_HOST_PIN) + ",\"progress_fraction\":" +
            tf(caps & MI_CAP_PROGRESS_FRACTION) + ",\"inspect\":" + tf(caps & MI_CAP_INSPECT) +
+           ",\"references\":" + tf(caps & MI_CAP_REFERENCE_IMAGES) +
            "},\"values\":{" + values + "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
@@ -689,7 +728,7 @@ class Server {
             "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length", "sampler", "scheduler",
             "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise", "dataspace", "loras", "save_metadata",
             "include_prompts", "preview_output", "preview_every", "init_image", "mask", "mask_encoding",
-            "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation", "step_cache",
+            "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation", "step_cache", "references",
             "step_cache_threshold"});
     auto w = std::make_unique<Work>();
     const auto output = p.string("output");
@@ -705,6 +744,7 @@ class Server {
             "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length", "sampler", "scheduler",
             "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise", "dataspace", "loras", "init_image", "mask",
             "mask_encoding", "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation", "step_cache",
+            "references",
             "step_cache_threshold"});
     auto w = std::make_unique<Work>();
     request_params(p, *w, true);
@@ -826,6 +866,18 @@ class Server {
       }
       g.control_images = w->control_images.data();
       g.control_images_count = w->control_images.size();
+    }
+    // Reference images of an edit adapter: paths only, like init_image (read by the library when the job runs).
+    if (auto r = p.references("references")) {
+      w->reference_paths = std::move(r->images);
+      for (const std::string& path : w->reference_paths) {
+        mi_reference_image ri{};
+        ri.image_path = path.c_str();
+        w->references.push_back(ri);
+      }
+      g.reference_images = w->references.data();
+      g.reference_images_count = w->references.size();
+      if (r->max_edge) g.reference_max_edge = static_cast<std::int32_t>(*r->max_edge);
     }
     if (const auto v = p.number("cfg_truncation")) g.cfg_truncation = *v;
     if (const auto v = p.name("step_cache", mi::server::kStepCacheNames)) g.step_cache = *v;
@@ -1039,6 +1091,8 @@ class Server {
     std::string control_adapter;
     std::vector<std::string> control_strings;    // kind, path of each control image
     std::vector<mi_control_image> control_images;  // points into control_strings
+    std::vector<std::string> reference_paths;
+    std::vector<mi_reference_image> references;  // points into reference_paths
     Job* job = nullptr;
     Output* out = nullptr;
     mi_engine* engine = nullptr;

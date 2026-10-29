@@ -116,7 +116,7 @@ int main(void) {
   FIELD(mi_progress, fraction, 40);
   FIELD(mi_progress, eta_seconds, 48);
 
-  SIZE(mi_gen_params, 376);
+  SIZE(mi_gen_params, 400);
   FIELD(mi_gen_params, struct_size, 0);
   FIELD(mi_gen_params, prompt, 8);
   FIELD(mi_gen_params, negative_prompt, 16);
@@ -174,7 +174,17 @@ int main(void) {
   FIELD(mi_gen_params, cfg_truncation, 352);
   FIELD(mi_gen_params, step_cache, 360);
   FIELD(mi_gen_params, _reserved4, 364);
-  FIELD(mi_gen_params, step_cache_threshold, 368);
+  FIELD(mi_gen_params, step_cache_threshold, 368); /* the 2.0.0 layout ends here (376 bytes) */
+  FIELD(mi_gen_params, reference_images, 376);
+  FIELD(mi_gen_params, reference_images_count, 384);
+  FIELD(mi_gen_params, reference_max_edge, 392);
+  FIELD(mi_gen_params, _reserved5, 396);
+
+  SIZE(mi_reference_image, 24); /* array element without struct_size: frozen */
+  FIELD(mi_reference_image, image, 0);
+  FIELD(mi_reference_image, image_path, 8);
+  FIELD(mi_reference_image, _reserved0, 16);
+  FIELD(mi_reference_image, _reserved1, 20);
 
   SIZE(mi_control_image, 48); /* array element without struct_size: frozen */
   FIELD(mi_control_image, kind, 0);
