@@ -886,30 +886,87 @@ bool make_junction(const std::filesystem::path& dir, const std::wstring& target)
   return ok;
 }
 
+// One instance of the named pipe \\.\pipe\<name> with an overlapped ConnectNamedPipe pending: connected() says,
+// without waiting, whether a client open reached it; the server side then reads what the client wrote and impersonates
+// it.
+class PipeInstance {
+ public:
+  PipeInstance(const std::wstring& name, bool first) {
+    event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ov_.hEvent = event_;
+    const DWORD open = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0);
+    pipe_ = CreateNamedPipeW((L"\\\\.\\pipe\\" + name).c_str(), open, PIPE_TYPE_BYTE | PIPE_WAIT,
+                             PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, nullptr);
+    if (pipe_ != INVALID_HANDLE_VALUE && !ConnectNamedPipe(pipe_, &ov_) && GetLastError() == ERROR_PIPE_CONNECTED) {
+      SetEvent(event_);
+    }
+  }
+  ~PipeInstance() {
+    if (pipe_ != INVALID_HANDLE_VALUE) {
+      CancelIo(pipe_);
+      CloseHandle(pipe_);
+    }
+    if (event_ != nullptr) CloseHandle(event_);
+  }
+  PipeInstance(const PipeInstance&) = delete;
+  PipeInstance& operator=(const PipeInstance&) = delete;
+
+  bool ok() const { return pipe_ != INVALID_HANDLE_VALUE && event_ != nullptr; }
+  bool connected() const { return WaitForSingleObject(event_, 0) == WAIT_OBJECT_0; }
+  // Reads the byte the client wrote (a pipe server may impersonate only after a read), then impersonates the client:
+  // its token's SECURITY_IMPERSONATION_LEVEL, or -1 when ImpersonateNamedPipeClient refuses.
+  int read_and_impersonate() {
+    char byte = 0;
+    DWORD n = 0;
+    ResetEvent(event_);
+    if (!ReadFile(pipe_, &byte, 1, nullptr, &ov_) && GetLastError() != ERROR_IO_PENDING) return -1;
+    if (!GetOverlappedResult(pipe_, &ov_, &n, TRUE) || n != 1) return -1;
+    return impersonate();
+  }
+  int impersonate() {
+    if (!ImpersonateNamedPipeClient(pipe_)) return -1;
+    HANDLE token = nullptr;
+    SECURITY_IMPERSONATION_LEVEL level = SecurityAnonymous;
+    DWORD n = 0;
+    const bool queried = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token) &&
+                         GetTokenInformation(token, TokenImpersonationLevel, &level, sizeof level, &n);
+    if (token != nullptr) CloseHandle(token);
+    RevertToSelf();
+    return queried ? static_cast<int>(level) : -2;
+  }
+
+ private:
+  HANDLE pipe_ = INVALID_HANDLE_VALUE;
+  HANDLE event_ = nullptr;
+  OVERLAPPED ov_{};
+};
+
+std::vector<std::unique_ptr<PipeInstance>> pipe_instances(const std::wstring& name, int count) {
+  std::vector<std::unique_ptr<PipeInstance>> out;
+  for (int i = 0; i < count; ++i) out.push_back(std::make_unique<PipeInstance>(name, i == 0));
+  return out;
+}
+
+int connected_count(const std::vector<std::unique_ptr<PipeInstance>>& pipes) {
+  int n = 0;
+  for (const auto& p : pipes) n += p->connected() ? 1 : 0;
+  return n;
+}
+
 }  // namespace
 
 // The design limit of check_user_path (it classifies the text only): a junction inside a folder the engine reads can
-// lead an ordinary-looking path to a named pipe. The handle-based helpers refuse it (kOther, kNotRegular, no output
-// file), and their opens carry SECURITY_IDENTIFICATION, so the pipe's server cannot impersonate the engine: a junction
-// to the pipe itself, and a junction to the pipe namespace with the pipe's name below it (a cache folder redirected).
+// lead an ordinary-looking path to a named pipe, with a server listening. Every helper refuses it and none blocks:
+//   - a junction to the pipe namespace (\??\pipe\) with the pipe's name below it (a cache folder redirected) reaches
+//     the pipe: file_info says kOther, open_regular_file kNotRegular, OutputFile and FileReader refuse, and whatever
+//     the server gets from those opens impersonates at SecurityIdentification at most;
+//   - a junction that is itself the final component, to \??\pipe\<name>: Windows does not resolve a final-component
+//     mount point to a pipe (the open fails as not found), and the helpers fail closed: never a regular file.
 TEST(RegularFile, WindowsJunctionToPipeIsRefused) {
   TempDir dir("junction_pipe");
   const std::wstring name = L"mi_test_pipe_" + std::to_wstring(GetCurrentProcessId());
-  // Enough instances for every open below (each client open takes one).
-  std::vector<HANDLE> servers;
-  for (int i = 0; i < 12; ++i) {
-    const DWORD first = i == 0 ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0;
-    HANDLE s = CreateNamedPipeW((L"\\\\.\\pipe\\" + name).c_str(), PIPE_ACCESS_DUPLEX | first, PIPE_TYPE_BYTE,
-                                PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, nullptr);
-    ASSERT_NE(s, INVALID_HANDLE_VALUE) << GetLastError();
-    servers.push_back(s);
-  }
-  struct Servers {
-    const std::vector<HANDLE>* h;
-    ~Servers() {
-      for (HANDLE s : *h) CloseHandle(s);
-    }
-  } closer{&servers};
+  const auto pipes = pipe_instances(name, 16);  // enough for every client open below
+  for (const auto& p : pipes) ASSERT_TRUE(p->ok()) << GetLastError();
   const std::filesystem::path to_pipe = dir.path() / "model.safetensors";
   const std::filesystem::path to_namespace = dir.path() / "cache";
   std::filesystem::create_directory(to_pipe);
@@ -918,15 +975,70 @@ TEST(RegularFile, WindowsJunctionToPipeIsRefused) {
     GTEST_SKIP() << "this file system refuses junctions (" << GetLastError() << ")";
   }
   const std::filesystem::path in_namespace = to_namespace / name;
-  for (const std::filesystem::path& p : {to_pipe, in_namespace}) {
+  for (const std::filesystem::path& p : {in_namespace, to_pipe}) {
     SCOPED_TRACE(p.string());
+    const auto t0 = std::chrono::steady_clock::now();
     EXPECT_NO_THROW(mi::util::check_user_path(p, "dit_file"));  // the text is an ordinary path
-    EXPECT_EQ(mi::util::file_info(p).kind, mi::util::FileKind::kOther);
+    const mi::util::FileInfo info = mi::util::file_info(p);
+    EXPECT_FALSE(info.regular() || info.directory());
     void* handle = nullptr;
-    EXPECT_EQ(mi::util::open_regular_file(p, FILE_ATTRIBUTE_NORMAL, handle), mi::util::OpenStatus::kNotRegular);
+    EXPECT_NE(mi::util::open_regular_file(p, FILE_ATTRIBUTE_NORMAL, handle), mi::util::OpenStatus::kOk);
     EXPECT_FALSE(mi::util::OutputFile(p).is_open());
     EXPECT_THROW(FileReader{p}, IoError);
+    EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), 5.0);
+    if (p == in_namespace) {
+      EXPECT_EQ(info.kind, mi::util::FileKind::kOther);
+      EXPECT_GT(connected_count(pipes), 0) << "the opens did not reach the pipe";
+    } else {
+      EXPECT_NE(info.kind, mi::util::FileKind::kRegular);
+    }
   }
+  // The engine's opens write nothing, so the server cannot even read before impersonating; were impersonation
+  // allowed, it would be at identification level.
+  for (const auto& p : pipes) {
+    if (!p->connected()) continue;
+    const int level = p->impersonate();
+    EXPECT_TRUE(level == -1 || level == SecurityIdentification) << level;
+  }
+}
+
+// What the server of a pipe gets from a client that opens it with the engine's flags (util::kUserPathSqos, on every
+// CreateFileW of a user path) and writes: ImpersonateNamedPipeClient succeeds, but the token is at
+// SecurityIdentification, so the server can learn who the engine runs as and cannot act as it. The same client without
+// SQOS gives SecurityImpersonation: the test can tell the two apart. With every instance busy, file_info returns at
+// once (kOther from ERROR_PIPE_BUSY), never waiting for an instance.
+TEST(RegularFile, WindowsPipeOpenIsIdentificationOnlyAndNeverBlocks) {
+  const std::wstring name = L"mi_test_sqos_" + std::to_wstring(GetCurrentProcessId());
+  const std::wstring path = L"\\\\.\\pipe\\" + name;
+  const auto level_of = [&](DWORD flags) {
+    PipeInstance server(name, true);
+    if (!server.ok()) return -3;
+    HANDLE client = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, flags, nullptr);
+    if (client == INVALID_HANDLE_VALUE) return -4;
+    const char byte = 1;
+    DWORD n = 0;
+    const bool wrote = WriteFile(client, &byte, 1, &n, nullptr) && n == 1;
+    const int level = wrote ? server.read_and_impersonate() : -5;
+    CloseHandle(client);
+    return level;
+  };
+  EXPECT_EQ(level_of(FILE_ATTRIBUTE_NORMAL | mi::util::kUserPathSqos), SecurityIdentification);
+  EXPECT_EQ(level_of(FILE_ATTRIBUTE_NORMAL), SecurityImpersonation);
+
+  TempDir dir("pipe_busy");
+  const std::filesystem::path to_namespace = dir.path() / "cache";
+  std::filesystem::create_directory(to_namespace);
+  if (!make_junction(to_namespace, L"\\??\\pipe\\")) GTEST_SKIP() << "this file system refuses junctions";
+  PipeInstance only(name, true);
+  ASSERT_TRUE(only.ok());
+  HANDLE holder = CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, mi::util::kUserPathSqos, nullptr);
+  ASSERT_NE(holder, INVALID_HANDLE_VALUE) << GetLastError();
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(mi::util::file_info(to_namespace / name).kind, mi::util::FileKind::kOther);
+  void* handle = nullptr;
+  EXPECT_NE(mi::util::open_regular_file(to_namespace / name, FILE_ATTRIBUTE_NORMAL, handle), mi::util::OpenStatus::kOk);
+  EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), 5.0);
+  CloseHandle(holder);
 }
 
 // A regular file's info from its handle: the size, the last write time GetFileTime reports (as nanoseconds since the

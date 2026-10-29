@@ -127,7 +127,8 @@ namespace {
 // SECURITY_IDENTIFICATION on every open of a user path: were it a pipe after all, its server could identify the caller
 // but not impersonate it.
 constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-constexpr DWORD kSqos = SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
+static_assert(kUserPathSqos == (SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION));
+constexpr DWORD kSqos = kUserPathSqos;
 
 // The attributes-only open of file_info: reads no data (BACKUP_SEMANTICS: a directory opens too).
 HANDLE open_attributes(const std::filesystem::path& path) {

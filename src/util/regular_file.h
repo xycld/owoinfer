@@ -100,6 +100,12 @@ std::filesystem::path resolved_path(const std::filesystem::path& path);
 std::filesystem::path path_key(const std::filesystem::path& path);
 
 #ifdef _WIN32
+// SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, carried by every CreateFileW of a user path: a pipe reached
+// through a reparse point can identify the engine's account but never act as it. Identification, not Anonymous: an
+// SMB server receives the level with every file open on a share (model folders on a NAS are supported) and an
+// anonymous one may be refused there; what Identification discloses is the account's name and groups.
+inline constexpr unsigned long kUserPathSqos = 0x00110000;
+
 // windows_path_names_device of the path or of its GetFullPathNameW form (true too when there is no full path): such a
 // path is never handed to CreateFileW. (A pipe opened without SECURITY_SQOS_PRESENT would let its server impersonate
 // the caller; a device's open runs its driver.) Every CreateFileW of a user path checks it first.
