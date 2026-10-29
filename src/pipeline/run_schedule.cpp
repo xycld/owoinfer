@@ -37,12 +37,17 @@ std::vector<float> engine_sigmas(SchedulerKind kind, int steps, const FlowSampli
   if (!std::isfinite(strength) || strength < 0.0 || strength > 1.0) {
     throw std::invalid_argument("engine_sigmas: denoise strength must be in [0, 1], got " + num(strength));
   }
-  std::vector<float> sigmas = make_schedule(kind, steps, fs).sigmas;
-  const int n = static_cast<int>(sigmas.size()) - 1;
-  const int start = strength_start_step(n, strength);
-  if (start >= n) return {};  // no step left (mi_generate runs no DiT)
-  sigmas.erase(sigmas.begin(), sigmas.begin() + start);
-  return sigmas;
+  Schedule pass = strength_pass(make_schedule(kind, steps, fs), strength);
+  if (pass.num_steps() == 0) return {};  // no step left (mi_generate runs no DiT)
+  return std::move(pass.sigmas);
+}
+
+Schedule strength_pass(Schedule full, double strength, int* start) {
+  const int skip = strength_start_step(full.num_steps(), strength);
+  full.sigmas.erase(full.sigmas.begin(), full.sigmas.begin() + skip);
+  full.timesteps.erase(full.timesteps.begin(), full.timesteps.begin() + skip);
+  if (start != nullptr) *start = skip;
+  return full;
 }
 
 std::size_t first_schedule_difference(std::span<const float> a, std::span<const float> b) {

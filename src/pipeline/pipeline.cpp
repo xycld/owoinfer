@@ -40,6 +40,7 @@
 #include "pipeline/quality_report.h"
 #include "pipeline/report_json.h"
 #include "pipeline/rng_torch_compat.h"
+#include "pipeline/run_schedule.h"
 #include "planner/host_memory.h"
 #include "runtime/device_arena.h"
 #include "runtime/stream_set.h"
@@ -1899,19 +1900,15 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   const bool hires = req.hires.enabled();
   const bool inpaint = req.mask != nullptr;
   const bool img2img = req.init_image != nullptr && (req.denoise_strength < 1.0 || inpaint);
-  const auto crop_schedule = [](Schedule s, int start) {
-    s.sigmas.erase(s.sigmas.begin(), s.sigmas.begin() + start);
-    s.timesteps.erase(s.timesteps.begin(), s.timesteps.begin() + start);
-    return s;
-  };
   const int H1 = req.height, W1 = req.width;
   const int H2 = hires ? req.hires.height : H1, W2 = hires ? req.hires.width : W1;
   r.image_mode = inpaint ? "inpaint" : img2img ? "img2img" : "txt2img";
   if (req.init_image != nullptr && !img2img) {
     r.image_note = "denoise strength 1 without a mask samples from pure noise: the init image was not used";
   }
-  const int start1 = (req.init_image == nullptr) ? 0 : strength_start_step(schedule.num_steps(), req.denoise_strength);
-  const Schedule sched1 = crop_schedule(schedule, start1);
+  // The pass's share of the schedule (run_schedule.h: the crop engine_sigmas makes too); txt2img runs all of it.
+  int start1 = 0;
+  const Schedule sched1 = strength_pass(schedule, req.init_image == nullptr ? 1.0 : req.denoise_strength, &start1);
   r.first_pass.width = W1;
   r.first_pass.height = H1;
   r.first_pass.schedule_steps = schedule.num_steps();
@@ -1920,8 +1917,8 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   Schedule sched2;
   if (hires) {
     const Schedule full = make_schedule(req.scheduler, req.hires.steps > 0 ? req.hires.steps : req.steps, flow);
-    const int start2 = strength_start_step(full.num_steps(), req.hires.strength);
-    sched2 = crop_schedule(full, start2);
+    int start2 = 0;
+    sched2 = strength_pass(full, req.hires.strength, &start2);
     r.hires.width = W2;
     r.hires.height = H2;
     r.hires.schedule_steps = full.num_steps();

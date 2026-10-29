@@ -26,12 +26,17 @@ namespace mi::pipeline {
 // Longest schedule a run takes: kMaxDenoiseSteps (pipeline/sampler.h) steps plus the terminal value.
 inline constexpr std::size_t kMaxRunSigmas = 10001;
 
-// mi_generate's sigmas for one pass: make_schedule(kind, steps, fs) cropped to the tail a denoise strength leaves
-// (strength_start_step, the img2img rule of Pipeline::run); strength 1 is the whole schedule. Empty when no step is
-// left (strength 0). Throws std::invalid_argument as make_schedule, or for a strength outside [0, 1].
-// Two differences from Pipeline::run as it is today, which does not call this function yet: mi_generate ignores the
-// strength without an init image (txt2img always runs the whole schedule), and its dataspace sampler takes
-// dataspace_sigmas instead of make_schedule (no dataspace here: the component API does not offer that sampler).
+// The pass of schedule `full` that a denoise strength leaves (the diffusers get_timesteps rule): its first
+// strength_start_step(full.num_steps(), strength) steps dropped from the sigmas and the timesteps, the terminal sigma
+// kept (num_steps() 0 when no step is left). `start` (optional) receives that count. Pipeline::run's passes (img2img,
+// the hires fix's second pass) and engine_sigmas() both crop with it.
+Schedule strength_pass(Schedule full, double strength, int* start = nullptr);
+
+// mi_generate's sigmas for one pass: strength_pass(make_schedule(kind, steps, fs), strength); strength 1 is the whole
+// schedule. Empty when no step is left (strength 0). Throws std::invalid_argument as make_schedule, or for a strength
+// outside [0, 1]. Two differences from Pipeline::run: mi_generate ignores the strength without an init image (txt2img
+// runs the whole schedule: strength 1 here), and its dataspace sampler takes dataspace_sigmas instead of make_schedule
+// (the component API does not offer that sampler).
 std::vector<float> engine_sigmas(SchedulerKind kind, int steps, const FlowSampling& fs, double strength);
 
 // Index of the first position where a and b differ bit for bit (a shorter array differs at its end), or npos when they
