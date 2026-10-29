@@ -1138,6 +1138,26 @@ bool Pipeline::Impl::prepare_dit(DitSource& src, const moss_dit::Residency& resi
   return true;
 }
 
+std::vector<float> Pipeline::Impl::encode_image(const EncoderSource& e, const Image& im, PassReport& pass, Timings& tm) {
+  Impl& m = *this;
+  const cudaStream_t stream = streams.compute();
+  m.ensure_encoder(e, encode_need_of(im.height, im.width), tm);
+  const auto te0 = Clock::now();
+  runtime::StackScope scope(*m.arena);
+  const Tensor lat = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, im.height / 16, im.width / 16});
+  const Tensor rgb = Tensor::view(const_cast<std::uint8_t*>(im.pixels.data()), DType::kU8, Device::kCPU, {im.height, im.width, 3});
+  const flux2_vae_encoder::TilePlan used =
+      m.encoder->encode_within(rgb, lat, flux2_vae_encoder::EncodeOptions{}, m.arena->available(), stream);
+  std::vector<float> z(static_cast<std::size_t>(lat.numel()));
+  MI_CUDA_CHECK(cudaMemcpyAsync(z.data(), lat.data, lat.nbytes(), cudaMemcpyDeviceToHost, stream));
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+  pass.encoded = true;
+  pass.encode_schedule += (pass.encode_schedule.empty() ? "" : "; ") + (used.tiled() ? used.describe() : std::string("untiled"));
+  tm.encode_s += since(te0);
+  m.sample_memory();
+  return z;
+}
+
 // generate(), or with `preload` the same up to the plan and the arena, then the loads of the models the plan keeps.
 Result Pipeline::run(const Request& req, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
@@ -1358,9 +1378,6 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   // VAE encodes (latents + the smallest exact tiling; at run time the encode takes the fastest tiling the arena leaves):
   // the init image at the request size, the upscaled first image (and, inpainting, the init image) at the hires size.
   std::size_t encode_need = 0;
-  const auto encode_need_of = [&](int H, int W) {
-    return latent_bytes_of(H, W) + flux2_vae_encoder::Flux2VaeEncoder::plan_min_memory(H, W).workspace_bytes;
-  };
   if (img2img || (ctl_encode && sched1.num_steps() > 0)) encode_need = encode_need_of(H1, W1);
   if (hires) encode_need = std::max(encode_need, encode_need_of(H2, W2));
   // The decodes that run: the hires fix's first pass (for the upscale) and the final one; the plan sizes the larger.
@@ -1544,25 +1561,8 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     }
   }
 
-  // Host latents of an RGB image at its own size: the VAE encoder's posterior mean, on the arena stack with what the
-  // resident models leave (encode_within: exact tiling when the untiled encode does not fit, same bytes).
-  const auto encode_image = [&](const Image& im, PassReport& pass) {
-    m.ensure_encoder(*enc_src, encode_need_of(im.height, im.width), tm);
-    const auto te0 = Clock::now();
-    runtime::StackScope scope(*m.arena);
-    const Tensor lat = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, im.height / 16, im.width / 16});
-    const Tensor rgb = Tensor::view(const_cast<std::uint8_t*>(im.pixels.data()), DType::kU8, Device::kCPU, {im.height, im.width, 3});
-    const flux2_vae_encoder::TilePlan used =
-        m.encoder->encode_within(rgb, lat, flux2_vae_encoder::EncodeOptions{}, m.arena->available(), stream);
-    std::vector<float> z(static_cast<std::size_t>(lat.numel()));
-    MI_CUDA_CHECK(cudaMemcpyAsync(z.data(), lat.data, lat.nbytes(), cudaMemcpyDeviceToHost, stream));
-    MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-    pass.encoded = true;
-    pass.encode_schedule += (pass.encode_schedule.empty() ? "" : "; ") + (used.tiled() ? used.describe() : std::string("untiled"));
-    tm.encode_s += since(te0);
-    m.sample_memory();
-    return z;
-  };
+  // Host latents of an RGB image at its own size (Impl::encode_image).
+  const auto encode_image = [&](const Image& im, PassReport& pass) { return m.encode_image(*enc_src, im, pass, tm); };
   // An image brought to H x W by the request's resize mode (host, PIL-exact Lanczos).
   const auto sized = [&](const Image& im, int H, int W) {
     const auto ti = Clock::now();

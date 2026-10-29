@@ -71,6 +71,11 @@ inline std::size_t latent_bytes_of(int H, int W) {
 }
 inline std::size_t image_bytes_of(int H, int W) { return static_cast<std::size_t>(H) * static_cast<std::size_t>(W) * 3; }
 inline std::size_t bf16_rows(std::int64_t s, std::int64_t c) { return runtime::align_up(static_cast<std::size_t>(s * c) * 2); }
+// A VAE encode at H x W: its latents and the smallest exact tiling (at run time the encode takes the fastest tiling the
+// arena leaves).
+inline std::size_t encode_need_of(int H, int W) {
+  return latent_bytes_of(H, W) + flux2_vae_encoder::Flux2VaeEncoder::plan_min_memory(H, W).workspace_bytes;
+}
 
 // The denoise phase's stack of one pass at height x width (denoise_stack_bytes): the refined texts, then the larger of
 // the refiner (its inputs and workspace) and the pass's buffers: the latents, a control adapter's input latents, a
@@ -1061,6 +1066,10 @@ struct Pipeline::Impl {
                    const std::string& merge_key, const std::atomic<bool>* cancel, const moss_dit::LinearInputHook& linear_inputs,
                    Result& r);
 
+  // Host latents [128, H / 16, W / 16] of an RGB image at its own size (sides multiples of 16): the VAE encoder `e`'s
+  // posterior mean (loaded as needed), on the arena stack with what the resident models leave (encode_within: exact
+  // tiling when the untiled encode does not fit, same bytes). The tiling used is appended to pass.encode_schedule.
+  std::vector<float> encode_image(const EncoderSource& e, const Image& im, PassReport& pass, Timings& tm);
   // Private host memory the pipeline holds itself across calls (cache contents, text-encoder rings and host copy),
   // which the planner adds on its own and must not count twice. The planner adds the text encoder's share only when
   // it runs: on a full embedding-cache hit the encoder's held memory stays in the baseline.
