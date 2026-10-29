@@ -319,6 +319,10 @@ class MossDit {
   // with): re-merges every merged module from the pristine weights kept at load, into the device weights and the
   // pinned host copies of streamed blocks. Synchronizes the device; call between forwards.
   void remerge_lora(const lora::LoraStack& stack);
+  // Whether remerge_lora / rebase_merges can change the merged adapters in place: false once a module was merged at load
+  // without a pristine copy (lora::Adapter::keep_pristine: a merged edit adapter's block modules); remerge_lora then
+  // throws std::logic_error and rebase_merges returns false (reload the model).
+  bool can_remerge() const { return !no_pristine_; }
   // Switches the merged adapters to those of `stack` (nullptr: none) without reloading: every module merged now is
   // merged again from its pristine copy (its pristine bits when `stack` does not merge it, the copy then dropped), and a
   // module `stack` merges that is not merged yet is kept and merged in place, the same bits as a load with `stack`.
@@ -514,6 +518,7 @@ class MossDit {
   static void remerge_into(const lora::PristineWeights& pristine, const lora::LoraStack& stack, const std::string& module,
                            const MergeTarget& t, MergeStaging& staging);
   std::unique_ptr<lora::PristineWeights> pristine_;
+  bool no_pristine_ = false;  // some module merged at load without a pristine copy (can_remerge)
   std::vector<std::pair<std::string, MergeTarget>> merge_targets_;
   // rebase_merges' memo: the merged bits of the stack named memo_key_, by module.
   std::string memo_key_;

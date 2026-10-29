@@ -503,10 +503,68 @@ TEST(LoraFormat, Int8MergeWarnings) {
   LoadOptions opt;
   opt.int8_block_gemms = true;
   const LoraStack q = open1(dir.path() / "w.safetensors", 1.0f, opt);
-  ASSERT_EQ(q.reports()[0].warnings.size(), 1u);  // only the LoHa on layers.4.proj.o (side branch and text_embedder: none)
-  EXPECT_EQ(q.reports()[0].warnings[0], "layers.4.proj.o: loha adapter merged into INT8: adds requantization error");
+  // One warning per file: only the LoHa on layers.4.proj.o is merged into INT8 (side branch and text_embedder: none).
+  ASSERT_EQ(q.reports()[0].warnings.size(), 1u);
+  EXPECT_EQ(q.reports()[0].warnings[0], "1 adapter merged into INT8 (requantization error)");
   opt.strict = true;
   EXPECT_THROW(open1(dir.path() / "w.safetensors", 1.0f, opt), LoraError);
+}
+
+// lora_placement, per module from its base format: an ordinary LoRA stays on the side branch under default and merges
+// under merge (refused on a packed 4-bit module); a moss-edit-lora file merges on bf16 / INT8 modules under default
+// (INT8: one warning; strict refuses it, naming side_branch), the side branch on packed ones; side_branch never merges.
+// Merged edit block modules keep no pristine copy.
+TEST(LoraFormat, PlacementPerModule) {
+  TempDir dir("lora_place");
+  auto plain = low_rank("transformer.layers.0.proj.q", ".lora_A.weight", ".lora_B.weight", kD, kD, 4, 1);
+  for (auto& x : low_rank("transformer.layers.1.proj.o", ".lora_A.weight", ".lora_B.weight", kD, kD, 4, 2)) plain.push_back(x);
+  write_st(dir.path() / "plain.safetensors", plain);
+  auto edit = low_rank("layers.0.proj.q", ".lora_A", ".lora_B", kD, kD, 4, 3);
+  for (auto& x : low_rank("layers.1.proj.o", ".lora_A", ".lora_B", kD, kD, 4, 4)) edit.push_back(x);
+  write_st(dir.path() / "edit.safetensors", edit,
+           R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"modules\": {}}"})");
+  // Block 0 INT8, block 1 packed 4-bit.
+  const auto base = [](std::string_view m) {
+    return m.starts_with("layers.0.") ? mi::lora::BaseFormat::kInt8 : mi::lora::BaseFormat::kPacked4;
+  };
+  const auto open = [&](const char* file, mi::lora::Placement p, bool strict = false) {
+    LoadOptions o;
+    o.placement = p;
+    o.base_format = base;
+    o.strict = strict;
+    return open1(dir.path() / file, 1.0f, o);
+  };
+  using mi::lora::Placement;
+  const auto side = [](const LoraStack& s, const char* m) { return s.adapters_of(m).at(0)->side_branch; };
+  {
+    const LoraStack s = open("plain.safetensors", Placement::kDefault);
+    EXPECT_TRUE(side(s, "layers.0.proj.q"));
+    EXPECT_TRUE(side(s, "layers.1.proj.o"));
+    EXPECT_TRUE(s.reports()[0].warnings.empty());
+  }
+  EXPECT_THROW(open("plain.safetensors", Placement::kMerge), LoraError);  // layers.1.proj.o is packed
+  {
+    const LoraStack s = open("edit.safetensors", Placement::kDefault);
+    EXPECT_FALSE(side(s, "layers.0.proj.q"));
+    EXPECT_TRUE(side(s, "layers.1.proj.o"));
+    EXPECT_FALSE(s.keeps_pristine("layers.0.proj.q"));
+    EXPECT_EQ(s.reports()[0].warnings, std::vector<std::string>{"1 adapter merged into INT8 (requantization error)"});
+  }
+  try {
+    open("edit.safetensors", Placement::kDefault, true);
+    ADD_FAILURE() << "strict accepted an INT8 merge";
+  } catch (const LoraError& e) {
+    EXPECT_NE(std::string(e.what()).find("lora_placement side_branch"), std::string::npos) << e.what();
+  }
+  {
+    const LoraStack s = open("edit.safetensors", Placement::kSideBranch, true);
+    EXPECT_TRUE(side(s, "layers.0.proj.q"));
+    EXPECT_TRUE(side(s, "layers.1.proj.o"));
+    EXPECT_TRUE(s.merge_modules().empty());
+  }
+  EXPECT_EQ(mi::lora::parse_placement("side_branch"), Placement::kSideBranch);
+  EXPECT_STREQ(mi::lora::placement_name(Placement::kDefault), "default");
+  EXPECT_THROW(mi::lora::parse_placement("auto"), std::invalid_argument);
 }
 
 // PristineWeights: a strength change re-merges from the kept base weights; strength 0 restores them bit for bit.

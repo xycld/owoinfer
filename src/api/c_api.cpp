@@ -143,7 +143,7 @@ MI_LAYOUT(mi_progress, step_seconds, 24);
 MI_LAYOUT(mi_progress, elapsed_seconds, 32);  // the 1.0.0 layout ends here (40 bytes)
 MI_LAYOUT(mi_progress, fraction, 40);
 MI_LAYOUT(mi_progress, eta_seconds, 48);
-static_assert(sizeof(mi_gen_params) == 400);
+static_assert(sizeof(mi_gen_params) == 408);
 MI_LAYOUT(mi_gen_params, struct_size, 0);
 MI_LAYOUT(mi_gen_params, prompt, 8);
 MI_LAYOUT(mi_gen_params, negative_prompt, 16);
@@ -206,6 +206,8 @@ MI_LAYOUT(mi_gen_params, reference_images, 376);
 MI_LAYOUT(mi_gen_params, reference_images_count, 384);
 MI_LAYOUT(mi_gen_params, reference_max_edge, 392);
 MI_LAYOUT(mi_gen_params, _reserved5, 396);
+MI_LAYOUT(mi_gen_params, lora_placement, 400);
+MI_LAYOUT(mi_gen_params, _reserved6, 404);
 static_assert(sizeof(mi_reference_image) == 24);  // array element: no struct_size, frozen
 MI_LAYOUT(mi_reference_image, image, 0);
 MI_LAYOUT(mi_reference_image, image_path, 8);
@@ -597,6 +599,7 @@ void check_reserved(const mi_gen_params& p) {
   check_reserved(p._reserved3, "mi_gen_params._reserved3");
   check_reserved(p._reserved4, "mi_gen_params._reserved4");
   check_reserved(p._reserved5, "mi_gen_params._reserved5");
+  check_reserved(p._reserved6, "mi_gen_params._reserved6");
 }
 
 // Versioned structs: `known` lists every size the struct has had (ABI 1: it only grows at the end).

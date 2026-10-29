@@ -728,7 +728,8 @@ class Server {
             "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length", "sampler", "scheduler",
             "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise", "dataspace", "loras", "save_metadata",
             "include_prompts", "preview_output", "preview_every", "init_image", "mask", "mask_encoding",
-            "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation", "step_cache", "references",
+            "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation", "step_cache",
+            "references", "lora_placement",
             "step_cache_threshold"});
     auto w = std::make_unique<Work>();
     const auto output = p.string("output");
@@ -744,7 +745,7 @@ class Server {
             "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length", "sampler", "scheduler",
             "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise", "dataspace", "loras", "init_image", "mask",
             "mask_encoding", "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation", "step_cache",
-            "references",
+            "references", "lora_placement",
             "step_cache_threshold"});
     auto w = std::make_unique<Work>();
     request_params(p, *w, true);
@@ -881,6 +882,7 @@ class Server {
     }
     if (const auto v = p.number("cfg_truncation")) g.cfg_truncation = *v;
     if (const auto v = p.name("step_cache", mi::server::kStepCacheNames)) g.step_cache = *v;
+    if (const auto v = p.name("lora_placement", mi::server::kLoraPlacementNames)) g.lora_placement = *v;
     if (const auto v = p.number("step_cache_threshold")) {
       // 0 is the C API's "default": the protocol spells that by leaving the parameter out.
       if (!(*v > 0 && *v <= 1)) throw RequestError("invalid_params", "\"step_cache_threshold\" must be a number in (0, 1]");

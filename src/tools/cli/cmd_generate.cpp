@@ -55,6 +55,7 @@ constexpr const char* kUsage =
     "                           [--control <file> [--control-scale S] [--control-image <kind>=<png|jpg>\n"
     "                            [--control-strength X] [--control-start X] [--control-end X]]...]\n"
     "                           [--reference <png|jpg>]... [--reference-max-edge N]\n"
+    "                           [--lora-placement default|merge|side_branch]\n"
     "Flags override values read from --params. At least one of -o / --latent-out is required;\n"
     "without -o the VAE decode is skipped. --vram-budget caps the process's GPU memory (CUDA context included).\n"
     "Each --then-prompt generates one more image in the same engine session (same settings, warm models and\n"
@@ -107,7 +108,10 @@ constexpr const char* kUsage =
     "the source image first (at most 4): each is fit within --reference-max-edge (default 512, floored to a multiple\n"
     "of 16; the adapter was trained at 256), each side rounded to 16, never upscaled, and VAE-encoded once; every\n"
     "row then attends to the reference tokens (at most 16384 in all). Not with --slg-scale > 0; --skip-layers (the\n"
-    "edit workflow's 22) skips only the rows, not the references.\n";
+    "edit workflow's 22) skips only the rows, not the references.\n"
+    "--lora-placement sets where low-rank adapters on the DiT blocks go: default (ordinary LoRAs on the side branch,\n"
+    "an edit adapter merged on bf16 and INT8 blocks, INT8 requantized), merge (every one; refused on INT4 / NVFP4) or\n"
+    "side_branch (none merged: no load-time merge, a per-step cost). Changing what is merged reloads the DiT.\n";
 
 std::atomic<bool> g_cancel{false};
 // First Ctrl-C: cancel (within a text-encoder layer, DiT block or decode band). A second one terminates (default action restored).
@@ -403,6 +407,7 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--quiet") quiet = true;
       else if (f == "--reference") reference_images.push_back(path_arg(v, f));
       else if (f == "--reference-max-edge") req.references.max_edge = to_int32(f, v);
+      else if (f == "--lora-placement") req.lora_placement = lora::parse_placement(v);
       else throw std::invalid_argument("unknown flag " + f);
     }
   } catch (const std::invalid_argument& e) {

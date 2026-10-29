@@ -567,6 +567,12 @@ pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embe
     throw std::invalid_argument("reference_images: at most " + std::to_string(pipeline::kMaxReferenceImages) +
                                 " entries (got " + std::to_string(p.reference_images_count) + ").");
   }
+  switch (p.lora_placement) {
+    case MI_LORA_PLACEMENT_DEFAULT: q.lora_placement = lora::Placement::kDefault; break;
+    case MI_LORA_PLACEMENT_MERGE: q.lora_placement = lora::Placement::kMerge; break;
+    case MI_LORA_PLACEMENT_SIDE_BRANCH: q.lora_placement = lora::Placement::kSideBranch; break;
+    default: unknown("lora_placement", static_cast<int>(p.lora_placement));
+  }
   if (p.reference_max_edge != 0 && (p.reference_max_edge < 16 || p.reference_max_edge > 2048)) {
     throw std::invalid_argument("reference_max_edge must be 0 (the default, 512) or 16 to 2048.");
   }

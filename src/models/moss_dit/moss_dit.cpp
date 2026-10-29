@@ -462,6 +462,7 @@ void MossDit::set_merge_memo_cap_for_tests(std::size_t bytes) { g_merge_memo_cap
 bool MossDit::rebase_merges(const lora::LoraStack* stack, const std::string& memo_key) {
   static const lora::LoraStack kNone(std::span<const lora::LoraSpec>{}, lora::moss_dit_targets());
   const lora::LoraStack& s = stack != nullptr ? *stack : kNone;
+  if (no_pristine_) return false;  // merged without pristine copies: only a reload changes them
   const std::vector<std::string> want = s.merge_modules();
   const auto merged = [&](const std::string& module) {
     return std::any_of(merge_targets_.begin(), merge_targets_.end(), [&](const auto& e) { return e.first == module; });
@@ -577,6 +578,7 @@ std::size_t MossDit::memo_bytes() const {
 
 void MossDit::remerge_lora(const lora::LoraStack& stack) {
   if (merge_targets_.empty()) return;
+  if (no_pristine_) throw std::logic_error("moss_dit: remerge_lora on a model merged without pristine copies (reload it)");
   MI_CUDA_CHECK(cudaDeviceSynchronize());  // no forward may read the weights while they change
   // Module by module (a failure leaves earlier modules re-merged: the caller discards the model then).
   for (const auto& [module, t] : merge_targets_) {
@@ -590,7 +592,7 @@ std::size_t MossDit::pristine_bytes(const lora::LoraStack& stack, const quant::Q
   std::size_t total = 0;
   for (const std::string& module : stack.merge_modules()) {
     const lora::TargetModule* t = stack.model().find(module);
-    if (t == nullptr) continue;
+    if (t == nullptr || !stack.keeps_pristine(module)) continue;
     const auto n = static_cast<std::size_t>(t->n), k = static_cast<std::size_t>(t->k);
     const quant::QuantSpec* spec = quant != nullptr ? quant->find_spec(module) : nullptr;
     total += spec != nullptr && spec->quantized() ? n * k + 4 * n : 2 * n * k + (t->has_bias ? 2 * n : 0);
@@ -651,6 +653,21 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
     for (const std::string& module : merges->merge_modules()) {
       const MergeTarget t = merge_target(m, module);
       if (t.w.data == nullptr) continue;
+      if (!merges->keeps_pristine(module)) {
+        // Merged in place from the loaded bits, without a pristine copy (a merged edit adapter's block modules): a
+        // strength or placement change reloads the model (can_remerge()).
+        MergeStaging staging(t, true);
+        if (t.group == 0) {
+          lora::merge_bf16(*merges, module, staging.w<std::uint16_t>(), t.w.dim(0), t.w.dim(1), staging.bias());
+        } else {
+          lora::merge_requantize_int8(*merges, module, staging.w<std::int8_t>(), staging.scale(), t.w.dim(0), t.w.dim(1),
+                                      t.group);
+        }
+        staging.store();
+        merge_targets_.emplace_back(module, t);
+        no_pristine_ = true;
+        continue;
+      }
       if (!pristine_) pristine_ = std::make_unique<lora::PristineWeights>();
       const bool keep = !pristine_->has(module);
       MergeStaging staging(t, keep);

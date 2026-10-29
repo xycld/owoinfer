@@ -642,6 +642,9 @@ GenerationMetadata generation_metadata(const Request& q, const Result& r) {
     }
     if (!q.control.images.empty() && !image_used && !q.hires.enabled()) m.extra.emplace_back("resize", resize_mode_name(q.resize));
   }
+  if (!q.loras.empty() && q.lora_placement != lora::Placement::kDefault) {
+    m.extra.emplace_back("lora_placement", lora::placement_name(q.lora_placement));
+  }
   // Reference images (only when they ran).
   if (r.references.count > 0) {
     std::string refs;
@@ -890,6 +893,8 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     m.lora_files_key.clear();
   } else {
     std::string files = util::path_utf8(src.path) + (m.options.lora_strict ? "|strict" : "");
+    // The placement decides what is merged: part of the stack's and the DiT's key (the default adds nothing).
+    if (req.lora_placement != lora::Placement::kDefault) files += std::string("|placement:") + lora::placement_name(req.lora_placement);
     // The control adapter's entry is tagged: the same file as a plain LoRA is another stack (and is refused below).
     for (std::size_t i = 0; i < loras.size(); ++i) {
       files += (ctl != nullptr && i + 1 == loras.size() ? "|control:" : "|") +
@@ -906,6 +911,16 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
       lora::LoadOptions lo;
       lo.strict = m.options.lora_strict;
       lo.int8_block_gemms = src.precision != planner::Precision::kBf16;
+      lo.placement = req.lora_placement;
+      if (const quant::QuantIndex* qi = src.quant.get(); qi != nullptr) {
+        lo.base_format = [qi](std::string_view module) {
+          const quant::QuantSpec* s = qi->find_spec(module);
+          if (s == nullptr || !s->quantized()) return lora::BaseFormat::kBf16;
+          return s->format == quant::QuantFormat::kInt8ConvRot ? lora::BaseFormat::kInt8 : lora::BaseFormat::kPacked4;
+        };
+      } else {
+        lo.base_format = [](std::string_view) { return lora::BaseFormat::kBf16; };
+      }
       auto stack = std::make_unique<lora::LoraStack>(loras, lora::moss_dit_targets(), lo);
       moss_dit::check_lora_merges(*stack, src.quant.get());  // before anything is released or loaded
       // The side branches live outside the arena: make room first when a held arena leaves too little free memory
@@ -938,6 +953,8 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
       if (changed) {
         m.lora_sb->update_strengths(*m.lora_stack);  // between forwards: nothing reads them now
         // Merged adapters: re-merged from the pristine weights kept at load, in place (no reload).
+        // A model merged without pristine copies (an edit adapter's blocks) is reloaded instead (its key cleared).
+        if (m.dit && m.dit_merge_key == files && !m.dit->can_remerge()) m.dit_merge_key.clear();
         if (m.dit && m.dit_merge_key == files && !m.lora_stack->merge_modules().empty()) {
           const auto t0m = Clock::now();
           try {
@@ -1139,13 +1156,27 @@ Pipeline::Impl::Planned Pipeline::Impl::plan_call(const CallModels& models, cons
     in.caps.dit_ring_bytes = 0;
   }
   bool drop_resident = false;
+  // Merged LoRA blocks stream only from a pinned host copy: when the host cannot hold it the plan fails, naming what
+  // would fit instead (the placement is never switched on the request's behalf).
+  const auto planned = [&] {
+    try {
+      return planner::plan(in);
+    } catch (const planner::BudgetError& e) {
+      if (in.caps.dit_file_source || !m.lora_stack) throw;
+      throw planner::BudgetError(std::string(e.what()) +
+                                     " (merged LoRA blocks stream from a pinned host copy: use lora_placement side_branch, "
+                                     "a larger host_ram_budget, or a DiT file with the adapter baked in: moss-infer "
+                                     "quantize --lora)",
+                                 e.required_arena, e.arena_cap, e.required_host, e.host_limit);
+    }
+  };
   try {
-    r.plan = planner::plan(in);
+    r.plan = planned();
   } catch (const planner::BudgetError&) {
     if (held_vae == 0) throw;
     in.shapes.vae_bytes = needed_vae > 0 ? needed_vae : dec_bytes;
     in.request.vae_resident = needed_vae > 0;
-    r.plan = planner::plan(in);
+    r.plan = planned();
     drop_resident = true;
   }
   // A loaded DiT stays (in its held arena, with its residency) unless the request's own plan saves more than reloading

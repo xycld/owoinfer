@@ -431,6 +431,23 @@ typedef struct mi_image {
   int32_t _reserved0; /* must be 0 */
 } mi_image;
 
+/* Where the low-rank adapters of `loras` on the DiT's block GEMMs go (MI_CAP_REFERENCE_IMAGES), a fixed rule per
+ * module and base precision:
+ *   DEFAULT      ordinary LoRAs on the side branch (strength changes are instant, the weights untouched); an edit
+ *                adapter (moss-edit-lora) merged into the weights at load on bf16 and INT8 blocks (INT8: requantized,
+ *                one MI_MESSAGE_LORA_WARNING per file; refused with lora_strict), on the side branch on INT4 / NVFP4
+ *   MERGE        every low-rank block adapter merged (an INT4 / NVFP4 module is MI_ERR_MODEL)
+ *   SIDE_BRANCH  every low-rank block adapter on the side branch
+ * Merging costs nothing per step but a load-time merge; an edit adapter's merged blocks keep no pristine copy, so its
+ * strength or placement changes reload the DiT. Merged blocks that stream need a pinned host copy: when the host
+ * budget cannot hold it the plan fails (MI_ERR_OUT_OF_MEMORY) and names the alternatives. */
+typedef enum mi_lora_placement {
+  MI_LORA_PLACEMENT_DEFAULT = 0,
+  MI_LORA_PLACEMENT_MERGE = 1,
+  MI_LORA_PLACEMENT_SIDE_BRANCH = 2,
+  MI_LORA_PLACEMENT_MAX_ENUM = 0x7fffffff
+} mi_lora_placement;
+
 /* One reference image of an edit adapter (MI_CAP_REFERENCE_IMAGES). A fixed 24-byte layout without struct_size. The
  * image comes as pixels (1, 3 or 4 channels: converted like PIL convert("RGB"), alpha dropped) or as a PNG / JPEG file
  * (read as RGB, EXIF orientation applied), exactly one of the two. */
@@ -624,6 +641,8 @@ typedef struct mi_gen_params {
   size_t reference_images_count;
   int32_t reference_max_edge;       /* 0 (default) = 512; else 16..2048, floored to a multiple of 16 */
   int32_t _reserved5;               /* must be 0 */
+  mi_lora_placement lora_placement; /* default MI_LORA_PLACEMENT_DEFAULT */
+  int32_t _reserved6;               /* must be 0 */
 } mi_gen_params;
 
 /* Fills the first `struct_size` bytes of `params` with the defaults. struct_size is sizeof(mi_gen_params) of the

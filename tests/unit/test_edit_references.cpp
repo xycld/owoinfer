@@ -213,7 +213,10 @@ class EditDit : public ::testing::Test {
     }
     info_ = std::make_unique<mi::pipeline::DitFileInfo>(mi::pipeline::inspect_dit_file(dit, std::string_view{}));
     const mi::lora::LoraSpec spec{lora, 1.0f};
-    stack_ = std::make_unique<mi::lora::LoraStack>(std::span<const mi::lora::LoraSpec>(&spec, 1), mi::lora::moss_dit_targets());
+    mi::lora::LoadOptions lo;
+    lo.placement = mi::lora::Placement::kSideBranch;  // the adapter on the side branch: the model's weights untouched
+    stack_ = std::make_unique<mi::lora::LoraStack>(std::span<const mi::lora::LoraSpec>(&spec, 1), mi::lora::moss_dit_targets(),
+                                                   lo);
     sb_ = std::make_unique<mi::lora::SideBranches>(*stack_);
     streams_ = std::make_unique<mi::runtime::StreamSet>();
     const mi::weights::ModelIndex& index = info_->quant->index;
@@ -444,6 +447,98 @@ TEST_F(EditDit, BitExactInvariants) {
   model_->set_references(nullptr);
   const md::RefKv bad{cache.t.slice0(0, 41)};
   EXPECT_THROW(model_->set_references(&bad), std::invalid_argument);
+}
+
+// One engine, requests alternating without and with references (INT8 DiT, the edit adapter on the side branch): the
+// no-reference ones stay bit-identical to the first, the reference ones to each other, the DiT is loaded once (a
+// reference changes no load key), a cancel during a reference pass leaves nothing behind, a hires fix computes the
+// references once per pass, and repeated requests take the same arena.
+TEST(GpuEditPipeline, AlternatingRequests) {
+  const fs::path com = "/workspace/Models/community";
+  const fs::path dit = com / "comfy-org/moss_image_sft_int8_convrot.safetensors";
+  const fs::path te = com / "comfy-org/qwen3.5_9b_int8_convrot.safetensors";
+  const fs::path lora = com / "chinoll/Moss-Image-Edit/adapter_model.safetensors";
+  const fs::path bundle = "/workspace/Models/MOSS-Image/sft";
+  if (!fs::is_regular_file(dit) || !fs::is_regular_file(te) || !fs::is_regular_file(lora) || !fs::is_directory(bundle)) {
+    GTEST_SKIP() << "the INT8 SFT DiT, the INT8 text encoder, the edit adapter or the SFT bundle not present";
+  }
+  mi::pipeline::PipelineOptions o;
+  o.hardware = mi::planner::HardwareProfile{};
+  o.hardware->h2d_gbps = 24;
+  o.hardware->disk_gbps = 3;
+  o.hardware->host_gbps = 18;
+  o.hardware->bf16_tflops = 150;
+  o.hardware->measured = true;
+  o.te_host_pin = mi::planner::TeHostPin::kOff;
+  o.tier = mi::planner::Tier::kHigh;
+  o.attention = mi::planner::AttentionMode::kQ8Fp8;
+  o.vram_budget = std::size_t{9} << 30;
+  o.host_ram_budget = std::size_t{8} << 30;
+  o.dit_file = dit;
+  o.text_encoder_file = te;
+  mi::pipeline::Pipeline p(o);
+
+  auto ref_img = std::make_shared<mi::pipeline::Image>();
+  ref_img->width = 300;
+  ref_img->height = 200;
+  ref_img->channels = 3;
+  ref_img->pixels.resize(300 * 200 * 3);
+  for (std::size_t i = 0; i < ref_img->pixels.size(); ++i) {
+    ref_img->pixels[i] = static_cast<std::uint8_t>(127.5 + 120 * std::sin(0.013 * static_cast<double>(i)));
+  }
+  const auto request = [&](bool refs, bool with_lora) {
+    mi::pipeline::Request r;
+    r.model = bundle;
+    r.prompt = "make the sky green";
+    r.negative_prompt = "";
+    r.width = r.height = 512;
+    r.steps = 3;
+    r.cfg = 4.0;
+    r.seed = 3;
+    r.decode = false;
+    if (with_lora) r.loras.push_back({lora, 1.0f});
+    if (refs) r.references.images.push_back(ref_img);
+    return r;
+  };
+  struct Out {
+    std::vector<float> latents;
+    int dit_loads = 0, prefills = 0;
+    std::size_t high_water = 0;
+    bool cancelled = false;
+  };
+  const auto run = [&](const mi::pipeline::Request& r, const mi::pipeline::GenerateControl& c = {}) {
+    const mi::pipeline::Result res = p.generate(r, c);
+    return Out{res.latents, res.memory.dit_loads, res.references.prefills, res.memory.arena_high_water, res.cancelled};
+  };
+  const Out a1 = run(request(false, true));
+  const Out b1 = run(request(true, true));
+  const Out a2 = run(request(false, true));
+  const Out b2 = run(request(true, true));
+  EXPECT_EQ(a1.dit_loads, 1);
+  for (const Out* o2 : {&b1, &a2, &b2}) EXPECT_EQ(o2->dit_loads, 0);
+  EXPECT_EQ(a1.prefills, 0);
+  EXPECT_EQ(b1.prefills, 1);
+  EXPECT_EQ(a1.latents, a2.latents) << "a request without references changed after one with them";
+  EXPECT_EQ(b1.latents, b2.latents);
+  EXPECT_NE(a1.latents, b1.latents);
+  EXPECT_EQ(b1.high_water, b2.high_water);
+  // A cancel inside a reference pass (after its first step), then a plain request: unchanged.
+  mi::pipeline::GenerateControl stop;
+  stop.on_step = [](const mi::pipeline::StepInfo& s) { return s.step < 1; };
+  EXPECT_TRUE(run(request(true, true), stop).cancelled);
+  const Out a3 = run(request(false, true));
+  EXPECT_EQ(a3.latents, a1.latents);
+  // The same arena as the plain request before (a1 ran the text encoder and had no VAE encoder resident yet).
+  EXPECT_EQ(a3.high_water, a2.high_water);
+  // Without the adapter, then with it again.
+  const Out c1 = run(request(false, false));
+  EXPECT_EQ(run(request(true, true)).latents, b1.latents);
+  EXPECT_EQ(run(request(false, false)).latents, c1.latents);
+  // A hires fix: the references computed once per pass.
+  mi::pipeline::Request h = request(true, true);
+  h.hires.width = h.hires.height = 640;
+  h.hires.steps = 2;
+  EXPECT_EQ(run(h).prefills, 2);
 }
 
 }  // namespace

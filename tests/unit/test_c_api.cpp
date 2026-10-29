@@ -392,7 +392,7 @@ TEST(CApi, OldStructSizes) {
   for (const std::size_t bad : {kGen01 - 8, kGen01 + 8, sizeof g - 8}) {
     g.struct_size = bad;
     EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_ABI_MISMATCH) << bad;
-    EXPECT_NE(last_error().find("168, 240, 320, 376 or 400"), std::string::npos) << last_error();
+    EXPECT_NE(last_error().find("168, 240, 320, 376 or 408"), std::string::npos) << last_error();
   }
 
   mi_engine_params e;

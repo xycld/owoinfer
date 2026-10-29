@@ -271,7 +271,7 @@ class CpuProtocolTest(ProtocolTestBase):
                                                "references": True})
         self.assertEqual(set(res["values"]), {"mode", "block_path", "tier", "attention", "dit_direct_io", "te_host_pin",
                                               "sampler", "scheduler", "noise_layout", "noise_source", "resize",
-                                              "mask_encoding", "step_cache"})
+                                              "mask_encoding", "step_cache", "lora_placement"})
         self.assertEqual(res["values"]["tier"], ["reference", "high", "turbo"])  # exactly the accepted names
         self.assertEqual(res["values"]["mode"], ["min_memory", "balanced", "max_speed"])
         probe = res["probe"]

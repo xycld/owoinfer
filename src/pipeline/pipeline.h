@@ -103,6 +103,13 @@ struct Request {
   // side branches (a strength change between requests is instant); the others are merged into the DiT at load (a
   // strength change re-merges them from the pristine weights kept on the host).
   std::vector<lora::LoraSpec> loras;
+  // Where low-rank adapters on the block GEMMs go (lora::Placement, a fixed rule per module and base precision):
+  // kDefault puts ordinary LoRAs on the side branch and merges a moss-edit-lora adapter on bf16 and INT8 (requantized)
+  // blocks, the side branch on INT4 / NVFP4; kMerge merges every low-rank block adapter (INT4 / NVFP4 modules refused);
+  // kSideBranch puts them all on the side branch. Part of the DiT's load key: changing it reloads the DiT when it changes
+  // what is merged. Merged blocks that stream need a pinned host copy; when the host budget cannot hold it the plan
+  // fails (never a silent switch).
+  lora::Placement lora_placement = lora::Placement::kDefault;
   // img2img (roadmap P7b, diffusers' img2img / inpainting convention). init_image (null: none): RGB (3 channels), any
   // size up to kMaxInputSide per side and kMaxInputPixels, shared (a request copy does not copy the pixels); it is
   // brought to height x width by `resize` (pipeline_image.h; crop by default) and VAE-encoded (the posterior mean) to
