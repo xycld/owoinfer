@@ -98,9 +98,9 @@ hf download OpenMOSS-Team/MOSS-Image-SFT  --revision 2c7954437269461767f533b0068
 - **Fine-tunes** with the same architecture (the same config values, tensor names and shapes; class names may differ) load and run like the official folders.
 - **How the engine checks.** It identifies a model by its architecture, from configs and safetensors headers only (no hashing): the folder's `transformer/config.json`, `text_encoder/config.json` and `vae/config.json`, and the tensor names and shapes of the DiT and text-encoder files. Anything else fails the first generation with `MI_ERR_MODEL` (server: `model`), and `moss-infer index` refuses it too. The message names what was found, e.g.: `MOSS-Image/x is not a supported MOSS-Image model (found transformer num_layers 40 (MOSS-Image: 42)). Supported: OpenMOSS-Team/MOSS-Image-Base and -SFT; see docs/integration.md#supported-models`. A folder without `transformer/config.json` or `text_encoder/config.json` is reported as incomplete (`… (incomplete download, or not the model folder?)`), also `MI_ERR_MODEL`. A LoRA, control adapter or distill bundle file given as the DiT or text encoder is named as such.
 
-**Community files verified during 1.0/1.1 development.** Files loaded next to an official folder. The last column names the run:
+**Community files verified during 1.0 and 2.0 development.** Files loaded next to an official folder. The last column names the run:
 - **E24, E25:** RTX 5090 runs on pre-release commits `211ef35` and `1b141ce` (ancestors of v1.0.0); images generated end to end.
-- **4090L:** RTX 4090 Laptop, the 1.1 development tree (2026-10-23); images generated end to end.
+- **4090L:** RTX 4090 Laptop, the 2.0 development tree (2026-10-23); images generated end to end.
 - **Tests:** the GPU test suite loads the file and checks its results against reference values.
 
 The revision is the one whose files were tested (same SHA-256); copies of the same file under another name work the same.
@@ -302,7 +302,7 @@ RTX 5090, SFT, 1024², 50 steps, every model resident:
 |---|---|---|---|
 | bf16 bundle, `reference` | 0.466 s | 1.0× | 11.7 GiB |
 | INT8 DiT, `high` (q8_fp8) | 0.192 s | 2.4× | 7.2 GiB |
-| NVFP4 DiT, `turbo` (q8_fp8) | 0.143 s | 3.3× | below INT8 |
+| NVFP4 DiT, `turbo` (q8_fp8) | 0.143 s | 3.3× | 5.5 GiB |
 
 The gain holds at 2048²: INT8 `high` runs 1.18 s per step against 2.77 s for bf16. 8-bit attention runs at every size; `attention` picks another kernel (`exact`, or the fp32-accumulating variants) when the caller wants one.
 

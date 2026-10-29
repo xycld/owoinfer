@@ -1153,7 +1153,8 @@ TEST(Planner, TurboTier) {
   EXPECT_EQ(d.precision, Precision::kInt4);
   EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
   EXPECT_EQ(d.reason, "Turbo tier: INT4 ConvRot GEMMs, q8_fp8 attention");
-  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, no_q8).attention, AttentionMode::kExact);
+  EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, no_q8), std::invalid_argument);  // no fallback
+  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{AttentionMode::kExact}, Precision::kInt4, no_q8).attention, AttentionMode::kExact);
   EXPECT_EQ(resolve_tier(Tier::kTurbo, O{AttentionMode::kExact}, Precision::kInt4, all).attention, AttentionMode::kExact);
   EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, all, true).tier, Tier::kTurbo);  // + quantized TE
   // Turbo needs a 4-bit DiT; a 4-bit DiT is never Reference or High.
@@ -1182,7 +1183,7 @@ TEST(Planner, Nvfp4Tier) {
   EXPECT_EQ(d.precision, Precision::kNvfp4);
   EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
   EXPECT_EQ(d.reason, "Turbo tier: NVFP4 GEMMs, q8_fp8 attention");
-  EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, no_q8, false, kSm120).attention, AttentionMode::kExact);
+  EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, no_q8, false, kSm120), std::invalid_argument);
   EXPECT_EQ(resolve_tier(Tier::kTurbo, O{AttentionMode::kQ8Fp16}, Precision::kNvfp4, all, false, kSm120).attention,
             AttentionMode::kQ8Fp16);
   EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kNvfp4, all, true, kSm120).tier, Tier::kTurbo);
@@ -1287,8 +1288,8 @@ TEST(Planner, ResolveTier) {
   EXPECT_THROW(resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kBf16, all), std::invalid_argument);
   EXPECT_THROW(resolve_tier(Tier::kHigh, O{AttentionMode::kQ8Fp8}, Precision::kInt8, no_q8), std::invalid_argument);
   EXPECT_THROW(resolve_tier(Tier::kHigh, O{}, Precision::kBf16, no_q8), std::invalid_argument);  // no 8-bit kernel
-  // High: the loaded DiT's GEMMs + q8_fp8 by default, q8_fp16 without FP8, exact when asked for or (INT8 DiT) without
-  // any 8-bit kernel.
+  // High: the loaded DiT's GEMMs + q8_fp8 by default, q8_fp16 without FP8, exact only when asked for; without any 8-bit
+  // kernel the tier is refused, naming the explicit way out.
   d = resolve_tier(Tier::kHigh, O{}, Precision::kInt8, all);
   EXPECT_EQ(d.tier, Tier::kHigh);
   EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
@@ -1297,9 +1298,26 @@ TEST(Planner, ResolveTier) {
   EXPECT_EQ(resolve_tier(Tier::kHigh, O{}, Precision::kBf16, no_fp8).attention, AttentionMode::kQ8Fp16);
   EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, no_fp8).attention, AttentionMode::kQ8Fp16);
   EXPECT_EQ(resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kInt8, all).attention, AttentionMode::kExact);
-  d = resolve_tier(Tier::kHigh, O{}, Precision::kInt8, no_q8);
-  EXPECT_EQ(d.attention, AttentionMode::kExact);
-  EXPECT_NE(d.reason.find("no 8-bit attention kernel"), std::string::npos) << d.reason;
+  try {
+    resolve_tier(Tier::kHigh, O{}, Precision::kInt8, no_q8);
+    ADD_FAILURE() << "high fell back to exact attention";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_EQ(std::string(e.what()),
+              "tier high runs 8-bit attention, which this device/build lacks; pass attention exact explicitly");
+  }
+  EXPECT_EQ(resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kInt8, no_q8).attention, AttentionMode::kExact);
+  try {
+    resolve_tier(Tier::kHigh, O{AttentionMode::kExact}, Precision::kBf16, all);
+    ADD_FAILURE() << "high ran a bf16 DiT with exact attention";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string(e.what()).find("use tier reference"), std::string::npos) << e.what();
+  }
+  try {
+    resolve_tier(Tier::kReference, O{}, Precision::kInt4, all);
+    ADD_FAILURE() << "reference ran an INT4 DiT";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string(e.what()).find("use tier turbo"), std::string::npos) << e.what();
+  }
   d = resolve_tier(Tier::kHigh, O{}, Precision::kBf16, all);  // bf16 GEMMs + q8
   EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
   EXPECT_EQ(d.reason, "High tier: bf16 GEMMs, q8_fp8 attention");

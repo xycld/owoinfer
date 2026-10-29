@@ -278,7 +278,7 @@ TEST(CApiInspect, Bf16Dit) {
   EXPECT_EQ(rep.info.tiers, bit(MI_TIER_REFERENCE) | bit(MI_TIER_HIGH));
   EXPECT_EQ(rep.tier_reason(MI_TIER_REFERENCE), "Reference tier: bf16 GEMMs, exact attention");
   EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("reserved since 2.0"), std::string::npos) << rep.tier_reason(MI_TIER_AUTO);
-  EXPECT_NE(rep.tier_reason(MI_TIER_HIGH).find("bf16 GEMMs, q8_fp8 attention"), std::string::npos);
+  EXPECT_NE(rep.tier_reason(MI_TIER_HIGH).find("bf16 GEMMs, 8-bit attention (q8_fp8; q8_fp16 on GPUs without FP8)"), std::string::npos);
   EXPECT_NE(rep.tier_reason(MI_TIER_TURBO).find("tier turbo runs an INT4 ConvRot DiT"), std::string::npos);
   EXPECT_EQ(rep.info.lora_adapters, 0);
   EXPECT_EQ(rep.info.control_kind_count, 0);
@@ -296,7 +296,7 @@ TEST(CApiInspect, QuantizedDits) {
     EXPECT_EQ(rep.info.tiers, bit(MI_TIER_HIGH));
     EXPECT_NE(rep.tier_reason(MI_TIER_REFERENCE).find("quantized"), std::string::npos)
         << rep.tier_reason(MI_TIER_REFERENCE);
-    EXPECT_EQ(rep.tier_reason(MI_TIER_HIGH), "High tier: INT8 ConvRot GEMMs, q8_fp8 attention");
+    EXPECT_EQ(rep.tier_reason(MI_TIER_HIGH), "High tier: INT8 ConvRot GEMMs, 8-bit attention (q8_fp8; q8_fp16 on GPUs without FP8)");
     EXPECT_NE(rep.tier_reason(MI_TIER_AUTO).find("reserved since 2.0"), std::string::npos)
         << rep.tier_reason(MI_TIER_AUTO);
   }
@@ -319,6 +319,38 @@ TEST(CApiInspect, QuantizedDits) {
     EXPECT_EQ(rep.info.tiers, 0u);
     EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "");
     EXPECT_EQ(rep.tier_reason(MI_TIER_HIGH), "not a loadable DiT file");
+  }
+}
+
+// Inspect's tier bits are exactly what generate accepts, on a GPU with FP8 and on one without (sm_80 / sm_86): for
+// every DiT precision and tier, the bit is set iff planner::resolve_tier (generate's call, no explicit attention)
+// accepts it with that GPU's kernels. NVFP4 is judged for an RTX 50 with the NVFP4 kernels.
+TEST(CApiInspect, TierBitsAreGeneratesDecision) {
+  using mi::planner::AttentionMode;
+  using mi::planner::Precision;
+  using mi::planner::Tier;
+  const mi::planner::AttentionSupported all = [](AttentionMode) { return true; };
+  const mi::planner::AttentionSupported no_fp8 = [](AttentionMode a) {
+    return a == AttentionMode::kExact || a == AttentionMode::kQ8Fp16 || a == AttentionMode::kQ8Fp16F32Acc;
+  };
+  constexpr std::pair<mi_tier, Tier> kTiers[] = {
+      {MI_TIER_REFERENCE, Tier::kReference}, {MI_TIER_HIGH, Tier::kHigh}, {MI_TIER_TURBO, Tier::kTurbo}};
+  for (const Precision p : {Precision::kBf16, Precision::kInt8, Precision::kInt4, Precision::kNvfp4}) {
+    mi::api::FileInspection r;
+    mi::api::describe_dit_tiers(p, true, r);
+    EXPECT_EQ(r.info.tiers & bit(MI_TIER_AUTO), 0u);
+    for (const auto& supported : {all, no_fp8}) {
+      for (const auto& [c, t] : kTiers) {
+        bool accepted = true;
+        try {
+          mi::planner::resolve_tier(t, std::nullopt, p, supported, false, true);
+        } catch (const std::invalid_argument&) {
+          accepted = false;
+        }
+        EXPECT_EQ((r.info.tiers & bit(c)) != 0, accepted)
+            << mi::planner::precision_name(p) << " " << mi::planner::tier_name(t) << ": " << r.tier_reasons[c];
+      }
+    }
   }
 }
 
@@ -441,8 +473,8 @@ TEST(CApiInspect, Nvfp4Dit) {
     EXPECT_EQ(rep.text(MI_FILE_TEXT_QUANTIZATION), "nvfp4");
     EXPECT_EQ(rep.info.tiers, 1u << MI_TIER_TURBO);
     EXPECT_NE(note.find("compute capability 12.0"), std::string::npos) << note;
-    EXPECT_NE(rep.tier_reason(MI_TIER_TURBO).find("Turbo tier: NVFP4 GEMMs"), std::string::npos)
-        << rep.tier_reason(MI_TIER_TURBO);
+    EXPECT_EQ(rep.tier_reason(MI_TIER_TURBO),
+              "Turbo tier: NVFP4 GEMMs, 8-bit attention (q8_fp8; q8_fp16 on GPUs without FP8) (RTX 50 only)");
   } else {
     EXPECT_NE(note.find("NVFP4"), std::string::npos) << note;
     EXPECT_NE(note.find("INT8"), std::string::npos) << note;

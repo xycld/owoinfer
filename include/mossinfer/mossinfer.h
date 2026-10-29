@@ -1041,10 +1041,10 @@ MOSSINFER_API const char* mi_file_report_text(const mi_file_report* report, mi_f
 /* A control adapter's kind `index` in [0, control_kind_count), in channel order: the strings mi_control_image.kind
  * (and MI_TEXT_CONTROL_KINDS) use. Owned by the report. NULL for a NULL report or an index out of range. */
 MOSSINFER_API const char* mi_file_report_control_kind(const mi_file_report* report, int32_t index);
-/* The engine's tier decision for a loadable DiT: what `tier` would run (e.g. "High tier: INT8 ConvRot GEMMs, q8_fp8
- * attention"; on a GPU without FP8 the default attention is q8_fp16) when mi_file_info.tiers has its bit, else why the
- * engine refuses it (MI_TIER_AUTO: reserved); for other files, why there is no tier. Owned by the report. NULL for a
- * NULL report or an unknown tier. */
+/* The engine's tier decision for a loadable DiT: what `tier` would run (e.g. "High tier: INT8 ConvRot GEMMs, 8-bit
+ * attention (q8_fp8; q8_fp16 on GPUs without FP8)", with "(RTX 50 only)" for an NVFP4 file) when mi_file_info.tiers has
+ * its bit, else why the engine refuses it (MI_TIER_AUTO: reserved); for other files, why there is no tier. Owned by the
+ * report. NULL for a NULL report or an unknown tier. */
 MOSSINFER_API const char* mi_file_report_tier_reason(const mi_file_report* report, mi_tier tier);
 /* NULL is a no-op. */
 MOSSINFER_API void mi_file_report_free(mi_file_report* report);

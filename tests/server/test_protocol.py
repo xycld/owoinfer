@@ -743,7 +743,7 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertEqual(r["tiers"], ["reference", "high"])
         self.assertEqual(set(r["tier_reasons"]), {"reference", "high", "turbo"})  # no auto, no certificates
         self.assertEqual(r["tier_reasons"]["reference"], "Reference tier: bf16 GEMMs, exact attention")
-        self.assertEqual(r["tier_reasons"]["high"], "High tier: bf16 GEMMs, q8_fp8 attention")
+        self.assertEqual(r["tier_reasons"]["high"], "High tier: bf16 GEMMs, 8-bit attention (q8_fp8; q8_fp16 on GPUs without FP8)")
         self.assertIn("INT4", r["tier_reasons"]["turbo"])
         self.assertNotIn("control_kinds", r)
 

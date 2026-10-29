@@ -890,8 +890,9 @@ TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention
   }
   if (requested == Tier::kReference) {
     if (int8) {
-      throw std::invalid_argument("tier reference runs bf16 weights exactly, but the loaded DiT or text encoder file is "
-                                  "quantized; load the bundle's bf16 models or use tier high");
+      throw std::invalid_argument(std::string("tier reference runs bf16 weights exactly, but the loaded DiT or text encoder "
+                                              "file is quantized; load the bundle's bf16 models or use tier ") +
+                                  (int4 ? "turbo" : "high"));
     }
     if (attention && is_q8(*attention)) {
       throw std::invalid_argument("tier reference uses exact attention; 8-bit attention belongs to tier high");
@@ -899,22 +900,25 @@ TierDecision resolve_tier(Tier requested, std::optional<AttentionMode> attention
     d.reason = "Reference tier: bf16 GEMMs, exact attention";
     return d;
   }
-  // High and Turbo: the tier's default attention (kTierAttention) unless the caller gave one.
-  std::string why = requested == Tier::kTurbo ? "Turbo tier" : "High tier";
-  d.attention = AttentionMode::kExact;
+  // High and Turbo: the tier's default attention (kTierAttention) unless the caller gave one; never a silent fallback.
+  const char* const tier = requested == Tier::kTurbo ? "turbo" : "high";
   if (attention) {
     d.attention = *attention;
   } else {
     const auto it = std::find_if(std::begin(kTierAttention), std::end(kTierAttention),
                                  [&](AttentionMode m) { return !supported || supported(m); });
-    if (it != std::end(kTierAttention)) d.attention = *it;
-    else why += " (this device/build has no 8-bit attention kernel)";
+    if (it == std::end(kTierAttention)) {
+      throw std::invalid_argument(std::string("tier ") + tier + " runs 8-bit attention, which this device/build lacks; "
+                                  "pass attention exact explicitly");
+    }
+    d.attention = *it;
   }
   if (!int8 && d.attention == AttentionMode::kExact) {
-    throw std::invalid_argument("tier high needs an INT8 DiT or 8-bit attention, but the loaded DiT is bf16 and "
-                                "attention exact: that is the Reference tier");
+    throw std::invalid_argument("tier high with attention exact on a bf16 DiT and text encoder is the Reference "
+                                "configuration; use tier reference, or 8-bit attention");
   }
-  d.reason = why + ": " + weights + ", " + attention_name(d.attention) + " attention";
+  d.reason = std::string(requested == Tier::kTurbo ? "Turbo tier" : "High tier") + ": " + weights + ", " +
+             attention_name(d.attention) + " attention";
   return d;
 }
 

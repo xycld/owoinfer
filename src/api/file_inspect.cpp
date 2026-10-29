@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <iterator>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -168,18 +170,7 @@ void inspect_dit(const weights::SafetensorsFile& header, FileInspection& r) {
   describe_dit_linears(*dit, r);
   r.info.loadable = 1;
   r.info.precision = to_precision(dit->precision);
-  r.tier_reasons[MI_TIER_AUTO] = "MI_TIER_AUTO is reserved since 2.0: choose reference, high or turbo";
-  constexpr std::pair<mi_tier, planner::Tier> kTiers[] = {{MI_TIER_REFERENCE, planner::Tier::kReference},
-                                                          {MI_TIER_HIGH, planner::Tier::kHigh},
-                                                          {MI_TIER_TURBO, planner::Tier::kTurbo}};
-  for (const auto& [c, t] : kTiers) {
-    try {
-      r.tier_reasons[c] = planner::resolve_tier(t, std::nullopt, dit->precision, {}, false, kNvfp4Kernels).reason;
-      r.info.tiers |= 1u << c;
-    } catch (const std::invalid_argument& e) {
-      r.tier_reasons[c] = e.what();
-    }
-  }
+  describe_dit_tiers(dit->precision, kNvfp4Kernels, r);
 }
 
 void inspect_text_encoder(const fs::path& path, FileInspection& r) {
@@ -215,6 +206,29 @@ void describe_dit_linears(const pipeline::DitFileInfo& dit, FileInspection& r) {
   r.quantization = dit.linears;
   r.note = dit.nvfp4 ? "NVFP4 linears run on compute capability 12.0 only (an RTX 50 GPU)" : "";
   if (!dit.remarks.empty()) r.note += (r.note.empty() ? "" : "; ") + dit.remarks;
+}
+
+void describe_dit_tiers(planner::Precision precision, bool nvfp4_kernels, FileInspection& r) {
+  r.tier_reasons[MI_TIER_AUTO] = "MI_TIER_AUTO is reserved since 2.0: choose reference, high or turbo";
+  constexpr std::pair<mi_tier, planner::Tier> kTiers[] = {{MI_TIER_REFERENCE, planner::Tier::kReference},
+                                                          {MI_TIER_HIGH, planner::Tier::kHigh},
+                                                          {MI_TIER_TURBO, planner::Tier::kTurbo}};
+  // The tiers' default attention depends on the GPU (q8_fp8 needs FP8): the reason names both choices.
+  constexpr std::string_view kDefaultQ8 = "q8_fp8 attention";
+  for (const auto& [c, t] : kTiers) {
+    try {
+      std::string reason = planner::resolve_tier(t, std::nullopt, precision, {}, false, nvfp4_kernels).reason;
+      if (reason.ends_with(kDefaultQ8)) {
+        reason.replace(reason.size() - kDefaultQ8.size(), kDefaultQ8.size(),
+                       "8-bit attention (q8_fp8; q8_fp16 on GPUs without FP8)");
+      }
+      if (precision == planner::Precision::kNvfp4) reason += " (RTX 50 only)";
+      r.tier_reasons[c] = std::move(reason);
+      r.info.tiers |= 1u << c;
+    } catch (const std::invalid_argument& e) {
+      r.tier_reasons[c] = e.what();
+    }
+  }
 }
 
 FileInspection inspect_file(const fs::path& path) {

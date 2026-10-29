@@ -204,4 +204,10 @@ if(MOSSINFER_TESTS)
   # The 5 s default discovery timeout is too short on Windows runners, where the first start of the large test
   # executable can be slow (seen once in CI: "Process terminated due to timeout").
   gtest_discover_tests(mossinfer_tests DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 120)
+  if(TARGET moss-infer)
+    # 2.0: `moss-infer generate` requires --tier and has no `auto` (exit status 2 and the message, before CUDA).
+    add_test(NAME cli_generate_requires_tier
+             COMMAND ${CMAKE_COMMAND} -DMOSS_INFER=$<TARGET_FILE:moss-infer> -P ${CMAKE_SOURCE_DIR}/tests/cli/generate_requires_tier.cmake)
+    set_tests_properties(cli_generate_requires_tier PROPERTIES LABELS cpu)
+  endif()
 endif()

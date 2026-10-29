@@ -857,7 +857,9 @@ TEST(GpuAccelPipeline, TiersIgnoreAcceleratorsAndInt4Caches) {
     Pipeline pipe(o);
     const Result off = pipe.generate(req), on = pipe.generate(fast);
     EXPECT_EQ(off.tier.tier, mi::planner::Tier::kHigh);
-    EXPECT_EQ(off.tier.attention, mi::planner::AttentionMode::kQ8Fp8);
+    EXPECT_EQ(off.tier.attention, mi::moss_dit::attention_supported(mi::moss_dit::AttentionMode::kQ8Fp8)
+                                      ? mi::planner::AttentionMode::kQ8Fp8
+                                      : mi::planner::AttentionMode::kQ8Fp16);
     check(off, on, "int8 file");
   }
   {

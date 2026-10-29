@@ -393,7 +393,7 @@ Params: `path` (string, required): a file. Says what it is to the engine (`mi_in
     "file_bytes": 3000000000, "tensors": 700, "note": "", "precision": "w4a4", "quantization": "int4_convrot256",
     "tiers": ["turbo"], "tier_reasons": {"reference": "tier reference runs bf16 weights exactly, ...",
     "high": "the loaded DiT is INT4 ConvRot, which runs the Turbo tier; use tier turbo",
-    "turbo": "Turbo tier: INT4 ConvRot GEMMs, q8_fp8 attention"}}}
+    "turbo": "Turbo tier: INT4 ConvRot GEMMs, 8-bit attention (q8_fp8; q8_fp16 on GPUs without FP8)"}}}
 >> {"id": 6, "method": "inspect", "params": {"path": "/models/moss_image_color_depth_control.safetensors"}}
 << {"id": 6, "result": {"path": "...", "kind": "control_adapter", "loadable": true, "file_bytes": 300000000, "tensors": 500,
     "note": "", "control_kinds": ["color", "depth"], "base_model": "moss-base", "adapter_types": ["lora"], "lora_rank": 64,
@@ -401,7 +401,7 @@ Params: `path` (string, required): a file. Says what it is to the engine (`mi_in
 ```
 
 Every answer has `path`, `kind` (`"dit"`, `"text_encoder"`, `"vae"`, `"lora"`, `"control_adapter"` or `"unknown"`), `loadable` (the loader for that role accepts the file), `file_bytes`, `tensors` and `note` (why not loadable, or what an unknown file is instead, e.g. a GGUF file or a distill bundle file; `""` for none). By kind:
-- `dit`: `precision` (`"bf16"`, `"int8"`, `"w4a4"` or `"nvfp4"`; `null` when not loadable), `quantization` (its block linears as the engine runs them, e.g. `"int8_convrot256"`; `""` when not loadable), `tiers` (exactly the `load` `tier` values `generate` accepts for it with the bundle's text encoder and no explicit `attention`: the engine's own decision, the same on every GPU it supports; an NVFP4 DiT is judged for an RTX 50 with this build's kernels) and `tier_reasons` (for `reference`, `high` and `turbo`: what the tier runs, e.g. `"High tier: INT8 ConvRot GEMMs, q8_fp8 attention"` (`q8_fp16` on a GPU without FP8), or why it is refused).
+- `dit`: `precision` (`"bf16"`, `"int8"`, `"w4a4"` or `"nvfp4"`; `null` when not loadable), `quantization` (its block linears as the engine runs them, e.g. `"int8_convrot256"`; `""` when not loadable), `tiers` (exactly the `load` `tier` values `generate` accepts for it with the bundle's text encoder and no explicit `attention`: the engine's own decision, the same on every GPU it supports; an NVFP4 DiT is judged for an RTX 50 with this build's kernels) and `tier_reasons` (for `reference`, `high` and `turbo`: what the tier runs, e.g. `"High tier: INT8 ConvRot GEMMs, 8-bit attention (q8_fp8; q8_fp16 on GPUs without FP8)"`, with `(RTX 50 only)` for an NVFP4 file, or why it is refused).
 - `text_encoder`: `precision` (`"bf16"`, `"int8"` or `"w4a8"`) and `quantization`.
 - `lora`: `base_model` (the metadata, `""` when absent), `adapter_types` (`"lora"`, `"loha"`, `"lokr"`, `"full"`), `lora_rank` (the largest low-rank rank), `lora_adapters` (on the DiT) and `lora_unknown_keys`. A file in the LoRA naming conventions that the LoRA reader refuses (a LoRA for another model, a malformed one) is a `lora` with `loadable` false and the reader's message as `note`.
 - `control_adapter`: `control_kinds` (in channel order: exactly the strings `generate`'s `control.images[].kind` takes) and the `lora` fields of its LoRA part.

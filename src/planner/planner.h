@@ -113,9 +113,9 @@ bool is_q8(AttentionMode a);  // an 8-bit mode
 // `attention` takes the tier's default, the first of kTierAttention this device/build runs (q8_fp8, else q8_fp16: FP8
 // needs compute capability 8.9); a given `attention` overrides it. The result never depends on the request's size.
 //   reference  bf16 DiT and text encoder, exact attention. Refused for quantized weights and with an 8-bit attention.
-//   high       the loaded bf16 or INT8 DiT's GEMMs with 8-bit attention (exact only when asked for, or for an INT8 DiT
-//              when the device/build has no 8-bit kernel). Refused for a bf16 DiT with exact attention (that is the
-//              Reference tier) and for an INT4 or NVFP4 DiT (that is the Turbo tier).
+//   high       the loaded bf16 or INT8 DiT's GEMMs with 8-bit attention (exact only when asked for: a device/build
+//              without an 8-bit kernel is refused, never a silent fallback). Refused for a bf16 DiT with exact attention
+//              (that is the Reference tier) and for an INT4 or NVFP4 DiT (that is the Turbo tier).
 //   turbo      an INT4 or NVFP4 DiT (refused for any other): its 4-bit GEMMs, attention as for high.
 // An NVFP4 DiT where its GEMMs cannot run (nvfp4_native false: no FP4 tensor cores or no sm_120a kernels in the build)
 // is refused for every tier, and so is an 8-bit `attention` the device/build does not run.

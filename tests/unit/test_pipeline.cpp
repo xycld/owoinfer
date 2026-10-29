@@ -62,6 +62,11 @@ fs::path weights_root() {
 }
 fs::path golden_dir() { return fs::path(MOSSINFER_SOURCE_DIR) / "tests" / "golden"; }
 fs::path data_dir() { return fs::path(MOSSINFER_SOURCE_DIR) / "tests" / "data" / "pipeline"; }
+// The high / turbo tiers' default attention on this GPU (planner::kTierAttention): q8_fp8 with FP8, else q8_fp16.
+mi::planner::AttentionMode tier_default_attention() {
+  return mi::moss_dit::attention_supported(mi::moss_dit::AttentionMode::kQ8Fp8) ? mi::planner::AttentionMode::kQ8Fp8
+                                                                                 : mi::planner::AttentionMode::kQ8Fp16;
+}
 
 mi::json::Value read_json(const fs::path& p) {
   std::ifstream in(p, std::ios::binary);
@@ -1348,10 +1353,36 @@ TEST(PipelineEndToEnd, Int8DitFileHighTierAddsQ8Attention) {
   mi::pipeline::Pipeline pipe(options);
   const mi::pipeline::Result r = pipe.generate(req);
   EXPECT_EQ(r.tier.tier, mi::planner::Tier::kHigh);
-  EXPECT_EQ(r.tier.attention, mi::planner::AttentionMode::kQ8Fp8);
-  EXPECT_EQ(r.plan.dit.attention, mi::planner::AttentionMode::kQ8Fp8);
+  EXPECT_EQ(r.tier.attention, tier_default_attention());
+  EXPECT_EQ(r.plan.dit.attention, tier_default_attention());
   EXPECT_EQ(r.steps_run, r.steps_scheduled);
   for (const float v : r.latents) ASSERT_TRUE(std::isfinite(v));
+}
+
+// Guard: the tier's attention holds at every size and memory mode. A 2048² min_memory request on the High tier plans
+// and runs the 8-bit attention the tier chose (no size- or memory-based override).
+TEST(PipelineEndToEnd, HighTierKeeps8BitAttentionAt2048MinMemory) {
+  const fs::path int8 = "/workspace/Models/community/comfy-org/moss_image_sft_int8_convrot.safetensors";
+  if (!fs::is_regular_file(weights_root() / "sft" / "moss.mossidx") || !fs::is_regular_file(int8)) {
+    GTEST_SKIP() << "SFT bundle or INT8 DiT file not present";
+  }
+  mi::pipeline::Request req;
+  req.model = weights_root() / "sft";
+  req.prompt = "a lighthouse on a cliff at night";
+  req.height = req.width = 2048;
+  req.steps = 1;
+  req.decode = false;
+  mi::pipeline::PipelineOptions options;
+  options.dit_file = int8;
+  options.tier = mi::planner::Tier::kHigh;
+  options.mode = mi::planner::Mode::kMinMemory;
+  options.embedding_cache = false;
+  mi::pipeline::Pipeline pipe(options);
+  const mi::pipeline::Result r = pipe.generate(req);
+  EXPECT_TRUE(mi::planner::is_q8(r.tier.attention)) << mi::planner::attention_name(r.tier.attention);
+  EXPECT_EQ(r.plan.dit.attention, r.tier.attention);
+  EXPECT_EQ(r.tier.attention, tier_default_attention());
+  EXPECT_EQ(r.steps_run, r.steps_scheduled);
 }
 
 // Runtime LoRAs on the bf16 SFT DiT (two real files, kohya and PEFT): they change the latents, reported as active;
@@ -1448,7 +1479,7 @@ TEST(PipelineQuality, HighTierIsTheSameWithLoras) {
     if (lora) req.loras.push_back({kPeftLora, 0.5f});
     const Result r = pipe.generate(req);
     EXPECT_EQ(r.tier.tier, mi::planner::Tier::kHigh) << round;
-    EXPECT_EQ(r.tier.attention, mi::planner::AttentionMode::kQ8Fp8) << round;
+    EXPECT_EQ(r.tier.attention, tier_default_attention()) << round;
     EXPECT_EQ(r.quality.config.lora, lora) << round;
     EXPECT_EQ(r.tier.reason.find("runtime LoRAs active") != std::string::npos, lora) << round << ": " << r.tier.reason;
   }
