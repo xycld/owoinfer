@@ -464,6 +464,16 @@ class Exchange {
     }
     st.x = latent_shape(xp, MI_LATENT_CHANNELS);
     if (c.control != nullptr) st.control = latent_shape(cp, C);
+    // Every output slot poisoned (NaN) before the call, so a slot the call should write cannot pass on a value an
+    // earlier call left there (a masked call writing row k into another slot).
+    if (device) {
+      EXPECT_EQ(cudaMemsetAsync(dout_, 0xFF, static_cast<std::size_t>(info_.outputs) * n_ * sizeof(float), stream_),
+                cudaSuccess);
+    } else {
+      for (int k = 0; k < info_.outputs; ++k) {
+        if (ov_[k].data != nullptr) std::memset(ov_[k].data, 0xFF, n_ * sizeof(float));
+      }
+    }
     for (int k = 0; k < info_.outputs; ++k) {
       if (ov_[k].data == nullptr) continue;  // a slot the run lacks (MOSS out[1] without an uncond row): zeroed
       void* p = device ? static_cast<void*>(static_cast<float*>(dout_) + static_cast<std::size_t>(k) * n_) : ov_[k].data;
@@ -823,6 +833,7 @@ TEST_F(GpuComponentRuns, OffScheduleCallsAndTableB) {
   midpoint_run(false, unused);
   const Vec a = midpoint_run(true, cached_a);
   const Vec b = midpoint_run(true, cached_b);
+  EXPECT_FALSE(cached_a.empty()) << "the threshold reused nothing: the test shows nothing";
   EXPECT_EQ(cached_a, cached_b);
   EXPECT_EQ(differing(a, b), 0u) << "two step-cache runs differ";
 
@@ -1896,17 +1907,28 @@ TEST_F(GpuComponentRuns, CancelDuringBeginAndMidStep) {
   EXPECT_EQ(mi_cancel(engine_), MI_OK);  // between calls: a no-op
   EXPECT_EQ(mi_run_end(engine_, nullptr), MI_OK);
 
-  // From another thread while the begin loads a released DiT.
+  // From another thread while the begin loads a released DiT: from its DiT-load phase on, the canceller repeats
+  // mi_cancel every millisecond until the begin returns (a cancel before the engine marks the job running is a no-op,
+  // so one fixed-time cancel could miss a fast reload), and gives up after 60 s or when the begin returns without
+  // reaching the phase (a failure the status check reports, not a hang).
   ASSERT_EQ(mi_engine_release(engine_, 0, nullptr), MI_OK) << last_error();
   ev.loading.store(false);
   mi_engine* const e = engine_;
+  std::atomic<bool> begin_returned{false};
   std::thread canceller([&] {
-    while (!ev.loading.load()) std::this_thread::yield();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    mi_cancel(e);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!ev.loading.load() && !begin_returned.load() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    while (ev.loading.load() && !begin_returned.load() && std::chrono::steady_clock::now() < deadline) {
+      mi_cancel(e);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   });
   const mi_status cancelled = mi_run_begin(engine_, &rp);
+  begin_returned.store(true);
   canceller.join();
+  EXPECT_TRUE(ev.loading.load()) << "the begin never reached its DiT-load phase";
   EXPECT_EQ(cancelled, MI_CANCELLED) << last_error();
   EXPECT_EQ(mi_run_query(engine_, &info), MI_ERR_INVALID_ARGUMENT);
   ASSERT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
@@ -2058,6 +2080,10 @@ TEST_F(GpuComponentRuns, EndingRaceIterations) {
     }
   }
   std::printf("[race] %d iterations: %d steps cancelled in flight, %d refused at the gate\n", n, cancelled, refused);
+  // Enough iterations land an ending mid-forward at least once: otherwise the in-flight path went unexercised.
+  if (n >= 100) {
+    EXPECT_GT(cancelled, 0) << "no ending cancelled a step in flight";
+  }
 }
 
 // After a step fails in device mode the engine no longer touches x, out[] or control (design §4): right after a

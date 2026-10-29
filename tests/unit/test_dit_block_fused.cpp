@@ -1574,13 +1574,19 @@ TEST(DitSmallImages, PausedGraphsRunEagerlyAndKeepTheRunsGraphs) {
   const md::StepGraphStats s0 = model.graph_stats();
   ASSERT_GT(s0.captures, 0u);
   ASSERT_GT(s0.replays, 0u);
+  // The outputs are poisoned before each checked forward: they hold the expected values from the forwards above.
+  const auto poison = [&](const Tensor (&outs)[2]) {
+    for (const Tensor& t : outs) MI_CUDA_CHECK(cudaMemsetAsync(t.data, 0xFF, t.nbytes(), stream));
+  };
   model.set_graphs_paused(true);
   model.forward(crop, 500.0f, rows, crop_out, stream);
+  poison(crop_out);
   model.forward(crop, 500.0f, rows, crop_out, stream);  // a repeated shape: still eager while paused
   EXPECT_EQ(host(crop_out), crop_fused) << "the paused forward differs from kFused";
   EXPECT_EQ(model.graph_stats().captures, s0.captures) << "a paused forward captured";
   EXPECT_EQ(model.graph_stats().replays, s0.replays) << "a paused forward replayed";
   model.set_graphs_paused(false);
+  poison(full_out);
   model.forward(full, 500.0f, rows, full_out, stream);
   EXPECT_EQ(model.graph_stats().captures, s0.captures) << "the run's shape was captured again";
   EXPECT_GT(model.graph_stats().replays, s0.replays) << "the run's graphs did not replay after the pause";
