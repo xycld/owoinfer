@@ -1691,6 +1691,13 @@ class GpuComponentTest(ProtocolTestBase):
     """The component methods on the GPU (design §7.5): the base bundle, tier reference, 384^2."""
 
     SIZE = 384
+    REFUSE_PIN = False  # GpuComponentCopyTest: the server's copy path (its test seam)
+
+    def setUp(self):
+        if self.REFUSE_PIN:
+            os.environ["MOSSINFER_SERVER_TEST_REFUSE_PIN"] = "1"  # read by the server at its start
+            self.addCleanup(os.environ.pop, "MOSSINFER_SERVER_TEST_REFUSE_PIN", None)
+        super().setUp()
 
     def load_base(self):
         base = os.path.join(WEIGHTS, "base")
@@ -1839,7 +1846,7 @@ class GpuComponentTest(ProtocolTestBase):
                 run, region = self.begin(dict({"width": size, "height": size, "rows": rows, "steps": self.STEPS}, **params))
                 self.assertEqual(run["info"]["latent_height"], lat)
                 self.assertEqual(run["info"]["staging_bytes"] + 4096 <= run["shm"]["bytes"], True)
-                self.assertTrue(run["adopted"], run)  # pinned in place on Linux
+                self.assertEqual(run["adopted"], not self.REFUSE_PIN, run)  # pinned in place on Linux
                 self.assertTrue(run["info"]["schedule_matches"])
                 s = run["sigmas"]
                 self.assertEqual(len(s), self.STEPS + 1)
@@ -1949,11 +1956,16 @@ class GpuComponentTest(ProtocolTestBase):
         end_id = self.server.send("run_end", id="end")
         got = self.collect(ids + [end_id])
         self.assertEqual([m["id"] for m in got], ids + [end_id], "answers out of order")
-        self.assertEqual(got[0]["error"], {"code": "cancelled", "message": "the run is ending"}, got[0])
+        # The running step is cancelled (in flight, or by the server's check right before the engine call). A run_end
+        # landing in the microseconds between that check and the engine's start is lost to the engine (its job start
+        # clears the cancel flag): the step then completes, and is counted.
+        completed = "result" in got[0]
+        if not completed:
+            self.assertEqual(got[0]["error"], {"code": "cancelled", "message": "the run is ending"}, got[0])
         for m in got[1:-1]:
             self.assertEqual(m["error"], {"code": "cancelled", "message": "the run is ending (not started)"}, m)
         self.assertTrue(got[-1]["result"]["ended"])
-        self.assertEqual(got[-1]["result"]["report"]["component"]["calls"], 0)
+        self.assertEqual(got[-1]["result"]["report"]["component"]["calls"], 1 if completed else 0)
         region.close()
         # The next run plans as before and loads nothing (the DiT stayed resident).
         run, region = self.begin(params)
@@ -1971,6 +1983,41 @@ class GpuComponentTest(ProtocolTestBase):
         self.assertIsNone(end["report"]["dit_load"]["source"], end["report"]["dit_load"])
         region.close()
         self.assertEqual(self.ok("run_end"), {"ended": False})
+
+    def test_jobs_and_session_calls_never_overlap(self):
+        """A session call while a generate runs answers busy, and a cancel of its id or a session_close cannot reach
+        the generate, which completes; a generate while session steps are queued answers busy."""
+        self.load_base()
+        self.open_session()
+        out = os.path.join(self.tmp, "job.png")
+        gid = self.server.send("generate", {"prompt": self.PROMPT, "width": 512, "height": 512, "steps": 8, "seed": 3,
+                                            "output": out}, id="job")
+        self.assertEqual(self.server.response(gid, timeout=GPU_TIMEOUT)["result"], {"accepted": True})
+        refused = [("encode_text", {"prompts": ["x"]}), ("shm_alloc", {"bytes": 4096}), ("run_end", {}),
+                   ("session_close", {})]
+        for i, (method, params) in enumerate(refused):
+            self.assertError(self.server.call(method, params, id="r%d" % i), "busy", "r%d" % i)
+        self.assertEqual(self.ok("cancel", {"id": "r0"}), {"cancelling": False, "generating_id": "job"})
+        deadline = time.monotonic() + GPU_TIMEOUT
+        while True:
+            msg = self.server.read(max(0.1, deadline - time.monotonic()))
+            if msg.get("event") == "done" and msg["id"] == "job":
+                break
+        self.assertEqual(msg["status"], "ok", msg)
+        conds = self.ok("encode_text", {"prompts": [self.PROMPT]})["conditionings"]
+        run, region = self.begin({"width": 1024, "height": 1024, "steps": 4, "rows": [{"conditioning": conds[0]["id"]}]})
+        ids = self.pipelined_steps(run["sigmas"][0], 2, "s")
+        busy = self.server.send("generate", {"prompt": "x", "output": out}, id="g2")
+        got = {m["id"]: m for m in self.collect(ids + [busy])}
+        self.assertError(got["g2"], "busy", "g2")
+        self.assertTrue(all("result" in got[i] for i in ids), got)
+        self.end()
+        region.close()
+        # The scratch regions' total is capped (2^34 payload bytes): checked before anything is reserved.
+        self.ok("shm_alloc", {"bytes": 4096})
+        self.assertError(self.server.call("shm_alloc", {"bytes": 1 << 34}, id="cap"),
+                         "out_of_memory", "cap")
+        self.assertEqual(self.ok("session_close"), {"closed": True})
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "the thread count comes from /proc")
     def test_steps_create_no_threads(self):
@@ -2052,6 +2099,19 @@ class GpuComponentTest(ProtocolTestBase):
         self.assertEqual(st["session"], {"run": False, "queued": 0, "running_id": None})
         self.assertEqual(self.ok("session_close"), {"closed": True})
         self.assertNotIn("session", self.ok("status"))
+
+
+
+class GpuComponentCopyTest(GpuComponentTest):
+    """The bit-exact component tests through the server's copy path (the run region not pinned, as where the system
+    refuses it: steps copy through the engine's staging), forced by the server's test seam."""
+
+    REFUSE_PIN = True
+    test_run_end_interrupts_steps_and_cancel_skips_queued_ones = None
+    test_jobs_and_session_calls_never_overlap = None
+    test_steps_create_no_threads = None
+    test_sigkill_leaves_nothing_after_the_next_start = None
+    test_unnamed_scratch_region_goes_after_60_s = None
 
 
 if __name__ == "__main__":

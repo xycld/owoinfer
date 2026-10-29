@@ -31,6 +31,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <span>
 #include <string_view>
 #include <system_error>
 #include <thread>
@@ -141,7 +142,31 @@ std::string status_code(mi_status s) {
 // "/data/mask_path/x.png") comes back unchanged: it must start the message or follow a space, quote, "(" or "[" (a
 // ".image_path" must follow "]"), and end the message or precede a space, quote, ",", ":", ";", ")", "[", "]", or a
 // "." that ends a sentence.
-std::string protocol_names(std::string message) {
+using Renames = std::span<const std::pair<std::string_view, std::string_view>>;
+
+// generate's, preload's and load's parameters.
+constexpr std::pair<std::string_view, std::string_view> kGenerateRenames[] = {
+    {"dataspace_path", "dataspace"}, {"init_image_path", "init_image"}, {"mask_path", "mask"},
+    {"mi_engine_params.distill_dir", "load's \"distill\""}, {"distill_dir", "distill"},
+    {"hires_width / hires_height", "hires"}, {"hires_width and hires_height", "hires width and height"},
+    {"with MI_MASK_BINARY01", "with mask_encoding \"binary01\""},
+    // "control_images[0].image_path" -> "control.images[0].path".
+    {"control_images", "control.images"}, {"reference_images", "references.images"},
+    {"reference_max_edge", "references.max_edge"}, {".image_path", ".path"}, {"control_adapter", "control.adapter"},
+    {"control_lora_strength", "control.lora_strength"}};
+
+// The component methods' parameters and methods (their params keep the C fields' names, control_images and
+// control_adapter included).
+constexpr std::pair<std::string_view, std::string_view> kComponentRenames[] = {
+    {"MI_RUN_CROPS", "\"crops\""}, {"MI_RUN_EXACT_SIGMA", "\"exact_sigma\""},
+    {"MI_STEP_CONTROL_CHANGED", "\"control_changed\""}, {"mi_session_params.plan_request", "\"plan_request\""},
+    {"mi_run_info.staging_bytes", "info.staging_bytes"}, {"StepArgs::rows", "\"rows\""},
+    {"mi_encode_text", "encode_text"}, {"mi_run_end", "run_end"}, {"mi_run_begin", "run_begin"},
+    {"mi_session_close", "session_close"}, {"mi_generate()", "generate"}, {"mi_generate", "generate"},
+    {"mi_run_staging", "the run region"}, {".image_path", ".path"}};
+
+
+std::string protocol_names(std::string message, Renames renames = kGenerateRenames) {
   const auto token_at = [&](std::size_t at, std::string_view from) {
     const bool starts = from.front() == '.' ? at > 0 && message[at - 1] == ']'
                                             : at == 0 || std::string_view(" \"'([").find(message[at - 1]) != std::string_view::npos;
@@ -151,16 +176,7 @@ std::string protocol_names(std::string message) {
     if (message[end] == '.') return end + 1 == message.size() || message[end + 1] == ' ';
     return std::string_view(" \"',:;)[]").find(message[end]) != std::string_view::npos;
   };
-  static constexpr std::pair<std::string_view, std::string_view> kRenames[] = {
-      {"dataspace_path", "dataspace"}, {"init_image_path", "init_image"}, {"mask_path", "mask"},
-      {"mi_engine_params.distill_dir", "load's \"distill\""}, {"distill_dir", "distill"},
-      {"hires_width / hires_height", "hires"}, {"hires_width and hires_height", "hires width and height"},
-      {"with MI_MASK_BINARY01", "with mask_encoding \"binary01\""},
-      // "control_images[0].image_path" -> "control.images[0].path".
-      {"control_images", "control.images"}, {"reference_images", "references.images"},
-      {"reference_max_edge", "references.max_edge"}, {".image_path", ".path"}, {"control_adapter", "control.adapter"},
-      {"control_lora_strength", "control.lora_strength"}};
-  for (const auto& [from, to] : kRenames) {
+  for (const auto& [from, to] : renames) {
     for (std::size_t at = 0; (at = message.find(from, at)) != std::string::npos;) {
       if (!token_at(at, from)) {
         ++at;
@@ -528,9 +544,22 @@ const char* file_kind_name(mi_file_kind k) {
 
 // ---------------------------------------------------------------- server
 
+// Test seam, for tests/server/test_protocol.py only (not a user option, not in the protocol's documentation): with
+// MOSSINFER_SERVER_TEST_REFUSE_PIN=1 in the server's environment, run_begin answers as if the system refused to pin the
+// run's region (mi_run_adopt_staging's MI_ERR_NOT_SUPPORTED), so the steps' copy path runs where pinning works.
+bool test_refuse_pin() {
+#ifdef _WIN32
+  char v[2] = {};
+  return GetEnvironmentVariableA("MOSSINFER_SERVER_TEST_REFUSE_PIN", v, sizeof v) == 1 && v[0] == '1';
+#else
+  const char* v = std::getenv("MOSSINFER_SERVER_TEST_REFUSE_PIN");
+  return v != nullptr && std::string_view(v) == "1";
+#endif
+}
+
 class Server {
  public:
-  explicit Server(Output& out) : out_(out) {}
+  explicit Server(Output& out) : out_(out), refuse_pin_(test_refuse_pin()) {}
   ~Server() { stop(); }
 
   // Returns false when the server should exit (shutdown).
@@ -577,7 +606,7 @@ class Server {
       else if (m == "unload") result = unload(params);
       else if (m == "session_open") result = session_open(params);
       else if (m == "session_close") result = session_close(params, id);
-      else if (m == "shm_alloc") result = shm_alloc(params);
+      else if (m == "shm_alloc") result = shm_alloc(params, id);
       else if (m == "shm_free") result = shm_free(params);
       else if (m == "encode_text") result = encode_text(params, id);
       else if (m == "conditioning_import") result = conditioning_import(params, id);
@@ -606,11 +635,11 @@ class Server {
     return true;
   }
 
-  // Closes an open session (its calls cancelled), cancels a running job, waits for it and for the inspects (they have no
-  // cancel: each reads one file's header and small tensors), and releases the engine.
+  // Cancels a running job, closes an open session (its calls cancelled), waits for the job and for the inspects (they
+  // have no cancel: each reads one file's header and small tensors), and releases the engine.
   void stop() {
+    request_cancel();  // first: the session's close waits for a running generation without cancelling it
     close_session(nullptr);
-    request_cancel();
     join_worker();
     join_inspections();
     mi_engine_free(engine_);
@@ -963,6 +992,11 @@ class Server {
   std::string start(std::unique_ptr<Work> w, const std::string& id, Kind kind) {
     if (engine_ == nullptr) throw RequestError("no_engine", "no model loaded; send \"load\" first");
     if (generating()) throw busy_error();
+    // A job and a session call never run at once (the engine has one cancel flag: a session's cancel must never reach
+    // a job, nor a job's a session call).
+    if (session_ != nullptr && session_busy(*session_)) {
+      throw RequestError("busy", "a component session call is queued or running; send this after its answer");
+    }
     join_worker();
     job_ = std::make_unique<Job>();
     job_->id = id;
@@ -1352,7 +1386,7 @@ class Server {
     bool named = false;
   };
   static constexpr std::chrono::seconds kScratchUnnamedLifetime{60};
-  static constexpr std::uint64_t kMaxScratchBytes = std::uint64_t{1} << 34;
+  static constexpr std::uint64_t kMaxScratchBytes = std::uint64_t{1} << 34;  // per region, and all of them together
 
   // The open run as the worker sees it: the region, and the engine's staging views and their offsets in the region.
   struct RunState {
@@ -1395,7 +1429,7 @@ class Server {
   }
   // The engine's verdict on a session call, with its message (read on the calling thread: it is thread-local).
   [[noreturn]] static void throw_call(mi_status s) {
-    throw RequestError(status_code(s), mi_last_error_message());
+    throw RequestError(status_code(s), protocol_names(mi_last_error_message(), kComponentRenames));
   }
 
   Session& session() {
@@ -1403,9 +1437,21 @@ class Server {
     return *session_;
   }
 
+  // A session call while a generate, preload or release runs.
+  static RequestError session_busy_error() {
+    return RequestError("busy", "a generate, preload or release is running; send session calls after its done event "
+                                "(or the release's response), or cancel it");
+  }
+
+  static bool session_busy(Session& s) {
+    const std::lock_guard<std::mutex> lock(s.mu);
+    return !s.queue.empty() || s.running != nullptr;
+  }
+
   // Queues a call on the session's worker; it answers it.
   std::optional<std::string> enqueue(const std::string& id, SessionTask::Kind kind, std::function<std::string()> run) {
     Session& s = session();
+    if (generating()) throw session_busy_error();
     auto t = std::make_shared<SessionTask>();
     t->id = id;
     t->kind = kind;
@@ -1561,7 +1607,7 @@ class Server {
       if (s.running != nullptr) {
         s.running->cancelled = true;
         s.running->cancel_reason = "the session is closing";
-        call_running = true;
+        call_running = s.running->kind != SessionTask::Kind::kRunEnd;
       }
       s.queue.push_back(t);
       s.stop = true;
@@ -1618,29 +1664,42 @@ class Server {
   std::optional<std::string> session_close(const Params& p, const std::string& id) {
     p.only({});
     if (session_ == nullptr) return std::string("{\"closed\":false}");
+    if (generating()) throw session_busy_error();
     close_session(&id);
     return std::nullopt;
   }
 
-  // shm_alloc {"bytes"}: a scratch region whose payload holds `bytes`, answered at once.
-  std::string shm_alloc(const Params& p) {
+  // shm_alloc {"bytes"}: a scratch region whose payload holds `bytes`. On the worker: reserving a large region's blocks
+  // takes a while, and the request loop keeps answering cancel and status.
+  std::optional<std::string> shm_alloc(const Params& p, const std::string& id) {
     p.only({"bytes"});
     const auto bytes = p.integer("bytes", 1, static_cast<std::int64_t>(kMaxScratchBytes));
     if (!bytes) throw RequestError("invalid_params", "\"bytes\" (the payload size) is required");
     Session& s = session();
-    std::shared_ptr<mi::server::shm::Region> region;
-    try {
-      region = std::make_shared<mi::server::shm::Region>(mi::server::shm::Region::create(static_cast<std::size_t>(*bytes)));
-    } catch (const std::system_error& e) {
-      throw RequestError(e.code() == std::errc::no_space_on_device ? "out_of_memory" : "io", e.what());
-    }
-    const std::string answer = region_json(*region);
-    {
-      const std::lock_guard<std::mutex> lock(s.mu);
-      s.scratch[region->name()] = Scratch{region, std::chrono::steady_clock::now() + kScratchUnnamedLifetime, false};
-    }
-    s.cv.notify_all();  // the worker's next removal deadline
-    return "{\"shm\":" + answer + "}";
+    return enqueue(id, SessionTask::Kind::kCall, [&s, n = static_cast<std::size_t>(*bytes)] {
+      {
+        const std::lock_guard<std::mutex> lock(s.mu);
+        std::uint64_t held = 0;
+        for (const auto& [name, r] : s.scratch) held += r.region->payload_bytes();
+        if (held + n > kMaxScratchBytes) {
+          throw RequestError("out_of_memory", "the session's scratch regions would hold more than " +
+                                                  std::to_string(kMaxScratchBytes >> 30) + " GiB (" +
+                                                  std::to_string(held >> 20) + " MiB held); shm_free some first");
+        }
+      }
+      std::shared_ptr<mi::server::shm::Region> region;
+      try {
+        region = std::make_shared<mi::server::shm::Region>(mi::server::shm::Region::create(n));
+      } catch (const std::system_error& e) {
+        throw RequestError(e.code() == std::errc::no_space_on_device ? "out_of_memory" : "io", e.what());
+      }
+      const std::string answer = region_json(*region);
+      {
+        const std::lock_guard<std::mutex> lock(s.mu);
+        s.scratch[region->name()] = Scratch{region, std::chrono::steady_clock::now() + kScratchUnnamedLifetime, false};
+      }
+      return "{\"shm\":" + answer + "}";
+    });
   }
 
   std::string shm_free(const Params& p) {
@@ -2016,10 +2075,14 @@ class Server {
       } catch (const std::system_error& e) {
         throw RequestError(e.code() == std::errc::no_space_on_device ? "out_of_memory" : "io", e.what());
       }
-      const mi_status adopt = mi_run_adopt_staging(s.engine, R.region->payload(), R.region->payload_bytes());
+      const mi_status adopt = refuse_pin_ ? MI_ERR_NOT_SUPPORTED
+                                          : mi_run_adopt_staging(s.engine, R.region->payload(), R.region->payload_bytes());
       if (adopt != MI_OK && adopt != MI_ERR_NOT_SUPPORTED) throw_call(adopt);
       R.adopted = adopt == MI_OK;
-      if (!R.adopted) out_.log("warning", std::string("run region not pinned, steps copy through the engine's staging: ") + mi_last_error_message(), "");
+      if (!R.adopted) {
+        out_.log("warning", std::string("run region not pinned, steps copy through the engine's staging: ") +
+                                (refuse_pin_ ? "MOSSINFER_SERVER_TEST_REFUSE_PIN is set" : mi_last_error_message()));
+      }
       if (const mi_status st = mi_run_staging(s.engine, &R.x, R.out.data(), R.out.size(), &R.control); st != MI_OK) {
         throw_call(st);
       }
@@ -2144,6 +2207,13 @@ class Server {
     }
     mi_step_info info{};
     info.struct_size = sizeof info;
+    {
+      // A cancel or run_end that arrived since the worker took the call: the engine clears its cancel flag when the
+      // step starts, so it is honoured here (one that lands between this check and the engine's start is lost: the
+      // step runs and answers normally).
+      const std::lock_guard<std::mutex> lock(s.mu);
+      if (s.running != nullptr && s.running->cancelled) throw RequestError("cancelled", s.running->cancel_reason);
+    }
     if (const mi_status st = mi_denoise_step(s.engine, &sp, &info); st != MI_OK) {
       if (st == MI_CANCELLED) {
         std::string reason;
@@ -2173,6 +2243,7 @@ class Server {
   std::optional<std::string> run_end(const Params& p, const std::string& id) {
     p.only({});
     Session& s = session();
+    if (generating()) throw session_busy_error();
     auto t = std::make_shared<SessionTask>();
     t->id = id;
     t->kind = SessionTask::Kind::kRunEnd;
@@ -2452,6 +2523,7 @@ class Server {
 
   Output& out_;
   std::unique_ptr<Session> session_;  // the open component session (the request loop's)
+  const bool refuse_pin_;              // test_refuse_pin()
   mi_engine* engine_ = nullptr;
   std::string model_;
   mi_mode mode_ = MI_MODE_BALANCED;

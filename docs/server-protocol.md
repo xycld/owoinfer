@@ -70,7 +70,7 @@ Unknown members in `params` are rejected (`invalid_params`), so a typo cannot be
 | `no_engine` | a valid `generate`, `preload`, `release` or `session_open` before `load` |
 | `no_session` | a valid component call (other than `session_open` and `session_close`) without an open session |
 | `cancelled` | a component call cancelled before it started or while it ran (`cancel`, `run_end`, `session_close`) |
-| `busy` | a valid `generate`, `preload` or `release`, or `load` or `unload`, while a job (a generation, preload or release) runs; an `inspect` while two run; `session_open` while a session is open; the engine's `MI_ERR_BUSY` for a component call |
+| `busy` | a valid `generate`, `preload` or `release`, or `load` or `unload`, while a job (a generation, preload or release) runs; an `inspect` while two run; `session_open` while a session is open; a session call while a job runs, and a job while a session call is queued or running; the engine's `MI_ERR_BUSY` for a component call |
 | `invalid_argument`, `abi_mismatch`, `not_supported`, `out_of_memory`, `model`, `io`, `cuda`, `internal` | the engine's `mi_status` (`MI_ERR_<CODE>`), with `mi_last_error_message()` as the message |
 
 ## Methods
@@ -456,7 +456,7 @@ With the `components` capability, the server exposes the C API's component calls
 |---|---|---|
 | `session_open` | `max_rows` (1–8, default 3), `max_latents` (1–`max_rows`, default 1), `control_adapter` (path), `plan_request` (object: `preload`'s params) | at once: `{"max_rows", "max_latents"}` |
 | `session_close` | none | `{"closed": true}`, or `{"closed": false}` without a session |
-| `shm_alloc` | `bytes` (the payload, 1 to 2^34) | at once: `{"shm": {"name", "token", "bytes"}}`, a scratch region |
+| `shm_alloc` | `bytes` (the payload, 1 to 2^34; all of a session's scratch regions together at most 2^34, else `out_of_memory`) | `{"shm": {"name", "token", "bytes"}}`, a scratch region |
 | `shm_free` | `name` | at once: `{"freed": true}` |
 | `encode_text` | `prompts` (1–8 strings, `""` allowed), `max_sequence_length` (1–4096, default 4096) | `{"conditionings": [{"id", "tokens", "engine_encoded", "prompt_tokens": {"total_tokens", "kept_tokens", "prompt_tokens", "dropped_tokens", "max_length", "truncated"}}]}` |
 | `conditioning_import` | `shm` (a scratch region), `dtype` (`"f32"` default, or `"bf16"`), `shape` (`[tokens, 4096]`, 1 ≤ tokens ≤ 4096) | one conditioning as above, `engine_encoded` false (`mi_conditioning_create`, copied from the payload) |
@@ -484,19 +484,21 @@ With the `components` capability, the server exposes the C API's component calls
 >> {"id": 12, "method": "run_begin", "params": {"width": 1024, "height": 1024, "steps": 30, "guidance": "moss",
     "output": "guided_velocity", "rows": [{"conditioning": 1}, {"conditioning": 2, "skip_layers": [22]}]}}
 << {"id": 12, "result": {"sigmas": [1, 0.99, ...], "info": {...}, "shm": {"name": "/mossinfer-4242-3-9f...", "token": "5c...",
-    "bytes": 6295552}, "tensors": {"x": 4096, "control": null, "out": [2101248]}, "adopted": true}}
+    "bytes": 4198400}, "tensors": {"x": 4096, "control": null, "out": [2101248]}, "adopted": true}}
 >> {"id": 13, "method": "denoise_step", "params": {"sigma": 1}}
 << {"id": 13, "result": {"step": 0, "rows": 3, "cached": false, "on_schedule": true, "seconds": 0.21}}
 >> {"id": 42, "method": "run_end"}
 << {"id": 42, "result": {"ended": true, "report": {...}, "warnings": [], "note": ""}}
 ```
 
-**Order and threads.** One worker thread per session runs its calls (everything above except `session_open`, `shm_alloc` and `shm_free`, which answer at once) in the order they arrive; there is no thread per call. A call is validated when it arrives (`invalid_params` at once), then queued; its answer comes when it has run, so `status`, `cancel` and other requests sent meanwhile may be answered first: match by `id`. A client may send its steps without waiting for each answer. Engine errors are the `mi_status` codes, with `mi_last_error_message()`. Without a session, these methods answer `no_session`; `session_open` without an engine `no_engine`, and with a session open `busy`. `encode_text`, `vae_*` and a second `run_begin` during a run, and `generate` or `preload` while a session call runs or a run is open, get the engine's `busy`.
+**Order and threads.** One worker thread per session runs its calls (everything above except `session_open` and `shm_free`, which answer at once) in the order they arrive; there is no thread per call. A call is validated when it arrives (`invalid_params` at once), then queued; its answer comes when it has run, so `status`, `cancel` and other requests sent meanwhile may be answered first: match by `id`. A client may send its steps without waiting for each answer. Engine errors are the `mi_status` codes, with `mi_last_error_message()` (naming this protocol's parameters). Without a session, these methods answer `no_session`; `session_open` without an engine `no_engine`, and with a session open `busy`.
+
+**Session calls and jobs never run at once.** While a `generate`, `preload` or `release` runs, the session methods (all but `session_open` and `shm_free`) answer `busy`; while a session call is queued or running, `generate`, `preload` and `release` answer `busy`. So a session's `cancel`, `run_end` or `session_close` never stops a job, and a job's `cancel` never stops a session call. During a run, `encode_text`, `vae_*`, a second `run_begin`, and a `generate` or `preload` sent between calls get the engine's `busy`.
 
 **Cancel and interrupts.**
 - `cancel {"id"}` of a session call still queued: it is answered `{"code": "cancelled", "message": "cancelled (not started)"}` without reaching the engine. Of the running call: `mi_cancel` (a step stops within one DiT block and answers `cancelled`; the run stays usable). Without an `id`, `cancel` stops the running `generate`, `preload` or `release`, else the running session call. The answer is `{"cancelling": true, "generating_id": <the call's id>}`. `run_end` and `session_close` are not cancelled.
 - `run_end` while steps are queued or running (the client's interrupt): queued steps are answered `cancelled` ("the run is ending (not started)") without running, a step in flight is cancelled and answers `cancelled` ("the run is ending"), and `run_end`'s answer comes last, after the run has ended (`mi_run_end`). The models stay loaded: the next `run_begin` of the same shape loads nothing.
-- `session_close` cancels every queued and running call of the session (answered `cancelled`, "the session is closing"), then ends an open run and closes the session; its answer comes last. `load`, `unload`, `shutdown` and the end of input close an open session the same way (without an answer of their own for it).
+- `session_close` cancels every queued and running call of the session, then ends an open run and closes the session; its answer comes last. Queued calls answer `cancelled` ("the session is closing (not started)"), a running step `cancelled` ("the session is closing"), another running call `cancelled` with the engine's message. `load`, `unload`, `shutdown` and the end of input close an open session the same way (without an answer of their own for it).
 - `status` carries `"session": {"run": <a run is open>, "queued": <calls waiting>, "running_id": <id or null>}` while a session is open.
 - Session calls that load (`run_begin`), encode text or run the VAE send `progress` events with their `id` (`phase`, `step`, `total_steps`, `step_seconds`, `elapsed_seconds`); steps send none.
 
@@ -509,6 +511,7 @@ Every region is created by the server, exclusively and for the current user only
 - **Windows.** `Local\mossinfer-<pid>-<seq>-<16 hex>` (a page-file mapping; a DACL granting the current user only; a name that exists gets a new suffix). Attach with `mmap.mmap(-1, bytes, tagname=name)`, then check the token. A mapping vanishes with its last handle.
 - **Lifetime.** Attach to a region before naming it in a request: the first request naming it removes its name (the run's first `denoise_step`; the first `conditioning_import`, `initial_noise` or `vae_*` naming a scratch region), so that from then on a crash of either process leaks nothing; the mappings stay valid. `shm_free`, `run_end` (the run's region), `session_close` and exit destroy what is left, and a scratch region never named is removed 60 s after its creation. A server that starts removes the regions of servers that died before their client attached: a region whose name's pid is dead and whose header names that pid and the server's PID namespace; files that never got a header after 10 minutes unchanged; never a region of another PID namespace (a container sharing `/dev/shm`).
 - **Pinning.** The run's region is the engine's pinned staging (`adopted`), so a step copies nothing on the server's side. A client that moves tensors to and from a GPU pins its own mapping too (e.g. `torch.cuda.cudart().cudaHostRegister`).
+- **Size.** A client must not resize a region (`ftruncate` on Linux): the server maps every region for its whole life, and touching pages past a shortened end is a fatal error (SIGBUS) in the server. A region is the current user's only, so only a client of the same user can do this.
 
 ## Client sketch (Python)
 
@@ -565,6 +568,8 @@ With `MOSSINFER_GPU_TESTS=1`, `GpuComponentTest` (the base bundle, tier `referen
 - 1000 steps leave the server's thread count unchanged
 - SIGKILL with a run region and a scratch region, before they are named and after (unlinked at once): nothing is left in `/dev/shm` once the next server answers `hello`; a wrong token is refused by the client helper
 - a scratch region never named is gone after 60 s, a named one stays until `shm_free`; `status`'s `session`
+- a session call while a `generate` runs answers `busy` (and a `cancel` of its id leaves the generation running to `ok`); a `generate` while steps are queued answers `busy`; the scratch regions' total cap
+- `GpuComponentCopyTest`: the bit-exact tests again through the copy path (`adopted` false), forced by a test-only switch of the server
 
 ```
 MOSS_SERVER=<build>/moss-server python3 tests/server/test_protocol.py
