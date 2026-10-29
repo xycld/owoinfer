@@ -449,10 +449,10 @@ TEST_F(EditDit, BitExactInvariants) {
   EXPECT_THROW(model_->set_references(&bad), std::invalid_argument);
 }
 
-// One engine, requests alternating without and with references (INT8 DiT, the edit adapter on the side branch): the
+// One engine, requests alternating without and with references (INT8 DiT, the edit adapter on the side branch: its default there): the
 // no-reference ones stay bit-identical to the first, the reference ones to each other, the DiT is loaded once (a
 // reference changes no load key), a cancel during a reference pass leaves nothing behind, a hires fix computes the
-// references once per pass, and repeated requests take the same arena.
+// references once per pass, and repeated requests take the same arena; an explicit merge reloads on every change.
 TEST(GpuEditPipeline, AlternatingRequests) {
   const fs::path com = "/workspace/Models/community";
   const fs::path dit = com / "comfy-org/moss_image_sft_int8_convrot.safetensors";
@@ -539,6 +539,20 @@ TEST(GpuEditPipeline, AlternatingRequests) {
   h.hires.width = h.hires.height = 640;
   h.hires.steps = 2;
   EXPECT_EQ(run(h).prefills, 2);
+  // An explicit merge on INT8 (no pristine copies): it reloads the DiT, a strength change reloads it again (no in-place
+  // re-merge), and so does going back to the default placement, whose bits are the side branch's again.
+  mi::pipeline::Request mq = request(true, true);
+  mq.lora_placement = mi::lora::Placement::kMerge;
+  const Out m1 = run(mq);
+  EXPECT_EQ(m1.dit_loads, 1);
+  EXPECT_NE(m1.latents, b1.latents);
+  mq.loras[0].strength = 0.5f;
+  const Out m2 = run(mq);
+  EXPECT_EQ(m2.dit_loads, 1);
+  EXPECT_NE(m2.latents, m1.latents);
+  const Out back = run(request(true, true));
+  EXPECT_EQ(back.dit_loads, 1);
+  EXPECT_EQ(back.latents, b1.latents);
 }
 
 }  // namespace

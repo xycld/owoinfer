@@ -110,7 +110,8 @@ constexpr const char* kUsage =
     "row then attends to the reference tokens (at most 16384 in all). Not with --slg-scale > 0; --skip-layers (the\n"
     "edit workflow's 22) skips only the rows, not the references.\n"
     "--lora-placement sets where low-rank adapters on the DiT blocks go: default (ordinary LoRAs on the side branch,\n"
-    "an edit adapter merged on bf16 and INT8 blocks, INT8 requantized), merge (every one; refused on INT4 / NVFP4) or\n"
+    "an edit adapter merged on bf16 blocks, on the side branch elsewhere; for INT8, a DiT with the adapter baked in\n"
+    "(quantize --lora) costs nothing per step), merge (every one; INT8 requantized; refused on INT4 / NVFP4) or\n"
     "side_branch (none merged: no load-time merge, a per-step cost). Changing what is merged reloads the DiT.\n";
 
 std::atomic<bool> g_cancel{false};

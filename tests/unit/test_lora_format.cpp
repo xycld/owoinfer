@@ -511,21 +511,25 @@ TEST(LoraFormat, Int8MergeWarnings) {
 }
 
 // lora_placement, per module from its base format: an ordinary LoRA stays on the side branch under default and merges
-// under merge (refused on a packed 4-bit module); a moss-edit-lora file merges on bf16 / INT8 modules under default
-// (INT8: one warning; strict refuses it, naming side_branch), the side branch on packed ones; side_branch never merges.
-// Merged edit block modules keep no pristine copy.
+// under merge (refused on a packed 4-bit module); a moss-edit-lora file merges on bf16 modules under default and stays
+// on the side branch on INT8 and packed ones; merge on INT8 warns once per file and strict refuses it, naming
+// side_branch; side_branch never merges. Merged edit block modules keep no pristine copy.
 TEST(LoraFormat, PlacementPerModule) {
   TempDir dir("lora_place");
   auto plain = low_rank("transformer.layers.0.proj.q", ".lora_A.weight", ".lora_B.weight", kD, kD, 4, 1);
   for (auto& x : low_rank("transformer.layers.1.proj.o", ".lora_A.weight", ".lora_B.weight", kD, kD, 4, 2)) plain.push_back(x);
   write_st(dir.path() / "plain.safetensors", plain);
+  const std::string edit_meta = R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"modules\": {}}"})";
   auto edit = low_rank("layers.0.proj.q", ".lora_A", ".lora_B", kD, kD, 4, 3);
   for (auto& x : low_rank("layers.1.proj.o", ".lora_A", ".lora_B", kD, kD, 4, 4)) edit.push_back(x);
-  write_st(dir.path() / "edit.safetensors", edit,
-           R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"modules\": {}}"})");
-  // Block 0 INT8, block 1 packed 4-bit.
+  for (auto& x : low_rank("layers.2.proj.k", ".lora_A", ".lora_B", kD, kD, 4, 5)) edit.push_back(x);
+  write_st(dir.path() / "edit.safetensors", edit, edit_meta);
+  write_st(dir.path() / "edit8.safetensors", low_rank("layers.0.proj.q", ".lora_A", ".lora_B", kD, kD, 4, 3), edit_meta);
+  // Block 0 INT8, block 1 packed 4-bit, the others bf16.
   const auto base = [](std::string_view m) {
-    return m.starts_with("layers.0.") ? mi::lora::BaseFormat::kInt8 : mi::lora::BaseFormat::kPacked4;
+    return m.starts_with("layers.0.")   ? mi::lora::BaseFormat::kInt8
+           : m.starts_with("layers.1.") ? mi::lora::BaseFormat::kPacked4
+                                        : mi::lora::BaseFormat::kBf16;
   };
   const auto open = [&](const char* file, mi::lora::Placement p, bool strict = false) {
     LoadOptions o;
@@ -544,14 +548,22 @@ TEST(LoraFormat, PlacementPerModule) {
   }
   EXPECT_THROW(open("plain.safetensors", Placement::kMerge), LoraError);  // layers.1.proj.o is packed
   {
-    const LoraStack s = open("edit.safetensors", Placement::kDefault);
-    EXPECT_FALSE(side(s, "layers.0.proj.q"));
+    const LoraStack s = open("edit.safetensors", Placement::kDefault, true);  // strict: nothing lossy by default
+    EXPECT_TRUE(side(s, "layers.0.proj.q"));
     EXPECT_TRUE(side(s, "layers.1.proj.o"));
+    EXPECT_FALSE(side(s, "layers.2.proj.k"));
+    EXPECT_TRUE(s.keeps_pristine("layers.0.proj.q"));
+    EXPECT_FALSE(s.keeps_pristine("layers.2.proj.k"));
+    EXPECT_TRUE(s.reports()[0].warnings.empty());
+  }
+  {
+    const LoraStack s = open("edit8.safetensors", Placement::kMerge);
+    EXPECT_FALSE(side(s, "layers.0.proj.q"));
     EXPECT_FALSE(s.keeps_pristine("layers.0.proj.q"));
     EXPECT_EQ(s.reports()[0].warnings, std::vector<std::string>{"1 adapter merged into INT8 (requantization error)"});
   }
   try {
-    open("edit.safetensors", Placement::kDefault, true);
+    open("edit8.safetensors", Placement::kMerge, true);
     ADD_FAILURE() << "strict accepted an INT8 merge";
   } catch (const LoraError& e) {
     EXPECT_NE(std::string(e.what()).find("lora_placement side_branch"), std::string::npos) << e.what();
@@ -559,7 +571,7 @@ TEST(LoraFormat, PlacementPerModule) {
   {
     const LoraStack s = open("edit.safetensors", Placement::kSideBranch, true);
     EXPECT_TRUE(side(s, "layers.0.proj.q"));
-    EXPECT_TRUE(side(s, "layers.1.proj.o"));
+    EXPECT_TRUE(side(s, "layers.2.proj.k"));
     EXPECT_TRUE(s.merge_modules().empty());
   }
   EXPECT_EQ(mi::lora::parse_placement("side_branch"), Placement::kSideBranch);
