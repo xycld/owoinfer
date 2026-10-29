@@ -27,7 +27,9 @@ namespace mi::runtime {
 // part, which the pointer attributes' range would include). Two driver calls per check (cuPointerGetAttributes,
 // cuMemGetAddressRange), plus one pair per further VMM allocation the tensor spans; where libcuda lacks them, the
 // runtime's memory type and device only. It holds a reference to the device's primary context (retained at
-// construction, released at destruction), so the handle it compares with stays valid.
+// construction, released at destruction), so the handle it compares with stays valid, and makes it current around the
+// extent walk: check() works from any thread, with or without a current context (restored on return). Neither copyable
+// nor movable: an owner keeps it in place (or behind a unique_ptr).
 class DevicePointerCheck {
  public:
   explicit DevicePointerCheck(int device);

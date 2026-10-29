@@ -244,23 +244,15 @@ TEST(ServerShm, SweepRemovesOnlyADeadServersRegions) {
   shm::CreateOptions o;
   o.name_for_tests = [&](int attempt) { return prefix + std::to_string(getpid()) + "-live-" + std::to_string(attempt); };
   shm::Region live = shm::Region::create(4096, o);  // this process: alive
-  // Everything here is seconds old: a server's sweep (10 minutes) leaves it all.
-  EXPECT_TRUE(shm::sweep_stale(prefix).empty());
-  EXPECT_TRUE(exists(stale));
-  // The default prefix never matches this test's names.
-  for (const std::string& n : shm::sweep_stale(shm::kNamePrefix, std::chrono::seconds(0))) {
-    EXPECT_EQ(n.find(prefix), std::string::npos) << n;
-  }
-  const std::vector<std::string> removed = shm::sweep_stale(prefix, std::chrono::seconds(0));
-  const auto was_removed = [&](const std::string& n) { return std::find(removed.begin(), removed.end(), n) != removed.end(); };
-  EXPECT_TRUE(was_removed(stale));
-  EXPECT_TRUE(was_removed(unfinished));
-  EXPECT_FALSE(was_removed(foreign));
-  EXPECT_FALSE(was_removed(other_ns));
-  EXPECT_FALSE(was_removed(odd));
-  EXPECT_FALSE(was_removed(live.name()));
-  EXPECT_EQ(removed.size(), 2u);
+  // A server's sweep (the 10-minute floor): the proven region of the dead pid goes at once, the seconds-old unfinished
+  // creation stays (it may be another PID namespace's, under way).
+  const std::vector<std::string> first = shm::sweep_stale(prefix);
+  EXPECT_EQ(first, std::vector<std::string>{stale});
   EXPECT_FALSE(exists(stale));
+  EXPECT_TRUE(exists(unfinished));
+  // With no age floor the unfinished creation goes too; the rest is never removed.
+  const std::vector<std::string> removed = shm::sweep_stale(prefix, std::chrono::seconds(0));
+  EXPECT_EQ(removed, std::vector<std::string>{unfinished});
   EXPECT_FALSE(exists(unfinished));
   EXPECT_TRUE(exists(foreign));
   EXPECT_TRUE(exists(other_ns));

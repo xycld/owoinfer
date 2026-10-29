@@ -139,10 +139,11 @@ class Attachment {
 };
 
 // Linux: unlinks the regions a dead server left behind and returns their names: /dev/shm/<prefix><pid>-* owned by this
-// user, unchanged for at least `min_age`, <pid> not alive and not this process, and a header naming that pid and this
-// process's PID namespace (or an unfinished creation: shorter than a header, or all zero). The age and namespace tests
-// keep it off the regions of a server in another PID namespace sharing /dev/shm (containers). A pid reused by a live
-// process keeps its regions until that process exits. `prefix` is a test seam (tests sweep their own names only).
+// user, <pid> not alive and not this process, and either a header naming that pid and this process's PID namespace
+// (removed at once) or an unfinished creation (shorter than a header, or all zero) unchanged for at least `min_age`. A
+// header of another pid or PID namespace is never removed: the namespace and age tests keep the sweep off the regions
+// of a server in another PID namespace sharing /dev/shm (containers). A pid reused by a live process keeps its regions
+// until that process exits. `prefix` is a test seam (tests sweep their own names only).
 // Windows: none (mappings vanish with their processes); returns nothing.
 std::vector<std::string> sweep_stale(std::string_view prefix = kNamePrefix,
                                      std::chrono::seconds min_age = std::chrono::minutes(10));

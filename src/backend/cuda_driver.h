@@ -66,12 +66,19 @@ struct PointerInfo {
 // Empty when libcuda or its cuPointerGetAttributes is absent.
 std::optional<PointerInfo> pointer_info(const void* ptr);
 
-// The bytes from `ptr` on, up to `want`, that are mapped device memory of `device` without a gap: allocation after
-// allocation (cuMemGetAddressRange), each next one starting where the last ended. The pointer attributes' range is not
-// enough: for VMM memory (cuMemAddressReserve + cuMemMap, torch's expandable segments) it spans the whole reserved
-// address range, mapped or not, while cuMemGetAddressRange gives the mapped allocation holding the address. Empty when
-// libcuda is absent.
-std::optional<std::size_t> mapped_device_bytes(const void* ptr, std::size_t want, int device);
+// The bytes from `ptr` on, up to `want`, that are mapped device memory without a gap: the allocation holding `ptr`
+// (cuMemGetAddressRange), then, for VMM memory, the allocations mapped right after it in the same reservation (the
+// same CU_POINTER_ATTRIBUTE_RANGE_START_ADDR), each device memory of `device`, not managed, in `context` or in none.
+// The pointer attributes' range alone is not enough: for VMM memory (cuMemAddressReserve + cuMemMap, torch's expandable
+// segments) it spans the whole reservation, mapped or not. `context`: the device's primary context (retained by the
+// caller), made current around the walk (cuMemGetAddressRange needs one; the calling thread may have none). A driver
+// error other than "not mapped" ends the walk with its name in driver_error. Empty when libcuda is absent or `context`
+// is null.
+struct MappedExtent {
+  std::size_t bytes = 0;
+  std::string driver_error;
+};
+std::optional<MappedExtent> mapped_device_bytes(const void* ptr, std::size_t want, int device, void* context);
 
 // Saves the calling thread's current CUDA context and makes it current again on destruction, whatever the code in
 // between selected (cudaSetDevice). Without libcuda it falls back to the runtime's current device.

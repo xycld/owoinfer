@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -84,6 +85,34 @@ TEST_F(GpuExchange, AcceptsDeviceMemoryInsideItsAllocation) {
   const std::string past = refusal([&] { check.check(p + 4096, kMiB, "out[1]"); });
   EXPECT_TRUE(contains(past, "out[1] needs 1048576 bytes, but only 1044480 are mapped")) << past;
   EXPECT_TRUE(contains(refusal([&] { check.check(d, kMiB + 1, "x"); }), "only 1048576 are mapped"));
+  MI_CUDA_CHECK(cudaFree(d));
+}
+
+TEST_F(GpuExchange, ChecksFromAThreadWithoutACurrentContext) {
+  // A host's own thread (P2's callers): no CUDA context is current there until the check makes one current itself, and
+  // the thread's (absent) current context is restored afterwards.
+  void* d = nullptr;
+  MI_CUDA_CHECK(cudaMalloc(&d, kMiB));
+  const DevicePointerCheck check(0);
+  std::string accepted = "not run", refused;
+  bool had_context = true, has_context_after = true;
+  std::thread([&] {
+    void* lib = nullptr;
+#ifndef _WIN32
+    lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+#endif
+    const auto current = lib != nullptr ? reinterpret_cast<decltype(&cuCtxGetCurrent)>(dlsym(lib, "cuCtxGetCurrent")) : nullptr;
+    CUcontext ctx = nullptr;
+    had_context = current != nullptr && current(&ctx) == CUDA_SUCCESS && ctx != nullptr;
+    accepted = refusal([&] { check.check(d, kMiB, "x"); });
+    refused = refusal([&] { check.check(static_cast<std::byte*>(d) + 4096, kMiB, "out[0]"); });
+    ctx = nullptr;
+    has_context_after = current != nullptr && current(&ctx) == CUDA_SUCCESS && ctx != nullptr;
+  }).join();
+  EXPECT_FALSE(had_context);
+  EXPECT_EQ(accepted, "");
+  EXPECT_TRUE(contains(refused, "out[0] needs 1048576 bytes, but only 1044480 are mapped")) << refused;
+  EXPECT_FALSE(has_context_after);
   MI_CUDA_CHECK(cudaFree(d));
 }
 

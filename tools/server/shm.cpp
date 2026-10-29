@@ -438,27 +438,27 @@ std::vector<std::string> sweep_stale(std::string_view prefix, std::chrono::secon
     if (i == prefix.size() || i >= entry.size() || entry[i] != '-' || pid <= 0 || pid >= (1LL << 31)) continue;
     struct stat st {};
     if (fstatat(dirfd(dir), e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode) || st.st_uid != uid) continue;
-    // Young objects are left alone: a server of another PID namespace sharing /dev/shm (a container) may be creating or
-    // using one under a pid that means nothing here.
-    if (now - std::max(st.st_mtime, st.st_ctime) < static_cast<std::time_t>(min_age.count())) continue;
     if (static_cast<pid_t>(pid) == self) continue;
     if (kill(static_cast<pid_t>(pid), 0) == 0 || errno != ESRCH) continue;  // alive (EPERM: another user's live pid)
-    // A complete header must be a region's of that pid created in this PID namespace (another namespace's pids are not
-    // ours to test); a shorter or all-zero file is a creation its server did not finish (killed before ftruncate or the
-    // header write).
+    // Proven: a complete header of that pid, created in this PID namespace, so the dead pid is really its server's
+    // (removed at once: a crash-looping server must not fill /dev/shm with its predecessors' reserved regions).
+    // Unproven: shorter than a header or all zero, a creation its server did not finish (killed before ftruncate or the
+    // header write) or one of another PID namespace sharing /dev/shm (a container) still under way: removed only once
+    // unchanged for min_age. Any other header is not ours.
+    bool proven = false;
     if (st.st_size >= static_cast<off_t>(kHeaderBytes)) {
       const int fd = openat(dirfd(dir), e->d_name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
       if (fd < 0) continue;
       std::byte header[kHeaderBytes];
       const ssize_t got = pread(fd, header, sizeof(header), 0);
       close(fd);
-      const bool zero = got == static_cast<ssize_t>(sizeof(header)) &&
-                        std::all_of(header, header + sizeof(header), [](std::byte b) { return b == std::byte{0}; });
-      if (!zero && (got != static_cast<ssize_t>(sizeof(header)) || std::memcmp(header, kMagic, sizeof(kMagic)) != 0 ||
-                    get_u32(header + 12) != static_cast<std::uint32_t>(pid) || ns == 0 || get_u64(header + 48) != ns)) {
-        continue;
-      }
+      if (got != static_cast<ssize_t>(sizeof(header))) continue;
+      const bool zero = std::all_of(header, header + sizeof(header), [](std::byte b) { return b == std::byte{0}; });
+      proven = !zero && std::memcmp(header, kMagic, sizeof(kMagic)) == 0 &&
+               get_u32(header + 12) == static_cast<std::uint32_t>(pid) && ns != 0 && get_u64(header + 48) == ns;
+      if (!zero && !proven) continue;
     }
+    if (!proven && now - std::max(st.st_mtime, st.st_ctime) < static_cast<std::time_t>(min_age.count())) continue;
     const std::string name = "/" + std::string(entry);
     if (shm_unlink(name.c_str()) == 0) removed.push_back(name);
   }
