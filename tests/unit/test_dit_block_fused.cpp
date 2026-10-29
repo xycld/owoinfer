@@ -1512,4 +1512,79 @@ TEST(DitSmallImages, ForwardFusedMatchesOpByOpBitForBit) {
   }
 }
 
+// MossDit::set_graphs_paused, which a component run's crop calls use (design §5.2: crops bypass CUDA graphs): with
+// kFusedGraphs and every block resident, a paused forward at another shape runs eagerly (no capture, no replay) and
+// leaves the step-shape hash alone, so the next forward at the run's shape replays the run's graphs instead of running
+// eagerly; the paused forward gives kFused's velocities, and the replay gives the velocities before the pause.
+TEST(DitSmallImages, PausedGraphsRunEagerlyAndKeepTheRunsGraphs) {
+  if (!fs::is_regular_file(bundle_dir() / "moss.mossidx")) GTEST_SKIP() << "weights not present (" << bundle_dir() << ")";
+  const mi::weights::ModelIndex index = mi::weights::load_index(bundle_dir() / "moss.mossidx", bundle_dir());
+  mi::runtime::StreamSet streams;
+  const cudaStream_t stream = streams.compute();
+  constexpr std::int64_t kText = 40, kUncond = 10, kFull = 16, kCrop = 9;  // 256^2 and a 144^2 crop
+  const std::int64_t lengths[] = {kText, kUncond};
+  const std::size_t work = std::max(md::MossDit::workspace_bytes(kFull, kFull, lengths, md::BlockPath::kOpByOp),
+                                    md::MossDit::workspace_bytes(kCrop, kCrop, lengths, md::BlockPath::kOpByOp));
+  const std::size_t io = 2 * mi::runtime::align_up(static_cast<std::size_t>(kText * kDim * 2)) +
+                         6 * mi::runtime::align_up(static_cast<std::size_t>(128 * kFull * kFull * 4));
+  md::Residency residency;  // every block resident: graphs need it
+  const std::size_t need = md::MossDit::persistent_bytes(index, residency) + io + work;
+  if (need + (std::size_t{512} << 20) > mi::runtime::DeviceArena::free_device_bytes()) {
+    GTEST_SKIP() << "the bf16 DiT does not fit resident here";
+  }
+  mi::runtime::DeviceArena arena(need);
+  md::MossDit model(index, arena, streams, false, nullptr, residency);
+  const Tensor cond = arena.alloc_persistent_tensor(DType::kBF16, {kText, kDim});
+  const Tensor uncond = arena.alloc_persistent_tensor(DType::kBF16, {kUncond, kDim});
+  upload(cond, synth_bf16(71, static_cast<std::size_t>(kText * kDim), 0));
+  upload(uncond, synth_bf16(72, static_cast<std::size_t>(kUncond * kDim), 0));
+  install_self_check(stream);
+  md::SkipSet skip22;
+  skip22.set(22);
+  const md::Row rows[2] = {{cond, {}}, {uncond, skip22}};
+  const auto latents = [&](std::int64_t g) {
+    const Tensor t = arena.alloc_persistent_tensor(DType::kF32, {128, g, g});
+    std::vector<float> v(static_cast<std::size_t>(t.numel()));
+    for (std::size_t i = 0; i < v.size(); ++i) v[i] = std::sin(0.29f * static_cast<float>(i));
+    MI_CUDA_CHECK(cudaMemcpy(t.data, v.data(), t.nbytes(), cudaMemcpyHostToDevice));
+    return t;
+  };
+  const Tensor full = latents(kFull), crop = latents(kCrop);
+  const Tensor full_out[2] = {arena.alloc_persistent_tensor(DType::kF32, {128, kFull, kFull}),
+                              arena.alloc_persistent_tensor(DType::kF32, {128, kFull, kFull})};
+  const Tensor crop_out[2] = {arena.alloc_persistent_tensor(DType::kF32, {128, kCrop, kCrop}),
+                              arena.alloc_persistent_tensor(DType::kF32, {128, kCrop, kCrop})};
+  const auto host = [&](const Tensor (&outs)[2]) {
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<float> v;
+    for (const Tensor& t : outs) {
+      std::vector<float> part(static_cast<std::size_t>(t.numel()));
+      MI_CUDA_CHECK(cudaMemcpy(part.data(), t.data, t.nbytes(), cudaMemcpyDeviceToHost));
+      v.insert(v.end(), part.begin(), part.end());
+    }
+    return v;
+  };
+  model.set_block_path(md::BlockPath::kFused);
+  model.forward(crop, 500.0f, rows, crop_out, stream);
+  const std::vector<float> crop_fused = host(crop_out);
+
+  model.set_block_path(md::BlockPath::kFusedGraphs);
+  for (int i = 0; i < 3; ++i) model.forward(full, 500.0f, rows, full_out, stream);  // shape seen, captured, replayed
+  const std::vector<float> before = host(full_out);
+  const md::StepGraphStats s0 = model.graph_stats();
+  ASSERT_GT(s0.captures, 0u);
+  ASSERT_GT(s0.replays, 0u);
+  model.set_graphs_paused(true);
+  model.forward(crop, 500.0f, rows, crop_out, stream);
+  model.forward(crop, 500.0f, rows, crop_out, stream);  // a repeated shape: still eager while paused
+  EXPECT_EQ(host(crop_out), crop_fused) << "the paused forward differs from kFused";
+  EXPECT_EQ(model.graph_stats().captures, s0.captures) << "a paused forward captured";
+  EXPECT_EQ(model.graph_stats().replays, s0.replays) << "a paused forward replayed";
+  model.set_graphs_paused(false);
+  model.forward(full, 500.0f, rows, full_out, stream);
+  EXPECT_EQ(model.graph_stats().captures, s0.captures) << "the run's shape was captured again";
+  EXPECT_GT(model.graph_stats().replays, s0.replays) << "the run's graphs did not replay after the pause";
+  EXPECT_EQ(host(full_out), before);
+}
+
 }  // namespace
