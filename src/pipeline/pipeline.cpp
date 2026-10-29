@@ -1157,12 +1157,21 @@ Pipeline::Impl::Planned Pipeline::Impl::plan_call(const CallModels& models, cons
   }
   bool drop_resident = false;
   // Merged LoRA blocks stream only from a pinned host copy: when the host cannot hold it the plan fails, naming what
-  // would fit instead (the placement is never switched on the request's behalf).
+  // would fit instead (the placement is never switched on the request's behalf). Named only for a host shortfall with
+  // a low-rank block adapter merged, the one kind merged by its placement (LoHa / LoKr / full deltas merge under every
+  // placement).
   const auto planned = [&] {
     try {
       return planner::plan(in);
     } catch (const planner::BudgetError& e) {
-      if (in.caps.dit_file_source || !m.lora_stack) throw;
+      if (in.caps.dit_file_source || !m.lora_stack || e.required_host <= e.host_limit) throw;
+      const auto& adapters = m.lora_stack->adapters();
+      if (std::none_of(adapters.begin(), adapters.end(), [&](const lora::Adapter& a) {
+            const lora::TargetModule* t = m.lora_stack->model().find(a.module);
+            return a.kind == lora::AdapterKind::kLowRank && !a.side_branch && t != nullptr && t->block >= 0;
+          })) {
+        throw;
+      }
       throw planner::BudgetError(std::string(e.what()) +
                                      " (merged LoRA blocks stream from a pinned host copy: use lora_placement side_branch, "
                                      "a larger host_ram_budget, or a DiT file with the adapter baked in: moss-infer "

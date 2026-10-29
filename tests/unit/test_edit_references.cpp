@@ -30,6 +30,7 @@
 #include "models/moss_dit/moss_dit.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_image.h"
+#include "planner/host_memory.h"
 #include "runtime/device_arena.h"
 #include "runtime/stream_set.h"
 #include "util/npy.h"
@@ -553,6 +554,81 @@ TEST(GpuEditPipeline, AlternatingRequests) {
   const Out back = run(request(true, true));
   EXPECT_EQ(back.dit_loads, 1);
   EXPECT_EQ(back.latents, b1.latents);
+}
+
+// Merged streamed blocks need a pinned host copy: over the host budget the plan fails (out of memory) naming the side
+// branch, a larger host_ram_budget and a baked file, and the same request on the side branch plans and runs from the
+// file; a GPU shortfall with the same merges is not blamed on them.
+TEST(GpuEditPipeline, PlanFailureNamesThePlacement) {
+  const fs::path com = "/workspace/Models/community";
+  const fs::path dit = com / "comfy-org/moss_image_sft_int8_convrot.safetensors";
+  const fs::path te = com / "comfy-org/qwen3.5_9b_int8_convrot.safetensors";
+  const fs::path lora = com / "chinoll/Moss-Image-Edit/adapter_model.safetensors";
+  const fs::path bundle = "/workspace/Models/MOSS-Image/sft";
+  if (!fs::is_regular_file(dit) || !fs::is_regular_file(te) || !fs::is_regular_file(lora) || !fs::is_directory(bundle)) {
+    GTEST_SKIP() << "the INT8 SFT DiT, the INT8 text encoder, the edit adapter or the SFT bundle not present";
+  }
+  const auto options = [&](std::size_t vram, std::size_t host) {
+    mi::pipeline::PipelineOptions o;
+    o.hardware = mi::planner::HardwareProfile{};
+    o.hardware->h2d_gbps = 24;
+    o.hardware->disk_gbps = 3;
+    o.hardware->host_gbps = 18;
+    o.hardware->bf16_tflops = 150;
+    o.hardware->measured = true;
+    o.te_host_pin = mi::planner::TeHostPin::kOff;
+    o.tier = mi::planner::Tier::kHigh;
+    o.attention = mi::planner::AttentionMode::kQ8Fp8;
+    o.mode = mi::planner::Mode::kMinMemory;
+    o.vram_budget = vram;
+    o.host_ram_budget = host;
+    o.dit_file = dit;
+    o.text_encoder_file = te;
+    return o;
+  };
+  const auto request = [&](mi::lora::Placement placement) {
+    mi::pipeline::Request r;
+    r.model = bundle;
+    r.prompt = "make the sky green";
+    r.negative_prompt = "";
+    r.width = r.height = 512;
+    r.steps = 1;
+    r.cfg = 4.0;
+    r.seed = 3;
+    r.decode = false;
+    r.loras.push_back({lora, 1.0f});
+    r.lora_placement = placement;
+    return r;
+  };
+  const auto plan_error = [&](mi::pipeline::Pipeline& p, const mi::pipeline::Request& r) {
+    try {
+      p.generate(r);
+    } catch (const mi::planner::BudgetError& e) {
+      return std::string(e.what());
+    }
+    return std::string("planned");
+  };
+  {
+    // 3 GiB of VRAM streams (nearly) every block; the host holds the generation from the files but not the merged
+    // streamed blocks' pinned copy (~130 MB each).
+    mi::pipeline::Pipeline p(options(std::size_t{3} << 30,
+                                     mi::planner::process_host_memory().private_bytes + (std::size_t{3} << 30)));
+    const std::string e = plan_error(p, request(mi::lora::Placement::kMerge));
+    EXPECT_NE(e.find("not enough host memory"), std::string::npos) << e;
+    EXPECT_NE(e.find("use lora_placement side_branch, a larger host_ram_budget, or a DiT file with the adapter baked in"),
+              std::string::npos)
+        << e;
+    const mi::pipeline::Result res = p.generate(request(mi::lora::Placement::kSideBranch));
+    EXPECT_EQ(res.steps_run, 1);
+    EXPECT_EQ(res.dit_stream.source, "file");
+  }
+  {
+    // Too little GPU memory for any plan: the merges are not what failed.
+    mi::pipeline::Pipeline p(options(std::size_t{1} << 30, 0));
+    const std::string e = plan_error(p, request(mi::lora::Placement::kMerge));
+    EXPECT_NE(e.find("not enough GPU memory"), std::string::npos) << e;
+    EXPECT_EQ(e.find("lora_placement"), std::string::npos) << e;
+  }
 }
 
 }  // namespace
