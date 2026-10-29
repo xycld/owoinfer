@@ -39,7 +39,8 @@
  *   waits. Keep them short. They must not throw (C++), longjmp, or call mi_generate(), mi_engine_preload(),
  *   mi_engine_release() or mi_engine_free() on the same engine.
  * - mi_engine_free() may be called while a job runs on that engine on another thread: it cancels the job, waits for it
- *   to return, then frees (2.1). Using the engine after mi_engine_free() returns remains the caller's bug.
+ *   to return, then frees (2.1). A call not yet started when mi_engine_free() begins (mi_cancel() included, or one still
+ *   reading its arguments) must not overlap it. Using the engine after mi_engine_free() returns is the caller's bug.
  * - mi_result objects are independent of their engine. They may outlive it and be used from any one thread at a time.
  */
 #ifndef MOSSINFER_MOSSINFER_H
