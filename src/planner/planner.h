@@ -192,7 +192,8 @@ struct ModelShapes {
 // component the engine needs is missing.
 ModelShapes shapes_from_index(const weights::ModelIndex& index);
 // The same with components loaded from their own files (P6/P7a): the DiT's fields from `dit_index` (with
-// `dit_precision`), the text encoder's from `te_index`, the VAE's from `vae_index`; nullptr: the bundle's.
+// `dit_precision`), the text encoder's from `te_index`, the VAE's from `vae_index`; nullptr: the bundle's. `index` need
+// not hold the components given separately.
 ModelShapes shapes_from_index(const weights::ModelIndex& index, const weights::ModelIndex* dit_index, Precision dit_precision,
                               const weights::ModelIndex* te_index = nullptr, const weights::ModelIndex* vae_index = nullptr);
 

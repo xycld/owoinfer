@@ -1118,4 +1118,90 @@ TEST_F(Flux2VaeFullTiledTest, DecodeWithinBudget) {
   EXPECT_EQ(got, want);
 }
 
+// bf16 round to nearest even of an fp32 value (finite), still fp32: written out here, independent of the engine's.
+float bf16_rne(float x) {
+  std::uint32_t u;
+  std::memcpy(&u, &x, 4);
+  u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
+  float r;
+  std::memcpy(&r, &u, 4);
+  return r;
+}
+
+// The latent statistics a single VAE file is decoded and encoded with (read_latent_stats, Flux2VaeDecoder's and
+// Flux2VaeEncoder's round_stats): its fp32 values rounded to bf16, ties to even, from a tiny synthetic file (CPU only).
+TEST(Flux2VaeLatentStats, VaeFileStatisticsAreRoundedToBf16) {
+  mi::testing::TempDir dir("vae_latent_stats");
+  std::vector<float> mean(128), var(128);
+  for (int i = 0; i < 128; ++i) {
+    std::uint32_t u = 0x3F800000u + static_cast<std::uint32_t>(i) * 0x1111u;  // 1.0 plus low mantissa bits
+    if (i == 1) u = 0x3F808000u;                                              // a tie, even below: rounds down
+    if (i == 2) u = 0x3F818000u;                                              // a tie, odd below: rounds up
+    if (i == 3) u = 0xBF7FFFFFu;                                              // negative, carries into the exponent
+    std::memcpy(&mean[static_cast<std::size_t>(i)], &u, 4);
+    var[static_cast<std::size_t>(i)] = 0.001f * static_cast<float>(i + 1) + 1e-7f;
+  }
+  // index_vae_file's minimum: the decoder's first and last conv, post_quant_conv and the statistics, all F32.
+  struct T {
+    std::string name;
+    std::vector<float> v;
+  };
+  const std::vector<T> tensors = {{"decoder.conv_in.weight", std::vector<float>(4, 0.5f)},
+                                  {"decoder.conv_out.weight", std::vector<float>(4, 0.25f)},
+                                  {"post_quant_conv.weight", std::vector<float>(4, 1.0f)},
+                                  {"bn.running_mean", mean},
+                                  {"bn.running_var", var}};
+  std::string header = "{";
+  std::size_t end = 0;
+  for (const T& t : tensors) {
+    header += (end == 0 ? "\"" : ",\"") + t.name + "\":{\"dtype\":\"F32\",\"shape\":[" + std::to_string(t.v.size()) +
+              "],\"data_offsets\":[" + std::to_string(end) + "," + std::to_string(end + 4 * t.v.size()) + "]}";
+    end += 4 * t.v.size();
+  }
+  header += "}";
+  const fs::path file = dir.path() / "vae.safetensors";
+  {
+    std::ofstream out(file, std::ios::binary);
+    const std::uint64_t n = header.size();
+    out.write(reinterpret_cast<const char*>(&n), 8);
+    out << header;
+    for (const T& t : tensors) out.write(reinterpret_cast<const char*>(t.v.data()), static_cast<std::streamsize>(4 * t.v.size()));
+  }
+  const mi::weights::ModelIndex index = mi::flux2_vae::index_vae_file(file);
+  const mi::flux2_vae::LatentStats as_stored = mi::flux2_vae::read_latent_stats(index, false);
+  const mi::flux2_vae::LatentStats used = mi::flux2_vae::read_latent_stats(index, true);
+  ASSERT_EQ(used.mean.size(), 128u);
+  ASSERT_EQ(used.var.size(), 128u);
+  EXPECT_EQ(as_stored.mean, mean);
+  EXPECT_EQ(as_stored.var, var);
+  std::size_t changed = 0;
+  for (std::size_t i = 0; i < 128; ++i) {
+    EXPECT_EQ(used.mean[i], bf16_rne(mean[i])) << i;
+    EXPECT_EQ(used.var[i], bf16_rne(var[i])) << i;
+    changed += used.mean[i] != mean[i];
+  }
+  EXPECT_GT(changed, 100u);  // the synthetic values need rounding
+  EXPECT_EQ(used.mean[1], 1.0f);
+  EXPECT_EQ(used.mean[2], 1.015625f);
+  EXPECT_EQ(used.mean[3], -1.0f);
+  // Values already bf16 (a bundle's) are left as they are.
+  for (const float v : used.mean) EXPECT_EQ(bf16_rne(v), v);
+}
+
+// The Comfy-Org VAE files' statistics, as used, equal the MOSS-Image bundle's as stored (skipped without the files).
+TEST(Flux2VaeLatentStats, ComfyOrgFilesRoundToTheBundlesValues) {
+  const fs::path bundle_vae = bundle_dir() / "vae" / "diffusion_pytorch_model.safetensors";
+  if (!fs::is_regular_file(bundle_vae)) GTEST_SKIP() << "weights not present";
+  const mi::flux2_vae::LatentStats bundle = mi::flux2_vae::read_latent_stats(mi::flux2_vae::index_vae_file(bundle_vae), false);
+  int files = 0;
+  for (const fs::path& f : {full_vae_file(), small_vae_file()}) {
+    if (!fs::is_regular_file(f)) continue;
+    ++files;
+    const mi::flux2_vae::LatentStats used = mi::flux2_vae::read_latent_stats(mi::flux2_vae::index_vae_file(f), true);
+    EXPECT_EQ(used.mean, bundle.mean) << f;
+    EXPECT_EQ(used.var, bundle.var) << f;
+  }
+  if (files == 0) GTEST_SKIP() << "no community VAE file present";
+}
+
 }  // namespace

@@ -90,7 +90,7 @@ The weights load on the first `mi_generate()`, or earlier with `mi_engine_preloa
 
 | `mi_engine_params` field | Default | Meaning |
 |---|---|---|
-| `model_path` | — (required) | bundle directory. The tokenizer and configs always come from it. |
+| `model_path` | — (required) | bundle directory. The tokenizer and configs always come from it. A component that `dit_file`, `text_encoder_file` or `vae_file` replaces needs only its config in its folder: the engine identifies each file as its component by its shapes, and the folder's weights for that component are then not read, whether there or not (a `moss.mossidx` still serves). A component no file replaces needs its weights: without them `mi_generate()` fails with `MI_ERR_MODEL`, naming the component ("missing weights for …: add them or pass its component file" when a `moss.mossidx` lists them). |
 | `model_format` | `AUTO` | `AUTO`: a directory is an HF bundle, a file is a ComfyUI checkpoint (not supported: `MI_ERR_NOT_SUPPORTED`). `COMFYUI` is reserved and not supported either. |
 | `mode` | `BALANCED` | `MIN_MEMORY` / `BALANCED` / `MAX_SPEED` (planner objective) |
 | `device_index` | 0 | CUDA ordinal |
@@ -103,7 +103,7 @@ The weights load on the first `mi_generate()`, or earlier with `mi_engine_preloa
 | `block_path` | `DEFAULT` (fused) | DiT block implementation: `OP_BY_OP`, `FUSED` or `FUSED_GRAPHS`; all give the same image bits. `FUSED` runs op by op when the startup self-check finds the fused GEMMs not bit-identical on this GPU, and `FUSED_GRAPHS` replays CUDA graphs only when every DiT block is resident. `mi_result_block_path()` reports what ran. |
 | `dit_file` | NULL = the bundle's `transformer/` | single-file DiT: INT8 ConvRot (G = 256), INT4 ConvRot (the `TURBO` tier), NVFP4 (the `TURBO` tier on an RTX 50: compute capability 12.0; refused elsewhere with `MI_ERR_MODEL`), mixed INT8/bf16 or bf16 safetensors in the ComfyUI layout (Comfy-Org and community files, `moss-infer quantize` output) |
 | `text_encoder_file` | NULL = the bundle's `text_encoder/` | INT8 ConvRot or W4A8 Qwen3.5 text encoder. Its embeddings are cached under its own identity. |
-| `vae_file` | NULL = the bundle's `vae/` | single FLUX.2 VAE file, decoded with the bundle's latent statistics |
+| `vae_file` | NULL = the bundle's `vae/` | single FLUX.2 VAE file, decoded (and, when it holds an encoder, encoded) with its own latent statistics rounded to bf16 at load, as the bundle stores them; the bundle's `vae/` weights are not read. For the Comfy-Org files these are the bundle's values, so the image is the bundle's bit for bit. img2img with a decoder-only file still needs the bundle's `vae/diffusion_pytorch_model.safetensors` for the encoder. |
 | `tier` | none: **required** | quality tier, see below. The zero default `MI_TIER_AUTO` is refused by `mi_engine_create()` with `MI_ERR_INVALID_ARGUMENT` |
 | `attention` | `DEFAULT` (the tier's choice) | DiT attention kernel: `EXACT` (FlashAttention-2) or an 8-bit mode |
 | `lora_strict` | 0 | 1: unknown LoRA keys and lossy merges fail the generation with `MI_ERR_MODEL` instead of being reported |

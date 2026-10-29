@@ -15,6 +15,7 @@
 #include "kernels/vae/attention.h"
 #include "models/flux2_vae/flux2_vae_internal.h"
 #include "models/flux2_vae/torch_group_norm.h"
+#include "models/flux2_vae/vae_file.h"
 #include "runtime/pinned_ring.h"
 #include "weights/safetensors.h"
 #include "weights/upload.h"
@@ -203,7 +204,7 @@ std::size_t Flux2VaeDecoder::persistent_bytes(const weights::ModelIndex& index, 
 
 Flux2VaeDecoder::Flux2VaeDecoder(const weights::ModelIndex& index, runtime::DeviceArena& arena,
                                  runtime::StreamSet& streams, bool bf16_weights, bool direct_io,
-                                 const weights::ModelIndex* latent_stats)
+                                 const weights::ModelIndex* latent_stats, bool round_stats)
     : arena_(arena), config_(decoder_config(index)), has_bf16_(bf16_weights) {
   const auto t0 = std::chrono::steady_clock::now();
   const int mid = config_.mid();
@@ -220,7 +221,20 @@ Flux2VaeDecoder::Flux2VaeDecoder(const weights::ModelIndex& index, runtime::Devi
     // The largest tensor is 9.4 MB (full decoder): a small ring suffices and keeps the pinned allocation cheap.
     runtime::PinnedRing ring(streams.copy(), 2, std::size_t{16} << 20);
     m = weights::upload_group(readers, group, arena, ring);
-    m.merge(weights::upload_group(stats_readers, stats, arena, ring));
+    if (round_stats) {
+      // A VAE file's statistics, rounded on the host before their upload (read_latent_stats).
+      const LatentStats st = read_latent_stats(stats_index, true);
+      const std::size_t bytes = weights::group_device_bytes(stats);
+      std::vector<weights::UploadPiece> pieces;
+      m.merge(weights::plan_group_upload(stats, arena.alloc_persistent(bytes), bytes, pieces));
+      for (const weights::UploadPiece& p : pieces) {
+        const std::vector<float>& v = p.tensor->name == "bn.running_mean" ? st.mean : st.var;
+        MI_CUDA_CHECK(cudaMemcpyAsync(p.dst, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice, streams.copy()));
+      }
+      MI_CUDA_CHECK(cudaStreamSynchronize(streams.copy()));
+    } else {
+      m.merge(weights::upload_group(stats_readers, stats, arena, ring));
+    }
     ring.synchronize();
   }
   load_stats_.bytes = group.total_bytes + stats.total_bytes;

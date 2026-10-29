@@ -31,6 +31,7 @@
 #include "models/moss_dit/moss_dit.h"
 #include "pipeline/hardware_profile.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/pipeline_image.h"
 #include "pipeline/report_json.h"
 #include "pipeline/png_writer.h"
 #include "pipeline/rng_torch_compat.h"
@@ -41,7 +42,10 @@
 #include "test_util.h"
 #include "util/json.h"
 #include "util/npy.h"
+#include "weights/file_reader.h"
 #include "weights/model_index.h"
+#include "weights/safetensors.h"
+#include "weights/supported_model.h"
 
 // Independent PNG decoder for the writer's round trip (static: test_flux2_vae.cpp links its own copy).
 #define STB_IMAGE_STATIC
@@ -1383,6 +1387,154 @@ TEST(PipelineEndToEnd, HighTierKeeps8BitAttentionAt2048MinMemory) {
   EXPECT_EQ(r.plan.dit.attention, r.tier.attention);
   EXPECT_EQ(r.tier.attention, tier_default_attention());
   EXPECT_EQ(r.steps_run, r.steps_scheduled);
+}
+
+// The decoder tensors of a VAE file (decoder.*, post_quant_conv.*, bn.running_*) as a decoder-only safetensors file.
+void write_decoder_only_vae(const fs::path& from, const fs::path& to) {
+  const mi::weights::SafetensorsFile src(from);
+  std::string header = "{";
+  std::uint64_t end = 0;
+  std::vector<const mi::weights::TensorInfo*> kept;
+  for (const mi::weights::TensorInfo& t : src.tensors()) {
+    const bool decoder = t.name.rfind("decoder.", 0) == 0 || t.name.rfind("post_quant_conv.", 0) == 0 ||
+                         t.name.rfind("bn.running_", 0) == 0;
+    if (!decoder) continue;
+    std::string shape;
+    for (const std::int64_t d : t.shape) shape += (shape.empty() ? "" : ",") + std::to_string(d);
+    header += (kept.empty() ? "\"" : ",\"") + t.name + "\":{\"dtype\":\"" + mi::weights::dtype_name(t.dtype) + "\",\"shape\":[" +
+              shape + "],\"data_offsets\":[" + std::to_string(end) + "," + std::to_string(end + t.nbytes) + "]}";
+    end += t.nbytes;
+    kept.push_back(&t);
+  }
+  header += "}";
+  header.append((8 - header.size() % 8) % 8, ' ');
+  std::ofstream out(to, std::ios::binary | std::ios::trunc);
+  const std::uint64_t n = header.size();
+  out.write(reinterpret_cast<const char*>(&n), 8);
+  out << header;
+  const mi::weights::FileReader in(from);
+  std::vector<char> buf;
+  for (const mi::weights::TensorInfo* t : kept) {
+    buf.resize(t->nbytes);
+    in.read_at(t->offset, buf.data(), buf.size());
+    out.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+  }
+  ASSERT_TRUE(out.good());
+}
+
+// Component files replace the bundle's components: the bundle folder then needs only its configs and tokenizer (its
+// moss.mossidx still serves, without the replaced components), and its weights for them are not read: with or without
+// them the image is the same bit for bit, img2img's too (a VAE file's encoder, or for a decoder-only file the bundle's
+// VAE file, read directly). A VAE file normalizes with its own statistics rounded to bf16 (Flux2VaeLatentStats). A wrong
+// file fails with its own error, and a component not replaced still needs its weights.
+TEST(PipelineEndToEnd, ComponentFilesNeedOnlyTheBundleConfigs) {
+  const fs::path sft = weights_root() / "sft";
+  const fs::path te = "/workspace/Models/community/comfy-org/qwen3.5_9b_int8_convrot.safetensors";
+  const fs::path small_vae = "/workspace/Models/community/comfy-org/flux2-vae_small.safetensors";
+  const fs::path full_vae = "/workspace/Models/community/comfy-org/flux2-vae.safetensors";
+  const fs::path init = fs::path(MOSSINFER_SOURCE_DIR) / "tests" / "reference_images" / "asset005_base.png";
+  if (!fs::is_regular_file(sft / "moss.mossidx") || !fs::is_regular_file(kInt8Dit) || !fs::is_regular_file(te) ||
+      !fs::is_regular_file(small_vae) || !fs::is_regular_file(full_vae) || !fs::is_regular_file(init)) {
+    GTEST_SKIP() << "SFT bundle, component files or init image not present";
+  }
+  mi::testing::TempDir bare("pipe_configs_only"), with_vae("pipe_configs_vae");
+  const auto link = [&](const fs::path& dir, const fs::path& rel) {
+    fs::create_directories((dir / rel).parent_path());
+    fs::create_symlink(sft / rel, dir / rel);
+  };
+  for (const fs::path& dir : {bare.path(), with_vae.path()}) {
+    for (const char* rel : {"model_index.json", "moss.mossidx", "transformer/config.json", "text_encoder/config.json",
+                            "vae/config.json", "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json"}) {
+      link(dir, rel);
+    }
+  }
+  link(with_vae.path(), "vae/diffusion_pytorch_model.safetensors");
+
+  mi::pipeline::Request req;
+  req.prompt = "a lighthouse on a cliff at night";
+  req.height = req.width = 256;
+  req.steps = 3;
+  mi::pipeline::PipelineOptions options;
+  options.dit_file = kInt8Dit;
+  options.text_encoder_file = te;
+  options.tier = mi::planner::Tier::kHigh;
+  options.mode = mi::planner::Mode::kMinMemory;  // streamed: little host and device memory
+  const auto init_image = std::make_shared<const mi::pipeline::Image>(mi::pipeline::load_image(init));
+  {
+    options.vae_file = small_vae;
+    mi::pipeline::Pipeline pipe(options);
+    req.model = sft;
+    const mi::pipeline::Result full = pipe.generate(req);
+    ASSERT_FALSE(full.rgb.empty());
+    for (const fs::path& dir : {with_vae.path(), bare.path()}) {
+      SCOPED_TRACE(dir.string());
+      req.model = dir;
+      const mi::pipeline::Result r = pipe.generate(req);
+      EXPECT_EQ(r.dit_source, kInt8Dit.string());
+      EXPECT_EQ(r.te_source, te.string());
+      EXPECT_EQ(r.vae_source, small_vae.string());
+      EXPECT_EQ(bit_mismatches(r.latents, full.latents), 0u);
+      EXPECT_TRUE(r.rgb == full.rgb);
+    }
+  }
+  // img2img. The small and the full VAE file both carry an encoder: the configs-only folder serves. A decoder-only file
+  // encodes with the bundle's VAE file, which the configs-only folder lacks.
+  mi::testing::TempDir scratch("pipe_decoder_only_vae");
+  const fs::path decoder_only = scratch.path() / "flux2-vae_small_decoder.safetensors";
+  write_decoder_only_vae(small_vae, decoder_only);
+  for (const fs::path& vae : {small_vae, full_vae, decoder_only}) {
+    SCOPED_TRACE(vae.string());
+    options.vae_file = vae;
+    mi::pipeline::Pipeline pipe(options);
+    mi::pipeline::Request img = req;
+    img.init_image = init_image;
+    img.denoise_strength = 0.6;
+    img.model = sft;
+    const mi::pipeline::Result full = pipe.generate(img);
+    ASSERT_TRUE(full.first_pass.encoded);
+    ASSERT_FALSE(full.rgb.empty());
+    img.model = vae == decoder_only ? with_vae.path() : bare.path();
+    const mi::pipeline::Result r = pipe.generate(img);
+    EXPECT_TRUE(r.first_pass.encoded);
+    EXPECT_EQ(bit_mismatches(r.latents, full.latents), 0u);
+    EXPECT_TRUE(r.rgb == full.rgb);
+    if (vae == decoder_only) {
+      img.model = bare.path();
+      try {
+        pipe.generate(img);
+        ADD_FAILURE() << "expected std::invalid_argument";
+      } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("img2img needs the VAE encoder"), std::string::npos) << e.what();
+      }
+    }
+  }
+
+  // A LoRA given as the DiT: refused as such (the file's own error), before the configs-only folder is indexed.
+  mi::pipeline::PipelineOptions lora_dit = options;
+  lora_dit.dit_file = kKohyaLora;
+  if (fs::is_regular_file(kKohyaLora)) {
+    mi::pipeline::Pipeline lora_pipe(lora_dit);
+    req.model = bare.path();
+    try {
+      lora_pipe.generate(req);
+      ADD_FAILURE() << "expected UnsupportedModelError";
+    } catch (const mi::weights::UnsupportedModelError& e) {
+      EXPECT_NE(std::string(e.what()).find("a LoRA"), std::string::npos) << e.what();
+    }
+  }
+
+  // Only the text encoder replaced: the DiT's weights are still the bundle's, and missing.
+  mi::pipeline::PipelineOptions te_only;
+  te_only.text_encoder_file = te;
+  te_only.tier = mi::planner::Tier::kHigh;
+  mi::pipeline::Pipeline te_pipe(te_only);
+  req.model = bare.path();
+  try {
+    te_pipe.generate(req);
+    ADD_FAILURE() << "expected IndexError";
+  } catch (const mi::weights::IndexError& e) {
+    EXPECT_NE(std::string(e.what()).find("missing weights for transformer"), std::string::npos) << e.what();
+  }
 }
 
 // Runtime LoRAs on the bf16 SFT DiT (two real files, kohya and PEFT): they change the latents, reported as active;

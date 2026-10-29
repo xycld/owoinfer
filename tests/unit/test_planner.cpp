@@ -1044,6 +1044,31 @@ TEST(Planner, ShapesFromIndex) {
   EXPECT_EQ(s.vae_bytes, 77u);
   idx.groups.pop_back();
   EXPECT_THROW(shapes_from_index(idx), std::invalid_argument);
+
+  // Components from their own files: the bundle's index leaves them out (weights::BuildOptions::skip), and the shapes
+  // are the same. A component neither in the bundle's index nor given separately is still an error.
+  group(Component::kVae, "decoder", 77);
+  ModelIndex te, dit, vae, bundle;
+  for (const WeightGroup& g : idx.groups) {
+    (g.component == Component::kTextEncoder ? te : g.component == Component::kTransformer ? dit : vae).groups.push_back(g);
+  }
+  const ModelShapes split = shapes_from_index(bundle, &dit, Precision::kInt8, &te, &vae);
+  EXPECT_EQ(split.te_layers, s.te_layers);
+  EXPECT_EQ(split.te_layer_bytes, s.te_layer_bytes);
+  EXPECT_EQ(split.te_stream_bytes, s.te_stream_bytes);
+  EXPECT_EQ(split.te_embed_bytes, s.te_embed_bytes);
+  EXPECT_EQ(split.dit_blocks, s.dit_blocks);
+  EXPECT_EQ(split.dit_block_bytes, s.dit_block_bytes);
+  EXPECT_EQ(split.dit_bytes, s.dit_bytes);
+  EXPECT_EQ(split.dit_dim, s.dit_dim);
+  EXPECT_EQ(split.dit_precision, Precision::kInt8);
+  EXPECT_EQ(split.vae_bytes, s.vae_bytes);
+  // The bundle holds the VAE only: the DiT and the text encoder come from their files.
+  const ModelShapes vae_bundle = shapes_from_index(vae, &dit, Precision::kInt8, &te, nullptr);
+  EXPECT_EQ(vae_bundle.vae_bytes, s.vae_bytes);
+  EXPECT_EQ(vae_bundle.te_layers, s.te_layers);
+  EXPECT_THROW(shapes_from_index(vae, &dit, Precision::kInt8, nullptr, nullptr), std::invalid_argument);  // no text encoder
+  EXPECT_THROW(shapes_from_index(bundle, nullptr, Precision::kBf16, &te, &vae), std::invalid_argument);   // no DiT
 }
 
 // P6: an INT8 DiT (the Comfy-Org SFT file's sizes): half the block bytes, so an 8 GiB budget keeps far more blocks

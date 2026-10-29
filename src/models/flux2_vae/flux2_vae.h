@@ -167,15 +167,16 @@ class Flux2VaeDecoder {
   // and the streams must outlive the decoder; the indexes need not.
   //
   // latent_stats: the index whose VAE "decoder" group supplies bn.running_mean / bn.running_var, the latent
-  // de-normalization the DiT latents were made for. Pass the MOSS bundle's index whenever `index` comes from a single
-  // VAE file (vae_file.h): the official pipeline de-normalizes with the bundle's statistics (bf16-rounded values stored
-  // as F32), while the community files carry the unrounded fp32 originals. The two indexes stay separate (the weights
-  // are read through `index`, the statistics through `latent_stats`), so their tensors can never mix. nullptr: `index`'s
-  // own statistics, i.e. the bundle decode, or a single file with no bundle at hand (a fallback, not a current use
-  // case: the result then differs slightly from the official pipeline's). Throws std::runtime_error for a missing,
-  // misshapen or unexpected tensor, or a tensor outside its index's files.
+  // de-normalization the DiT latents were made for; nullptr: `index`'s own. The two indexes stay separate (the weights
+  // are read through `index`, the statistics through `latent_stats`), so their tensors can never mix.
+  // round_stats: the statistics are a single VAE file's (vae_file.h), whose fp32 originals are rounded to bf16 on the
+  // host before their upload (read_latent_stats), as the MOSS-Image bundle stores them: the official pipeline
+  // de-normalizes with those values. The pipeline sets it for a VAE file; the bundle's own statistics are uploaded as
+  // stored. Throws std::runtime_error for a missing, misshapen or unexpected tensor, or a tensor outside its index's
+  // files.
   Flux2VaeDecoder(const weights::ModelIndex& index, runtime::DeviceArena& arena, runtime::StreamSet& streams,
-                  bool bf16_weights = false, bool direct_io = false, const weights::ModelIndex* latent_stats = nullptr);
+                  bool bf16_weights = false, bool direct_io = false, const weights::ModelIndex* latent_stats = nullptr,
+                  bool round_stats = false);
   ~Flux2VaeDecoder();
   Flux2VaeDecoder(const Flux2VaeDecoder&) = delete;
   Flux2VaeDecoder& operator=(const Flux2VaeDecoder&) = delete;

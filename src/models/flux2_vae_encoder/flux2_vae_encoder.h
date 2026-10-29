@@ -115,16 +115,17 @@ class Flux2VaeEncoder {
   // must outlive the encoder; the index need not.
   //
   // latent_stats: as Flux2VaeDecoder's, the index whose VAE "decoder" group supplies bn.running_mean / running_var, the
-  // latent normalization the DiT works in. Pass the MOSS bundle's index whenever vae_file is a single VAE file: the
-  // official pipeline normalizes with the bundle's statistics (bf16-rounded values stored as F32), the community files
-  // carry the unrounded originals. nullptr: vae_file's own statistics (the bundle VAE itself).
+  // latent normalization the DiT works in; nullptr: vae_file's own. round_stats: those statistics are a single VAE
+  // file's fp32 originals, rounded to bf16 on the host before their upload (flux2_vae::read_latent_stats), as the
+  // MOSS-Image bundle stores them: the official pipeline normalizes with those values. The pipeline passes a VAE file's
+  // index (flux2_vae::index_vae_file) with round_stats; the bundle's VAE file is read as stored.
   //
   // Failure: the file is validated (persistent_bytes()) before anything is allocated, so a bad file throws with the
   // arena untouched. An I/O or CUDA error during the upload (or bad latent_stats tensors) throws after part of the
   // persistent region was allocated; like Flux2VaeDecoder, the arena cannot free persistent allocations one by one, so
   // the caller recreates or resets the arena.
   Flux2VaeEncoder(const std::filesystem::path& vae_file, runtime::DeviceArena& arena, runtime::StreamSet& streams,
-                  bool direct_io = false, const weights::ModelIndex* latent_stats = nullptr);
+                  bool direct_io = false, const weights::ModelIndex* latent_stats = nullptr, bool round_stats = false);
   ~Flux2VaeEncoder();
   Flux2VaeEncoder(const Flux2VaeEncoder&) = delete;
   Flux2VaeEncoder& operator=(const Flux2VaeEncoder&) = delete;

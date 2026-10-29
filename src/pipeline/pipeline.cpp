@@ -104,18 +104,19 @@ std::vector<int> parse_layers(const json::Value& v, const char* name) {
 
 struct Bundle {
   std::filesystem::path dir;
-  weights::ModelIndex index;
+  weights::ModelIndex index;  // without the components left out for the pipeline's component files
   tok::Tokenizer tokenizer;
-  std::uint64_t te_hash = 0;  // embedding-cache identity of the text encoder's weights
+  std::uint64_t te_hash = 0;  // embedding-cache identity of the text encoder's weights (0: not indexed)
 };
 
-std::unique_ptr<Bundle> open_bundle(const std::filesystem::path& dir) {
-  if (!std::filesystem::is_directory(dir)) throw std::invalid_argument("model bundle not found: " + util::path_utf8(dir));
-  weights::check_supported_bundle(dir);  // plain refusal of other models, before any weight file is read
+// The bundle's index without the components in `skip` (weights::BuildOptions::skip; a .mossidx is read the same way)
+// and its tokenizer. The folder has passed check_supported_bundle.
+std::unique_ptr<Bundle> open_bundle(const std::filesystem::path& dir, weights::ComponentSet skip) {
   const std::filesystem::path idx = dir / "moss.mossidx";
-  weights::ModelIndex index = std::filesystem::is_regular_file(idx) ? weights::load_index(idx, dir) : weights::build_index(dir);
+  weights::ModelIndex index = std::filesystem::is_regular_file(idx) ? weights::load_index(idx, dir, skip)
+                                                                    : weights::build_index(dir, {.skip = skip});
   auto b = std::unique_ptr<Bundle>(new Bundle{dir, std::move(index), tok::Tokenizer::load(dir / "tokenizer" / "tokenizer.json"), 0});
-  b->te_hash = text_encoder_hash(b->index);
+  if (!skip.has(weights::Component::kTextEncoder)) b->te_hash = text_encoder_hash(b->index);
   return b;
 }
 
@@ -327,21 +328,21 @@ struct TeSource {
 };
 
 // Where the VAE decoder comes from (P7a): the bundle's, or a single FLUX.2 VAE file (flux2_vae::index_vae_file, e.g.
-// the full decoder) decoded with the bundle's latent statistics. `index` is used whole, never merged.
+// the full decoder) decoded with its own latent statistics rounded to bf16 as the bundle stores them (Flux2VaeDecoder's
+// round_stats). `index` is used whole, never merged.
 struct VaeSource {
   std::filesystem::path path;
   const weights::ModelIndex* index = nullptr;
-  std::unique_ptr<weights::ModelIndex> own;           // file only
-  const weights::ModelIndex* latent_stats = nullptr;  // file only: the bundle's index
+  const weights::ModelIndex* file = nullptr;  // file only: Impl::vae_file_index
   flux2_vae::DecoderConfig config;
 };
 
-// Where the VAE encoder comes from (P7b img2img): PipelineOptions::vae_file when that file holds an encoder (its latent
-// statistics: the bundle's, as for the decoder), else the bundle's VAE file. `persistent` is
-// Flux2VaeEncoder::persistent_bytes (the file validated).
+// Where the VAE encoder comes from (P7b img2img): PipelineOptions::vae_file when that file holds an encoder (its own
+// latent statistics, rounded as for the decoder), else the bundle's VAE file, read directly (not through the index).
+// `persistent` is Flux2VaeEncoder::persistent_bytes (the file validated).
 struct EncoderSource {
   std::filesystem::path file;
-  const weights::ModelIndex* latent_stats = nullptr;
+  const weights::ModelIndex* vae_file = nullptr;  // the VAE file's index (round_stats), or nullptr: the bundle's file
   std::size_t persistent = 0;
 };
 
@@ -839,6 +840,7 @@ struct Pipeline::Impl {
   std::unique_ptr<flux2_vae::Flux2VaeDecoder> vae;
   const VaeSource* vae_src = nullptr;
   std::map<std::string, std::unique_ptr<VaeSource>> vae_sources;
+  std::unique_ptr<weights::ModelIndex> vae_file;  // options.vae_file's index (vae_file_index)
   // img2img's VAE encoder: persistent in the arena next to the decoder once loaded (dropped with the arena).
   std::unique_ptr<flux2_vae_encoder::Flux2VaeEncoder> encoder;
   const EncoderSource* encoder_src = nullptr;
@@ -890,12 +892,26 @@ struct Pipeline::Impl {
     arena.reset();
   }
 
+  // The bundle of a call. The component files are opened first, each identified as its component by its shapes
+  // (open_dit_file, check_supported_text_encoder_file, index_vae_file refuse any other file), and only then are the
+  // components they replace left out of the bundle's index (weights::BuildOptions::skip): their folders' weights are not
+  // read, so the folders need hold only their configs. The key carries the replaced set, so an index without a
+  // component never serves a call that needs it.
   Bundle& bundle(const std::filesystem::path& dir, double& load_s) {
-    const std::string key = util::path_utf8(util::path_key(dir));
+    weights::ComponentSet replaced;
+    if (!options.text_encoder_file.empty()) replaced.add(weights::Component::kTextEncoder);
+    if (!options.dit_file.empty()) replaced.add(weights::Component::kTransformer);
+    if (!options.vae_file.empty()) replaced.add(weights::Component::kVae);
+    const std::string key = util::path_utf8(util::path_key(dir)) + "|" + std::to_string(replaced.bits);
     auto it = bundles.find(key);
     if (it == bundles.end()) {
       const auto t0 = Clock::now();
-      it = bundles.emplace(key, open_bundle(dir)).first;
+      if (!std::filesystem::is_directory(dir)) throw std::invalid_argument("model bundle not found: " + util::path_utf8(dir));
+      weights::check_supported_bundle(dir);  // plain refusal of other models, before any weight file is read
+      if (replaced.has(weights::Component::kTransformer)) dit_file_source(load_s);
+      if (replaced.has(weights::Component::kTextEncoder)) te_file_source(load_s);
+      if (replaced.has(weights::Component::kVae)) vae_file_index();
+      it = bundles.emplace(key, open_bundle(dir, replaced)).first;
       load_s = since(t0);
     }
     return *it->second;
@@ -903,21 +919,26 @@ struct Pipeline::Impl {
 
   // The DiT of this call: options.dit_file, else the bundle's transformer.
   DitSource& dit_source(const Bundle& b, double& load_s) {
-    const bool file = !options.dit_file.empty();
-    const std::filesystem::path path = file ? options.dit_file : b.dir;
-    const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(util::path_key(path));
+    if (!options.dit_file.empty()) return dit_file_source(load_s);
+    return cached_dit("bundle:" + util::path_utf8(util::path_key(b.dir)), load_s, [&] {
+      auto d = std::make_unique<DitSource>();
+      d->path = b.dir / "transformer";
+      d->index = &b.index;
+      d->linears = moss_dit::describe_linears(nullptr);
+      return d;
+    });
+  }
+  // options.dit_file's DiT (opened before the bundle is indexed: Impl::bundle).
+  DitSource& dit_file_source(double& load_s) {
+    return cached_dit("file:" + util::path_utf8(util::path_key(options.dit_file)), load_s,
+                      [&] { return open_dit_file(options.dit_file); });
+  }
+  template <class Open>
+  DitSource& cached_dit(const std::string& key, double& load_s, Open&& open) {
     auto it = dit_sources.find(key);
     if (it == dit_sources.end()) {
       const auto t0 = Clock::now();
-      std::unique_ptr<DitSource> d;
-      if (file) {
-        d = open_dit_file(path);
-      } else {
-        d = std::make_unique<DitSource>();
-        d->path = b.dir / "transformer";
-        d->index = &b.index;
-        d->linears = moss_dit::describe_linears(nullptr);
-      }
+      std::unique_ptr<DitSource> d = open();
       d->files = dit_files(*d->index);
       d->lineage = dit_lineage(*d->index);
       it = dit_sources.emplace(key, std::move(d)).first;
@@ -928,25 +949,35 @@ struct Pipeline::Impl {
 
   // The text encoder of this call: options.text_encoder_file, else the bundle's.
   TeSource& te_source(const Bundle& b, double& load_s) {
-    const bool file = !options.text_encoder_file.empty();
-    const std::filesystem::path path = file ? options.text_encoder_file : b.dir;
-    const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(util::path_key(path));
+    if (!options.text_encoder_file.empty()) return te_file_source(load_s);
+    return cached_te("bundle:" + util::path_utf8(util::path_key(b.dir)), load_s, [&] {
+      auto t = std::make_unique<TeSource>();
+      t->path = b.dir / "text_encoder";
+      t->index = &b.index;
+      t->identity = b.te_hash;
+      return t;
+    });
+  }
+  // options.text_encoder_file's text encoder (opened before the bundle is indexed: Impl::bundle).
+  TeSource& te_file_source(double& load_s) {
+    const std::filesystem::path& path = options.text_encoder_file;
+    return cached_te("file:" + util::path_utf8(util::path_key(path)), load_s, [&] {
+      if (!std::filesystem::is_regular_file(path)) throw std::invalid_argument("text encoder file not found: " + util::path_utf8(path));
+      weights::check_supported_text_encoder_file(path);
+      auto t = std::make_unique<TeSource>();
+      t->path = path;
+      t->model = model_file_errors(path, [&] { return std::make_unique<qwen35_text::QuantTextModel>(path); });
+      t->precision = t->model->precision();
+      t->identity = text_encoder_hash(t->model->index());
+      return t;
+    });
+  }
+  template <class Open>
+  TeSource& cached_te(const std::string& key, double& load_s, Open&& open) {
     auto it = te_sources.find(key);
     if (it == te_sources.end()) {
       const auto t0 = Clock::now();
-      auto t = std::make_unique<TeSource>();
-      if (file) {
-        if (!std::filesystem::is_regular_file(path)) throw std::invalid_argument("text encoder file not found: " + util::path_utf8(path));
-        weights::check_supported_text_encoder_file(path);
-        t->path = path;
-        t->model = model_file_errors(path, [&] { return std::make_unique<qwen35_text::QuantTextModel>(path); });
-        t->precision = t->model->precision();
-        t->identity = text_encoder_hash(t->model->index());
-      } else {
-        t->path = b.dir / "text_encoder";
-        t->index = &b.index;
-        t->identity = b.te_hash;
-      }
+      std::unique_ptr<TeSource> t = open();
       t->numerics = qwen35_text::numerics_id(t->precision);
       it = te_sources.emplace(key, std::move(t)).first;
       load_s += since(t0);
@@ -954,23 +985,33 @@ struct Pipeline::Impl {
     return *it->second;
   }
 
+  // options.vae_file's index, read once: flux2_vae::index_vae_file refuses a file without a complete FLUX.2 decoder,
+  // decoder_config one whose shapes are no supported decoder's.
+  const weights::ModelIndex& vae_file_index() {
+    if (!vae_file) {
+      if (!std::filesystem::is_regular_file(options.vae_file)) {
+        throw std::invalid_argument("VAE file not found: " + util::path_utf8(options.vae_file));
+      }
+      auto index = std::make_unique<weights::ModelIndex>(flux2_vae::index_vae_file(options.vae_file));
+      flux2_vae::decoder_config(*index);
+      vae_file = std::move(index);
+    }
+    return *vae_file;
+  }
+
   // The VAE decoder of this call: options.vae_file, else the bundle's.
   VaeSource& vae_source(const Bundle& b, double& load_s) {
     const bool file = !options.vae_file.empty();
     const std::filesystem::path path = file ? options.vae_file : b.dir;
-    // A file is decoded with the bundle's latent statistics: one source per (file, bundle).
-    const std::string key = (file ? "file:" + util::path_utf8(util::path_key(path)) + "|bundle:" : "bundle:") +
-                            util::path_utf8(util::path_key(b.dir));
+    const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(util::path_key(path));
     auto it = vae_sources.find(key);
     if (it == vae_sources.end()) {
       const auto t0 = Clock::now();
       auto v = std::make_unique<VaeSource>();
       if (file) {
-        if (!std::filesystem::is_regular_file(path)) throw std::invalid_argument("VAE file not found: " + util::path_utf8(path));
         v->path = path;
-        v->own = std::make_unique<weights::ModelIndex>(flux2_vae::index_vae_file(path));
-        v->index = v->own.get();
-        v->latent_stats = &b.index;
+        v->file = &vae_file_index();
+        v->index = v->file;
       } else {
         v->path = b.dir / "vae";
         v->index = &b.index;
@@ -1000,9 +1041,9 @@ struct Pipeline::Impl {
         }
       }
       if (has_encoder) {
-        e->persistent = flux2_vae_encoder::Flux2VaeEncoder::persistent_bytes(options.vae_file, &b.index);
+        e->vae_file = &vae_file_index();
+        e->persistent = flux2_vae_encoder::Flux2VaeEncoder::persistent_bytes(options.vae_file, e->vae_file);
         e->file = options.vae_file;
-        e->latent_stats = &b.index;
       } else {
         e->file = b.dir / "vae" / "diffusion_pytorch_model.safetensors";
         if (!std::filesystem::is_regular_file(e->file)) {
@@ -1413,7 +1454,7 @@ struct Pipeline::Impl {
 
   void ensure_vae(const VaeSource& v, std::size_t stack_need, bool park_dit, Timings& tm) {
     if (vae && vae_src == &v && arena->available() >= stack_need && !(park_dit && dit)) return;
-    const std::size_t persistent = flux2_vae::Flux2VaeDecoder::persistent_bytes(*v.index, false, v.latent_stats);
+    const std::size_t persistent = flux2_vae::Flux2VaeDecoder::persistent_bytes(*v.index);
     if (park_dit || vae || arena->available() < persistent + stack_need) {
       // Parking: only where the plan asks for it, or (never expected with the exact workspace queries) as the
       // exact fallback when the decode does not fit; either way it is reported.
@@ -1424,7 +1465,8 @@ struct Pipeline::Impl {
       throw runtime::BudgetError(persistent + stack_need, arena->available());
     }
     const auto t0 = Clock::now();
-    vae = std::make_unique<flux2_vae::Flux2VaeDecoder>(*v.index, *arena, streams, false, options.direct_io, v.latent_stats);
+    vae = std::make_unique<flux2_vae::Flux2VaeDecoder>(*v.index, *arena, streams, false, options.direct_io, nullptr,
+                                                     v.file != nullptr);
     vae_src = &v;
     tm.vae_load_s += since(t0);
     sample_memory();
@@ -1438,7 +1480,8 @@ struct Pipeline::Impl {
     if (arena->available() < e.persistent + stack_need) throw runtime::BudgetError(e.persistent + stack_need, arena->available());
     const auto t0 = Clock::now();
     try {
-      encoder = std::make_unique<flux2_vae_encoder::Flux2VaeEncoder>(e.file, *arena, streams, options.direct_io, e.latent_stats);
+      encoder = std::make_unique<flux2_vae_encoder::Flux2VaeEncoder>(e.file, *arena, streams, options.direct_io, e.vae_file,
+                                                                     e.vae_file != nullptr);
     } catch (...) {
       reset_arena(arena->capacity());  // a partial upload stays in the persistent region
       throw;
@@ -2024,7 +2067,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
 
   planner::PlanInputs in;
   in.shapes = planner::shapes_from_index(b.index, src.quant ? src.index : nullptr, src.precision,
-                                         tes.model ? &tes.model->index() : nullptr, vs.own.get());
+                                         tes.model ? &tes.model->index() : nullptr, vs.file);
   in.shapes.dit_bytes = moss_dit::MossDit::persistent_bytes(*src.index);
   if (src.quant) in.shapes.dit_int8_fraction = moss_dit::int8_gemm_fraction(src.quant.get());
   if (src.quant) in.shapes.dit_int4_fraction = moss_dit::int4_gemm_fraction(src.quant.get());
@@ -2039,7 +2082,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   // The VAE side of the persistent region: the decoder and the encoder this request uses, plus those an earlier
   // request left resident (counted in every phase; when that alone makes the request infeasible, plan without them and
   // recreate the arena, dropping them, below).
-  const std::size_t dec_bytes = flux2_vae::Flux2VaeDecoder::persistent_bytes(*vs.index, false, vs.latent_stats);
+  const std::size_t dec_bytes = flux2_vae::Flux2VaeDecoder::persistent_bytes(*vs.index);
   const std::size_t needed_vae = (need_decoder ? dec_bytes : 0) + (enc_src != nullptr ? enc_src->persistent : 0);
   const std::size_t held_vae = (!need_decoder && m.vae ? dec_bytes : 0) +
                                (enc_src == nullptr && m.encoder && m.encoder_src != nullptr ? m.encoder_src->persistent : 0);

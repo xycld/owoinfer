@@ -186,8 +186,20 @@ TEST(ModelIndex, DetectsStaleFilesAndBadVersions) {
   // size change -> stale (restore mtime first so only size differs).
   fs::last_write_time(shard, fs::last_write_time(shard) - std::chrono::hours(1));
   EXPECT_NO_THROW(load_index(b.root() / "moss.mossidx"));
+  // A file gone: its component's weights are missing, which no rebuild mends.
   fs::remove(shard);
-  EXPECT_THROW(load_index(b.root() / "moss.mossidx"), StaleIndexError);
+  try {
+    load_index(b.root() / "moss.mossidx");
+    FAIL() << "expected IndexError";
+  } catch (const StaleIndexError& e) {
+    FAIL() << "a missing file is not staleness: " << e.what();
+  } catch (const IndexError& e) {
+    EXPECT_NE(std::string(e.what()).find("missing weights for vae (vae/diffusion_pytorch_model.safetensors): add them or "
+                                         "pass its component file"),
+              std::string::npos)
+        << e.what();
+    EXPECT_EQ(std::string(e.what()).find("rebuild"), std::string::npos) << e.what();
+  }
 }
 
 TEST(ModelIndex, RejectsUnclassifiedAndInconsistentBundles) {
@@ -381,6 +393,136 @@ TEST(ModelIndex, LoadRejectsTamperedIndexes) {
   EXPECT_THROW(load_index(b.root() / "typed.mossidx"), IndexError);
 }
 
+std::string index_error(const fs::path& bundle, const BuildOptions& options) {
+  try {
+    build_index(bundle, options);
+  } catch (const IndexError& e) {
+    return e.what();
+  }
+  return "";
+}
+
+// Components a component file replaces are left out (BuildOptions::skip): none of their weight files is opened, so
+// their folders need only their configs, which stay required. A component not skipped fails exactly as before.
+TEST(ModelIndex, SkippedComponentsNeedOnlyTheirConfigs) {
+  Bundle b("mi_skip");
+  b.build();
+  const ModelIndex full = build_index(b.root());
+  const ComponentSet te = ComponentSet{}.add(Component::kTextEncoder);
+  const ComponentSet te_dit = ComponentSet{te}.add(Component::kTransformer);
+  // The skipped components' weights unreadable (never opened), then gone.
+  write_text(b.root() / "text_encoder/model-00001-of-00002.safetensors", "not a safetensors file");
+  write_text(b.root() / "transformer/diffusion_pytorch_model.safetensors", "not a safetensors file");
+  EXPECT_THROW(build_index(b.root()), FormatError);
+  for (int gone = 0; gone < 2; ++gone) {
+    SCOPED_TRACE(gone ? "weights removed" : "weights unreadable");
+    const ModelIndex idx = build_index(b.root(), {.skip = te_dit});
+    EXPECT_TRUE(idx.groups_of(Component::kTextEncoder).empty());
+    EXPECT_TRUE(idx.groups_of(Component::kTransformer).empty());
+    ASSERT_EQ(idx.groups.size(), 1u);
+    ASSERT_EQ(idx.files.size(), 1u);
+    EXPECT_EQ(idx.files[0].path, "vae/diffusion_pytorch_model.safetensors");
+    const WeightGroup* vae = full.find_group(Component::kVae, "decoder");
+    ASSERT_EQ(idx.groups[0].tensors.size(), vae->tensors.size());
+    for (std::size_t i = 0; i < vae->tensors.size(); ++i) {
+      EXPECT_EQ(idx.groups[0].tensors[i].name, vae->tensors[i].name);
+      EXPECT_EQ(idx.groups[0].tensors[i].offset, vae->tensors[i].offset);
+      EXPECT_EQ(idx.file_path(idx.groups[0].tensors[i].file), full.file_path(vae->tensors[i].file));
+    }
+    ASSERT_EQ(idx.excluded.size(), 2u);  // encoder., quant_conv.
+    for (const auto& e : idx.excluded) EXPECT_EQ(e.component, Component::kVae) << e.prefix;
+    for (const char* rel : {"text_encoder/model-00001-of-00002.safetensors", "text_encoder/model-00002-of-00002.safetensors",
+                            "text_encoder/model.safetensors.index.json", "transformer/diffusion_pytorch_model.safetensors"}) {
+      fs::remove(b.root() / rel);
+    }
+  }
+  // Every component skipped: configs only (the VAE's weights unreadable, then gone, as the others').
+  const ComponentSet all = ComponentSet{te_dit}.add(Component::kVae);
+  write_text(b.root() / "vae/diffusion_pytorch_model.safetensors", "not a safetensors file");
+  EXPECT_TRUE(build_index(b.root(), {.skip = all}).groups.empty());
+  EXPECT_TRUE(build_index(b.root(), {.skip = all}).files.empty());
+  fs::remove_all(b.root() / "vae");
+  EXPECT_TRUE(build_index(b.root(), {.skip = all}).groups.empty());
+
+  // A component not skipped: today's error.
+  const std::string no_weights = "expected one .safetensors file or a shard index, found 0 files and no index";
+  EXPECT_NE(index_error(b.root(), {}).find("text_encoder: " + no_weights), std::string::npos);
+  EXPECT_NE(index_error(b.root(), {.skip = te}).find("transformer: " + no_weights), std::string::npos);
+  // Configs stay required, also for a skipped component. The message names the file with native separators.
+  const std::string te_config_file = (fs::path("text_encoder") / "config.json").string();
+  const std::string dit_config_file = (fs::path("transformer") / "config.json").string();
+  const std::string te_config = read_text(b.root() / "text_encoder/config.json");
+  fs::remove(b.root() / "text_encoder/config.json");
+  EXPECT_NE(index_error(b.root(), {.skip = te_dit}).find(te_config_file), std::string::npos);
+  write_text(b.root() / "text_encoder/config.json", R"({"text_config":{}})");
+  EXPECT_NE(index_error(b.root(), {.skip = te_dit}).find("missing text_config.layer_types"), std::string::npos);
+  write_text(b.root() / "text_encoder/config.json", te_config);
+  fs::remove(b.root() / "transformer/config.json");
+  EXPECT_NE(index_error(b.root(), {.skip = te_dit}).find(dit_config_file), std::string::npos);
+}
+
+// A .mossidx built for the whole bundle serves a run that skips components: their stored files, groups and exclusions
+// are dropped unread (their files may be gone) and the rest keep their checksums under renumbered file ids. An index
+// built without a component serves only runs that skip it.
+TEST(ModelIndex, LoadIndexSkipsComponents) {
+  const ComponentSet te = ComponentSet{}.add(Component::kTextEncoder);
+  const ComponentSet dit = ComponentSet{}.add(Component::kTransformer);
+  {
+    Bundle b("mi_loadskip");
+    b.build();
+    const ModelIndex full = build_index(b.root(), {.checksum = true});
+    write_index(full, b.root() / "moss.mossidx");
+    fs::remove(b.root() / "text_encoder/model-00002-of-00002.safetensors");
+    EXPECT_THROW(load_index(b.root() / "moss.mossidx"), IndexError);  // missing weights for text_encoder
+    const ModelIndex loaded = load_index(b.root() / "moss.mossidx", {}, te);
+    const ModelIndex fresh = build_index(b.root(), {.skip = te});
+    ASSERT_EQ(loaded.files.size(), 2u);  // transformer, vae
+    for (std::size_t i = 0; i < fresh.files.size(); ++i) EXPECT_EQ(loaded.files[i].path, fresh.files[i].path);
+    ASSERT_EQ(loaded.groups.size(), fresh.groups.size());
+    for (const WeightGroup& g : loaded.groups) {
+      EXPECT_NE(g.component, Component::kTextEncoder);
+      const WeightGroup* f = full.find_group(g.component, g.name);
+      ASSERT_NE(f, nullptr);
+      EXPECT_EQ(g.checksum, f->checksum) << g.name;
+      ASSERT_EQ(g.tensors.size(), f->tensors.size());
+      for (std::size_t t = 0; t < g.tensors.size(); ++t) {
+        EXPECT_EQ(loaded.file_path(g.tensors[t].file), full.file_path(f->tensors[t].file)) << g.tensors[t].name;
+      }
+      EXPECT_EQ(checksum_group(loaded, g), *g.checksum) << g.name;
+    }
+    ASSERT_EQ(loaded.excluded.size(), fresh.excluded.size());
+    for (const auto& e : loaded.excluded) EXPECT_NE(e.component, Component::kTextEncoder) << e.prefix;
+    // The components not skipped are still checked: a changed DiT file is stale.
+    const fs::path dit_file = b.root() / "transformer/diffusion_pytorch_model.safetensors";
+    fs::last_write_time(dit_file, fs::last_write_time(dit_file) + std::chrono::hours(1));
+    EXPECT_THROW(load_index(b.root() / "moss.mossidx", {}, te), StaleIndexError);
+    EXPECT_NO_THROW(load_index(b.root() / "moss.mossidx", {}, ComponentSet{te}.add(Component::kTransformer)));
+  }
+  {
+    Bundle b("mi_partialidx");
+    b.build();
+    write_index(build_index(b.root(), {.skip = te}), b.root() / "moss.mossidx");
+    EXPECT_NO_THROW(load_index(b.root() / "moss.mossidx", {}, te));
+    EXPECT_THROW(load_index(b.root() / "moss.mossidx"), StaleIndexError);  // the bundle's text encoder is not in it
+    EXPECT_THROW(load_index(b.root() / "moss.mossidx", {}, dit), StaleIndexError);
+
+    // A kept group's tensor in a skipped component's file: refused before any range is trusted.
+    ModelIndex evil = build_index(b.root());
+    std::uint32_t dit_file = 0;
+    while (evil.files[dit_file].path.rfind("transformer/", 0) != 0) ++dit_file;
+    group(evil, Component::kTextEncoder, "embed_tokens").tensors[0].file = dit_file;
+    write_index(evil, b.root() / "evil.mossidx");
+    try {
+      load_index(b.root() / "evil.mossidx", {}, dit);
+      FAIL() << "expected IndexError";
+    } catch (const StaleIndexError& e) {
+      FAIL() << e.what();
+    } catch (const IndexError& e) {
+      EXPECT_NE(std::string(e.what()).find("component left out"), std::string::npos) << e.what();
+    }
+  }
+}
+
 // Config, shard-index and .mossidx files come from a downloaded bundle: size is checked before
 // reading and the DOM's value count while parsing.
 TEST(ModelIndex, RejectsOversizedAndOverValuedJson) {
@@ -557,8 +699,8 @@ TEST(ModelIndex, NonAsciiPathsRoundTrip) {
   fs::remove(b.root() / "vae" / mi::util::path_from_utf8(vae_name));
   try {
     load_index(b.root() / "moss.mossidx");
-    ADD_FAILURE() << "expected StaleIndexError";
-  } catch (const StaleIndexError& e) {
+    ADD_FAILURE() << "expected IndexError";
+  } catch (const IndexError& e) {  // missing weights for vae
     EXPECT_NE(std::string(e.what()).find(vae_name), std::string::npos) << e.what();
   }
 }
