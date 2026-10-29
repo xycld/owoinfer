@@ -551,6 +551,7 @@ class Server {
       else if (m == "cancel") result = cancel(params);
       else if (m == "status") result = status(params);
       else if (m == "inspect") result = inspect(params, id);
+      else if (m == "check") result = check(params, id);
       else if (m == "unload") result = unload(params);
       else if (m == "shutdown") {
         params.only({});
@@ -654,7 +655,7 @@ class Server {
            ",\"release\":" + tf(caps & MI_CAP_RELEASE) + ",\"certificate_dirs\":" + tf(caps & MI_CAP_CERTIFICATE_DIRS) +
            ",\"te_host_pin\":" + tf(caps & MI_CAP_TE_HOST_PIN) + ",\"progress_fraction\":" +
            tf(caps & MI_CAP_PROGRESS_FRACTION) + ",\"inspect\":" + tf(caps & MI_CAP_INSPECT) +
-           ",\"references\":" + tf(caps & MI_CAP_REFERENCE_IMAGES) +
+           ",\"references\":" + tf(caps & MI_CAP_REFERENCE_IMAGES) + ",\"check\":" + tf(caps & MI_CAP_CHECK) +
            "},\"values\":{" + values + "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
@@ -665,46 +666,58 @@ class Server {
            ",\"error\":" + str(probe.cublaslt_error) + "}" + (with_devices ? ",\"devices\":[" + devices + "]" : std::string()) + "}}";
   }
 
-  std::string load(const Params& p, const std::string& id) {
+  // load's parameters (also check's "load"): the strings, then the struct pointing into them (never copied).
+  struct EngineRequest {
+    mi_engine_params e{};
+    std::optional<std::string> model, cache_dir, dit_file, te_file, vae_file, te, distill;
+  };
+  static void engine_request(const Params& p, EngineRequest& r) {
     p.only({"model", "mode", "device", "vram_budget_bytes", "vram_reserve_bytes", "host_ram_budget_bytes", "cache_dir",
             "embedding_cache", "direct_io", "block_path", "dit_file", "text_encoder_file", "vae_file", "tier", "attention",
             "lora_strict", "time_embedding_file", "distill", "certificate_dirs", "dit_direct_io", "te_host_pin"});
-    if (generating()) throw busy_error();
-    mi_engine_params e;
+    mi_engine_params& e = r.e;
     if (const mi_status s = mi_engine_params_init(&e, sizeof e); s != MI_OK) throw_status(s);
-    const std::optional<std::string> model = p.string("model");
-    if (!model) throw RequestError("invalid_params", "\"model\" (bundle directory) is required");
-    e.model_path = model->c_str();
+    r.model = p.string("model");
+    if (!r.model) throw RequestError("invalid_params", "\"model\" (bundle directory) is required");
+    e.model_path = r.model->c_str();
     if (const auto v = p.name("mode", mi::server::kModeNames)) e.mode = *v;
     constexpr std::int64_t kMaxBytes = std::numeric_limits<std::int64_t>::max();
     if (const auto v = p.integer("device", 0, 1024)) e.device_index = static_cast<std::int32_t>(*v);
     if (const auto v = p.integer("vram_budget_bytes", 0, kMaxBytes)) e.vram_budget_bytes = static_cast<std::uint64_t>(*v);
     if (const auto v = p.integer("vram_reserve_bytes", 0, kMaxBytes)) e.vram_reserve_bytes = static_cast<std::uint64_t>(*v);
     if (const auto v = p.integer("host_ram_budget_bytes", 0, kMaxBytes)) e.host_ram_budget_bytes = static_cast<std::uint64_t>(*v);
-    const std::optional<std::string> cache_dir = p.string("cache_dir");
-    if (cache_dir) e.cache_dir = cache_dir->c_str();
+    r.cache_dir = p.string("cache_dir");
+    if (r.cache_dir) e.cache_dir = r.cache_dir->c_str();
     if (const auto v = p.boolean("embedding_cache")) e.embedding_cache = *v ? 1 : 0;
     if (const auto v = p.boolean("direct_io")) e.direct_io = *v ? 1 : 0;
     if (const auto v = p.name("block_path", mi::server::kBlockPathNames)) e.block_path = *v;
-    const std::optional<std::string> dit_file = p.string("dit_file");
-    const std::optional<std::string> te_file = p.string("text_encoder_file");
-    const std::optional<std::string> vae_file = p.string("vae_file");
-    if (dit_file) e.dit_file = dit_file->c_str();
-    if (te_file) e.text_encoder_file = te_file->c_str();
-    if (vae_file) e.vae_file = vae_file->c_str();
+    r.dit_file = p.string("dit_file");
+    r.te_file = p.string("text_encoder_file");
+    r.vae_file = p.string("vae_file");
+    if (r.dit_file) e.dit_file = r.dit_file->c_str();
+    if (r.te_file) e.text_encoder_file = r.te_file->c_str();
+    if (r.vae_file) e.vae_file = r.vae_file->c_str();
     const std::optional<mi_tier> tier = p.name("tier", mi::server::kTierNames);
     if (const auto v = p.name("attention", mi::server::kAttentionNames)) e.attention = *v;
     if (const auto v = p.boolean("lora_strict")) e.lora_strict = *v ? 1 : 0;
-    const std::optional<std::string> te = p.path("time_embedding_file");
-    const std::optional<std::string> distill = p.path("distill");
-    if (te) e.time_embedding_file = te->c_str();
-    if (distill) e.distill_dir = distill->c_str();
+    r.te = p.path("time_embedding_file");
+    r.distill = p.path("distill");
+    if (r.te) e.time_embedding_file = r.te->c_str();
+    if (r.distill) e.distill_dir = r.distill->c_str();
     // "certificate_dirs": reserved since 2.0, accepted and ignored.
     if (const auto v = p.name("dit_direct_io", mi::server::kDitDirectIoNames)) e.dit_direct_io = *v;
     if (const auto v = p.name("te_host_pin", mi::server::kTeHostPinNames)) e.te_host_pin = *v;
     // Required since 2.0 (the C API refuses MI_TIER_AUTO); checked once every parameter is valid.
     if (!tier) throw RequestError("invalid_params", "\"tier\" is required: reference, high or turbo");
     e.tier = *tier;
+  }
+
+  std::string load(const Params& p, const std::string& id) {
+    EngineRequest r;
+    engine_request(p, r);
+    if (generating()) throw busy_error();
+    const mi_engine_params& e = r.e;
+    const std::string& model = *r.model;
     // The old engine goes first: two engines would hold two arenas.
     join_worker();
     mi_engine_free(engine_);
@@ -715,7 +728,7 @@ class Server {
       throw RequestError(status_code(s), protocol_names(mi_last_error_message()));
     }
     engine_ = engine;
-    model_ = *model;
+    model_ = model;
     mode_ = e.mode;
     out_.log("info", "engine created for " + model_ + " (mode " + mode_name(mode_) + ", device " +
                          std::to_string(e.device_index) + "); weights load on the first generate",
@@ -979,25 +992,108 @@ class Server {
     p.only({"path"});
     const std::optional<std::string> path = p.path("path");
     if (!path) throw RequestError("invalid_params", "\"path\" (the file to inspect) is required");
+    return on_thread(id, "inspect", [file = *path] { return inspect_json(file); });
+  }
+
+  // check: load's and generate's parameters checked by mi_check() (no engine of the server's is touched), on its own
+  // thread as an inspect (they share the slots).
+  std::optional<std::string> check(const Params& p, const std::string& id) {
+    p.only({"load", "generate"});
+    if (p.find("load") == nullptr) throw RequestError("invalid_params", "\"load\" (load's parameters) is required");
+    if (p.find("generate") == nullptr) throw RequestError("invalid_params", "\"generate\" (generate's parameters) is required");
+    // The parameters are read on the thread: Params point into the request line's document.
+    auto doc = std::make_shared<Value>(*p.find("load"));
+    auto gen = std::make_shared<Value>(*p.find("generate"));
+    return on_thread(id, "check", [this, doc, gen] { return check_json(Params(doc.get()), Params(gen.get())); });
+  }
+
+  // check's result: the first refusal of load then generate, as each would answer it, else the plan.
+  std::string check_json(const Params& load_params, const Params& gen_params) {
+    const auto refusal = [](const char* by, const std::string& code, const std::string& message) {
+      return "{\"ok\":false,\"refused_by\":\"" + std::string(by) + "\",\"error\":" + error_json(code, message) +
+             ",\"planned\":false,\"plan\":null,\"explanation\":\"\",\"tier\":\"\",\"warnings\":[],\"notes\":[],"
+             "\"gguf_convert_seconds\":0}";
+    };
+    EngineRequest engine;
+    try {
+      engine_request(load_params, engine);
+    } catch (const RequestError& e) {
+      return refusal("load", e.code, e.what());
+    }
+    // generate's own checks of its parameters (as generate answers them); held until the engine's are known.
+    Work w;
+    std::optional<RequestError> request_error;
+    try {
+      gen_params.only({"output", "prompt", "negative_prompt", "width", "height", "steps", "cfg", "shift", "seed",
+                       "uncond_skip_layers", "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length",
+                       "sampler", "scheduler", "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise",
+                       "dataspace", "loras", "save_metadata", "include_prompts", "preview_output", "preview_every",
+                       "init_image", "mask", "mask_encoding", "denoise_strength", "resize", "hires", "distill", "control",
+                       "cfg_truncation", "step_cache", "references", "lora_placement", "step_cache_threshold"});
+      request_params(gen_params, w, false);
+    } catch (const RequestError& e) {
+      request_error = e;
+    }
+    mi_gen_params g = w.params;
+    if (request_error) {
+      // Only the engine's verdict is wanted: a stand-in request.
+      if (const mi_status s = mi_gen_params_init(&g, sizeof g); s != MI_OK) throw_status(s);
+      g.prompt = "check";
+    }
+    if (!w.preview.empty()) g.preview_callback = [](const std::uint8_t*, std::int32_t, std::int32_t, std::int32_t, void*) {};
+    mi_check_report* report = nullptr;
+    if (const mi_status s = mi_check(&engine.e, &g, &report); s != MI_OK) throw_status(s);
+    const std::unique_ptr<mi_check_report, void (*)(mi_check_report*)> owner(report, mi_check_report_free);
+    mi_check_info info{};
+    info.struct_size = sizeof info;
+    if (const mi_status s = mi_check_report_info(report, &info); s != MI_OK) throw_status(s);
+    const auto text = [&](mi_check_text_kind k) { return std::string(mi_check_report_text(report, k)); };
+    if (info.stage == MI_CHECK_STAGE_ENGINE_CREATE) {
+      return refusal("load", status_code(info.status), protocol_names(text(MI_CHECK_TEXT_MESSAGE)));
+    }
+    if (request_error) return refusal("generate", request_error->code, request_error->what());
+    if (info.stage == MI_CHECK_STAGE_GENERATE) {
+      return refusal("generate", status_code(info.status), protocol_names(text(MI_CHECK_TEXT_MESSAGE)));
+    }
+    const auto lines = [](const std::string& t) {
+      std::string out;
+      for (std::size_t i = 0; i < t.size();) {
+        const std::size_t n = std::min(t.find('\n', i), t.size());
+        out += (out.empty() ? "" : ",") + str(protocol_names(t.substr(i, n - i)));
+        i = n + 1;
+      }
+      return "[" + out + "]";
+    };
+    return std::string("{\"ok\":true,\"refused_by\":null,\"error\":null,\"planned\":") + tf(info.planned != 0) +
+           ",\"plan\":" + (info.planned ? one_line(text(MI_CHECK_TEXT_PLAN_JSON).c_str()) : std::string("null")) +
+           ",\"explanation\":" + str(text(MI_CHECK_TEXT_EXPLANATION)) + ",\"tier\":" + str(text(MI_CHECK_TEXT_TIER_REASON)) +
+           ",\"warnings\":" + lines(text(MI_CHECK_TEXT_WARNINGS)) + ",\"notes\":" + lines(text(MI_CHECK_TEXT_NOTES)) +
+           ",\"gguf_convert_seconds\":" + num(info.gguf_convert_seconds) + "}";
+  }
+
+  // Runs `answer` (the result object, or a RequestError) on a thread of its own and sends its response from there:
+  // inspect and check, at most kMaxInspects at a time.
+  template <class F>
+  std::optional<std::string> on_thread(const std::string& id, const char* what, F answer) {
     inspections_.remove_if([](const std::unique_ptr<Inspection>& i) {
       if (!i->done.load()) return false;
       i->thread.join();  // it has sent its answer: only returning is left
       return true;
     });
     if (inspections_.size() >= kMaxInspects) {
-      throw RequestError("busy",
-                         std::to_string(kMaxInspects) + " inspects are running; send it again after one answers");
+      throw RequestError("busy", std::to_string(kMaxInspects) + " inspects or checks are running; send it again after "
+                                 "one answers");
     }
     auto slot = std::make_unique<Inspection>();
     Inspection* s = slot.get();
     // Prepared here: the answer when building the real one fails (out of memory), so nothing escapes the thread.
     std::string fallback =
-        "{\"id\":" + id + ",\"error\":" + error_json("internal", "inspect could not build its answer") + "}";
-    s->thread = std::thread([this, s, id, file = *path, fallback = std::move(fallback)] {
+        "{\"id\":" + id + ",\"error\":" + error_json("internal", std::string(what) + " could not build its answer") + "}";
+    s->thread = std::thread([this, s, id, answer = std::move(answer), fallback = std::move(fallback)] {
       std::string line;
       try {
         try {
-          line = "{\"id\":" + id + ",\"result\":" + inspect_json(file) + "}";
+          line = "{\"id\":" + id + ",\"result\":" + answer() + "}";
         } catch (const RequestError& e) {
           line = "{\"id\":" + id + ",\"error\":" + error_json(e.code, e.what()) + "}";
         } catch (const std::exception& e) {

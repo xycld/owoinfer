@@ -22,7 +22,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "util/regular_file.h"
 
@@ -76,5 +79,30 @@ struct GgufCachedFile {
 GgufCachedFile gguf_converted_file(const std::filesystem::path& file, const GgufDitInfo& info,
                                    const quant::QuantSpec& target, const std::filesystem::path& cache_dir,
                                    const GgufConvertHooks& hooks = {});
+
+// A plan-only pipeline (PipelineOptions::plan_only, mi_check) never converts: gguf_cached_file finds the converted
+// file read-only (no folder, lock or sweep), and without one the open throws GgufNotConverted, with what the first
+// load's conversion would write and an estimate of its time.
+struct GgufNotConverted : std::runtime_error {
+  GgufNotConverted(const std::string& message, std::string format, std::uint64_t bytes, double estimate_s)
+      : std::runtime_error(message), runs_as(std::move(format)), converted_bytes(bytes), seconds(estimate_s) {}
+  std::string runs_as;                // gguf_runs_as
+  std::uint64_t converted_bytes = 0;  // the converted file's size (the cache directory needs this much free)
+  double seconds = 0;                 // estimated conversion time on this machine (gguf_conversion_seconds)
+};
+
+// The converted file of `file` for `target` that gguf_converted_file would use, when the cache already holds it (a
+// valid entry for the GGUF's current identity); nullopt otherwise. Reads only: no folder is created, no lock taken.
+// Throws std::invalid_argument for an empty cache_dir (as gguf_converted_file).
+std::optional<std::filesystem::path> gguf_cached_file(const std::filesystem::path& file, const quant::QuantSpec& target,
+                                                      const std::filesystem::path& cache_dir);
+
+// Bytes of the converted file of `file` for `target` (the GEMMs' weights and scales, the other tensors), as
+// gguf_converted_file's free-space check counts them (without its margin).
+std::uint64_t gguf_converted_bytes(const std::filesystem::path& file, const quant::QuantSpec& target);
+
+// A rough conversion time for `converted_bytes` of output on this machine: the converter's throughput measured on a
+// 32-thread laptop CPU (about 32 s for the 5.4 GB INT8 file), scaled by the hardware threads.
+double gguf_conversion_seconds(std::uint64_t converted_bytes);
 
 }  // namespace mi::pipeline

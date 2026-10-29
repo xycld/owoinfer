@@ -18,7 +18,9 @@
 #include <string>
 #include <vector>
 
+#include "api/progress_model.h"
 #include "models/moss_dit/distill.h"
+#include "pipeline/gguf_dit.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/samplers/sampler_driver.h"
 #include "pipeline/png_writer.h"
@@ -56,6 +58,8 @@ constexpr const char* kUsage =
     "                            [--control-strength X] [--control-start X] [--control-end X]]...]\n"
     "                           [--reference <png|jpg>]... [--reference-max-edge N]\n"
     "                           [--lora-placement default|merge|side_branch]\n"
+    "`moss-infer check` takes the same options (-o optional): it checks them and plans the request as generate would,\n"
+    "without loading weights or writing anything, and prints the verdict as JSON (exit 0 accepted, 1 refused).\n"
     "Flags override values read from --params. At least one of -o / --latent-out is required;\n"
     "without -o the VAE decode is skipped. --vram-budget caps the process's GPU memory (CUDA context included).\n"
     "Each --then-prompt generates one more image in the same engine session (same settings, warm models and\n"
@@ -253,9 +257,76 @@ void print_summary(const pipeline::Result& r) {
   }
 }
 
-}  // namespace
+// `moss-infer check`: the generate command's options and request, through a plan-only pipeline (Pipeline::check):
+// the same checks and plan as the generation, nothing loaded or written. The verdict as one JSON object on stdout, the
+// plan, the estimate, warnings and notes on stderr (unless quiet). 0 when accepted, 1 when refused.
+int run_check(pipeline::PipelineOptions options, const pipeline::Request& req, bool preview, bool quiet) {
+  options.plan_only = true;
+  std::string refused_by, message;
+  std::optional<pipeline::Result> r;
+  std::optional<pipeline::GgufNotConverted> gguf;
+  std::string estimate_json = "null";
+  try {
+    refused_by = "generate";  // generate validates the request before it creates the pipeline
+    pipeline::validate(req);
+    refused_by = "engine";
+    pipeline::Pipeline pipe(options);
+    refused_by = "generate";
+    pipeline::GenerateControl control;
+    if (preview) control.on_preview = [](const pipeline::PreviewImage&) {};
+    try {
+      r = pipe.check(req, control);
+      const planner::HardwareProfile rates = api::stored_rates(options.cache_dir);
+      const api::Estimate e = api::estimate_of(
+          api::generate_segments(r->plan, rates, api::HeldModels{}, api::model_bytes(req.model, options.text_encoder_file, options.vae_file),
+                                 api::job_shape(req)),
+          r->plan, rates);
+      estimate_json = api::estimate_json(e);
+      if (!quiet) std::fprintf(stderr, "%s\n%s\n", r->plan.explanation.c_str(), api::estimate_text(e).c_str());
+    } catch (const pipeline::GgufNotConverted& g) {
+      gguf = g;
+    }
+    refused_by.clear();
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  std::vector<std::string> warnings, notes;
+  if (r) {
+    for (const auto* w : {&r->lora_warnings, &r->control.lora.warnings, &r->reference_warnings, &r->accel_warnings}) {
+      warnings.insert(warnings.end(), w->begin(), w->end());
+    }
+    notes = r->plan_only_notes;
+  }
+  if (gguf) {
+    char b[160];
+    std::snprintf(b, sizeof b, " (%s, %.1f GB; about %.0f s); the text encoder, VAE, LoRA and plan checks follow the conversion",
+                  gguf->runs_as.c_str(), static_cast<double>(gguf->converted_bytes) / 1e9, gguf->seconds);
+    notes.push_back(gguf->what() + std::string(b));
+  }
+  const auto list = [](const std::vector<std::string>& v) {
+    std::string s;
+    for (const std::string& x : v) s += (s.empty() ? "" : ", ") + pipeline::json_escape(x);
+    return "[" + s + "]";
+  };
+  std::string doc = "{\"ok\": " + std::string(refused_by.empty() ? "true" : "false") +
+                    ", \"refused_by\": " + (refused_by.empty() ? "null" : pipeline::json_escape(refused_by)) +
+                    ", \"message\": " + pipeline::json_escape(message) + ", \"planned\": " + (r ? "true" : "false") +
+                    ", \"tier\": " + pipeline::json_escape(r ? r->tier.reason : "") + ", \"estimate\": " + estimate_json +
+                    ", \"gguf_convert_s\": " + pipeline::json_number(gguf ? gguf->seconds : 0.0) +
+                    ", \"plan\": " + (r ? r->plan.to_json() : "null") + ", \"warnings\": " + list(warnings) +
+                    ", \"notes\": " + list(notes) + "}";
+  std::cout << doc << "\n";
+  if (!quiet) {
+    for (const std::string& w : warnings) std::fprintf(stderr, "warning: %s\n", w.c_str());
+    for (const std::string& n : notes) std::fprintf(stderr, "note: %s\n", n.c_str());
+    if (refused_by.empty()) std::fprintf(stderr, "check: accepted\n");
+    else std::fprintf(stderr, "check: refused by the %s: %s\n", refused_by.c_str(), message.c_str());
+  }
+  return refused_by.empty() ? 0 : 1;
+}
 
-int cmd_generate(const std::vector<std::string>& args) {
+// generate and check share the options and the request: check stops before the pipeline loads anything.
+int generate_or_check(const std::vector<std::string>& args, bool check) {
   pipeline::Request req;
   pipeline::PipelineOptions options;
   fs::path params, out_png, out_latent, report, preview_png;
@@ -441,7 +512,7 @@ int cmd_generate(const std::vector<std::string>& args) {
   if (req.accel.cfg_truncation < 1.0 && req.cfg == 1.0) {
     std::fprintf(stderr, "warning: CFG truncation has no effect without CFG (cfg 1)\n");
   }
-  if ((params.empty() && !have_prompt) || req.model.empty() || (out_png.empty() && out_latent.empty())) {
+  if ((params.empty() && !have_prompt) || req.model.empty() || (!check && out_png.empty() && out_latent.empty())) {
     std::cerr << kUsage;
     return 2;
   }
@@ -496,7 +567,8 @@ int cmd_generate(const std::vector<std::string>& args) {
     std::cerr << "moss-infer generate: " << e.what() << "\n";
     return 1;
   }
-  req.decode = !out_png.empty();
+  req.decode = !out_png.empty() || (check && out_latent.empty());  // check: a PNG unless only --latent-out is given
+  if (check) return run_check(options, req, !preview_png.empty(), quiet);
   pipeline::validate(req);
   for (const std::string& p : then_prompts) {
     pipeline::Request f = req;
@@ -508,8 +580,15 @@ int cmd_generate(const std::vector<std::string>& args) {
   pipeline::Pipeline pipe(options);
   pipeline::GenerateControl control;
   control.cancel = &g_cancel;
+  // The estimate before each image (api/progress_model.h): rates and the warm / cold record as an engine keeps them.
+  const api::ModelBytes model_bytes = api::model_bytes(req.model, options.text_encoder_file, options.vae_file);
+  planner::HardwareProfile rates = api::stored_rates(options.cache_dir);
+  api::HeldModels held;
+  api::JobShape shape;
   control.on_plan = [&](const planner::ExecutionPlan& plan) {
-    if (!quiet) std::fprintf(stderr, "%s\n", plan.explanation.c_str());
+    if (quiet) return;
+    const api::Estimate e = api::estimate_of(api::generate_segments(plan, rates, held, model_bytes, shape), plan, rates);
+    std::fprintf(stderr, "%s\n%s\n", plan.explanation.c_str(), api::estimate_text(e).c_str());
   };
   if (!preview_png.empty()) {
     control.preview_every = preview_every;
@@ -523,7 +602,10 @@ int cmd_generate(const std::vector<std::string>& args) {
     return true;
   };
   const auto run = [&](const pipeline::Request& q, const fs::path& png) {
+    shape = api::job_shape(q);
     pipeline::Result r = pipe.generate(q, control);
+    rates = r.hardware;
+    held.job_done(r.plan, shape, false, r.cancelled, r.memory.arena_creations, r.dit_load.source);
     if (!quiet) std::fprintf(stderr, "\n");
     if (r.cancelled) return r;
     if (!png.empty()) {
@@ -588,5 +670,11 @@ int cmd_generate(const std::vector<std::string>& args) {
   }
   return 0;
 }
+
+}  // namespace
+
+int cmd_generate(const std::vector<std::string>& args) { return generate_or_check(args, false); }
+
+int cmd_check(const std::vector<std::string>& args) { return generate_or_check(args, true); }
 
 }  // namespace mi::cli

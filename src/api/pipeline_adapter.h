@@ -96,6 +96,15 @@ struct Generation {
   std::vector<std::string> reference_warnings;  // MI_MESSAGE_REFERENCE_WARNING
 };
 
+// mi_check's findings on a plan-only engine (PipelineAdapter::check), in C-API terms; mi_check sets the verdict
+// (info.status, info.stage, message).
+struct CheckFindings {
+  mi_check_info info{};
+  std::string message;  // MI_CHECK_TEXT_MESSAGE
+  std::string explanation, plan_json, tier_reason;
+  std::vector<std::string> warnings, notes;  // MI_CHECK_TEXT_WARNINGS, MI_CHECK_TEXT_NOTES (one per line)
+};
+
 // The pipeline request of `params` (a full-size struct): the unset markers resolved (mossinfer.h), a distill bundle
 // expanded, image inputs (control images included) copied or decoded, a dataspace sampler's file read and the steps
 // checked against it, the control adapter's file and the accelerators checked (its kinds are generate()'s). Throws
@@ -117,13 +126,20 @@ pipeline::PipelineOptions to_options(const mi_engine_params& params);
 // Throws std::invalid_argument on invalid engine parameters, std::runtime_error subclasses on model or CUDA errors.
 class PipelineAdapter {
  public:
-  explicit PipelineAdapter(const mi_engine_params& params);
+  // plan_only: an engine for check() alone (pipeline::PipelineOptions::plan_only): mi_engine_create()'s checks and CUDA
+  // initialization, a pipeline that writes nothing and uploads nothing.
+  explicit PipelineAdapter(const mi_engine_params& params, bool plan_only = false);
   ~PipelineAdapter();
   PipelineAdapter(const PipelineAdapter&) = delete;
   PipelineAdapter& operator=(const PipelineAdapter&) = delete;
 
   // Not thread-safe (one job at a time); `cancel` is polled throughout.
   Generation generate(const mi_gen_params& params, const std::atomic<bool>& cancel);
+  // A plan-only engine's dry run of generate(params) (pipeline::Pipeline::check): the same request conversion and checks,
+  // with the same exceptions, then the plan, its time estimate on this new engine and what it would warn about into
+  // `out`. A GGUF DiT not converted yet is no exception: out.info.planned stays 0, gguf_convert_seconds and a note say
+  // so.
+  void check(const mi_gen_params& params, CheckFindings& out);
   // Pipeline::preload of `params` (prompt optional): the plan callback once after planning, before any load; a progress
   // callback (step 0) before each load step, in the pipeline's order (PreloadOptions::on_phase).
   Generation preload(const mi_gen_params& params, const std::atomic<bool>& cancel);

@@ -65,9 +65,15 @@ class SideBranches {
   SideBranches(const SideBranches&) = delete;
   SideBranches& operator=(const SideBranches&) = delete;
 
+  // The layout `stack` would get, without reading a factor or allocating anything (a plan-only pipeline: mi_check):
+  // site() (null or not; a branch it returns has no tensors), any_active(), max_rank() and device_bytes() answer as for
+  // the uploaded object, with the same refusal of a non-finite coefficient; update_strengths() is refused.
+  struct LayoutOnly {};
+  SideBranches(const LoraStack& stack, LayoutOnly);
+
   // Device bytes the constructor allocates for `stack` (for the planner).
   static std::size_t device_bytes(const LoraStack& stack);
-  std::size_t device_bytes() const { return buffer_.size(); }
+  std::size_t device_bytes() const { return buffer_.size() + layout_bytes_; }
 
   // The site's branch, or null when no adapter with a nonzero coefficient targets it.
   const SiteBranch* site(int block, Site s) const;
@@ -105,6 +111,7 @@ class SideBranches {
   std::vector<Entry> entries_;  // [block * kSites + site]
   std::size_t coef_bytes_ = 0;  // every site's coefficients, contiguous at the start of buffer_
   DeviceBuffer buffer_;
+  std::size_t layout_bytes_ = 0;  // LayoutOnly: the bytes the upload would allocate (buffer_ stays empty)
   std::uint64_t generation_ = 0;
 };
 

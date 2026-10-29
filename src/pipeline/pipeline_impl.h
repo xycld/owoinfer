@@ -233,9 +233,11 @@ inline void check_layers(const std::vector<int>& layers, const char* name) {
   }
 }
 
+// plan_only (PipelineOptions::plan_only): a GGUF file's converted copy is only looked up (gguf_cached_file), never
+// made: without one, GgufNotConverted.
 inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file, planner::Tier tier,
                                                 const std::filesystem::path& cache_dir,
-                                                const GgufConvertHooks& hooks = {}) {
+                                                const GgufConvertHooks& hooks = {}, bool plan_only = false) {
   // NVFP4 linears run only on cc 12.0 with the sm_120a kernels (user decision D1); otherwise the file is refused as an
   // unsupported model (MI_ERR_MODEL).
   // Stamped before it is read: a file replaced during the open is seen at the next call.
@@ -246,8 +248,19 @@ inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& fil
   if (stamp.regular() && weights::is_gguf_file(file)) {
     const GgufDitInfo g = model_file_errors(file, [&] { return inspect_gguf_dit(file); });
     const quant::QuantSpec target = gguf_target(g, tier);
-    GgufCachedFile converted =
-        model_file_errors(file, [&] { return gguf_converted_file(file, g, target, cache_dir, hooks); });
+    GgufCachedFile converted;
+    if (plan_only) {
+      const std::optional<std::filesystem::path> cached =
+          model_file_errors(file, [&] { return gguf_cached_file(file, target, cache_dir); });
+      if (!cached) {
+        const std::uint64_t bytes = model_file_errors(file, [&] { return gguf_converted_bytes(file, target); });
+        throw GgufNotConverted(util::path_utf8(file) + ": the first load converts the GGUF DiT into the cache directory",
+                               gguf_runs_as(g, target), bytes, gguf_conversion_seconds(bytes));
+      }
+      converted.path = *cached;
+    } else {
+      converted = model_file_errors(file, [&] { return gguf_converted_file(file, g, target, cache_dir, hooks); });
+    }
     std::unique_ptr<DitSource> d = open_dit_file(converted.path, tier, cache_dir);
     d->cache_lock = std::move(converted.lock);
     d->path = file;
@@ -403,6 +416,9 @@ inline std::int64_t unix_now() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// A plan-only pipeline's stand-in for a fused self-check it did not run (Impl::check_fused).
+inline constexpr std::string_view kFusedCheckNotRun = "plan-only: not run";
+
 // The fused-block self-check result of each hardware key this process has checked (first use per process).
 inline std::optional<moss_dit::FusedCheck> process_fused_check(const std::string& key, const moss_dit::FusedCheck* set = nullptr) {
   static std::mutex mu;
@@ -447,6 +463,7 @@ struct Pipeline::Impl {
   // file stays the same), and the DiT input extension a pass points at its control latents.
   std::unique_ptr<control::ControlFile> control_file;
   std::unique_ptr<control::DeviceEmbedder> control_emb;
+  std::size_t control_plan_bytes = 0;  // plan-only: the device bytes control_emb would hold (it is not uploaded)
   std::string control_key;
   moss_dit::InputExtension control_ext;
   std::unique_ptr<flux2_vae::Flux2VaeDecoder> vae;
@@ -489,7 +506,7 @@ struct Pipeline::Impl {
     free_at_start = runtime::DeviceArena::free_device_bytes();
     if (options.embedding_cache) {
       EmbeddingCacheOptions co;
-      co.disk_dir = options.cache_dir;
+      if (!options.plan_only) co.disk_dir = options.cache_dir;  // plan-only: no folder is created
       cache = std::make_unique<EmbeddingCache>(co);
     }
     if (!options.time_embedding_file.empty()) {
@@ -628,7 +645,7 @@ struct Pipeline::Impl {
   // options.dit_file's DiT (opened before the bundle is indexed: Impl::bundle).
   DitSource& dit_file_source(double& load_s) {
     return cached_dit(file_key(options.dit_file), load_s,
-                      [&] { return open_dit_file(options.dit_file, options.tier, options.cache_dir, convert_hooks); });
+                      [&] { return open_dit_file(options.dit_file, options.tier, options.cache_dir, convert_hooks, options.plan_only); });
   }
   template <class Open>
   DitSource& cached_dit(const std::string& key, double& load_s, Open&& open) {
@@ -924,7 +941,8 @@ struct Pipeline::Impl {
     if (!stored) {
       StoredProfile p;
       try {
-        p.probe = probe_hardware(dit_index, streams.compute());
+        // Plan-only: nothing measured, nothing stored (the defaults; the first generate() probes).
+        if (!options.plan_only) p.probe = probe_hardware(dit_index, streams.compute());
       } catch (const std::exception&) {
         p.probe = planner::HardwareProfile{};  // e.g. no room for the probe's 64 MiB buffers: plan with the defaults
       }
@@ -953,6 +971,12 @@ struct Pipeline::Impl {
     } else {
       const std::string key = learner ? hw_key : hardware_key();
       c = process_fused_check(key);
+      if (!c && options.plan_only) {
+        // Not run (it launches kernels and is stored): the block path the option asks for, sized for the route
+        // without validated configurations (setup_dit_call), until a generate() runs the check.
+        fused_check = moss_dit::FusedCheck{true, std::string(kFusedCheckNotRun), {}};
+        return *fused_check;
+      }
       if (!c) {
         try {
           c = moss_dit::check_fused_gemms(streams.compute());
@@ -962,12 +986,12 @@ struct Pipeline::Impl {
         }
         process_fused_check(key, &*c);
       }
-      if (learner) {
+      if (learner && !options.plan_only) {
         learner->stored().fused_check = c;
         save_profile(learner->stored());
       }
     }
-    moss_dit::install_fused_check(*c);
+    if (!options.plan_only) moss_dit::install_fused_check(*c);  // plan-only: setup_dit_call sizes for it instead
     fused_check = c;
     return *c;
   }

@@ -550,3 +550,52 @@ TEST(ProgressModel, ReferencePrefillIsTheFirstUnitOfEachPass) {
   EXPECT_NEAR(s[4].seconds, 1.0, 1e-9);
   EXPECT_NEAR(s[2].step_seconds * 10 + s[4].step_seconds * 10, denoise, 1e-9);
 }
+
+// The estimate before a job (the plan callback's "estimate", mi_check): the segments summed per phase, every pass's
+// steps counted, and the confidence flags from the rates.
+TEST(ProgressModel, EstimateBeforeTheJob) {
+  mi::planner::ExecutionPlan plan = resident_plan();
+  plan.time.reference_prefill_s = 0.5;
+  // Hires: two passes (10 steps of 1 s, then 5 of 2 s with a 0.25 s setup), two decodes.
+  const std::vector<ProgressSegment> segments = {{MI_PHASE_TEXT_ENCODER, 2},     {MI_PHASE_DIT_LOAD, 4},
+                                                 {MI_PHASE_DENOISE, 0.25, 10, 1.0}, {MI_PHASE_DECODE, 0.5},
+                                                 {MI_PHASE_DENOISE, 0.25, 5, 2.0},  {MI_PHASE_DECODE, 1}};
+  mi::planner::HardwareProfile hw;
+  mi::api::Estimate e = mi::api::estimate_of(segments, plan, hw);
+  EXPECT_DOUBLE_EQ(e.text_encoder_s, 2);
+  EXPECT_DOUBLE_EQ(e.dit_load_s, 4);
+  EXPECT_DOUBLE_EQ(e.denoise_s, 20.5);
+  EXPECT_DOUBLE_EQ(e.decode_s, 1.5);
+  EXPECT_DOUBLE_EQ(e.total_s, 28);
+  EXPECT_EQ(e.steps, 15);
+  EXPECT_DOUBLE_EQ(e.step_s, 20.0 / 15);
+  EXPECT_DOUBLE_EQ(e.reference_prefill_s, 0.5);
+  EXPECT_FALSE(e.rates_measured);
+  EXPECT_FALSE(e.load_rates_learned);
+  EXPECT_NE(mi::api::estimate_json(e).find("\"rates\": \"default\", \"load_rates\": \"default\""), std::string::npos);
+  hw.measured = true;
+  e = mi::api::estimate_of(segments, plan, hw);
+  EXPECT_NE(mi::api::estimate_json(e).find("\"rates\": \"measured\", \"load_rates\": \"probed\""), std::string::npos);
+  hw.direct_gbps = 5;
+  e = mi::api::estimate_of(segments, plan, hw);
+  EXPECT_TRUE(e.load_rates_learned);
+  EXPECT_NE(mi::api::estimate_json(e).find("\"load_rates\": \"learned\""), std::string::npos);
+  EXPECT_NE(mi::api::estimate_text(e).find("15 steps of 1.33 s"), std::string::npos) << mi::api::estimate_text(e);
+
+  // A plan's JSON gets it as its last member; the generation's segments give the same totals as the progress model's.
+  const std::string json = mi::api::with_estimate(plan.to_json(), e);
+  EXPECT_EQ(json.rfind(", \"estimate\": {\"total_s\": 28,", json.size()), json.find(", \"estimate\": "));
+  EXPECT_EQ(json.back(), '}');
+  ProgressModel m;
+  m.expect(segments);
+  m.phase(MI_PHASE_TEXT_ENCODER, 0);
+  EXPECT_DOUBLE_EQ(m.eta_seconds(), e.total_s);
+
+  // No steps (a preload's load steps): no step price, no prefill.
+  const mi::api::Estimate loads = mi::api::estimate_of({{MI_PHASE_DIT_LOAD, 3}, {MI_PHASE_DECODE, 1}}, plan, hw);
+  EXPECT_EQ(loads.steps, 0);
+  EXPECT_DOUBLE_EQ(loads.step_s, 0);
+  EXPECT_DOUBLE_EQ(loads.reference_prefill_s, 0);
+  EXPECT_DOUBLE_EQ(loads.total_s, 4);
+}
+

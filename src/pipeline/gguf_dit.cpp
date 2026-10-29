@@ -183,30 +183,84 @@ std::string gguf_runs_as(const GgufDitInfo& info, const quant::QuantSpec& target
   return "GGUF " + info.types + ", runs as " + (target.quantized() ? "INT8 ConvRot" : "bf16");
 }
 
-GgufCachedFile gguf_converted_file(const fs::path& file, const GgufDitInfo& info, const quant::QuantSpec& target,
-                                   const fs::path& cache_dir, const GgufConvertHooks& hooks) {
-  const std::string target_name = quant::describe(target);
+namespace {
+
+void require_cache_dir(const quant::QuantSpec& target, const fs::path& cache_dir) {
   if (cache_dir.empty()) {
     throw std::invalid_argument("a GGUF DiT is converted once into " + std::string(target.quantized() ? "INT8 ConvRot" : "bf16") +
                                 " and kept in the cache directory: set cache_dir (moss-infer --cache-dir)");
   }
-  const Identity id = identity_of(file);
-  const util::FileInfo& f = id.info;
+}
+
+// Where the converted file of `file` for `target` lives in <cache_dir>/gguf/, and the key its metadata must carry.
+struct CacheEntry {
+  Identity id;
+  std::string key, source, name;
+  fs::path dir, out;
+};
+CacheEntry cache_entry(const fs::path& file, const quant::QuantSpec& target, const fs::path& cache_dir) {
+  const std::string target_name = quant::describe(target);
+  CacheEntry c;
+  c.id = identity_of(file);
+  const util::FileInfo& f = c.id.info;
   const std::string key_text = "mossinfer-gguf-dit|import " + std::to_string(kGgufImportVersion) + "|converter " +
                                std::to_string(quant::kConverterVersion) + "|" + target_name + "|" + std::to_string(f.size) +
                                "|" + std::to_string(f.mtime_ns) + "|" + hex64(f.volume) + ":" + hex64(f.id_high) + hex64(f.id) +
-                               "|" + hex64(id.header_xxh64);
-  const std::string key = hex64(xxh64(key_text.data(), key_text.size()));
+                               "|" + hex64(c.id.header_xxh64);
+  c.key = hex64(xxh64(key_text.data(), key_text.size()));
   // The GGUF's path as given, absolute but with its links not resolved: a Hugging Face cache's snapshot link names the
   // model (its blob does not), so a newer download of it replaces the older one's converted file.
   std::error_code ec;
   const fs::path absolute = fs::absolute(file, ec);
-  const std::string source = util::path_utf8((ec ? file : absolute).lexically_normal());
-  const fs::path dir = cache_dir / "gguf";
+  c.source = util::path_utf8((ec ? file : absolute).lexically_normal());
+  c.dir = cache_dir / "gguf";
+  c.name = safe_stem(file) + "." + target_name + "." + c.key + std::string(kExtension);
+  c.out = c.dir / util::path_from_utf8(c.name);
+  return c;
+}
+
+std::uint64_t converted_bytes(const quant::QuantModel& model, const quant::QuantSpec& target) {
+  std::uint64_t need = 0;
+  for (const quant::QuantLinear& l : model.linears) {
+    need += static_cast<std::uint64_t>(l.n * l.k) * (target.quantized() ? 1 : 2) + (target.quantized() ? 4 * l.n : 0);
+  }
+  for (const weights::IndexedTensor& t : model.tensors) need += static_cast<std::uint64_t>(t.numel()) * weights::dtype_size(t.dtype);
+  return need;
+}
+
+}  // namespace
+
+std::optional<fs::path> gguf_cached_file(const fs::path& file, const quant::QuantSpec& target, const fs::path& cache_dir) {
+  require_cache_dir(target, cache_dir);
+  const CacheEntry c = cache_entry(file, target, cache_dir);
+  if (util::file_info(c.out).regular() && cache_metadata(c.out, "mossinfer_gguf_key") == c.key) return c.out;
+  return std::nullopt;
+}
+
+std::uint64_t gguf_converted_bytes(const fs::path& file, const quant::QuantSpec& target) {
+  return converted_bytes(quant::open_gguf_dit(weights::GgufFile(file)), target);
+}
+
+double gguf_conversion_seconds(std::uint64_t bytes) {
+  // Measured: 30 to 35 s for the 5.4 GB INT8 ConvRot file on 32 hardware threads (docs/integration.md).
+  constexpr double kBytesPerThreadSecond = 5.4e9 / 32.0 / 32.0;
+  const double threads = std::max(1u, std::thread::hardware_concurrency());
+  return static_cast<double>(bytes) / (kBytesPerThreadSecond * std::min(threads, 32.0));
+}
+
+GgufCachedFile gguf_converted_file(const fs::path& file, const GgufDitInfo& info, const quant::QuantSpec& target,
+                                   const fs::path& cache_dir, const GgufConvertHooks& hooks) {
+  const std::string target_name = quant::describe(target);
+  require_cache_dir(target, cache_dir);
+  const CacheEntry c = cache_entry(file, target, cache_dir);
+  const Identity& id = c.id;
+  const std::string& key = c.key;
+  const std::string& source = c.source;
+  const fs::path& dir = c.dir;
   if (!util::make_directories(dir)) throw weights::IoError(util::path_utf8(dir) + ": cannot create the GGUF cache directory");
   const fs::path resolved_dir = util::resolved_path(dir);
-  const std::string name = safe_stem(file) + "." + target_name + "." + key + std::string(kExtension);
-  const fs::path out = dir / util::path_from_utf8(name);
+  const std::string& name = c.name;
+  const fs::path& out = c.out;
   const fs::path lock_path = dir / util::path_from_utf8(name + ".lock");
   const auto valid = [&] { return util::file_info(out).regular() && cache_metadata(out, "mossinfer_gguf_key") == key; };
 
@@ -231,12 +285,8 @@ GgufCachedFile gguf_converted_file(const fs::path& file, const GgufDitInfo& info
     for (const util::DirEntry& e : entries) {
       if (util::path_utf8(e.name).starts_with(name + ".tmp-")) util::remove_file_in(resolved_dir, dir / e.name);
     }
-    const quant::QuantModel model = quant::open_gguf_dit(weights::GgufFile(file));
-    std::uint64_t need = kSpaceMargin;
-    for (const quant::QuantLinear& l : model.linears) {
-      need += static_cast<std::uint64_t>(l.n * l.k) * (target.quantized() ? 1 : 2) + (target.quantized() ? 4 * l.n : 0);
-    }
-    for (const weights::IndexedTensor& t : model.tensors) need += static_cast<std::uint64_t>(t.numel()) * weights::dtype_size(t.dtype);
+    const std::uint64_t need = kSpaceMargin + converted_bytes(quant::open_gguf_dit(weights::GgufFile(file)), target);
+    std::error_code ec;
     const fs::space_info space = fs::space(dir, ec);
     if (!ec && space.available < need) {
       throw weights::IoError(util::path_utf8(dir) + ": the converted DiT needs " + std::to_string(need >> 20) + " MiB free, " +

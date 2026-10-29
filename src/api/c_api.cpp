@@ -60,6 +60,11 @@ struct mi_file_report {
   mi::api::FileInspection inspection;
 };
 
+struct mi_check_report {
+  mi::api::CheckFindings findings;
+  std::string warnings, notes;  // one per line
+};
+
 namespace {
 
 // ---------------------------------------------------------------- frozen layouts (ABI 1, docs/c-api.md)
@@ -363,6 +368,30 @@ MI_LAYOUT(mi_file_info, lora_adapters, 40);
 MI_LAYOUT(mi_file_info, lora_unknown_keys, 44);
 MI_LAYOUT(mi_file_info, control_kind_count, 48);
 MI_LAYOUT(mi_file_info, _reserved0, 52);
+// mi_check (2.1, MI_CAP_CHECK).
+static_assert(sizeof(mi_check_stage) == 4 && sizeof(mi_check_text_kind) == 4);
+static_assert(sizeof(mi_check_info) == 136);
+MI_LAYOUT(mi_check_info, struct_size, 0);
+MI_LAYOUT(mi_check_info, status, 8);
+MI_LAYOUT(mi_check_info, stage, 12);
+MI_LAYOUT(mi_check_info, planned, 16);
+MI_LAYOUT(mi_check_info, dit_streamed, 20);
+MI_LAYOUT(mi_check_info, dit_parked, 24);
+MI_LAYOUT(mi_check_info, dit_resident_blocks, 28);
+MI_LAYOUT(mi_check_info, steps, 32);
+MI_LAYOUT(mi_check_info, rates_measured, 36);
+MI_LAYOUT(mi_check_info, arena_bytes, 40);
+MI_LAYOUT(mi_check_info, arena_cap_bytes, 48);
+MI_LAYOUT(mi_check_info, device_peak_bytes, 56);
+MI_LAYOUT(mi_check_info, host_private_bytes, 64);
+MI_LAYOUT(mi_check_info, host_limit_bytes, 72);
+MI_LAYOUT(mi_check_info, eta_seconds, 80);
+MI_LAYOUT(mi_check_info, text_encoder_seconds, 88);
+MI_LAYOUT(mi_check_info, dit_load_seconds, 96);
+MI_LAYOUT(mi_check_info, denoise_seconds, 104);
+MI_LAYOUT(mi_check_info, step_seconds, 112);
+MI_LAYOUT(mi_check_info, decode_seconds, 120);
+MI_LAYOUT(mi_check_info, gguf_convert_seconds, 128);
 // The component API (2.1).
 static_assert(sizeof(mi_memory) == 4 && sizeof(mi_dtype) == 4 && sizeof(mi_guidance) == 4 &&
                   sizeof(mi_step_output) == 4,
@@ -849,7 +878,7 @@ uint32_t mi_capabilities(void) {
   return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS | MI_CAP_IMAGE_INPUT | MI_CAP_HIRES |
          MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL | MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE |
          MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT |
-         MI_CAP_COMPONENTS | MI_CAP_REFERENCE_IMAGES;  // MI_CAP_CERTIFICATE_DIRS: reserved since 2.0
+         MI_CAP_COMPONENTS | MI_CAP_REFERENCE_IMAGES | MI_CAP_CHECK;  // MI_CAP_CERTIFICATE_DIRS: reserved since 2.0
 }
 
 mi_status mi_probe(mi_probe_info* info) {
@@ -1405,6 +1434,83 @@ const char* mi_file_report_tier_reason(const mi_file_report* report, mi_tier tie
 }
 
 void mi_file_report_free(mi_file_report* report) { delete report; }
+
+// ---------------------------------------------------------------- check
+
+// The engine's and the generation's own entry checks run inside guarded(), as in mi_engine_create() and mi_generate():
+// a refusal is the status and message they would return. The caller's last error stays as it was.
+mi_status mi_check(const mi_engine_params* engine_params, const mi_gen_params* params, mi_check_report** out_report) {
+  if (out_report != nullptr) *out_report = nullptr;
+  return guarded([&] {
+    require(engine_params, "engine_params");
+    require(params, "params");
+    require(out_report, "out_report");
+    const mi_engine_params ep =
+        read_input<mi_engine_params>(engine_params, kEngineParamsSizes, engine_params_defaults, "mi_engine_params");
+    const mi_gen_params gp = read_input<mi_gen_params>(params, kGenParamsSizes, gen_params_defaults, "mi_gen_params");
+    auto report = std::make_unique<mi_check_report>();
+    mi::api::CheckFindings& f = report->findings;
+    f.info.struct_size = sizeof f.info;
+    const std::string last_error = mi_last_error_message();
+    std::unique_ptr<mi::api::PipelineAdapter> engine;
+    f.info.stage = MI_CHECK_STAGE_ENGINE_CREATE;
+    mi_status s = guarded([&] {
+      check_reserved(ep);
+      engine = std::make_unique<mi::api::PipelineAdapter>(ep, true);
+      return MI_OK;
+    });
+    if (s == MI_OK) {
+      f.info.stage = MI_CHECK_STAGE_GENERATE;
+      s = guarded([&] {
+        check_reserved(gp);
+        engine->check(gp, f);
+        return MI_OK;
+      });
+    }
+    f.info.status = s;
+    if (s == MI_OK) {
+      f.info.stage = MI_CHECK_STAGE_NONE;
+    } else {
+      f.message = mi_last_error_message();
+    }
+    set_error(last_error.c_str());
+    for (const std::string& w : f.warnings) report->warnings += (report->warnings.empty() ? "" : "\n") + w;
+    for (const std::string& n : f.notes) report->notes += (report->notes.empty() ? "" : "\n") + n;
+    *out_report = report.release();
+    return MI_OK;
+  });
+}
+
+mi_status mi_check_report_info(const mi_check_report* report, mi_check_info* out) {
+  return guarded([&] {
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_check_info), "mi_check_info");
+    require(report, "report");
+    write_output(out, report->findings.info);
+    return MI_OK;
+  });
+}
+
+const char* mi_check_report_text(const mi_check_report* report, mi_check_text_kind kind) {
+  if (report == nullptr) {
+    set_error("report is NULL.");
+    return nullptr;
+  }
+  const mi::api::CheckFindings& f = report->findings;
+  switch (kind) {
+    case MI_CHECK_TEXT_MESSAGE: return f.message.c_str();
+    case MI_CHECK_TEXT_EXPLANATION: return f.explanation.c_str();
+    case MI_CHECK_TEXT_PLAN_JSON: return f.plan_json.c_str();
+    case MI_CHECK_TEXT_TIER_REASON: return f.tier_reason.c_str();
+    case MI_CHECK_TEXT_WARNINGS: return report->warnings.c_str();
+    case MI_CHECK_TEXT_NOTES: return report->notes.c_str();
+    case MI_CHECK_TEXT_MAX_ENUM: break;
+  }
+  set_error("mi_check_report_text: unknown kind.");
+  return nullptr;
+}
+
+void mi_check_report_free(mi_check_report* report) { delete report; }
 
 // ---------------------------------------------------------------- components
 

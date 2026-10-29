@@ -254,6 +254,33 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
   upload_coefs(stack);
 }
 
+SideBranches::SideBranches(const LoraStack& stack, LayoutOnly) : stack_(&stack), adapters_(stack.adapters().size()) {
+  const Plan plan = make_plan(stack);
+  blocks_ = plan.blocks;
+  entries_.resize(plan.sites.size());
+  generation_ = next_generation();
+  layout_bytes_ = plan.bytes;
+  for (std::size_t e = 0; e < plan.sites.size(); ++e) {
+    const SitePlan& sp = plan.sites[e];
+    if (sp.slices.empty()) continue;
+    max_rank_ = std::max(max_rank_, sp.rank);
+    Entry& en = entries_[e];
+    en.present = true;
+    // The columns the constructor records (the shared groups, then each slice's own runs), and upload_coefs' verdict.
+    for (std::size_t g = 0; g < sp.shared_first.size(); ++g) {
+      en.columns.push_back({sp.shared_first[g], sp.shared_offset[g], stack.adapters()[sp.shared_first[g]].rank});
+    }
+    for (const SlicePlan& sl : sp.slices) {
+      for (const Run& r : sl.own) en.columns.push_back({r.adapter, sl.own_col0 + r.offset, stack.adapters()[r.adapter].rank});
+    }
+    for (const Column& c : en.columns) {
+      const float v = stack.coef(stack.adapters()[c.adapter]);
+      if (!std::isfinite(v)) fail("coefficient strength * alpha / rank of '" + stack.adapters()[c.adapter].source + "' is not finite");
+      if (v != 0.0f) en.active = true;
+    }
+  }
+}
+
 void SideBranches::upload_coefs(const LoraStack& stack) {
   // Every coefficient first (validation before any upload), then one copy of the whole coefficient region.
   std::vector<float> coef(coef_bytes_ / sizeof(float), 0.0f);
@@ -283,6 +310,7 @@ void SideBranches::update_strengths(const LoraStack& stack) {
   if (&stack != stack_ || stack.adapters().size() != adapters_) {
     fail("update_strengths: not the LoraStack these side branches were built from");
   }
+  if (layout_bytes_ != 0) fail("update_strengths: a layout-only object holds no device data");
   upload_coefs(stack);
 }
 

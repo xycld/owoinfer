@@ -24,12 +24,17 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "mossinfer/mossinfer.h"
 #include "planner/planner.h"
+
+namespace mi::pipeline {
+struct Request;
+}  // namespace mi::pipeline
 
 namespace mi::api {
 
@@ -55,6 +60,9 @@ struct JobShape {
   bool encodes_image = false;
   std::string merge_key;         // the runtime LoRAs and the control adapter's LoRA part: paths and strengths
 };
+
+// The passes of request `q` (its unset markers resolved) as the progress sees them.
+JobShape job_shape(const pipeline::Request& q);
 
 // What the engine holds when a job starts, as far as the adapter can tell (the pipeline reports no residency between
 // calls): warm (the last job's models are loaded) or cold, the DiT, a VRAM-resident text encoder, and the host-side
@@ -103,6 +111,14 @@ struct LoadEstimates {
   double vae_decoder = 0;
   double vae_encoder = 0;
 };
+// The weight-file bytes of an engine's text encoder and VAE: each component file, else the *.safetensors in the bundle
+// `model`'s folder (0 when unreadable).
+ModelBytes model_bytes(const std::filesystem::path& model, const std::filesystem::path& text_encoder_file,
+                       const std::filesystem::path& vae_file);
+// The rates a new engine's first plan uses for its estimates: the hardware profile stored under `cache_dir` (read only,
+// for this machine's hardware key), else the planner's defaults.
+planner::HardwareProfile stored_rates(const std::filesystem::path& cache_dir);
+
 LoadEstimates load_estimates(const planner::ExecutionPlan& plan, const planner::HardwareProfile& hw, const HeldModels& held,
                              const ModelBytes& bytes, const JobShape& shape);
 
@@ -115,6 +131,32 @@ std::vector<ProgressSegment> generate_segments(const planner::ExecutionPlan& pla
 // out.
 std::vector<ProgressSegment> preload_segments(const planner::ExecutionPlan& plan, const planner::HardwareProfile& hw,
                                               const HeldModels& held, const ModelBytes& bytes, const JobShape& shape);
+
+// A job's estimate before it starts (the plan callback's "estimate", mi_check): the expected segments summed per phase,
+// as the progress callbacks report them. A generation: text encoder (its run and a resident copy's load), DiT load
+// (with the VAE encoder's load of an image input), denoise (every pass: reference prefills, then the steps), decode
+// (with the VAE decoder's load); a preload: its load steps under the phases its progress names.
+struct Estimate {
+  double total_s = 0;
+  double text_encoder_s = 0, dit_load_s = 0, denoise_s = 0, decode_s = 0;
+  int steps = 0;                   // sampling steps of the denoise (both passes of a hires fix)
+  double step_s = 0;               // their mean (0 without steps)
+  double reference_prefill_s = 0;  // of denoise_s: the reference images' prefills
+  // Confidence: the transfer and compute rates were measured on this machine (the stored profile or a probe), else
+  // the planner's defaults; and the DiT's load rates were learned from earlier loads (else the probe's file rates).
+  bool rates_measured = false;
+  bool load_rates_learned = false;
+};
+Estimate estimate_of(const std::vector<ProgressSegment>& segments, const planner::ExecutionPlan& plan,
+                     const planner::HardwareProfile& hw);
+// {"total_s", "text_encoder_s", "dit_load_s", "denoise_s", "decode_s", "steps", "step_s", "reference_prefill_s",
+//  "rates": "measured" | "default", "load_rates": "learned" | "probed" | "default"}
+std::string estimate_json(const Estimate& e);
+// One line for a launcher, e.g. "Estimate: 14.2 s (text encoder 1.1 s, DiT load 5.3 s, denoise 7.4 s: 20 steps of
+// 0.37 s, decode 0.4 s); rates measured on this machine."
+std::string estimate_text(const Estimate& e);
+// `plan_json` (a JSON object) with "estimate": estimate_json(e) as its last member.
+std::string with_estimate(const std::string& plan_json, const Estimate& e);
 
 // The fraction stays at or below this until the job ends (the end itself is 1).
 inline constexpr double kFractionBeforeEnd = 0.999;

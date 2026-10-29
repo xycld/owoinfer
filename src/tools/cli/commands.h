@@ -19,6 +19,7 @@ using CommandFn = int (*)(const std::vector<std::string>& args);
 int cmd_index(const std::vector<std::string>& args);
 int cmd_inspect(const std::vector<std::string>& args);
 int cmd_generate(const std::vector<std::string>& args);
+int cmd_check(const std::vector<std::string>& args);
 int cmd_quantize(const std::vector<std::string>& args);
 
 // A path argument (`what`: its flag), through the boundary check (util::check_user_path: a Windows device or pipe path

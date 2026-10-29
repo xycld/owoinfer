@@ -2,7 +2,18 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <ctime>
+#include <exception>
+#include <optional>
 #include <utility>
+
+#include "models/lora/lora.h"
+#include "pipeline/hardware_profile.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/report_json.h"
+#include "util/path.h"
+#include "util/regular_file.h"
 
 namespace mi::api {
 
@@ -44,7 +55,127 @@ double dit_load_seconds(const planner::ExecutionPlan& plan, const HeldModels& he
   return std::max(plan.time.dit_load_s, 0.0);
 }
 
+// Bytes of a component's weights: its file, else the *.safetensors files in the bundle's folder (0 when unreadable).
+std::uint64_t weight_bytes(const std::filesystem::path& file, const std::filesystem::path& folder) {
+  if (!file.empty()) return util::file_info(file).size;
+  std::uint64_t total = 0;
+  std::vector<util::DirEntry> entries;
+  util::list_directory(folder, entries);
+  for (const util::DirEntry& e : entries) {
+    if (e.name.extension() == ".safetensors") total += e.link ? util::file_info(folder / e.name).size : e.info.size;
+  }
+  return total;
+}
+
+std::string seconds_text(double s) {
+  char b[32];
+  std::snprintf(b, sizeof b, "%.1f s", s);
+  return b;
+}
+
 }  // namespace
+
+JobShape job_shape(const pipeline::Request& q) {
+  JobShape s;
+  s.total_steps = static_cast<int>(pipeline::schedule_steps(q));  // both passes, after the strengths
+  s.first_steps = s.total_steps;
+  s.hires = q.hires.enabled();
+  if (s.hires) {
+    pipeline::Request first = q;
+    first.hires = {};
+    s.first_steps = static_cast<int>(pipeline::schedule_steps(first));
+    const double target = static_cast<double>(q.hires.width) * static_cast<double>(q.hires.height);
+    if (target > 0) s.first_pixel_share = static_cast<double>(q.width) * static_cast<double>(q.height) / target;
+  }
+  // The pipeline's img2img condition (an init image at strength 1 without a mask is not used), and control images.
+  s.encodes_image = (q.init_image != nullptr && (q.denoise_strength < 1.0 || q.mask != nullptr)) ||
+                    (q.control.enabled() && !q.control.images.empty() && s.total_steps > 0) ||
+                    (q.references.enabled() && s.total_steps > 0);  // reference images: encoded before the DiT load
+  // A LoRA change may re-merge or reload the DiT: the progress prices a load whenever the stack differs.
+  for (const lora::LoraSpec& l : q.loras) s.merge_key += util::path_utf8(l.path) + '\n' + std::to_string(l.strength) + '\n';
+  if (q.control.enabled()) {
+    s.merge_key += "control\n" + util::path_utf8(q.control.adapter) + '\n' + std::to_string(q.control.lora_strength);
+  }
+  return s;
+}
+
+ModelBytes model_bytes(const std::filesystem::path& model, const std::filesystem::path& text_encoder_file,
+                       const std::filesystem::path& vae_file) {
+  ModelBytes b;
+  b.text_encoder = weight_bytes(text_encoder_file, model / "text_encoder");
+  b.vae = weight_bytes(vae_file, model / "vae");
+  return b;
+}
+
+planner::HardwareProfile stored_rates(const std::filesystem::path& cache_dir) {
+  if (!cache_dir.empty()) {
+    try {
+      const std::optional<pipeline::StoredProfile> stored =
+          pipeline::read_profile(cache_dir / "hardware_profile.json", pipeline::hardware_key(), std::time(nullptr));
+      if (stored) return stored->learned;
+    } catch (const std::exception&) {
+      // An estimate never fails a job: the defaults stand.
+    }
+  }
+  return planner::HardwareProfile{};
+}
+
+Estimate estimate_of(const std::vector<ProgressSegment>& segments, const planner::ExecutionPlan& plan,
+                     const planner::HardwareProfile& hw) {
+  Estimate e;
+  double step_total = 0;
+  for (const ProgressSegment& s : segments) {
+    const double steps_s = s.steps * s.step_seconds;
+    const double t = s.seconds + steps_s;
+    switch (s.phase) {
+      case MI_PHASE_TEXT_ENCODER: e.text_encoder_s += t; break;
+      case MI_PHASE_DIT_LOAD: e.dit_load_s += t; break;
+      case MI_PHASE_DENOISE:
+        e.denoise_s += t;
+        e.steps += s.steps;
+        step_total += steps_s;
+        break;
+      case MI_PHASE_DECODE: e.decode_s += t; break;
+      case MI_PHASE_MAX_ENUM: break;
+    }
+  }
+  e.total_s = e.text_encoder_s + e.dit_load_s + e.denoise_s + e.decode_s;
+  e.step_s = e.steps > 0 ? step_total / e.steps : 0;
+  e.reference_prefill_s = e.steps > 0 ? plan.time.reference_prefill_s : 0;
+  e.rates_measured = hw.measured;
+  e.load_rates_learned = hw.direct_gbps > 0 || hw.buffered_warm_gbps > 0;
+  return e;
+}
+
+std::string estimate_json(const Estimate& e) {
+  using pipeline::json_number;
+  return "{\"total_s\": " + json_number(e.total_s) + ", \"text_encoder_s\": " + json_number(e.text_encoder_s) +
+         ", \"dit_load_s\": " + json_number(e.dit_load_s) + ", \"denoise_s\": " + json_number(e.denoise_s) +
+         ", \"decode_s\": " + json_number(e.decode_s) + ", \"steps\": " + std::to_string(e.steps) +
+         ", \"step_s\": " + json_number(e.step_s) + ", \"reference_prefill_s\": " + json_number(e.reference_prefill_s) +
+         ", \"rates\": \"" + (e.rates_measured ? "measured" : "default") + "\", \"load_rates\": \"" +
+         (e.load_rates_learned ? "learned" : e.rates_measured ? "probed" : "default") + "\"}";
+}
+
+std::string estimate_text(const Estimate& e) {
+  std::string t = "Estimate: " + seconds_text(e.total_s) + " (text encoder " + seconds_text(e.text_encoder_s) +
+                  ", DiT load " + seconds_text(e.dit_load_s) + ", denoise " + seconds_text(e.denoise_s);
+  if (e.steps > 0) {
+    char b[64];
+    std::snprintf(b, sizeof b, ": %d steps of %.2f s", e.steps, e.step_s);
+    t += b;
+  }
+  t += ", decode " + seconds_text(e.decode_s) + "); ";
+  t += e.rates_measured ? "rates measured on this machine" : "the planner's default rates (nothing measured yet)";
+  if (e.rates_measured) t += e.load_rates_learned ? ", load rates learned" : "";
+  return t + ".";
+}
+
+std::string with_estimate(const std::string& plan_json, const Estimate& e) {
+  const std::size_t close = plan_json.rfind('}');
+  if (close == std::string::npos) return plan_json;
+  return plan_json.substr(0, close) + ", \"estimate\": " + estimate_json(e) + plan_json.substr(close);
+}
 
 void HeldModels::job_done(const planner::ExecutionPlan& plan, const JobShape& shape, bool preload, bool cancelled,
                           int arena_creations, std::string_view dit_load_source) {

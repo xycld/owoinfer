@@ -268,7 +268,7 @@ class CpuProtocolTest(ProtocolTestBase):
                                                "system_cuda": True, "control": True, "accel": True,
                                                "preload": True, "release": True, "certificate_dirs": False,
                                                "te_host_pin": True, "progress_fraction": True, "inspect": True,
-                                               "references": True})
+                                               "references": True, "check": True})
         self.assertEqual(set(res["values"]), {"mode", "block_path", "tier", "attention", "dit_direct_io", "te_host_pin",
                                               "sampler", "scheduler", "noise_layout", "noise_source", "resize",
                                               "mask_encoding", "step_cache", "lora_placement"})
@@ -755,6 +755,25 @@ class CpuProtocolTest(ProtocolTestBase):
             self.assertError(r, "invalid_params", param)
             self.assertEqual(r["error"]["message"], '"%s" must be %s' % (param, listed))
 
+    def test_check(self):
+        """check: load's then generate's parameters, each refusal as that request answers it (no GPU reached here)."""
+        s = self.server
+        missing = os.path.join(self.tmp, "missing")
+        self.assertError(s.call("check", {"load": {"model": missing}}, id="g"), "invalid_params", "g")
+        self.assertError(s.call("check", {"generate": {}}, id="l"), "invalid_params", "l")
+        r = s.call("check", {"load": {"model": missing}, "generate": {"prompt": "x"}})["result"]
+        self.assertEqual((r["ok"], r["refused_by"], r["planned"], r["plan"]), (False, "load", False, None))
+        self.assertEqual(r["error"], {"code": "invalid_params", "message": '"tier" is required: reference, high or turbo'})
+        # The engine's own refusal (mi_check's engine stage): the load response's error, word for word.
+        load = {"model": missing, "tier": "high"}
+        real = s.call("load", load)
+        self.assertIn("error", real)
+        r = s.call("check", {"load": load, "generate": {"prompt": "x", "width": 17}})["result"]
+        self.assertEqual((r["ok"], r["refused_by"]), (False, "load"))  # the engine is refused before the request
+        self.assertEqual(r["error"], real["error"])
+        r = s.call("check", {"load": load, "generate": {"prompt": "x", "bogus": 1}})["result"]
+        self.assertEqual(r["refused_by"], "load")
+
     def test_inspect(self):
         s = self.server
         dit = os.path.join(self.tmp, "dit.safetensors")
@@ -840,7 +859,7 @@ class CpuProtocolTest(ProtocolTestBase):
             self.assertEqual((answers[i]["result"]["kind"], answers[i]["result"]["loadable"]), ("dit", True))
         for i in set(ids) - set(done):
             self.assertError(answers[i], "busy", i)
-            self.assertIn("inspects are running", answers[i]["error"]["message"])
+            self.assertIn("inspects or checks are running", answers[i]["error"]["message"])
         self.assertEqual(s.proc.wait(timeout=TIMEOUT), 0)
 
     def test_inspect_slot_free_once_answered(self):
@@ -1175,6 +1194,13 @@ class GpuProtocolTest(ProtocolTestBase):
         plan = next(e for e in events if e["event"] == "plan")
         self.assertTrue(plan["explanation"])
         self.assertIsInstance(plan["plan"], dict)
+        # The job's estimate before it starts: per phase, its steps, the rates' source.
+        est = plan["plan"]["estimate"]
+        self.assertEqual(est["steps"], 2)
+        self.assertAlmostEqual(est["total_s"], est["text_encoder_s"] + est["dit_load_s"] + est["denoise_s"] + est["decode_s"],
+                               places=3)
+        self.assertGreater(est["total_s"], 0)
+        self.assertIn(est["rates"], ("measured", "default"))
         progress = [(e["phase"], e["step"]) for e in events if e["event"] == "progress"]
         self.assertEqual(progress, [("text_encoder", 0), ("dit_load", 0), ("denoise", 0), ("denoise", 1), ("denoise", 2),
                                     ("decode", 0)])
@@ -1191,6 +1217,32 @@ class GpuProtocolTest(ProtocolTestBase):
         self.assertIn("NUL", r["error"]["message"])
         self.assertEqual(self.server.call("shutdown")["result"], {})
         self.assertEqual(self.server.proc.wait(timeout=TIMEOUT), 0)
+
+    def test_check_agrees_with_load_and_generate(self):
+        """check on the GPU: an accepted request comes with its plan and estimate; a refusal is the error the real
+        generate's done event carries, word for word."""
+        base = os.path.join(WEIGHTS, "base")
+        if not os.path.isdir(os.path.join(base, "transformer")):
+            self.skipTest("weights not present: " + base)
+        request = {"prompt": "a red apple", "width": 256, "height": 256, "steps": 2}
+        r = self.server.call("check", {"load": {"model": base, "tier": "reference"}, "generate": request})["result"]
+        self.assertEqual((r["ok"], r["refused_by"], r["error"], r["planned"]), (True, None, None, True), r)
+        self.assertEqual(r["plan"]["estimate"]["steps"], 2)
+        self.assertTrue(r["explanation"])
+        self.assertTrue(r["tier"].startswith("Reference tier"), r["tier"])
+        self.assertEqual(self.server.call("status")["result"]["state"], "unloaded")  # no engine of the server's
+        # A bf16 DiT with exact attention is the Reference tier: tier high refuses it at the first generate.
+        load = {"model": base, "tier": "high", "attention": "exact"}
+        r = self.server.call("check", {"load": load, "generate": request})["result"]
+        self.assertEqual((r["ok"], r["refused_by"], r["planned"]), (False, "generate", False), r)
+        self.assertIn("result", self.server.call("load", load))
+        out = os.path.join(self.tmp, "x.png")
+        events = []
+        gid = self.server.send("generate", dict(request, output=out), id="h")
+        self.server.response(gid, events=events)
+        done = self.wait_done(gid, events)
+        self.assertEqual(done["status"], "error", done)
+        self.assertEqual(r["error"], done["error"])
 
     def test_tier_high_runs_8bit_attention(self):
         """The tier is the caller's: high on the bf16 bundle runs its bf16 GEMMs with the tier's default 8-bit attention

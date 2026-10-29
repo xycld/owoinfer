@@ -59,6 +59,8 @@ COMPONENT_API = {
     "mi_vae_encode", "mi_vae_decode",
     "mi_schedule", "mi_sampler_prediction", "mi_initial_noise", "mi_image_resize",
 }
+# The check's functions (2.1, MI_CAP_CHECK), held to the same rule.
+CHECK_API = {"mi_check", "mi_check_report_info", "mi_check_report_text", "mi_check_report_free"}
 
 
 # The C++ runtime DLLs of MSVC's /MD (the UCRT, api-ms-win-*, ships with Windows 10 and newer).
@@ -232,6 +234,8 @@ def main():
         failures.append(f"ABI: no MOSSINFER_API functions found in {HEADER}")
     elif COMPONENT_API - api:
         failures.append(f"ABI: component API functions not declared in {HEADER}: {sorted(COMPONENT_API - api)}")
+    elif CHECK_API - api:
+        failures.append(f"ABI: check functions not declared in {HEADER}: {sorted(CHECK_API - api)}")
     for lib in libs:
         syms = set(exported_symbols(lib))
         # mi_internal_cli_main: moss-infer's entry when it links the library (MOSSINFER_CLI_SHARED); not C API.

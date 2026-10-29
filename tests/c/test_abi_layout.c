@@ -44,6 +44,8 @@ int main(void) {
   check("sizeof(mi_load_io)", sizeof(mi_load_io), 4);
   check("sizeof(mi_file_kind)", sizeof(mi_file_kind), 4);
   check("sizeof(mi_file_text_kind)", sizeof(mi_file_text_kind), 4);
+  check("sizeof(mi_check_stage)", sizeof(mi_check_stage), 4);
+  check("sizeof(mi_check_text_kind)", sizeof(mi_check_text_kind), 4);
 
   SIZE(mi_device_info, 592);
   FIELD(mi_device_info, struct_size, 0);
@@ -353,6 +355,29 @@ int main(void) {
   FIELD(mi_file_info, control_kind_count, 48);
   FIELD(mi_file_info, _reserved0, 52);
 
+  SIZE(mi_check_info, 136);
+  FIELD(mi_check_info, struct_size, 0);
+  FIELD(mi_check_info, status, 8);
+  FIELD(mi_check_info, stage, 12);
+  FIELD(mi_check_info, planned, 16);
+  FIELD(mi_check_info, dit_streamed, 20);
+  FIELD(mi_check_info, dit_parked, 24);
+  FIELD(mi_check_info, dit_resident_blocks, 28);
+  FIELD(mi_check_info, steps, 32);
+  FIELD(mi_check_info, rates_measured, 36);
+  FIELD(mi_check_info, arena_bytes, 40);
+  FIELD(mi_check_info, arena_cap_bytes, 48);
+  FIELD(mi_check_info, device_peak_bytes, 56);
+  FIELD(mi_check_info, host_private_bytes, 64);
+  FIELD(mi_check_info, host_limit_bytes, 72);
+  FIELD(mi_check_info, eta_seconds, 80);
+  FIELD(mi_check_info, text_encoder_seconds, 88);
+  FIELD(mi_check_info, dit_load_seconds, 96);
+  FIELD(mi_check_info, denoise_seconds, 104);
+  FIELD(mi_check_info, step_seconds, 112);
+  FIELD(mi_check_info, decode_seconds, 120);
+  FIELD(mi_check_info, gguf_convert_seconds, 128);
+
   /* The component API (2.1). */
   check("sizeof(mi_memory)", sizeof(mi_memory), 4);
   check("sizeof(mi_dtype)", sizeof(mi_dtype), 4);
@@ -470,6 +495,10 @@ int main(void) {
   check("MI_TEXT_COMPONENT_NOTE", MI_TEXT_COMPONENT_NOTE, 18);
   check("MI_MAX_CALL_TOKENS", MI_MAX_CALL_TOKENS, 61506);
   check("MI_MAX_ROWS", MI_MAX_ROWS, 8);
+  /* The check (2.1): its capability bit, the next free after MI_CAP_REFERENCE_IMAGES, and its enum values. */
+  check("MI_CAP_CHECK", MI_CAP_CHECK, 0x100000u);
+  check("MI_CHECK_STAGE_GENERATE", MI_CHECK_STAGE_GENERATE, 2);
+  check("MI_CHECK_TEXT_NOTES", MI_CHECK_TEXT_NOTES, 5);
 
   printf("%s: C struct layouts %s the frozen ABI %d table\n", failures ? "FAIL" : "ok",
          failures ? "differ from" : "match", MI_ABI_VERSION);

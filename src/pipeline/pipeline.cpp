@@ -789,6 +789,29 @@ ReleaseReport Pipeline::release_device_memory(bool keep_host_copy, const std::at
 
 Result Pipeline::generate(const Request& req, const GenerateControl& control) { return run(req, control, false); }
 
+Result Pipeline::check(const Request& req, const GenerateControl& control) {
+  if (!impl_->options.plan_only) throw std::logic_error("Pipeline::check needs a plan-only pipeline (PipelineOptions::plan_only)");
+  // Only what shapes the plan: the preview's buffers count in the denoise phase.
+  GenerateControl c;
+  if (control.on_preview) c.on_preview = [](const PreviewImage&) {};
+  c.preview_every = control.preview_every;
+  Result r = run(req, c, false);
+  if (!r.hardware.measured) {
+    r.plan_only_notes.push_back("transfer rates: the planner's defaults (no hardware profile stored" +
+                                std::string(impl_->options.cache_dir.empty() ? ": no cache_dir" : " in cache_dir yet") +
+                                "); the first generate measures them");
+  }
+  if (impl_->fused_check && impl_->fused_check->detail == kFusedCheckNotRun &&
+      impl_->options.block_path != moss_dit::BlockPath::kOpByOp) {
+    r.plan_only_notes.push_back("fused self-check: not run in this process yet; the denoise workspace is sized for the "
+                                "op-by-op route (larger than the fused one: a conservative plan)");
+  }
+  if (impl_->options.embedding_cache && !impl_->options.cache_dir.empty()) {
+    r.plan_only_notes.push_back("embedding cache: its folder is not read; the text encoder is planned to run");
+  }
+  return r;
+}
+
 Result Pipeline::preload(const PreloadOptions& options) {
   Request req = options.request;
   if (tok::python_strip(req.prompt).empty()) req.prompt = "preload";  // plans for a short prompt
@@ -850,14 +873,18 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
       const std::size_t bytes = control::DeviceEmbedder::device_bytes(ew.out_features, ew.in_features);
       if (m.dit) m.dit->set_input_extension(nullptr);
       m.control_emb.reset();
-      if (m.arena && runtime::DeviceArena::free_device_bytes() < bytes + m.options.vram_reserve) m.release_arena();
       std::unique_ptr<control::DeviceEmbedder> e;
-      try {
-        e = std::make_unique<control::DeviceEmbedder>(ew);
-      } catch (const CudaError&) {
-        if (!m.arena) throw;
-        m.release_arena();
-        e = std::make_unique<control::DeviceEmbedder>(ew);
+      if (m.options.plan_only) {
+        m.control_plan_bytes = bytes;  // planned by its size, never uploaded
+      } else {
+        if (m.arena && runtime::DeviceArena::free_device_bytes() < bytes + m.options.vram_reserve) m.release_arena();
+        try {
+          e = std::make_unique<control::DeviceEmbedder>(ew);
+        } catch (const CudaError&) {
+          if (!m.arena) throw;
+          m.release_arena();
+          e = std::make_unique<control::DeviceEmbedder>(ew);
+        }
       }
       m.control_file = std::move(f);
       m.control_emb = std::move(e);
@@ -866,8 +893,10 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     }
     ctl = m.control_file.get();
     check_kinds(*ctl);
-    m.control_ext.weight = m.control_emb->weight();
-    m.control_ext.bias = m.control_emb->bias();
+    if (m.control_emb) {
+      m.control_ext.weight = m.control_emb->weight();
+      m.control_ext.bias = m.control_emb->bias();
+    }
     loras.push_back({req.control.adapter, req.control.lora_strength, ctl->consumed()});
     r.control.adapter = util::path_utf8(req.control.adapter);
     r.control.kinds = ctl->kinds;
@@ -969,13 +998,17 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
       if (m.dit) m.dit->set_lora(nullptr);
       m.lora_sb.reset();
       std::unique_ptr<lora::SideBranches> sb;
-      if (m.arena && runtime::DeviceArena::free_device_bytes() < sb_bytes + m.options.vram_reserve) m.release_arena();
-      try {
-        sb = std::make_unique<lora::SideBranches>(*stack);
-      } catch (const CudaError&) {
-        if (!m.arena) throw;
-        m.release_arena();
-        sb = std::make_unique<lora::SideBranches>(*stack);
+      if (m.options.plan_only) {
+        sb = std::make_unique<lora::SideBranches>(*stack, lora::SideBranches::LayoutOnly{});  // its layout, no upload
+      } else {
+        if (m.arena && runtime::DeviceArena::free_device_bytes() < sb_bytes + m.options.vram_reserve) m.release_arena();
+        try {
+          sb = std::make_unique<lora::SideBranches>(*stack);
+        } catch (const CudaError&) {
+          if (!m.arena) throw;
+          m.release_arena();
+          sb = std::make_unique<lora::SideBranches>(*stack);
+        }
       }
       m.lora_stack = std::move(stack);
       m.lora_sb = std::move(sb);
@@ -1068,6 +1101,10 @@ Pipeline::Impl::CallDit Pipeline::Impl::setup_dit_call(const DitSource& src, Res
   // One fused route for the whole request: it sizes the denoise workspace and every step runs under it, so a poisoning
   // meanwhile (another pipeline's failed self-check) applies from the next request on instead of failing a step.
   d.route = d.block_path == moss_dit::BlockPath::kOpByOp ? moss_dit::FusedRouteSnapshot{} : moss_dit::fused_route_snapshot();
+  // Plan-only: the check found is not installed (process state); the route is sized as installing it would make it.
+  if (options.plan_only && d.block_path != moss_dit::BlockPath::kOpByOp && fused_check) {
+    d.route.validated.insert(d.route.validated.end(), fused_check->validated.begin(), fused_check->validated.end());
+  }
   d.attention = dit_attention(r.tier.attention);
   // The side branches run on the quantized block path (its fused LoRA GEMMs; on NVFP4 sites a stored Δ).
   d.config = moss_dit::MossDit::compute_config(src.quant.get(), d.attention, moss_dit::Int4Route::kAuto, lora_sb.get());
@@ -1180,6 +1217,7 @@ Pipeline::Impl::Planned Pipeline::Impl::plan_call(const CallModels& models, cons
   // The LoRA side branches hold device memory outside the arena, as the context does: it counts against the budget.
   if (m.lora_sb) in.budgets.context_bytes += m.lora_sb->device_bytes();
   if (m.control_emb) in.budgets.context_bytes += m.control_emb->device_bytes();
+  in.budgets.context_bytes += m.control_plan_bytes;  // plan-only: the embedder it would upload (else 0)
   const std::size_t held_host = m.held_host_bytes(!te_lengths.empty());
   // Of it, what the plan counts again (and so would replace): not a soft unload's DiT copy, nor a held DiT's host
   // memory when this request plans no DiT.
@@ -1194,7 +1232,8 @@ Pipeline::Impl::Planned Pipeline::Impl::plan_call(const CallModels& models, cons
   in.budgets.host_budget = m.options.host_ram_budget;
   in.mode = m.options.mode;
   in.attention = r.tier.attention;
-  in.cache_disk_spill = m.cache && m.cache->disk_enabled();
+  // Plan-only: the folder is neither created nor read, but the engine would spill to it.
+  in.cache_disk_spill = m.cache && (m.cache->disk_enabled() || (m.options.plan_only && !m.options.cache_dir.empty()));
   if (!need_dit) {
     // No sampling step (denoise strength 0): the DiT is neither loaded nor planned (the planner wants a DiT shape: one
     // byte, resident).
@@ -1749,6 +1788,12 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
         r.reference_warnings.push_back(f.file + " is an edit adapter (moss-edit-lora) used without reference images");
       }
     }
+  }
+  if (m.options.plan_only) {
+    // Pipeline::check: everything a generation decides before its first phase, nothing it does after.
+    tm.total_s = since(t_total);
+    m.mem = nullptr;
+    return r;
   }
   const planner::ExecutionPlan& plan = r.plan;
   if (m.cache) m.cache->set_max_bytes(plan.cache.host_bytes);

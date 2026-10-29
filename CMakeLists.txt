@@ -80,6 +80,7 @@ list(FILTER MOSSINFER_SOURCES EXCLUDE REGEX ".*/src/tools/.*")
 option(MOSSINFER_BUILD_API "Build the C API (src/api), libmossinfer and moss-server" ON)
 if(NOT MOSSINFER_BUILD_API)
   list(FILTER MOSSINFER_SOURCES EXCLUDE REGEX ".*/src/api/.*")
+  list(APPEND MOSSINFER_SOURCES ${CMAKE_SOURCE_DIR}/src/api/progress_model.cpp)  # the CLI's estimates (host logic only)
 endif()
 
 # Parallel development: MOSSINFER_ONLY="core;util;kernels/gdn" builds only sources under those src/
@@ -174,7 +175,7 @@ if(MOSSINFER_TESTS)
   file(GLOB MOSSINFER_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/unit/*.cpp ${CMAKE_SOURCE_DIR}/tests/unit/*.cu)
   mossinfer_filter(MOSSINFER_TEST_SOURCES "${MOSSINFER_TEST_SOURCES}" ${CMAKE_SOURCE_DIR}/tests/unit "${MOSSINFER_TESTS_ONLY}")
   if(NOT MOSSINFER_BUILD_API)
-    list(FILTER MOSSINFER_TEST_SOURCES EXCLUDE REGEX ".*/tests/unit/test_(c_api|c_api_inspect|component_api|progress_model)\\.cpp$")
+    list(FILTER MOSSINFER_TEST_SOURCES EXCLUDE REGEX ".*/tests/unit/test_(c_api|c_api_check|c_api_inspect|component_api|progress_model)\\.cpp$")
   endif()
   add_executable(mossinfer_tests ${MOSSINFER_TEST_SOURCES})
   # Its reference arithmetic is compared bit for bit with the NVFP4 recipes (MOSSINFER_STRICT_FP_SOURCES).

@@ -154,6 +154,9 @@ MOSSINFER_API const char* mi_last_error_message(void);
 /* Reference images of edit adapters (moss-edit-lora files such as Moss-Image-Edit): mi_gen_params.reference_images /
  * reference_max_edge, MI_TEXT_REFERENCES and MI_MESSAGE_REFERENCE_WARNING. mi_generate() only (not the components). */
 #define MI_CAP_REFERENCE_IMAGES 0x80000u
+/* mi_check() (a dry run of an engine configuration and a request), and the job's time estimate before it starts: the
+ * "estimate" object of the plan callback's plan_json. */
+#define MI_CAP_CHECK 0x100000u
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -530,7 +533,8 @@ typedef struct mi_progress {
  * before planning and the plan callback): MI_PHASE_DIT_LOAD with step 0, fraction 0 and eta_seconds < 0. */
 typedef void (*mi_progress_fn)(const mi_progress* progress, void* user_data);
 /* Called once per generation, after planning and before the first phase. `explanation` is the plan in several
- * human-readable lines, `plan_json` the plan as one JSON object. Both are valid during the call only. */
+ * human-readable lines, `plan_json` the plan as one JSON object. Both are valid during the call only. MI_CAP_CHECK:
+ * plan_json's last member "estimate" is the job's time estimate from now, per phase (docs/c-api.md). */
 typedef void (*mi_plan_fn)(const char* explanation, const char* plan_json, void* user_data);
 /* Latent preview (MI_CAP_PREVIEW): RGB8 [height][width][3] at the requested image size, a linear latent -> RGB map of
  * the x0 estimate after sampling step `step` (no VAE). Called after every preview_interval-th step and after the last
@@ -1109,6 +1113,85 @@ MOSSINFER_API const char* mi_file_report_control_kind(const mi_file_report* repo
 MOSSINFER_API const char* mi_file_report_tier_reason(const mi_file_report* report, mi_tier tier);
 /* NULL is a no-op. */
 MOSSINFER_API void mi_file_report_free(mi_file_report* report);
+
+/* ------------------------------------------------------------------------------------------------ check */
+
+/* A dry run of an engine configuration and a request (MI_CAP_CHECK): what mi_engine_create(engine_params) and then
+ * mi_generate(params) on that new engine would decide before their first heavy step, without loading weights. */
+typedef struct mi_check_report mi_check_report;
+
+/* Which call the refusal is from. */
+typedef enum mi_check_stage {
+  MI_CHECK_STAGE_NONE = 0,          /* accepted */
+  MI_CHECK_STAGE_ENGINE_CREATE = 1, /* mi_engine_create() */
+  MI_CHECK_STAGE_GENERATE = 2,      /* mi_generate() */
+  MI_CHECK_STAGE_MAX_ENUM = 0x7fffffff
+} mi_check_stage;
+
+/* What mi_check() found. An output struct: struct_size set by the caller. */
+typedef struct mi_check_info {
+  size_t struct_size;
+  /* MI_OK, or the status the call named by `stage` would fail with (its message: MI_CHECK_TEXT_MESSAGE). */
+  mi_status status;
+  mi_check_stage stage;
+  /* The request was planned: the fields below and the plan texts are set. 0 when refused before planning, and with
+   * status MI_OK for a GGUF dit_file not converted yet (gguf_convert_seconds > 0): the first load converts it, and the
+   * text encoder, VAE, LoRA and plan checks follow the conversion. */
+  int32_t planned;
+  int32_t dit_streamed;        /* the plan streams DiT blocks every step */
+  int32_t dit_parked;          /* the plan evicts the DiT for the text encoder or the decode, and reloads it */
+  int32_t dit_resident_blocks; /* of 42 */
+  int32_t steps;               /* sampling steps (both passes of a hires fix) */
+  int32_t rates_measured;      /* the estimates use rates measured on this machine (else the planner's defaults) */
+  uint64_t arena_bytes;        /* the device arena the plan reserves */
+  uint64_t arena_cap_bytes;    /* the largest arena the budgets allow */
+  uint64_t device_peak_bytes;  /* estimated device peak (arena, CUDA context, graphs) */
+  uint64_t host_private_bytes; /* estimated host private memory at its peak */
+  uint64_t host_limit_bytes;   /* the hard host limit the plan was held to */
+  /* The job's estimated time on a new engine, as the plan JSON's "estimate" (cold: every model loads). */
+  double eta_seconds;
+  double text_encoder_seconds;
+  double dit_load_seconds;
+  double denoise_seconds;
+  double step_seconds;         /* the mean sampling step */
+  double decode_seconds;
+  double gguf_convert_seconds; /* a GGUF dit_file's first-load conversion (not in eta_seconds); 0 otherwise */
+} mi_check_info;
+
+typedef enum mi_check_text_kind {
+  MI_CHECK_TEXT_MESSAGE = 0,     /* the refusal's message, as mi_last_error_message() after the refused call; "" if none */
+  MI_CHECK_TEXT_EXPLANATION = 1, /* the plan in several lines, as the plan callback's `explanation` */
+  /* the plan as one JSON object, as the plan callback's `plan_json` (with its "estimate" of the job) */
+  MI_CHECK_TEXT_PLAN_JSON = 2,
+  MI_CHECK_TEXT_TIER_REASON = 3, /* what the tier runs, as MI_TEXT_TIER_REASON */
+  /* what mi_generate() would report as messages before it generates (LoRA, control, reference and accelerator
+   * warnings), one per line */
+  MI_CHECK_TEXT_WARNINGS = 4,
+  /* facts the check could not know as the real calls do (no stored hardware profile, the fused self-check not run
+   * yet, the embedding cache's folder not read) and a GGUF conversion still to run, one per line */
+  MI_CHECK_TEXT_NOTES = 5,
+  MI_CHECK_TEXT_MAX_ENUM = 0x7fffffff
+} mi_check_text_kind;
+
+/* Checks `engine_params` as mi_engine_create() and `params` as mi_generate() on that engine, with the same functions:
+ * the parameter checks, the model files' headers and indexes (component files, the time embedding, a LoRA's and a
+ * control adapter's files, the distill bundle), the tier, the LoRA placement, the image inputs (decoded), the token
+ * counts and the plan within the budgets against the device's free memory now, and the job's time estimate. Loads no
+ * weights and writes nothing: no GGUF conversion, cache folder, hardware probe or profile (a stored profile is read).
+ * It initializes CUDA on the device as mi_engine_create() does (the device's primary context) and allocates no
+ * device memory. The plan is a new engine's: memory other engines hold, in this process too, counts as used.
+ * Returns MI_OK with *out_report set (release it with mi_check_report_free()) whatever the verdict: a refusal is in
+ * the report (status, stage, message). Fails only for NULL arguments (MI_ERR_INVALID_ARGUMENT) and unknown struct
+ * sizes (MI_ERR_ABI_MISMATCH). mi_last_error_message() is unchanged on MI_OK. Thread-safe (each call has its own
+ * pipeline). */
+MOSSINFER_API mi_status mi_check(const mi_engine_params* engine_params, const mi_gen_params* params,
+                                 mi_check_report** out_report);
+/* `out` has struct_size set by the caller. */
+MOSSINFER_API mi_status mi_check_report_info(const mi_check_report* report, mi_check_info* out);
+/* Owned by the report; "" when empty. NULL for a NULL report or an unknown kind. */
+MOSSINFER_API const char* mi_check_report_text(const mi_check_report* report, mi_check_text_kind kind);
+/* NULL is a no-op. */
+MOSSINFER_API void mi_check_report_free(mi_check_report* report);
 
 /* ------------------------------------------------------------------------------------------------ components */
 
