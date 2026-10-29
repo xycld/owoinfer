@@ -336,18 +336,14 @@ struct Session::State {
     m.dit->set_graphs_paused(false);
   }
 
-  // The most pinned host bytes the staging may hold: the planner's pin margin of the available host memory, and the
-  // host budget when one is set.
+  // The most pinned host bytes the staging may hold: the host budget left when one is set, else no bound but the
+  // system's (cudaHostAlloc). The staging is a run's few latents, counted in its plan's host buffers, like
+  // mi_generate's own pinned buffers (the stream ring, the read slices); planner::host_pin_margin() is for the large
+  // copies the engine keeps on its own initiative, and would refuse a few MiB on any host with less than 8 GiB free.
   std::size_t staging_budget() const {
-    const std::size_t available = planner::host_available_bytes();
-    const std::size_t margin = planner::host_pin_margin(planner::host_total_bytes());
-    std::size_t budget = available == 0 ? std::numeric_limits<std::size_t>::max()
-                                        : staging.bytes() + (available > margin ? available - margin : 0);
-    if (m.options.host_ram_budget != 0) {
-      const std::size_t used = planner::process_host_memory().private_bytes;
-      budget = std::min(budget, staging.bytes() + (m.options.host_ram_budget > used ? m.options.host_ram_budget - used : 0));
-    }
-    return budget;
+    if (m.options.host_ram_budget == 0) return std::numeric_limits<std::size_t>::max();
+    const std::size_t used = planner::process_host_memory().private_bytes;
+    return staging.bytes() + (m.options.host_ram_budget > used ? m.options.host_ram_budget - used : 0);
   }
 
   RunResult finish_run();
