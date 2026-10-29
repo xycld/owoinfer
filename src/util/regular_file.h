@@ -194,6 +194,12 @@ struct DirEntry {
 // name again. POSIX: opendir(3), readdir(3), fstatat(AT_SYMLINK_NOFOLLOW) per entry.
 bool list_directory(const std::filesystem::path& dir, std::vector<DirEntry>& out);
 
+// Creates the folder `dir` and its missing parents (std::filesystem::create_directories without its opens): each level
+// that exists is checked with file_info (on Windows a handle opened with kUserPathSqos) and must be a folder, a file,
+// pipe or device refusing the whole; only missing levels are created (CreateDirectoryW / mkdir(2), one created
+// meanwhile accepted). True when `dir` is a folder at the end.
+bool make_directories(const std::filesystem::path& dir);
+
 // Sets the modification time of `path` to now, or deletes it: a file in the folder whose resolved_path is `dir` (a
 // cache folder, resolved once). Windows: through one handle opened without following a final reparse point
 // (FILE_FLAG_OPEN_REPARSE_POINT, kUserPathSqos) that must be a plain regular file (no reparse point) whose final

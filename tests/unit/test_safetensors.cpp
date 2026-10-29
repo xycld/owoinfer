@@ -949,6 +949,18 @@ TEST(RegularFile, ListTouchAndRemoveInFolder) {
   EXPECT_TRUE(mi::util::remove_file_in(folder, file));
   EXPECT_FALSE(mi::util::file_info(file).exists());
   EXPECT_FALSE(mi::util::remove_file_in(folder, file));
+
+  // make_directories: the missing levels only; an existing folder is fine, a file in the way refuses the whole.
+  EXPECT_TRUE(mi::util::make_directories(dir.path() / "a" / "b" / "c"));
+  EXPECT_TRUE(mi::util::file_info(dir.path() / "a" / "b" / "c").directory());
+  EXPECT_TRUE(mi::util::make_directories(dir.path() / "a" / "b"));
+  std::ofstream(dir.path() / "a" / "plain") << "x";
+  EXPECT_FALSE(mi::util::make_directories(dir.path() / "a" / "plain" / "d"));
+  EXPECT_FALSE(mi::util::make_directories(dir.path() / "a" / "plain"));
+#ifdef __linux__
+  ASSERT_EQ(::mkfifo((dir.path() / "fifo").c_str(), 0600), 0);
+  EXPECT_FALSE(mi::util::make_directories(dir.path() / "fifo" / "d"));
+#endif
 }
 
 #ifdef _WIN32

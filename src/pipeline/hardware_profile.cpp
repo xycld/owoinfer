@@ -187,8 +187,7 @@ bool write_profile(const std::filesystem::path& path, const std::string& key, co
     doc += "]}";
   }
   doc += "}\n";
-  std::error_code ec;
-  std::filesystem::create_directories(path.parent_path(), ec);
+  if (path.has_parent_path() && !util::make_directories(path.parent_path())) return false;
   // A new temporary file (concurrent writers never share one); the rename replaces atomically.
   util::OutputFile out(path, util::OutputFile::Create::kTemporary);
   if (!out.write(doc) || !out.publish(path)) {

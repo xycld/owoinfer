@@ -148,9 +148,7 @@ std::uint64_t text_encoder_hash(const weights::ModelIndex& index) {
 EmbeddingCache::EmbeddingCache(EmbeddingCacheOptions options)
     : max_bytes_(options.max_bytes), disk_dir_(std::move(options.disk_dir)), max_disk_bytes_(options.max_disk_bytes) {
   if (!disk_dir_.empty()) {
-    std::error_code ec;
-    fs::create_directories(disk_dir_, ec);
-    if (ec || !util::file_info(disk_dir_).directory()) {
+    if (!util::make_directories(disk_dir_)) {
       disk_dir_.clear();
       ++stats_.disk_errors;
     }

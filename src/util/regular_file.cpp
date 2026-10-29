@@ -125,6 +125,21 @@ std::filesystem::path path_key(const std::filesystem::path& path) {
 #endif
 }
 
+bool make_directories(const std::filesystem::path& dir) {
+  const FileInfo info = file_info(dir);
+  if (info.directory()) return true;
+  if (info.exists()) return false;  // a file, a pipe or a device
+  const std::filesystem::path parent = dir.parent_path();
+  if (!parent.empty() && parent != dir && !make_directories(parent)) return false;
+#ifdef _WIN32
+  if (is_windows_device_path(dir)) return false;
+  if (!CreateDirectoryW(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+#else
+  if (::mkdir(dir.c_str(), 0777) != 0 && errno != EEXIST) return false;
+#endif
+  return file_info(dir).directory();
+}
+
 #ifdef _WIN32
 
 bool is_windows_device_path(const std::filesystem::path& path) {
