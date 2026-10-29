@@ -256,6 +256,9 @@ class PristineWeights {
   int remerge_bf16(const LoraStack& stack, std::string_view module, std::uint16_t* dst, std::uint16_t* dst_bias = nullptr,
                    int threads = 0) const;
   int remerge_int8(const LoraStack& stack, std::string_view module, std::int8_t* q, float* scale, int threads = 0) const;
+  // dst (and dst_bias, null exactly when the module has no bias) = the pristine bf16 bits of `module`, unmerged (a
+  // device merge follows). Throws LoraError as remerge_bf16.
+  void restore_bf16(std::string_view module, std::uint16_t* dst, std::uint16_t* dst_bias = nullptr) const;
 
  private:
   struct Entry {

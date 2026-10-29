@@ -646,41 +646,43 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
       throw Cancelled();
     }
   };
-  // LoRA merges (lossy for INT8 block GEMMs) into a group's views, on the device (staging copy, merged, uploaded) or
-  // in a pinned host copy (in place). The pristine weights are kept on the host first, so a strength change re-merges
-  // from them (remerge_lora) instead of reloading.
+  // LoRA merges (lossy for INT8 block GEMMs) into a group's views, on the device or in a pinned host copy. The pristine
+  // weights are kept on the host first, so a strength change re-merges from them (remerge_lora) instead of reloading.
+  // One module on the host (its target's bytes have arrived): staging copy, merged, stored back.
+  const auto merge_on_host = [&](const std::string& module, const MergeTarget& t) {
+    if (!merges->keeps_pristine(module)) {
+      // Merged in place from the loaded bits, without a pristine copy (a merged edit adapter's block modules): a
+      // strength or placement change reloads the model (can_remerge()).
+      MergeStaging staging(t, true);
+      if (t.group == 0) {
+        lora::merge_bf16(*merges, module, staging.w<std::uint16_t>(), t.w.dim(0), t.w.dim(1), staging.bias());
+      } else {
+        lora::merge_requantize_int8(*merges, module, staging.w<std::int8_t>(), staging.scale(), t.w.dim(0), t.w.dim(1),
+                                    t.group);
+      }
+      staging.store();
+      no_pristine_ = true;
+      return;
+    }
+    if (!pristine_) pristine_ = std::make_unique<lora::PristineWeights>();
+    const bool keep = !pristine_->has(module);
+    MergeStaging staging(t, keep);
+    if (keep) {
+      if (t.group == 0) {
+        pristine_->keep_bf16(module, staging.w<std::uint16_t>(), t.w.dim(0), t.w.dim(1), staging.bias());
+      } else {
+        pristine_->keep_int8(module, staging.w<std::int8_t>(), staging.scale(), t.w.dim(0), t.w.dim(1), t.group);
+      }
+    }
+    remerge_into(*pristine_, *merges, module, t, staging);
+    staging.store();
+  };
   const auto merge = [&](const TensorMap& m) {
     if (merges == nullptr) return;
     for (const std::string& module : merges->merge_modules()) {
       const MergeTarget t = merge_target(m, module);
       if (t.w.data == nullptr) continue;
-      if (!merges->keeps_pristine(module)) {
-        // Merged in place from the loaded bits, without a pristine copy (a merged edit adapter's block modules): a
-        // strength or placement change reloads the model (can_remerge()).
-        MergeStaging staging(t, true);
-        if (t.group == 0) {
-          lora::merge_bf16(*merges, module, staging.w<std::uint16_t>(), t.w.dim(0), t.w.dim(1), staging.bias());
-        } else {
-          lora::merge_requantize_int8(*merges, module, staging.w<std::int8_t>(), staging.scale(), t.w.dim(0), t.w.dim(1),
-                                      t.group);
-        }
-        staging.store();
-        merge_targets_.emplace_back(module, t);
-        no_pristine_ = true;
-        continue;
-      }
-      if (!pristine_) pristine_ = std::make_unique<lora::PristineWeights>();
-      const bool keep = !pristine_->has(module);
-      MergeStaging staging(t, keep);
-      if (keep) {
-        if (t.group == 0) {
-          pristine_->keep_bf16(module, staging.w<std::uint16_t>(), t.w.dim(0), t.w.dim(1), staging.bias());
-        } else {
-          pristine_->keep_int8(module, staging.w<std::int8_t>(), staging.scale(), t.w.dim(0), t.w.dim(1), t.group);
-        }
-      }
-      remerge_into(*pristine_, *merges, module, t, staging);
-      staging.store();
+      merge_on_host(module, t);
       merge_targets_.emplace_back(module, t);
     }
   };
