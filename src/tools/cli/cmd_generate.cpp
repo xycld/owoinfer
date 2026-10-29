@@ -115,11 +115,11 @@ constexpr const char* kUsage =
     "of 16; the adapter was trained at 256), each side rounded to 16, never upscaled, and VAE-encoded once; every\n"
     "row then attends to the reference tokens (at most 16384 in all). Not with --slg-scale > 0; --skip-layers (the\n"
     "edit workflow's 22) skips only the rows, not the references.\n"
-    "--lora-placement sets where low-rank adapters on the DiT blocks go: default and side_branch (the side branch:\n"
-    "fast loads, instant strength changes, a per-step cost: ~6.5 % on bf16, ~15 % on INT8 for the edit adapter) or\n"
-    "merge (merged at load: no per-step cost, a load tens of seconds slower, INT8 requantized, refused on INT4 /\n"
-    "NVFP4; for long sessions with a fixed adapter). Changing what is merged reloads the DiT. On INT8, a DiT with the\n"
-    "adapter baked in (moss-infer quantize --lora) has no per-step cost and loads fast.\n";
+    "--lora-placement sets where low-rank adapters on the DiT blocks go: side_branch (fast loads, instant strength\n"
+    "changes, a per-step cost: ~5 % on bf16, ~12 % on INT8 for the edit adapter), merge (merged at load: no per-step\n"
+    "cost; bf16 on the GPU, ~1 s; INT8 requantized on the host, tens of seconds; refused on INT4 / NVFP4) or default\n"
+    "(the side branch, except an edit adapter on bf16 modules: merged). Changing what is merged reloads the DiT. On\n"
+    "INT8, a DiT with the adapter baked in (moss-infer quantize --lora) has no per-step cost and loads fast.\n";
 
 std::atomic<bool> g_cancel{false};
 // First Ctrl-C: cancel (within a text-encoder layer, DiT block or decode band). A second one terminates (default action restored).

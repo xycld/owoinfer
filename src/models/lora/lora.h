@@ -24,8 +24,9 @@
 //   - everything else (LoHa / LoKr / full deltas anywhere; any adapter on text_embedder, the modulation and time
 //     linears, the embedders and the final layer) -> merged into the base weight at load (merge_bf16, or
 //     merge_requantize_int8 for an INT8 block GEMM, which adds the requantization error: with
-//     LoadOptions::int8_block_gemms each such adapter gets a FileReport warning). A strength change re-merges from the
-//     pristine base weights kept by PristineWeights.
+//     LoadOptions::int8_block_gemms each such adapter gets a FileReport warning; bf16 low-rank merges run on the GPU
+//     with the same bits, lora_merge_device.h). A strength change re-merges from the pristine base weights kept by
+//     PristineWeights.
 //
 // Untrusted input: every name, dtype, shape and value is validated (weights::FormatError / LoraError); keys that are
 // not understood or do not match a module of the model are reported per file (FileReport::unknown), never silently
@@ -141,9 +142,11 @@ struct FileReport {
 
 // Where low-rank adapters on the block GEMMs go (the request's lora_placement), a fixed rule per module, decided when
 // the stack is parsed:
-//   kDefault     every low-rank block adapter on the side branch, moss-edit-lora files (Moss-Image-Edit) included:
-//                strength changes are instant and loads fast (a DiT file with the adapter baked in, moss-infer
-//                quantize --lora, has no per-step cost)
+//   kDefault     every low-rank block adapter on the side branch (strength changes are instant and loads fast), except
+//                a moss-edit-lora file's (Moss-Image-Edit) on bf16 modules, which are merged (on the GPU at load: about a
+//                second more than the side branch's load, ~5 % faster per step; its strength or placement changes
+//                reload the DiT); an edit adapter on INT8, INT4 or NVFP4 modules stays on the side branch (a DiT file
+//                with the adapter baked in, moss-infer quantize --lora, has no per-step cost)
 //   kMerge       every low-rank block adapter merged (no per-step cost, a slower load; an edit adapter's strength or
 //                placement change reloads the DiT); one on a module that cannot take a merge (INT8 without ConvRot,
 //                INT4, NVFP4) is a LoraError naming the module and its format
@@ -256,6 +259,9 @@ class PristineWeights {
   int remerge_bf16(const LoraStack& stack, std::string_view module, std::uint16_t* dst, std::uint16_t* dst_bias = nullptr,
                    int threads = 0) const;
   int remerge_int8(const LoraStack& stack, std::string_view module, std::int8_t* q, float* scale, int threads = 0) const;
+  // dst (and dst_bias, null exactly when the module has no bias) = the pristine bf16 bits of `module`, unmerged (a
+  // device merge follows). Throws LoraError as remerge_bf16.
+  void restore_bf16(std::string_view module, std::uint16_t* dst, std::uint16_t* dst_bias = nullptr) const;
 
  private:
   struct Entry {

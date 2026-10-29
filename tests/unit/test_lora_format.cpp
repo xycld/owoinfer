@@ -534,9 +534,9 @@ TEST(LoraFormat, Int8MergeWarnings) {
 }
 
 // lora_placement, per module from its base format: an ordinary LoRA stays on the side branch under default and merges
-// under merge (refused on a packed 4-bit module); a moss-edit-lora file too: the side branch everywhere by default,
-// merged under merge (on INT8 one warning per file, refused by strict naming side_branch); side_branch never merges.
-// side_branch; side_branch never merges. Merged edit block modules keep no pristine copy.
+// under merge (refused on a packed 4-bit module); a moss-edit-lora file is merged by default on bf16 modules only (the
+// side branch on INT8, INT4 and INT8 without ConvRot), merged under merge (on INT8 one warning per file, refused by
+// strict naming side_branch); side_branch never merges. Merged edit block modules keep no pristine copy.
 TEST(LoraFormat, PlacementPerModule) {
   TempDir dir("lora_place");
   auto plain = low_rank("transformer.layers.0.proj.q", ".lora_A.weight", ".lora_B.weight", kD, kD, 4, 1);
@@ -589,11 +589,14 @@ TEST(LoraFormat, PlacementPerModule) {
   EXPECT_TRUE(side(open("plain8.safetensors", Placement::kDefault), "layers.3.proj.v"));
   {
     const LoraStack s = open("edit.safetensors", Placement::kDefault, true);  // strict: nothing lossy by default
-    EXPECT_TRUE(side(s, "layers.0.proj.q"));
-    EXPECT_TRUE(side(s, "layers.1.proj.o"));
-    EXPECT_TRUE(side(s, "layers.2.proj.k"));
-    EXPECT_TRUE(s.merge_modules().empty());
+    EXPECT_TRUE(side(s, "layers.0.proj.q"));   // INT8
+    EXPECT_TRUE(side(s, "layers.1.proj.o"));   // INT4
+    EXPECT_FALSE(side(s, "layers.2.proj.k"));  // bf16: merged
+    EXPECT_FALSE(s.keeps_pristine("layers.2.proj.k"));
+    EXPECT_EQ(s.merge_modules(), std::vector<std::string>{"layers.2.proj.k"});
     EXPECT_TRUE(s.reports()[0].warnings.empty());
+    EXPECT_EQ(s.reports()[0].merged, 1);
+    EXPECT_EQ(s.reports()[0].side_branch, 2);
   }
   {
     // merge on a bf16 module: no warning, no pristine copy for an edit adapter's block module.

@@ -281,12 +281,18 @@ const PristineWeights::Entry& PristineWeights::entry(std::string_view module, bo
   fail("no pristine weights kept for '" + std::string(module) + "'");
 }
 
+void PristineWeights::restore_bf16(std::string_view module, std::uint16_t* dst, std::uint16_t* dst_bias) const {
+  const Entry& e = entry(module, false);
+  if (dst == nullptr || (dst_bias != nullptr) != !e.bias.empty()) fail("restore_bf16: destination does not match '" + std::string(module) + "'");
+  std::copy(e.w.begin(), e.w.end(), dst);
+  if (dst_bias != nullptr) std::copy(e.bias.begin(), e.bias.end(), dst_bias);
+}
+
 int PristineWeights::remerge_bf16(const LoraStack& stack, std::string_view module, std::uint16_t* dst,
                                   std::uint16_t* dst_bias, int threads) const {
   const Entry& e = entry(module, false);
   if (dst == nullptr || (dst_bias != nullptr) != !e.bias.empty()) fail("remerge_bf16: destination does not match '" + std::string(module) + "'");
-  std::copy(e.w.begin(), e.w.end(), dst);
-  if (dst_bias != nullptr) std::copy(e.bias.begin(), e.bias.end(), dst_bias);
+  restore_bf16(module, dst, dst_bias);
   return merge_bf16(stack, module, dst, e.n, e.k, dst_bias, threads);
 }
 

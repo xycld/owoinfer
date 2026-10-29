@@ -627,6 +627,50 @@ TEST(GpuControlMerges, FailedRebaseLeavesNoState) {
   EXPECT_EQ(bit_mismatches(plain, fresh_run(req)), 0u);
 }
 
+// The bf16 merges on the GPU give the host merge's bits, at load and in remerge_lora: a low-rank LoRA on
+// text_embedder.blocks.0.qkv (a module with a base bias) and one on two block GEMMs with lora_placement merge, then
+// both strengths changed (re-merged in place from the pristine copies), with every merge forced onto the host
+// (MossDit's test seam) and without.
+TEST(GpuControlMerges, DeviceMergeEqualsHostMerge) {
+  if (!have_e2e()) GTEST_SKIP() << "SFT bundle or control adapter not present";
+  const SyntheticLoras f;
+  testing::TempDir dir{"device_merge"};
+  const fs::path blocks = dir.path() / "blocks.safetensors";
+  {
+    std::vector<StTensor> t;
+    std::uint32_t seed = 21;
+    for (const char* m : {"layers.5.proj.o", "layers.17.proj.k"}) {
+      const std::string p = std::string("transformer.") + m;
+      t.push_back({p + ".lora_A.weight", WDType::kBF16, {8, kDim}, randn(8 * kDim, seed++, 0.05f)});
+      t.push_back({p + ".lora_B.weight", WDType::kBF16, {kDim, 8}, randn(8 * kDim, seed++, 0.05f)});
+    }
+    write_st(blocks, t);
+  }
+  pl::Request a = plain_request();
+  a.loras = {{f.s, 1.0f}, {blocks, 0.8f}};
+  a.lora_placement = lora::Placement::kMerge;
+  pl::Request b = a;
+  b.loras[0].strength = 0.5f;
+  b.loras[1].strength = -0.6f;
+  const auto run = [&](bool host) {
+    moss_dit::MossDit::set_host_merges_for_tests(host);
+    struct Reset {  // a throw must not leave every later test's merges on the host
+      ~Reset() { moss_dit::MossDit::set_host_merges_for_tests(false); }
+    } reset;
+    pl::Pipeline pipe;
+    std::vector<std::vector<float>> out;
+    out.push_back(pipe.generate(a).latents);
+    const pl::Result rb = pipe.generate(b);
+    EXPECT_EQ(rb.memory.dit_loads, 0) << "re-merged in place, host " << host;
+    out.push_back(rb.latents);
+    return out;
+  };
+  const auto device = run(false), host = run(true);
+  EXPECT_EQ(bit_mismatches(device[0], host[0]), 0u) << "at load";
+  EXPECT_EQ(bit_mismatches(device[1], host[1]), 0u) << "after the strength change";
+  EXPECT_GT(bit_mismatches(device[0], device[1]), device[0].size() / 2);
+}
+
 // A LoRA on a module the control also merges, toggled with the control and a strength change: every request equals
 // a fresh pipeline's, and no request after the first loads the DiT.
 TEST(GpuControlMerges, SharedModuleToggleMatchesFresh) {

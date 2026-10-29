@@ -481,14 +481,17 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
         t.n = tm->n;
         t.row0 = row0;
         // Placement (LoadOptions::placement): a low-rank block adapter goes to the side branch unless the placement
-        // merges it where its module's format allows.
+        // merges it where its module's format allows; the default merges a moss-edit-lora file's adapters on bf16
+        // modules (a GPU merge at load, no per-step cost) and keeps them on the side branch on every other format.
         const BaseFormat base = tm->block < 0             ? BaseFormat::kBf16
                                 : options.base_format     ? options.base_format(name)
                                 : options.int8_block_gemms ? BaseFormat::kInt8
                                                           : BaseFormat::kBf16;
         const bool branchable = t.kind == AdapterKind::kLowRank && tm->block >= 0 && !t.bias_diff;
         t.side_branch = branchable;
-        if (branchable && options.placement == Placement::kMerge) {
+        const bool merge = options.placement == Placement::kMerge ||
+                           (options.placement == Placement::kDefault && edit && base == BaseFormat::kBf16);
+        if (branchable && merge) {
           if (base != BaseFormat::kBf16 && base != BaseFormat::kInt8) {
             const char* stored = base == BaseFormat::kInt8Plain ? "int8_plain (INT8 without ConvRot)"
                                  : base == BaseFormat::kInt4    ? "int4_convrot"

@@ -341,6 +341,8 @@ class MossDit {
   static constexpr std::size_t kMaxMergeMemoBytes = std::size_t{1} << 30;
   // Test seam (internal): the memo's cap for every model of the process (default kMaxMergeMemoBytes).
   static void set_merge_memo_cap_for_tests(std::size_t bytes);
+  // Test seam (internal): every merge on the host (merge_on_device declines), for every model of the process.
+  static void set_host_merges_for_tests(bool host);
   const lora::SideBranches* lora() const { return lora_; }
 
   // Control adapters: every following forward embeds [latents | ext->extra] with ext's weight and bias instead of the
@@ -517,6 +519,11 @@ class MossDit {
   // staging = merge(pristine copy of `module`) for `stack`'s strengths, from `pristine` (host math only).
   static void remerge_into(const lora::PristineWeights& pristine, const lora::LoraStack& stack, const std::string& module,
                            const MergeTarget& t, MergeStaging& staging);
+  // merge_bf16 of `module` into a bf16 target in place on the GPU (lora_merge_device.h, the same bits), with scratch
+  // from the arena's free stack (a pinned host target's row chunks staged through it). False, with the target
+  // untouched, when the module has adapters the device merge does not take or the arena lacks the scratch: the caller
+  // then runs the host merge.
+  bool merge_on_device(const lora::LoraStack& stack, const std::string& module, const MergeTarget& t);
   std::unique_ptr<lora::PristineWeights> pristine_;
   bool no_pristine_ = false;  // some module merged at load without a pristine copy (can_remerge)
   std::vector<std::pair<std::string, MergeTarget>> merge_targets_;

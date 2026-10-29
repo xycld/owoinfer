@@ -1,6 +1,6 @@
 // LoRA side branch kernels: the LoRA-fused GEMMs (bit-identical to their plain counterparts with t = 0; bit-exact
 // math on exactly summable operands), the coefficient scaling, compute_t and the side-branch layout (shared fused-qkv
-// ranges, strengths, generations), and the INT8 path's unfused norm + rotate.
+// ranges, strengths, generations), the INT8 path's unfused norm + rotate, and the device merge of low-rank adapters.
 #include <gtest/gtest.h>
 
 #include <cuda_bf16.h>
@@ -22,6 +22,7 @@
 #include "kernels/lora/lora_kernels.h"
 #include "kernels/quant/quant.h"
 #include "models/lora/lora.h"
+#include "models/lora/lora_merge_device.h"
 #include "models/lora/side_branch.h"
 #include "test_lora_util.h"
 #include "test_util.h"
@@ -561,26 +562,147 @@ TEST(LoraSideBranch, SharedFusedQkvEqualsSeparateAdapters) {
   EXPECT_EQ(of, os);
 }
 
-// The INT8 path materializes the norm output for a site with a side branch: rms_norm_modulate_moss then
-// rotate_quantize must give the fused norm + rotate kernel's bits (same row count per call, as quant.h requires).
+// rms_norm_modulate_moss then rotate_quantize give the fused norm + rotate kernel's bits at every reduce width
+// (m = 1, 2, 7, 12 and >= 16 give 512, 256, 128, 64 and 32 threads per row at k = 3072; same row count per call, as
+// quant.h requires), and the fused kernel's optional norm output (the INT8 path's side-branch input) is
+// rms_norm_modulate_moss's, written at its row stride and nowhere else; storing it leaves q and the scales unchanged.
 TEST(LoraKernels, SplitNormRotateEqualsFused) {
   REQUIRE_GPU();
-  constexpr std::int64_t k = 3072;
+  constexpr std::int64_t k = 3072, ldy = k + 8;
   const U16 nw = rand_bf16(k, 61, 0.3f), sc = rand_bf16(k, 62, 0.2f), sh = rand_bf16(k, 63, 0.2f);
   Dev dnw(nw, mi::DType::kBF16, {k}), dsc(sc, mi::DType::kBF16, {k}), dsh(sh, mi::DType::kBF16, {k});
-  for (const std::int64_t m : {1LL, 37LL, 300LL, 4242LL}) {
+  for (const std::int64_t m : {1LL, 2LL, 7LL, 12LL, 37LL, 300LL, 4242LL}) {
     const U16 x = rand_bf16(static_cast<std::size_t>(m * k), 64 + static_cast<std::uint32_t>(m), 6.0f);
     Dev dx(x, mi::DType::kBF16, {m, k}), y(U16{}, mi::DType::kBF16, {m, k});
     Dev q1(std::vector<std::int8_t>{}, mi::DType::kI8, {m, k}), q2(std::vector<std::int8_t>{}, mi::DType::kI8, {m, k});
+    Dev q3(std::vector<std::int8_t>{}, mi::DType::kI8, {m, k});
     Dev s1(std::vector<float>{}, mi::DType::kF32, {m}), s2(std::vector<float>{}, mi::DType::kF32, {m});
+    Dev s3(std::vector<float>{}, mi::DType::kF32, {m});
+    Dev y3(U16(static_cast<std::size_t>(m * ldy), 0x7fc1), mi::DType::kBF16, {m, ldy});
     kernels::quant::rms_norm_modulate_rotate_quantize(dx.bf(), k, dnw.bf(), dsc.bf(), dsh.bf(), static_cast<std::int8_t*>(q1.t.data),
                                                       k, static_cast<float*>(s1.t.data), m, static_cast<int>(k), nullptr);
     kernels::rms_norm_modulate_moss(dx.t, dnw.t, dsc.t, dsh.t, y.t, nullptr);
     kernels::quant::rotate_quantize(y.bf(), k, static_cast<std::int8_t*>(q2.t.data), k, static_cast<float*>(s2.t.data), m,
                                     static_cast<int>(k), nullptr);
+    kernels::quant::rms_norm_modulate_rotate_quantize(dx.bf(), k, dnw.bf(), dsc.bf(), dsh.bf(), static_cast<std::int8_t*>(q3.t.data),
+                                                      k, static_cast<float*>(s3.t.data), m, static_cast<int>(k), nullptr,
+                                                      y3.bf(), ldy);
     MI_CUDA_CHECK(cudaDeviceSynchronize());
     EXPECT_EQ(q1.get<std::int8_t>(), q2.get<std::int8_t>()) << m << " rows";
     EXPECT_EQ(s1.get<float>(), s2.get<float>()) << m << " rows";
+    EXPECT_EQ(q3.get<std::int8_t>(), q1.get<std::int8_t>()) << m << " rows";
+    EXPECT_EQ(s3.get<float>(), s1.get<float>()) << m << " rows";
+    const U16 want = y.get<std::uint16_t>(), got = y3.get<std::uint16_t>();
+    std::size_t bad = 0;
+    for (std::int64_t r = 0; r < m; ++r) {
+      for (std::int64_t c = 0; c < ldy; ++c) {
+        const std::uint16_t g = got[static_cast<std::size_t>(r * ldy + c)];
+        bad += c < k ? g != want[static_cast<std::size_t>(r * k + c)] : g != 0x7fc1;
+      }
+    }
+    EXPECT_EQ(bad, 0u) << m << " rows";
+  }
+}
+
+// The device merge gives merge_bf16's bits: two files with three adapters on one module (ranks 8, 40 and 5: a rank
+// step boundary inside an adapter, a fused-qkv adapter's row offset on proj.k, an alpha), the weight on the device or
+// in pinned host memory with too little scratch for one chunk; strength 0 leaves the weight untouched and a
+// non-finite result throws.
+TEST(LoraKernels, DeviceMergeEqualsHostMerge) {
+  REQUIRE_GPU();
+  constexpr std::int64_t kD = 3072;
+  mi::testing::TempDir dir("lora_device_merge");
+  const auto low_rank = [](const std::string& p, std::int64_t n, std::int64_t k, std::int64_t r, std::uint32_t seed,
+                           float alpha) {
+    std::vector<StTensor> t{{p + ".lora_down.weight", DType::kBF16, {r, k}, randn(static_cast<std::size_t>(r * k), seed, 0.3f)},
+                            {p + ".lora_up.weight", DType::kF32, {n, r}, randn(static_cast<std::size_t>(n * r), seed + 1, 0.3f)}};
+    if (alpha >= 0) t.push_back({p + ".alpha", DType::kF32, {}, {alpha}});
+    return t;
+  };
+  std::vector<StTensor> a = low_rank("diffusion_model.layers.3.proj.qkv", 3 * kD, kD, 8, 11, 3.0f);
+  for (auto& x : low_rank("diffusion_model.layers.3.proj.k", kD, kD, 40, 13, -1)) a.push_back(x);
+  write_st(dir.path() / "a.safetensors", a);
+  write_st(dir.path() / "b.safetensors", low_rank("diffusion_model.layers.3.proj.k", kD, kD, 5, 17, 2.0f));
+  const LoraSpec specs[] = {{dir.path() / "a.safetensors", 0.7f}, {dir.path() / "b.safetensors", -1.3f}};
+  LoadOptions opt;
+  opt.placement = Placement::kMerge;
+  LoraStack s(specs, moss_dit_targets(), opt);
+  const std::string module = "layers.3.proj.k";
+  ASSERT_EQ(s.adapters_of(module).size(), 3u);
+  ASSERT_TRUE(device_mergeable(s, module));
+
+  const U16 base = rand_bf16(static_cast<std::size_t>(kD * kD), 19, 0.5f);
+  U16 want = base;
+  ASSERT_EQ(merge_bf16(s, module, want.data(), kD, kD), 3);
+  std::size_t changed = 0;
+  for (std::size_t i = 0; i < want.size(); ++i) changed += want[i] != base[i];
+  EXPECT_GT(changed, want.size() / 2);  // the deltas are not lost in the bf16 rounding
+
+  // Weight on the device, scratch for one chunk.
+  const std::size_t full = device_merge_full_scratch(s, module, false);
+  DeviceBuffer scratch(full);
+  {
+    Dev w(base, mi::DType::kBF16, {kD, kD});
+    EXPECT_EQ(merge_bf16_device(s, module, static_cast<std::uint16_t*>(w.t.data), kD, kD, false, scratch.get(), full,
+                                nullptr), 3);
+    EXPECT_EQ(w.get<std::uint16_t>(), want);
+  }
+  // Weight in pinned host memory, chunks of about 100 rows.
+  {
+    const std::size_t small = device_merge_min_scratch(s, module, true) + 70 * (53 * 4 + kD * 2);
+    std::uint16_t* pinned = nullptr;
+    MI_CUDA_CHECK(cudaMallocHost(&pinned, base.size() * 2));
+    std::copy(base.begin(), base.end(), pinned);
+    DeviceBuffer sb(small);
+    EXPECT_EQ(merge_bf16_device(s, module, pinned, kD, kD, true, sb.get(), small, nullptr), 3);
+    EXPECT_TRUE(std::equal(want.begin(), want.end(), pinned));
+    EXPECT_THROW(merge_bf16_device(s, module, pinned, kD, kD, true, sb.get(), device_merge_min_scratch(s, module, true) - 512,
+                                   nullptr), LoraError);
+    MI_CUDA_CHECK(cudaFreeHost(pinned));
+  }
+  // Exactly the minimum and exactly the full scratch, for both weight locations: one row tile per chunk at the
+  // minimum, every row in one chunk at full, one byte less than the minimum is too few; the merge is the same.
+  for (const bool host : {false, true}) {
+    const std::size_t lo = device_merge_min_scratch(s, module, host), hi = device_merge_full_scratch(s, module, host);
+    EXPECT_EQ(device_merge_chunk_rows(s, module, host, hi), kD) << host;
+    EXPECT_EQ(device_merge_chunk_rows(s, module, host, hi - 1), kD - 32) << host;
+    EXPECT_EQ(device_merge_chunk_rows(s, module, host, lo), 32) << host;
+    EXPECT_EQ(device_merge_chunk_rows(s, module, host, lo - 1), 0) << host;
+    for (const std::size_t bytes : {lo, hi}) {
+      DeviceBuffer sb(bytes);
+      std::uint16_t* wp = nullptr;
+      if (host) {
+        MI_CUDA_CHECK(cudaMallocHost(&wp, base.size() * 2));
+      } else {
+        MI_CUDA_CHECK(cudaMalloc(&wp, base.size() * 2));
+      }
+      MI_CUDA_CHECK(cudaMemcpy(wp, base.data(), base.size() * 2, cudaMemcpyDefault));
+      EXPECT_EQ(merge_bf16_device(s, module, wp, kD, kD, host, sb.get(), bytes, nullptr), 3) << host << " " << bytes;
+      U16 got(base.size());
+      MI_CUDA_CHECK(cudaMemcpy(got.data(), wp, got.size() * 2, cudaMemcpyDefault));
+      EXPECT_EQ(got, want) << host << " " << bytes;
+      MI_CUDA_CHECK(host ? cudaFreeHost(wp) : cudaFree(wp));
+    }
+  }
+  // Strength 0 everywhere: nothing to merge.
+  s.set_strength(0, 0.0f);
+  s.set_strength(1, 0.0f);
+  {
+    Dev w(base, mi::DType::kBF16, {kD, kD});
+    EXPECT_EQ(merge_bf16_device(s, module, static_cast<std::uint16_t*>(w.t.data), kD, kD, false, scratch.get(), full,
+                                nullptr), 0);
+    EXPECT_EQ(w.get<std::uint16_t>(), base);
+  }
+  // A result beyond the fp32 range (a row near the top of it plus a huge coefficient), as on the host.
+  s.set_strength(1, 1e38f);
+  {
+    U16 huge = base;
+    std::fill(huge.begin(), huge.begin() + kD, float_to_bf16(3.38e38f));
+    U16 host = huge;
+    EXPECT_THROW(merge_bf16(s, module, host.data(), kD, kD), LoraError);
+    Dev w(huge, mi::DType::kBF16, {kD, kD});
+    EXPECT_THROW(merge_bf16_device(s, module, static_cast<std::uint16_t*>(w.t.data), kD, kD, false, scratch.get(), full,
+                                   nullptr), LoraError);
   }
 }
 

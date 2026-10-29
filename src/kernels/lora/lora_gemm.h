@@ -17,9 +17,11 @@
 // [rows, cols + colsb] contiguous (the second range is optional: colsb = 0), other columns get no LoRA term. Two
 // ranges let fused-qkv adapters keep one shared range of t columns next to each slice's own adapters. Each slice must
 // cover whole threadblock tiles: row0 and rows multiples of 256 (or the slice ends at n). For the SiTU-GLU variants
-// b's rows are in the GEMM's column order (up_gate_gemm_row), as models/lora stores them.
+// b's rows are in the GEMM's column order (up_gate_gemm_row), as models/lora stores them, and SiTU's two bf16 factors
+// come from quant's tables (int8_gemm_situ_glu's: a lookup is the computation bit for bit; filled once per device,
+// which synchronizes the stream of the first call outside a capture, as there).
 // Operands otherwise as the plain variants (fused_gemm.h, quant.h). t: 16-byte aligned, ldt % 8 == 0; col0, cols
-// multiples of 8. No workspace, no host synchronization; graph-capturable. Invalid arguments throw
+// multiples of 8. No workspace, no other host synchronization; graph-capturable. Invalid arguments throw
 // std::invalid_argument.
 #pragma once
 

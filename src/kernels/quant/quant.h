@@ -57,9 +57,12 @@ void rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx, std::int8_t* q, s
 // input, and that order (threads per row) depends on m as well as k. A row's result is bit-exact only against a
 // reference norm over the same m rows: call it once per run the reference normalizes as one tensor (one DiT block
 // call), not in row chunks of a different size.
+// y (optional): the bf16 norm output is also stored there (row stride ldy, 16-byte aligned, ldy % 8 == 0, not
+// overlapping x), bit for bit kernels::rms_norm_modulate_moss's: one kernel for a GEMM whose LoRA side branch reads it.
 void rms_norm_modulate_rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx, const __nv_bfloat16* norm_weight,
                                        const __nv_bfloat16* mod_scale, const __nv_bfloat16* mod_shift, std::int8_t* q,
-                                       std::int64_t ldq, float* scale, std::int64_t m, int k, cudaStream_t stream);
+                                       std::int64_t ldq, float* scale, std::int64_t m, int k, cudaStream_t stream,
+                                       __nv_bfloat16* y = nullptr, std::int64_t ldy = 0);
 
 // Largest K the INT8 GEMMs take: the int32 accumulator cannot overflow (see above).
 inline constexpr std::int64_t kMaxInt8GemmK = 131071;
