@@ -1025,6 +1025,11 @@ struct Pipeline::Impl {
   };
   CallModels setup_models(const Request& req, Result& r);
 
+  // The loaded DiT (of the call's source) switched to the call's merged adapters `merge_key` (e.g. a control adapter,
+  // with its merged text-refiner adapters, toggled on or off): in place from the pristine copies when no block module
+  // is newly merged, the same bits as a reload without its cost. A failure drops the DiT (the next load starts clean).
+  void switch_merges(const std::string& merge_key, Timings& tm);
+
   // The DiT side of a call (setup_dit_call): the machine profile (into r.hardware), the block path, the call's fused
   // route (one snapshot sizes its workspace and runs every step), the attention and the compute config.
   struct CallDit {

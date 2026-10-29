@@ -913,6 +913,28 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
   return {&b, &src, &tes, &vs, ctl, merge_key};
 }
 
+void Pipeline::Impl::switch_merges(const std::string& merge_key, Timings& tm) {
+  Impl& m = *this;
+  const auto t0m = Clock::now();
+  // The stack and its strengths name the merged bits: switching back to them later stores the DiT's kept copy.
+  std::string memo_key;
+  if (!merge_key.empty()) {
+    memo_key = merge_key;
+    for (int i = 0; i < m.lora_stack->files(); ++i) {
+      char strength[32];
+      std::snprintf(strength, sizeof(strength), "|%a", static_cast<double>(m.lora_stack->strength(i)));
+      memo_key += strength;
+    }
+  }
+  try {
+    if (m.dit->rebase_merges(merge_key.empty() ? nullptr : m.lora_stack.get(), memo_key)) m.dit_merge_key = merge_key;
+  } catch (...) {
+    m.drop_dit_after_failed_merge();
+    throw;
+  }
+  tm.lora_merge_s += since(t0m);
+}
+
 Pipeline::Impl::CallDit Pipeline::Impl::setup_dit_call(const DitSource& src, Result& r) {
   r.hardware = hardware(*src.index);
   CallDit d;
@@ -1318,29 +1340,8 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     r.hires.strength = req.hires.strength;
   }
   const bool need_dit = sched1.num_steps() > 0 || (hires && sched2.num_steps() > 0);
-  // A loaded DiT whose merged adapters differ from this request's (e.g. a control adapter, with its merged text-refiner
-  // adapters, toggled on or off): switched in place from the pristine copies when no block module is newly merged,
-  // the same bits as a reload without its cost. A failure drops the DiT (the next load starts clean).
-  if (need_dit && m.dit && m.dit_src == &src && m.dit_merge_key != merge_key) {
-    const auto t0m = Clock::now();
-    // The stack and its strengths name the merged bits: switching back to them later stores the DiT's kept copy.
-    std::string memo_key;
-    if (!merge_key.empty()) {
-      memo_key = merge_key;
-      for (int i = 0; i < m.lora_stack->files(); ++i) {
-        char strength[32];
-        std::snprintf(strength, sizeof(strength), "|%a", static_cast<double>(m.lora_stack->strength(i)));
-        memo_key += strength;
-      }
-    }
-    try {
-      if (m.dit->rebase_merges(merge_key.empty() ? nullptr : m.lora_stack.get(), memo_key)) m.dit_merge_key = merge_key;
-    } catch (...) {
-      m.drop_dit_after_failed_merge();
-      throw;
-    }
-    tm.lora_merge_s += since(t0m);
-  }
+  // A loaded DiT whose merged adapters differ from this request's (Impl::switch_merges).
+  if (need_dit && m.dit && m.dit_src == &src && m.dit_merge_key != merge_key) m.switch_merges(merge_key, tm);
   // Control images are encoded once per pass size (not without a sampling step).
   const bool ctl_encode = ctl != nullptr && !req.control.images.empty() && need_dit;
   const bool need_encoder = img2img || hires || ctl_encode;
