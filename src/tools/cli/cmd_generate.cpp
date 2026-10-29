@@ -54,6 +54,7 @@ constexpr const char* kUsage =
     "                           [--cfg-truncation X] [--step-cache off|fbcache] [--step-cache-threshold X]\n"
     "                           [--control <file> [--control-scale S] [--control-image <kind>=<png|jpg>\n"
     "                            [--control-strength X] [--control-start X] [--control-end X]]...]\n"
+    "                           [--reference <png|jpg>]... [--reference-max-edge N]\n"
     "Flags override values read from --params. At least one of -o / --latent-out is required;\n"
     "without -o the VAE decode is skipped. --vram-budget caps the process's GPU memory (CUDA context included).\n"
     "Each --then-prompt generates one more image in the same engine session (same settings, warm models and\n"
@@ -101,7 +102,12 @@ constexpr const char* kUsage =
     "adapter's kinds (e.g. color=map.png, depth=depth.png: near = white), brought to the output size with --resize and\n"
     "VAE-encoded; the following --control-strength (default 1, 0..10) scales it and --control-start / --control-end\n"
     "(default 0 / 1) limit it to the steps i with start <= i / steps < end (e.g. 0.5 for 3D-render inputs). A kind\n"
-    "without an image gets no control.\n";
+    "without an image gets no control.\n"
+    "--reference gives a reference image of an edit adapter (Moss-Image-Edit: pass its file with --lora), in order,\n"
+    "the source image first (at most 4): each is fit within --reference-max-edge (default 512, floored to a multiple\n"
+    "of 16; the adapter was trained at 256), each side rounded to 16, never upscaled, and VAE-encoded once; every\n"
+    "row then attends to the reference tokens (at most 16384 in all). Not with --slg-scale > 0; --skip-layers (the\n"
+    "edit workflow's 22) skips only the rows, not the references.\n";
 
 std::atomic<bool> g_cancel{false};
 // First Ctrl-C: cancel (within a text-encoder layer, DiT block or decode band). A second one terminates (default action restored).
@@ -253,6 +259,7 @@ int cmd_generate(const std::vector<std::string>& args) {
   bool have_prompt = false, quiet = false, size_given = false;
   fs::path init_image, mask;
   std::vector<fs::path> control_images;  // per --control-image, in order
+  std::vector<fs::path> reference_images;  // per --reference, in order
   std::optional<double> strength;
   std::string hires;
   bool distill = false, distill_dataspace = false;
@@ -394,6 +401,8 @@ int cmd_generate(const std::vector<std::string>& args) {
       else if (f == "--step-cache") req.accel.step_cache = pipeline::accel::parse_step_cache(v);
       else if (f == "--step-cache-threshold") req.accel.step_cache_threshold = to_double(f, v);
       else if (f == "--quiet") quiet = true;
+      else if (f == "--reference") reference_images.push_back(path_arg(v, f));
+      else if (f == "--reference-max-edge") req.references.max_edge = to_int32(f, v);
       else throw std::invalid_argument("unknown flag " + f);
     }
   } catch (const std::invalid_argument& e) {
@@ -468,6 +477,9 @@ int cmd_generate(const std::vector<std::string>& args) {
     for (std::size_t i = 0; i < control_images.size(); ++i) {
       req.control.images[i].image = std::make_shared<const pipeline::Image>(pipeline::load_image(control_images[i], 3));
     }
+    for (const fs::path& p : reference_images) {
+      req.references.images.push_back(std::make_shared<const pipeline::Image>(pipeline::load_image(p, 3)));
+    }
   } catch (const std::invalid_argument& e) {
     std::cerr << "moss-infer generate: " << e.what() << "\n" << kUsage;
     return 2;
@@ -514,6 +526,13 @@ int cmd_generate(const std::vector<std::string>& args) {
       pipeline::write_png_rgb8(png, r.rgb, r.width, r.height, text);
     }
     for (const std::string& w : r.lora_warnings) std::fprintf(stderr, "warning: LoRA %s\n", w.c_str());
+    for (const std::string& w : r.reference_warnings) std::fprintf(stderr, "warning: %s\n", w.c_str());
+    if (r.references.count > 0 && !quiet) {
+      std::fprintf(stderr, "references: %d image(s), %lld tokens, cache %.0f MiB; encode %.2f s, prefill %.2f s (%d pass%s)\n",
+                   r.references.count, static_cast<long long>(r.references.tokens),
+                   static_cast<double>(r.references.cache_bytes) / (1 << 20), r.timings.reference_encode_s,
+                   r.timings.reference_prefill_s, r.references.prefills, r.references.prefills == 1 ? "" : "es");
+    }
     if (!r.control.adapter.empty() && !quiet) {
       std::fprintf(stderr, "control: %s (%d LoRA adapters: %d side branch, %d merged), %d image(s) encoded\n",
                    r.control.lora.file.c_str(), r.control.lora.adapters, r.control.lora.side_branch, r.control.lora.merged,

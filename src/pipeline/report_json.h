@@ -31,6 +31,11 @@ struct ReportParts {
 };
 ReportParts report_parts(const Request& q, const Result& r, std::string_view latent_path);
 
+// The report's "references" object (reference images: count, max_edge, sizes, tokens, cache_bytes, prefills,
+// encode_schedule, warnings; a count-0 object with the warnings when an edit adapter ran without them), or "" when
+// neither applies (the report then has no "references" key).
+std::string references_json(const Request& q, const Result& r);
+
 // head + json_escape(image) + tail.
 std::string report_fields(const Request& q, const Result& r, std::string_view image, std::string_view latent);
 

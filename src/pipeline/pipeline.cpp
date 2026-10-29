@@ -215,6 +215,18 @@ std::size_t denoise_stack_bytes(const DenoiseStack& d, moss_dit::BlockPath path,
   // A latent preview: the previous latents, the x0 estimate, the preview's scratch and its RGB image.
   const std::size_t preview_bytes =
       d.preview ? 2 * lat + align_up(latent_preview::workspace_bytes(lh, lw)) + align_up(image_bytes_of(d.height, d.width)) : 0;
+  if (d.ref_tokens > 0) {
+    // Reference images: the pass's key / value cache below the loop, and before the loop the prefill over the
+    // uploaded reference latents; the forwards read the cache through their slots.
+    const std::size_t cache = align_up(moss_dit::MossDit::reference_cache_bytes(d.ref_tokens));
+    const std::size_t ref_latents = static_cast<std::size_t>(d.ref_tokens) * moss_dit::kLatentChannels * sizeof(float) +
+                                    static_cast<std::size_t>(d.ref_images) * runtime::kArenaAlign;
+    const std::size_t ref_forward = moss_dit::MossDit::workspace_bytes(lh, lw, d.rows, path, config, &route, d.ref_tokens);
+    const std::size_t prefill = moss_dit::MossDit::prefill_workspace_bytes(d.ref_tokens, path, config, &route);
+    return refined_bytes + std::max(refine_need, latents + control_bytes + preview_bytes + cache +
+                                                     std::max({d.loop_bytes + ref_forward, ref_latents + prefill,
+                                                               d.from_image ? lat : std::size_t{0}}));
+  }
   return refined_bytes + std::max(refine_need, latents + control_bytes + preview_bytes +
                                                    std::max(d.loop_bytes + forward_bytes, d.from_image ? lat : 0));
 }
@@ -292,6 +304,42 @@ std::vector<int> parse_layer_list(std::string_view text) {
     if (comma == std::string_view::npos) return out;
     pos = comma + 1;
   }
+}
+
+ReferenceSize reference_size(int width, int height, int max_edge) {
+  // Python: limit = max_edge // 16 * 16; scale = min(1.0, limit / max(w, h)); int(math.floor(v * scale / 16 + 0.5)) * 16.
+  const int limit = max_edge / 16 * 16;
+  const double scale = std::min(1.0, static_cast<double>(limit) / static_cast<double>(std::max(width, height)));
+  const auto aligned = [&](int v) {
+    return std::min(limit, std::max(16, static_cast<int>(std::floor(static_cast<double>(v) * scale / 16 + 0.5)) * 16));
+  };
+  return {aligned(width), aligned(height)};
+}
+
+Image reference_pixels(const Image& image, int max_edge) {
+  Image rgb;
+  rgb.width = image.width;
+  rgb.height = image.height;
+  rgb.channels = 3;
+  rgb.name = image.name;
+  const std::size_t n = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
+  if (image.channels == 3) {
+    rgb.pixels = image.pixels;
+  } else {
+    // PIL convert("RGB"): L replicated, RGBA's alpha dropped (no compositing).
+    rgb.pixels.resize(n * 3);
+    for (std::size_t i = 0; i < n; ++i) {
+      for (int c = 0; c < 3; ++c) {
+        rgb.pixels[3 * i + static_cast<std::size_t>(c)] =
+            image.pixels[image.channels == 1 ? i : 4 * i + static_cast<std::size_t>(c)];
+      }
+    }
+  }
+  const ReferenceSize s = reference_size(image.width, image.height, max_edge);
+  if (s.width == rgb.width && s.height == rgb.height) return rgb;
+  Image out = resize_lanczos(rgb, s.width, s.height);
+  out.name = image.name;
+  return out;
 }
 
 void validate(const Request& r) {
@@ -397,6 +445,37 @@ void validate(const Request& r) {
       throw std::invalid_argument(what + ": the strength must be between 0 and 10.");
     }
     if (!(0 <= c.start && c.start <= c.end && c.end <= 1)) throw std::invalid_argument(what + ": require 0 <= start <= end <= 1.");
+  }
+  // Reference images (the edit layout).
+  if (r.references.enabled()) {
+    const Request::References& refs = r.references;
+    if (refs.images.size() > static_cast<std::size_t>(kMaxReferenceImages)) {
+      throw std::invalid_argument("At most " + std::to_string(kMaxReferenceImages) + " reference images.");
+    }
+    if (refs.max_edge < 16 || refs.max_edge > 2048) {
+      throw std::invalid_argument("The reference images' max edge must be between 16 and 2048.");
+    }
+    if (r.slg_scale > 0) {
+      throw std::invalid_argument("Reference images do not work with an SLG row (slg_scale > 0); use uncond_skip_layers "
+                                  "(SLG-simple), as the edit workflow does.");
+    }
+    std::int64_t tokens = 0;
+    for (std::size_t i = 0; i < refs.images.size(); ++i) {
+      const std::string what = "Reference image " + std::to_string(i + 1);
+      const Image* im = refs.images[i].get();
+      if (im == nullptr) throw std::invalid_argument(what + " is missing.");
+      if (im->channels != 1 && im->channels != 3 && im->channels != 4) {
+        throw std::invalid_argument(what + " must have 1, 3 or 4 channels (grayscale, RGB or RGBA).");
+      }
+      check_image(*im, im->channels, what.c_str());
+      const ReferenceSize s = reference_size(im->width, im->height, refs.max_edge);
+      tokens += std::int64_t{s.width / 16} * (s.height / 16);
+    }
+    if (tokens > kMaxReferenceTokens) {
+      throw std::invalid_argument("The reference images take " + std::to_string(tokens) + " tokens at max edge " +
+                                  std::to_string(refs.max_edge) + "; at most " + std::to_string(kMaxReferenceTokens) +
+                                  " (lower the max edge or use fewer images).");
+    }
   }
   accel::validate(r.accel);
 }
@@ -562,6 +641,13 @@ GenerationMetadata generation_metadata(const Request& q, const Result& r) {
                                                     num(c.start) + "-" + num(c.end));
     }
     if (!q.control.images.empty() && !image_used && !q.hires.enabled()) m.extra.emplace_back("resize", resize_mode_name(q.resize));
+  }
+  // Reference images (only when they ran).
+  if (r.references.count > 0) {
+    std::string refs;
+    for (const auto& im : q.references.images) refs += (refs.empty() ? "" : "; ") + image_label(*im);
+    m.extra.emplace_back("references", refs);
+    m.extra.emplace_back("reference_max_edge", std::to_string(q.references.max_edge));
   }
   // P6b accelerators that changed the image.
   if (q.accel.cfg_truncation < 1.0 && q.cfg != 1.0) m.extra.emplace_back("cfg_truncation", num(q.accel.cfg_truncation));
@@ -963,6 +1049,8 @@ Pipeline::Impl::Planned Pipeline::Impl::plan_call(const CallModels& models, cons
   in.request.text_lengths = c.text_lengths;
   in.request.steps = c.steps;
   in.request.rows_per_step = c.rows_per_step;
+  in.request.reference_tokens = c.reference_tokens;
+  in.request.reference_prefills = c.reference_prefills;
   in.request.te_lengths = te_lengths;
   in.request.decode = need_decoder;
   in.request.te_cached = te_lengths.empty();
@@ -1288,6 +1376,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
         m.dit->set_input_extension(nullptr);  // a pass's control latents live on its stack
         m.dit->set_step_cache(nullptr);       // a pass's step cache too (run_pass also clears it)
         m.dit->set_linear_input_hook({});     // and the call's calibration hook
+        m.dit->set_references(nullptr);       // a pass's reference cache too (run_pass also clears it)
       }
       if (m.vae) m.vae->set_cancel(nullptr);
     }
@@ -1370,7 +1459,17 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   if (need_dit && m.dit && m.dit_src == &src && m.dit_merge_key != merge_key) m.switch_merges(merge_key, tm);
   // Control images are encoded once per pass size (not without a sampling step).
   const bool ctl_encode = ctl != nullptr && !req.control.images.empty() && need_dit;
-  const bool need_encoder = img2img || hires || ctl_encode;
+  // Reference images: encoded once per request (not without a sampling step), their keys and values once per pass.
+  const bool refs_on = req.references.enabled() && need_dit;
+  std::vector<ReferenceSize> ref_sizes;
+  std::int64_t ref_tokens = 0;
+  if (refs_on) {
+    for (const auto& im : req.references.images) {
+      ref_sizes.push_back(reference_size(im->width, im->height, req.references.max_edge));
+      ref_tokens += std::int64_t{ref_sizes.back().width / 16} * (ref_sizes.back().height / 16);
+    }
+  }
+  const bool need_encoder = img2img || hires || ctl_encode || refs_on;
   const EncoderSource* enc_src = need_encoder ? &m.encoder_source(b, tm.index_load_s) : nullptr;
   if (enc_src != nullptr) r.vae_encoder_source = util::path_utf8(enc_src->file);
   r.height = H1;
@@ -1439,6 +1538,8 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     d.control_groups = ctl != nullptr ? ctl->groups() : 0;
     d.preview = static_cast<bool>(control.on_preview);
     d.from_image = from_image;
+    d.ref_tokens = ref_tokens;
+    d.ref_images = static_cast<int>(ref_sizes.size());
     return denoise_stack_bytes(d, block_path, dit_call.config, route);
   };
   std::size_t denoise_need = 0;
@@ -1449,6 +1550,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   std::size_t encode_need = 0;
   if (img2img || (ctl_encode && sched1.num_steps() > 0)) encode_need = encode_need_of(H1, W1);
   if (hires) encode_need = std::max(encode_need, encode_need_of(H2, W2));
+  for (const ReferenceSize& s : ref_sizes) encode_need = std::max(encode_need, encode_need_of(s.height, s.width));
   // The decodes that run: the hires fix's first pass (for the upscale) and the final one; the plan sizes the larger.
   int dec_h = 0, dec_w = 0;
   const auto consider_decode = [&](int H, int W) {
@@ -1476,6 +1578,10 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     pc.steps = steps * model_calls_per_step(req.sampler);
   }
   pc.rows_per_step = 1 + (g.do_cfg() ? 1 : 0) + (g.slg_scale > 0 && g.slg_layers.any() ? 1 : 0);
+  if (refs_on) {
+    pc.reference_tokens = ref_tokens;
+    pc.reference_prefills = (sched1.num_steps() > 0 ? 1 : 0) + (hires && sched2.num_steps() > 0 ? 1 : 0);
+  }
   pc.te_lengths = te_lengths;
   pc.need_dit = need_dit;
   pc.encoder = enc_src;
@@ -1497,6 +1603,8 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     pc.host_buffers += req.control.images.size() * (std::max(latent_bytes_of(H1, W1), latent_bytes_of(H2, W2)) +
                                                      std::max(image_bytes_of(H1, W1), image_bytes_of(H2, W2)));
   }
+  // Reference images: each sized RGB copy and its latent.
+  for (const ReferenceSize& s : ref_sizes) pc.host_buffers += latent_bytes_of(s.height, s.width) + image_bytes_of(s.height, s.width);
   // Throws planner::BudgetError before any heavy work.
   const Impl::Planned planned = m.plan_call(models, pc, block_path, r);
   const bool kept = planned.kept, drop_resident = planned.drop_resident;
@@ -1519,6 +1627,33 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     r.plan.explanation += "\nImage: " + what + "; VAE encoder from " + r.vae_encoder_source + ".";
   }
   if (ctl != nullptr) Impl::explain_control(req.control, r);
+  if (refs_on) {
+    r.references.count = static_cast<int>(ref_sizes.size());
+    r.references.sizes = ref_sizes;
+    r.references.tokens = ref_tokens;
+    r.references.cache_bytes = moss_dit::MossDit::reference_cache_bytes(ref_tokens);
+    std::string sizes;
+    for (const ReferenceSize& s : ref_sizes) sizes += (sizes.empty() ? "" : ", ") + std::to_string(s.width) + "x" + std::to_string(s.height);
+    char cache[32];
+    std::snprintf(cache, sizeof cache, "%.0f MiB", static_cast<double>(r.references.cache_bytes) / (1 << 20));
+    r.plan.explanation += "\nReferences: " + std::to_string(ref_sizes.size()) + " image" + (ref_sizes.size() > 1 ? "s" : "") +
+                          " (" + sizes + ", max edge " + std::to_string(req.references.max_edge) + "), " +
+                          std::to_string(ref_tokens) + " tokens: their keys and values (" + cache +
+                          ") computed once per pass, every row attending to them; VAE encoder from " +
+                          r.vae_encoder_source + ".";
+    bool edit_adapter = false;
+    for (const lora::FileReport& f : r.loras) edit_adapter = edit_adapter || f.format == "moss-edit-lora";
+    if (!edit_adapter) {
+      r.reference_warnings.push_back("reference images without a moss-edit-lora adapter: the base model was not trained "
+                                     "to use them");
+    }
+  } else {
+    for (const lora::FileReport& f : r.loras) {
+      if (f.format == "moss-edit-lora") {
+        r.reference_warnings.push_back(f.file + " is an edit adapter (moss-edit-lora) used without reference images");
+      }
+    }
+  }
   const planner::ExecutionPlan& plan = r.plan;
   if (m.cache) m.cache->set_max_bytes(plan.cache.host_bytes);
   // A DiT's merge memo (a control adapter's switch-back bits) goes when the host is tight (merge_memo_unaffordable). It
@@ -1657,6 +1792,25 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
       return finish();
     }
   }
+  // Reference images: sized and encoded once (their latents serve every pass), before the DiT load as img2img's.
+  std::vector<std::vector<float>> ref_lat;
+  if (refs_on) {
+    const auto te = Clock::now();
+    for (const auto& im : req.references.images) {
+      const auto ti = Clock::now();
+      const Image px = reference_pixels(*im, req.references.max_edge);
+      tm.image_ops_s += since(ti);
+      PassReport enc;
+      ref_lat.push_back(m.encode_image(*enc_src, px, enc, tm));
+      r.references.encode_schedule += (r.references.encode_schedule.empty() ? "" : "; ") + enc.encode_schedule;
+      if (cancel_requested()) break;
+    }
+    tm.reference_encode_s = since(te);
+    if (cancel_requested()) {
+      r.cancelled = true;
+      return finish();
+    }
+  }
   if (need_dit && !prepare_dit()) return finish();
 
   // 3. Sampling passes: the text refiner once per row, then the sampling loop at H x W over `sched`, from the seeded
@@ -1729,6 +1883,38 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
       m.dit->set_input_extension(nullptr);
     }
     MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+    // Reference images: this pass's key / value cache (the stack below the loop) from one prefill, read by every forward
+    // of the pass; the DiT drops the pointer however the pass ends.
+    struct ReferenceReset {
+      moss_dit::MossDit* dit = nullptr;
+      ~ReferenceReset() {
+        if (dit != nullptr) dit->set_references(nullptr);
+      }
+    } reference_reset;
+    moss_dit::RefKv ref_kv;
+    if (!ref_lat.empty()) {
+      ref_kv.kv = m.arena->alloc_tensor(DType::kBF16, {moss_dit::kLayers, ref_tokens, 2 * moss_dit::kDim});
+      const auto tp = Clock::now();
+      try {
+        runtime::StackScope upload(*m.arena);
+        std::vector<Tensor> lat;
+        for (std::size_t i = 0; i < ref_lat.size(); ++i) {
+          lat.push_back(m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, ref_sizes[i].height / 16,
+                                                            ref_sizes[i].width / 16}));
+          MI_CUDA_CHECK(cudaMemcpyAsync(lat.back().data, ref_lat[i].data(), lat.back().nbytes(), cudaMemcpyHostToDevice, stream));
+        }
+        m.dit->prefill_references(lat, ref_kv, stream);
+        MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+      } catch (const moss_dit::Cancelled&) {
+        tm.reference_prefill_s += since(tp);
+        r.cancelled = true;
+        return false;
+      }
+      tm.reference_prefill_s += since(tp);
+      ++r.references.prefills;
+      m.dit->set_references(&ref_kv);
+      reference_reset.dit = m.dit.get();
+    }
 
     // Streaming diagnostics per step: the provider's running totals (read after the step's synchronization), added to
     // the earlier passes' totals.
@@ -1876,7 +2062,8 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   }
   // Compute and streaming rates from a single pass at one size (a hires fix's passes mix sizes).
   // Not from accelerated steps (P6b: cached / truncated steps are no measure of the DiT's rate).
-  if (!hires && sched1.num_steps() > 0 && !req.accel.active(g.do_cfg())) m.learn_from_denoise(r);
+  // Not from reference requests either (their prefill and extra attention are no measure of the plain step).
+  if (!hires && sched1.num_steps() > 0 && !req.accel.active(g.do_cfg()) && !refs_on) m.learn_from_denoise(r);
 
   // 5. Hires fix: decode the first pass, upscale it in pixel space, encode it at the target size, and refine it there.
   if (hires) {

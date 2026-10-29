@@ -164,7 +164,32 @@ struct Request {
   // P6b opt-in accelerators (pipeline/accel/accel.h): CFG truncation and step caching, lossy and off by default. The
   // tier is resolved as without them. They apply to each sampling pass (a hires fix's too).
   accel::Options accel;
+  // Reference images (the edit layout of Moss-Image-Edit adapters, "index_timestep_zero_text_start" as in ComfyUI PR
+  // #17296; moss_dit::RefKv): each image is converted like PIL convert("RGB") (gray replicated, alpha dropped), sized
+  // by the training rule (reference_size, PIL Lanczos) and VAE-encoded (posterior mean, normalized: img2img's z0) once
+  // per request; each sampling pass then computes every block's reference keys and values once (the prefill, at
+  // t = 0), and every row (cond and uncond) attends to its own tokens plus all reference tokens. An uncond row's
+  // skipped layers skip only the row: the reference keys are computed without skips (ComfyUI's cached path). At most
+  // kMaxReferenceImages images and kMaxReferenceTokens tokens (Σ (h/16)(w/16) of the sized images); not with an SLG row
+  // (slg_scale > 0). Meant with a moss-edit-lora adapter in `loras` (Result warns otherwise). Empty: none, and nothing
+  // of this runs.
+  struct References {
+    std::vector<std::shared_ptr<const Image>> images;  // in order (the source image first)
+    int max_edge = 512;  // [16, 2048], floored to a multiple of 16; the training used 256, the authors' workflow 512
+    bool enabled() const { return !images.empty(); }
+  } references;
 };
+
+inline constexpr int kMaxReferenceImages = 4;
+inline constexpr std::int64_t kMaxReferenceTokens = 16384;  // moss_dit::kMaxReferenceTokens
+// Moss-Image-Edit's reference sizing (moss_edit/processing.py resize_image): limit = max_edge // 16 * 16,
+// scale = min(1, limit / max(width, height)), each side min(limit, max(16, floor(side * scale / 16 + 0.5) * 16)).
+struct ReferenceSize {
+  int width = 0, height = 0;
+};
+ReferenceSize reference_size(int width, int height, int max_edge);
+// A reference image as the VAE encodes it: RGB, at reference_size (PIL convert("RGB") then Image.resize(LANCZOS)).
+Image reference_pixels(const Image& image, int max_edge);
 
 // Throws std::invalid_argument with the official app's wording where it has one.
 void validate(const Request& request);
@@ -276,6 +301,10 @@ struct Timings {
   double vae_encoder_load_s = 0;
   double encode_s = 0;
   double image_ops_s = 0;
+  // Reference images (Request::references; 0 without): their encodes (within the VAE encoder's phase, as img2img's)
+  // and every pass's prefill (before its first step; not in denoise_s or step_s).
+  double reference_encode_s = 0;
+  double reference_prefill_s = 0;
   double total_s = 0;
   std::vector<double> step_s;  // every sampling step, both passes of a hires fix
 };
@@ -415,6 +444,18 @@ struct Result {
     int encodes = 0;
     std::string encode_schedule;  // "untiled" or the tile plans, per encode
   } control;
+  // Reference images (Request::references; count 0: none, and front ends then report nothing of it): the sized images,
+  // their tokens, the per-pass key / value cache and how often it was computed, the encodes' tilings, and what the
+  // user should know (no edit adapter loaded, an edit adapter without references).
+  struct ReferenceReport {
+    int count = 0;
+    std::vector<ReferenceSize> sizes;
+    std::int64_t tokens = 0;
+    std::size_t cache_bytes = 0;
+    int prefills = 0;
+    std::string encode_schedule;
+  } references;
+  std::vector<std::string> reference_warnings;
   DitStreamStats dit_stream;
   DitLoadReport dit_load;
   // P6b: what the accelerators did (CFG-truncated steps, step-cache calls and reuses), and what the user should know

@@ -1,0 +1,449 @@
+// Edit adapters' reference images (Moss-Image-Edit, moss_dit::RefKv):
+//   - the reference RoPE table against the image table (golden-tested against the official _RoPE): every reference row
+//     is the image rows' arithmetic with the axis-0 coordinate i + 1 (= the text rows' axis-1 values at position i + 1);
+//   - the DiT against ComfyUI's implementation (PR #17296, tools/reference/edit_oracle.py) on the oracle's first step:
+//     the reference keys / values of blocks 0, 21 and 41 and both CFG calls' velocities, gated against the no-reference
+//     difference between the two implementations;
+//   - the reference path's own invariants, bit for bit: a row's output does not depend on the other row of its forward,
+//     set_references(nullptr) restores the no-reference forward, and the op-by-op prefill equals the fused one.
+// The DiT tests need the oracle's tensors as .npy (MOSS_EDIT_ORACLE: x, ctx_{cond,uncond}, out_{cond,uncond}[_noref],
+// kv_{0,21,41}, ref_latent_in), the SFT bf16 DiT file (MOSS_EDIT_DIT) and the chinoll adapter (MOSS_EDIT_LORA); they
+// skip without them.
+#include <gtest/gtest.h>
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <memory>
+#include <span>
+#include <string>
+#include <vector>
+
+#include "core/cuda_check.h"
+#include "core/tensor.h"
+#include "kernels/basic/rope.h"
+#include "models/flux2_vae_encoder/flux2_vae_encoder.h"
+#include "models/lora/lora.h"
+#include "models/lora/side_branch.h"
+#include "models/moss_dit/moss_dit.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/pipeline_image.h"
+#include "runtime/device_arena.h"
+#include "runtime/stream_set.h"
+#include "util/npy.h"
+
+namespace {
+
+namespace fs = std::filesystem;
+namespace md = mi::moss_dit;
+using mi::Tensor;
+
+std::vector<std::uint16_t> download_u16(const Tensor& t) {
+  std::vector<std::uint16_t> h(static_cast<std::size_t>(t.numel()));
+  MI_CUDA_CHECK(cudaMemcpy(h.data(), t.data, h.size() * 2, cudaMemcpyDeviceToHost));
+  return h;
+}
+std::vector<float> download_f32(const Tensor& t) {
+  std::vector<float> h(static_cast<std::size_t>(t.numel()));
+  MI_CUDA_CHECK(cudaMemcpy(h.data(), t.data, h.size() * 4, cudaMemcpyDeviceToHost));
+  return h;
+}
+float from_bf16(std::uint16_t b) {
+  const std::uint32_t u = static_cast<std::uint32_t>(b) << 16;
+  float v = 0;
+  std::memcpy(&v, &u, sizeof(v));
+  return v;
+}
+std::uint16_t to_bf16(float v) {
+  std::uint32_t u = 0;
+  std::memcpy(&u, &v, sizeof(u));
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return static_cast<std::uint16_t>(u >> 16);
+}
+
+struct DevTensor {
+  mi::DeviceBuffer buf;
+  Tensor t;
+  DevTensor(mi::DType dt, std::initializer_list<std::int64_t> shape) {
+    t = Tensor::view(nullptr, dt, mi::Device::kCUDA, shape);
+    buf = mi::DeviceBuffer(std::max<std::size_t>(t.nbytes(), 1));
+    t.data = buf.get();
+  }
+};
+
+TEST(GpuEditReferences, RopeTableIsTheImageArithmeticOnAxisZero) {
+  for (const auto& [h, w] : {std::pair{32, 24}, std::pair{7, 5}, std::pair{1, 9}}) {
+    const std::int64_t n = std::int64_t{h} * w;
+    for (const int index : {0, 1, 3}) {
+      // Image rows of the same grid (axes 2, 3; axis 0 is 0) and text rows (axis 1 = position) long enough to hold
+      // position index + 1.
+      const int text = index + 2;
+      DevTensor ref(mi::DType::kBF16, {n, 128}), img(mi::DType::kBF16, {n + text, 128});
+      mi::kernels::moss_rope_table_reference(ref.t, h, w, index, nullptr);
+      mi::kernels::moss_rope_table(img.t, h, w, text, nullptr);
+      const auto r = download_u16(ref.t), m = download_u16(img.t);
+      const std::size_t pos = static_cast<std::size_t>(n + index + 1) * 128;  // text row at position index + 1
+      std::size_t differ = 0;
+      for (std::int64_t t = 0; t < n; ++t) {
+        for (int c = 0; c < 128; ++c) {
+          const int axis = (c & 63) >> 4, band = c & 15, half = c & 64;
+          std::uint16_t want = 0;
+          if (axis == 0) want = m[pos + static_cast<std::size_t>(half + 16 + band)];  // text axis 1 at index + 1
+          if (axis == 1) want = half ? 0x3f80 : 0;  // coordinate 0: sin 0 = 0, cos 0 = 1
+          if (axis >= 2) want = m[static_cast<std::size_t>(t) * 128 + static_cast<std::size_t>(c)];
+          differ += r[static_cast<std::size_t>(t) * 128 + static_cast<std::size_t>(c)] != want;
+        }
+      }
+      EXPECT_EQ(differ, 0u) << h << "x" << w << " reference " << index;
+    }
+  }
+  DevTensor bad(mi::DType::kBF16, {10, 128});
+  EXPECT_THROW(mi::kernels::moss_rope_table_reference(bad.t, 3, 3, 0, nullptr), std::invalid_argument);
+  EXPECT_THROW(mi::kernels::moss_rope_table_reference(bad.t, 2, 5, -1, nullptr), std::invalid_argument);
+}
+
+fs::path env_path(const char* name, const char* fallback) {
+  const char* v = std::getenv(name);
+  return v != nullptr && *v != '\0' ? fs::path(v) : fs::path(fallback);
+}
+
+struct Stats {
+  double cosine = 0, rel_l2 = 0;
+};
+Stats compare(const std::vector<float>& want, const std::vector<float>& got) {
+  double dot = 0, ww = 0, gg = 0, dd = 0;
+  for (std::size_t i = 0; i < want.size(); ++i) {
+    dot += double{want[i]} * got[i];
+    ww += double{want[i]} * want[i];
+    gg += double{got[i]} * got[i];
+    dd += (double{want[i]} - got[i]) * (double{want[i]} - got[i]);
+  }
+  return {dot / std::sqrt(ww * gg), std::sqrt(dd / ww)};
+}
+
+// moss_edit/processing.py resize_image's sizes (training rule): limit = max_edge // 16 * 16, fit, round each side to 16,
+// never above the limit nor below 16, no upscale beyond the rounding.
+TEST(EditReferences, SizesFollowTheTrainingRule) {
+  using mi::pipeline::reference_size;
+  const auto eq = [](mi::pipeline::ReferenceSize s, int w, int h) { return s.width == w && s.height == h; };
+  EXPECT_TRUE(eq(reference_size(1536, 2048, 512), 384, 512));   // the oracle's asset019
+  EXPECT_TRUE(eq(reference_size(2048, 1536, 256), 256, 192));
+  EXPECT_TRUE(eq(reference_size(1000, 1000, 520), 512, 512));   // max edge floored to 512
+  EXPECT_TRUE(eq(reference_size(300, 200, 512), 304, 208));      // no downscale: sides rounded to 16 (half up)
+  EXPECT_TRUE(eq(reference_size(296, 200, 512), 304, 208));      // 18.5 -> 19
+  EXPECT_TRUE(eq(reference_size(4000, 20, 512), 512, 16));       // at least 16
+  EXPECT_TRUE(eq(reference_size(8, 8, 512), 16, 16));
+  EXPECT_TRUE(eq(reference_size(509, 100, 512), 512, 96));       // rounded up, capped at the limit
+}
+
+// RGB of 1 / 3 / 4 channels as PIL convert("RGB"), then the PIL-exact Lanczos; the oracle's asset resized byte for byte
+// as its ref.png (MOSS_EDIT_ORACLE, with ref.png copied in).
+TEST(EditReferences, PixelsAreConvertRgbThenLanczos) {
+  mi::pipeline::Image rgba;
+  rgba.width = 3;
+  rgba.height = 1;
+  rgba.channels = 4;
+  rgba.pixels = {1, 2, 3, 9, 4, 5, 6, 9, 7, 8, 9, 9};
+  const mi::pipeline::Image a = mi::pipeline::reference_pixels(rgba, 512);  // 3x1 -> 16x16
+  mi::pipeline::Image rgb = rgba;
+  rgb.channels = 3;
+  rgb.pixels = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+  EXPECT_EQ(a.pixels, mi::pipeline::reference_pixels(rgb, 512).pixels);
+  mi::pipeline::Image gray = rgba;
+  gray.channels = 1;
+  gray.pixels = {10, 20, 30};
+  const mi::pipeline::Image g = mi::pipeline::reference_pixels(gray, 512);
+  ASSERT_EQ(g.channels, 3);
+  for (std::size_t i = 0; i < g.pixels.size(); i += 3) {
+    EXPECT_EQ(g.pixels[i], g.pixels[i + 1]);
+    EXPECT_EQ(g.pixels[i], g.pixels[i + 2]);
+  }
+  const fs::path oracle = env_path("MOSS_EDIT_ORACLE", "");
+  const fs::path asset = fs::path(MOSSINFER_SOURCE_DIR) / "tests" / "reference_images" / "asset019_sft.png";
+  if (oracle.empty() || !fs::is_regular_file(oracle / "ref.png")) GTEST_SKIP() << "MOSS_EDIT_ORACLE/ref.png not present";
+  const mi::pipeline::Image got = mi::pipeline::reference_pixels(mi::pipeline::load_image(asset, 3), 512);
+  const mi::pipeline::Image want = mi::pipeline::load_image(oracle / "ref.png", 3);
+  ASSERT_EQ(got.width, want.width);
+  ASSERT_EQ(got.height, want.height);
+  EXPECT_TRUE(got.pixels == want.pixels) << "the reference resize differs from the oracle's ref.png";
+}
+
+// The engine's VAE encode (the bundle's VAE, posterior mean, normalized: img2img's z0) of the oracle's ref.png against
+// ComfyUI's process_latent_in(vae.encode(...)).
+TEST(GpuEditReferences, EncodeMatchesTheOracle) {
+  const fs::path oracle = env_path("MOSS_EDIT_ORACLE", "");
+  const fs::path vae = env_path("MOSS_EDIT_VAE", "/workspace/Models/MOSS-Image/sft/vae/diffusion_pytorch_model.safetensors");
+  if (oracle.empty() || !fs::is_regular_file(oracle / "ref.png") || !fs::is_regular_file(vae)) {
+    GTEST_SKIP() << "MOSS_EDIT_ORACLE/ref.png or the VAE not present";
+  }
+  const mi::pipeline::Image im = mi::pipeline::load_image(oracle / "ref.png", 3);
+  mi::runtime::StreamSet streams;
+  const std::size_t bytes = mi::flux2_vae_encoder::Flux2VaeEncoder::persistent_bytes(vae) +
+                            mi::flux2_vae_encoder::Flux2VaeEncoder::workspace_bytes(im.height, im.width);
+  mi::runtime::DeviceArena arena(bytes + (std::size_t{64} << 20));
+  mi::flux2_vae_encoder::Flux2VaeEncoder enc(vae, arena, streams);
+  DevTensor lat(mi::DType::kF32, {128, im.height / 16, im.width / 16});
+  const Tensor rgb = Tensor::view(const_cast<std::uint8_t*>(im.pixels.data()), mi::DType::kU8, mi::Device::kCPU,
+                                  {im.height, im.width, 3});
+  enc.encode(rgb, lat.t, mi::flux2_vae_encoder::EncodeOptions{}, streams.compute());
+  MI_CUDA_CHECK(cudaStreamSynchronize(streams.compute()));
+  // The oracle's VAE ran in ComfyUI's default bf16 (0.99986 from its own fp32 encode): the gate is against the fp32
+  // encode of the same file (ref_latent_fp32.npy) when present, the bf16 one is reported and held to that floor.
+  const std::vector<float> got = download_f32(lat.t);
+  const Stats s = compare(mi::npy::load(oracle / "ref_latent_in.npy").to_vector<float>(), got);
+  std::printf("[edit parity] reference latent vs the oracle (bf16 VAE): cosine %.7f rel L2 %.5f\n", s.cosine, s.rel_l2);
+  EXPECT_GE(s.cosine, 0.9998);
+  if (fs::is_regular_file(oracle / "ref_latent_fp32.npy")) {
+    const Stats f = compare(mi::npy::load(oracle / "ref_latent_fp32.npy").to_vector<float>(), got);
+    std::printf("[edit parity] reference latent vs ComfyUI's fp32 encode: cosine %.7f rel L2 %.5f\n", f.cosine, f.rel_l2);
+    EXPECT_GE(f.cosine, 0.9999);
+  }
+}
+
+class EditDit : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    oracle_ = env_path("MOSS_EDIT_ORACLE", "");
+    const fs::path dit = env_path("MOSS_EDIT_DIT", "/workspace/Models/community/comfy-org/moss_image_sft_bf16.safetensors");
+    const fs::path lora = env_path("MOSS_EDIT_LORA", "/workspace/Models/community/chinoll/Moss-Image-Edit/adapter_model.safetensors");
+    if (oracle_.empty() || !fs::is_regular_file(oracle_ / "kv_0.npy") || !fs::is_regular_file(dit) || !fs::is_regular_file(lora)) {
+      return;
+    }
+    info_ = std::make_unique<mi::pipeline::DitFileInfo>(mi::pipeline::inspect_dit_file(dit, std::string_view{}));
+    const mi::lora::LoraSpec spec{lora, 1.0f};
+    stack_ = std::make_unique<mi::lora::LoraStack>(std::span<const mi::lora::LoraSpec>(&spec, 1), mi::lora::moss_dit_targets());
+    sb_ = std::make_unique<mi::lora::SideBranches>(*stack_);
+    streams_ = std::make_unique<mi::runtime::StreamSet>();
+    const mi::weights::ModelIndex& index = info_->quant->index;
+    // The oracle's grid (74x55) with its two rows, the op-by-op path (the largest big buffer), the cache and the prefill.
+    const std::int64_t lengths[] = {32, 10};
+    const md::ComputeConfig config = md::MossDit::compute_config(info_->quant.get(), md::AttentionMode::kExact,
+                                                                 md::Int4Route::kAuto, sb_.get());
+    std::size_t work = 0;
+    for (const md::BlockPath p : {md::BlockPath::kFused, md::BlockPath::kOpByOp}) {
+      work = std::max({work, md::MossDit::workspace_bytes(74, 55, lengths, p, config, nullptr, kRefTokens),
+                       md::MossDit::prefill_workspace_bytes(kRefTokens, p, config, nullptr),
+                       md::MossDit::encode_text_workspace_bytes(32)});
+    }
+    work += 2 * md::MossDit::reference_cache_bytes(kRefTokens) + (std::size_t{64} << 20);
+    const std::size_t free = mi::runtime::DeviceArena::free_device_bytes() - (std::size_t{512} << 20);
+    for (residency_.resident_blocks = md::kNumBlocks; residency_.resident_blocks > 0; --residency_.resident_blocks) {
+      if (md::MossDit::persistent_bytes(index, residency_) + work + md::MossDit::stream_workspace_bytes(index, residency_) <= free) break;
+    }
+    const std::size_t bytes =
+        md::MossDit::persistent_bytes(index, residency_) + work + md::MossDit::stream_workspace_bytes(index, residency_);
+    std::printf("[edit] arena %.2f GiB, %d of 42 blocks resident\n", static_cast<double>(bytes) / (1 << 30),
+                residency_.resident_blocks);
+    arena_ = std::make_unique<mi::runtime::DeviceArena>(bytes);
+    model_ = std::make_unique<md::MossDit>(*info_->quant, *arena_, *streams_, false, nullptr, residency_);
+    model_->set_lora(sb_.get());
+  }
+  static void TearDownTestSuite() {
+    model_.reset();
+    arena_.reset();
+    streams_.reset();
+    sb_.reset();
+    stack_.reset();
+    info_.reset();
+  }
+  void SetUp() override {
+    if (!model_) GTEST_SKIP() << "MOSS_EDIT_ORACLE, the SFT bf16 DiT or the edit adapter not present";
+  }
+  cudaStream_t stream() const { return streams_->compute(); }
+  static mi::npy::Array load(const std::string& name) { return mi::npy::load(oracle_ / (name + ".npy")); }
+  static std::unique_ptr<DevTensor> upload_f32(const mi::npy::Array& a, std::initializer_list<std::int64_t> shape) {
+    auto d = std::make_unique<DevTensor>(mi::DType::kF32, shape);
+    const auto v = a.to_vector<float>();
+    d->buf.upload(v.data(), v.size() * 4);
+    return d;
+  }
+  // The text refiner on the oracle's TE output (bf16 values held as fp32).
+  std::unique_ptr<DevTensor> refine(const std::string& name) {
+    const mi::npy::Array a = load(name);
+    const std::int64_t s = a.shape[0];
+    DevTensor in(mi::DType::kBF16, {s, md::kTextDim});
+    const auto v = a.to_vector<float>();
+    std::vector<std::uint16_t> h(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i) h[i] = to_bf16(v[i]);
+    in.buf.upload(h.data(), h.size() * 2);
+    auto out = std::make_unique<DevTensor>(mi::DType::kBF16, std::initializer_list<std::int64_t>{s, md::kDim});
+    model_->encode_text(in.t, out->t, stream());
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+    return out;
+  }
+
+  static constexpr std::int64_t kRefTokens = 32 * 24;  // the oracle's 384x512 reference
+  static fs::path oracle_;
+  static std::unique_ptr<mi::pipeline::DitFileInfo> info_;
+  static std::unique_ptr<mi::lora::LoraStack> stack_;
+  static std::unique_ptr<mi::lora::SideBranches> sb_;
+  static std::unique_ptr<mi::runtime::StreamSet> streams_;
+  static std::unique_ptr<mi::runtime::DeviceArena> arena_;
+  static std::unique_ptr<md::MossDit> model_;
+  static md::Residency residency_;
+};
+fs::path EditDit::oracle_;
+std::unique_ptr<mi::pipeline::DitFileInfo> EditDit::info_;
+std::unique_ptr<mi::lora::LoraStack> EditDit::stack_;
+std::unique_ptr<mi::lora::SideBranches> EditDit::sb_;
+std::unique_ptr<mi::runtime::StreamSet> EditDit::streams_;
+std::unique_ptr<mi::runtime::DeviceArena> EditDit::arena_;
+std::unique_ptr<md::MossDit> EditDit::model_;
+md::Residency EditDit::residency_;
+
+// The cache's block b as fp32 [2, R, kDim] (k then v), the oracle's ref_kv layout.
+std::vector<float> cache_block(const DevTensor& cache, int b) {
+  const auto all = download_u16(cache.t);
+  const std::size_t r = static_cast<std::size_t>(cache.t.dim(1)), d = md::kDim;
+  std::vector<float> out(2 * r * d);
+  const std::uint16_t* blk = all.data() + static_cast<std::size_t>(b) * r * 2 * d;
+  for (std::size_t i = 0; i < r; ++i) {
+    for (std::size_t c = 0; c < d; ++c) {
+      out[i * d + c] = from_bf16(blk[i * 2 * d + c]);
+      out[r * d + i * d + c] = from_bf16(blk[i * 2 * d + d + c]);
+    }
+  }
+  return out;
+}
+
+TEST_F(EditDit, OracleStepZero) {
+  const auto ref = upload_f32(load("ref_latent_in"), {128, 32, 24});
+  const auto x = upload_f32(load("x"), {128, 74, 55});
+  const auto cond = refine("ctx_cond"), uncond = refine("ctx_uncond");
+  DevTensor cache(mi::DType::kBF16, {md::kLayers, kRefTokens, 2 * md::kDim});
+  const md::RefKv refs{cache.t};
+  const Tensor refs_in[] = {ref->t};
+  model_->prefill_references(refs_in, refs, stream());
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  for (const int b : {0, 21, 41}) {
+    const auto want = load("kv_" + std::to_string(b)).to_vector<float>();
+    const auto got = cache_block(cache, b);
+    const std::size_t half = want.size() / 2;
+    const Stats k = compare(std::vector<float>(want.begin(), want.begin() + half), std::vector<float>(got.begin(), got.begin() + half));
+    const Stats v = compare(std::vector<float>(want.begin() + half, want.end()), std::vector<float>(got.begin() + half, got.end()));
+    std::printf("[edit parity] block %2d: K cosine %.6f rel L2 %.4f, V cosine %.6f rel L2 %.4f\n", b, k.cosine, k.rel_l2,
+                v.cosine, v.rel_l2);
+    EXPECT_GE(k.cosine, 0.999) << "block " << b;
+    EXPECT_GE(v.cosine, 0.999) << "block " << b;
+  }
+
+  // Step 0 of the oracle: ComfyUI's timestep 1.0 is the scheduler's 1000 (flux timestep_embedding's time_factor).
+  md::SkipSet s22;
+  s22.set(22);
+  const md::Row rows[] = {{cond->t, md::SkipSet{}}, {uncond->t, s22}};
+  DevTensor o0(mi::DType::kF32, {128, 74, 55}), o1(mi::DType::kF32, {128, 74, 55});
+  DevTensor n0(mi::DType::kF32, {128, 74, 55}), n1(mi::DType::kF32, {128, 74, 55});
+  const Tensor with[] = {o0.t, o1.t}, without[] = {n0.t, n1.t};
+  model_->forward(x->t, 1000.0f, rows, without, stream());
+  model_->set_references(&refs);
+  model_->forward(x->t, 1000.0f, rows, with, stream());
+  model_->set_references(nullptr);
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  const char* names[] = {"cond", "uncond"};
+  for (int r = 0; r < 2; ++r) {
+    const std::string n = names[r];
+    const Stats floor = compare(load("out_" + n + "_noref").to_vector<float>(), download_f32(without[r]));
+    const Stats got = compare(load("out_" + n).to_vector<float>(), download_f32(with[r]));
+    const Stats moved = compare(load("out_" + n + "_noref").to_vector<float>(), load("out_" + n).to_vector<float>());
+    std::printf("[edit parity] %-6s velocity: with references cosine %.6f rel L2 %.4f; no-reference floor cosine %.6f rel "
+                "L2 %.4f; the references move the oracle by rel L2 %.4f\n",
+                n.c_str(), got.cosine, got.rel_l2, floor.cosine, floor.rel_l2, moved.rel_l2);
+    EXPECT_LE(got.rel_l2, 1.5 * floor.rel_l2 + 1e-3) << n;
+    EXPECT_GE(got.cosine, std::min(floor.cosine - 1e-4, 0.99988)) << n;
+  }
+}
+
+// The stack queries the planner prices (workspace_bytes with reference tokens, prefill_workspace_bytes) are what a
+// forward with references and a prefill take: not over, and tight (one alignment unit per allocation).
+TEST_F(EditDit, StackBytesAreWhatTheCallsTake) {
+  const auto ref = upload_f32(load("ref_latent_in"), {128, 32, 24});
+  const auto x = upload_f32(load("x"), {128, 74, 55});
+  const auto cond = refine("ctx_cond"), uncond = refine("ctx_uncond");
+  DevTensor cache(mi::DType::kBF16, {md::kLayers, kRefTokens, 2 * md::kDim});
+  const md::RefKv refs{cache.t};
+  const Tensor refs_in[] = {ref->t};
+  const std::size_t prefill_need = model_->prefill_stack_bytes(kRefTokens);
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  arena_->reset_high_water();
+  std::size_t before = arena_->used();
+  model_->prefill_references(refs_in, refs, stream());
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  std::size_t took = arena_->high_water() - before;
+  std::printf("[edit] prefill took %zu stack bytes, prefill_stack_bytes %zu\n", took, prefill_need);
+  EXPECT_LE(took, prefill_need);
+  EXPECT_GE(took + 64 * mi::runtime::kArenaAlign, prefill_need);
+
+  const std::int64_t lengths[] = {cond->t.dim(0), uncond->t.dim(0)};
+  md::SkipSet s22;
+  s22.set(22);
+  const md::Row rows[] = {{cond->t, md::SkipSet{}}, {uncond->t, s22}};
+  DevTensor o0(mi::DType::kF32, {128, 74, 55}), o1(mi::DType::kF32, {128, 74, 55});
+  const Tensor outs[] = {o0.t, o1.t};
+  const std::size_t plain = model_->forward_stack_bytes(74, 55, lengths);
+  model_->set_references(&refs);
+  const std::size_t need = model_->forward_stack_bytes(74, 55, lengths);
+  EXPECT_GT(need, plain);
+  arena_->reset_high_water();
+  before = arena_->used();
+  model_->forward(x->t, 1000.0f, rows, outs, stream());
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  model_->set_references(nullptr);
+  took = arena_->high_water() - before;
+  std::printf("[edit] forward with references took %zu stack bytes, forward_stack_bytes %zu (%zu without)\n", took, need,
+              plain);
+  EXPECT_LE(took, need);
+  EXPECT_GE(took + 64 * mi::runtime::kArenaAlign, need);
+  EXPECT_EQ(md::MossDit::reference_cache_bytes(kRefTokens), std::size_t{12288} * 42 * kRefTokens);
+}
+
+TEST_F(EditDit, BitExactInvariants) {
+  const auto ref = upload_f32(load("ref_latent_in"), {128, 32, 24});
+  const auto x = upload_f32(load("x"), {128, 74, 55});
+  const auto cond = refine("ctx_cond"), uncond = refine("ctx_uncond");
+  DevTensor cache(mi::DType::kBF16, {md::kLayers, kRefTokens, 2 * md::kDim});
+  DevTensor op_cache(mi::DType::kBF16, {md::kLayers, kRefTokens, 2 * md::kDim});
+  const md::RefKv refs{cache.t}, op_refs{op_cache.t};
+  const Tensor refs_in[] = {ref->t};
+  model_->prefill_references(refs_in, refs, stream());
+  model_->set_block_path(md::BlockPath::kOpByOp);
+  model_->prefill_references(refs_in, op_refs, stream());
+  model_->set_block_path(md::BlockPath::kFused);
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  EXPECT_EQ(download_u16(cache.t), download_u16(op_cache.t)) << "op-by-op prefill differs from the fused one";
+
+  // The row invariants on the plain bf16 blocks (the LoRA side-branch GEMMs are not batch-invariant: their bits depend
+  // on the run's token count with or without references).
+  model_->set_lora(nullptr);
+  struct RestoreLora {
+    ~RestoreLora() { model_->set_lora(sb_.get()); }
+  } restore;
+  md::SkipSet s22;
+  s22.set(22);
+  const md::Row both[] = {{cond->t, md::SkipSet{}}, {uncond->t, s22}};
+  const auto out = [&] { return std::make_unique<DevTensor>(mi::DType::kF32, std::initializer_list<std::int64_t>{128, 74, 55}); };
+  auto b0 = out(), b1 = out(), a0 = out(), n0 = out(), n0b = out();
+  model_->forward(x->t, 1000.0f, std::span<const md::Row>(both, 1), std::span<const Tensor>(&n0->t, 1), stream());
+  model_->set_references(&refs);
+  const Tensor bo[] = {b0->t, b1->t};
+  model_->forward(x->t, 1000.0f, both, bo, stream());
+  model_->forward(x->t, 1000.0f, std::span<const md::Row>(both, 1), std::span<const Tensor>(&a0->t, 1), stream());
+  model_->set_references(nullptr);
+  model_->forward(x->t, 1000.0f, std::span<const md::Row>(both, 1), std::span<const Tensor>(&n0b->t, 1), stream());
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  EXPECT_EQ(download_f32(b0->t), download_f32(a0->t)) << "the cond row depends on the uncond row of its forward";
+  EXPECT_EQ(download_f32(n0->t), download_f32(n0b->t)) << "set_references(nullptr) does not restore the plain forward";
+  EXPECT_NE(download_f32(n0->t), download_f32(a0->t));
+
+  // Refusals: 3 rows, a latent batch of 2, a malformed cache.
+  model_->set_references(&refs);
+  const md::Row three[] = {both[0], both[1], both[0]};
+  const Tensor three_out[] = {b0->t, b1->t, a0->t};
+  EXPECT_THROW(model_->forward(x->t, 1000.0f, three, three_out, stream()), std::invalid_argument);
+  model_->set_references(nullptr);
+  const md::RefKv bad{cache.t.slice0(0, 41)};
+  EXPECT_THROW(model_->set_references(&bad), std::invalid_argument);
+}
+
+}  // namespace

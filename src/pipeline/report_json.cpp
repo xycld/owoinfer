@@ -224,6 +224,8 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
   } else {
     o << "null,\n";
   }
+  // Reference images (the edit layout): only when they ran (or an edit adapter ran without them).
+  if (const std::string refs = references_json(q, r); !refs.empty()) o << " \"references\": " << refs << ",\n";
   o << " \"plan\": " << r.plan.to_json() << ",\n";
   o << " \"embedding_cache\": {\"hits\": " << r.te_cache_hits << ", \"te_skipped\": " << tf(r.te_skipped) << "},\n";
   // What ran (it may differ from plan.vae: the decode takes the fastest schedule the arena it finds leaves room for).
@@ -239,7 +241,11 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
     << ", \"te_compute\": " << num(t.te_compute_s) << ", \"dit_load\": " << num(t.dit_load_s)
     << ", \"lora_load\": " << num(t.lora_load_s) << ", \"lora_merge\": " << num(t.lora_merge_s) << ", \"refine\": " << num(t.refine_s)
     << ", \"vae_load\": " << num(t.vae_load_s) << ", \"vae_encoder_load\": " << num(t.vae_encoder_load_s)
-    << ", \"vae_encode\": " << num(t.encode_s) << ", \"image_ops\": " << num(t.image_ops_s) << ", \"steps\": [";
+    << ", \"vae_encode\": " << num(t.encode_s) << ", \"image_ops\": " << num(t.image_ops_s);
+  if (r.references.count > 0) {
+    o << ", \"reference_encode\": " << num(t.reference_encode_s) << ", \"reference_prefill\": " << num(t.reference_prefill_s);
+  }
+  o << ", \"steps\": [";
   for (std::size_t i = 0; i < t.step_s.size(); ++i) o << (i ? ", " : "") << num(t.step_s[i]);
   o << "]},\n";
   o << " \"memory_gib\": {\"arena_capacity\": " << g(m.arena_capacity) << ", \"arena_high_water\": " << g(m.arena_high_water)
@@ -272,6 +278,24 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
   o << "]}";
   parts.tail = o.str();
   return parts;
+}
+
+std::string references_json(const Request& q, const Result& r) {
+  if (r.references.count == 0 && r.reference_warnings.empty()) return {};
+  std::ostringstream o;
+  o.imbue(std::locale::classic());
+  std::string warnings = "[";
+  for (std::size_t i = 0; i < r.reference_warnings.size(); ++i) warnings += (i ? ", " : "") + json_escape(r.reference_warnings[i]);
+  warnings += "]";
+  if (r.references.count == 0) return "{\"count\": 0, \"warnings\": " + warnings + "}";
+  o << "{\"count\": " << r.references.count << ", \"max_edge\": " << q.references.max_edge << ", \"sizes\": [";
+  for (std::size_t i = 0; i < r.references.sizes.size(); ++i) {
+    o << (i ? ", " : "") << "[" << r.references.sizes[i].width << ", " << r.references.sizes[i].height << "]";
+  }
+  o << "], \"tokens\": " << r.references.tokens << ", \"cache_bytes\": " << r.references.cache_bytes
+    << ", \"prefills\": " << r.references.prefills << ", \"encode_schedule\": " << json_escape(r.references.encode_schedule)
+    << ", \"warnings\": " << warnings << "}";
+  return o.str();
 }
 
 std::string report_fields(const Request& q, const Result& r, std::string_view image, std::string_view latent) {
