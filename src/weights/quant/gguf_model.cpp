@@ -80,6 +80,14 @@ QuantModel open_gguf_dit(const weights::GgufFile& file) {
   model.base_dir = file.path().parent_path();
   model.files.push_back({util::path_utf8(file.path().filename()), file.file_size(), util::file_mtime_ns(file.path())});
 
+  // Custom quantization stored in GGUF (ComfyUI-GGUF's comfy.gguf.quant.* configs over I8 / U8 tensors, e.g. molbal's
+  // Q8_CR and Q4_CR_L): no ggml type, so named as such.
+  for (const auto& [key, value] : file.metadata()) {
+    if (key.starts_with("comfy.gguf.quant.")) {
+      refuse("custom quantization in GGUF (" + key + " = " + value.substr(0, 120) +
+             "), not a ggml type; GGUF DiTs are read in Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, BF16, F16 and F32");
+    }
+  }
   const bool any_shapes = weights::testing::any_model_shapes();
   std::vector<std::string> unknown, bad_shape;
   std::map<std::string, std::pair<int, std::string>> unsupported;  // type -> (tensors, first name)

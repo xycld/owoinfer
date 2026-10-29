@@ -625,6 +625,15 @@ TEST(GgufDit, RefusesUnknownNamesShapesAndTypes) {
     }
   }
   expect({{"layers.0.norm1.weight", {3072}, ggml::kF32, std::vector<std::byte>(3072 * 4)}}, "missing MOSS-Image DiT tensors");
+  // Custom quantization over ggml containers (comfy.gguf.quant.* configs) is named as such.
+  write_file(p, gguf_bytes({{"layers.0.norm1.weight", {3072}, ggml::kF32, std::vector<std::byte>(3072 * 4)}},
+                           {kv_string("comfy.gguf.quant.layers.0.proj.o.weight", R"({"format": "int8_tensorwise"})")}));
+  try {
+    mi::quant::open_quant_model(p);
+    ADD_FAILURE() << "accepted";
+  } catch (const mi::quant::QuantError& e) {
+    EXPECT_NE(std::string(e.what()).find("custom quantization in GGUF"), std::string::npos) << e.what();
+  }
   // A GGUF text encoder is refused as such.
   write_file(p, gguf_bytes({{"layers.0.norm1.weight", {3072}, ggml::kF32, std::vector<std::byte>(3072 * 4)}}));
   EXPECT_THROW(mi::quant::open_quant_model(p, mi::quant::ModelKind::kTextEncoder), mi::quant::QuantError);
