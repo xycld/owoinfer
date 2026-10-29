@@ -32,8 +32,8 @@
 namespace mi::pipeline {
 
 struct GgufDitInfo {
-  // The GGUF types of every stored tensor, the most bytes first, joined by " + " (e.g. "Q4_K + Q6_K + F32",
-  // "Q8_0 + F32", "BF16 + F32").
+  // The GGUF types of every stored tensor, the most bytes first, joined by " + " (e.g. "Q4_K + Q6_K + BF16 + F32",
+  // "Q8_0 + BF16 + F32", "BF16 + F32").
   std::string types;
   // Every stored tensor is BF16, F16 or F32: tier reference runs the file as bf16.
   bool reference = false;

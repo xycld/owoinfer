@@ -1024,7 +1024,7 @@ typedef enum mi_file_text_kind {
   MI_FILE_TEXT_NOTE = 0,          /* why the file is not loadable or what it is instead, or a remark; "" for none */
   /* A loadable DiT: its block linears as the engine runs them, e.g. "bf16", "int8_convrot256", "int4_convrot256",
    * "mixed (80 bf16, 172 int8_convrot256)"; a GGUF DiT: its types and the format it is converted to and runs as, e.g.
-   * "GGUF Q4_K + Q6_K + F32, runs as INT8 ConvRot"; a loadable text encoder: "bf16", "int8_convrot" or "w4a8"; else "". */
+   * "GGUF Q4_K + Q6_K + BF16 + F32, runs as INT8 ConvRot"; a loadable text encoder: "bf16", "int8_convrot" or "w4a8"; else "". */
   MI_FILE_TEXT_QUANTIZATION = 1,
   /* LoRA, control adapter: the file's base_model metadata (informational); "" if absent */
   MI_FILE_TEXT_BASE_MODEL = 2,

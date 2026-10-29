@@ -3285,6 +3285,101 @@ TEST_F(GpuCApiModels, TurboInt4) {
   mi_result_free(r);
 }
 
+// A GGUF DiT (leejet's Q4_K) through the C API, without converting it whole: a cache folder that cannot be created is
+// MI_ERR_IO before any conversion work; the conversion reports MI_PHASE_DIT_LOAD progress (fraction 0, no eta) before
+// the plan, and mi_cancel from that callback, or mi_engine_free from another thread, stops it at once (MI_CANCELLED)
+// leaving no converted file and no temporary behind.
+TEST_F(GpuCApiModels, GgufDitStatusesProgressAndCancel) {
+  const fs::path gguf = community_models() / "gguf" / "leejet" / "MOSS-Image-SFT-GGUF" / "MOSS-Image-SFT-Q4_K.gguf";
+  if (!fs::is_regular_file(gguf)) GTEST_SKIP() << "no GGUF DiT";
+  mi::testing::TempDir dir("c_api_gguf");
+  const std::string dit = mi::util::path_utf8(gguf);
+  const std::string blocked = mi::util::path_utf8(dir.path() / "blocked");  // a file where the cache folder goes
+  std::ofstream(dir.path() / "blocked") << "x";
+  const std::string cache = mi::util::path_utf8(dir.path() / "cache");
+  mi_engine_params e = engine_defaults();
+  e.model_path = model_.c_str();
+  e.dit_file = dit.c_str();
+  e.tier = MI_TIER_HIGH;
+  e.cache_dir = blocked.c_str();
+  ASSERT_EQ(mi_engine_create(&e, &engine_), MI_OK) << last_error();
+  mi_gen_params p = gen_defaults();
+  p.prompt = "a red apple on a wooden table";
+  p.width = p.height = 256;
+  p.steps = 2;
+  mi_result* r = nullptr;
+  EXPECT_EQ(mi_generate(engine_, &p, &r), MI_ERR_IO);
+  EXPECT_NE(last_error().find("cache"), std::string::npos) << last_error();
+  EXPECT_EQ(r, nullptr);
+  mi_engine_free(engine_);
+  engine_ = nullptr;
+
+  struct Seen {
+    mi_engine* engine = nullptr;
+    bool cancel = false;  // mi_cancel from the first DIT_LOAD callback
+    std::atomic<int> dit_load{0};
+    std::atomic<bool> plan{false}, before_plan{false}, fraction_zero{true};
+  };
+  const auto on_progress = [](const mi_progress* pr, void* user) {
+    auto* s = static_cast<Seen*>(user);
+    if (pr->phase != MI_PHASE_DIT_LOAD || s->plan) return;
+    s->before_plan = true;
+    if (pr->fraction != 0.0 || pr->eta_seconds >= 0) s->fraction_zero = false;
+    if (s->dit_load++ == 2 && s->cancel) mi_cancel(s->engine);
+  };
+  const auto converted_or_temporary = [&] {
+    std::vector<std::string> left;
+    if (!fs::is_directory(dir.path() / "cache" / "gguf")) return left;
+    for (const auto& f : fs::directory_iterator(dir.path() / "cache" / "gguf")) {
+      if (f.path().extension() != ".lock") left.push_back(f.path().filename().string());
+    }
+    return left;
+  };
+  e.cache_dir = cache.c_str();
+  {
+    ASSERT_EQ(mi_engine_create(&e, &engine_), MI_OK) << last_error();
+    Seen seen;
+    seen.engine = engine_;
+    seen.cancel = true;
+    p.progress_callback = on_progress;
+    p.plan_callback = [](const char*, const char*, void* user) { static_cast<Seen*>(user)->plan = true; };
+    p.user_data = &seen;
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(mi_generate(engine_, &p, &r), MI_CANCELLED) << last_error();
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(20));
+    EXPECT_TRUE(seen.before_plan);
+    EXPECT_FALSE(seen.plan);
+    EXPECT_TRUE(seen.fraction_zero);
+    EXPECT_GE(seen.dit_load.load(), 3);
+    mi_result_free(r);
+    r = nullptr;
+    EXPECT_EQ(converted_or_temporary(), std::vector<std::string>{});
+    mi_engine_free(engine_);
+    engine_ = nullptr;
+  }
+  {
+    // mi_engine_free from another thread while the conversion runs.
+    ASSERT_EQ(mi_engine_create(&e, &engine_), MI_OK) << last_error();
+    Seen seen;
+    p.progress_callback = on_progress;
+    p.plan_callback = nullptr;
+    p.user_data = &seen;
+    mi_status status = MI_OK;
+    mi_result* r2 = nullptr;
+    std::thread gen([&] { status = mi_generate(engine_, &p, &r2); });
+    while (seen.dit_load < 3) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto t0 = std::chrono::steady_clock::now();
+    mi_engine_free(engine_);
+    const auto freed = std::chrono::steady_clock::now() - t0;
+    gen.join();
+    engine_ = nullptr;
+    EXPECT_EQ(status, MI_CANCELLED);
+    mi_result_free(r2);
+    EXPECT_LT(freed, std::chrono::seconds(5));
+    EXPECT_EQ(converted_or_temporary(), std::vector<std::string>{});
+  }
+}
+
 // mi_engine_create / mi_generate / mi_engine_free leave the calling thread's current CUDA context as they found it:
 // none on a fresh thread, the caller's own otherwise.
 TEST_F(GpuCApi, RestoresTheCallersCurrentContext) {

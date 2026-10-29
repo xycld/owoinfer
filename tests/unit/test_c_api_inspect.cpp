@@ -836,6 +836,16 @@ TEST(CApiInspect, CommunityFiles) {
        MI_PRECISION_BF16},
       {"lodestones/MOSS-Image-SFT-8-steps-dmd/time_embedding.safetensors", MI_FILE_KIND_UNKNOWN, 0, "", 0,
        MI_PRECISION_BF16},
+      // GGUF DiTs: the types of all their tensors, the INT8 conversion under tier HIGH only (none is BF16/F16/F32 only)
+      {"gguf/leejet/MOSS-Image-SFT-GGUF/MOSS-Image-SFT-Q4_K.gguf", MI_FILE_KIND_DIT, 1,
+       "GGUF Q4_K + BF16 + F32, runs as INT8 ConvRot", bit(MI_TIER_HIGH),
+       MI_PRECISION_INT8},
+      {"gguf/leejet/MOSS-Image-SFT-GGUF/MOSS-Image-SFT-Q8_0.gguf", MI_FILE_KIND_DIT, 1,
+       "GGUF Q8_0 + BF16 + F32, runs as INT8 ConvRot", bit(MI_TIER_HIGH),
+       MI_PRECISION_INT8},
+      {"gguf/unsloth/MOSS-Image-SFT-GGUF/MOSS-Image-SFT-Q4_K_M.gguf", MI_FILE_KIND_DIT, 1,
+       "GGUF Q4_K + Q6_K + BF16 + F32, runs as INT8 ConvRot", bit(MI_TIER_HIGH),
+       MI_PRECISION_INT8},
   };
   int checked = 0;
   for (const Expect& e : files) {
