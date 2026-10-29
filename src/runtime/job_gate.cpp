@@ -86,8 +86,8 @@ bool JobGate::start_ending(std::unique_lock<std::mutex>& lock, bool session) {
   ending_ = true;
   ending_session_ = session;
   // Only the component calls the ending ends are cancelled: a run ending cancels a step, a session closing any session
-  // or run call; a job outside the session (a generate) is waited for.
-  if (busy_ && (job_kind_ == Kind::kRun || (session && job_kind_ == Kind::kSession))) cancel_.store(true);
+  // or run call; a job outside the session (a generate) is waited for, except in the engine's teardown.
+  if (busy_ && (teardown_ || job_kind_ == Kind::kRun || (session && job_kind_ == Kind::kSession))) cancel_.store(true);
   cv_.wait(lock, [&] { return !busy_; });
   busy_ = true;  // the ender's own job: nothing else starts while it frees
   job_kind_ = session ? Kind::kSession : Kind::kRun;
@@ -139,6 +139,17 @@ bool JobGate::end_session(const std::function<void()>& free_run, const std::func
   }
   free_session();
   return true;
+}
+
+void JobGate::begin_teardown() {
+  std::lock_guard<std::mutex> lock(mu_);
+  teardown_ = true;
+  if (busy_) cancel_.store(true);
+}
+
+bool JobGate::on_job_thread() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return busy_ && job_thread_ == std::this_thread::get_id();
 }
 
 void JobGate::close_engine() {

@@ -88,9 +88,14 @@ class JobGate {
   // was closed meanwhile. end_session frees the session's state even when freeing its run throws.
   bool end_run(const std::function<void()>& free_state);
   bool end_session(const std::function<void()>& free_run, const std::function<void()>& free_session);
+  // mi_engine_free's first step: from now on an ending cancels any job in flight (a generate too), so the teardown's
+  // end_session never waits out a whole generation. The running job is cancelled at once.
+  void begin_teardown();
   // mi_engine_free's last step (after end_session): every later begin and ender is refused, the job in flight is
   // cancelled, and this returns once no job runs and no ender waits on the gate. Busy from the running job's thread.
   void close_engine();
+  // This thread runs the gate's job (a callback of the running call).
+  bool on_job_thread() const;
 
  private:
   void finish_job();
@@ -104,7 +109,8 @@ class JobGate {
   Kind job_kind_ = Kind::kEngine;
   std::thread::id job_thread_;
   int waiters_ = 0;      // enders inside start_ending
-  bool closed_ = false;  // close_engine()
+  bool closed_ = false;    // close_engine()
+  bool teardown_ = false;  // begin_teardown()
   bool session_open_ = false;
   bool run_open_ = false;
   bool ending_ = false;

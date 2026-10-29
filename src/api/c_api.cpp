@@ -928,26 +928,30 @@ mi_status mi_engine_create(const mi_engine_params* params, mi_engine** out_engin
   });
 }
 
-// The session is closed and the gate closed first (JobGate::end_session, then close_engine: later jobs are refused, a
-// job in flight on another thread is cancelled and waited for), so the free never races a job; then every call still
-// holding the session object has returned (the closed gate refused it). ~PipelineAdapter and the pipeline below it
-// tear down with CUDA's C API and ignore its errors (never MI_CUDA_CHECK). The thread's last error stays untouched:
-// from a callback of the engine's running job (forbidden) this is a silent no-op that frees nothing.
+// The teardown starts (JobGate::begin_teardown: the job in flight on another thread is cancelled, a generate too), the
+// session is closed and the gate closed (end_session, then close_engine: later jobs are refused, the job in flight is
+// waited for), so the free never races a job; then every call still holding the session object has returned (the
+// closed gate refused it). ~PipelineAdapter and the pipeline below it tear down with CUDA's C API and ignore its errors
+// (never MI_CUDA_CHECK). The thread's last error stays untouched: from a callback of the engine's running job
+// (forbidden) this is a silent no-op that touches no state.
 static_assert(std::is_nothrow_destructible_v<mi_engine>);
 void mi_engine_free(mi_engine* engine) {
   if (engine == nullptr) return;
+  try {
+    if (engine->gate.on_job_thread()) return;
+    engine->gate.begin_teardown();
+  } catch (...) {
+    return;
+  }
   const auto close_session = [&] {
     try {
       const SessionRef session(engine->session, false);
       if (session) session->close();
-    } catch (const mi::runtime::JobGate::Busy&) {
-      return false;  // from a callback of the running call
     } catch (...) {
       // A failure freeing the session's state: the engine is freed all the same.
     }
-    return true;
   };
-  if (!close_session()) return;
+  close_session();
   try {
     engine->session.begin_freeing();
     close_session();  // one a racing mi_session_open opened before the flag
@@ -1423,6 +1427,10 @@ mi_status mi_session_open(mi_engine* engine, const mi_session_params* params) {
 mi_status mi_session_close(mi_engine* engine) {
   return guarded([&] {
     require(engine, "engine");
+    // From a callback of the engine's running job (any job) nothing is done, even with no session open.
+    if (engine->gate.on_job_thread()) {
+      throw mi::runtime::JobGate::Busy("the session cannot be closed from a callback of its running call");
+    }
     const SessionRef session(engine->session, false);
     if (session) session->close();
     return MI_OK;
@@ -1613,6 +1621,9 @@ mi_status mi_run_end(mi_engine* engine, mi_result** out_result) {
   if (out_result != nullptr) *out_result = nullptr;
   return guarded([&] {
     require(engine, "engine");
+    if (engine->gate.on_job_thread()) {
+      throw mi::runtime::JobGate::Busy("the run cannot be ended from a callback of its running call");
+    }
     const SessionRef session(engine->session, false);
     if (!session) return MI_OK;
     std::optional<mi::api::Generation> g = session->end_run();

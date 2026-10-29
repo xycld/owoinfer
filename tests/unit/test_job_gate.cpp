@@ -230,6 +230,32 @@ TEST(JobGate, EndingsNeverCancelAGenerate) {
   }
 }
 
+// The engine's teardown (begin_teardown): the generate in flight is cancelled at once, and the teardown's end_session
+// waits only for it to stop; on_job_thread is true on the job's thread only.
+TEST(JobGate, TeardownCancelsAGenerate) {
+  JobGate g;
+  open(g, false);
+  EXPECT_FALSE(g.on_job_thread());
+  std::atomic<bool> started{false}, saw_cancel{false}, on_thread{false};
+  std::thread generate([&] {
+    JobGate::Job j = g.begin(Kind::kEngine);
+    on_thread = g.on_job_thread();
+    started = true;
+    for (int k = 0; k < 100000 && !saw_cancel; ++k) {
+      if (g.cancel_flag()->load()) saw_cancel = true;
+      std::this_thread::sleep_for(100us);
+    }
+  });
+  while (!started) std::this_thread::yield();
+  EXPECT_FALSE(g.on_job_thread());
+  g.begin_teardown();
+  EXPECT_TRUE(g.end_session([] {}, [] {}));
+  generate.join();
+  EXPECT_TRUE(on_thread);
+  EXPECT_TRUE(saw_cancel);
+  g.close_engine();
+}
+
 // end_run racing a begin_run: the ender waits for the session call in flight and ends the run it opened.
 TEST(JobGate, EndRunEndsTheRunABeginRunInFlightOpens) {
   for (int iteration = 0; iteration < 100; ++iteration) {
