@@ -615,6 +615,7 @@ class Pipeline {
   ReleaseReport release_device_memory(bool keep_host_copy, const std::atomic<bool>* cancel = nullptr);
 
  private:
+  friend class Session;  // the component session (pipeline/session.h) drives the same state
   struct Impl;
   std::unique_ptr<Impl> impl_;
   Result run(const Request& request, const GenerateControl& control, bool preload);
