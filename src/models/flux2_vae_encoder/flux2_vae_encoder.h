@@ -117,7 +117,8 @@ class Flux2VaeEncoder {
   // latent_stats: as Flux2VaeDecoder's, the index whose VAE "decoder" group supplies bn.running_mean / running_var, the
   // latent normalization the DiT works in. Pass the MOSS bundle's index whenever vae_file is a single VAE file: the
   // official pipeline normalizes with the bundle's statistics (bf16-rounded values stored as F32), the community files
-  // carry the unrounded originals. nullptr: vae_file's own statistics (the bundle VAE itself).
+  // carry the unrounded originals. nullptr: vae_file's own statistics rounded to bf16 as the bundle stores them (the
+  // bundle VAE itself: unchanged; a VAE file without a bundle VAE at hand: the bundle's values bit for bit).
   //
   // Failure: the file is validated (persistent_bytes()) before anything is allocated, so a bad file throws with the
   // arena untouched. An I/O or CUDA error during the upload (or bad latent_stats tensors) throws after part of the

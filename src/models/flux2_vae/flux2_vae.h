@@ -171,8 +171,9 @@ class Flux2VaeDecoder {
   // VAE file (vae_file.h): the official pipeline de-normalizes with the bundle's statistics (bf16-rounded values stored
   // as F32), while the community files carry the unrounded fp32 originals. The two indexes stay separate (the weights
   // are read through `index`, the statistics through `latent_stats`), so their tensors can never mix. nullptr: `index`'s
-  // own statistics, i.e. the bundle decode, or a single file with no bundle at hand (a fallback, not a current use
-  // case: the result then differs slightly from the official pipeline's). Throws std::runtime_error for a missing,
+  // own statistics rounded to bf16 as the bundle stores them, i.e. the bundle decode (already bf16 values: unchanged),
+  // or a single file with no bundle VAE at hand (its fp32 originals then round to the bundle's values bit for bit, so
+  // the result is the official pipeline's). Throws std::runtime_error for a missing,
   // misshapen or unexpected tensor, or a tensor outside its index's files.
   Flux2VaeDecoder(const weights::ModelIndex& index, runtime::DeviceArena& arena, runtime::StreamSet& streams,
                   bool bf16_weights = false, bool direct_io = false, const weights::ModelIndex* latent_stats = nullptr);

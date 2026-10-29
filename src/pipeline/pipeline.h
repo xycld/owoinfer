@@ -234,9 +234,9 @@ struct PipelineOptions {
   //   text_encoder_file: an INT8 ConvRot or W4A8 Qwen3.5 text encoder (qwen35_text::QuantTextModel); its embeddings
   //     are cached under its own identity and numerics. Held in RAM it is pinned (the plan's host-resident residency).
   //   vae_file: a single FLUX.2 VAE file (flux2_vae::index_vae_file: e.g. the full decoder), decoded with the
-  //     bundle's latent statistics when the bundle has its VAE weights, else with the file's own (fp32, unrounded:
-  //     the image differs slightly from the official pipeline's). img2img with a decoder-only file encodes with the
-  //     bundle's VAE, which it then needs.
+  //     bundle's latent statistics when the bundle has its VAE weights, else with the file's own rounded to bf16 as
+  //     the bundle stores them (the same values). img2img with a decoder-only file encodes with the bundle's VAE,
+  //     which it then needs.
   std::filesystem::path dit_file;
   std::filesystem::path text_encoder_file;
   std::filesystem::path vae_file;

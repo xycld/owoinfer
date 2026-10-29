@@ -16,6 +16,7 @@
 #include "models/flux2_vae/flux2_vae_internal.h"
 #include "models/flux2_vae/torch_group_norm.h"
 #include "runtime/pinned_ring.h"
+#include "weights/quant/quant_codec.h"
 #include "weights/safetensors.h"
 #include "weights/upload.h"
 
@@ -102,6 +103,18 @@ weights::WeightGroup stats_part(const weights::ModelIndex& index) {
     s.tensors.push_back(*it);
   }
   return s;
+}
+
+// An index's own latent statistics as the MOSS-Image bundle stores them: F32 values rounded to bf16 (round to nearest
+// even), in place through the host. A VAE file's fp32 originals then equal the bundle's bit for bit; the bundle's own
+// are bf16 values already and stay as they are.
+void round_to_bf16(const Tensor& t, cudaStream_t s) {
+  std::vector<float> host(static_cast<std::size_t>(t.numel()));
+  MI_CUDA_CHECK(cudaMemcpyAsync(host.data(), t.data, t.nbytes(), cudaMemcpyDeviceToHost, s));
+  MI_CUDA_CHECK(cudaStreamSynchronize(s));
+  for (float& v : host) v = quant::bf16_to_float(quant::float_to_bf16(v));
+  MI_CUDA_CHECK(cudaMemcpyAsync(t.data, host.data(), t.nbytes(), cudaMemcpyHostToDevice, s));
+  MI_CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
 void check_lt(cublasStatus_t st, const char* what) {
@@ -259,6 +272,10 @@ Flux2VaeDecoder::Flux2VaeDecoder(const weights::ModelIndex& index, runtime::Devi
 
   bn_mean_ = take("bn.running_mean", {kLatentChannels});
   bn_var_ = take("bn.running_var", {kLatentChannels});
+  if (latent_stats == nullptr) {
+    round_to_bf16(bn_mean_, streams.compute());
+    round_to_bf16(bn_var_, streams.compute());
+  }
   post_quant_conv_ = make_conv("post_quant_conv", 32, 32, 1);
   conv_in_ = make_conv("decoder.conv_in", mid, 32, 3);
   for (int i = 0; i < 2; ++i) mid_resnets_[i] = make_resnet("decoder.mid_block.resnets." + std::to_string(i), mid, mid);

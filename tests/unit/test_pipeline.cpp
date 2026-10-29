@@ -31,6 +31,7 @@
 #include "models/moss_dit/moss_dit.h"
 #include "pipeline/hardware_profile.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/pipeline_image.h"
 #include "pipeline/report_json.h"
 #include "pipeline/png_writer.h"
 #include "pipeline/quality_cert.h"
@@ -1355,16 +1356,19 @@ TEST(PipelineEndToEnd, Int8DitFileHighTierAddsQ8Attention) {
 }
 
 // Component files replace the bundle's components: the bundle folder then needs only its configs and tokenizer (its
-// moss.mossidx still serves, without the replaced components). With the bundle's VAE weights there, the image is the
-// full bundle's bit for bit (the same latent statistics); without them the VAE file's own statistics decode the same
-// latents. Without the component files the configs-only folder is refused as before.
+// moss.mossidx still serves, without the replaced components). The image is the full bundle's bit for bit, with the
+// bundle's VAE weights there (its latent statistics) or without them (the VAE file's own, rounded to bf16 as the
+// bundle stores them); img2img's too, encoded by the VAE file's encoder. A component not replaced still needs its
+// weights.
 TEST(PipelineEndToEnd, ComponentFilesNeedOnlyTheBundleConfigs) {
   const fs::path sft = weights_root() / "sft";
   const fs::path te = "/workspace/Models/community/comfy-org/qwen3.5_9b_int8_convrot.safetensors";
-  const fs::path vae = "/workspace/Models/community/comfy-org/flux2-vae_small.safetensors";
+  const fs::path small_vae = "/workspace/Models/community/comfy-org/flux2-vae_small.safetensors";
+  const fs::path full_vae = "/workspace/Models/community/comfy-org/flux2-vae.safetensors";
+  const fs::path init = fs::path(MOSSINFER_SOURCE_DIR) / "tests" / "reference_images" / "asset005_base.png";
   if (!fs::is_regular_file(sft / "moss.mossidx") || !fs::is_regular_file(kInt8Dit) || !fs::is_regular_file(te) ||
-      !fs::is_regular_file(vae)) {
-    GTEST_SKIP() << "SFT bundle or component files not present";
+      !fs::is_regular_file(small_vae) || !fs::is_regular_file(full_vae) || !fs::is_regular_file(init)) {
+    GTEST_SKIP() << "SFT bundle, component files or init image not present";
   }
   mi::testing::TempDir bare("pipe_configs_only"), with_vae("pipe_configs_vae");
   const auto link = [&](const fs::path& dir, const fs::path& rel) {
@@ -1386,32 +1390,50 @@ TEST(PipelineEndToEnd, ComponentFilesNeedOnlyTheBundleConfigs) {
   mi::pipeline::PipelineOptions options;
   options.dit_file = kInt8Dit;
   options.text_encoder_file = te;
-  options.vae_file = vae;
   options.mode = mi::planner::Mode::kMinMemory;  // streamed: little host and device memory
-  mi::pipeline::Pipeline pipe(options);
-  req.model = sft;
-  const mi::pipeline::Result full = pipe.generate(req);
-  ASSERT_FALSE(full.rgb.empty());
-  req.model = with_vae.path();
-  const mi::pipeline::Result a = pipe.generate(req);
-  EXPECT_EQ(a.dit_source, kInt8Dit.string());
-  EXPECT_EQ(a.te_source, te.string());
-  EXPECT_EQ(a.vae_source, vae.string());
-  EXPECT_EQ(bit_mismatches(a.latents, full.latents), 0u);
-  EXPECT_EQ(a.rgb, full.rgb);
-  req.model = bare.path();
-  const mi::pipeline::Result b = pipe.generate(req);
-  EXPECT_EQ(bit_mismatches(b.latents, full.latents), 0u);
-  ASSERT_EQ(b.rgb.size(), full.rgb.size());
-  int max_diff = 0;
-  for (std::size_t i = 0; i < b.rgb.size(); ++i) max_diff = std::max(max_diff, std::abs(int{b.rgb[i]} - int{full.rgb[i]}));
-  EXPECT_GT(max_diff, 0) << "decoded with the file's own (unrounded) latent statistics";
-  EXPECT_LE(max_diff, 8) << "decoded with the file's own (unrounded) latent statistics";
+  const auto init_image = std::make_shared<const mi::pipeline::Image>(mi::pipeline::load_image(init));
+  {
+    options.vae_file = small_vae;
+    mi::pipeline::Pipeline pipe(options);
+    req.model = sft;
+    const mi::pipeline::Result full = pipe.generate(req);
+    ASSERT_FALSE(full.rgb.empty());
+    for (const fs::path& dir : {with_vae.path(), bare.path()}) {
+      SCOPED_TRACE(dir.string());
+      req.model = dir;
+      const mi::pipeline::Result r = pipe.generate(req);
+      EXPECT_EQ(r.dit_source, kInt8Dit.string());
+      EXPECT_EQ(r.te_source, te.string());
+      EXPECT_EQ(r.vae_source, small_vae.string());
+      EXPECT_EQ(bit_mismatches(r.latents, full.latents), 0u);
+      EXPECT_TRUE(r.rgb == full.rgb);
+    }
+  }
+  // img2img: the small and the full VAE file both carry an encoder, which normalizes with the same values as the
+  // bundle's statistics.
+  for (const fs::path& vae : {small_vae, full_vae}) {
+    SCOPED_TRACE(vae.string());
+    options.vae_file = vae;
+    mi::pipeline::Pipeline pipe(options);
+    mi::pipeline::Request img = req;
+    img.init_image = init_image;
+    img.denoise_strength = 0.6;
+    img.model = sft;
+    const mi::pipeline::Result full = pipe.generate(img);
+    ASSERT_TRUE(full.first_pass.encoded);
+    ASSERT_FALSE(full.rgb.empty());
+    img.model = bare.path();
+    const mi::pipeline::Result r = pipe.generate(img);
+    EXPECT_TRUE(r.first_pass.encoded);
+    EXPECT_EQ(bit_mismatches(r.latents, full.latents), 0u);
+    EXPECT_TRUE(r.rgb == full.rgb);
+  }
 
   // Only the text encoder replaced: the DiT's weights are still the bundle's, and missing.
   mi::pipeline::PipelineOptions te_only;
   te_only.text_encoder_file = te;
   mi::pipeline::Pipeline te_pipe(te_only);
+  req.model = bare.path();
   EXPECT_THROW(te_pipe.generate(req), mi::weights::IndexError);
 }
 

@@ -18,6 +18,7 @@
 #include "util/path.h"
 #include "weights/file_reader.h"
 #include "weights/model_index.h"
+#include "weights/quant/quant_codec.h"
 #include "weights/safetensors.h"
 
 namespace mi::flux2_vae_encoder {
@@ -548,13 +549,20 @@ class Loader {
   }
 
   // A tensor whose numel matches `shape` (the original layout stores the attention linears as [C, C, 1, 1]).
-  Tensor plain(const std::string& dname, std::initializer_list<std::int64_t> shape) {
+  // bf16_rounded: its values rounded to bf16 (round to nearest even), still F32.
+  Tensor plain(const std::string& dname, std::initializer_list<std::int64_t> shape, bool bf16_rounded = false) {
     const weights::TensorInfo& t = info(dname, shape);
     Tensor dst = Tensor::view(nullptr, DType::kF32, Device::kCUDA, shape);
     bytes_ += align_up(dst.nbytes());
     if (arena_ == nullptr) return dst;
     dst.data = arena_->alloc_persistent(dst.nbytes());
     read(t);
+    for (std::size_t i = 0; bf16_rounded && i + sizeof(float) <= host_.size(); i += sizeof(float)) {
+      float v = 0;
+      std::memcpy(&v, host_.data() + i, sizeof v);
+      v = quant::bf16_to_float(quant::float_to_bf16(v));
+      std::memcpy(host_.data() + i, &v, sizeof v);
+    }
     MI_CUDA_CHECK(cudaMemcpyAsync(dst.data, host_.data(), dst.nbytes(), cudaMemcpyHostToDevice, stream_));
     return dst;
   }
@@ -664,9 +672,11 @@ void assemble(Loader& ld, Flux2VaeEncoder::Weights& w) {
   w.quant_conv = ld.conv("quant_conv", kMomentCh, kMomentCh, 1);
 }
 
+// The file's own latent statistics as the MOSS-Image bundle stores them, rounded to bf16: a VAE file's fp32 originals
+// then equal the bundle's bit for bit; the bundle's own are bf16 values already and stay as they are.
 void assemble_bn(Loader& ld, Flux2VaeEncoder::Weights& w) {
-  w.bn_mean = ld.plain("bn.running_mean", {kLatentChannels});
-  w.bn_var = ld.plain("bn.running_var", {kLatentChannels});
+  w.bn_mean = ld.plain("bn.running_mean", {kLatentChannels}, true);
+  w.bn_var = ld.plain("bn.running_var", {kLatentChannels}, true);
 }
 
 void check_lt(cublasStatus_t st, const char* what) {
