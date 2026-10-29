@@ -290,7 +290,7 @@ The engine reads the official Hugging Face model folders in place, with no conve
 
 ### GGUF DiT files
 
-Community GGUF DiTs (`leejet/MOSS-Image-SFT-GGUF`, `unsloth/MOSS-Image-*-GGUF`, `realrebelai/MOSS-Image_GGUFs`, …) load as `dit_file`. The engine has no GGUF runtime: on the first load it converts the file into one of its own formats, keeps the result in the cache directory, and from then on loads that file. **VRAM and speed are those of the format the file runs as, not of the GGUF type:** a Q4_K file takes INT8's VRAM and runs at INT8's speed. What a GGUF saves is download size.
+Community GGUF DiTs (`leejet/MOSS-Image-SFT-GGUF`, `unsloth/MOSS-Image-*-GGUF`, `realrebelai/MOSS-Image_GGUFs`, …) load as `dit_file`. The engine has no GGUF runtime: on the first load it converts the file into one of its own formats, keeps the result in the cache directory, and from then on loads that file. **VRAM and speed are those of the format the file runs as, not of the GGUF type:** a Q4_K file takes INT8's VRAM and runs at INT8's speed. What a GGUF saves is download size. Below Q8_0 the GGUF's own rounding stays in the weights (the conversion adds next to nothing to it), so a Q6_K to Q4_0 file's images differ more from the bf16 model's than an INT8 file's do; a Q8_0 file runs about as an INT8 file.
 
 | GGUF block weights | tier `high` | tier `reference` | tier `turbo` |
 |---|---|---|---|
