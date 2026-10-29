@@ -7,6 +7,34 @@ namespace mi::kernels::quant {
 namespace detail {
 namespace {
 
+// SituFactorTables' storage (256 KiB per device), filled by situ_tables_kernel before every SituGlu epilogue on its
+// stream: no host state, so it is graph-capturable and every stream sees filled tables in its own order (concurrent
+// fills write the same bits).
+constexpr int kBf16Values = 1 << 16;
+__device__ std::uint16_t g_gate_factor[kBf16Values];
+__device__ std::uint16_t g_hidden_factor[kBf16Values];
+
+__global__ void situ_tables_kernel() {
+  const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const float x = __uint_as_float(static_cast<std::uint32_t>(i) << 16);
+  g_gate_factor[i] = __bfloat16_as_ushort(__float2bfloat16_rn(situ_gate_factor(x)));
+  g_hidden_factor[i] = __bfloat16_as_ushort(__float2bfloat16_rn(situ_hidden_factor(x)));
+}
+
+}  // namespace
+
+SituFactorTables situ_factor_tables(cudaStream_t stream) {
+  constexpr int kThreads = 256;
+  situ_tables_kernel<<<kBf16Values / kThreads, kThreads, 0, stream>>>();
+  MI_CUDA_CHECK_LAUNCH();
+  void *gate = nullptr, *hidden = nullptr;
+  MI_CUDA_CHECK(cudaGetSymbolAddress(&gate, g_gate_factor));
+  MI_CUDA_CHECK(cudaGetSymbolAddress(&hidden, g_hidden_factor));
+  return {static_cast<const std::uint16_t*>(gate), static_cast<const std::uint16_t*>(hidden)};
+}
+
+namespace {
+
 template <class Tile>
 void situ_glu(const Problem& p, const Int8Operands& a, __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream) {
   using N = Nodes<Tile>;
@@ -16,7 +44,7 @@ void situ_glu(const Problem& p, const Int8Operands& a, __nv_bfloat16* out, std::
   auto* d = reinterpret_cast<std::uint8_t*>(out);
   const std::int64_t ldd = 2 * ldo;
   const typename N::SituGlu::Arguments cb{
-      {{}, {const_cast<float*>(a.x_scale), 0.f, {_1{}, _0{}, p.m}}, {a.w_scale}, {}},
+      {{}, {const_cast<float*>(a.x_scale), 0.f, {_1{}, _0{}, p.m}}, {a.w_scale}, situ_factor_tables(stream)},
       {d, {ldd, _1{}, ldd * p.m}}};
   launch<Gemm>("quant::int8_gemm_situ_glu", p, a, cb, stream);
 }

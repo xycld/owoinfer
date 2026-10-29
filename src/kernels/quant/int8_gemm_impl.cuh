@@ -23,7 +23,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/default_gemm_universal_with_visitor.h"
 #include "cutlass/layout/permute.h"
-#include "kernels/fused/fused_gemm_impl.cuh"  // situ_value, kUpGateGroup, UpGatePermuteB
+#include "kernels/fused/fused_gemm_impl.cuh"  // situ_gate_factor, situ_hidden_factor, kUpGateGroup, UpGatePermuteB
 // The visitor headers rely on the GEMM and epilogue headers above being included first.
 #include "cutlass/epilogue/threadblock/fusion/visitors.hpp"
 #include "kernels/basic/detail.h"
@@ -73,8 +73,10 @@ __device__ __forceinline__ float dequant(float acc, float xs, float ws, float bi
   return add(mul(mul(acc, xs), ws), bias);
 }
 
-// MOSS _situ on bf16 values and the ffn_up_gate column permutation of the bf16 fused GEMMs, reused as they are.
-using fused::detail::situ_value;
+// MOSS _situ's factors on bf16 values and the ffn_up_gate column permutation of the bf16 fused GEMMs, reused as they
+// are.
+using fused::detail::situ_gate_factor;
+using fused::detail::situ_hidden_factor;
 using fused::detail::kUpGateGroup;
 using fused::detail::UpGatePermuteB;
 
@@ -108,13 +110,48 @@ CUTLASS_HOST_DEVICE int up_gate_row(int n, int half) {
   return ((n / kUpGateGroup) % 2) * half + (n / (2 * kUpGateGroup)) * kUpGateGroup + n % kUpGateGroup;
 }
 
+// SiTU's two bf16 factors (fused::detail::situ_gate_factor / situ_hidden_factor) tabulated for every bf16 input,
+// indexed by the input's bits: computed on the device by the same code (int8_gemm_situ.cu), so a lookup is the
+// computation bit for bit, NaN and inf inputs included. The epilogue's transcendentals (two tanhf, an expf and an
+// IEEE division per output) otherwise serialize after the main loop: ~12 % of the GEMM's time on sm_89.
+struct SituFactorTables {
+  const std::uint16_t* gate = nullptr;    // [65536] bf16 bits of situ_gate_factor(g)
+  const std::uint16_t* hidden = nullptr;  // [65536] bf16 bits of situ_hidden_factor(h)
+};
+
+// Fills the tables (static device memory of int8_gemm_situ.cu) on `stream` and returns them: before every launch of
+// a SituGlu epilogue (int8_gemm_situ_glu, quant4::int4_gemm_situ_glu).
+SituFactorTables situ_factor_tables(cudaStream_t stream);
+
+// A bf16-representable float's bits (exact: its low 16 bits are zero) and back.
+__device__ __forceinline__ std::uint32_t bf16_index(float v) { return __float_as_uint(v) >> 16; }
+__device__ __forceinline__ float bf16_entry(const std::uint16_t* table, std::uint32_t i) {
+  return __uint_as_float(static_cast<std::uint32_t>(__ldg(table + i)) << 16);
+}
+
 // The int8_gemm_situ_glu epilogue node: an access of 8 accumulator columns [8j, 8j + 8) = hidden 4j..4j+3 then gate
 // 4j..4j+3 gives 4 bf16 results, returned as their 8 bytes (the store writes them at byte column 8j of the output
-// declared as bytes, i.e. bf16 column 4j of [M, F]).
-struct SituGluNode : cutlass::epilogue::threadblock::VisitorImpl2x<> {
-  using VisitorImpl2x<>::VisitorImpl2x;
+// declared as bytes, i.e. bf16 column 4j of [M, F]). situ_value(h, g) = gate factor * hidden factor, from the tables.
+struct SituGluNode {
+  using Arguments = SituFactorTables;
+  using Params = Arguments;
+  struct SharedStorage {};
+
+  template <class ProblemShape>
+  static constexpr Params to_underlying_arguments(ProblemShape const&, Arguments const& args, void*) {
+    return args;
+  }
+  template <class ProblemShape>
+  static size_t get_workspace_size(ProblemShape const&, Arguments const&) {
+    return 0;
+  }
+
+  CUTLASS_HOST_DEVICE SituGluNode() {}
+  CUTLASS_HOST_DEVICE SituGluNode(Params const& params, SharedStorage const&) : params_ptr(&params) {}
+  Params const* params_ptr = nullptr;
 
   struct Callbacks : cutlass::epilogue::threadblock::EmptyCallbacks {
+    SituFactorTables t;
     template <class ElementAccumulator, class ElementXs, class ElementWs, int kFrag>
     CUTLASS_DEVICE cutlass::Array<std::uint8_t, kFrag> visit(int, int, int, int,
                                                             cutlass::Array<ElementAccumulator, kFrag> const&,
@@ -130,7 +167,8 @@ struct SituGluNode : cutlass::epilogue::threadblock::VisitorImpl2x<> {
         // The GEMM output is a bf16 tensor in the reference: round both halves before SiTU.
         const float h = rbf(dequant(__int2float_rn(acc[i]), xs[i], ws[i], 0.0f));
         const float gt = rbf(dequant(__int2float_rn(acc[g]), xs[g], ws[g], 0.0f));
-        words[i] = __bfloat16_as_ushort(__float2bfloat16_rn(situ_value(h, gt)));
+        const float v = mul(bf16_entry(t.gate, bf16_index(gt)), bf16_entry(t.hidden, bf16_index(h)));
+        words[i] = __bfloat16_as_ushort(__float2bfloat16_rn(v));
       }
       return out;
     }
@@ -138,7 +176,9 @@ struct SituGluNode : cutlass::epilogue::threadblock::VisitorImpl2x<> {
 
   template <class ProblemShape>
   CUTLASS_DEVICE auto get_callbacks(cutlass::gemm::GemmCoord, int, ProblemShape) {
-    return Callbacks();
+    Callbacks c;
+    c.t = *params_ptr;
+    return c;
   }
 };
 

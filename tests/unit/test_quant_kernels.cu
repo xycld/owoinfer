@@ -770,6 +770,50 @@ TEST(GpuQuantKernels, Int8GemmEdgeShapes) {
 // Padded row strides everywhere (ldx > k, ldo > n, ldr > n, SiTU ldo > F) and K = 272: 4 full 64-deep k-tiles (2 of
 // the 128-deep tile) plus a 16-deep residue; N = 264 is not a tile multiple either. Every tile, every row, against the
 // oracle; the padding of the outputs must stay untouched.
+// The SiTU-GLU epilogue reads SiTU's two factors from tables over every bf16 input: every value goes through it.
+// acc = 1 in every column (x = e_0, every weight row e_0) and x_scale = 1, so the dequantized up_gate value of column c
+// is w_scale[c] exactly and w_scale places any bf16 value, NaN and inf included, in the hidden or the gate half.
+// Passes: every hidden value against gate 1, every gate value against hidden 1, every hidden value against a
+// permutation of every gate value. Against kernels::situ_glu on the same bf16 [1, 2F] values, bit for bit.
+TEST(GpuQuantKernels, Int8GemmSituGluEveryBf16Value) {
+  constexpr std::int64_t F = 65536, n = 2 * F, k = 16;
+  std::vector<std::int8_t> xh(k, 0), wh(static_cast<std::size_t>(n * k), 0);
+  xh[0] = 1;
+  for (std::int64_t i = 0; i < n; ++i) wh[static_cast<std::size_t>(i * k)] = 1;
+  Buf<std::int8_t> x(xh), w(wh);
+  Buf<float> xs(std::vector<float>{1.0f});
+  const std::uint16_t one = bf16_bits(1.0f);
+  for (int pass = 0; pass < 3; ++pass) {
+    std::vector<float> ws(static_cast<std::size_t>(n));
+    std::vector<std::uint16_t> y(static_cast<std::size_t>(n));
+    for (std::int64_t i = 0; i < F; ++i) {
+      const auto all = static_cast<std::uint16_t>(i), perm = static_cast<std::uint16_t>((i * 40503 + 12345) & 0xFFFF);
+      const std::uint16_t h = pass == 1 ? one : all, g = pass == 0 ? one : pass == 1 ? all : perm;
+      const auto at = static_cast<std::size_t>(i);
+      ws[at] = bf16_float(h);
+      ws[at + F] = bf16_float(g);
+      // The dequantization adds the zero bias: -0 arrives as +0.
+      y[at] = bf16_bits(ws[at] + 0.0f);
+      y[at + F] = bf16_bits(ws[at + F] + 0.0f);
+    }
+    Buf<float> wsb(ws);
+    Buf<std::uint16_t> yb(y), got(static_cast<std::size_t>(F)), ref(static_cast<std::size_t>(F));
+    quant::Int8Operands o;
+    o.x_q = x.get();
+    o.ldx = k;
+    o.x_scale = xs.get();
+    o.w = w.get();
+    o.w_scale = wsb.get();
+    o.m = 1;
+    o.n = n;
+    o.k = k;
+    quant::int8_gemm_situ_glu(o, as_bf16(got), F, nullptr);
+    mi::kernels::situ_glu(view_bf16(yb.get(), 1, n), view_bf16(ref.get(), 1, F), nullptr);
+    MI_CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(count_diff(got.download(), ref.download()), 0u) << "pass " << pass;
+  }
+}
+
 TEST(GpuQuantKernels, Int8GemmPaddedStridesAndKResidue) {
   constexpr std::int64_t m = 300, n = 264, k = 272, ldx = k + 48, ldo = n + 24, ldr = n + 40, ldf = n / 2 + 12;
   constexpr std::uint16_t kSentinel = 0x7FC1;
