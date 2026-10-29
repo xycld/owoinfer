@@ -169,14 +169,6 @@ static_assert(static_cast<int>(planner::AttentionMode::kQ8Fp8F32Acc) == static_c
               static_cast<int>(planner::AttentionMode::kExact) == 0 && static_cast<int>(moss_dit::AttentionMode::kExact) == 0);
 moss_dit::AttentionMode dit_attention(planner::AttentionMode a) { return static_cast<moss_dit::AttentionMode>(a); }
 
-// A file's size and modification time, for keys of state built from its contents: a file replaced under the same
-// path gets another stamp (empty when it cannot be read; the load that follows reports why).
-std::string file_stamp(const std::filesystem::path& p) {
-  const util::FileInfo f = util::file_info(p);
-  if (!f.regular()) return {};
-  return std::to_string(f.size) + "@" + std::to_string(f.mtime_ns);
-}
-
 // Bytes of a weight file, or of the *.safetensors files directly inside a directory.
 std::uint64_t weight_bytes(const std::filesystem::path& p) {
   const util::FileInfo info = util::file_info(p);
@@ -680,6 +672,7 @@ Result Pipeline::preload(const PreloadOptions& options) {
 Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Result& r) {
   Impl& m = *this;
   Timings& tm = r.timings;
+  m.check_component_files();
   Bundle& b = m.bundle(req.model, tm.index_load_s);
   DitSource& src = m.dit_source(b, tm.index_load_s);
   const TeSource& tes = m.te_source(b, tm.index_load_s);
@@ -709,9 +702,11 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
         }
       }
     };
-    const std::string key = util::path_utf8(util::path_key(req.control.adapter));
+    // Kept while the file stays the same: a file replaced under the same path loads anew (file_stamp).
+    const util::FileInfo stamp = util::file_info(req.control.adapter);
+    const std::string key = util::path_utf8(util::path_key(req.control.adapter)) + "#" + file_stamp(stamp);
     if (!m.control_file || m.control_key != key) {
-      if (!util::file_info(req.control.adapter).regular()) {
+      if (!stamp.regular()) {
         throw std::invalid_argument("control adapter not found: " + util::path_utf8(req.control.adapter));
       }
       const auto t0c = Clock::now();
@@ -801,7 +796,7 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     // The control adapter's entry is tagged: the same file as a plain LoRA is another stack (and is refused below).
     for (std::size_t i = 0; i < loras.size(); ++i) {
       files += (ctl != nullptr && i + 1 == loras.size() ? "|control:" : "|") +
-               util::path_utf8(util::path_key(loras[i].path)) + "#" + file_stamp(loras[i].path);
+               util::path_utf8(util::path_key(loras[i].path)) + "#" + file_stamp(util::file_info(loras[i].path));
     }
     if (!m.lora_stack || files != m.lora_files_key) {
       for (const lora::LoraSpec& l : req.loras) {

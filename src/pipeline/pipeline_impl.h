@@ -125,10 +125,22 @@ inline std::unique_ptr<Bundle> open_bundle(const std::filesystem::path& dir, wei
   return b;
 }
 
+// A component file's stamp in a key of state built from its contents (util::FileInfo: size, modification time and
+// identity): a file replaced under the same path, or written in place, gets another; empty when it is no regular file
+// (the load that follows reports why).
+inline std::string file_stamp(const util::FileInfo& f) {
+  if (!f.regular()) return {};
+  return std::to_string(f.size) + "@" + std::to_string(f.mtime_ns) + "#" + std::to_string(f.volume) + ":" + std::to_string(f.id);
+}
+
+// The key of a component file's source (Impl::dit_sources, te_sources, vae_sources; a prefix of encoder_sources').
+inline std::string file_key(const std::filesystem::path& file) { return "file:" + util::path_utf8(util::path_key(file)); }
+
 // Where the DiT's weights come from (P6): the bundle's transformer, or a single file (quant::to_model_index; INT8,
 // mixed or bf16). `index` is what MossDit and the planner read: the bundle's index or quant->index.
 struct DitSource {
   std::filesystem::path path;  // the bundle's transformer directory or the file
+  util::FileInfo stamp;        // the file's when it was opened (single file only: Impl::check_component_files)
   const weights::ModelIndex* index = nullptr;
   std::unique_ptr<quant::QuantIndex> quant;  // single file only
   planner::Precision precision = planner::Precision::kBf16;
@@ -212,11 +224,14 @@ inline void check_layers(const std::vector<int>& layers, const char* name) {
 inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file) {
   // NVFP4 linears run only on cc 12.0 with the sm_120a kernels (user decision D1); otherwise the file is refused as an
   // unsupported model (MI_ERR_MODEL).
-  if (!util::file_info(file).exists()) throw std::invalid_argument("DiT file not found: " + util::path_utf8(file));
+  // Stamped before it is read: a file replaced during the open is seen at the next call.
+  const util::FileInfo stamp = util::file_info(file);
+  if (!stamp.exists()) throw std::invalid_argument("DiT file not found: " + util::path_utf8(file));
   DitFileInfo info = inspect_dit_file(file, [] { return moss_dit::nvfp4_unsupported_reason(); });
   if (!info.refusal.empty()) throw weights::UnsupportedModelError(info.refusal);
   auto d = std::make_unique<DitSource>();
   d->path = file;
+  d->stamp = stamp;
   d->quant = std::move(info.quant);
   d->index = &d->quant->index;
   d->precision = info.precision;
@@ -231,6 +246,7 @@ inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& fil
 // (precision and kernel versions), so embeddings of one encoder are never served for another.
 struct TeSource {
   std::filesystem::path path;  // the bundle's text_encoder directory or the file
+  util::FileInfo stamp;        // the file's when it was opened (file only: Impl::check_component_files)
   const weights::ModelIndex* index = nullptr;           // the bundle's (bf16)
   std::unique_ptr<qwen35_text::QuantTextModel> model;   // file only
   qwen35_text::Precision precision = qwen35_text::Precision::kBF16;
@@ -402,6 +418,7 @@ struct Pipeline::Impl {
   const VaeSource* vae_src = nullptr;
   std::map<std::string, std::unique_ptr<VaeSource>> vae_sources;
   std::unique_ptr<weights::ModelIndex> vae_file;  // options.vae_file's index (vae_file_index)
+  util::FileInfo vae_file_stamp;                  // the file's when vae_file was read
   // img2img's VAE encoder: persistent in the arena next to the decoder once loaded (dropped with the arena).
   std::unique_ptr<flux2_vae_encoder::Flux2VaeEncoder> encoder;
   const EncoderSource* encoder_src = nullptr;
@@ -478,6 +495,56 @@ struct Pipeline::Impl {
     return *it->second;
   }
 
+  // The component files (options.dit_file, text_encoder_file, vae_file) against the stamps of the state read from them,
+  // at the start of each call (setup_models: one util::file_info per file). A file replaced under the same path,
+  // written in place or truncated drops that state: its source, the models loaded from it (the arena is released when
+  // one is loaded: a mapped file is never read again), a soft unload's host copy of it, the LoRA stack checked against
+  // the DiT. The call then opens the file anew, so it never runs stale weights, and a file that no longer reads (a
+  // truncated one) is a clear error instead of a fault in a mapping. The control adapter and the LoRA files carry
+  // their stamps in their keys (setup_models).
+  void check_component_files() {
+    const auto changed = [](const std::filesystem::path& file, const util::FileInfo& stamp) {
+      return util::file_info(file) != stamp;
+    };
+    if (!options.dit_file.empty()) {
+      const auto it = dit_sources.find(file_key(options.dit_file));
+      if (it != dit_sources.end() && changed(options.dit_file, it->second->stamp)) {
+        const DitSource* old = it->second.get();
+        if (dit_src == old) release_arena();
+        if (dit_lost == old) dit_lost = nullptr;
+        if (dit_parked == old) dit_parked = nullptr;
+        if (dit_host_src == old) {
+          dit_host.reset();
+          dit_host_src = nullptr;
+        }
+        lora_files_key.clear();  // the stack was built for this DiT: rebuilt for the new one
+        dit_sources.erase(it);
+      }
+    }
+    if (!options.text_encoder_file.empty()) {
+      const auto it = te_sources.find(file_key(options.text_encoder_file));
+      if (it != te_sources.end() && changed(options.text_encoder_file, it->second->stamp)) {
+        const TeSource* old = it->second.get();
+        if (te_src == old) release_arena();
+        if (te_kept_src == old) drop_te_host();
+        te_sources.erase(it);
+      }
+    }
+    if (!options.vae_file.empty() && vae_file && changed(options.vae_file, vae_file_stamp)) {
+      // The decoder's source, and the encoder sources that read the file (its own encoder, or the header that sent a
+      // decoder-only file's encodes to the bundle's VAE).
+      const std::string key = file_key(options.vae_file);
+      const auto from_file = [&](const auto& entry) { return entry.first.starts_with(key + "|"); };
+      const auto v = vae_sources.find(key);
+      bool loaded = v != vae_sources.end() && vae_src == v->second.get();
+      for (const auto& e : encoder_sources) loaded = loaded || (from_file(e) && encoder_src == e.second.get());
+      if (loaded) release_arena();
+      if (v != vae_sources.end()) vae_sources.erase(v);
+      std::erase_if(encoder_sources, from_file);
+      vae_file.reset();
+    }
+  }
+
   // The DiT of this call: options.dit_file, else the bundle's transformer.
   DitSource& dit_source(const Bundle& b, double& load_s) {
     if (!options.dit_file.empty()) return dit_file_source(load_s);
@@ -491,8 +558,7 @@ struct Pipeline::Impl {
   }
   // options.dit_file's DiT (opened before the bundle is indexed: Impl::bundle).
   DitSource& dit_file_source(double& load_s) {
-    return cached_dit("file:" + util::path_utf8(util::path_key(options.dit_file)), load_s,
-                      [&] { return open_dit_file(options.dit_file); });
+    return cached_dit(file_key(options.dit_file), load_s, [&] { return open_dit_file(options.dit_file); });
   }
   template <class Open>
   DitSource& cached_dit(const std::string& key, double& load_s, Open&& open) {
@@ -522,11 +588,13 @@ struct Pipeline::Impl {
   // options.text_encoder_file's text encoder (opened before the bundle is indexed: Impl::bundle).
   TeSource& te_file_source(double& load_s) {
     const std::filesystem::path& path = options.text_encoder_file;
-    return cached_te("file:" + util::path_utf8(util::path_key(path)), load_s, [&] {
-      if (!util::file_info(path).regular()) throw std::invalid_argument("text encoder file not found: " + util::path_utf8(path));
+    return cached_te(file_key(path), load_s, [&] {
+      const util::FileInfo stamp = util::file_info(path);  // before it is read, as open_dit_file
+      if (!stamp.regular()) throw std::invalid_argument("text encoder file not found: " + util::path_utf8(path));
       weights::check_supported_text_encoder_file(path);
       auto t = std::make_unique<TeSource>();
       t->path = path;
+      t->stamp = stamp;
       t->model = model_file_errors(path, [&] { return std::make_unique<qwen35_text::QuantTextModel>(path); });
       t->precision = t->model->precision();
       t->identity = text_encoder_hash(t->model->index());
@@ -550,10 +618,12 @@ struct Pipeline::Impl {
   // decoder_config one whose shapes are no supported decoder's.
   const weights::ModelIndex& vae_file_index() {
     if (!vae_file) {
-      if (!util::file_info(options.vae_file).regular()) throw std::invalid_argument("VAE file not found: " + util::path_utf8(options.vae_file));
+      const util::FileInfo stamp = util::file_info(options.vae_file);  // before it is read, as open_dit_file
+      if (!stamp.regular()) throw std::invalid_argument("VAE file not found: " + util::path_utf8(options.vae_file));
       auto index = std::make_unique<weights::ModelIndex>(flux2_vae::index_vae_file(options.vae_file));
       flux2_vae::decoder_config(*index);
       vae_file = std::move(index);
+      vae_file_stamp = stamp;
     }
     return *vae_file;
   }
@@ -562,7 +632,7 @@ struct Pipeline::Impl {
   VaeSource& vae_source(const Bundle& b, double& load_s) {
     const bool file = !options.vae_file.empty();
     const std::filesystem::path path = file ? options.vae_file : b.dir;
-    const std::string key = (file ? "file:" : "bundle:") + util::path_utf8(util::path_key(path));
+    const std::string key = file ? file_key(path) : "bundle:" + util::path_utf8(util::path_key(path));
     auto it = vae_sources.find(key);
     if (it == vae_sources.end()) {
       const auto t0 = Clock::now();
@@ -584,8 +654,8 @@ struct Pipeline::Impl {
 
   // The VAE encoder of this call (EncoderSource).
   EncoderSource& encoder_source(const Bundle& b, double& load_s) {
-    const std::string key = (options.vae_file.empty() ? std::string() : "file:" + util::path_utf8(util::path_key(options.vae_file)) + "|") +
-                            "bundle:" + util::path_utf8(util::path_key(b.dir));
+    const std::string key = (options.vae_file.empty() ? std::string() : file_key(options.vae_file) + "|") + "bundle:" +
+                            util::path_utf8(util::path_key(b.dir));
     auto it = encoder_sources.find(key);
     if (it == encoder_sources.end()) {
       const auto t0 = Clock::now();

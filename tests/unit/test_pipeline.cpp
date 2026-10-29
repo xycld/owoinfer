@@ -26,6 +26,13 @@
 #include <utility>
 #include <vector>
 
+#ifdef __linux__
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+
 #include "core/cuda_check.h"
 #include "models/flux2_vae/flux2_vae.h"
 #include "models/moss_dit/moss_dit.h"
@@ -1613,6 +1620,119 @@ TEST(PipelineEndToEnd, ReplacedLoraFileLoadsAnew) {
   std::error_code ec;
   fs::remove_all(dir, ec);
 }
+
+#ifdef __linux__
+// A reflink copy of `from` placed at `to` by a rename, as a launcher replaces a file (btrfs, XFS: no data is copied, and
+// truncating the copy leaves the original alone); false when the file system cannot clone.
+bool clone_file(const fs::path& from, const fs::path& to) {
+  const fs::path tmp = fs::path(to) += ".tmp";
+  const int in = ::open(from.c_str(), O_RDONLY | O_CLOEXEC);
+  const int out = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  const bool cloned = in >= 0 && out >= 0 && ::ioctl(out, FICLONE, in) == 0;
+  if (in >= 0) ::close(in);
+  if (out >= 0) ::close(out);
+  std::error_code ec;
+  if (cloned) {
+    fs::rename(tmp, to, ec);
+  } else {
+    fs::remove(tmp, ec);
+  }
+  return cloned && !ec;
+}
+
+// Component files replaced under the same path between two generates (a launcher re-downloads one, a user overwrites
+// it) load anew: the DiT (the base model's INT8 file over the SFT's), the text encoder (W4A8 over INT8, the in-memory
+// embedding cache not serving the old encoder's embeddings) and the VAE (the full decoder over the small one) each give
+// what the new file gives under its own path. A component file truncated in place while the engine holds it (the
+// loaded DiT, the text encoder's mapped embedding) is a clean error naming it at the next generate, not a fault or
+// stale weights; restored, the next generate runs again. The same for the control adapter.
+TEST(PipelineEndToEnd, ReplacedComponentFilesLoadAnew) {
+  const fs::path sft = weights_root() / "sft";
+  const fs::path models = "/workspace/Models/community/comfy-org";
+  const fs::path base_dit = models / "moss_image_base_int8_convrot.safetensors";
+  const fs::path te8 = models / "qwen3.5_9b_int8_convrot.safetensors";
+  const fs::path te4 = models / "qwen3.5_9b_w4a8_gptq.safetensors";
+  const fs::path small_vae = models / "flux2-vae_small.safetensors";
+  const fs::path full_vae = models / "flux2-vae.safetensors";
+  const fs::path control = models / "moss_image_color_depth_control.safetensors";
+  for (const fs::path& f : {sft / "moss.mossidx", kInt8Dit, base_dit, te8, te4, small_vae, full_vae, control}) {
+    if (!fs::is_regular_file(f)) GTEST_SKIP() << f.string() << " not present";
+  }
+  mi::testing::TempDir scratch("pipe_replaced");
+  const fs::path dit = scratch.path() / "dit.safetensors", te = scratch.path() / "te.safetensors",
+                 vae = scratch.path() / "vae.safetensors", ctl = scratch.path() / "control.safetensors";
+  if (!clone_file(kInt8Dit, dit)) GTEST_SKIP() << "the test folder's file system cannot clone files";
+  ASSERT_TRUE(clone_file(te8, te));
+  ASSERT_TRUE(clone_file(small_vae, vae));
+  ASSERT_TRUE(clone_file(control, ctl));
+
+  mi::pipeline::Request req;
+  req.model = sft;
+  req.prompt = "a lighthouse on a cliff at night";
+  req.height = req.width = 256;
+  req.steps = 3;
+  mi::pipeline::PipelineOptions options;
+  options.tier = mi::planner::Tier::kHigh;
+  // What the files give under their own paths, each in a pipeline of its own.
+  const auto reference = [&](const fs::path& d, const fs::path& t, const fs::path& v) {
+    mi::pipeline::PipelineOptions o = options;
+    o.dit_file = d;
+    o.text_encoder_file = t;
+    o.vae_file = v;
+    mi::pipeline::Pipeline p(o);
+    return p.generate(req);
+  };
+  const mi::pipeline::Result ref_base = reference(base_dit, te8, small_vae);
+  const mi::pipeline::Result ref_last = reference(base_dit, te4, full_vae);
+
+  options.dit_file = dit;
+  options.text_encoder_file = te;
+  options.vae_file = vae;
+  mi::pipeline::Pipeline pipe(options);
+  const mi::pipeline::Result first = pipe.generate(req);
+  ASSERT_FALSE(first.rgb.empty());
+  ASSERT_TRUE(clone_file(base_dit, dit));
+  const mi::pipeline::Result new_dit = pipe.generate(req);
+  EXPECT_EQ(new_dit.memory.dit_loads, 1);
+  EXPECT_GT(bit_mismatches(new_dit.latents, first.latents), 0u);
+  EXPECT_EQ(bit_mismatches(new_dit.latents, ref_base.latents), 0u);
+  EXPECT_TRUE(new_dit.rgb == ref_base.rgb);
+  ASSERT_TRUE(clone_file(te4, te));
+  const mi::pipeline::Result new_te = pipe.generate(req);
+  EXPECT_EQ(new_te.te_precision, ref_last.te_precision);
+  EXPECT_NE(new_te.te_precision, new_dit.te_precision);
+  EXPECT_EQ(bit_mismatches(new_te.latents, ref_last.latents), 0u);
+  ASSERT_TRUE(clone_file(full_vae, vae));
+  const mi::pipeline::Result new_vae = pipe.generate(req);
+  EXPECT_EQ(bit_mismatches(new_vae.latents, ref_last.latents), 0u);
+  EXPECT_TRUE(new_vae.rgb == ref_last.rgb);
+  EXPECT_FALSE(new_vae.rgb == new_te.rgb);
+
+  const auto truncated_fails = [&](const fs::path& file) {
+    fs::resize_file(file, 4096);  // in place: the same file, now cut short
+    try {
+      pipe.generate(req);
+      ADD_FAILURE() << "a truncated file generated";
+    } catch (const std::exception& e) {
+      EXPECT_NE(std::string(e.what()).find(file.string()), std::string::npos) << e.what();
+    }
+  };
+  for (const auto& [file, original] : {std::pair{dit, base_dit}, std::pair{te, te4}, std::pair{vae, full_vae}}) {
+    SCOPED_TRACE(file.string());
+    truncated_fails(file);
+    ASSERT_TRUE(clone_file(original, file));
+    const mi::pipeline::Result again = pipe.generate(req);
+    EXPECT_EQ(bit_mismatches(again.latents, ref_last.latents), 0u);
+    EXPECT_TRUE(again.rgb == ref_last.rgb);
+  }
+  req.control.adapter = ctl;
+  const mi::pipeline::Result with_control = pipe.generate(req);
+  truncated_fails(ctl);
+  ASSERT_TRUE(clone_file(control, ctl));
+  const mi::pipeline::Result restored = pipe.generate(req);
+  EXPECT_EQ(bit_mismatches(restored.latents, with_control.latents), 0u);
+}
+#endif
 
 // The High tier on the Comfy-Org INT8 file keeps its 8-bit attention with runtime LoRAs, in either order: the tier is
 // the caller's, never adjusted to what the request carries; the report says the LoRAs are active.
