@@ -94,6 +94,17 @@ struct DenoiseStack {
 std::size_t denoise_stack_bytes(const DenoiseStack& d, moss_dit::BlockPath path, const moss_dit::ComputeConfig& config,
                                 const moss_dit::FusedRouteSnapshot& route);
 
+// The forward workspace a component run that makes crop calls (MI_RUN_CROPS) reserves for its rows at its full latent
+// grid h x w: a crop's smaller token count can move a GEMM to the op-by-op route (fused_route), whose big buffer is
+// wider, so the bound is the larger of the route's and the op-by-op path's workspace at the full size. GpuCropBound
+// sweeps every crop size and row subset against it.
+inline std::size_t crop_workspace_bound(std::int64_t h, std::int64_t w, std::span<const std::int64_t> rows,
+                                        moss_dit::BlockPath path, const moss_dit::ComputeConfig& config,
+                                        const moss_dit::FusedRouteSnapshot& route) {
+  return std::max(moss_dit::MossDit::workspace_bytes(h, w, rows, path, config, &route),
+                  moss_dit::MossDit::workspace_bytes(h, w, rows, moss_dit::BlockPath::kOpByOp, config, &route));
+}
+
 struct Bundle {
   std::filesystem::path dir;
   weights::ModelIndex index;  // without the components left out for the pipeline's component files
