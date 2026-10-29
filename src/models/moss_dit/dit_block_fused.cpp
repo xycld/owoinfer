@@ -291,9 +291,7 @@ struct DevMatrix {
 };
 
 // Run lengths the self-check asks cuBLASLt about: every count up to 1536 (small images, where its choice changes
-// most), then every 16th up to 8192 and every 64th up to the longest run (cond + uncond + SLG rows of a 4.2 MP image,
-// pipeline::kMaxPixels, each with a 4096-token prompt).
-constexpr std::int64_t kMaxRunRows = 3 * (4'200'000 / 256 + 4096);
+// most), then every 16th up to 8192 and every 64th up to the longest run (kMaxRunRows).
 std::vector<std::int64_t> realistic_rows() {
   std::vector<std::int64_t> rows;
   for (std::int64_t m = 1; m <= 1536; ++m) rows.push_back(m);

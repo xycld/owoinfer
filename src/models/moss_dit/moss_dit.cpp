@@ -927,6 +927,13 @@ std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, st
   return plan.total();
 }
 
+std::size_t MossDit::forward_stack_bytes(std::int64_t height, std::int64_t width,
+                                        std::span<const std::int64_t> text_lengths) const {
+  const ComputeConfig config = lora_ != nullptr ? compute_config(quant_, config_.attention, int4_route_, lora_) : config_;
+  const FusedRouteSnapshot* route = request_route_ ? &*request_route_ : nullptr;
+  return workspace_bytes(height, width, text_lengths, path_, config, route) + blocks_->buffer_bytes();
+}
+
 void embed_video(kernels::Gemm& gemm, void* gemm_workspace, std::size_t gemm_workspace_bytes, const Tensor& latents,
                  const Tensor* extra, void* tokens, const Tensor& weight, const Tensor& bias, const Tensor& out,
                  cudaStream_t stream) {
@@ -996,8 +1003,14 @@ void MossDit::run_block(int bi, const Block& b, const Activations& a, const Run&
 void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row> rows, std::span<const Tensor> out,
                       cudaStream_t stream, const BlockHook& hook) {
   check_device(latents, DType::kF32, "latents");
-  if (latents.rank != 3 || latents.dim(0) != kLatentChannels) fail("latents must be [128, h, w], got " + latents.describe());
-  const std::int64_t height = latents.dim(1), width = latents.dim(2), hw = height * width;
+  // [128, h, w], or a latent batch [L, 128, h, w].
+  const bool batched = latents.rank == 4;
+  if (!(latents.rank == 3 && latents.dim(0) == kLatentChannels) &&
+      !(batched && latents.dim(0) >= 1 && latents.dim(1) == kLatentChannels)) {
+    fail("latents must be [128, h, w] or [L, 128, h, w], got " + latents.describe());
+  }
+  const std::int64_t num_latents = batched ? latents.dim(0) : 1;
+  const std::int64_t height = latents.dim(latents.rank - 2), width = latents.dim(latents.rank - 1), hw = height * width;
   if (rows.empty() || out.size() != rows.size()) fail("forward needs >= 1 row and one output per row");
   if (rows.size() > static_cast<std::size_t>(kMaxRows)) fail("at most " + std::to_string(kMaxRows) + " rows per forward");
   std::vector<std::int64_t> lengths;
@@ -1005,6 +1018,10 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     const Tensor& t = rows[r].text;
     check_device(t, DType::kBF16, "row text");
     if (t.rank != 2 || t.dim(0) < 1 || t.dim(1) != kDim) fail("row text must be [S >= 1, 3072], got " + t.describe());
+    if (rows[r].latent < 0 || rows[r].latent >= num_latents) {
+      fail("row " + std::to_string(r) + " reads latent " + std::to_string(rows[r].latent) + " of " +
+           std::to_string(num_latents));
+    }
     check_device(out[r], DType::kF32, "out");
     if (out[r].rank != 3 || out[r].dim(0) != kLatentChannels || out[r].dim(1) != height || out[r].dim(2) != width) {
       fail("out must match latents [128, h, w], got " + out[r].describe());
@@ -1013,7 +1030,11 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   }
   const std::vector<std::int64_t> off = token_offsets(height, width, lengths);
   const std::int64_t total = off.back();
-  if (total > INT32_MAX) fail("too many tokens");
+  // Past the self-check's longest run the linears would go op by op unchecked: refused instead (a latent batch or many
+  // long rows; mi_generate's rows stay within it).
+  if (total > kMaxRunRows) {
+    fail("a forward of " + std::to_string(total) + " joint tokens exceeds " + std::to_string(kMaxRunRows));
+  }
 
   // One route for the whole forward (its big buffer, graph keys and every block): an install_fused_check meanwhile, e.g.
   // another pipeline's poisoning, applies from the next forward on instead of failing this one's buffer check.
@@ -1104,28 +1125,50 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   time_modulation(timestep, a.mod, a.head, stream);
 
   // Per-row RoPE tables (P:250, text length differs per row) and the joint inputs [video_r | text_r] (P:247-252).
-  // The video embedding is the same for every row: computed once, copied to the other rows.
+  // The video embedding is the same for every row of a latent: computed once, into the latent's first row, and copied
+  // to its other rows (one latent: row 0's embedding copied to every other row).
   if (input_ext_ != nullptr) {
     const Tensor& e = input_ext_->extra;
+    const std::int64_t c = input_ext_->weight.dim(1) - kLatentChannels;
     check_device(e, DType::kF32, "input extension extra");
-    if (e.rank != 3 || e.dim(0) != input_ext_->weight.dim(1) - kLatentChannels || e.dim(1) != height || e.dim(2) != width ||
-        !e.is_contiguous()) {
-      fail("input extension extra must be a contiguous [" + std::to_string(input_ext_->weight.dim(1) - kLatentChannels) + ", " +
-           std::to_string(height) + ", " + std::to_string(width) + "], got " + e.describe());
+    if (e.rank != latents.rank || (batched && e.dim(0) != num_latents) || e.dim(e.rank - 3) != c ||
+        e.dim(e.rank - 2) != height || e.dim(e.rank - 1) != width || !e.is_contiguous()) {
+      fail("input extension extra must be a contiguous [" + (batched ? std::to_string(num_latents) + ", " : std::string()) +
+           std::to_string(c) + ", " + std::to_string(height) + ", " + std::to_string(width) + "], got " + e.describe());
     }
   }
-  // The tokens live in the big buffer ([total, >= kFusedBigCols] bf16, idle until the first block), also when widened.
-  embed_video(gemm_, gemm_workspace_, kernels::Gemm::kWorkspaceBytes, latents,
-              input_ext_ != nullptr ? &input_ext_->extra : nullptr, a.big.data,
-              input_ext_ != nullptr ? input_ext_->weight : video_embedder_.w,
-              input_ext_ != nullptr ? input_ext_->bias : video_embedder_.bias, a.x.slice0(0, hw), stream);
+  // Latent l's [C, h, w] plane of a [L, C, h, w] batch (the tensor itself when not batched).
+  const auto plane = [&](const Tensor& t, int l) {
+    if (!batched) return t;
+    const std::int64_t c = t.dim(1);
+    return Tensor::view(t.ptr<float>() + static_cast<std::size_t>(l) * static_cast<std::size_t>(c * hw), DType::kF32,
+                        Device::kCUDA, {c, height, width});
+  };
+  // src[r]: the row whose video tokens hold row r's embedding (the first row reading its latent).
+  std::size_t src[kMaxRows];
+  for (std::size_t r = 0; r < rows.size(); ++r) {
+    src[r] = r;
+    for (std::size_t q = 0; q < r; ++q) {
+      if (rows[q].latent == rows[r].latent) {
+        src[r] = q;
+        break;
+      }
+    }
+    if (src[r] != r) continue;
+    // The tokens live in the big buffer ([total, >= kFusedBigCols] bf16, idle until the first block), also when widened.
+    const Tensor extra = input_ext_ != nullptr ? plane(input_ext_->extra, rows[r].latent) : Tensor{};
+    embed_video(gemm_, gemm_workspace_, kernels::Gemm::kWorkspaceBytes, plane(latents, rows[r].latent),
+                input_ext_ != nullptr ? &extra : nullptr, a.big.data,
+                input_ext_ != nullptr ? input_ext_->weight : video_embedder_.w,
+                input_ext_ != nullptr ? input_ext_->bias : video_embedder_.bias, a.x.slice0(off[r], off[r] + hw), stream);
+  }
   const std::size_t row_bytes = kDim * sizeof(std::uint16_t);
   for (std::size_t r = 0; r < rows.size(); ++r) {
     kernels::moss_rope_table(a.rope.slice0(off[r], off[r + 1]), static_cast<int>(height), static_cast<int>(width),
                              static_cast<int>(lengths[r]), stream);
-    if (r > 0) {
-      MI_CUDA_CHECK(cudaMemcpyAsync(a.x.slice0(off[r], off[r] + hw).data, a.x.data, static_cast<std::size_t>(hw) * row_bytes,
-                                    cudaMemcpyDeviceToDevice, stream));
+    if (src[r] != r) {
+      MI_CUDA_CHECK(cudaMemcpyAsync(a.x.slice0(off[r], off[r] + hw).data, a.x.slice0(off[src[r]], off[src[r]] + hw).data,
+                                    static_cast<std::size_t>(hw) * row_bytes, cudaMemcpyDeviceToDevice, stream));
     }
     MI_CUDA_CHECK(cudaMemcpyAsync(a.x.slice0(off[r] + hw, off[r + 1]).data, rows[r].text.data,
                                   static_cast<std::size_t>(lengths[r]) * row_bytes, cudaMemcpyDeviceToDevice, stream));

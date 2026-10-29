@@ -204,6 +204,8 @@ class BlockWeights {
   BlockWeights& operator=(const BlockWeights&) = delete;
 
   const Residency& residency() const { return residency_; }
+  // buffer_bytes() of this provider: the stack bytes a forward's streaming pass adds.
+  std::size_t buffer_bytes() const { return buffer_bytes(index_, residency_); }
   bool resident(int block) const { return mask_.test(static_cast<std::size_t>(block)); }
   int streamed_blocks() const { return static_cast<int>(streamed_.size()); }
   std::size_t host_resident_bytes() const;  // pinned host copy held (kHostPinned)

@@ -61,6 +61,9 @@ struct FusedRoute {
   bool up_gate = true;  // ffn_up_gate + SiTU-GLU
   bool down = true;     // ffn_down + gated residual
 };
+// The longest run the startup self-check covers: the cond, uncond and SLG rows of a 4.2 MP image (pipeline::kMaxPixels),
+// each with a 4096-token prompt. MossDit::forward refuses a forward with more joint tokens.
+inline constexpr std::int64_t kMaxRunRows = 3 * (4'200'000 / 256 + 4096);
 FusedRoute fused_route(std::int64_t rows);
 // The same with `validated` in place of the installed configurations and regardless of poisoning (route snapshots,
 // tests).
