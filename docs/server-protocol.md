@@ -1,4 +1,4 @@
-# moss-server protocol (version 1)
+# moss-server protocol (version 2)
 
 `moss-server` is the engine as a sidecar process for launchers, in the role `llama-server` plays for llama.cpp.
 - The launcher spawns it and talks **JSON lines over stdin/stdout**. There are no ports, no firewall prompts and no extra dependencies.
@@ -8,7 +8,7 @@
 ```
 moss-server                     # speak the protocol on stdin/stdout
 moss-server --parent-pid <pid>  # the same, and exit when process <pid> (the launcher) exits
-moss-server --version           # "moss-server 2.0.0 (protocol 1, ABI 1)"
+moss-server --version           # "moss-server 2.0.0 (protocol 2, ABI 1)"
 ```
 
 ### `--parent-pid`
@@ -77,12 +77,12 @@ Unknown members in `params` are rejected (`invalid_params`), so a typo cannot be
 
 Params (all optional):
 - `client` (string)
-- `protocol_version` (integer; an error unless it is 1)
+- `protocol_version` (integer; `unsupported_protocol` unless it is 2)
 - `devices` (bool): adds the per-device list, with free memory from NVML or a short-lived driver context. No CUDA context remains afterwards (`mi_probe_device()`, docs/c-api.md).
 
 ```
->> {"id": 1, "method": "hello", "params": {"client": "launcher", "protocol_version": 1}}
-<< {"id": 1, "result": {"protocol_version": 1, "server": "moss-server", "version": "2.0.0", "abi_version": 1,
+>> {"id": 1, "method": "hello", "params": {"client": "launcher", "protocol_version": 2}}
+<< {"id": 1, "result": {"protocol_version": 2, "server": "moss-server", "version": "2.0.0", "abi_version": 1,
     "capabilities": {"preview": true, "comfyui_models": false, "model_files": true, "lora": true, "tiers": true,
                      "samplers": true, "image_input": true, "hires": true, "distill": true, "system_cuda": true,
                      "control": true, "accel": true, "preload": true, "release": true, "certificate_dirs": false,

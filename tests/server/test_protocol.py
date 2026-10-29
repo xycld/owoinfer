@@ -256,9 +256,9 @@ class ProtocolTestBase(unittest.TestCase):
 
 class CpuProtocolTest(ProtocolTestBase):
     def test_hello(self):
-        r = self.server.call("hello", {"client": "test_protocol.py", "protocol_version": 1})
+        r = self.server.call("hello", {"client": "test_protocol.py", "protocol_version": 2})
         res = r["result"]
-        self.assertEqual(res["protocol_version"], 1)
+        self.assertEqual(res["protocol_version"], 2)
         self.assertEqual(res["server"], "moss-server")
         self.assertRegex(res["version"], r"^\d+\.\d+\.\d+$")
         self.assertEqual(res["abi_version"], 1)
@@ -290,7 +290,11 @@ class CpuProtocolTest(ProtocolTestBase):
             self.assertEqual((lt["version"], lt["path"]), (0, ""))
             self.assertTrue(lt["error"].startswith("no usable cuBLASLt"), lt["error"])
             self.assertRegex(lt["error"], r"rejected:|missing \(|no candidates")
-        self.assertError(self.server.call("hello", {"protocol_version": 2}, id="v2"), "unsupported_protocol", "v2")
+        # Protocol 2 since 2.0: a protocol-1 client (no tier on load, done.certified read) stops at the handshake.
+        for v in (1, 3):
+            r = self.server.call("hello", {"protocol_version": v}, id="v%d" % v)
+            self.assertError(r, "unsupported_protocol", "v%d" % v)
+            self.assertIn("protocol version 2", r["error"]["message"])
 
     def test_status_and_idle_commands_without_engine(self):
         self.assertEqual(self.server.call("status")["result"], {"state": "unloaded"})
@@ -327,7 +331,7 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertError(s.read(), "parse_error")
         s.send_raw(b'{"id": 6, "method": "hello", "params": {"client": "' + b"a" * (2 << 20) + b'"}}\n')
         self.assertError(s.read(), "invalid_request")
-        self.assertEqual(s.call("hello")["result"]["protocol_version"], 1)
+        self.assertEqual(s.call("hello")["result"]["protocol_version"], 2)
 
     def test_unknown_method_and_params(self):
         self.assertError(self.server.call("frobnicate", id="m"), "method_not_found", "m")
@@ -844,7 +848,7 @@ class CpuProtocolTest(ProtocolTestBase):
     def test_version_flag(self):
         out = subprocess.run([SERVER, "--version"], capture_output=True, timeout=TIMEOUT)
         self.assertEqual(out.returncode, 0)
-        self.assertRegex(out.stdout.decode(), r"^moss-server \d+\.\d+\.\d+ \(protocol 1, ABI 1\)")
+        self.assertRegex(out.stdout.decode(), r"^moss-server \d+\.\d+\.\d+ \(protocol 2, ABI 1\)")
         self.assertEqual(subprocess.run([SERVER, "--bogus"], capture_output=True, timeout=TIMEOUT).returncode, 2)
         for bad in (["--parent-pid"], ["--parent-pid", "abc"], ["--parent-pid", "0"], ["--parent-pid", "-5"],
                     ["--parent-pid", "99999999999"]):
@@ -874,7 +878,7 @@ class CpuProtocolTest(ProtocolTestBase):
     def run_session(self, server):
         """hello, status, shutdown on `server`; the protocol stream must stay clean."""
         try:
-            self.assertEqual(server.call("hello", {"protocol_version": 1})["result"]["protocol_version"], 1)
+            self.assertEqual(server.call("hello", {"protocol_version": 2})["result"]["protocol_version"], 2)
             self.assert_protocol_fd_private(server)
             load = {"model": os.path.join(self.tmp, "missing"), "tier": "reference"}
             self.assertEqual(server.call("load", load)["error"]["code"], "invalid_argument")

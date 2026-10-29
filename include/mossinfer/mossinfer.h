@@ -865,7 +865,7 @@ typedef struct mi_accel_info {
   /* The request's settings activate a lossy accelerator (MI_TEXT_ACCELERATORS). It describes the requested, active
    * settings, not what ran: a run cancelled before sampling still reports 1. */
   int32_t lossy;
-  /* Fields after the 24-byte layout (an earlier 2.0.0 header). The threshold the step cache ran with: the request's,
+  /* Fields after the 24-byte layout (a pre-release header). The threshold the step cache ran with: the request's,
    * or the model's default (MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE says which); 0 with the step cache off. */
   double step_cache_threshold;
 } mi_accel_info;

@@ -56,7 +56,8 @@
 
 namespace {
 
-constexpr int kProtocolVersion = 1;
+// 2 since moss-server 2.0: load's tier is required and done has no certified (docs/server-protocol.md).
+constexpr int kProtocolVersion = 2;
 constexpr std::size_t kMaxLineBytes = std::size_t{1} << 20;  // a request is a prompt and a few numbers
 constexpr std::size_t kMaxJsonValues = 1 << 16;
 

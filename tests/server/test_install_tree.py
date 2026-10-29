@@ -66,7 +66,7 @@ def hello(prefix, **env_vars):
     p = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                          env=env, cwd=os.path.dirname(os.path.abspath(prefix)))  # never the build tree
     try:
-        p.stdin.write('{"id": 1, "method": "hello", "params": {"protocol_version": 1}}\n')
+        p.stdin.write('{"id": 1, "method": "hello", "params": {"protocol_version": 2}}\n')
         p.stdin.flush()
         answer = None
         for line in p.stdout:

@@ -8,7 +8,7 @@ The reference documents are:
 
 This page does not repeat them. It explains how the pieces fit together, and which choices the launcher has to make.
 
-Version 2.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what stays compatible, and [Migrating from 1.x](#migrating-from-1x) for what changed.
+Version 2.0.0 (ABI 1, server protocol 2). See [Versioning](#versioning) for what stays compatible, and [Migrating from 1.x](#migrating-from-1x) for what changed.
 
 MossInfer is a low-level engine: it runs what the caller asks for, refuses what the hardware or the files cannot run with the reason, and reports what ran. It does not choose for the caller. The launcher picks the tier, the memory mode and the budgets; [Performance](#performance) says what each costs and gives.
 
@@ -321,7 +321,7 @@ The gain holds at 2048²: INT8 `high` runs 1.18 s per step against 2.77 s for bf
 Ask the engine. `mi_probe()`, or the sidecar's `hello`, works on machines without a driver or GPU, and leaves no CUDA context behind. A `cu13` build also answers correctly on a CUDA 12 driver.
 
 ```
->> {"id": 1, "method": "hello", "params": {"client": "launcher", "protocol_version": 1, "devices": true}}
+>> {"id": 1, "method": "hello", "params": {"client": "launcher", "protocol_version": 2, "devices": true}}
 << {"id": 1, "result": {..., "probe": {"driver_cuda_version": 13040, "build_flavour": "cu13",
     "recommended_flavour": "cu13", "driver_compatible": true, "supported_device_count": 1,
     "message": "recommended flavour cu13 (the driver supports CUDA 13.4)", "devices": [...]}}}
@@ -352,7 +352,7 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 - Events (`plan`, `progress`, `preview`, `done`, `log`) carry the `id` of the request they belong to, and can arrive between responses. Read stdout on a dedicated thread, and dispatch by `id` and `event`.
 
 **Lifecycle.**
-1. `hello`: check `protocol_version == 1` and `abi_version`, and pick the flavour (see above). Fill the settings' menus from `values`. `inspect` `{"path": ...}` classifies the user's model files at any time, before `load` too.
+1. `hello`: send and check `protocol_version` 2 and `abi_version`, and pick the flavour (see above). Fill the settings' menus from `values`. `inspect` `{"path": ...}` classifies the user's model files at any time, before `load` too.
 2. `load` `{"model": "<folder>", "dit_file": "<INT8 DiT>", "tier": "high", "mode": "balanced", "cache_dir": "<launcher cache dir>/mossinfer"}`. `tier` is required. This returns quickly. The weights load during `generate`: the DiT in the first `dit_load` phase, and the text encoder streams in `text_encoder` whenever the prompt is not in the embedding cache.
 3. `generate` `{"prompt": ..., "output": "<path>.png", ...}`. The answer is immediate: `{"accepted": true}`. Then come `plan` once, `progress` at each phase start and after each step, `preview` before a step's `progress` when `preview_output` is set, and finally `done` with `status` `ok`, `cancelled` or `error`. Show `done.warnings` (LoRA losses, a truncated prompt) next to the image.
 4. `cancel` `{"id": <the generate request's id>}` from the UI's stop button. The id must match exactly, JSON type included (`"g1"` is not `1`). The generation stops within one block or layer, and `done` arrives with `"status": "cancelled"`.
@@ -515,13 +515,14 @@ Attach it to bug reports, together with the server's stderr log and `hello`'s `p
 - **Version numbers.**
   - `mi_version()` returns the release version (`2.0.0`).
   - `mi_abi_version()` and `MI_ABI_VERSION` give the binary interface version (1).
-  - The server's `hello` reports its `protocol_version` (1).
+  - The server's `hello` reports its `protocol_version` (2).
 - **Additive changes keep ABI 1:** new functions, new fields at the end of structs, new enum values, new optional server parameters and events.
   - A newer library accepts structs from programs built against an older header: their `struct_size` is smaller, the library reads only those bytes, and the missing fields take their defaults. It writes only `struct_size` bytes of output structs.
   - This is implemented: every earlier size of `mi_engine_params` and `mi_gen_params` is accepted ([c-api.md](c-api.md#struct-sizes)); any other size returns `MI_ERR_ABI_MISMATCH`. A 0.1.0 `mi_gen_params` keeps the 0.1.0 behaviour (its PNGs carry no metadata). The 0.1.0 `mi_engine_params` (80 bytes) has no `tier` field, so since 2.0 it creates no engine.
 - **Incompatible binary changes raise `MI_ABI_VERSION`.** On Linux the shared library's SONAME follows the ABI (`libmossinfer.so.1`). 2.0 keeps ABI 1: no symbol, field, offset or enum value moved; retired fields stay in place as reserved.
 - **Releases with the same MAJOR version are source and binary compatible.** A launcher built against a 2.x header runs with any later 2.y library: additions arrive as new functions, enum values and trailing struct fields (versioned by `struct_size`). A behaviour change that callers must act on raises the MAJOR version, as 2.0 did.
   - **Build time:** the CMake package (`SameMajorVersion`) satisfies a request from any release with the same MAJOR and at least the requested version: `find_package(MossInfer 2.0)` finds every 2.x, but not 1.x or 3.0.
+- **The server protocol version** rises when a request that was valid fails, or a documented field goes away: protocol 2 (moss-server 2.0) requires `load`'s `tier` and drops `done.certified`. A `hello` with another `protocol_version` is `unsupported_protocol`, so a 1.x launcher stops at the handshake rather than at its first `load`.
 - **Server clients:** unknown parameters are rejected with `invalid_params`, so a typo never goes unnoticed. Send only parameters that the server's version documents. Ignore unknown fields in responses and events, because new ones will appear.
 
 ### Migrating from 1.x
@@ -530,7 +531,7 @@ Attach it to bug reports, together with the server's stderr log and `hello`'s `p
 - **Pass a tier.** `mi_engine_params.tier` (server: `load`'s `tier`, CLI: `--tier`) is required: `MI_TIER_REFERENCE`, `MI_TIER_HIGH` or `MI_TIER_TURBO`. `MI_TIER_AUTO`, the zero default, now fails `mi_engine_create()` with `MI_ERR_INVALID_ARGUMENT`; a `load` without `tier` is `invalid_params`. What 1.x `auto` ran without a certificate: `REFERENCE` for the bf16 bundle, `HIGH` with `attention` `EXACT` for an INT8 DiT. For speed, use `HIGH` with its default 8-bit attention.
 - **Treat the certificate fields as inert.** The engine reads no quality certificates and packages ship none. `certificate_dirs` is ignored, `MI_CAP_CERTIFICATE_DIRS` is never set, `mi_tier_info.certified` and `run_certified` are 0, `MI_TEXT_CERTIFICATE` is `""`, and the server's `done` has no `certified`. The report's `models.dit` has `tier` instead of `tier_requested`, `tier_effective` and `certified`; its `quality` object keeps what ran (tier, configuration, numerics, cuBLASLt, GPU class, model paths) without `reason` or `certificate`.
 
-`hello`'s `values.tier` lists exactly the accepted names, and `inspect`'s `tiers` exactly the tiers `generate` accepts for a DiT. The server protocol stays version 1.
+`hello`'s `values.tier` lists exactly the accepted names, and `inspect`'s `tiers` exactly the tiers `generate` accepts for a DiT. The server protocol is version 2: send `protocol_version` 2 in `hello`.
 
 ## Licensing and redistribution
 
