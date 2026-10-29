@@ -175,12 +175,13 @@ if(MOSSINFER_TESTS)
   file(GLOB MOSSINFER_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/unit/*.cpp ${CMAKE_SOURCE_DIR}/tests/unit/*.cu)
   mossinfer_filter(MOSSINFER_TEST_SOURCES "${MOSSINFER_TEST_SOURCES}" ${CMAKE_SOURCE_DIR}/tests/unit "${MOSSINFER_TESTS_ONLY}")
   if(NOT MOSSINFER_BUILD_API)
-    list(FILTER MOSSINFER_TEST_SOURCES EXCLUDE REGEX ".*/tests/unit/test_(c_api|c_api_check|c_api_inspect|component_api|progress_model)\\.cpp$")
+    list(FILTER MOSSINFER_TEST_SOURCES EXCLUDE REGEX ".*/tests/unit/test_(c_api|c_api_check|c_api_inspect|component_api|component_gpu|progress_model)\\.cpp$")
   endif()
   add_executable(mossinfer_tests ${MOSSINFER_TEST_SOURCES})
-  # Its reference arithmetic is compared bit for bit with the NVFP4 recipes (MOSSINFER_STRICT_FP_SOURCES).
+  # Their reference arithmetic is compared bit for bit with the NVFP4 recipes (MOSSINFER_STRICT_FP_SOURCES) and with
+  # the samplers' kernels (the component API's host loops, design §5.3).
   set(_mi_strict_tests ${MOSSINFER_TEST_SOURCES})
-  list(FILTER _mi_strict_tests INCLUDE REGEX ".*/tests/unit/test_nvfp4_convert\\.cpp$")
+  list(FILTER _mi_strict_tests INCLUDE REGEX ".*/tests/unit/test_(nvfp4_convert|component_gpu)\\.cpp$")
   if(_mi_strict_tests)
     set_source_files_properties(${_mi_strict_tests} PROPERTIES COMPILE_OPTIONS "${MOSSINFER_STRICT_FP_OPTIONS}")
   endif()
