@@ -473,9 +473,14 @@ TEST(LoraFormat, MossEditLoraAdapterConfig) {
   const LoraStack s = open1(dir.path() / "e.safetensors");
   EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.q").at(0)->alpha_scale, 2.0);
   EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.k").at(0)->alpha_scale, 0.5);
-  EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.v").at(0)->alpha_scale, 1.0);  // no alpha: 1
+  EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.v").at(0)->alpha_scale, 1.0);  // no alpha: 1, with a warning
   EXPECT_EQ(s.reports()[0].format, "moss-edit-lora");
   EXPECT_TRUE(s.reports()[0].unknown.empty());
+  EXPECT_EQ(s.reports()[0].warnings,
+            std::vector<std::string>{"1 module without an alpha in adapter_config (moss-edit-lora), first: layers.0.proj.v"});
+  LoadOptions strict;
+  strict.strict = true;
+  EXPECT_THROW(open1(dir.path() / "e.safetensors", 1.0f, strict), LoraError);
   EXPECT_NE(s.reports()[0].notes.back().find("adapter_config (moss-edit-lora) applied to 2 modules"), std::string::npos);
   std::map<std::string, std::string> md{{"adapter_config", R"({"format": "other", "modules": {"q": {"alpha": 2}}})"}};
   EXPECT_TRUE(quant::lora_adapter_config_alphas(md).empty());  // only the moss-edit-lora format's
@@ -537,7 +542,9 @@ TEST(LoraFormat, PlacementPerModule) {
   auto plain = low_rank("transformer.layers.0.proj.q", ".lora_A.weight", ".lora_B.weight", kD, kD, 4, 1);
   for (auto& x : low_rank("transformer.layers.1.proj.o", ".lora_A.weight", ".lora_B.weight", kD, kD, 4, 2)) plain.push_back(x);
   write_st(dir.path() / "plain.safetensors", plain);
-  const std::string edit_meta = R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"modules\": {}}"})";
+  const std::string edit_meta =
+      R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"modules\": {\"layers.0.proj.q\": {\"alpha\": 4}, )"
+      R"(\"layers.1.proj.o\": {\"alpha\": 4}, \"layers.2.proj.k\": {\"alpha\": 4}}}"})";
   auto edit = low_rank("layers.0.proj.q", ".lora_A", ".lora_B", kD, kD, 4, 3);
   for (auto& x : low_rank("layers.1.proj.o", ".lora_A", ".lora_B", kD, kD, 4, 4)) edit.push_back(x);
   for (auto& x : low_rank("layers.2.proj.k", ".lora_A", ".lora_B", kD, kD, 4, 5)) edit.push_back(x);

@@ -166,7 +166,8 @@ void lora_merge_row(float* w, std::int64_t k, const float* up_row, const float* 
 //   ...}}}): lora_adapter_config_alphas returns them by module name as written (QuantError for a moss-edit-lora header
 //   without a modules object or with a non-finite alpha), and lora_adapter_config_format "moss-edit-lora" for such a
 //   file. Any other adapter_config (absent, not JSON, not an object, another format) is an ordinary LoRA's: "", no
-//   alphas, never an error.
+//   alphas, never an error. The converter and the runtime stack look a module up by its name as written in its keys,
+//   then without its prefix; a module of such a file with neither an alpha tensor nor an entry is warned about.
 // - Without either, alpha / rank = 1.
 // (ComfyUI reads only the alpha tensors and ignores the metadata; for every file surveyed the two agree.)
 std::optional<double> lora_metadata_alpha(const std::map<std::string, std::string>& metadata);

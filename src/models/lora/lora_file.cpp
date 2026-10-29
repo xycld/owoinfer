@@ -256,6 +256,8 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
       throw FormatError(spec.path, "", e.what());
     }
     int config_alpha_used = 0;
+    int config_alpha_missing = 0;  // moss-edit-lora modules without an alpha (tensor or adapter_config entry)
+    std::string config_alpha_first_missing;
     const bool edit = rep.format == "moss-edit-lora";
     int int8_merges = 0;  // adapters merged into INT8 block GEMMs
 
@@ -386,11 +388,17 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
         if (r > std::min(stored_rows, k)) throw FormatError(spec.path, down.name, "rank " + std::to_string(r) + " exceeds the module's dimensions");
         a.rank = divisor = r;
         a.parts = {down, up};
-        // Without an alpha tensor, a moss-edit-lora adapter_config's module alpha, else diffusers' metadata alpha
-        // (PEFT: scaling = lora_alpha / r).
-        if (const auto it = config_alphas.find(src); !alpha && it != config_alphas.end()) {
-          alpha = it->second;
-          ++config_alpha_used;
+        // Without an alpha tensor, a moss-edit-lora adapter_config's module alpha (by the name as written, else the
+        // module's: the converter's rule), else diffusers' metadata alpha (PEFT: scaling = lora_alpha / r).
+        if (!alpha) {
+          auto it = config_alphas.find(src);
+          if (it == config_alphas.end()) it = config_alphas.find(module);
+          if (it != config_alphas.end()) {
+            alpha = it->second;
+            ++config_alpha_used;
+          } else if (edit) {
+            if (config_alpha_missing++ == 0) config_alpha_first_missing = src;
+          }
         }
         if (!alpha && meta_alpha) {
           alpha = *meta_alpha;
@@ -499,6 +507,12 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
     }
     if (options.strict && !rep.unknown.empty()) {
       fail(util::path_utf8(spec.path) + ": " + std::to_string(rep.unknown.size()) + " keys not applied, first: " + rep.unknown.front());
+    }
+    // One warning per moss-edit-lora file for its modules without an alpha: the file declares them all, so one missing is
+    // likely a renamed key, read at a scale its training did not use.
+    if (config_alpha_missing > 0) {
+      rep.warnings.push_back(std::to_string(config_alpha_missing) + " module" + (config_alpha_missing == 1 ? "" : "s") +
+                             " without an alpha in adapter_config (moss-edit-lora), first: " + config_alpha_first_missing);
     }
     // One warning per file for its merges into INT8 block GEMMs (lossy: requantized).
     if (int8_merges > 0) {

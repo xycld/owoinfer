@@ -197,11 +197,13 @@ using LoraMap = std::map<std::string, std::vector<LoraFactor>>;
 
 struct LoraKey {
   std::string module, part;  // part: down | up | alpha
+  std::string written;       // the module's name as written (with its prefix)
 };
 
 // kohya `diffusion_model.<m>.lora_{down,up}.weight` + `<m>.alpha` (the distill repos' style) and PEFT
 // `<prefix><m>.lora_{A,B}.weight`, and moss-edit-lora's bare `<m>.lora_{A,B}`.
 std::optional<LoraKey> parse_lora_key(std::string_view name) {
+  const std::string_view full = name;
   for (std::string_view p : {"model.diffusion_model.", "diffusion_model.", "base_model.model.", "transformer."}) {
     if (name.starts_with(p)) {
       name.remove_prefix(p.size());
@@ -213,7 +215,9 @@ std::optional<LoraKey> parse_lora_key(std::string_view name) {
       {".lora_A", "down"},  // moss-edit-lora: bare PEFT names, alphas in adapter_config
       {".lora_B", "up"},     {".alpha", "alpha"}};
   for (const auto& [s, part] : suffixes) {
-    if (name.ends_with(s) && name.size() > s.size()) return LoraKey{std::string(name.substr(0, name.size() - s.size())), part};
+    if (name.ends_with(s) && name.size() > s.size()) {
+      return LoraKey{std::string(name.substr(0, name.size() - s.size())), part, std::string(full.substr(0, full.size() - s.size()))};
+    }
   }
   return std::nullopt;
 }
@@ -223,6 +227,8 @@ struct LoraFileInfo {
   float strength;
   std::uint64_t xxh64;
   int modules;
+  int config_alpha_missing = 0;  // moss-edit-lora modules without an alpha (tensor or adapter_config entry)
+  std::string first_missing;
 };
 
 LoraFileInfo load_lora(const LoraInput& in, LoraMap& out) {
@@ -230,12 +236,14 @@ LoraFileInfo load_lora(const LoraInput& in, LoraMap& out) {
   weights::FileReader reader(in.file);
   struct Parts {
     const weights::TensorInfo *down = nullptr, *up = nullptr, *alpha = nullptr;
+    std::string written;  // the module's name as written
   };
   std::map<std::string, Parts> mods;
   for (const auto& t : f.tensors()) {
     auto key = parse_lora_key(t.name);
     if (!key) throw weights::FormatError(in.file, t.name, "not a LoRA tensor (expected <module>.lora_{down,up,A,B}.weight or <module>.alpha)");
     Parts& p = mods[key->module];
+    if (p.written.empty()) p.written = key->written;
     const weights::TensorInfo*& slot = key->part == "down" ? p.down : key->part == "up" ? p.up : p.alpha;
     if (slot != nullptr) throw weights::FormatError(in.file, t.name, "duplicate LoRA part");
     slot = &t;
@@ -243,12 +251,15 @@ LoraFileInfo load_lora(const LoraInput& in, LoraMap& out) {
   // The shared alpha rule (lora_metadata_alpha): without an alpha tensor, the diffusers / PEFT metadata alpha.
   std::optional<double> meta_alpha;
   std::map<std::string, double> config_alphas;  // moss-edit-lora: per module
+  bool edit = false;
   try {
     meta_alpha = lora_metadata_alpha(f.metadata());
     config_alphas = lora_adapter_config_alphas(f.metadata());
+    edit = lora_adapter_config_format(f.metadata()) == "moss-edit-lora";
   } catch (const QuantError& e) {
     throw weights::FormatError(in.file, "", e.what());
   }
+  LoraFileInfo info{util::path_utf8(in.file.filename()), in.strength, 0, static_cast<int>(mods.size()), 0, {}};
   Xxh64 hash;
   auto read = [&](const weights::TensorInfo& t) {
     std::vector<std::byte> raw(static_cast<std::size_t>(t.nbytes));
@@ -268,7 +279,14 @@ LoraFileInfo load_lora(const LoraInput& in, LoraMap& out) {
     lf.down = to_floats(read(*p.down), p.down->dtype);
     lf.up = to_floats(read(*p.up), p.up->dtype);
     std::optional<double> alpha = meta_alpha;
-    if (const auto it = config_alphas.find(m); it != config_alphas.end()) alpha = it->second;
+    // A moss-edit-lora module's alpha by its name as written, else the module's (the runtime stack's rule).
+    auto it = config_alphas.find(p.written);
+    if (it == config_alphas.end()) it = config_alphas.find(m);
+    if (it != config_alphas.end()) {
+      alpha = it->second;
+    } else if (edit && p.alpha == nullptr) {
+      if (info.config_alpha_missing++ == 0) info.first_missing = p.written;
+    }
     if (p.alpha != nullptr) {
       if (p.alpha->numel() != 1) throw weights::FormatError(in.file, p.alpha->name, "alpha must be a scalar");
       alpha = to_floats(read(*p.alpha), p.alpha->dtype)[0];
@@ -284,7 +302,8 @@ LoraFileInfo load_lora(const LoraInput& in, LoraMap& out) {
     if (!std::isfinite(lf.coef)) throw weights::FormatError(in.file, m, "LoRA coefficient strength * alpha / rank is not finite");
     out[m].push_back(std::move(lf));
   }
-  return {util::path_utf8(in.file.filename()), in.strength, hash.digest(), static_cast<int>(mods.size())};
+  info.xxh64 = hash.digest();
+  return info;
 }
 
 // A fused-qkv LoRA lands on proj.q / proj.k / proj.v by thirds of its up rows.
@@ -824,7 +843,15 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   ConvertStats stats;
   LoraMap loras;
   std::vector<LoraFileInfo> lora_info;
-  for (const LoraInput& li : options.loras) lora_info.push_back(load_lora(li, loras));
+  for (const LoraInput& li : options.loras) {
+    lora_info.push_back(load_lora(li, loras));
+    const LoraFileInfo& fi = lora_info.back();
+    if (fi.config_alpha_missing > 0) {
+      log("warning: " + fi.file + ": " + std::to_string(fi.config_alpha_missing) + " module" +
+          (fi.config_alpha_missing == 1 ? "" : "s") + " without an alpha in adapter_config (moss-edit-lora), first: " +
+          fi.first_missing);
+    }
+  }
   split_fused_lora(loras);
   std::set<std::string> lora_used;
 
