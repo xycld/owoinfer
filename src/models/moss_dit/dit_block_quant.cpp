@@ -358,8 +358,9 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
                                                  kD / 2, scale, m, static_cast<int>(kD), stream);
     kq4::int4_gemm(operands4(u8(xq_qkv), kD / 2, scale, w.qkv4, m), nullptr, bf_mut(qkv), 3 * kD, stream);
   } else if (!w.qkv8.empty() && s_qkv != nullptr) {
-    kernels::rms_norm_modulate_moss(x, w.norm1, vec(a.mod, 1), vec(a.mod, 0), y, stream);
-    kq::rotate_quantize(bf(y), kD, xq_qkv, kD, scale, m, static_cast<int>(kD), stream);
+    // The fused norm + rotate + quantize also stores the bf16 norm output (the side branch's input) in y.
+    kq::rms_norm_modulate_rotate_quantize(bf(x), kD, bf(w.norm1), bf(vec(a.mod, 1)), bf(vec(a.mod, 0)), xq_qkv, kD, scale,
+                                          m, static_cast<int>(kD), stream, bf_mut(y), kD);
     kl::int8_gemm_lora(operands(xq_qkv, kD, scale, w.qkv8, m), nullptr, prepare(*s_qkv, y), bf_mut(qkv), 3 * kD, stream);
   } else if (!w.qkv8.empty()) {
     kq::rms_norm_modulate_rotate_quantize(bf(x), kD, bf(w.norm1), bf(vec(a.mod, 1)), bf(vec(a.mod, 0)), xq_qkv, kD, scale,
@@ -531,8 +532,8 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     // The bf16 norm output stays in y: the quantized input goes to the attention output's columns (free now, and
     // after the [L, kF] ffn this GEMM writes).
     ffn = rows_of(a.big, 0, l, kF, run.t0, run.t1);
-    kernels::rms_norm_modulate_moss(x, w.norm2, vec(a.mod, 4), vec(a.mod, 3), y, stream);
-    kq::rotate_quantize(bf(y), kD, xq_qkv, kD, scale, m, static_cast<int>(kD), stream);
+    kq::rms_norm_modulate_rotate_quantize(bf(x), kD, bf(w.norm2), bf(vec(a.mod, 4)), bf(vec(a.mod, 3)), xq_qkv, kD, scale,
+                                          m, static_cast<int>(kD), stream, bf_mut(y), kD);
     kl::int8_gemm_situ_glu_lora(operands(xq_qkv, kD, scale, w.up_gate8, m), prepare(*s_up, y), bf_mut(ffn), kF, stream);
   } else if (!w.up_gate8.empty()) {
     ffn = rows_of(a.big, 0, l, kF, run.t0, run.t1);
