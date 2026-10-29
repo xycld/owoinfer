@@ -27,8 +27,8 @@ namespace mi::pipeline {
 inline constexpr std::size_t kMaxRunSigmas = 10001;
 
 // mi_generate's sigmas for one pass: make_schedule(kind, steps, fs) cropped to the tail a denoise strength leaves
-// (strength_start_step, the img2img rule of Pipeline::run); strength 1 is the whole schedule, 0 leaves only the
-// terminal value. Throws std::invalid_argument as make_schedule, or for a strength outside [0, 1].
+// (strength_start_step, the img2img rule of Pipeline::run); strength 1 is the whole schedule. Empty when no step is
+// left (strength 0). Throws std::invalid_argument as make_schedule, or for a strength outside [0, 1].
 std::vector<float> engine_sigmas(SchedulerKind kind, int steps, const FlowSampling& fs, double strength);
 
 // Index of the first position where a and b differ bit for bit (a shorter array differs at its end), or npos when they
