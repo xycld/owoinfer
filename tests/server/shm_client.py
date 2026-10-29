@@ -37,7 +37,7 @@ def attach(name, token_hex, region_bytes, how="mmap"):
         finally:
             os.close(fd)
     magic, version, _pid, token, size, payload = HEADER.unpack_from(buf, 0)
-    if magic != MAGIC or version != LAYOUT_VERSION or size > len(buf) or payload != 4096:
+    if magic != MAGIC or version != LAYOUT_VERSION or payload != 4096 or not payload <= size <= len(buf):
         raise ValueError("%s is not a moss-server region" % name)
     if token != bytes.fromhex(token_hex):
         raise ValueError("%s has another token" % name)
