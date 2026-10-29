@@ -224,7 +224,7 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
   } else {
     o << "null,\n";
   }
-  // Reference images (the edit layout): only when they ran (or an edit adapter ran without them).
+  // Reference images (the edit layout): only when they ran.
   if (const std::string refs = references_json(q, r); !refs.empty()) o << " \"references\": " << refs << ",\n";
   o << " \"plan\": " << r.plan.to_json() << ",\n";
   o << " \"embedding_cache\": {\"hits\": " << r.te_cache_hits << ", \"te_skipped\": " << tf(r.te_skipped) << "},\n";
@@ -281,13 +281,12 @@ ReportParts report_parts(const Request& q, const Result& r, std::string_view lat
 }
 
 std::string references_json(const Request& q, const Result& r) {
-  if (r.references.count == 0 && r.reference_warnings.empty()) return {};
+  if (r.references.count == 0) return {};
   std::ostringstream o;
   o.imbue(std::locale::classic());
   std::string warnings = "[";
   for (std::size_t i = 0; i < r.reference_warnings.size(); ++i) warnings += (i ? ", " : "") + json_escape(r.reference_warnings[i]);
   warnings += "]";
-  if (r.references.count == 0) return "{\"count\": 0, \"warnings\": " + warnings + "}";
   o << "{\"count\": " << r.references.count << ", \"max_edge\": " << q.references.max_edge << ", \"sizes\": [";
   for (std::size_t i = 0; i < r.references.sizes.size(); ++i) {
     o << (i ? ", " : "") << "[" << r.references.sizes[i].width << ", " << r.references.sizes[i].height << "]";

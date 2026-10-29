@@ -2495,6 +2495,39 @@ TEST(CApi, DitLoadNotesAndDiffs) {
   }
 }
 
+// An edit adapter without reference images: MI_TEXT_REFERENCES is "" and the report has no "references" key (as the
+// header says: "" when no reference image ran); the warning is MI_MESSAGE_REFERENCE_WARNING's alone. With references
+// that ran, both carry the object and its warnings.
+TEST(CApi, ReferencesTextOnlyWhenTheyRan) {
+  mi::pipeline::Request q;
+  q.prompt = "a cat";
+  mi::pipeline::Result r;
+  r.reference_warnings = {"edit.safetensors is an edit adapter (moss-edit-lora) used without reference images"};
+  {
+    mi_result* res = mi::api::new_result(mi::api::to_generation(q, r, true));
+    EXPECT_STREQ(mi_result_text(res, MI_TEXT_REFERENCES), "");
+    ASSERT_EQ(mi_result_message_count(res, MI_MESSAGE_REFERENCE_WARNING), 1);
+    EXPECT_STREQ(mi_result_message(res, MI_MESSAGE_REFERENCE_WARNING, 0), r.reference_warnings[0].c_str());
+    mi_result_free(res);
+    const mi::json::Value rep = mi::json::parse("{" + mi::pipeline::report_fields(q, r, "", "") + "}");
+    EXPECT_EQ(rep.find("references"), nullptr);
+  }
+  r.references.count = 1;
+  r.references.sizes = {{384, 512}};
+  r.references.tokens = 768;
+  r.references.prefills = 1;
+  r.reference_warnings = {"reference images without a moss-edit-lora adapter"};
+  mi_result* res = mi::api::new_result(mi::api::to_generation(q, r, true));
+  const mi::json::Value refs = mi::json::parse(mi_result_text(res, MI_TEXT_REFERENCES));
+  ASSERT_NE(refs.find("count"), nullptr);
+  EXPECT_EQ(refs.find("count")->as_double(), 1);
+  ASSERT_NE(refs.find("warnings"), nullptr);
+  EXPECT_EQ(refs.find("warnings")->as_array().size(), 1u);
+  mi_result_free(res);
+  const mi::json::Value rep = mi::json::parse("{" + mi::pipeline::report_fields(q, r, "", "") + "}");
+  EXPECT_NE(rep.find("references"), nullptr);
+}
+
 // mi_engine_preload's request: the prompt may be NULL or blank (kept blank for Pipeline::preload), everything else is
 // checked as for mi_generate(); mi_gen_params_validate() still requires a prompt. Preload and release on a NULL engine.
 TEST(CApi, PreloadAndReleaseWithoutAnEngine) {

@@ -1138,7 +1138,7 @@ class Server {
                 std::to_string(width) + ",\"height\":" + std::to_string(height) + "}");
   }
 
-  // done.warnings: the LoRA and control adapter warnings, lossy accelerators and settings without effect, prompt
+  // done.warnings: the LoRA, control adapter and reference image warnings, lossy accelerators and settings without effect, prompt
   // truncation, for launchers that do not read the report. `g` is the request.
   static std::string warnings_json(const mi_result* r, const mi_gen_params& g) {
     std::string out;
@@ -1154,6 +1154,10 @@ class Server {
         for (std::int32_t i = 0; i < n; ++i) {
           if (const char* m = mi_result_message(r, kind, i)) add(prefix + std::string(m));
         }
+      }
+      // Reference images without an edit adapter, an edit adapter without reference images.
+      for (std::int32_t i = 0, n = mi_result_message_count(r, MI_MESSAGE_REFERENCE_WARNING); i < n; ++i) {
+        if (const char* m = mi_result_message(r, MI_MESSAGE_REFERENCE_WARNING, i)) add(m);
       }
       // The tier reason says it too, but only in the report: the accelerators are the one opt-in that trades quality.
       mi_accel_info a{};

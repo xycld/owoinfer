@@ -291,6 +291,7 @@ The fields of `done` depend on `status`:
 
 `warnings` is always present: an array of strings for the launcher to show, empty when there is nothing to say.
 - One entry per LoRA warning, `"LoRA <module>: <reason>"` (e.g. an adapter requantized on INT8 GEMMs), and per warning on the control adapter's LoRA part, `"control adapter LoRA <module>: <reason>"`.
+- One entry per reference-image warning (`MI_MESSAGE_REFERENCE_WARNING`): reference images without a moss-edit-lora adapter, or an edit adapter loaded without reference images (that request's report has no `references` object).
 - `"lossy accelerators (<the active ones>): CFG truncated on N steps, step cache reused C of D DiT calls"` when `cfg_truncation` (with CFG) or `step_cache` is active, with only the active accelerators' parts.
 - `"step_cache_threshold has no effect without step_cache \"fbcache\""` and `"cfg_truncation has no effect without CFG (cfg 1)"` for settings that change nothing, as `moss-infer generate` warns. A control adapter, like any LoRA, gets no such line: the report's `quality.config.lora` is `"active"`.
 - `"prompt truncated to K of N tokens (D dropped; max_sequence_length M)"`, and the same for the `"negative prompt"`, when the text encoder cut the end of a prompt.
@@ -309,7 +310,7 @@ The fields of `done` depend on `status`:
 - `quality` (tier, configuration, engine numerics, cuBLASLt copy, GPU class, model paths) and `models` (DiT, text encoder and VAE sources, DiT linears, tier, text-encoder precision)
 - `loras` (per file: adapters, side branch, merged, unknown keys, strength), `lora_warnings`, `lora_notes`
 - `control` (`null` without `control`: the adapter, kinds, base model, inputs, its LoRA part, encodes, encode schedule) and `accelerators` (`lossy`, `active`, `step_cache_threshold`, `step_cache_threshold_source`, `cfg_truncated_steps`, `step_cache_calls`, `step_cache_reused`, `cached_steps`, `step_cache_diffs`, `warnings`)
-- `references`, only when reference images ran (or an edit adapter ran without them): `count`, `max_edge`, `sizes`, `tokens`, `cache_bytes`, `prefills`, `encode_schedule`, `warnings`; then `timings_s` also has `reference_encode` and `reference_prefill`
+- `references`, only when reference images ran: `count`, `max_edge`, `sizes`, `tokens`, `cache_bytes`, `prefills`, `encode_schedule`, `warnings`; then `timings_s` also has `reference_encode` and `reference_prefill`
 - `dit_load` (how the call's last DiT load read the weights: `source` `"files"`, `"host_copy"` or `null`, `io`, `note`, `bytes`, `seconds`, `gbps`) and, after a `preload`, `preload_note`
 
 The server is idle again by the time `done` is written, so the next `generate` can follow it immediately.
