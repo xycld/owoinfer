@@ -3,12 +3,15 @@
 //                 the schedule, the step cache, mi_generate's shared rules, the token cap).
 //   GpuSession.*  on real weights (GTEST_SKIP when absent): an L = 1 MOSS-layout run plans exactly as mi_generate's
 //                 equivalent request (§7.2: the plan JSON) and, driven by the recipe's euler-on-moss host loop through the
-//                 staging, gives mi_generate's final latents bit for bit; the state errors of a session on its gate.
+//                 staging, gives mi_generate's final latents bit for bit; the state errors of a session on its gate;
+//                 table A's other host loops (HOST CFG, MOSS rows, GUIDED_DENOISED on simple, a latent batch of 2)
+//                 against mi_generate's final latents (the internal hook: decode off).
 #include <gtest/gtest.h>
 
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <regex>
@@ -16,6 +19,7 @@
 #include <vector>
 
 #include "pipeline/pipeline.h"
+#include "pipeline/samplers/initial_noise.h"
 #include "pipeline/session.h"
 #include "runtime/job_gate.h"
 
@@ -312,6 +316,173 @@ TEST_F(GpuSession, MossRunPlansAndSamplesAsGenerate) {
   EXPECT_EQ(diff, 0u) << "of " << x.size() << " latent values";
   EXPECT_TRUE(session.close());
   EXPECT_FALSE(session.close());
+}
+
+// §7.2's latent-level comparison through the internal hook (Result::latents, decode off), where the C API tests compare
+// RGB bytes, which can hide a 1-ulp latent difference: host loops through the staging give mi_generate's final latents
+// bit for bit for HOST rows {cond, uncond + {22}} with the host's CFG, for MOSS rows with the host's per-op combine, for
+// MOSS GUIDED_DENOISED with euler on simple, and for each image of a HOST latent batch of 2 (two seeds in one run).
+TEST_F(GpuSession, TableALatentsEqualGenerate) {
+  mi::pipeline::Pipeline pipe(pipeline_options());
+  mi::runtime::JobGate gate;
+  mi::pipeline::Request q = moss_request();
+  q.decode = false;  // the final latents only
+  pipe.generate(q);  // loads the models and fills the embedding cache
+  const mi::pipeline::Result ref7 = pipe.generate(q);
+  mi::pipeline::Request q8 = q;
+  q8.seed = 8;
+  const mi::pipeline::Result ref8 = pipe.generate(q8);
+  mi::pipeline::Request qs = q;
+  qs.scheduler = mi::pipeline::SchedulerKind::kSimple;  // euler on simple: the denoised prediction
+  const mi::pipeline::Result ref_simple = pipe.generate(qs);
+  ASSERT_FALSE(ref7.latents.empty());
+  ASSERT_NE(ref7.latents, ref8.latents);
+
+  SessionOptions so;
+  so.plan_request = q;
+  so.max_rows = 4;
+  so.max_latents = 2;
+  Session session(pipe, gate, so);
+  const std::vector<std::string> prompts = {q.prompt, q.negative_prompt};
+  const auto conds = session.encode_texts(prompts, q.max_sequence_length);
+  const float g = static_cast<float>(q.cfg);
+  const auto noise = [&](std::int64_t seed, std::int64_t h, std::int64_t w) {
+    return mi::pipeline::initial_noise(q.noise_layout, static_cast<std::uint64_t>(seed), 128, h, w);
+  };
+  // x = s0 * noise + (1 - s0) * 0, one rounding per op (flow_noise_scaling without an init image).
+  const auto start = [](const std::vector<float>& n, float s0) {
+    std::vector<float> x(n.size());
+    const float keep = 1.0f - s0;
+    for (std::size_t k = 0; k < x.size(); ++k) {
+      const float a = s0 * n[k];
+      const float b = keep * 0.0f;
+      x[k] = a + b;
+    }
+    return x;
+  };
+  // CFG in velocity space per op: u + g (c - u).
+  const auto cfg = [g](const float* c, const float* u, float* v, std::size_t n) {
+    for (std::size_t k = 0; k < n; ++k) {
+      const float d = c[k] - u[k];
+      const float t = g * d;
+      v[k] = u[k] + t;
+    }
+  };
+  // One run of `spec` sampled with euler (velocity, or with `denoised` the denoised form) from noise of `seeds` (one
+  // per latent); `predict` turns the staged outputs of a call into the prediction [L, 128, h, w].
+  using Predict = std::function<void(const mi::pipeline::StagingViews&, const std::vector<float>& x, float sigma,
+                                     std::uint32_t rows, std::vector<float>& pred)>;
+  const auto sample = [&](const RunSpec& spec, std::vector<std::int64_t> seeds, bool denoised, const Predict& predict) {
+    session.begin_run(spec);
+    const mi::pipeline::RunInfo info = session.run_info();
+    const mi::pipeline::StagingViews v = session.staging();
+    const std::vector<float> s = session.run_sigmas();
+    std::vector<float> x;
+    for (const std::int64_t seed : seeds) {
+      const std::vector<float> xl = start(noise(seed, info.latent_height, info.latent_width), s[0]);
+      x.insert(x.end(), xl.begin(), xl.end());
+    }
+    std::vector<float> pred;
+    for (int i = 0; i < info.steps; ++i) {
+      const float si = s[static_cast<std::size_t>(i)], sn = s[static_cast<std::size_t>(i) + 1];
+      std::copy(x.begin(), x.end(), static_cast<float*>(v.x.data));
+      mi::pipeline::StepArgs a;
+      a.sigma = si;
+      a.x = v.x;
+      a.out = v.out;
+      const mi::pipeline::StepReport rep = session.step(a);
+      EXPECT_EQ(rep.step, i);
+      predict(v, x, si, rep.rows, pred);
+      if (denoised) {
+        // SamplerDriver's euler on a denoised prediction: d = (x - D) / s, x = x + d * fp32(sn - si).
+        const float dt = sn - si;
+        for (std::size_t k = 0; k < x.size(); ++k) {
+          const float e = x[k] - pred[k];
+          const float d = e / si;
+          const float t = d * dt;
+          x[k] = x[k] + t;
+        }
+      } else {
+        // The official euler: h = fp32(double(sn) - double(si)), x = x + h * v.
+        const float h = static_cast<float>(static_cast<double>(sn) - static_cast<double>(si));
+        for (std::size_t k = 0; k < x.size(); ++k) {
+          const float t = h * pred[k];
+          x[k] = x[k] + t;
+        }
+      }
+    }
+    const std::optional<mi::pipeline::RunResult> done = session.end_run();
+    EXPECT_TRUE(done.has_value());
+    return x;
+  };
+  const auto differing = [](const std::vector<float>& a, const float* b, std::size_t n) {
+    std::size_t d = 0;
+    for (std::size_t k = 0; k < n; ++k) d += a[k] != b[k];
+    return d;
+  };
+
+  RunSpec spec;
+  spec.width = q.width;
+  spec.height = q.height;
+  spec.steps = q.steps;
+  spec.rows = {{conds[0], {}, 0}, {conds[1], {22}, 0}};
+  const std::size_t n = ref7.latents.size();
+  const Predict host_cfg = [&](const mi::pipeline::StagingViews& v, const std::vector<float>& x, float, std::uint32_t,
+                               std::vector<float>& pred) {
+    const std::size_t L = x.size() / n;
+    pred.resize(x.size());
+    for (std::size_t l = 0; l < L; ++l) {
+      cfg(static_cast<const float*>(v.out[2 * l].data), static_cast<const float*>(v.out[2 * l + 1].data),
+          pred.data() + l * n, n);
+    }
+  };
+  {
+    SCOPED_TRACE("HOST rows, the host's CFG");
+    spec.guidance = GuidanceMode::kHost;
+    spec.output = StepOutput::kRows;
+    const std::vector<float> x = sample(spec, {q.seed}, false, host_cfg);
+    EXPECT_EQ(differing(x, ref7.latents.data(), n), 0u) << "of " << n << " latent values";
+  }
+  {
+    SCOPED_TRACE("MOSS rows, the host's combine (CFG on every step: no windows)");
+    spec.guidance = GuidanceMode::kMoss;
+    spec.output = StepOutput::kRows;
+    const std::vector<float> x = sample(spec, {q.seed}, false, [&](const mi::pipeline::StagingViews& v,
+                                                                  const std::vector<float>& xx, float, std::uint32_t rows,
+                                                                  std::vector<float>& pred) {
+      ASSERT_EQ(rows, 3u);
+      pred.resize(xx.size());
+      cfg(static_cast<const float*>(v.out[0].data), static_cast<const float*>(v.out[1].data), pred.data(), n);
+    });
+    EXPECT_EQ(differing(x, ref7.latents.data(), n), 0u) << "of " << n << " latent values";
+  }
+  {
+    SCOPED_TRACE("MOSS GUIDED_DENOISED, euler on simple");
+    RunSpec ds = spec;
+    ds.guidance = GuidanceMode::kMoss;
+    ds.output = StepOutput::kGuidedDenoised;
+    ds.scheduler = mi::pipeline::SchedulerKind::kSimple;
+    const std::vector<float> x = sample(ds, {q.seed}, true, [&](const mi::pipeline::StagingViews& v,
+                                                               const std::vector<float>& xx, float, std::uint32_t,
+                                                               std::vector<float>& pred) {
+      const auto* o = static_cast<const float*>(v.out[0].data);
+      pred.assign(o, o + xx.size());
+    });
+    EXPECT_EQ(differing(x, ref_simple.latents.data(), n), 0u) << "of " << n << " latent values";
+  }
+  {
+    SCOPED_TRACE("HOST latent batch of 2");
+    RunSpec bs = spec;
+    bs.guidance = GuidanceMode::kHost;
+    bs.output = StepOutput::kRows;
+    bs.rows = {{conds[0], {}, 0}, {conds[1], {22}, 0}, {conds[0], {}, 1}, {conds[1], {22}, 1}};
+    const std::vector<float> x = sample(bs, {q.seed, q8.seed}, false, host_cfg);
+    ASSERT_EQ(x.size(), 2 * n);
+    EXPECT_EQ(differing(x, ref7.latents.data(), n), 0u) << "image 0 of the batch";
+    std::vector<float> second(x.begin() + static_cast<std::ptrdiff_t>(n), x.end());
+    EXPECT_EQ(differing(second, ref8.latents.data(), n), 0u) << "image 1 of the batch";
+  }
+  EXPECT_TRUE(session.close());
 }
 
 // Refine dedup by handle (design §5.4): a HOST run whose two rows share one conditioning handle and skip set (one refined
