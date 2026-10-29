@@ -178,7 +178,7 @@ std::vector<std::byte> random_rows(std::uint32_t type, std::int64_t rows, std::i
       put_half(b0 + 208);
     } else {
       put_half(b0);
-      if (type == ggml::kQ4_K || type == ggml::kQ5_K) put_half(b0 + 2);
+      if (type == ggml::kQ4_K || type == ggml::kQ5_K || type == ggml::kQ4_1 || type == ggml::kQ5_1) put_half(b0 + 2);
     }
   }
   return out;
@@ -206,7 +206,8 @@ std::size_t bit_mismatches(const std::vector<float>& a, const std::vector<float>
 TEST(GgufDequant, BitExactToGgufPy) {
   const std::pair<const char*, std::uint32_t> types[] = {{"F32", ggml::kF32},   {"F16", ggml::kF16},   {"BF16", ggml::kBF16},
                                                          {"Q8_0", ggml::kQ8_0}, {"Q4_0", ggml::kQ4_0}, {"Q4_K", ggml::kQ4_K},
-                                                         {"Q5_K", ggml::kQ5_K}, {"Q6_K", ggml::kQ6_K}};
+                                                         {"Q5_K", ggml::kQ5_K}, {"Q6_K", ggml::kQ6_K}, {"Q4_1", ggml::kQ4_1},
+                                                         {"Q5_0", ggml::kQ5_0}, {"Q5_1", ggml::kQ5_1}};
   for (const auto& [name, type] : types) {
     SCOPED_TRACE(name);
     const auto raw = mi::npy::load(kData / (std::string(name) + "_raw.npy"));
@@ -643,9 +644,11 @@ TEST(GgufDit, RefusesUnknownNamesShapesAndTypes) {
 // ---- A full-shape MOSS-Image GGUF (sparse: headers are read, data never) --------------------------------------
 
 // Every tensor of the MOSS-Image DiT under the official names, fused or separate q/k/v, block GEMMs in `gemm_type`,
-// the rest F32 (norms, rope.bands) or BF16; the data section is a sparse tail of zeros.
+// the other linears' weights in `kept_type`, the rest F32 (norms, biases, rope.bands); the data section is a sparse
+// tail of zeros.
 void write_moss_gguf(const fs::path& p, std::uint32_t gemm_type, bool fused, const std::vector<KV>& kvs = {},
-                     const std::string& rename_from = "", const std::string& rename_to = "") {
+                     const std::string& rename_from = "", const std::string& rename_to = "",
+                     std::uint32_t kept_type = ggml::kBF16) {
   std::vector<GT> ts;
   const auto add = [&](std::string name, std::vector<std::int64_t> shape, std::uint32_t type) {
     if (!rename_from.empty() && name == rename_from) name = rename_to;
@@ -658,7 +661,7 @@ void write_moss_gguf(const fs::path& p, std::uint32_t gemm_type, bool fused, con
       add("layers." + std::to_string(l.block) + ".proj." + (qkv ? "qkv" : l.name.substr(l.name.rfind('.') + 1)) + ".weight",
           {qkv ? 3 * l.n : l.n, l.k}, gemm_type);
     } else {
-      add(l.name + ".weight", {l.n, l.k}, ggml::kBF16);
+      add(l.name + ".weight", {l.n, l.k}, kept_type);
       if (l.has_bias) add(l.name + ".bias", {l.n}, ggml::kF32);
     }
   }
@@ -693,22 +696,35 @@ TEST(GgufDit, FullShapeFilesCheckedFromTheHeader) {
   const auto m4 = mi::quant::open_quant_model(q4);
   EXPECT_EQ(m4.linears.size(), 252u);
   EXPECT_EQ(m4.tensors.size(), 379u - 168u);
+  // The types of every stored tensor, the most bytes first; tier reference only without a quantized tensor.
   const auto i4 = mi::pipeline::inspect_gguf_dit(q4);
-  EXPECT_EQ(i4.types, "Q4_K");
+  EXPECT_EQ(i4.types, "Q4_K + BF16 + F32");
   EXPECT_FALSE(i4.reference);
   const auto i8 = mi::pipeline::inspect_gguf_dit(q8);
-  EXPECT_EQ(i8.types, "Q8_0");
-  EXPECT_TRUE(i8.reference);
+  EXPECT_EQ(i8.types, "Q8_0 + BF16 + F32");
+  EXPECT_FALSE(i8.reference);
   EXPECT_EQ(i8.tensors, 379);
+  const fs::path bf = dir.path() / "bf16.gguf", bf_q8 = dir.path() / "bf16_q8_kept.gguf";
+  write_moss_gguf(bf, ggml::kBF16, true);
+  write_moss_gguf(bf_q8, ggml::kBF16, true, {}, "", "", ggml::kQ8_0);
+  const auto ibf = mi::pipeline::inspect_gguf_dit(bf);
+  EXPECT_EQ(ibf.types, "BF16 + F32");
+  EXPECT_TRUE(ibf.reference);
+  const auto ibf_q8 = mi::pipeline::inspect_gguf_dit(bf_q8);  // a quantized kept linear counts
+  EXPECT_EQ(ibf_q8.types, "BF16 + Q8_0 + F32");
+  EXPECT_FALSE(ibf_q8.reference);
 
   // Targets per tier, and what the file runs as.
   using mi::planner::Tier;
   EXPECT_EQ(mi::pipeline::gguf_target(i4, Tier::kHigh), mi::quant::QuantSpec::int8_convrot(256));
   EXPECT_THROW(mi::pipeline::gguf_target(i4, Tier::kReference), std::invalid_argument);
   EXPECT_THROW(mi::pipeline::gguf_target(i4, Tier::kTurbo), std::invalid_argument);
-  EXPECT_EQ(mi::pipeline::gguf_target(i8, Tier::kReference), mi::quant::QuantSpec::bf16());
-  EXPECT_EQ(mi::pipeline::gguf_runs_as(i4, mi::quant::QuantSpec::int8_convrot(256)), "GGUF Q4_K, runs as INT8 ConvRot");
-  EXPECT_EQ(mi::pipeline::gguf_runs_as(i8, mi::quant::QuantSpec::bf16()), "GGUF Q8_0, runs as bf16");
+  EXPECT_THROW(mi::pipeline::gguf_target(i8, Tier::kReference), std::invalid_argument);
+  EXPECT_THROW(mi::pipeline::gguf_target(ibf_q8, Tier::kReference), std::invalid_argument);
+  EXPECT_EQ(mi::pipeline::gguf_target(ibf, Tier::kReference), mi::quant::QuantSpec::bf16());
+  EXPECT_EQ(mi::pipeline::gguf_target(ibf, Tier::kHigh), mi::quant::QuantSpec::int8_convrot(256));
+  EXPECT_EQ(mi::pipeline::gguf_runs_as(i4, mi::quant::QuantSpec::int8_convrot(256)), "GGUF Q4_K + BF16 + F32, runs as INT8 ConvRot");
+  EXPECT_EQ(mi::pipeline::gguf_runs_as(ibf, mi::quant::QuantSpec::bf16()), "GGUF BF16 + F32, runs as bf16");
   EXPECT_THROW(mi::pipeline::gguf_converted_file(q4, i4, mi::quant::QuantSpec::int8_convrot(256), {}), std::invalid_argument);
 
   // Inspection: a DiT, loadable, its tiers and the format it runs as.
@@ -719,16 +735,24 @@ TEST(GgufDit, FullShapeFilesCheckedFromTheHeader) {
     EXPECT_EQ(r.info.precision, MI_PRECISION_INT8);
     EXPECT_EQ(r.info.tensor_count, 463);
     EXPECT_EQ(r.info.tiers, 1u << MI_TIER_HIGH);
-    EXPECT_EQ(r.quantization, "GGUF Q4_K, runs as INT8 ConvRot");
-    EXPECT_NE(r.tier_reasons[MI_TIER_HIGH].find("(GGUF Q4_K, runs as INT8 ConvRot)"), std::string::npos) << r.tier_reasons[MI_TIER_HIGH];
-    EXPECT_NE(r.tier_reasons[MI_TIER_REFERENCE].find("Q8_0, BF16 or F16"), std::string::npos) << r.tier_reasons[MI_TIER_REFERENCE];
+    EXPECT_EQ(r.quantization, "GGUF Q4_K + BF16 + F32, runs as INT8 ConvRot");
+    EXPECT_NE(r.tier_reasons[MI_TIER_HIGH].find("(GGUF Q4_K + BF16 + F32, runs as INT8 ConvRot)"), std::string::npos)
+        << r.tier_reasons[MI_TIER_HIGH];
+    EXPECT_NE(r.tier_reasons[MI_TIER_REFERENCE].find("every tensor is BF16, F16 or F32"), std::string::npos)
+        << r.tier_reasons[MI_TIER_REFERENCE];
     EXPECT_NE(r.tier_reasons[MI_TIER_TURBO].find("use tier high"), std::string::npos) << r.tier_reasons[MI_TIER_TURBO];
   }
   {
     const auto r = mi::api::inspect_file(q8);
+    EXPECT_EQ(r.info.tiers, 1u << MI_TIER_HIGH);
+    EXPECT_EQ(r.quantization, "GGUF Q8_0 + BF16 + F32, runs as INT8 ConvRot");
+  }
+  {
+    const auto r = mi::api::inspect_file(bf);
     EXPECT_EQ(r.info.tiers, (1u << MI_TIER_HIGH) | (1u << MI_TIER_REFERENCE));
-    EXPECT_EQ(r.quantization, "GGUF Q8_0, runs as INT8 ConvRot (tier high) or bf16 (tier reference)");
-    EXPECT_NE(r.tier_reasons[MI_TIER_REFERENCE].find("(GGUF Q8_0, runs as bf16)"), std::string::npos) << r.tier_reasons[MI_TIER_REFERENCE];
+    EXPECT_EQ(r.quantization, "GGUF BF16 + F32, runs as INT8 ConvRot (tier high) or bf16 (tier reference)");
+    EXPECT_NE(r.tier_reasons[MI_TIER_REFERENCE].find("(GGUF BF16 + F32, runs as bf16)"), std::string::npos)
+        << r.tier_reasons[MI_TIER_REFERENCE];
   }
 
   // Refused: a type below 4 bits (a DiT, not loadable), another architecture and other names (no role).

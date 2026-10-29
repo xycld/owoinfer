@@ -94,18 +94,19 @@ std::string cache_metadata(const fs::path& p, const std::string& key) {
 GgufDitInfo inspect_gguf_dit(const fs::path& file) {
   const weights::GgufFile g(file);
   weights::check_supported_gguf_dit(g);
-  const quant::QuantModel m = quant::open_gguf_dit(g);
-  std::map<std::uint32_t, int> counts;
-  for (const quant::QuantLinear& l : m.linears) ++counts[m.gguf_types.at(l.weight.name)];
-  std::vector<std::pair<int, std::uint32_t>> order;
-  for (const auto& [type, n] : counts) order.emplace_back(n, type);
+  quant::open_gguf_dit(g);  // every tensor a MOSS-Image DiT tensor of a type the converter reads
+  // The types of every stored tensor (the block GEMMs, the other linears, the norms), by their bytes.
+  std::map<std::uint32_t, std::uint64_t> bytes;
+  for (const weights::GgufTensorInfo& t : g.tensors()) bytes[t.type] += t.nbytes;
+  std::vector<std::pair<std::uint64_t, std::uint32_t>> order;
+  for (const auto& [type, n] : bytes) order.emplace_back(n, type);
   std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
   GgufDitInfo info;
   info.reference = true;
   for (const auto& [n, type] : order) {
     info.types += (info.types.empty() ? "" : " + ") + std::string(weights::ggml_type_name(type));
     using namespace weights::ggml;
-    if (type != kQ8_0 && type != kBF16 && type != kF16 && type != kF32) info.reference = false;
+    if (type != kBF16 && type != kF16 && type != kF32) info.reference = false;
   }
   info.tensors = static_cast<int>(g.tensors().size());
   return info;
@@ -118,7 +119,7 @@ quant::QuantSpec gguf_target(const GgufDitInfo& info, planner::Tier tier) {
     case planner::Tier::kReference:
       if (info.reference) return quant::QuantSpec::bf16();
       throw std::invalid_argument("tier reference runs bf16 weights, but " + what +
-                                  "; tier reference reads GGUF files of Q8_0, BF16 or F16 block weights");
+                                  "; tier reference reads GGUF files whose every tensor is BF16, F16 or F32");
     case planner::Tier::kTurbo: break;
   }
   throw std::invalid_argument("tier turbo runs a 4-bit DiT, but " + what + (info.reference ? " or bf16 (tier reference)" : "") +

@@ -85,7 +85,7 @@ QuantModel open_gguf_dit(const weights::GgufFile& file) {
   for (const auto& [key, value] : file.metadata()) {
     if (key.starts_with("comfy.gguf.quant.")) {
       refuse("custom quantization in GGUF (" + key + " = " + value.substr(0, 120) +
-             "), not a ggml type; GGUF DiTs are read in Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, BF16, F16 and F32");
+             "), not a ggml type; GGUF DiTs are read in Q8_0, Q6_K, Q5_K, Q5_1, Q5_0, Q4_K, Q4_1, Q4_0, BF16, F16 and F32");
     }
   }
   const bool any_shapes = weights::testing::any_model_shapes();
@@ -173,7 +173,7 @@ QuantModel open_gguf_dit(const weights::GgufFile& file) {
       types.push_back(type + " (" + std::to_string(u.first) + " tensors, e.g. '" + u.second + "')");
     }
     refuse("GGUF tensors of types the engine does not read: " + listed(types) +
-           "; GGUF DiTs are read in Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, BF16, F16 and F32");
+           "; GGUF DiTs are read in Q8_0, Q6_K, Q5_K, Q5_1, Q5_0, Q4_K, Q4_1, Q4_0, BF16, F16 and F32");
   }
   std::sort(linears.begin(), linears.end(), [](const QuantLinear& a, const QuantLinear& b) { return a.name < b.name; });
   for (std::size_t i = 1; i < linears.size(); ++i) {

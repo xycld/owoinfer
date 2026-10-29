@@ -33,8 +33,8 @@ inline constexpr int kMaxGgufArrayDepth = 4;
 // ggml tensor types (ggml.h enum ggml_type), as stored. The ones the engine dequantizes have names here; the others are
 // known by their block size only, so a file holding them parses and can be refused by name.
 namespace ggml {
-inline constexpr std::uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ8_0 = 8, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14,
-                               kBF16 = 30;
+inline constexpr std::uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ4_1 = 3, kQ5_0 = 6, kQ5_1 = 7, kQ8_0 = 8, kQ4_K = 12,
+                               kQ5_K = 13, kQ6_K = 14, kBF16 = 30;
 }
 
 // The type's name ("Q4_K", "BF16"), or empty for an id ggml does not define.
@@ -45,7 +45,7 @@ struct GgmlBlock {
   std::uint32_t bytes = 0;
 };
 std::optional<GgmlBlock> ggml_block(std::uint32_t type);
-// Whether dequantize_gguf_rows reads the type: F32, F16, BF16, Q8_0, Q4_0, Q4_K, Q5_K, Q6_K.
+// Whether dequantize_gguf_rows reads the type: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K.
 bool gguf_dequantizable(std::uint32_t type);
 
 // Bytes of one row of k elements (k a multiple of the type's block size; throws std::invalid_argument otherwise or for

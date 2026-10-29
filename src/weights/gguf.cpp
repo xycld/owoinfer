@@ -70,6 +70,43 @@ void dequant_q4_0(const std::byte* b, float* y) {
   }
 }
 
+void dequant_q4_1(const std::byte* b, float* y) {
+  const float d = half_to_float(u16_at(b)), m = half_to_float(u16_at(b + 2));
+  for (int i = 0; i < 16; ++i) {
+    const std::uint8_t q = u8_at(b + 4 + i);
+    y[i] = d * static_cast<float>(q & 0xF) + m;
+    y[i + 16] = d * static_cast<float>(q >> 4) + m;
+  }
+}
+
+// Q5_0 / Q5_1: the fifth bits of the block's 32 values in a little-endian u32 (bit i: value i, bit i + 16: value
+// i + 16).
+std::uint32_t u32_at(const std::byte* p) { return static_cast<std::uint32_t>(u16_at(p)) | (static_cast<std::uint32_t>(u16_at(p + 2)) << 16); }
+
+void dequant_q5_0(const std::byte* b, float* y) {
+  const float d = half_to_float(u16_at(b));
+  const std::uint32_t qh = u32_at(b + 2);
+  for (int i = 0; i < 16; ++i) {
+    const std::uint8_t q = u8_at(b + 6 + i);
+    const int x0 = static_cast<int>((q & 0xF) | (((qh >> i) << 4) & 0x10)) - 16;
+    const int x1 = static_cast<int>((q >> 4) | ((qh >> (i + 12)) & 0x10)) - 16;
+    y[i] = static_cast<float>(x0) * d;
+    y[i + 16] = static_cast<float>(x1) * d;
+  }
+}
+
+void dequant_q5_1(const std::byte* b, float* y) {
+  const float d = half_to_float(u16_at(b)), m = half_to_float(u16_at(b + 2));
+  const std::uint32_t qh = u32_at(b + 4);
+  for (int i = 0; i < 16; ++i) {
+    const std::uint8_t q = u8_at(b + 8 + i);
+    const unsigned x0 = (q & 0xF) | (((qh >> i) << 4) & 0x10);
+    const unsigned x1 = (q >> 4) | ((qh >> (i + 12)) & 0x10);
+    y[i] = static_cast<float>(x0) * d + m;
+    y[i + 16] = static_cast<float>(x1) * d + m;
+  }
+}
+
 void dequant_q4_k(const std::byte* b, float* y) {
   const float d = half_to_float(u16_at(b));
   const float dmin = half_to_float(u16_at(b + 2));
@@ -260,8 +297,8 @@ std::optional<GgmlBlock> ggml_block(std::uint32_t type) {
 
 bool gguf_dequantizable(std::uint32_t type) {
   using namespace ggml;
-  return type == kF32 || type == kF16 || type == kBF16 || type == kQ8_0 || type == kQ4_0 || type == kQ4_K || type == kQ5_K ||
-         type == kQ6_K;
+  return type == kF32 || type == kF16 || type == kBF16 || type == kQ8_0 || type == kQ4_0 || type == kQ4_1 || type == kQ5_0 ||
+         type == kQ5_1 || type == kQ4_K || type == kQ5_K || type == kQ6_K;
 }
 
 std::uint64_t gguf_row_bytes(std::uint32_t type, std::int64_t k) {
@@ -303,6 +340,9 @@ void dequantize_gguf_rows(std::uint32_t type, const std::byte* src, std::int64_t
   }
   void (*block)(const std::byte*, float*) = type == kQ8_0   ? dequant_q8_0
                                             : type == kQ4_0 ? dequant_q4_0
+                                            : type == kQ4_1 ? dequant_q4_1
+                                            : type == kQ5_0 ? dequant_q5_0
+                                            : type == kQ5_1 ? dequant_q5_1
                                             : type == kQ4_K ? dequant_q4_k
                                             : type == kQ5_K ? dequant_q5_k
                                                             : dequant_q6_k;
