@@ -17,6 +17,7 @@
 #include "kernels/basic/elementwise.h"
 #include "kernels/basic/norm.h"
 #include "kernels/basic/rope.h"
+#include "models/lora/lora_merge_device.h"
 #include "models/moss_dit/dit_kernels.h"
 #include "models/moss_dit/nvfp4_support.h"
 #include "runtime/pinned_ring.h"
@@ -437,6 +438,21 @@ void MossDit::remerge_into(const lora::PristineWeights& pristine, const lora::Lo
   }
 }
 
+bool MossDit::merge_on_device(const lora::LoraStack& stack, const std::string& module, const MergeTarget& t) {
+  if (t.group != 0 || t.w.dtype != DType::kBF16 || !lora::device_mergeable(stack, module)) return false;
+  const bool host = t.w.device != Device::kCUDA;
+  runtime::StackScope scope(arena_);
+  const std::size_t avail = arena_.available() / runtime::kArenaAlign * runtime::kArenaAlign;
+  if (avail < lora::device_merge_min_scratch(stack, module, host)) return false;
+  const std::size_t bytes = std::min(avail, lora::device_merge_full_scratch(stack, module, host));
+  void* const scratch = arena_.alloc_stack(bytes);
+  // The legacy stream, synchronized by the call: the target's upload (the load's ring) has completed, and every engine
+  // stream sees the merged bits afterwards.
+  lora::merge_bf16_device(stack, module, static_cast<std::uint16_t*>(t.w.data), t.w.dim(0), t.w.dim(1), host, scratch,
+                          bytes, nullptr);
+  return true;
+}
+
 MossDit::MergeTarget MossDit::merge_target(const TensorMap& m, const std::string& module) const {
   MergeTarget t;
   const auto w = m.find(module + ".weight");
@@ -584,6 +600,12 @@ void MossDit::remerge_lora(const lora::LoraStack& stack) {
   // Module by module (a failure leaves earlier modules re-merged: the caller discards the model then).
   for (const auto& [module, t] : merge_targets_) {
     MergeStaging staging(t, false);
+    if (t.group == 0 && lora::device_mergeable(stack, module)) {
+      // The pristine bits back into the target, then the merge on the GPU.
+      pristine_->restore_bf16(module, staging.w<std::uint16_t>(), staging.bias());
+      staging.store();
+      if (merge_on_device(stack, module, t)) continue;
+    }
     remerge_into(*pristine_, stack, module, t, staging);
     staging.store();
   }
@@ -677,11 +699,21 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
     remerge_into(*pristine_, *merges, module, t, staging);
     staging.store();
   };
+  // bf16 low-rank merges run on the GPU once every group is loaded (merge_on_device: the same bits, without the host
+  // round trip and without stalling the load's pipeline per group); the others as each group arrives.
+  std::vector<std::pair<std::string, MergeTarget>> device_merges;
   const auto merge = [&](const TensorMap& m) {
     if (merges == nullptr) return;
+    bool synced = false;
     for (const std::string& module : merges->merge_modules()) {
       const MergeTarget t = merge_target(m, module);
       if (t.w.data == nullptr) continue;
+      if (t.group == 0 && lora::device_mergeable(*merges, module)) {
+        device_merges.emplace_back(module, t);
+        continue;
+      }
+      if (!synced) ring.synchronize();  // the bytes are on the device before they are read back
+      synced = true;
       merge_on_host(module, t);
       merge_targets_.emplace_back(module, t);
     }
@@ -690,10 +722,7 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
     check_cancel();
     load_stats_.bytes += g.total_bytes;
     TensorMap m = weights::upload_group(readers, g, arena, ring);
-    if (merges != nullptr && !merges->merge_modules().empty()) {
-      ring.synchronize();  // the bytes are on the device before they are read back
-      merge(m);
-    }
+    merge(m);
     return m;
   };
   if (merges != nullptr && residency.streamed() && residency.source == StreamSource::kFile) {
@@ -752,6 +781,22 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
   }, quant, [&](const TensorMap& host) { merge(host); });
   host_bytes_ = BlockWeights::host_bytes(index, residency);
   ring.synchronize();
+  for (const auto& [module, t] : device_merges) {
+    check_cancel();
+    if (merges->keeps_pristine(module)) {
+      if (!pristine_) pristine_ = std::make_unique<lora::PristineWeights>();
+      if (!pristine_->has(module)) {
+        const MergeStaging loaded(t, true);
+        pristine_->keep_bf16(module, loaded.w<std::uint16_t>(), t.w.dim(0), t.w.dim(1), loaded.bias());
+      }
+    } else {
+      no_pristine_ = true;
+    }
+    // The target holds the loaded bits, the module's pristine ones: merged in place (on the host when the arena lacks
+    // the scratch).
+    if (!merge_on_device(*merges, module, t)) merge_on_host(module, t);
+    merge_targets_.emplace_back(module, t);
+  }
   load_stats_.direct = readers.all_direct();
   for (cudaEvent_t& e : block_done_) MI_CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
   load_stats_.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

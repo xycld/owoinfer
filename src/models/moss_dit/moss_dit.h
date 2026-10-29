@@ -517,6 +517,11 @@ class MossDit {
   // staging = merge(pristine copy of `module`) for `stack`'s strengths, from `pristine` (host math only).
   static void remerge_into(const lora::PristineWeights& pristine, const lora::LoraStack& stack, const std::string& module,
                            const MergeTarget& t, MergeStaging& staging);
+  // merge_bf16 of `module` into a bf16 target in place on the GPU (lora_merge_device.h, the same bits), with scratch
+  // from the arena's free stack (a pinned host target's row chunks staged through it). False, with the target
+  // untouched, when the module has adapters the device merge does not take or the arena lacks the scratch: the caller
+  // then runs the host merge.
+  bool merge_on_device(const lora::LoraStack& stack, const std::string& module, const MergeTarget& t);
   std::unique_ptr<lora::PristineWeights> pristine_;
   bool no_pristine_ = false;  // some module merged at load without a pristine copy (can_remerge)
   std::vector<std::pair<std::string, MergeTarget>> merge_targets_;

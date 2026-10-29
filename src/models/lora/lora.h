@@ -24,8 +24,9 @@
 //   - everything else (LoHa / LoKr / full deltas anywhere; any adapter on text_embedder, the modulation and time
 //     linears, the embedders and the final layer) -> merged into the base weight at load (merge_bf16, or
 //     merge_requantize_int8 for an INT8 block GEMM, which adds the requantization error: with
-//     LoadOptions::int8_block_gemms each such adapter gets a FileReport warning). A strength change re-merges from the
-//     pristine base weights kept by PristineWeights.
+//     LoadOptions::int8_block_gemms each such adapter gets a FileReport warning; bf16 low-rank merges run on the GPU
+//     with the same bits, lora_merge_device.h). A strength change re-merges from the pristine base weights kept by
+//     PristineWeights.
 //
 // Untrusted input: every name, dtype, shape and value is validated (weights::FormatError / LoraError); keys that are
 // not understood or do not match a module of the model are reported per file (FileReport::unknown), never silently
