@@ -145,15 +145,16 @@ struct FileReport {
 //                strength changes are instant and loads fast (a DiT file with the adapter baked in, moss-infer
 //                quantize --lora, has no per-step cost)
 //   kMerge       every low-rank block adapter merged (no per-step cost, a slower load; an edit adapter's strength or
-//                placement change reloads the DiT); one on an INT4 / NVFP4 module is a LoraError naming it
+//                placement change reloads the DiT); one on a module that cannot take a merge (INT8 without ConvRot,
+//                INT4, NVFP4) is a LoraError naming the module and its format
 //   kSideBranch  every low-rank block adapter on the side branch
 // Other adapters (LoHa / LoKr / full deltas, non-block modules) are merged whatever the placement.
 enum class Placement : std::uint8_t { kDefault, kMerge, kSideBranch };
 const char* placement_name(Placement p);  // "default", "merge", "side_branch"
 Placement parse_placement(std::string_view name);  // one of those; std::invalid_argument otherwise
 
-// How the base stores a block linear (merges need bf16 or INT8 ConvRot).
-enum class BaseFormat : std::uint8_t { kBf16, kInt8, kPacked4 };
+// How the base stores a block linear, one value per quant::QuantFormat (merges need kBf16 or kInt8, INT8 ConvRot).
+enum class BaseFormat : std::uint8_t { kBf16, kInt8, kInt8Plain, kInt4, kNvfp4 };
 
 struct LoadOptions {
   bool strict = false;            // throw LoraError instead of reporting unknown keys or warnings

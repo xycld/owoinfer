@@ -550,10 +550,11 @@ TEST(LoraFormat, PlacementPerModule) {
   for (auto& x : low_rank("layers.2.proj.k", ".lora_A", ".lora_B", kD, kD, 4, 5)) edit.push_back(x);
   write_st(dir.path() / "edit.safetensors", edit, edit_meta);
   write_st(dir.path() / "edit8.safetensors", low_rank("layers.0.proj.q", ".lora_A", ".lora_B", kD, kD, 4, 3), edit_meta);
-  // Block 0 INT8, block 1 packed 4-bit, the others bf16.
+  // Block 0 INT8, block 1 INT4, block 3 INT8 without ConvRot, the others bf16.
   const auto base = [](std::string_view m) {
     return m.starts_with("layers.0.")   ? mi::lora::BaseFormat::kInt8
-           : m.starts_with("layers.1.") ? mi::lora::BaseFormat::kPacked4
+           : m.starts_with("layers.1.") ? mi::lora::BaseFormat::kInt4
+           : m.starts_with("layers.3.") ? mi::lora::BaseFormat::kInt8Plain
                                         : mi::lora::BaseFormat::kBf16;
   };
   const auto open = [&](const char* file, mi::lora::Placement p, bool strict = false) {
@@ -571,7 +572,21 @@ TEST(LoraFormat, PlacementPerModule) {
     EXPECT_TRUE(side(s, "layers.1.proj.o"));
     EXPECT_TRUE(s.reports()[0].warnings.empty());
   }
-  EXPECT_THROW(open("plain.safetensors", Placement::kMerge), LoraError);  // layers.1.proj.o is packed
+  // layers.1.proj.o is INT4, layers.3 INT8 without ConvRot: refused naming the module's own format.
+  const auto merge_error = [&](const char* file) {
+    try {
+      open(file, Placement::kMerge);
+    } catch (const LoraError& e) {
+      return std::string(e.what());
+    }
+    return std::string("no error");
+  };
+  EXPECT_NE(merge_error("plain.safetensors").find("module layers.1.proj.o is stored int4_convrot, which cannot take a merge"),
+            std::string::npos);
+  write_st(dir.path() / "plain8.safetensors", low_rank("transformer.layers.3.proj.v", ".lora_A.weight", ".lora_B.weight", kD, kD, 4, 6));
+  EXPECT_NE(merge_error("plain8.safetensors").find("module layers.3.proj.v is stored int8_plain (INT8 without ConvRot)"),
+            std::string::npos);
+  EXPECT_TRUE(side(open("plain8.safetensors", Placement::kDefault), "layers.3.proj.v"));
   {
     const LoraStack s = open("edit.safetensors", Placement::kDefault, true);  // strict: nothing lossy by default
     EXPECT_TRUE(side(s, "layers.0.proj.q"));

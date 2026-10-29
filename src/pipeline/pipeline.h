@@ -105,7 +105,7 @@ struct Request {
   std::vector<lora::LoraSpec> loras;
   // Where low-rank adapters on the block GEMMs go (lora::Placement, a fixed rule per module and base precision):
   // kDefault puts every low-rank block adapter on the side branch, moss-edit-lora adapters included; kMerge merges
-  // every one (no per-step cost, a slower load; INT8 requantized; INT4 / NVFP4 refused);
+  // every one (no per-step cost, a slower load; INT8 requantized; INT4, NVFP4 and INT8 without ConvRot refused);
   // kSideBranch puts them all on the side branch. Part of the DiT's load key: changing it reloads the DiT when it changes
   // what is merged. Merged blocks that stream need a pinned host copy; when the host budget cannot hold it the plan
   // fails (never a silent switch).

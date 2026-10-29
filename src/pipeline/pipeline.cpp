@@ -922,8 +922,15 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
       if (const quant::QuantIndex* qi = src.quant.get(); qi != nullptr) {
         lo.base_format = [qi](std::string_view module) {
           const quant::QuantSpec* s = qi->find_spec(module);
-          if (s == nullptr || !s->quantized()) return lora::BaseFormat::kBf16;
-          return s->format == quant::QuantFormat::kInt8ConvRot ? lora::BaseFormat::kInt8 : lora::BaseFormat::kPacked4;
+          if (s == nullptr) return lora::BaseFormat::kBf16;
+          switch (s->format) {
+            case quant::QuantFormat::kBF16: return lora::BaseFormat::kBf16;
+            case quant::QuantFormat::kInt8ConvRot: return lora::BaseFormat::kInt8;
+            case quant::QuantFormat::kInt8Plain: return lora::BaseFormat::kInt8Plain;
+            case quant::QuantFormat::kInt4ConvRot: return lora::BaseFormat::kInt4;
+            case quant::QuantFormat::kNvfp4: return lora::BaseFormat::kNvfp4;
+          }
+          throw std::logic_error("LoRA placement: unknown quantization format of " + std::string(module));
         };
       } else {
         lo.base_format = [](std::string_view) { return lora::BaseFormat::kBf16; };

@@ -489,9 +489,13 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
         const bool branchable = t.kind == AdapterKind::kLowRank && tm->block >= 0 && !t.bias_diff;
         t.side_branch = branchable;
         if (branchable && options.placement == Placement::kMerge) {
-          if (base == BaseFormat::kPacked4) {
-            fail(util::path_utf8(spec.path) + ": lora_placement merge: module " + name +
-                 " is stored INT4 / NVFP4, which cannot take a merge (use lora_placement default or side_branch)");
+          if (base != BaseFormat::kBf16 && base != BaseFormat::kInt8) {
+            const char* stored = base == BaseFormat::kInt8Plain ? "int8_plain (INT8 without ConvRot)"
+                                 : base == BaseFormat::kInt4    ? "int4_convrot"
+                                                                : "nvfp4";
+            fail(util::path_utf8(spec.path) + ": lora_placement merge: module " + name + " is stored " + stored +
+                 ", which cannot take a merge (merges need bf16 or INT8 ConvRot; use lora_placement default or "
+                 "side_branch)");
           }
           t.side_branch = false;
         }
