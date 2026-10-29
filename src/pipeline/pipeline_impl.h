@@ -976,6 +976,20 @@ struct Pipeline::Impl {
     sample_memory();
   }
 
+  // The models of a call, set up for its request (Pipeline::run, the component session): the bundle and the DiT, text
+  // encoder and VAE sources (reported in `r`); the control adapter's file and device embedder, its LoRA part joining
+  // the runtime LoRA stack after the request's LoRAs; the quality tier and report; the runtime LoRA stack, kept,
+  // updated or rebuilt. Throws before anything heavy for a refused tier, kind or LoRA file.
+  struct CallModels {
+    Bundle* b = nullptr;
+    DitSource* src = nullptr;
+    const TeSource* tes = nullptr;
+    const VaeSource* vs = nullptr;
+    const control::ControlFile* ctl = nullptr;  // the request's control adapter (nullptr: none)
+    std::string merge_key;                      // the LoRA files merged into the DiT (empty: none)
+  };
+  CallModels setup_models(const Request& req, Result& r);
+
   // Private host memory the pipeline holds itself across calls (cache contents, text-encoder rings and host copy),
   // which the planner adds on its own and must not count twice. The planner adds the text encoder's share only when
   // it runs: on a full embedding-cache hit the encoder's held memory stays in the baseline.

@@ -681,51 +681,9 @@ Result Pipeline::preload(const PreloadOptions& options) {
   return run(req, control, true);
 }
 
-// generate(), or with `preload` the same up to the plan and the arena, then the loads of the models the plan keeps.
-Result Pipeline::run(const Request& req, const GenerateControl& control, bool preload) {
-  Impl& m = *impl_;
-  check_user_paths(m.options, req);
-  validate(req);
-  Result r;
-  r.tier.tier = m.options.tier;  // what a run cancelled before the tier is resolved reports
+Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Result& r) {
+  Impl& m = *this;
   Timings& tm = r.timings;
-  m.mem = &r.memory;
-  r.memory.free_at_start = m.free_at_start;
-  r.memory.host_private_start = planner::process_host_memory().private_bytes;
-  r.memory.host_private_peak = r.memory.host_private_start;
-  const auto t_total = Clock::now();
-  const cudaStream_t stream = m.streams.compute();
-  // Cancellation: before each phase (and after every step, below). A seen request always ends the call.
-  const auto cancel_requested = [&] { return control.cancel != nullptr && control.cancel->load(); };
-  const auto keep_going = [&](Phase phase) {
-    if (control.on_phase && !control.on_phase(phase)) r.cancelled = true;
-    if (cancel_requested()) r.cancelled = true;
-    return !r.cancelled;
-  };
-  const auto finish = [&] {
-    tm.total_s = since(t_total);
-    r.memory.host_copy_bytes = m.te_host_bytes() + m.dit_host_bytes();
-    r.memory.merge_memo_bytes = m.dit ? m.dit->memo_bytes() : 0;
-    m.sample_memory();
-    m.mem = nullptr;
-    if (m.learner) m.learner->end_generation();
-    return std::move(r);
-  };
-  // The models keep the call's cancel flag only for the call (the flag may not outlive it).
-  struct CancelScope {
-    Impl& m;
-    ~CancelScope() {
-      if (m.dit) {
-        m.dit->set_cancel(nullptr);
-        m.dit->set_request_route(std::nullopt);
-        m.dit->set_input_extension(nullptr);  // a pass's control latents live on its stack
-        m.dit->set_step_cache(nullptr);       // a pass's step cache too (run_pass also clears it)
-        m.dit->set_linear_input_hook({});     // and the call's calibration hook
-      }
-      if (m.vae) m.vae->set_cancel(nullptr);
-    }
-  } cancel_scope{m};
-
   Bundle& b = m.bundle(req.model, tm.index_load_s);
   DitSource& src = m.dit_source(b, tm.index_load_s);
   const TeSource& tes = m.te_source(b, tm.index_load_s);
@@ -925,6 +883,61 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
       for (const std::string& w : moss_dit::shadowed_by_time_embedding(*m.lora_stack)) r.lora_warnings.push_back(w);
     }
   }
+  return {&b, &src, &tes, &vs, ctl, merge_key};
+}
+
+// generate(), or with `preload` the same up to the plan and the arena, then the loads of the models the plan keeps.
+Result Pipeline::run(const Request& req, const GenerateControl& control, bool preload) {
+  Impl& m = *impl_;
+  check_user_paths(m.options, req);
+  validate(req);
+  Result r;
+  r.tier.tier = m.options.tier;  // what a run cancelled before the tier is resolved reports
+  Timings& tm = r.timings;
+  m.mem = &r.memory;
+  r.memory.free_at_start = m.free_at_start;
+  r.memory.host_private_start = planner::process_host_memory().private_bytes;
+  r.memory.host_private_peak = r.memory.host_private_start;
+  const auto t_total = Clock::now();
+  const cudaStream_t stream = m.streams.compute();
+  // Cancellation: before each phase (and after every step, below). A seen request always ends the call.
+  const auto cancel_requested = [&] { return control.cancel != nullptr && control.cancel->load(); };
+  const auto keep_going = [&](Phase phase) {
+    if (control.on_phase && !control.on_phase(phase)) r.cancelled = true;
+    if (cancel_requested()) r.cancelled = true;
+    return !r.cancelled;
+  };
+  const auto finish = [&] {
+    tm.total_s = since(t_total);
+    r.memory.host_copy_bytes = m.te_host_bytes() + m.dit_host_bytes();
+    r.memory.merge_memo_bytes = m.dit ? m.dit->memo_bytes() : 0;
+    m.sample_memory();
+    m.mem = nullptr;
+    if (m.learner) m.learner->end_generation();
+    return std::move(r);
+  };
+  // The models keep the call's cancel flag only for the call (the flag may not outlive it).
+  struct CancelScope {
+    Impl& m;
+    ~CancelScope() {
+      if (m.dit) {
+        m.dit->set_cancel(nullptr);
+        m.dit->set_request_route(std::nullopt);
+        m.dit->set_input_extension(nullptr);  // a pass's control latents live on its stack
+        m.dit->set_step_cache(nullptr);       // a pass's step cache too (run_pass also clears it)
+        m.dit->set_linear_input_hook({});     // and the call's calibration hook
+      }
+      if (m.vae) m.vae->set_cancel(nullptr);
+    }
+  } cancel_scope{m};
+
+  const Impl::CallModels models = m.setup_models(req, r);
+  Bundle& b = *models.b;
+  DitSource& src = *models.src;
+  const TeSource& tes = *models.tes;
+  const VaeSource& vs = *models.vs;
+  const control::ControlFile* ctl = models.ctl;
+  const std::string& merge_key = models.merge_key;
   if (req.seed >= 0) {
     r.seed = static_cast<std::uint64_t>(req.seed);
   } else {
