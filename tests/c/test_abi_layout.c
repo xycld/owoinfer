@@ -341,6 +341,124 @@ int main(void) {
   FIELD(mi_file_info, control_kind_count, 48);
   FIELD(mi_file_info, _reserved0, 52);
 
+  /* The component API (2.1). */
+  check("sizeof(mi_memory)", sizeof(mi_memory), 4);
+  check("sizeof(mi_dtype)", sizeof(mi_dtype), 4);
+  check("sizeof(mi_guidance)", sizeof(mi_guidance), 4);
+  check("sizeof(mi_step_output)", sizeof(mi_step_output), 4);
+
+  SIZE(mi_tensor, 56);
+  FIELD(mi_tensor, data, 0);
+  FIELD(mi_tensor, memory, 8);
+  FIELD(mi_tensor, dtype, 12);
+  FIELD(mi_tensor, rank, 16);
+  FIELD(mi_tensor, _reserved0, 20);
+  FIELD(mi_tensor, shape, 24);
+
+  SIZE(mi_session_params, 48);
+  FIELD(mi_session_params, struct_size, 0);
+  FIELD(mi_session_params, plan_request, 8);
+  FIELD(mi_session_params, progress_callback, 16);
+  FIELD(mi_session_params, user_data, 24);
+  FIELD(mi_session_params, max_rows, 32);
+  FIELD(mi_session_params, max_latents, 36);
+  FIELD(mi_session_params, control_adapter, 40);
+
+  SIZE(mi_text_params, 32);
+  FIELD(mi_text_params, struct_size, 0);
+  FIELD(mi_text_params, prompts, 8);
+  FIELD(mi_text_params, prompts_count, 16);
+  FIELD(mi_text_params, max_sequence_length, 24);
+  FIELD(mi_text_params, _reserved0, 28);
+
+  SIZE(mi_conditioning_info, 24);
+  FIELD(mi_conditioning_info, struct_size, 0);
+  FIELD(mi_conditioning_info, tokens, 8);
+  FIELD(mi_conditioning_info, text_dim, 12);
+  FIELD(mi_conditioning_info, dtype, 16);
+  FIELD(mi_conditioning_info, engine_encoded, 20);
+
+  SIZE(mi_run_row, 32);
+  FIELD(mi_run_row, conditioning, 0);
+  FIELD(mi_run_row, skip_layers, 8);
+  FIELD(mi_run_row, skip_layers_count, 16);
+  FIELD(mi_run_row, latent, 24);
+  FIELD(mi_run_row, _reserved0, 28);
+
+  SIZE(mi_run_params, 208);
+  FIELD(mi_run_params, struct_size, 0);
+  FIELD(mi_run_params, width, 8);
+  FIELD(mi_run_params, height, 12);
+  FIELD(mi_run_params, rows, 16);
+  FIELD(mi_run_params, rows_count, 24);
+  FIELD(mi_run_params, sigmas, 32);
+  FIELD(mi_run_params, sigmas_count, 40);
+  FIELD(mi_run_params, scheduler, 48);
+  FIELD(mi_run_params, steps, 52);
+  FIELD(mi_run_params, shift, 56);
+  FIELD(mi_run_params, flow_multiplier, 64);
+  FIELD(mi_run_params, denoise_strength, 72);
+  FIELD(mi_run_params, guidance, 80);
+  FIELD(mi_run_params, output, 84);
+  FIELD(mi_run_params, flags, 88);
+  FIELD(mi_run_params, _reserved0, 92);
+  FIELD(mi_run_params, cfg, 96);
+  FIELD(mi_run_params, slg_layers, 104);
+  FIELD(mi_run_params, slg_layers_count, 112);
+  FIELD(mi_run_params, slg_scale, 120);
+  FIELD(mi_run_params, slg_start, 128);
+  FIELD(mi_run_params, slg_stop, 136);
+  FIELD(mi_run_params, loras, 144);
+  FIELD(mi_run_params, loras_count, 152);
+  FIELD(mi_run_params, control_lora_strength, 160);
+  FIELD(mi_run_params, control_images, 168);
+  FIELD(mi_run_params, control_images_count, 176);
+  FIELD(mi_run_params, cfg_truncation, 184);
+  FIELD(mi_run_params, step_cache, 192);
+  FIELD(mi_run_params, control_resize, 196);
+  FIELD(mi_run_params, step_cache_threshold, 200);
+
+  SIZE(mi_run_info, 64);
+  FIELD(mi_run_info, struct_size, 0);
+  FIELD(mi_run_info, latent_channels, 8);
+  FIELD(mi_run_info, latent_height, 12);
+  FIELD(mi_run_info, latent_width, 16);
+  FIELD(mi_run_info, steps, 20);
+  FIELD(mi_run_info, outputs, 24);
+  FIELD(mi_run_info, rows, 28);
+  FIELD(mi_run_info, schedule_matches, 32);
+  FIELD(mi_run_info, off_schedule_calls, 36);
+  FIELD(mi_run_info, calls, 40);
+  FIELD(mi_run_info, control_channels, 44);
+  FIELD(mi_run_info, latents, 48);
+  FIELD(mi_run_info, _reserved0, 52);
+  FIELD(mi_run_info, staging_bytes, 56);
+
+  SIZE(mi_step_params, 592);
+  FIELD(mi_step_params, struct_size, 0);
+  FIELD(mi_step_params, sigma, 8);
+  FIELD(mi_step_params, step, 12);
+  FIELD(mi_step_params, rows, 16);
+  FIELD(mi_step_params, flags, 20);
+  FIELD(mi_step_params, cuda_stream, 24);
+  FIELD(mi_step_params, control, 32);
+  FIELD(mi_step_params, x, 88);
+  FIELD(mi_step_params, out, 144);
+
+  SIZE(mi_step_info, 32);
+  FIELD(mi_step_info, struct_size, 0);
+  FIELD(mi_step_info, step, 8);
+  FIELD(mi_step_info, rows, 12);
+  FIELD(mi_step_info, cached, 16);
+  FIELD(mi_step_info, on_schedule, 20);
+  FIELD(mi_step_info, seconds, 24);
+
+  /* The 2.1 values: the capability bit and the result text kind (the next free after 2.0's). */
+  check("MI_CAP_COMPONENTS", MI_CAP_COMPONENTS, 0x40000u);
+  check("MI_TEXT_COMPONENT_NOTE", MI_TEXT_COMPONENT_NOTE, 18);
+  check("MI_MAX_CALL_TOKENS", MI_MAX_CALL_TOKENS, 61506);
+  check("MI_MAX_ROWS", MI_MAX_ROWS, 8);
+
   printf("%s: C struct layouts %s the frozen ABI %d table\n", failures ? "FAIL" : "ok",
          failures ? "differ from" : "match", MI_ABI_VERSION);
   return failures ? 1 : 0;

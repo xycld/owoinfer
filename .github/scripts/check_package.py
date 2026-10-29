@@ -48,6 +48,17 @@ IS_WINDOWS = os.name == "nt"
 HEADER = "include/mossinfer/mossinfer.h"
 API_DECL = re.compile(r"^\s*MOSSINFER_API\b[^;(]*?\b(\w+)\s*\(", re.MULTILINE)
 INTERNAL_CLI_ENTRY = "mi_internal_cli_main"
+# The component API's frozen functions (2.1): the header must declare every one, so the export check covers them.
+COMPONENT_API = {
+    "mi_session_params_init", "mi_session_open", "mi_session_close",
+    "mi_text_params_init", "mi_encode_text",
+    "mi_conditioning_create", "mi_conditioning_query", "mi_conditioning_prompt_tokens", "mi_conditioning_tensor",
+    "mi_conditioning_free",
+    "mi_run_params_init", "mi_run_begin", "mi_run_query", "mi_run_sigmas", "mi_run_adopt_staging", "mi_run_staging",
+    "mi_step_params_init", "mi_denoise_step", "mi_run_end",
+    "mi_vae_encode", "mi_vae_decode",
+    "mi_schedule", "mi_sampler_prediction", "mi_initial_noise", "mi_image_resize",
+}
 
 
 # The C++ runtime DLLs of MSVC's /MD (the UCRT, api-ms-win-*, ships with Windows 10 and newer).
@@ -219,6 +230,8 @@ def main():
     api = c_api_functions(prefix)
     if not api:
         failures.append(f"ABI: no MOSSINFER_API functions found in {HEADER}")
+    elif COMPONENT_API - api:
+        failures.append(f"ABI: component API functions not declared in {HEADER}: {sorted(COMPONENT_API - api)}")
     for lib in libs:
         syms = set(exported_symbols(lib))
         # mi_internal_cli_main: moss-infer's entry when it links the library (MOSSINFER_CLI_SHARED); not C API.

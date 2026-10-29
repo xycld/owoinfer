@@ -75,6 +75,19 @@ if(NOT MOSSINFER_ONLY AND EXISTS ${CMAKE_SOURCE_DIR}/tools/server/main.cpp)
     endif()
     add_test(NAME c_abi_compat COMMAND mossinfer_abi_compat_c)
     set_tests_properties(c_abi_compat PROPERTIES LABELS cpu)
+
+    # The component API (2.1) from C99: every new symbol, the init sizes, the helpers, calls without an engine.
+    add_executable(mossinfer_component_api_c ${CMAKE_SOURCE_DIR}/tests/c/test_component_api.c)
+    set_target_properties(mossinfer_component_api_c PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+    target_compile_options(mossinfer_component_api_c PRIVATE ${_mi_c_warn})
+    if(TARGET mossinfer)
+      target_link_libraries(mossinfer_component_api_c PRIVATE mossinfer)
+    else()
+      target_link_libraries(mossinfer_component_api_c PRIVATE mossinfer_core)
+      set_target_properties(mossinfer_component_api_c PROPERTIES LINKER_LANGUAGE CXX)
+    endif()
+    add_test(NAME c_component_api COMMAND mossinfer_component_api_c)
+    set_tests_properties(c_component_api PROPERTIES LABELS cpu)
     # The same, plus a generation from the 0.1.0 structs (a PNG without metadata). Skipped without weights or a GPU.
     add_test(NAME c_abi_compat_gpu COMMAND mossinfer_abi_compat_c ${MOSSINFER_TEST_WEIGHTS}/base
              ${CMAKE_BINARY_DIR}/c_abi_compat_gpu.png)

@@ -3,25 +3,35 @@
 #include "mossinfer/mossinfer.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <new>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
 
+#include "api/component_adapter.h"
 #include "api/file_inspect.h"
 #include "api/pipeline_adapter.h"
+#include "backend/cuda_driver.h"
 #include "backend/cuda_libs.h"
 #include "backend/probe.h"
 #include "core/cuda_check.h"
+#include "pipeline/pipeline.h"
 #include "pipeline/pipeline_image.h"
+#include "pipeline/run_schedule.h"
+#include "pipeline/sampler.h"
+#include "pipeline/samplers/initial_noise.h"
 #include "planner/planner.h"
 #include "runtime/device_arena.h"
+#include "runtime/exchange.h"
 #include "runtime/job_gate.h"
 #include "util/json.h"
 #include "util/path.h"
@@ -32,10 +42,18 @@
 #include "weights/upload.h"
 
 struct mi_engine {
-  // The one gate of the engine's jobs (runtime/job_gate.h): mi_generate, mi_engine_preload, mi_engine_release, and the
-  // cancel flag the running job watches. Declared first: it outlives everything that runs through it.
+  // The one gate of the engine's jobs (runtime/job_gate.h): mi_generate, mi_engine_preload, mi_engine_release, every
+  // component call, and the cancel flag the running job watches. Declared first: it outlives everything that runs
+  // through it.
   mi::runtime::JobGate gate;
   std::unique_ptr<mi::api::PipelineAdapter> adapter;
+  // The open session, or the last one (closed). mi_session_open replaces it only once no call holds it (SessionRef),
+  // so a call never reaches another session than the one it found; the gate refuses calls on a closed one.
+  mutable std::mutex session_mu;
+  mutable std::condition_variable session_cv;
+  std::unique_ptr<mi::api::ComponentSession> session;
+  mutable int session_users = 0;
+  bool session_replacing = false;
 };
 
 struct mi_result {
@@ -340,6 +358,109 @@ MI_LAYOUT(mi_file_info, lora_adapters, 40);
 MI_LAYOUT(mi_file_info, lora_unknown_keys, 44);
 MI_LAYOUT(mi_file_info, control_kind_count, 48);
 MI_LAYOUT(mi_file_info, _reserved0, 52);
+// The component API (2.1).
+static_assert(sizeof(mi_memory) == 4 && sizeof(mi_dtype) == 4 && sizeof(mi_guidance) == 4 && sizeof(mi_step_output) == 4,
+              "C API enums are 32-bit");
+static_assert(sizeof(mi_tensor) == 56);  // no struct_size, frozen
+MI_LAYOUT(mi_tensor, data, 0);
+MI_LAYOUT(mi_tensor, memory, 8);
+MI_LAYOUT(mi_tensor, dtype, 12);
+MI_LAYOUT(mi_tensor, rank, 16);
+MI_LAYOUT(mi_tensor, _reserved0, 20);
+MI_LAYOUT(mi_tensor, shape, 24);
+static_assert(sizeof(mi_session_params) == 48);
+MI_LAYOUT(mi_session_params, struct_size, 0);
+MI_LAYOUT(mi_session_params, plan_request, 8);
+MI_LAYOUT(mi_session_params, progress_callback, 16);
+MI_LAYOUT(mi_session_params, user_data, 24);
+MI_LAYOUT(mi_session_params, max_rows, 32);
+MI_LAYOUT(mi_session_params, max_latents, 36);
+MI_LAYOUT(mi_session_params, control_adapter, 40);
+static_assert(sizeof(mi_text_params) == 32);
+MI_LAYOUT(mi_text_params, struct_size, 0);
+MI_LAYOUT(mi_text_params, prompts, 8);
+MI_LAYOUT(mi_text_params, prompts_count, 16);
+MI_LAYOUT(mi_text_params, max_sequence_length, 24);
+MI_LAYOUT(mi_text_params, _reserved0, 28);
+static_assert(sizeof(mi_conditioning_info) == 24);
+MI_LAYOUT(mi_conditioning_info, struct_size, 0);
+MI_LAYOUT(mi_conditioning_info, tokens, 8);
+MI_LAYOUT(mi_conditioning_info, text_dim, 12);
+MI_LAYOUT(mi_conditioning_info, dtype, 16);
+MI_LAYOUT(mi_conditioning_info, engine_encoded, 20);
+static_assert(sizeof(mi_run_row) == 32);  // array element: no struct_size, frozen
+MI_LAYOUT(mi_run_row, conditioning, 0);
+MI_LAYOUT(mi_run_row, skip_layers, 8);
+MI_LAYOUT(mi_run_row, skip_layers_count, 16);
+MI_LAYOUT(mi_run_row, latent, 24);
+MI_LAYOUT(mi_run_row, _reserved0, 28);
+static_assert(sizeof(mi_run_params) == 208);
+MI_LAYOUT(mi_run_params, struct_size, 0);
+MI_LAYOUT(mi_run_params, width, 8);
+MI_LAYOUT(mi_run_params, height, 12);
+MI_LAYOUT(mi_run_params, rows, 16);
+MI_LAYOUT(mi_run_params, rows_count, 24);
+MI_LAYOUT(mi_run_params, sigmas, 32);
+MI_LAYOUT(mi_run_params, sigmas_count, 40);
+MI_LAYOUT(mi_run_params, scheduler, 48);
+MI_LAYOUT(mi_run_params, steps, 52);
+MI_LAYOUT(mi_run_params, shift, 56);
+MI_LAYOUT(mi_run_params, flow_multiplier, 64);
+MI_LAYOUT(mi_run_params, denoise_strength, 72);
+MI_LAYOUT(mi_run_params, guidance, 80);
+MI_LAYOUT(mi_run_params, output, 84);
+MI_LAYOUT(mi_run_params, flags, 88);
+MI_LAYOUT(mi_run_params, _reserved0, 92);
+MI_LAYOUT(mi_run_params, cfg, 96);
+MI_LAYOUT(mi_run_params, slg_layers, 104);
+MI_LAYOUT(mi_run_params, slg_layers_count, 112);
+MI_LAYOUT(mi_run_params, slg_scale, 120);
+MI_LAYOUT(mi_run_params, slg_start, 128);
+MI_LAYOUT(mi_run_params, slg_stop, 136);
+MI_LAYOUT(mi_run_params, loras, 144);
+MI_LAYOUT(mi_run_params, loras_count, 152);
+MI_LAYOUT(mi_run_params, control_lora_strength, 160);
+MI_LAYOUT(mi_run_params, control_images, 168);
+MI_LAYOUT(mi_run_params, control_images_count, 176);
+MI_LAYOUT(mi_run_params, cfg_truncation, 184);
+MI_LAYOUT(mi_run_params, step_cache, 192);
+MI_LAYOUT(mi_run_params, control_resize, 196);
+MI_LAYOUT(mi_run_params, step_cache_threshold, 200);
+static_assert(sizeof(mi_run_info) == 64);
+MI_LAYOUT(mi_run_info, struct_size, 0);
+MI_LAYOUT(mi_run_info, latent_channels, 8);
+MI_LAYOUT(mi_run_info, latent_height, 12);
+MI_LAYOUT(mi_run_info, latent_width, 16);
+MI_LAYOUT(mi_run_info, steps, 20);
+MI_LAYOUT(mi_run_info, outputs, 24);
+MI_LAYOUT(mi_run_info, rows, 28);
+MI_LAYOUT(mi_run_info, schedule_matches, 32);
+MI_LAYOUT(mi_run_info, off_schedule_calls, 36);
+MI_LAYOUT(mi_run_info, calls, 40);
+MI_LAYOUT(mi_run_info, control_channels, 44);
+MI_LAYOUT(mi_run_info, latents, 48);
+MI_LAYOUT(mi_run_info, _reserved0, 52);
+MI_LAYOUT(mi_run_info, staging_bytes, 56);
+static_assert(sizeof(mi_step_params) == 592);
+MI_LAYOUT(mi_step_params, struct_size, 0);
+MI_LAYOUT(mi_step_params, sigma, 8);
+MI_LAYOUT(mi_step_params, step, 12);
+MI_LAYOUT(mi_step_params, rows, 16);
+MI_LAYOUT(mi_step_params, flags, 20);
+MI_LAYOUT(mi_step_params, cuda_stream, 24);
+MI_LAYOUT(mi_step_params, control, 32);
+MI_LAYOUT(mi_step_params, x, 88);
+MI_LAYOUT(mi_step_params, out, 144);
+static_assert(sizeof(mi_step_info) == 32);
+MI_LAYOUT(mi_step_info, struct_size, 0);
+MI_LAYOUT(mi_step_info, step, 8);
+MI_LAYOUT(mi_step_info, rows, 12);
+MI_LAYOUT(mi_step_info, cached, 16);
+MI_LAYOUT(mi_step_info, on_schedule, 20);
+MI_LAYOUT(mi_step_info, seconds, 24);
+static_assert(MI_LATENT_CHANNELS == mi::moss_dit::kLatentChannels && MI_TEXT_DIM == mi::moss_dit::kTextDim &&
+                  MI_MAX_ROWS == mi::pipeline::kMaxSessionRows && MI_MAX_CALL_TOKENS == mi::pipeline::kMaxCallTokens,
+              "the component macros are the engine's constants");
 #undef MI_LAYOUT
 
 // Every size a versioned input struct has had: the 0.1 layout, then today's. A struct of an older size is read as
@@ -366,6 +487,11 @@ static_assert(kEngineParamsSizes[0] == 80 && kGenParamsSizes[0] == 168 && kTimin
 static_assert(kProbeInfoSizes[0] == 576, "the 0.2.0 mi_probe_info");
 static_assert(kEngineParamsSizes[1] == 120 && kGenParamsSizes[1] == 240, "the first 0.2.0 layouts");
 static_assert(kGenParamsSizes[2] == 320, "the 1.0.0 mi_gen_params");
+// The component structs (2.1): one size each so far.
+constexpr std::size_t kSessionParamsSize = sizeof(mi_session_params);
+constexpr std::size_t kTextParamsSize = sizeof(mi_text_params);
+constexpr std::size_t kRunParamsSize = sizeof(mi_run_params);
+constexpr std::size_t kStepParamsSize = sizeof(mi_step_params);
 
 thread_local std::string t_last_error;
 // Set instead of t_last_error when copying a message failed (no memory): mi_last_error_message() must stay valid.
@@ -431,6 +557,12 @@ mi_status guarded(F&& body) noexcept {
     return fail(MI_ERR_CUDA, e.what());
   } catch (const mi::runtime::JobGate::Busy& e) {
     return fail(MI_ERR_BUSY, e.what());
+  } catch (const mi::pipeline::SessionCancelled& e) {
+    return fail(MI_CANCELLED, e.what());
+  } catch (const mi::pipeline::StagingNotPinned& e) {
+    return fail(MI_ERR_NOT_SUPPORTED, e.what());
+  } catch (const mi::runtime::StagingError& e) {
+    return fail(MI_ERR_OUT_OF_MEMORY, e.what());
   } catch (const std::exception& e) {
     return fail(MI_ERR_INTERNAL, e.what());
   } catch (...) {
@@ -612,6 +744,82 @@ std::string flavour_string(mi::backend::Flavour f) {
   return f == mi::backend::Flavour::kNone ? std::string() : mi::backend::flavour_name(f);
 }
 
+// ---------------------------------------------------------------- components
+
+// The component structs have one size each (2.1).
+mi_session_params session_params_defaults(std::size_t /*size*/ = sizeof(mi_session_params)) {
+  mi_session_params p{};
+  p.struct_size = sizeof p;
+  p.max_rows = 3;
+  p.max_latents = 1;
+  return p;
+}
+
+mi_text_params text_params_defaults(std::size_t /*size*/ = sizeof(mi_text_params)) {
+  mi_text_params p{};
+  p.struct_size = sizeof p;
+  p.max_sequence_length = 4096;
+  return p;
+}
+
+mi_run_params run_params_defaults(std::size_t /*size*/ = sizeof(mi_run_params)) {
+  mi_run_params p{};
+  p.struct_size = sizeof p;
+  p.width = 1024;
+  p.height = 1024;
+  p.scheduler = MI_SCHEDULER_MOSS;
+  p.steps = MI_DEFAULT_STEPS;
+  p.shift = 5.0;
+  p.flow_multiplier = 1.0;
+  p.denoise_strength = 1.0;
+  p.guidance = MI_GUIDANCE_HOST;
+  p.output = MI_STEP_OUTPUT_ROWS;
+  p.cfg = mi::pipeline::kDefaultRunCfg;
+  p.slg_stop = 1.0;
+  p.control_lora_strength = 1.0;
+  p.cfg_truncation = 1.0;
+  p.step_cache = MI_STEP_CACHE_OFF;
+  p.control_resize = MI_RESIZE_CROP;
+  return p;
+}
+
+mi_step_params step_params_defaults(std::size_t /*size*/ = sizeof(mi_step_params)) {
+  mi_step_params p{};
+  p.struct_size = sizeof p;
+  p.step = -1;
+  return p;
+}
+
+// A call's hold on the engine's session object (mi_engine::session): it stays that object until the call returns.
+// Without one (no session was ever opened) `required` throws "no session is open"; otherwise it is empty.
+class SessionRef {
+ public:
+  explicit SessionRef(const mi_engine& e, bool required = true) : e_(e) {
+    std::unique_lock<std::mutex> lock(e_.session_mu);
+    e_.session_cv.wait(lock, [&] { return !e_.session_replacing; });
+    if (!e_.session) {
+      if (required) throw mi::runtime::JobGate::Refused("no session is open");
+      return;
+    }
+    s_ = e_.session.get();
+    ++e_.session_users;
+  }
+  ~SessionRef() {
+    if (s_ == nullptr) return;
+    const std::lock_guard<std::mutex> lock(e_.session_mu);
+    --e_.session_users;
+    e_.session_cv.notify_all();
+  }
+  SessionRef(const SessionRef&) = delete;
+  SessionRef& operator=(const SessionRef&) = delete;
+  explicit operator bool() const { return s_ != nullptr; }
+  mi::api::ComponentSession* operator->() const { return s_; }
+
+ private:
+  const mi_engine& e_;
+  mi::api::ComponentSession* s_ = nullptr;
+};
+
 }  // namespace
 
 mi_result* mi::api::new_result(Generation generation) {
@@ -657,7 +865,8 @@ const char* mi_last_error_message(void) {
 uint32_t mi_capabilities(void) {
   return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS | MI_CAP_IMAGE_INPUT | MI_CAP_HIRES |
          MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL | MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE |
-         MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT;  // MI_CAP_CERTIFICATE_DIRS: reserved since 2.0
+         MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT |
+         MI_CAP_COMPONENTS;  // MI_CAP_CERTIFICATE_DIRS: reserved since 2.0
 }
 
 mi_status mi_probe(mi_probe_info* info) {
@@ -751,15 +960,26 @@ mi_status mi_engine_create(const mi_engine_params* params, mi_engine** out_engin
   });
 }
 
-// The gate is closed first (JobGate::close_engine: later jobs are refused, a job in flight on another thread is
-// cancelled and waited for), so the free never races a job. ~PipelineAdapter and the pipeline below it tear down with
-// CUDA's C API and ignore its errors (never MI_CUDA_CHECK). The thread's last error stays untouched: from a callback of
-// the engine's running job (forbidden) this is a silent no-op that frees nothing.
+// The session is closed and the gate closed first (JobGate::end_session, then close_engine: later jobs are refused, a
+// job in flight on another thread is cancelled and waited for), so the free never races a job; then every call still
+// holding the session object has returned (the closed gate refused it). ~PipelineAdapter and the pipeline below it
+// tear down with CUDA's C API and ignore its errors (never MI_CUDA_CHECK). The thread's last error stays untouched:
+// from a callback of the engine's running job (forbidden) this is a silent no-op that frees nothing.
 static_assert(std::is_nothrow_destructible_v<mi_engine>);
 void mi_engine_free(mi_engine* engine) {
   if (engine == nullptr) return;
   try {
+    const SessionRef session(*engine, false);
+    if (session) session->close();
+  } catch (const mi::runtime::JobGate::Busy&) {
+    return;  // from a callback of the running call
+  } catch (...) {
+    // A failure freeing the session's state: the engine is freed all the same.
+  }
+  try {
     engine->gate.close_engine();
+    std::unique_lock<std::mutex> lock(engine->session_mu);
+    engine->session_cv.wait(lock, [&] { return engine->session_users == 0 && !engine->session_replacing; });
   } catch (...) {
     return;
   }
@@ -997,6 +1217,7 @@ const char* mi_result_text(const mi_result* result, mi_result_text_kind kind) {
       case MI_TEXT_TE_NOTE: return g.te_note.c_str();
       case MI_TEXT_PRELOAD_NOTE: return g.preload_note.c_str();
       case MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE: return g.step_cache_threshold_source.c_str();
+      case MI_TEXT_COMPONENT_NOTE: return g.component_note.c_str();
       case MI_TEXT_MAX_ENUM: break;
     }
     set_error("mi_result_text: unknown kind.");
@@ -1191,5 +1412,354 @@ const char* mi_file_report_tier_reason(const mi_file_report* report, mi_tier tie
 }
 
 void mi_file_report_free(mi_file_report* report) { delete report; }
+
+// ---------------------------------------------------------------- components
+
+mi_status mi_session_params_init(mi_session_params* params, size_t struct_size) {
+  return guarded([&] {
+    require(params, "params");
+    check_size(struct_size, sizeof(mi_session_params), "mi_session_params");
+    init_prefix(params, session_params_defaults(), struct_size);
+    return MI_OK;
+  });
+}
+
+mi_status mi_session_open(mi_engine* engine, const mi_session_params* params) {
+  return guarded([&] {
+    require(engine, "engine");
+    mi_session_params p = params != nullptr ? read_input<mi_session_params>(params, std::span(&kSessionParamsSize, 1),
+                                                                            session_params_defaults, "mi_session_params")
+                                            : session_params_defaults();
+    mi_gen_params plan{};
+    if (p.plan_request != nullptr) {
+      plan = read_input<mi_gen_params>(p.plan_request, kGenParamsSizes, gen_params_defaults, "mi_session_params.plan_request");
+      check_reserved(plan);
+      p.plan_request = &plan;
+    }
+    {
+      std::unique_lock<std::mutex> lock(engine->session_mu);
+      if (engine->session_replacing) throw mi::runtime::JobGate::Busy("a session is being opened on this engine");
+      if (engine->gate.session_open()) throw mi::runtime::JobGate::Busy("a session is open on this engine");
+      engine->session_replacing = true;
+      engine->session_cv.wait(lock, [&] { return engine->session_users == 0; });
+    }
+    struct Done {
+      mi_engine& e;
+      ~Done() {
+        const std::lock_guard<std::mutex> lock(e.session_mu);
+        e.session_replacing = false;
+        e.session_cv.notify_all();
+      }
+    } done{*engine};
+    // The closed session first: its destructor's close() must find nothing open.
+    engine->session.reset();
+    engine->session = std::make_unique<mi::api::ComponentSession>(*engine->adapter, engine->gate, p);
+    return MI_OK;
+  });
+}
+
+mi_status mi_session_close(mi_engine* engine) {
+  return guarded([&] {
+    require(engine, "engine");
+    const SessionRef session(*engine, false);
+    if (session) session->close();
+    return MI_OK;
+  });
+}
+
+mi_status mi_text_params_init(mi_text_params* params, size_t struct_size) {
+  return guarded([&] {
+    require(params, "params");
+    check_size(struct_size, sizeof(mi_text_params), "mi_text_params");
+    init_prefix(params, text_params_defaults(), struct_size);
+    return MI_OK;
+  });
+}
+
+mi_status mi_encode_text(mi_engine* engine, const mi_text_params* params, mi_conditioning** out_conditionings) {
+  return guarded([&] {
+    require(engine, "engine");
+    require(params, "params");
+    require(out_conditionings, "out_conditionings");
+    const mi_text_params p =
+        read_input<mi_text_params>(params, std::span(&kTextParamsSize, 1), text_params_defaults, "mi_text_params");
+    const SessionRef session(*engine);
+    const std::vector<std::shared_ptr<const mi::pipeline::Conditioning>> conds = session->encode_text(p);
+    std::vector<std::unique_ptr<mi_conditioning>> out;
+    for (const auto& c : conds) out.push_back(std::make_unique<mi_conditioning>(mi_conditioning{c}));
+    for (std::size_t i = 0; i < out.size(); ++i) out_conditionings[i] = out[i].release();
+    return MI_OK;
+  });
+}
+
+mi_status mi_conditioning_create(const mi_tensor* embeddings, mi_conditioning** out_conditioning) {
+  if (out_conditioning != nullptr) *out_conditioning = nullptr;
+  return guarded([&] {
+    require(embeddings, "embeddings");
+    require(out_conditioning, "out_conditioning");
+    const mi::backend::ScopedCurrentContext restore;  // a device tensor's copy may make a context current
+    auto c = std::make_unique<mi_conditioning>(mi_conditioning{mi::api::to_conditioning(*embeddings)});
+    *out_conditioning = c.release();
+    return MI_OK;
+  });
+}
+
+mi_status mi_conditioning_query(const mi_conditioning* c, mi_conditioning_info* out) {
+  return guarded([&] {
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_conditioning_info), "mi_conditioning_info");
+    require(c, "conditioning");
+    mi_conditioning_info info{};
+    info.tokens = static_cast<int32_t>(c->c->length());
+    info.text_dim = MI_TEXT_DIM;
+    info.dtype = MI_DTYPE_BF16;
+    info.engine_encoded = c->c->engine_encoded ? 1 : 0;
+    write_output(out, info);
+    return MI_OK;
+  });
+}
+
+mi_status mi_conditioning_prompt_tokens(const mi_conditioning* c, mi_prompt_tokens* out) {
+  return guarded([&] {
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_prompt_tokens), "mi_prompt_tokens");
+    require(c, "conditioning");
+    mi_prompt_tokens t{};
+    if (c->c->engine_encoded) t = mi::api::to_tokens(c->c->tokens);
+    write_output(out, t);
+    return MI_OK;
+  });
+}
+
+mi_status mi_conditioning_tensor(const mi_conditioning* c, mi_tensor* out) {
+  return guarded([&] {
+    require(out, "out");
+    require(c, "conditioning");
+    mi_tensor t{};
+    t.data = const_cast<std::uint16_t*>(c->c->embedding->data.data());  // read only: the conditioning is immutable
+    t.memory = MI_MEMORY_HOST;
+    t.dtype = MI_DTYPE_BF16;
+    t.rank = 2;
+    t.shape[0] = c->c->length();
+    t.shape[1] = MI_TEXT_DIM;
+    *out = t;
+    return MI_OK;
+  });
+}
+
+void mi_conditioning_free(mi_conditioning* c) { delete c; }
+
+mi_status mi_run_params_init(mi_run_params* params, size_t struct_size) {
+  return guarded([&] {
+    require(params, "params");
+    check_size(struct_size, sizeof(mi_run_params), "mi_run_params");
+    init_prefix(params, run_params_defaults(), struct_size);
+    return MI_OK;
+  });
+}
+
+mi_status mi_run_begin(mi_engine* engine, const mi_run_params* params) {
+  return guarded([&] {
+    require(engine, "engine");
+    require(params, "params");
+    const mi_run_params p =
+        read_input<mi_run_params>(params, std::span(&kRunParamsSize, 1), run_params_defaults, "mi_run_params");
+    const SessionRef session(*engine);
+    session->begin_run(p);
+    return MI_OK;
+  });
+}
+
+mi_status mi_run_query(const mi_engine* engine, mi_run_info* out) {
+  return guarded([&] {
+    require(engine, "engine");
+    require(out, "out");
+    check_size(out->struct_size, sizeof(mi_run_info), "mi_run_info");
+    const SessionRef session(*engine);
+    write_output(out, session->run_info());
+    return MI_OK;
+  });
+}
+
+const float* mi_run_sigmas(const mi_engine* engine, size_t* count) {
+  if (count == nullptr) {
+    set_error("count is NULL.");
+    return nullptr;
+  }
+  *count = 0;
+  const float* out = nullptr;
+  guarded([&] {
+    require(engine, "engine");
+    const SessionRef session(*engine);
+    const std::vector<float>& s = session->run_sigmas();
+    out = s.data();
+    *count = s.size();
+    return MI_OK;
+  });
+  return out;
+}
+
+mi_status mi_run_adopt_staging(mi_engine* engine, void* base, size_t bytes) {
+  return guarded([&] {
+    require(engine, "engine");
+    require(base, "base");
+    const SessionRef session(*engine);
+    session->adopt_staging(base, bytes);
+    return MI_OK;
+  });
+}
+
+mi_status mi_run_staging(mi_engine* engine, mi_tensor* x, mi_tensor* outs, size_t outs_count, mi_tensor* control) {
+  return guarded([&] {
+    require(engine, "engine");
+    if (outs == nullptr && outs_count > 0) throw std::invalid_argument("outs: NULL array with a nonzero count.");
+    const SessionRef session(*engine);
+    const mi::pipeline::StagingViews v = session->staging();
+    if (x != nullptr) *x = mi::api::from_tensor(v.x);
+    for (std::size_t k = 0; k < outs_count && k < static_cast<std::size_t>(v.outputs); ++k) outs[k] = mi::api::from_tensor(v.out[k]);
+    if (control != nullptr) *control = mi::api::from_tensor(v.control);
+    return MI_OK;
+  });
+}
+
+mi_status mi_step_params_init(mi_step_params* params, size_t struct_size) {
+  return guarded([&] {
+    require(params, "params");
+    check_size(struct_size, sizeof(mi_step_params), "mi_step_params");
+    init_prefix(params, step_params_defaults(), struct_size);
+    return MI_OK;
+  });
+}
+
+mi_status mi_denoise_step(mi_engine* engine, const mi_step_params* params, mi_step_info* out_info) {
+  return guarded([&] {
+    require(engine, "engine");
+    require(params, "params");
+    if (out_info != nullptr) check_size(out_info->struct_size, sizeof(mi_step_info), "mi_step_info");
+    const mi_step_params p =
+        read_input<mi_step_params>(params, std::span(&kStepParamsSize, 1), step_params_defaults, "mi_step_params");
+    const SessionRef session(*engine);
+    const mi_step_info info = session->step(p);
+    if (out_info != nullptr) write_output(out_info, info);
+    return MI_OK;
+  });
+}
+
+mi_status mi_run_end(mi_engine* engine, mi_result** out_result) {
+  if (out_result != nullptr) *out_result = nullptr;
+  return guarded([&] {
+    require(engine, "engine");
+    const SessionRef session(*engine, false);
+    if (!session) return MI_OK;
+    std::optional<mi::api::Generation> g = session->end_run();
+    if (g && out_result != nullptr) *out_result = mi::api::new_result(std::move(*g));
+    return MI_OK;
+  });
+}
+
+mi_status mi_vae_encode(mi_engine* engine, const mi_image* image, const mi_tensor* out_latents) {
+  return guarded([&] {
+    require(engine, "engine");
+    require(image, "image");
+    require(out_latents, "out_latents");
+    const SessionRef session(*engine);
+    session->vae_encode(*image, *out_latents);
+    return MI_OK;
+  });
+}
+
+mi_status mi_vae_decode(mi_engine* engine, const mi_tensor* latents, const mi_tensor* out_rgb) {
+  return guarded([&] {
+    require(engine, "engine");
+    require(latents, "latents");
+    require(out_rgb, "out_rgb");
+    const SessionRef session(*engine);
+    session->vae_decode(*latents, *out_rgb);
+    return MI_OK;
+  });
+}
+
+mi_status mi_schedule(mi_scheduler scheduler, int32_t steps, double shift, double flow_multiplier, double denoise_strength,
+                      float* sigmas, size_t capacity, size_t* count) {
+  return guarded([&] {
+    require(count, "count");
+    *count = 0;
+    if (steps < 1 || steps > mi::pipeline::kMaxDenoiseSteps) {
+      throw std::invalid_argument("Steps must be between 1 and " + std::to_string(mi::pipeline::kMaxDenoiseSteps) + ".");
+    }
+    const std::vector<float> s = mi::pipeline::engine_sigmas(mi::api::to_scheduler(scheduler), steps,
+                                                             mi::pipeline::FlowSampling{shift, flow_multiplier}, denoise_strength);
+    *count = s.size();
+    if (sigmas == nullptr) return MI_OK;
+    if (capacity < s.size()) {
+      throw std::invalid_argument("sigmas: capacity " + std::to_string(capacity) + " is less than the schedule's " +
+                                  std::to_string(s.size()) + " values.");
+    }
+    std::copy(s.begin(), s.end(), sigmas);
+    return MI_OK;
+  });
+}
+
+mi_step_output mi_sampler_prediction(mi_sampler sampler, mi_scheduler scheduler) {
+  mi_step_output out = MI_STEP_OUTPUT_MAX_ENUM;
+  guarded([&] {
+    const mi::pipeline::SamplerKind k = mi::api::to_sampler(sampler);
+    const mi::pipeline::SchedulerKind s = mi::api::to_scheduler(scheduler);
+    if (k == mi::pipeline::SamplerKind::kDataSpace) throw std::invalid_argument("The dataspace sampler has no step-wise form.");
+    // SamplerDriver::prediction(): velocity for ab2 and for the official euler (euler on the moss schedule).
+    const bool velocity =
+        k == mi::pipeline::SamplerKind::kAb2 || (k == mi::pipeline::SamplerKind::kEuler && s == mi::pipeline::SchedulerKind::kMoss);
+    out = velocity ? MI_STEP_OUTPUT_GUIDED_VELOCITY : MI_STEP_OUTPUT_GUIDED_DENOISED;
+    return MI_OK;
+  });
+  return out;
+}
+
+mi_status mi_initial_noise(int64_t seed, mi_noise_layout layout, int32_t width, int32_t height, float* out, size_t count) {
+  return guarded([&] {
+    require(out, "out");
+    if (seed < 0 || seed >= mi::pipeline::kMaxSeed) throw std::invalid_argument("Seed must be an integer from 0 to 2^53-1.");
+    if (width < 16 || height < 16 || width % 16 != 0 || height % 16 != 0 || width > mi::pipeline::kMaxSide ||
+        height > mi::pipeline::kMaxSide) {
+      throw std::invalid_argument("Width and height must be multiples of 16 from 16 to " +
+                                  std::to_string(mi::pipeline::kMaxSide) + ".");
+    }
+    const std::size_t n = static_cast<std::size_t>(MI_LATENT_CHANNELS) * (height / 16) * (width / 16);
+    if (count < n) throw std::invalid_argument("out: " + std::to_string(count) + " floats, the noise has " + std::to_string(n) + ".");
+    const std::vector<float> noise = mi::pipeline::initial_noise(mi::api::to_noise_layout(layout), static_cast<std::uint64_t>(seed),
+                                                                 MI_LATENT_CHANNELS, height / 16, width / 16);
+    std::copy(noise.begin(), noise.end(), out);
+    return MI_OK;
+  });
+}
+
+mi_status mi_image_resize(const mi_image* image, int32_t width, int32_t height, mi_resize_mode mode, uint8_t* out,
+                          size_t out_bytes) {
+  return guarded([&] {
+    require(image, "image");
+    require(out, "out");
+    require(image->pixels, "image.pixels");
+    check_reserved(image->_reserved0, "image._reserved0");
+    constexpr int32_t kMaxSide = 16384;  // the image-input side limit
+    if (image->channels != 1 && image->channels != 3) {
+      throw std::invalid_argument("image.channels must be 3 (RGB) or 1 (grayscale), not " + std::to_string(image->channels) + ".");
+    }
+    if (image->width < 1 || image->height < 1 || image->width > kMaxSide || image->height > kMaxSide || width < 1 ||
+        height < 1 || width > kMaxSide || height > kMaxSide) {
+      throw std::invalid_argument("image sizes must be 1 to " + std::to_string(kMaxSide) + " on a side.");
+    }
+    const mi::pipeline::ResizeMode m = mi::api::to_resize(mode);
+    const std::size_t need = static_cast<std::size_t>(width) * height * image->channels;
+    if (out_bytes < need) throw std::invalid_argument("out: " + std::to_string(out_bytes) + " bytes, the image needs " + std::to_string(need) + ".");
+    mi::pipeline::Image src;
+    src.width = image->width;
+    src.height = image->height;
+    src.channels = image->channels;
+    src.pixels.assign(image->pixels, image->pixels + static_cast<std::size_t>(image->width) * image->height * image->channels);
+    const mi::pipeline::Image dst = mi::pipeline::resize_to(src, width, height, m);
+    std::copy(dst.pixels.begin(), dst.pixels.end(), out);
+    return MI_OK;
+  });
+}
 
 }  // extern "C"

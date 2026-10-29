@@ -26,12 +26,12 @@
  *   thread-local and stays valid until the next failing mi_* call on the same thread.
  * - Enums are 32-bit (each has a *_MAX_ENUM = 0x7fffffff member for that); unknown values are rejected with
  *   MI_ERR_INVALID_ARGUMENT.
- * - Handles (mi_engine, mi_result, mi_file_report) are opaque. NULL handles are rejected with MI_ERR_INVALID_ARGUMENT,
- *   or by a 0 / NULL return from accessors.
+ * - Handles (mi_engine, mi_result, mi_file_report, mi_conditioning) are opaque. NULL handles are rejected with
+ *   MI_ERR_INVALID_ARGUMENT, or by a 0 / NULL return from accessors.
  *
  * Threading
- * - Each engine runs one job at a time: mi_generate(), mi_engine_preload() or mi_engine_release(). A concurrent one on
- *   the same engine fails with MI_ERR_BUSY. Different engines may run concurrently, but they share the GPU and the
+ * - Each engine runs one job at a time: mi_generate(), mi_engine_preload(), mi_engine_release() or a component call
+ *   (below). A concurrent one on the same engine fails with MI_ERR_BUSY. Different engines may run concurrently, but they share the GPU and the
  *   memory budgets are per engine.
  * - mi_cancel() is thread-safe and may be called from any thread, including from inside a callback. It stops the job
  *   running on the engine, whichever it is.
@@ -147,6 +147,9 @@ MOSSINFER_API const char* mi_last_error_message(void);
 #define MI_CAP_PROGRESS_FRACTION 0x10000u
 /* mi_inspect_file(): what a model file is to the engine, without an engine or a GPU. */
 #define MI_CAP_INSPECT 0x20000u
+/* The component API ("components" below): mi_session_*, mi_encode_text(), mi_conditioning_*, mi_run_*,
+ * mi_denoise_step(), mi_vae_*, the pure helpers and MI_TEXT_COMPONENT_NOTE. */
+#define MI_CAP_COMPONENTS 0x40000u
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -835,6 +838,10 @@ typedef enum mi_result_text_kind {
   /* MI_CAP_ACCEL: where the step cache's threshold came from: "request", or "default for the base model" (sft,
    * unrecognized); "" with the step cache off or before it was resolved (a run cancelled early). */
   MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE = 17,
+  /* MI_CAP_COMPONENTS, a result of mi_run_end(): how the run's sigmas differ from the engine's schedule for its
+   * scheduler fields (the first differing index, both values), the calls whose sigma was off the schedule, and which
+   * rows had foreign conditioning; "" when none applies (and for every other result). Facts only. */
+  MI_TEXT_COMPONENT_NOTE = 18,
   MI_TEXT_MAX_ENUM = 0x7fffffff
 } mi_result_text_kind;
 /* Owned by the result; "" when empty (e.g. cancelled early). NULL for a NULL result or an unknown kind. */
@@ -1050,6 +1057,350 @@ MOSSINFER_API const char* mi_file_report_control_kind(const mi_file_report* repo
 MOSSINFER_API const char* mi_file_report_tier_reason(const mi_file_report* report, mi_tier tier);
 /* NULL is a no-op. */
 MOSSINFER_API void mi_file_report_free(mi_file_report* report);
+
+/* ------------------------------------------------------------------------------------------------ components */
+
+/* The component API (MI_CAP_COMPONENTS, 2.1): mi_generate() split into parts, so a host owns the sampling loop. Open a
+ * session, encode texts, begin a run, call mi_denoise_step() once per model evaluation, end the run, decode. A session
+ * and its run are state of the engine (at most one session per engine, one run per session): the calls take the
+ * mi_engine*, and mi_engine_free() closes the session. Conditionings are the only new handles.
+ *
+ * Every session call is a job of the engine (one at a time, MI_ERR_BUSY otherwise; mi_cancel() stops it). Between
+ * runs mi_generate(), mi_engine_preload() and mi_engine_release() work; while a run is open they (and mi_encode_text,
+ * mi_vae_*, a second mi_run_begin) fail with MI_ERR_BUSY. mi_run_end(), mi_session_close() and mi_engine_free() never
+ * fail for a call in flight on another thread: they cancel it (a step, or any session call for a close; a generation is
+ * waited for, never cancelled), wait for it to return, then end. From the moment an ending starts, new calls on what it
+ * ends fail with MI_ERR_INVALID_ARGUMENT ("the run is ending" / "the session is closing"). From a callback of the
+ * running call, mi_run_end() and mi_session_close() return MI_ERR_BUSY and do nothing; mi_engine_free() stays
+ * forbidden there.
+ *
+ * Runs use the engine's tier and attention (mi_engine_params; explicit since 2.0) and are planned as mi_generate() plans
+ * the equivalent request, within the engine's mode and budgets. Every image-affecting parameter is explicit; a default
+ * is always a fixed constant.
+ *
+ * Conventions (FLOW). x = (1 - sigma) x0 + sigma noise; each output is the DiT's raw output (the velocity), so
+ * denoised = x - sigma * out; the DiT's timestep is fp32(sigma * 1000). No shift or multiplier is applied to a call's
+ * sigma: they enter only the engine's own schedule (mi_schedule(), or mi_run_params.sigmas NULL).
+ *
+ * Latents: F32 [MI_LATENT_CHANNELS, height / MI_LATENT_SCALE, width / MI_LATENT_SCALE] per image, a batch of L as
+ * [L, 128, h, w]. Model space (what the DiT denoises): the FLUX.2 VAE's 32 channels patchified 2 x 2 into channel
+ * c * 4 + 2 * dy + dx and normalized by the VAE's batch-norm statistics. That is ComfyUI's Flux2 LATENT as is (its VAE
+ * patchifies and normalizes inside encode and undoes both in decode; latent_formats.Flux2's process_in / process_out
+ * are the identity): no conversion in either direction. 2 MiB per image at 1024^2. Conditioning: [tokens, MI_TEXT_DIM].
+ * Images: RGB8 [height][width][3]. */
+#define MI_LATENT_CHANNELS 128
+#define MI_LATENT_SCALE 16
+#define MI_TEXT_DIM 4096
+/* The most tokens one call may carry, summed over its rows (h * w + prompt tokens each): the longest run the fused
+ * block path's startup self-check validated. mi_run_begin() refuses a run whose rows exceed it. */
+#define MI_MAX_CALL_TOKENS 61506
+#define MI_MAX_ROWS 8 /* rows per run and per call (the DiT's varlen limit), latents included */
+
+typedef enum mi_memory {
+  MI_MEMORY_HOST = 0,   /* host memory; in mi_denoise_step(), only the run's staging (mi_run_staging()) */
+  MI_MEMORY_DEVICE = 1, /* memory of the engine's device_index in its primary context (as torch and CuPy allocate) */
+  MI_MEMORY_MAX_ENUM = 0x7fffffff
+} mi_memory;
+
+typedef enum mi_dtype { MI_DTYPE_F32 = 0, MI_DTYPE_BF16 = 1, MI_DTYPE_U8 = 2, MI_DTYPE_MAX_ENUM = 0x7fffffff } mi_dtype;
+
+/* A dense row-major tensor (no strides). A fixed 56-byte layout without struct_size. */
+typedef struct mi_tensor {
+  void* data;
+  mi_memory memory;
+  mi_dtype dtype;
+  int32_t rank;       /* 1..4 */
+  int32_t _reserved0; /* must be 0 */
+  int64_t shape[4];   /* shape[0..rank) > 0, the rest 0 */
+} mi_tensor;
+
+/* The text encoder's last hidden state of one prompt (the tensor before the DiT's text refiner), bf16 on the host.
+ * Immutable and independent of any engine: it may outlive engines, serve several runs and engines, and be read by
+ * threads at once. */
+typedef struct mi_conditioning mi_conditioning;
+
+/* ---- session */
+
+typedef struct mi_session_params {
+  size_t struct_size;
+  /* The request planned for before the first run fixes its shape. Copied; prompt may be NULL or blank (as
+   * mi_engine_preload()). NULL (default) = the defaults. Preload with mi_engine_preload(engine, same request). */
+  const mi_gen_params* plan_request;
+  /* As mi_gen_params': MI_PHASE_TEXT_ENCODER (mi_encode_text), MI_PHASE_DIT_LOAD (mi_run_begin), MI_PHASE_DECODE
+   * (mi_vae_*, control-image encodes). Never MI_PHASE_DENOISE. mi_generate()'s callback rules apply. */
+  mi_progress_fn progress_callback;
+  void* user_data;
+  /* Fixed for the session. They bound the session's runs and size only the pinned host staging; each run is planned
+   * for its own rows. The most rows of a run or call, 1..MI_MAX_ROWS (default 3: cond, uncond, SLG); */
+  int32_t max_rows;
+  /* the most latents of a run's latent batch, 1..max_rows (default 1); */
+  int32_t max_latents;
+  /* the control adapter (UTF-8 path; NULL or "" = none, default). With one, every call of the session runs the widened
+   * input embedder, and its control latent is zeros wherever none is given (zeros = no control, as mi_generate's). */
+  const char* control_adapter;
+} mi_session_params;
+
+MOSSINFER_API mi_status mi_session_params_init(mi_session_params* params, size_t struct_size);
+/* Opens the engine's session. MI_ERR_BUSY when a job runs or a session is open. */
+MOSSINFER_API mi_status mi_session_open(mi_engine* engine, const mi_session_params* params);
+/* Ends an open run, frees the staging and events; a session call running on another thread is cancelled and waited
+ * for first. MI_ERR_BUSY (nothing done) from a callback of the running call; MI_OK when no session is open. Models
+ * stay loaded, as after mi_generate(). */
+MOSSINFER_API mi_status mi_session_close(mi_engine* engine);
+
+/* ---- text */
+
+typedef struct mi_text_params {
+  size_t struct_size;
+  const char* const* prompts;  /* 1..8 prompts, UTF-8; "" allowed (an empty negative prompt) */
+  size_t prompts_count;
+  int32_t max_sequence_length; /* 1..4096; default 4096 */
+  int32_t _reserved0;
+} mi_text_params;
+
+/* An output struct: struct_size set by the caller. */
+typedef struct mi_conditioning_info {
+  size_t struct_size;
+  int32_t tokens;         /* S */
+  int32_t text_dim;       /* MI_TEXT_DIM */
+  mi_dtype dtype;         /* MI_DTYPE_BF16 */
+  int32_t engine_encoded; /* 1: mi_encode_text(); 0: mi_conditioning_create() (foreign) */
+} mi_conditioning_info;
+
+MOSSINFER_API mi_status mi_text_params_init(mi_text_params* params, size_t struct_size);
+/* Every prompt in one text-encoder pass, through the embedding cache, planned for the actual token counts.
+ * out_conditionings[prompts_count] on MI_OK, none otherwise. A job: mi_cancel() stops it within one layer
+ * (MI_CANCELLED). */
+MOSSINFER_API mi_status mi_encode_text(mi_engine* engine, const mi_text_params* params, mi_conditioning** out_conditionings);
+/* Foreign conditioning, copied: [S, MI_TEXT_DIM], 1 <= S <= 4096, F32 (rounded to bf16, nearest even) or BF16, host
+ * or device (complete before the call). No engine. Used exactly like engine-encoded conditioning; the run's note says
+ * it was foreign. */
+MOSSINFER_API mi_status mi_conditioning_create(const mi_tensor* embeddings, mi_conditioning** out_conditioning);
+MOSSINFER_API mi_status mi_conditioning_query(const mi_conditioning* c, mi_conditioning_info* out);
+/* The prompt's token report (zeros for foreign conditioning). `out` has struct_size set by the caller. */
+MOSSINFER_API mi_status mi_conditioning_prompt_tokens(const mi_conditioning* c, mi_prompt_tokens* out);
+/* Host BF16 view [S, MI_TEXT_DIM], owned by the conditioning. */
+MOSSINFER_API mi_status mi_conditioning_tensor(const mi_conditioning* c, mi_tensor* out);
+/* NULL is a no-op. mi_run_begin() copies what it needs: a conditioning may be freed while a run that uses it is open. */
+MOSSINFER_API void mi_conditioning_free(mi_conditioning* c);
+
+/* ---- runs */
+
+typedef enum mi_guidance {
+  /* The host owns guidance (default): each call evaluates the rows it names (mi_step_params.rows), each with its own
+   * fixed skip set; outputs are MI_STEP_OUTPUT_ROWS only; cfg, slg_* and cfg_truncation must keep their defaults. */
+  MI_GUIDANCE_HOST = 0,
+  /* mi_generate's layout: rows[0] cond, rows[1] uncond (optional), whose skip set is the uncond skip set and applies
+   * inside the skip window (slg_start..slg_stop) only; the SLG row is rows[0] with slg_layers. The engine picks each
+   * step's rows by mi_generate's rule; mi_step_params.rows must be 0. All outputs. */
+  MI_GUIDANCE_MOSS = 1,
+  MI_GUIDANCE_MAX_ENUM = 0x7fffffff
+} mi_guidance;
+
+typedef enum mi_step_output {
+  /* Each evaluated row's velocity as the DiT returns it (F32), out[k] for row bit k. MOSS uses fixed role slots:
+   * out[0] cond, out[1] uncond, out[2] the SLG row, so with cfg 1 + SLG out[1] is unused (pass it zeroed) and the SLG
+   * row stays at out[2] on every step. A row the call does not evaluate is left untouched: read mi_step_info.rows.
+   * Default. */
+  MI_STEP_OUTPUT_ROWS = 0,
+  MI_STEP_OUTPUT_GUIDED_VELOCITY = 1, /* MOSS only. out[0]: mi_generate's guidance in velocity space (CFG + SLG) */
+  MI_STEP_OUTPUT_GUIDED_DENOISED = 2, /* MOSS only. out[0]: mi_generate's guidance in denoised space (D = x - v sigma) */
+  MI_STEP_OUTPUT_MAX_ENUM = 0x7fffffff
+} mi_step_output;
+
+/* One row of a run. A fixed 32-byte layout without struct_size (array element). */
+typedef struct mi_run_row {
+  const mi_conditioning* conditioning; /* required */
+  const int32_t* skip_layers;          /* DiT blocks this row skips, unique, in [0, 42); the official uncond row: {22} */
+  size_t skip_layers_count;
+  int32_t latent;                      /* the row's latent in the call's batch, 0..latents-1 (default 0) */
+  int32_t _reserved0;                  /* must be 0 */
+} mi_run_row;
+
+/* mi_run_params.flags */
+#define MI_RUN_EXACT_SIGMA 0x1u /* refuse a sigma that is not an exact schedule entry (a host's own check); default off */
+/* This run may make crop calls (area conds: x smaller than the run's size, HOST guidance): its plan reserves the
+ * forward workspace's crop bound. mi_run_begin() refuses it (MI_ERR_INVALID_ARGUMENT, naming both counts) when that
+ * bound would keep fewer DiT blocks resident than the run without it. Without the flag (default) a crop call that does
+ * not fit the run's planned stack is refused, naming the crop. */
+#define MI_RUN_CROPS 0x2u
+
+/* One sampling pass. Names, ranges and defaults are mi_gen_params' where the meaning is shared; every default is a
+ * fixed constant. */
+typedef struct mi_run_params {
+  size_t struct_size;
+  int32_t width;  /* default 1024 */
+  int32_t height; /* default 1024 */
+  /* required: 1..session max_rows rows; their latent indices cover 0..L-1 with L <= session max_latents (the run's
+   * latent batch). MOSS: 1 or 2 rows on latent 0, L = 1. */
+  const mi_run_row* rows;
+  size_t rows_count;
+  /* The schedule: a position and precompute hint, never a limit on the calls. sigmas_count = steps + 1 values,
+   * finite, non-increasing, terminal last, <= 10001; copied. NULL (default) = the engine's: mi_schedule(scheduler,
+   * steps, shift, flow_multiplier, denoise_strength). With host sigmas, the scheduler fields name the schedule they are
+   * compared with (mi_run_info.schedule_matches, a reported fact). */
+  const float* sigmas;
+  size_t sigmas_count;
+  mi_scheduler scheduler;   /* default MI_SCHEDULER_MOSS */
+  int32_t steps;            /* 1..10000; default MI_DEFAULT_STEPS */
+  double shift;             /* default 5.0 (schedule creation only; no shift is applied in a step) */
+  double flow_multiplier;   /* default 1.0 */
+  double denoise_strength;  /* [0, 1], the pass's share of the schedule (img2img); default 1.0 */
+  mi_guidance guidance;     /* default MI_GUIDANCE_HOST */
+  mi_step_output output;    /* default MI_STEP_OUTPUT_ROWS */
+  uint32_t flags;           /* MI_RUN_*; default 0 */
+  int32_t _reserved0;       /* must be 0 */
+  double cfg;               /* MOSS guided outputs: >= 0, != 1 with an uncond row; default 3.0 */
+  const int32_t* slg_layers; /* MOSS only; default none */
+  size_t slg_layers_count;
+  double slg_scale;         /* MOSS only; default 0 */
+  double slg_start;         /* MOSS only: the skip and SLG window; default 0 */
+  double slg_stop;          /* default 1 */
+  const mi_lora* loras;     /* applied at mi_run_begin(); kept for later runs while unchanged */
+  size_t loras_count;
+  /* The session's control adapter (mi_session_params.control_adapter): its LoRA part's strength for this run, and the
+   * run-level control latents, from control_images (encoded once at mi_run_begin() at width x height, with their
+   * windows; latent 0 only) or per call (mi_step_params.control, which overrides them). Without either: zeros. */
+  double control_lora_strength; /* default 1.0 */
+  const mi_control_image* control_images;
+  size_t control_images_count;
+  double cfg_truncation;    /* MOSS only; lossy; default 1.0 = off */
+  mi_step_cache step_cache; /* lossy; default MI_STEP_CACHE_OFF */
+  /* How control_images are brought to width x height (as mi_gen_params.resize; grayscale is replicated to RGB after
+   * the resize). Default MI_RESIZE_CROP. */
+  mi_resize_mode control_resize;
+  /* (0, 1], required with the step cache on (0 is refused then: no model-dependent default); ignored when off. */
+  double step_cache_threshold;
+} mi_run_params;
+
+/* An output struct: struct_size set by the caller. */
+typedef struct mi_run_info {
+  size_t struct_size;
+  int32_t latent_channels, latent_height, latent_width;
+  int32_t steps;              /* sigmas_count - 1 */
+  int32_t outputs;            /* output slots per call: 1 (guided), else the highest bit of `rows` + 1 */
+  uint32_t rows;              /* bit k: row k exists (MOSS: bit 2 = the SLG row) */
+  int32_t schedule_matches;   /* sigmas == the engine's schedule for the scheduler fields, bit for bit */
+  int32_t off_schedule_calls; /* calls whose sigma was not an exact schedule entry */
+  int32_t calls;              /* completed mi_denoise_step() calls (no upper bound) */
+  int32_t control_channels;   /* the per-call control latent's channels (128 per adapter kind); 0 without adapter */
+  int32_t latents;            /* the run's latent batch L */
+  int32_t _reserved0;
+  uint64_t staging_bytes;     /* the size of the run's staging block (mi_run_adopt_staging) */
+} mi_run_info;
+
+typedef struct mi_step_params {
+  size_t struct_size;
+  float sigma; /* the flow sigma of x; timestep = sigma * 1000 */
+  /* 0-based step, or -1 (default) = from sigma: the first exact schedule entry from the cursor (the last step used
+   * + 1), else the interval s[i] > sigma > s[i + 1]. A corrector call inside a step (heun's, at sigmas[step + 1])
+   * gives its step, or the lookup takes the next step's windows. */
+  int32_t step;
+  uint32_t rows;  /* HOST: bit k evaluates row k; 0 (default) = every row. MOSS: must be 0 */
+  uint32_t flags; /* MI_STEP_*; default 0 */
+  /* Device tensors: the host's cudaStream_t, any handle (NULL = the legacy default stream, torch's default;
+   * cudaStreamLegacy, cudaStreamPerThread). The engine waits for the work enqueued on it before reading x, and makes it
+   * wait for the outputs. Ignored for host tensors. */
+  void* cuda_stream;
+  /* Optional control latent through the adapter's widened input channels (ComfyUI's concat_cond): F32
+   * [L, control_channels, h, w] ([control_channels, h, w] for L = 1), the same memory kind as x (host: the staging
+   * view). data NULL (default) = the run's control latents (control_images, zeros where a window is closed; zeros
+   * without them; always zeros on a crop call). Given, it is used as is for this call: the host owns windows and
+   * strengths; zeros = no control. When it differs from the previous call's, set MI_STEP_CONTROL_CHANGED. */
+  mi_tensor control;
+  /* F32 model-space latents [L, 128, h, w] ([128, h, w] for L = 1), read only. h x w is the run's latent size, or a
+   * smaller crop (an area cond; HOST guidance only). */
+  mi_tensor x;
+  mi_tensor out[MI_MAX_ROWS]; /* F32 [128, h, w] each (x's h x w), out[k] for row k; mi_run_info.outputs of them */
+} mi_step_params;
+
+/* mi_step_params.flags */
+/* The per-call control latent differs from the previous call's: the step cache is invalidated before this call (the
+ * next reuse needs a full call), as mi_generate invalidates it when a control window opens or closes. */
+#define MI_STEP_CONTROL_CHANGED 0x1u
+
+/* An output struct: struct_size set by the caller. */
+typedef struct mi_step_info {
+  size_t struct_size;
+  int32_t step;        /* the step position used */
+  uint32_t rows;       /* rows evaluated */
+  int32_t cached;      /* the step cache reused its residual */
+  int32_t on_schedule; /* sigma is sigmas[step], or sigmas[step + 1] with an explicit step (a corrector) */
+  double seconds;      /* wall time of the call */
+} mi_step_info;
+
+MOSSINFER_API mi_status mi_run_params_init(mi_run_params* params, size_t struct_size);
+/* Plans the pass as mi_generate() plans the equivalent request, within the engine's mode and budgets; then, a job like
+ * a preload: loads what the plan keeps, applies LoRAs and control, encodes the control images, pins a route snapshot,
+ * refines each distinct conditioning once, takes the denoise stack and the step cache. mi_cancel() stops it between
+ * models, weight groups and rows (MI_CANCELLED, no run). MI_ERR_OUT_OF_MEMORY when no mode fits; MI_ERR_BUSY when a run
+ * is open or a job runs; MI_ERR_INVALID_ARGUMENT without a session, for more rows than the session's max_rows, a run
+ * over MI_MAX_CALL_TOKENS, or a latent batch whose plan would stream more DiT bytes per step than its latent-0 rows. */
+MOSSINFER_API mi_status mi_run_begin(mi_engine* engine, const mi_run_params* params);
+/* The open run's facts. `out` has struct_size set by the caller. Not a job: it does not wait for a step. */
+MOSSINFER_API mi_status mi_run_query(const mi_engine* engine, mi_run_info* out);
+/* The run's schedule, owned by the engine until mi_run_end(). `count` required. NULL without a run. */
+MOSSINFER_API const float* mi_run_sigmas(const mi_engine* engine, size_t* count);
+/* Makes caller-owned host memory the run's staging block, e.g. a shared-memory region another process also maps.
+ * Call after mi_run_begin() and before the first mi_denoise_step() (refused once one has been called, whatever its
+ * status), once per run. `base`: page-aligned (4096); `bytes` >= mi_run_info.staging_bytes. The engine registers it as
+ * pinned (cudaHostRegister, portable) and lays x, out[] and control out at the same offsets as its own block;
+ * mi_run_staging() then returns views into it (offset = view.data - base). The memory must stay mapped until
+ * mi_run_end(), which unregisters it. MI_ERR_NOT_SUPPORTED when the registration is refused (e.g. some Windows
+ * file-mapping views): the engine's own staging stays in use, and the caller copies into it. Not a job a cancel
+ * reaches: MI_ERR_BUSY while a step runs, MI_ERR_INVALID_ARGUMENT ("the run is ending") once an ending began. */
+MOSSINFER_API mi_status mi_run_adopt_staging(mi_engine* engine, void* base, size_t bytes);
+/* Host views of the run's pinned staging: x, out[0..outputs) (an unused MOSS slot zeroed) and, with an adapter, the
+ * control latent. The only host memory mi_denoise_step() takes. Valid until mi_run_end() (or a later
+ * mi_run_adopt_staging()). `outs` (outs_count of them, at most outputs written) and `control` may be NULL. */
+MOSSINFER_API mi_status mi_run_staging(mi_engine* engine, mi_tensor* x, mi_tensor* outs, size_t outs_count,
+                                       mi_tensor* control);
+MOSSINFER_API mi_status mi_step_params_init(mi_step_params* params, size_t struct_size);
+/* One model evaluation of the call's rows at (x, sigma) in one batched varlen forward (rows of different prompt
+ * lengths included); returns when the outputs are written (device mode: also ordered into cuda_stream). Tensors: all
+ * device, or all host and exactly the staging views; x must not alias an output; else MI_ERR_INVALID_ARGUMENT (the run
+ * usable). A job: MI_ERR_BUSY while one runs. mi_cancel() stops it within one DiT block: MI_CANCELLED, outputs
+ * undefined, the run usable (step cache invalidated). On return, whatever the status, the engine no longer reads x or
+ * control and no longer writes out[]. `out_info` (struct_size set by the caller) may be NULL. */
+MOSSINFER_API mi_status mi_denoise_step(mi_engine* engine, const mi_step_params* params, mi_step_info* out_info);
+/* Ends the run, interrupt-safe: cancels a step running on another thread and waits for it (MI_ERR_BUSY, nothing done,
+ * from a callback of the running call); also after a cancelled or failed step. Releases the run's stack, step cache
+ * and control latents; models, LoRAs and the staging stay. `out_result` (may be NULL): an mi_result without image
+ * (plan, the tier that ran with its attention and precisions, timings, memory, dit_stream, accel, control, LoRA
+ * reports, MI_TEXT_COMPONENT_NOTE, the report JSON). MI_OK when no run is open (*out_result NULL then). */
+MOSSINFER_API mi_status mi_run_end(mi_engine* engine, mi_result** out_result);
+
+/* ---- VAE: synchronous; device inputs complete before the call, device outputs complete on return */
+
+/* RGB8 (sides multiples of 16, the request bounds) -> model-space latents [128, H/16, W/16] F32, host or device (the
+ * posterior mean): exactly mi_generate's img2img start and control-image encodes. Planned for the image's size. A
+ * job; mi_cancel() stops it between bands. Needs an open session and no open run. */
+MOSSINFER_API mi_status mi_vae_encode(mi_engine* engine, const mi_image* image, const mi_tensor* out_latents);
+/* Model-space latents [128, h, w] F32 -> RGB8 [16h, 16w, 3] U8 (host or device): mi_generate's final decode bit for
+ * bit. Planned for the latents' size. A job; mi_cancel() stops it between bands. Needs an open session and no open
+ * run. */
+MOSSINFER_API mi_status mi_vae_decode(mi_engine* engine, const mi_tensor* latents, const mi_tensor* out_rgb);
+
+/* ---- pure helpers: no engine, no GPU, thread-safe; each is the pipeline's own function */
+
+/* mi_generate's schedule for one pass: the scheduler's schedule at strength 1, then, below strength 1, cropped by the
+ * diffusers get_timesteps rule mi_generate's img2img uses (not k-diffusion's `denoise` tail). Strength 0 gives an empty
+ * schedule (mi_run_begin() refuses it: the VAE round trip needs no run). sigmas NULL: *count = the length only;
+ * otherwise MI_ERR_INVALID_ARGUMENT when capacity is too small (*count = the length needed). */
+MOSSINFER_API mi_status mi_schedule(mi_scheduler scheduler, int32_t steps, double shift, double flow_multiplier,
+                                    double denoise_strength, float* sigmas, size_t capacity, size_t* count);
+/* The prediction space mi_generate's `sampler` runs on with `scheduler`: GUIDED_VELOCITY for ab2 (any scheduler) and
+ * euler on moss; GUIDED_DENOISED for every other pair. MI_STEP_OUTPUT_MAX_ENUM for an unknown sampler or scheduler
+ * (and for MI_SAMPLER_DATASPACE, which the component API does not offer). */
+MOSSINFER_API mi_step_output mi_sampler_prediction(mi_sampler sampler, mi_scheduler scheduler);
+/* mi_generate's initial noise for `seed` (0..2^53-1) and `layout` at width x height into out[128 * h * w]
+ * (count = that many floats). */
+MOSSINFER_API mi_status mi_initial_noise(int64_t seed, mi_noise_layout layout, int32_t width, int32_t height, float* out,
+                                         size_t count);
+/* The pipeline's resize (PIL-exact Lanczos, `mode`) of an RGB or 1-channel image into out[width * height * channels]
+ * (out_bytes = that many bytes). */
+MOSSINFER_API mi_status mi_image_resize(const mi_image* image, int32_t width, int32_t height, mi_resize_mode mode,
+                                        uint8_t* out, size_t out_bytes);
 
 #ifdef __cplusplus
 }

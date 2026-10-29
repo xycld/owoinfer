@@ -204,6 +204,13 @@ int main(int argc, char** argv) {
     expect(mi_gen_params_validate(&u.p) == MI_OK, "mi_gen_params_validate accepts a 240-byte struct");
   }
 
+  /* A 2.0 program sees every capability it saw: later releases only add bits. */
+  {
+    const uint32_t caps_2_0 = 0x1u | 0x4u | 0x8u | 0x10u | 0x20u | 0x40u | 0x80u | 0x100u | 0x200u | 0x400u | 0x800u |
+                              0x1000u | 0x2000u | 0x8000u | 0x10000u | 0x20000u;
+    expect((mi_capabilities() & caps_2_0) == caps_2_0, "every 2.0 capability bit is still set");
+  }
+
   if (argc > 2) generate_old(argv[1], argv[2]);
 
   printf("%s: 0.1-layout structs %s\n", failures ? "FAIL" : "ok", failures ? "are mishandled" : "are accepted");

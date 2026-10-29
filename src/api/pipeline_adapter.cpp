@@ -815,6 +815,11 @@ struct PipelineAdapter::Impl {
   // else the defaults).
   ModelBytes model_bytes;
   HeldModels held;
+  std::atomic<bool> held_stale{false};  // models_changed() since the last job
+  // At a job's start: after a component call, what is loaded is unknown.
+  void sync_held() {
+    if (held_stale.exchange(false)) held.job_failed();
+  }
   std::optional<planner::HardwareProfile> hardware;
   const planner::HardwareProfile& rates();
 };
@@ -982,6 +987,7 @@ Generation PipelineAdapter::generate(const mi_gen_params& params, const std::ato
   // The CUDA device is per host thread; the caller's thread may not be the one that created the engine.
   const backend::ScopedCurrentContext restore;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
+  impl_->sync_held();
   const JobShape shape = job_shape(q);
   ProgressModel estimate;
   pipeline::GenerateControl control;
@@ -1038,6 +1044,7 @@ Generation PipelineAdapter::preload(const mi_gen_params& params, const std::atom
   // included: kTextEncoder (a host-resident text encoder's copy), kDecode (an image encode's VAE encoder), kDitLoad and
   // kDecode (the VAE decoder). Returning false cancels, as the cancel flag does (a callback's mi_cancel() lands at once).
   // The fraction and eta cover these load steps.
+  impl_->sync_held();
   const JobShape shape = job_shape(q);
   ProgressModel estimate;
   options.on_plan = [&](const planner::ExecutionPlan& plan) {
@@ -1062,11 +1069,27 @@ Generation PipelineAdapter::preload(const mi_gen_params& params, const std::atom
 mi_release_info PipelineAdapter::release(bool keep_host_copy, const std::atomic<bool>& cancel, bool* cancelled) {
   const backend::ScopedCurrentContext restore;
   MI_CUDA_CHECK(cudaSetDevice(impl_->device));
+  impl_->sync_held();
   const pipeline::ReleaseReport report =
       cold_on_throw(impl_->held, [&] { return impl_->pipe->release_device_memory(keep_host_copy, &cancel); });
   if (!report.cancelled) impl_->held.released(report.dit_host_copy, report.te_host_copy);
   return to_release_info(report, cancelled);
 }
+
+pipeline::Pipeline& PipelineAdapter::pipeline() { return *impl_->pipe; }
+
+int PipelineAdapter::device() const { return impl_->device; }
+
+pipeline::Request PipelineAdapter::session_request(const mi_gen_params& params) {
+  fs::path distill_te;
+  pipeline::Request q = to_request(params, &distill_te, true, true);  // as preload(): the prompt optional
+  q.model = impl_->model;
+  q.save_metadata = false;
+  check_distill_time_embedding(impl_->time_embedding, distill_te);
+  return q;
+}
+
+void PipelineAdapter::models_changed() { impl_->held_stale.store(true); }
 
 mi_release_info to_release_info(const pipeline::ReleaseReport& rr, bool* cancelled) {
   if (cancelled != nullptr) *cancelled = rr.cancelled;  // the cancel was set on entry: nothing was released

@@ -26,6 +26,7 @@ struct Request;
 struct Result;
 struct PipelineOptions;
 struct ReleaseReport;
+class Pipeline;
 enum class SamplerKind;
 enum class SchedulerKind;
 enum class NoiseLayout;
@@ -90,6 +91,7 @@ struct Generation {
   mi_dit_load_info dit_load{};
   // mi_result_text() kinds.
   std::string dit_load_note, te_note, preload_note, step_cache_threshold_source;
+  std::string component_note;  // MI_TEXT_COMPONENT_NOTE: mi_run_end()'s results only
 };
 
 // The pipeline request of `params` (a full-size struct): the unset markers resolved (mossinfer.h), a distill bundle
@@ -126,6 +128,16 @@ class PipelineAdapter {
   // Pipeline::release_device_memory. `cancel` already set on entry: nothing is released and *cancelled is set (the
   // report as to_release_info()); set during the host copy: the copy stops, the release completes.
   mi_release_info release(bool keep_host_copy, const std::atomic<bool>& cancel, bool* cancelled = nullptr);
+
+  // The component session's access (component_adapter.h): the engine's pipeline and CUDA device.
+  pipeline::Pipeline& pipeline();
+  int device() const;
+  // The request a session plans for before its first run: `params` (a full-size struct) read as mi_engine_preload()
+  // reads it (the prompt optional), with the engine's model and its distill time-embedding check. CPU only.
+  pipeline::Request session_request(const mi_gen_params& params);
+  // A component call may have loaded or dropped models: the progress record goes cold, applied at the start of the
+  // next generate or preload. Thread-safe (a component call runs outside those jobs).
+  void models_changed();
 
  private:
   struct Impl;

@@ -96,7 +96,7 @@ TEST(CApi, VersionAndAbi) {
   EXPECT_EQ(mi_capabilities(), MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS |
                                   MI_CAP_IMAGE_INPUT | MI_CAP_HIRES | MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL |
                                   MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE |
-                                  MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT);
+                                  MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT | MI_CAP_COMPONENTS);
   EXPECT_EQ(mi_capabilities() & MI_CAP_COMFYUI_MODELS, 0u);
   EXPECT_EQ(MI_CAP_PREVIEW | MI_CAP_COMFYUI_MODELS | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS, 0x3fu);
   EXPECT_EQ(MI_CAP_IMAGE_INPUT, 0x40u);
@@ -2361,7 +2361,8 @@ TEST(CApi, DitLoadNotesAndDiffs) {
   EXPECT_STREQ(mi_result_text(res, MI_TEXT_PRELOAD_NOTE), "the DiT was not loaded: the plan parks it for the text encoder");
   EXPECT_STREQ(mi_result_text(res, MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE), "request");
   EXPECT_EQ(mi_result_text(res, MI_TEXT_MAX_ENUM), nullptr);
-  EXPECT_EQ(mi_result_text(res, static_cast<mi_result_text_kind>(18)), nullptr);
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_COMPONENT_NOTE), "");  // a generation has no component note
+  EXPECT_EQ(mi_result_text(res, static_cast<mi_result_text_kind>(19)), nullptr);
   ASSERT_EQ(mi_result_message_count(res, MI_MESSAGE_ACCEL_WARNING), 2);
   EXPECT_STREQ(mi_result_message(res, MI_MESSAGE_ACCEL_WARNING, 1), "step cache never engaged");
   EXPECT_EQ(mi_result_message(res, MI_MESSAGE_ACCEL_WARNING, 2), nullptr);
