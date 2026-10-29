@@ -1184,6 +1184,22 @@ std::optional<flux2_vae::TilePlan> Pipeline::Impl::decode_image(const std::vecto
   return used;
 }
 
+void Pipeline::Impl::refine_texts(std::span<const std::shared_ptr<const Embedding>> texts, std::span<const Tensor> out,
+                                   Timings& tm) {
+  Impl& m = *this;
+  const cudaStream_t stream = streams.compute();
+  runtime::StackScope refine(*m.arena);
+  const auto tr = Clock::now();
+  for (std::size_t i = 0; i < texts.size(); ++i) {
+    const std::int64_t s = static_cast<std::int64_t>(texts[i]->data.size() / static_cast<std::size_t>(texts[i]->hidden));
+    const Tensor input = m.arena->alloc_tensor(DType::kBF16, {s, moss_dit::kTextDim});
+    MI_CUDA_CHECK(cudaMemcpyAsync(input.data, texts[i]->data.data(), input.nbytes(), cudaMemcpyHostToDevice, stream));
+    m.dit->encode_text(input, out[i], stream);
+  }
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+  tm.refine_s += since(tr);
+}
+
 // generate(), or with `preload` the same up to the plan and the arena, then the loads of the models the plan keeps.
 Result Pipeline::run(const Request& req, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
@@ -1672,16 +1688,8 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     const Tensor ref_c = m.arena->alloc_tensor(DType::kBF16, {sc, moss_dit::kDim});
     const Tensor ref_u = g.do_cfg() ? m.arena->alloc_tensor(DType::kBF16, {su, moss_dit::kDim}) : Tensor{};
     {
-      runtime::StackScope refine(*m.arena);
-      const auto tr = Clock::now();
-      for (std::size_t i = 0; i < embeds.size(); ++i) {
-        const std::int64_t s = static_cast<std::int64_t>(seqs[i].size());
-        const Tensor te = m.arena->alloc_tensor(DType::kBF16, {s, moss_dit::kTextDim});
-        MI_CUDA_CHECK(cudaMemcpyAsync(te.data, embeds[i]->data.data(), te.nbytes(), cudaMemcpyHostToDevice, stream));
-        m.dit->encode_text(te, i == 0 ? ref_c : ref_u, stream);
-      }
-      MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-      tm.refine_s += since(tr);
+      const Tensor refined[] = {ref_c, ref_u};
+      m.refine_texts(embeds, std::span<const Tensor>(refined, embeds.size()), tm);
     }
 
     // P:400-402: fp32 CPU noise [1, 128, h, w].

@@ -1075,6 +1075,10 @@ struct Pipeline::Impl {
   // either way (kDecodeMode). Returns the tiling used (nullopt: untiled). Throws flux2_vae::Cancelled (`cancel`).
   std::optional<flux2_vae::TilePlan> decode_image(const std::vector<float>& lat, int H, int W, std::vector<std::uint8_t>& out,
                                                   const std::atomic<bool>* cancel, Timings& tm);
+  // The DiT's text refiner (encode_text) over each text-encoder state into out[i] (bf16 [S_i, kDim], kept by the
+  // caller), with the uploaded inputs on a stack scope released on return.
+  void refine_texts(std::span<const std::shared_ptr<const Embedding>> texts, std::span<const Tensor> out, Timings& tm);
+
   // Private host memory the pipeline holds itself across calls (cache contents, text-encoder rings and host copy),
   // which the planner adds on its own and must not count twice. The planner adds the text encoder's share only when
   // it runs: on a full embedding-cache hit the encoder's held memory stays in the baseline.
