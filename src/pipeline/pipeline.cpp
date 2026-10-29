@@ -39,6 +39,7 @@
 #include "pipeline/report_json.h"
 #include "pipeline/rng_torch_compat.h"
 #include "pipeline/run_schedule.h"
+#include "pipeline/session.h"
 #include "planner/host_memory.h"
 #include "runtime/device_arena.h"
 #include "runtime/stream_set.h"
@@ -666,6 +667,7 @@ Result Pipeline::preload(const PreloadOptions& options) {
   GenerateControl control;
   control.on_plan = options.on_plan;
   control.on_phase = options.on_phase;
+  control.on_convert = options.on_convert;
   control.cancel = options.cancel;
   return run(req, control, true);
 }
@@ -1284,7 +1286,15 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     }
   } cancel_scope{m};
 
-  const Impl::CallModels models = m.setup_models(req, r);
+  // A GGUF DiT's conversion (its first load) cancelled: the call ends as cancelled, before planning.
+  std::optional<Impl::CallModels> setup;
+  try {
+    setup = m.setup_models(req, r, {control.cancel, control.on_convert});
+  } catch (const SessionCancelled&) {
+    r.cancelled = true;
+    return finish();
+  }
+  const Impl::CallModels models = *setup;
   Bundle& b = *models.b;
   DitSource& src = *models.src;
   const TeSource& tes = *models.tes;

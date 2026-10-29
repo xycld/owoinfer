@@ -318,7 +318,10 @@ struct Session::State {
   // as Pipeline::run.
   Pipeline::Impl::CallModels models_for(const Request& q, Result& r, bool for_run = false) {
     check_user_paths(m.options, q);
-    Pipeline::Impl::CallModels models = m.setup_models(q, r);
+    // A GGUF DiT's conversion: cancelled by the gate's flag; its progress reported as MI_PHASE_DIT_LOAD.
+    GgufConvertHooks hooks{gate.cancel_flag(), {}};
+    if (options.on_phase) hooks.progress = [this](double) { return options.on_phase(Phase::kDitLoad); };
+    Pipeline::Impl::CallModels models = m.setup_models(q, r, std::move(hooks));
     if (for_run && m.dit && m.dit_src == models.src && m.dit_merge_key != models.merge_key) m.switch_merges(models.merge_key, r.timings);
     return models;
   }

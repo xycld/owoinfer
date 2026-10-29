@@ -994,6 +994,11 @@ Generation PipelineAdapter::generate(const mi_gen_params& params, const std::ato
     progress(params, t, to_phase(phase), 0, shape.total_steps, 0.0, estimate);
     return true;
   };
+  // A GGUF DiT's conversion, before the plan: MI_PHASE_DIT_LOAD at fraction 0 with no eta (nothing is planned yet).
+  control.on_convert = [&](double) {
+    progress(params, since(t0), MI_PHASE_DIT_LOAD, 0, shape.total_steps, 0.0, estimate);
+    return true;
+  };
   control.on_step = [&](const pipeline::StepInfo& s) {
     const double t = since(t0);
     estimate.step(s.step, s.step_seconds, t);
@@ -1047,6 +1052,10 @@ Generation PipelineAdapter::preload(const mi_gen_params& params, const std::atom
     const double t = since(t0);
     estimate.phase(to_phase(phase), t);
     progress(params, t, to_phase(phase), 0, 0, 0.0, estimate);
+    return !cancel.load();
+  };
+  options.on_convert = [&](double) {
+    progress(params, since(t0), MI_PHASE_DIT_LOAD, 0, 0, 0.0, estimate);
     return !cancel.load();
   };
   pipeline::Result r =

@@ -37,28 +37,42 @@ using weights::IndexedTensor;
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) { throw QuantError("mi::quant: " + msg); }
+// The output cannot be written (OutputError).
+[[noreturn]] void fail_output(const std::string& msg) { throw OutputError("mi::quant: " + msg); }
 
-// The output while it is written: a new temporary file next to it (util::OutputFile::Create::kTemporary), removed
-// unless commit() published it.
+// The output while it is written: a new temporary file next to it (util::OutputFile::Create::kTemporary), or the
+// caller's (ConvertOptions::temporary), removed unless commit() published it (or, the caller's, kept it).
 class PartialFile {
  public:
-  explicit PartialFile(const fs::path& target) : file_(target, util::OutputFile::Create::kTemporary) {
-    if (!file_.is_open()) fail("cannot create a temporary file next to " + util::path_utf8(target));
+  PartialFile(const fs::path& target, util::OutputFile* given) {
+    if (given == nullptr) {
+      own_.emplace(target, util::OutputFile::Create::kTemporary);
+      file_ = &*own_;
+    } else {
+      file_ = given;
+    }
+    if (!file_->is_open()) fail_output("cannot create a temporary file next to " + util::path_utf8(target));
   }
   PartialFile(const PartialFile&) = delete;
   PartialFile& operator=(const PartialFile&) = delete;
   ~PartialFile() {
-    if (!committed_) file_.discard();
+    if (!committed_) file_->discard();
   }
-  util::OutputFile& file() { return file_; }
-  const fs::path& path() const { return file_.path(); }
+  util::OutputFile& file() { return *file_; }
+  const fs::path& path() const { return file_->path(); }
+  // Publishes the file as `final_path`; the caller's is left as it is, for the caller to publish.
   void commit(const fs::path& final_path) {
-    if (!file_.publish(final_path)) fail("cannot rename " + util::path_utf8(path()) + " to " + util::path_utf8(final_path));
+    if (!own_) {
+      committed_ = true;
+      return;
+    }
+    if (!file_->publish(final_path)) fail_output("cannot rename " + util::path_utf8(path()) + " to " + util::path_utf8(final_path));
     committed_ = true;
   }
 
  private:
-  util::OutputFile file_;
+  std::optional<util::OutputFile> own_;
+  util::OutputFile* file_ = nullptr;
   bool committed_ = false;
 };
 
@@ -359,7 +373,7 @@ class Writer {
     char lb[8];
     for (int i = 0; i < 8; ++i) lb[i] = static_cast<char>((len >> (8 * i)) & 0xFF);
     out_.write(lb, 8);
-    if (!out_.write(header)) fail("write failed: " + util::path_utf8(path));
+    if (!out_.write(header)) fail_output("write failed: " + util::path_utf8(path));
     for (const auto& t : tensors) {
       end_ = std::max(end_, t.offset + t.nbytes);
       planned_ += t.nbytes;
@@ -367,15 +381,15 @@ class Writer {
   }
   void write(const OutTensor& t, const void* data, std::size_t size) {
     if (size != t.nbytes) fail("internal: tensor '" + t.name + "' produced " + std::to_string(size) + " bytes, planned " + std::to_string(t.nbytes));
-    if (!out_.seek(t.offset) || !out_.write(data, size)) fail("write failed: " + util::path_utf8(path_));
+    if (!out_.seek(t.offset) || !out_.write(data, size)) fail_output("write failed: " + util::path_utf8(path_));
     written_ += size;
   }
   // Writes the final header over the first one (same length) and flushes the file to stable storage (so the rename
   // that publishes it cannot outrun its bytes); it stays open for PartialFile::commit.
   std::uint64_t finish(const std::string& header) {
     if (written_ != planned_) fail("internal: wrote " + std::to_string(written_) + " tensor bytes, planned " + std::to_string(planned_));
-    if (!out_.seek(8) || !out_.write(header)) fail("write failed: " + util::path_utf8(path_));
-    if (!out_.sync()) fail("cannot flush " + util::path_utf8(path_) + " to disk");
+    if (!out_.seek(8) || !out_.write(header)) fail_output("write failed: " + util::path_utf8(path_));
+    if (!out_.sync()) fail_output("cannot flush " + util::path_utf8(path_) + " to disk");
     if (util::file_info(path_).size != end_) fail("output size mismatch (internal)");
     return end_;
   }
@@ -548,6 +562,7 @@ void check_output_path(const fs::path& input, const fs::path& output, const Quan
 // The output modules and their specs: one per GEMM, or the fused proj.qkv; throws for every misuse of the options.
 std::vector<OutModule> plan_modules(const QuantModel& model, const ConvertOptions& options, const LoraMap& loras) {
   const Nvfp4Options* fp4 = options.nvfp4 ? &*options.nvfp4 : nullptr;
+  if (!model.gguf_types.empty() && fp4 != nullptr) fail("NVFP4 output is converted from bf16 weights, not from a GGUF file");
   const bool fuse_qkv = options.fuse_qkv || fp4 != nullptr;
   auto spec_of = [&](const QuantLinear& l) -> QuantSpec {
     const bool keep = std::any_of(options.keep_bf16.begin(), options.keep_bf16.end(), [&](const std::string& p) { return glob_match(p, l.name); });
@@ -739,7 +754,7 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   QuantModel model = open_quant_model(input, ModelKind::kDiT);
   if (model.kind != ModelKind::kDiT) fail("only the DiT can be converted");
   const bool gguf = !model.gguf_types.empty();
-  if (gguf && fp4 != nullptr) fail("NVFP4 output is converted from bf16 weights, not from a GGUF file");
+  if (options.temporary != nullptr && fp4 != nullptr) fail("internal: a caller's temporary file with nvfp4 output");
   for (const auto& [key, value] : options.metadata) {
     if (!key.starts_with("mossinfer_")) fail("internal: extra metadata key '" + key + "' must start with mossinfer_");
   }
@@ -987,9 +1002,18 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   for (std::size_t i = 0; i < tensors.size(); ++i) tensors[i].offset = data_start + rel[i];
 
   // The output is created before any long work, so an unwritable destination fails at once.
-  PartialFile partial(output);
+  PartialFile partial(output, options.temporary);
   Writer writer(partial.file(), tensors, header0);
   constexpr std::int64_t kBatch = 64;  // rows widened (and LoRA-merged) per quantize call
+  // Cancellation and progress (ConvertOptions::cancelled, progress): per output module and per other tensor.
+  const std::size_t units_total = mods.size() + model.tensors.size();
+  std::size_t units_done = 0;
+  const auto unit_start = [&] {
+    if (options.cancelled && options.cancelled()) throw ConvertCancelled();
+  };
+  const auto unit_done = [&] {
+    if (options.progress) options.progress(++units_done, units_total);
+  };
 
   int done = 0;
   std::vector<char> written(mods.size(), 0);
@@ -1012,6 +1036,7 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
     stats.nvfp4 += static_cast<int>(om.parts.size());
     written[mi] = 1;
     if (++done % 24 == 0) log("  " + std::to_string(done) + "/" + std::to_string(mods.size()) + " GEMMs");
+    unit_done();
   };
 
   // gptq recipes: each nvfp4 module is quantized and written as its Hessian arrives.
@@ -1027,6 +1052,7 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
     log("capturing calibration Hessians for " + std::to_string(units.size()) + " nvfp4 GEMMs");
     const HessianSink sink = [&](std::size_t u, const float* h) {
       if (u >= units.size() || seen[u]) fail("internal: a Hessian delivered twice or for an unknown unit");
+      unit_start();
       seen[u] = 1;
       unit_digest[u] = hessian_unit_digest(units[u], h);
       const std::size_t mi = unit_plan[u].second;
@@ -1055,6 +1081,7 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
     const OutModule& om = mods[mi];
     const std::int64_t k = om.k;
     if (written[mi]) continue;
+    unit_start();
     if (om.spec.format == QuantFormat::kNvfp4) {
       write_nvfp4(mi, quantize_nvfp4_module(om, module_f32(om), nullptr));
       continue;
@@ -1152,8 +1179,10 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
     }
     if (om.bias != kNone) writer.write(tensors[om.bias], bias_bytes.data(), bias_bytes.size());
     if (++done % 24 == 0) log("  " + std::to_string(done) + "/" + std::to_string(mods.size()) + " GEMMs");
+    unit_done();
   }
   for (std::size_t i = 0; i < model.tensors.size(); ++i) {
+    unit_start();
     const IndexedTensor& t = model.tensors[i];
     std::vector<std::byte> b = readers.read(t);
     note_source(t.name, b);
@@ -1198,6 +1227,7 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
       if (!ok) fail("'" + t.name + "' holds non-finite weights after the LoRA merge");
     }
     writer.write(tensors[copy_index[i]], b.data(), b.size());
+    unit_done();
   }
   for (std::size_t i : attn_index) writer.write(tensors[i], kAttentionConfig.data(), kAttentionConfig.size());
   for (const auto& [m, v] : loras) {
@@ -1287,7 +1317,7 @@ HessianFileInfo write_hessian_file(const fs::path& input, const fs::path& path, 
   };
   const std::string header0 = build_header(HessianCapture{});
   for (std::size_t i = 0; i < tensors.size(); ++i) tensors[i].offset = 8 + header0.size() + rel[i];
-  PartialFile partial(path);
+  PartialFile partial(path, nullptr);
   Writer writer(partial.file(), tensors, header0);
   std::vector<char> seen(units.size(), 0);
   std::vector<float> packed;

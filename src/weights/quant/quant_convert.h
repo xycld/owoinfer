@@ -38,10 +38,12 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "util/regular_file.h"
 #include "weights/quant/nvfp4_recipes.h"
 #include "weights/quant/quant_model.h"
 
@@ -100,7 +102,7 @@ std::vector<HessianUnit> nvfp4_hessian_units(const std::filesystem::path& input,
 // safetensors file: per unit `<module>` F32 [k * (k + 1) / 2], the upper triangle row by row, and in the metadata the
 // capture's strings (mossinfer_nvfp4_calibration, mossinfer_nvfp4_capture_class) and the captured DiT's identity
 // (mossinfer_nvfp4_dit_xxh64: convert()'s source digest of the input). `path` is checked as convert() checks its
-// output; written to <path>.partial, read back and renamed when complete. A conversion with
+// output; written to a temporary file, read back and renamed when complete. A conversion with
 // Nvfp4Options::hessian_file = path then writes the same bytes as one that captured directly.
 struct HessianFileInfo {
   HessianCapture capture;
@@ -130,6 +132,24 @@ struct ConvertOptions {
   std::function<void(std::string_view)> log;  // progress lines (optional)
   // Extra __metadata__ entries written after the converter's own (keys must start with mossinfer_).
   std::map<std::string, std::string> metadata;
+  // Checked before each output module and each other tensor: true stops the conversion with ConvertCancelled (the
+  // temporary file removed, nothing published).
+  std::function<bool()> cancelled;
+  // After each output module and each other tensor: how many of the total are written.
+  std::function<void(std::size_t done, std::size_t total)> progress;
+  // A temporary file next to `output` the caller created (util::OutputFile::Create::kTemporary, open): the output is
+  // written into it, flushed and read back, then left open and unpublished for the caller to publish or discard. On a
+  // failure convert discards it.
+  util::OutputFile* temporary = nullptr;
+};
+
+// convert() stopped by ConvertOptions::cancelled.
+struct ConvertCancelled : std::runtime_error {
+  ConvertCancelled() : std::runtime_error("mi::quant: the conversion was cancelled") {}
+};
+// convert() could not create, write, flush or publish its output (the destination's fault, not the input's).
+struct OutputError : QuantError {
+  using QuantError::QuantError;
 };
 
 struct ConvertStats {
@@ -147,11 +167,12 @@ struct ConvertStats {
 // Simple glob: '*' any run, '?' any one character.
 bool glob_match(std::string_view pattern, std::string_view text);
 
-// Converts `input` into `output`: written to `<output>.partial`, flushed to disk, read back and renamed; on any
-// failure the partial file is removed. Throws QuantError (bad options, an output that is an input or lies in the
-// input directory, LoRA keys that match nothing, a LoRA or keep_bf16 aimed at an already quantized GEMM, a
-// non-finite LoRA strength / alpha / coefficient, weights non-finite after merging, invalid stored scales) or the
-// reader's errors.
+// Converts `input` into `output`: written to a new temporary file next to it (util::OutputFile), flushed to disk, read
+// back and renamed over `output` (unless options.temporary); on any failure the temporary file is removed. Throws
+// QuantError (bad options, an output that is an input or lies in the input directory, LoRA keys that match nothing, a
+// LoRA or keep_bf16 aimed at an already quantized GEMM, a non-finite LoRA strength / alpha / coefficient, weights
+// non-finite after merging, invalid stored scales), OutputError (the output cannot be written), ConvertCancelled or
+// the reader's errors.
 ConvertStats convert(const std::filesystem::path& input, const std::filesystem::path& output, const ConvertOptions& options);
 
 // LoRA delta merge of one row (exposed for tests): w[k] += f32(coef * f32(sum_r up[n_row, r] * down[r, k])) with the

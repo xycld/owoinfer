@@ -6,8 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -18,10 +21,16 @@
 #include <thread>
 #include <vector>
 
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include "api/file_inspect.h"
 #include "pipeline/gguf_dit.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/report_json.h"
+#include "pipeline/session.h"
 #include "test_util.h"
 #include "util/json.h"
 #include "util/npy.h"
@@ -781,53 +790,325 @@ TEST(GgufDit, FullShapeFilesCheckedFromTheHeader) {
 
 // ---- The converted-file cache -------------------------------------------------------------------------------------
 
+// The cache folder's regular files by name.
+std::vector<std::string> cache_files(const fs::path& cache) {
+  std::vector<std::string> out;
+  for (const auto& e : fs::directory_iterator(cache / "gguf")) out.push_back(e.path().filename().string());
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+bool any_temporary(const fs::path& cache) {
+  for (const std::string& n : cache_files(cache)) {
+    if (n.find(".tmp-") != std::string::npos) return true;
+  }
+  return false;
+}
+
+// The converted file's path; its lock is released at once (the result is a temporary).
+fs::path converted_path(const fs::path& src, const mi::quant::QuantSpec& target, const fs::path& cache, bool& converted,
+                        const mi::pipeline::GgufConvertHooks& hooks = {}) {
+  mi::pipeline::GgufDitInfo info;
+  info.types = "Q8_0 + Q4_0";
+  mi::pipeline::GgufCachedFile r = mi::pipeline::gguf_converted_file(src, info, target, cache, hooks);
+  converted = r.converted;
+  EXPECT_TRUE(r.lock.locked());
+  return r.path;
+}
+
 TEST(GgufDit, ConvertedFileCache) {
   const mi::testing::AnyModelShapes any_shapes;  // a small synthetic model
   mi::testing::TempDir dir("gguf_cache");
   const fs::path src = dir.path() / "m.gguf", cache = dir.path() / "cache";
   write_file(src, gguf_bytes(tiny_gguf().ts));
-  mi::pipeline::GgufDitInfo info;
-  info.types = "Q8_0 + Q4_0";
   const auto int8 = mi::quant::QuantSpec::int8_convrot(256);
   bool converted = false;
-  const fs::path a = mi::pipeline::gguf_converted_file(src, info, int8, cache, &converted);
+  const fs::path a = converted_path(src, int8, cache, converted);
   EXPECT_TRUE(converted);
   EXPECT_EQ(a.parent_path(), cache / "gguf");
-  EXPECT_NE(a.filename().string().find("m.int8_convrot256."), std::string::npos) << a;
-  const mi::weights::SafetensorsFile f(a);
-  EXPECT_EQ(f.metadata().at("mossinfer_gguf_types"), "Q8_0 + Q4_0");
+  EXPECT_EQ(a.filename().string().rfind("gguf-m.int8_convrot256.", 0), 0u) << a;  // never a DOS device name
+  EXPECT_TRUE(fs::is_regular_file(a.string() + ".lock"));
+  {
+    const mi::weights::SafetensorsFile f(a);
+    EXPECT_EQ(f.metadata().at("mossinfer_gguf_types"), "Q8_0 + Q4_0");
+    EXPECT_EQ(f.metadata().at("mossinfer_gguf_source"), mi::util::path_utf8(fs::absolute(src).lexically_normal()));
+  }
   // Found again without converting; a bf16 target is another file.
-  EXPECT_EQ(mi::pipeline::gguf_converted_file(src, info, int8, cache, &converted), a);
+  EXPECT_EQ(converted_path(src, int8, cache, converted), a);
   EXPECT_FALSE(converted);
-  const fs::path b = mi::pipeline::gguf_converted_file(src, info, mi::quant::QuantSpec::bf16(), cache, &converted);
+  const fs::path b = converted_path(src, mi::quant::QuantSpec::bf16(), cache, converted);
   EXPECT_TRUE(converted);
   EXPECT_NE(a, b);
   // A damaged cache file is converted again.
   fs::resize_file(a, 100);
-  EXPECT_EQ(mi::pipeline::gguf_converted_file(src, info, int8, cache, &converted), a);
+  EXPECT_EQ(converted_path(src, int8, cache, converted), a);
   EXPECT_TRUE(converted);
-  // A new version of the GGUF (another modification time) gets a new file; the old one for that target goes, the
-  // other target's stays.
+  // A new version of the GGUF (another modification time) gets a new file; the old one for that target goes with its
+  // lock file, the other target's stays.
   fs::last_write_time(src, fs::last_write_time(src) + std::chrono::seconds(5));
-  const fs::path c = mi::pipeline::gguf_converted_file(src, info, int8, cache, &converted);
+  const fs::path c = converted_path(src, int8, cache, converted);
   EXPECT_TRUE(converted);
   EXPECT_NE(c, a);
   EXPECT_FALSE(fs::exists(a));
+  EXPECT_FALSE(fs::exists(a.string() + ".lock"));
   EXPECT_TRUE(fs::exists(b));
-  // A leftover temporary file of a conversion that died long ago is removed; nothing else is left behind.
-  const fs::path stale = cache / "gguf" / "x.safetensors.tmp-1-0.partial";
-  write_file(stale, "x");
-  fs::last_write_time(stale, fs::file_time_type::clock::now() - std::chrono::hours(1));
-  fs::last_write_time(src, fs::last_write_time(src) + std::chrono::seconds(5));
-  mi::pipeline::gguf_converted_file(src, info, int8, cache, &converted);
-  EXPECT_FALSE(fs::exists(stale));
-  int files = 0;
-  for (const auto& e : fs::directory_iterator(cache / "gguf")) {
-    EXPECT_EQ(e.path().extension(), ".safetensors") << e.path();
-    ++files;
+
+  // A file in use (its lock held shared, as a pipeline's DiT source holds it) is never removed by a sweep; once
+  // released, the next call removes it.
+  fs::path d;
+  {
+    mi::pipeline::GgufDitInfo info;
+    const mi::pipeline::GgufCachedFile held = mi::pipeline::gguf_converted_file(src, info, int8, cache);
+    EXPECT_EQ(held.path, c);
+    fs::last_write_time(src, fs::last_write_time(src) + std::chrono::seconds(5));
+    d = converted_path(src, int8, cache, converted);
+    EXPECT_TRUE(converted);
+    EXPECT_TRUE(fs::exists(c));  // in use
   }
-  EXPECT_EQ(files, 2);
+  EXPECT_EQ(converted_path(src, int8, cache, converted), d);
+  EXPECT_FALSE(fs::exists(c));
+
+  // The converted file of a GGUF that no longer exists goes; so do temporaries of conversions that died and lock files
+  // of entries that are gone. A file without the importer's metadata stays.
+  const fs::path other = dir.path() / "other.gguf";
+  write_file(other, gguf_bytes(tiny_gguf().ts));
+  const fs::path e = converted_path(other, int8, cache, converted);
+  fs::remove(other);
+  const fs::path dead_tmp = fs::path(b.string() + ".tmp-0123456789abcdef");  // the bf16 entry, not in use
+  const fs::path orphan_lock = cache / "gguf" / "gguf-gone.int8_convrot256.0000000000000000.safetensors.lock";
+  const fs::path foreign = cache / "gguf" / "mine.safetensors";
+  write_file(dead_tmp, "x");
+  write_file(orphan_lock, "");
+  mi::quant::convert(src, foreign, mi::quant::ConvertOptions{});  // the converter's own file: no importer metadata
+  EXPECT_EQ(converted_path(src, int8, cache, converted), d);
+  EXPECT_FALSE(converted);
+  EXPECT_FALSE(fs::exists(e));
+  EXPECT_FALSE(fs::exists(dead_tmp));
+  EXPECT_FALSE(fs::exists(orphan_lock));
+  EXPECT_TRUE(fs::exists(foreign));
+  const std::vector<std::string> want = {b.filename().string(), b.filename().string() + ".lock", d.filename().string(),
+                                         d.filename().string() + ".lock", "mine.safetensors"};
+  std::vector<std::string> sorted = want;
+  std::sort(sorted.begin(), sorted.end());
+  EXPECT_EQ(cache_files(cache), sorted);
 }
+
+// NVFP4 output is refused for a GGUF input as the modules are planned: convert, and nvfp4_hessian_units /
+// write_hessian_file (`moss-infer quantize --hessians-out`) before any capture.
+TEST(GgufDit, Nvfp4OutputRefusedUpFront) {
+  const mi::testing::AnyModelShapes any_shapes;
+  mi::testing::TempDir dir("gguf_nvfp4");
+  const fs::path src = dir.path() / "m.gguf";
+  write_file(src, gguf_bytes(tiny_gguf().ts));
+  mi::quant::ConvertOptions o;
+  o.nvfp4.emplace();
+  bool captured = false;
+  o.nvfp4->hessians = [&](const std::vector<mi::quant::HessianUnit>&, const mi::quant::HessianSink&) {
+    captured = true;
+    return mi::quant::HessianCapture{};
+  };
+  const auto refused = [](const auto& call) {
+    try {
+      call();
+      ADD_FAILURE() << "not refused";
+    } catch (const mi::quant::QuantError& e) {
+      EXPECT_NE(std::string(e.what()).find("not from a GGUF file"), std::string::npos) << e.what();
+    }
+  };
+  refused([&] { mi::quant::nvfp4_hessian_units(src, o); });
+  refused([&] { mi::quant::write_hessian_file(src, dir.path() / "h.safetensors", o); });
+  refused([&] { mi::quant::convert(src, dir.path() / "o.safetensors", o); });
+  EXPECT_FALSE(captured);
+  EXPECT_FALSE(fs::exists(dir.path() / "h.safetensors"));
+}
+
+// What `moss-infer quantize <file.gguf>` writes (quant::convert with the defaults) and the cache's converted file hold
+// the same tensors, byte for byte, and the same metadata but the cache's own keys.
+TEST(GgufDit, CacheFileEqualsTheQuantizeOutput) {
+  const mi::testing::AnyModelShapes any_shapes;
+  mi::testing::TempDir dir("gguf_quantize");
+  const fs::path src = dir.path() / "m.gguf", cache = dir.path() / "cache", out = dir.path() / "q.safetensors";
+  write_file(src, gguf_bytes(tiny_gguf().ts));
+  bool converted = false;
+  const fs::path cached = converted_path(src, mi::quant::QuantSpec::int8_convrot(256), cache, converted);
+  mi::quant::convert(src, out, mi::quant::ConvertOptions{});
+  const mi::weights::SafetensorsFile a(cached), b(out);
+  ASSERT_EQ(a.tensors().size(), b.tensors().size());
+  for (const auto& t : b.tensors()) {
+    SCOPED_TRACE(t.name);
+    const auto* u = a.find(t.name);
+    ASSERT_NE(u, nullptr);
+    EXPECT_EQ(u->dtype, t.dtype);
+    EXPECT_EQ(u->shape, t.shape);
+    EXPECT_EQ(tensor_bytes(cached, t.name), tensor_bytes(out, t.name));
+  }
+  std::map<std::string, std::string> ma = a.metadata();
+  for (auto it = ma.begin(); it != ma.end();) it = it->first.starts_with("mossinfer_gguf_") ? ma.erase(it) : std::next(it);
+  EXPECT_EQ(ma, b.metadata());
+}
+
+// A GGUF changed while it is converted: nothing is published (IoError naming the file, no temporary left), and the
+// next call converts the new version.
+TEST(GgufDit, ChangedWhileConvertingIsNotPublished) {
+  const mi::testing::AnyModelShapes any_shapes;
+  mi::testing::TempDir dir("gguf_changed");
+  const fs::path src = dir.path() / "m.gguf", cache = dir.path() / "cache";
+  write_file(src, gguf_bytes(tiny_gguf().ts));
+  mi::pipeline::GgufConvertHooks hooks;
+  bool touched = false;
+  hooks.progress = [&](double) {
+    if (!touched) fs::last_write_time(src, fs::last_write_time(src) + std::chrono::seconds(5));
+    touched = true;
+    return true;
+  };
+  bool converted = false;
+  try {
+    converted_path(src, mi::quant::QuantSpec::int8_convrot(256), cache, converted, hooks);
+    ADD_FAILURE() << "published a file converted from a GGUF that changed";
+  } catch (const mi::weights::IoError& e) {
+    EXPECT_NE(std::string(e.what()).find("changed while it was converted"), std::string::npos) << e.what();
+  }
+  EXPECT_TRUE(touched);
+  EXPECT_FALSE(any_temporary(cache));
+  for (const std::string& n : cache_files(cache)) EXPECT_FALSE(n.ends_with(".safetensors")) << n;
+  converted_path(src, mi::quant::QuantSpec::int8_convrot(256), cache, converted);
+  EXPECT_TRUE(converted);
+}
+
+// Cancelled through the cancel flag or the progress callback: SessionCancelled, no temporary and no converted file
+// left, and the entry free for the next call.
+TEST(GgufDit, CancelledConversionLeavesNothing) {
+  const mi::testing::AnyModelShapes any_shapes;
+  mi::testing::TempDir dir("gguf_cancel");
+  const fs::path src = dir.path() / "m.gguf", cache = dir.path() / "cache";
+  write_file(src, gguf_bytes(tiny_gguf().ts));
+  std::atomic<bool> cancel{false};
+  for (const bool by_flag : {true, false}) {
+    SCOPED_TRACE(by_flag ? "flag" : "progress");
+    int calls = 0;
+    mi::pipeline::GgufConvertHooks hooks;
+    hooks.cancel = &cancel;
+    hooks.progress = [&](double share) {
+      EXPECT_GT(share, 0.0);
+      EXPECT_LE(share, 1.0);
+      if (++calls == 3 && by_flag) cancel = true;
+      return by_flag || calls < 3;
+    };
+    bool converted = false;
+    EXPECT_THROW(converted_path(src, mi::quant::QuantSpec::int8_convrot(256), cache, converted, hooks),
+                 mi::pipeline::SessionCancelled);
+    EXPECT_EQ(calls, 3);
+    EXPECT_FALSE(any_temporary(cache));
+    for (const std::string& n : cache_files(cache)) EXPECT_FALSE(n.ends_with(".safetensors")) << n;
+    cancel = false;
+  }
+  bool converted = false;
+  converted_path(src, mi::quant::QuantSpec::int8_convrot(256), cache, converted);
+  EXPECT_TRUE(converted);
+}
+
+// A cache folder the engine cannot write: IoError naming the folder (MI_ERR_IO), before any conversion work.
+TEST(GgufDit, UnwritableCacheIsAnIoError) {
+  const mi::testing::AnyModelShapes any_shapes;
+  mi::testing::TempDir dir("gguf_unwritable");
+  const fs::path src = dir.path() / "m.gguf", cache = dir.path() / "cache";
+  write_file(src, gguf_bytes(tiny_gguf().ts));
+  bool converted = false;
+  // A file where the folder should be.
+  write_file(cache / "gguf", "x");
+  EXPECT_THROW(converted_path(src, mi::quant::QuantSpec::int8_convrot(256), cache, converted), mi::weights::IoError);
+#ifndef _WIN32
+  if (::geteuid() != 0) {  // root writes anyway
+    fs::remove(cache / "gguf");
+    fs::create_directories(cache / "gguf");
+    fs::permissions(cache / "gguf", fs::perms::owner_read | fs::perms::owner_exec);
+    int progress = 0;
+    mi::pipeline::GgufConvertHooks hooks;
+    hooks.progress = [&](double) { return ++progress > 0; };
+    try {
+      converted_path(src, mi::quant::QuantSpec::int8_convrot(256), cache, converted, hooks);
+      ADD_FAILURE() << "converted into a read-only folder";
+    } catch (const mi::weights::IoError& e) {
+      EXPECT_NE(std::string(e.what()).find("cache"), std::string::npos) << e.what();
+    }
+    EXPECT_EQ(progress, 0);  // nothing converted
+    // The entry's lock file exists (an earlier conversion, its file since deleted), the folder then read-only: the
+    // temporary cannot be created.
+    fs::permissions(cache / "gguf", fs::perms::owner_all);
+    const fs::path earlier = converted_path(src, mi::quant::QuantSpec::int8_convrot(256), cache, converted);
+    fs::remove(earlier);
+    ASSERT_TRUE(fs::exists(earlier.string() + ".lock"));
+    fs::permissions(cache / "gguf", fs::perms::owner_read | fs::perms::owner_exec);
+    try {
+      converted_path(src, mi::quant::QuantSpec::int8_convrot(256), cache, converted, hooks);
+      ADD_FAILURE() << "converted into a read-only folder";
+    } catch (const mi::weights::IoError& e) {
+      EXPECT_NE(std::string(e.what()).find("cannot create a file in the GGUF cache directory"), std::string::npos) << e.what();
+    }
+    EXPECT_EQ(progress, 0);
+    fs::permissions(cache / "gguf", fs::perms::owner_all);
+  }
+#endif
+}
+
+#ifndef _WIN32
+// Two processes load the same GGUF at once: one converts, the other waits on the entry's lock and then finds the file.
+TEST(GgufDit, ConcurrentFirstLoadsConvertOnce) {
+  const mi::testing::AnyModelShapes any_shapes;
+  mi::testing::TempDir dir("gguf_concurrent");
+  const fs::path src = dir.path() / "m.gguf", cache = dir.path() / "cache";
+  write_file(src, gguf_bytes(tiny_gguf().ts));
+  int pipe_fds[2];
+  ASSERT_EQ(::pipe(pipe_fds), 0);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    // The child converts, holding the conversion for a while once it has started.
+    ::close(pipe_fds[0]);
+    int code = 2;
+    try {
+      bool signalled = false;
+      mi::pipeline::GgufConvertHooks hooks;
+      hooks.progress = [&](double) {
+        if (!signalled) {
+          signalled = true;
+          const char c = 'x';
+          if (::write(pipe_fds[1], &c, 1) != 1) std::_Exit(3);
+          std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        return true;
+      };
+      mi::pipeline::GgufDitInfo info;
+      code = mi::pipeline::gguf_converted_file(src, info, mi::quant::QuantSpec::int8_convrot(256), cache, hooks).converted ? 0 : 1;
+    } catch (...) {
+    }
+    std::_Exit(code);
+  }
+  ::close(pipe_fds[1]);
+  char c = 0;
+  ASSERT_EQ(::read(pipe_fds[0], &c, 1), 1);  // the child is converting
+  ::close(pipe_fds[0]);
+  int waits = 0;
+  mi::pipeline::GgufConvertHooks hooks;
+  hooks.progress = [&](double share) {
+    EXPECT_EQ(share, 0.0);  // only the waits report: this process converts nothing
+    ++waits;
+    return true;
+  };
+  bool converted = true;
+  const auto t0 = std::chrono::steady_clock::now();
+  const fs::path p = converted_path(src, mi::quant::QuantSpec::int8_convrot(256), cache, converted, hooks);
+  EXPECT_GE(std::chrono::steady_clock::now() - t0, std::chrono::milliseconds(300));  // it waited for the child
+  EXPECT_FALSE(converted);
+  EXPECT_GE(waits, 1);
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);  // the child converted
+  EXPECT_TRUE(mi::weights::SafetensorsFile(p).tensors().size() > 0);
+  EXPECT_FALSE(any_temporary(cache));
+}
+#endif
 
 // ---- GPU: a published GGUF DiT end to end ---------------------------------------------------------------------
 
@@ -889,7 +1170,9 @@ TEST(GpuGgufDit, RunsBitIdenticalToItsConvertedInt8File) {
   const mi::json::Value doc = mi::json::parse("{" + mi::pipeline::report_fields(req, a, "", "") + "}");
   EXPECT_EQ(doc.at("models").at("dit").at("format").as_string(), a.dit_format);
   std::vector<fs::path> converted;
-  for (const auto& e : fs::directory_iterator(cache / "gguf")) converted.push_back(e.path());
+  for (const auto& e : fs::directory_iterator(cache / "gguf")) {
+    if (e.path().extension() == ".safetensors") converted.push_back(e.path());
+  }
   ASSERT_EQ(converted.size(), 1u);
   const auto stamp = fs::last_write_time(converted[0]);
 
@@ -909,8 +1192,23 @@ TEST(GpuGgufDit, RunsBitIdenticalToItsConvertedInt8File) {
   EXPECT_EQ(bit_mismatches(again.generate(req).latents, a.latents), 0u);
   EXPECT_EQ(fs::last_write_time(converted[0]), stamp);
   std::size_t files = 0;
-  for (const auto& e : fs::directory_iterator(cache / "gguf")) files += e.is_regular_file() ? 1 : 0;
+  for (const auto& e : fs::directory_iterator(cache / "gguf")) files += e.path().extension() == ".safetensors" ? 1 : 0;
   EXPECT_EQ(files, 1u);
+
+  // Independently, `moss-infer quantize <file.gguf>` (quant::convert with its defaults) writes the same tensors, byte
+  // for byte, and runs bit-identical to the GGUF.
+  const fs::path quantized = dir.path() / "quantized.safetensors";
+  mi::quant::convert(gguf, quantized, mi::quant::ConvertOptions{});
+  const mi::weights::SafetensorsFile qf(quantized), cf(converted[0]);
+  ASSERT_EQ(qf.tensors().size(), cf.tensors().size());
+  for (const auto& t : qf.tensors()) {
+    const auto* u = cf.find(t.name);
+    ASSERT_NE(u, nullptr) << t.name;
+    EXPECT_TRUE(u->dtype == t.dtype && u->shape == t.shape) << t.name;
+    EXPECT_TRUE(tensor_bytes(quantized, t.name) == tensor_bytes(converted[0], t.name)) << t.name;
+  }
+  mi::pipeline::Pipeline from_quantize(options(quantized));
+  EXPECT_EQ(bit_mismatches(from_quantize.generate(req).latents, a.latents), 0u);
 }
 
 }  // namespace

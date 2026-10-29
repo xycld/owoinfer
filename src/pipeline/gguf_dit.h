@@ -6,14 +6,25 @@
 //     weights would be rounded twice, and INT8 runs its own grid more closely);
 //   - tier turbo: refused (no 4-bit target), as is any other type (Q2_K, Q3_K, IQ*, custom types).
 // So VRAM and speed are the target format's. The converted file is kept in <cache_dir>/gguf/, found again by the GGUF
-// file's identity (size, modification time, XXH64 of its header, the target and the converter version): only the first
-// load converts (quant::convert, streamed one tensor at a time, under 0.6 GB of host RAM for a MOSS-Image DiT); later
-// loads read the converted file directly. A GGUF DiT therefore needs a cache directory.
+// file's identity (size, modification time, volume and 128-bit file id, XXH64 of its header, the target and the
+// converter version): only the first load converts (quant::convert, streamed one tensor at a time, under 0.6 GB of host
+// RAM for a MOSS-Image DiT); later loads read the converted file directly. A GGUF DiT therefore needs a cache directory.
+//
+// The cache folder is shared by processes. Each converted file has a lock file "<file>.lock" (util::FileLock): a load
+// holds it shared for as long as it uses the file, the conversion that writes it holds it exclusive (a second process
+// loading the same GGUF waits, then finds the file), and an entry is removed only under its exclusive lock (never one in
+// use). Each call sweeps the folder: converted files whose recorded source no longer exists or was replaced by a newer
+// version (same path, same target), temporaries of conversions that ended without publishing, and lock files of entries
+// that are gone. The folder's contents are trusted as the model: only the engine's account may write it.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
+
+#include "util/regular_file.h"
 
 #include "planner/planner.h"
 #include "weights/quant/quant_model.h"
@@ -41,13 +52,29 @@ quant::QuantSpec gguf_target(const GgufDitInfo& info, planner::Tier tier);
 // "GGUF Q4_K, runs as INT8 ConvRot" / "GGUF Q8_0, runs as bf16".
 std::string gguf_runs_as(const GgufDitInfo& info, const quant::QuantSpec& target);
 
+// The running call's hold on a conversion (gguf_converted_file): mi_cancel / mi_engine_free and the progress callback.
+struct GgufConvertHooks {
+  // Set: the conversion, or the wait for another process's, stops with SessionCancelled (the temporary removed).
+  const std::atomic<bool>* cancel = nullptr;
+  // Per converted module or tensor, the share done (0..1); every second with 0 while another process converts the
+  // file. Returning false cancels.
+  std::function<bool(double)> progress;
+};
+
+struct GgufCachedFile {
+  std::filesystem::path path;
+  util::FileLock lock;     // "<path>.lock" held shared: keep it while the file is in use (no sweep removes the file)
+  bool converted = false;  // this call converted it
+};
+
 // The converted file of `file` for `target` in <cache_dir>/gguf/, converted now when the cache has none for this
-// identity (written under a temporary name, read back, then renamed into place; a converted copy of an earlier version
-// of the same GGUF path is removed). `converted` (optional) is set when this call converted. Throws std::invalid_argument
-// for an empty cache_dir, weights::IoError when the cache directory cannot hold the file (free space is checked
-// first), or the converter's errors.
-std::filesystem::path gguf_converted_file(const std::filesystem::path& file, const GgufDitInfo& info,
-                                          const quant::QuantSpec& target, const std::filesystem::path& cache_dir,
-                                          bool* converted = nullptr);
+// identity: into a temporary file created exclusively there first, converted, read back, checked against a GGUF that
+// changed meanwhile, then published under its name (a file that another process published meanwhile with the same key
+// is used). Throws std::invalid_argument for an empty cache_dir; weights::IoError when the cache directory cannot hold
+// or take the file (it cannot be created, written or locked, too little free space, the GGUF changed while it was
+// converted); SessionCancelled; the converter's errors about the GGUF.
+GgufCachedFile gguf_converted_file(const std::filesystem::path& file, const GgufDitInfo& info,
+                                   const quant::QuantSpec& target, const std::filesystem::path& cache_dir,
+                                   const GgufConvertHooks& hooks = {});
 
 }  // namespace mi::pipeline

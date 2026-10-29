@@ -452,9 +452,13 @@ struct GenerateControl {
   std::function<void(const PreviewImage&)> on_preview;
   int preview_every = 1;
   std::function<bool(Phase)> on_phase;        // before each phase starts; returning false cancels
+  // A GGUF DiT's conversion (its first load, before planning: gguf_dit.h): the share done, per converted module, and
+  // every second while another process converts the same file; returning false cancels (Result::cancelled).
+  std::function<bool(double)> on_convert;
   // Checked before each phase and after every step, and inside the phases: between text-encoder layers, per DiT
   // weight group while loading, between DiT blocks and per tiled-decode band (each phase then keeps at most one
-  // layer / block / band queued on the GPU). The pipeline stays usable after a cancel.
+  // layer / block / band queued on the GPU), per module of a GGUF DiT's conversion. The pipeline stays usable after a
+  // cancel.
   const std::atomic<bool>* cancel = nullptr;
   // Internal (the NVFP4 converter's calibration capture, pipeline/nvfp4_calibration.h): installed on the DiT for the
   // call (moss_dit::MossDit::set_linear_input_hook). Needs PipelineOptions::block_path kOpByOp and a bf16 DiT.
@@ -566,6 +570,7 @@ struct PreloadOptions {
   // the decoder); kDitLoad before the DiT. A step the plan skips fires nothing. kDenoise is never reported.
   std::function<void(const planner::ExecutionPlan&)> on_plan;
   std::function<bool(Phase)> on_phase;
+  std::function<bool(double)> on_convert;  // as GenerateControl's
 };
 
 // Pipeline::release_device_memory: what was freed and kept.

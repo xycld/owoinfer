@@ -160,6 +160,9 @@ struct DitSource {
   mutable bool direct_refused = false;
   // The model it was trained as (dit_lineage): "base", "sft" or "" (unknown).
   std::string lineage;
+  // A GGUF file: the lock of its converted file, held shared while this source lives (every load, reload and re-open of
+  // the converted file reads it through this source), so no sweep of this or another process removes the file.
+  util::FileLock cache_lock;
 };
 
 // The DiT weight files of `index` (its transformer groups' files; a single file's index holds only the DiT).
@@ -227,7 +230,8 @@ inline void check_layers(const std::vector<int>& layers, const char* name) {
 }
 
 inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file, planner::Tier tier,
-                                                const std::filesystem::path& cache_dir) {
+                                                const std::filesystem::path& cache_dir,
+                                                const GgufConvertHooks& hooks = {}) {
   // NVFP4 linears run only on cc 12.0 with the sm_120a kernels (user decision D1); otherwise the file is refused as an
   // unsupported model (MI_ERR_MODEL).
   // Stamped before it is read: a file replaced during the open is seen at the next call.
@@ -238,13 +242,14 @@ inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& fil
   if (stamp.regular() && weights::is_gguf_file(file)) {
     const GgufDitInfo g = model_file_errors(file, [&] { return inspect_gguf_dit(file); });
     const quant::QuantSpec target = gguf_target(g, tier);
-    const std::filesystem::path converted =
-        model_file_errors(file, [&] { return gguf_converted_file(file, g, target, cache_dir); });
-    std::unique_ptr<DitSource> d = open_dit_file(converted, tier, cache_dir);
+    GgufCachedFile converted =
+        model_file_errors(file, [&] { return gguf_converted_file(file, g, target, cache_dir, hooks); });
+    std::unique_ptr<DitSource> d = open_dit_file(converted.path, tier, cache_dir);
+    d->cache_lock = std::move(converted.lock);
     d->path = file;
     d->stamp = stamp;
     d->format = gguf_runs_as(g, target);
-    d->remarks = d->format + " (converted copy: " + util::path_utf8(converted) + ")" +
+    d->remarks = d->format + " (converted copy: " + util::path_utf8(converted.path) + ")" +
                  (d->remarks.empty() ? "" : "; " + d->remarks);
     return d;
   }
@@ -410,6 +415,9 @@ using namespace detail;
 
 struct Pipeline::Impl {
   PipelineOptions options;
+  // The running call's cancel flag and conversion progress, for a GGUF DiT's conversion in setup_models (set by
+  // Pipeline::run and the session calls for the call only: setup_models(req, r, hooks)).
+  GgufConvertHooks convert_hooks;
   runtime::StreamSet streams;
   std::size_t free_at_start = 0;
   std::map<std::string, std::unique_ptr<Bundle>> bundles;
@@ -615,7 +623,7 @@ struct Pipeline::Impl {
   // options.dit_file's DiT (opened before the bundle is indexed: Impl::bundle).
   DitSource& dit_file_source(double& load_s) {
     return cached_dit(file_key(options.dit_file), load_s,
-                      [&] { return open_dit_file(options.dit_file, options.tier, options.cache_dir); });
+                      [&] { return open_dit_file(options.dit_file, options.tier, options.cache_dir, convert_hooks); });
   }
   template <class Open>
   DitSource& cached_dit(const std::string& key, double& load_s, Open&& open) {
@@ -1195,6 +1203,15 @@ struct Pipeline::Impl {
     std::string merge_key;                      // the LoRA files merged into the DiT (empty: none)
   };
   CallModels setup_models(const Request& req, Result& r);
+  // setup_models with the call's GGUF conversion hooks (convert_hooks) set for its duration.
+  CallModels setup_models(const Request& req, Result& r, GgufConvertHooks hooks) {
+    struct Reset {
+      GgufConvertHooks& h;
+      ~Reset() { h = {}; }
+    } reset{convert_hooks};
+    convert_hooks = std::move(hooks);
+    return setup_models(req, r);
+  }
 
   // The loaded DiT (of the call's source) switched to the call's merged adapters `merge_key` (e.g. a control adapter,
   // with its merged text-refiner adapters, toggled on or off): in place from the pristine copies when no block module
