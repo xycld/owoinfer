@@ -890,6 +890,38 @@ namespace {
 std::int64_t nvfp4_cols(const ComputeConfig& config) {
   return nvfp4_big_cols(config.nvfp4_up_gate, config.nvfp4_ffn || config.nvfp4_lora_ffn);
 }
+
+// The quantized block's buffers for `total` tokens, after the activations (every caller's stack order): per-token
+// scales, the 8-bit attention workspace of q8_bytes, the LoRA t buffers (for `side_branches`), the INT4 unpack buffer
+// and the NVFP4 scales and Δ.
+QuantBlockBuffers quant_buffers(StackPlan& plan, const ComputeConfig& config, std::int64_t total, std::size_t q8_bytes,
+                                const lora::SideBranches* side_branches = nullptr) {
+  QuantBlockBuffers qa;
+  qa.scale = plan.tensor(DType::kF32, {total});
+  qa.attn_workspace_bytes = q8_bytes;
+  if (q8_bytes > 0) qa.attn_workspace = plan.bytes(q8_bytes);
+  if (config.lora_rank > 0) {
+    qa.lora = side_branches;
+    qa.lora_t = plan.tensor(DType::kBF16, {total, config.lora_rank});
+    qa.lora_workspace_bytes = lora::t_workspace_bytes(total, config.lora_rank);
+    qa.lora_workspace = plan.bytes(qa.lora_workspace_bytes);
+  }
+  qa.int4_via_int8 = config.int4_via_int8;
+  if (config.int4 && (config.lora_rank > 0 || config.int4_via_int8)) {
+    qa.int4_unpack_bytes = kInt4UnpackBytes;
+    qa.int4_unpack = plan.bytes(kInt4UnpackBytes);
+  }
+  if (config.nvfp4) {
+    qa.nvfp4_sf_bytes = nvfp4_sf_bytes(total);
+    qa.nvfp4_sf = plan.bytes(qa.nvfp4_sf_bytes);
+    if (config.nvfp4_delta_cols > 0) {
+      qa.nvfp4_delta = plan.tensor(DType::kBF16, {total, config.nvfp4_delta_cols});
+      qa.nvfp4_scratch_bytes = lora::delta_scratch_bytes(total, config.lora_rank, config.nvfp4_delta_cols);
+      qa.nvfp4_scratch = plan.bytes(qa.nvfp4_scratch_bytes);
+    }
+  }
+  return qa;
+}
 }  // namespace
 
 std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
@@ -906,23 +938,7 @@ std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, st
   Activations(plan, total, total, static_cast<std::int64_t>(text_lengths.size()), true,
               config.quantized ? quant_big_cols(hw, text_lengths, config.bf16_up_gate, route, nvfp4_cols(config))
                                : big_cols(path, hw, text_lengths, route));
-  if (config.quantized) {
-    plan.tensor(DType::kF32, {total});
-    const std::size_t q8 = q8_attention_workspace_bytes(hw, text_lengths, config.attention);
-    if (q8 > 0) plan.bytes(q8);
-    if (config.lora_rank > 0) {
-      plan.tensor(DType::kBF16, {total, config.lora_rank});
-      plan.bytes(lora::t_workspace_bytes(total, config.lora_rank));
-    }
-    if (config.int4 && (config.lora_rank > 0 || config.int4_via_int8)) plan.bytes(kInt4UnpackBytes);
-    if (config.nvfp4) {
-      plan.bytes(nvfp4_sf_bytes(total));
-      if (config.nvfp4_delta_cols > 0) {
-        plan.tensor(DType::kBF16, {total, config.nvfp4_delta_cols});
-        plan.bytes(lora::delta_scratch_bytes(total, config.lora_rank, config.nvfp4_delta_cols));
-      }
-    }
-  }
+  if (config.quantized) quant_buffers(plan, config, total, q8_attention_workspace_bytes(hw, text_lengths, config.attention));
   TimeScratch{plan};
   return plan.total();
 }
@@ -1066,31 +1082,7 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
                           : big_cols(path_, hw, lengths, route));
   // Quantized blocks: per-token activation scales and the 8-bit attention workspace (workspace_bytes' order).
   QuantBlockBuffers qa;
-  if (quantized) {
-    qa.scale = plan.tensor(DType::kF32, {total});
-    qa.attn_workspace_bytes = q8_attention_workspace_bytes(hw, lengths, config_.attention);
-    if (qa.attn_workspace_bytes > 0) qa.attn_workspace = plan.bytes(qa.attn_workspace_bytes);
-    if (config_.lora_rank > 0) {
-      qa.lora = lora_;
-      qa.lora_t = plan.tensor(DType::kBF16, {total, config_.lora_rank});
-      qa.lora_workspace_bytes = lora::t_workspace_bytes(total, config_.lora_rank);
-      qa.lora_workspace = plan.bytes(qa.lora_workspace_bytes);
-    }
-    qa.int4_via_int8 = config_.int4_via_int8;
-    if (config_.int4 && (config_.lora_rank > 0 || config_.int4_via_int8)) {
-      qa.int4_unpack_bytes = kInt4UnpackBytes;
-      qa.int4_unpack = plan.bytes(kInt4UnpackBytes);
-    }
-    if (config_.nvfp4) {
-      qa.nvfp4_sf_bytes = nvfp4_sf_bytes(total);
-      qa.nvfp4_sf = plan.bytes(qa.nvfp4_sf_bytes);
-      if (config_.nvfp4_delta_cols > 0) {
-        qa.nvfp4_delta = plan.tensor(DType::kBF16, {total, config_.nvfp4_delta_cols});
-        qa.nvfp4_scratch_bytes = lora::delta_scratch_bytes(total, config_.lora_rank, config_.nvfp4_delta_cols);
-        qa.nvfp4_scratch = plan.bytes(qa.nvfp4_scratch_bytes);
-      }
-    }
-  }
+  if (quantized) qa = quant_buffers(plan, config_, total, q8_attention_workspace_bytes(hw, lengths, config_.attention), lora_);
   // Streamed blocks: device buffers after the activations; the first copies overlap the setup below.
   BlockWeights::Pass weights(*blocks_, stream, cancel_);
 
