@@ -130,7 +130,8 @@ inline std::unique_ptr<Bundle> open_bundle(const std::filesystem::path& dir, wei
 // (the load that follows reports why).
 inline std::string file_stamp(const util::FileInfo& f) {
   if (!f.regular()) return {};
-  return std::to_string(f.size) + "@" + std::to_string(f.mtime_ns) + "#" + std::to_string(f.volume) + ":" + std::to_string(f.id);
+  return std::to_string(f.size) + "@" + std::to_string(f.mtime_ns) + "#" + std::to_string(f.volume) + ":" + std::to_string(f.id_high) + ":" +
+         std::to_string(f.id);
 }
 
 // The key of a component file's source (Impl::dit_sources, te_sources, vae_sources; a prefix of encoder_sources').

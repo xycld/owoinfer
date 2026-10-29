@@ -64,7 +64,8 @@ struct FileInfo {
   std::uint64_t size = 0;
   std::int64_t mtime_ns = 0;  // since the system_clock (Unix) epoch: the value .mossidx files persist
   std::uint64_t volume = 0;   // st_dev; the volume serial number
-  std::uint64_t id = 0;       // st_ino; the file index
+  std::uint64_t id = 0;       // st_ino; the low half of the 128-bit file id (FileIdInfo: ReFS and Dev Drive ids
+  std::uint64_t id_high = 0;  // are not unique in 64 bits); its high half (0 on POSIX)
   bool exists() const { return kind != FileKind::kMissing; }
   bool regular() const { return kind == FileKind::kRegular; }
   bool directory() const { return kind == FileKind::kDirectory; }
@@ -80,13 +81,14 @@ struct FileInfo {
 //   share-all, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION), which
 //   follows the reparse points and reads no data, and its handle answers: GetFileType (not FILE_TYPE_DISK: kOther),
 //   then GetFileInformationByHandle (FILE_ATTRIBUTE_DEVICE: kOther; FILE_ATTRIBUTE_DIRECTORY: kDirectory; the size,
-//   the last write time, the volume serial number and the file index). An open that fails with ERROR_PIPE_BUSY is a
+//   the last write time) and GetFileInformationByHandleEx(FileIdInfo) (the 64-bit volume serial number and the 128-bit
+//   file id; the 32-bit serial and 64-bit file index where a file system has no FileIdInfo). An open that fails with ERROR_PIPE_BUSY is a
 //   pipe (kOther).
 FileInfo file_info(const std::filesystem::path& path);
 
 // Whether two infos are of one existing file (std::filesystem::equivalent).
 inline bool same_file(const FileInfo& a, const FileInfo& b) {
-  return a.exists() && b.exists() && a.volume == b.volume && a.id == b.id;
+  return a.exists() && b.exists() && a.volume == b.volume && a.id == b.id && a.id_high == b.id_high;
 }
 
 // The path with its links resolved, for comparing output and input paths: std::filesystem::weakly_canonical on POSIX.

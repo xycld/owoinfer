@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -159,8 +160,15 @@ FileInfo handle_info(HANDLE h) {
   info.kind = (bh.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? FileKind::kDirectory : FileKind::kRegular;
   if (info.regular()) info.size = (std::uint64_t{bh.nFileSizeHigh} << 32) | bh.nFileSizeLow;
   info.mtime_ns = filetime_ns(bh.ftLastWriteTime);
-  info.volume = bh.dwVolumeSerialNumber;
-  info.id = (std::uint64_t{bh.nFileIndexHigh} << 32) | bh.nFileIndexLow;
+  FILE_ID_INFO fid{};
+  if (GetFileInformationByHandleEx(h, FileIdInfo, &fid, sizeof fid)) {
+    info.volume = fid.VolumeSerialNumber;
+    std::memcpy(&info.id, fid.FileId.Identifier, sizeof info.id);
+    std::memcpy(&info.id_high, fid.FileId.Identifier + sizeof info.id, sizeof info.id_high);
+  } else {
+    info.volume = bh.dwVolumeSerialNumber;
+    info.id = (std::uint64_t{bh.nFileIndexHigh} << 32) | bh.nFileIndexLow;
+  }
   return info;
 }
 

@@ -1043,7 +1043,7 @@ TEST(RegularFile, WindowsPipeOpenIsIdentificationOnlyAndNeverBlocks) {
 }
 
 // A regular file's info from its handle: the size, the last write time GetFileTime reports (as nanoseconds since the
-// Unix epoch), the volume serial number and file index GetFileInformationByHandle reports (a hard link shares them);
+// Unix epoch), the volume serial number and 128-bit file id FileIdInfo reports (a hard link shares them);
 // resolved_path is the final path GetFinalPathNameByHandleW gives, with a missing tail appended.
 TEST(RegularFile, WindowsFileInfoFromHandle) {
   TempDir dir("win_file_info");
@@ -1053,6 +1053,8 @@ TEST(RegularFile, WindowsFileInfoFromHandle) {
   ASSERT_NE(h, INVALID_HANDLE_VALUE);
   BY_HANDLE_FILE_INFORMATION bh{};
   ASSERT_TRUE(GetFileInformationByHandle(h, &bh));
+  FILE_ID_INFO fid{};
+  ASSERT_TRUE(GetFileInformationByHandleEx(h, FileIdInfo, &fid, sizeof fid));
   std::wstring final_path(1024, L'\0');
   const DWORD n = GetFinalPathNameByHandleW(h, final_path.data(), static_cast<DWORD>(final_path.size()),
                                             FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
@@ -1062,8 +1064,12 @@ TEST(RegularFile, WindowsFileInfoFromHandle) {
   const mi::util::FileInfo info = mi::util::file_info(file);
   EXPECT_EQ(info.kind, mi::util::FileKind::kRegular);
   EXPECT_EQ(info.size, 4321u);
-  EXPECT_EQ(info.volume, bh.dwVolumeSerialNumber);
-  EXPECT_EQ(info.id, (std::uint64_t{bh.nFileIndexHigh} << 32) | bh.nFileIndexLow);
+  EXPECT_EQ(info.volume, fid.VolumeSerialNumber);
+  std::uint64_t id[2];
+  std::memcpy(id, fid.FileId.Identifier, sizeof id);
+  EXPECT_EQ(info.id, id[0]);
+  EXPECT_EQ(info.id_high, id[1]);
+  EXPECT_EQ(info.volume & 0xffffffffu, bh.dwVolumeSerialNumber);
   const auto ticks = static_cast<std::int64_t>((std::uint64_t{bh.ftLastWriteTime.dwHighDateTime} << 32) |
                                                bh.ftLastWriteTime.dwLowDateTime);
   const std::int64_t unix_ns = (ticks - 116444736000000000LL) * 100;  // FILETIME epoch 1601 -> 1970
