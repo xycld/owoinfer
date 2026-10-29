@@ -3,12 +3,10 @@
 #include "mossinfer/mossinfer.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <new>
 #include <span>
 #include <stdexcept>
@@ -24,6 +22,7 @@
 #include "pipeline/pipeline_image.h"
 #include "planner/planner.h"
 #include "runtime/device_arena.h"
+#include "runtime/job_gate.h"
 #include "util/json.h"
 #include "util/path.h"
 #include "util/regular_file.h"
@@ -33,11 +32,10 @@
 #include "weights/upload.h"
 
 struct mi_engine {
+  // The one gate of the engine's jobs (runtime/job_gate.h): mi_generate, mi_engine_preload, mi_engine_release, and the
+  // cancel flag the running job watches. Declared first: it outlives everything that runs through it.
+  mi::runtime::JobGate gate;
   std::unique_ptr<mi::api::PipelineAdapter> adapter;
-  std::atomic<bool> cancel{false};
-  // Guards busy and the cancel flag's reset, so a cancel lands on exactly the job running when it is issued.
-  std::mutex state;
-  bool busy = false;
 };
 
 struct mi_result {
@@ -431,6 +429,8 @@ mi_status guarded(F&& body) noexcept {
     return fail(MI_ERR_CUDA, e.what());
   } catch (const mi::backend::CudaLibraryError& e) {
     return fail(MI_ERR_CUDA, e.what());
+  } catch (const mi::runtime::JobGate::Busy& e) {
+    return fail(MI_ERR_BUSY, e.what());
   } catch (const std::exception& e) {
     return fail(MI_ERR_INTERNAL, e.what());
   } catch (...) {
@@ -607,30 +607,6 @@ void copy_string(char (&dst)[N], const std::string& s) {
   dst[n] = '\0';
 }
 
-// Marks the engine busy for one job (mi_generate, mi_engine_preload, mi_engine_release) and idle again when it ends,
-// with the cancel flag reset at both ends: a cancel lands on exactly the job running when it is issued.
-class BusyGuard {
- public:
-  explicit BusyGuard(mi_engine& e) : e_(e) {
-    const std::lock_guard<std::mutex> lock(e_.state);
-    if (e_.busy) {
-      throw StatusError(MI_ERR_BUSY, "the engine is busy (one generation, preload or release at a time).");
-    }
-    e_.busy = true;
-    e_.cancel.store(false);
-  }
-  ~BusyGuard() {
-    const std::lock_guard<std::mutex> lock(e_.state);
-    e_.busy = false;
-    e_.cancel.store(false);
-  }
-  BusyGuard(const BusyGuard&) = delete;
-  BusyGuard& operator=(const BusyGuard&) = delete;
-
- private:
-  mi_engine& e_;
-};
-
 // mi_probe_info's spelling: "cu12", "cu13", or "" for none.
 std::string flavour_string(mi::backend::Flavour f) {
   return f == mi::backend::Flavour::kNone ? std::string() : mi::backend::flavour_name(f);
@@ -775,16 +751,25 @@ mi_status mi_engine_create(const mi_engine_params* params, mi_engine** out_engin
   });
 }
 
-// No try/catch: destructors are noexcept, so there is nothing it could catch. ~PipelineAdapter and the pipeline below it
-// tear down with CUDA's C API and ignore its errors (never MI_CUDA_CHECK), and the thread's last error stays untouched.
+// The gate is closed first (JobGate::close_engine: later jobs are refused, a job in flight on another thread is
+// cancelled and waited for), so the free never races a job. ~PipelineAdapter and the pipeline below it tear down with
+// CUDA's C API and ignore its errors (never MI_CUDA_CHECK). The thread's last error stays untouched: from a callback of
+// the engine's running job (forbidden) this is a silent no-op that frees nothing.
 static_assert(std::is_nothrow_destructible_v<mi_engine>);
-void mi_engine_free(mi_engine* engine) { delete engine; }
+void mi_engine_free(mi_engine* engine) {
+  if (engine == nullptr) return;
+  try {
+    engine->gate.close_engine();
+  } catch (...) {
+    return;
+  }
+  delete engine;
+}
 
 mi_status mi_cancel(mi_engine* engine) {
   return guarded([&] {
     require(engine, "engine");
-    const std::lock_guard<std::mutex> lock(engine->state);
-    if (engine->busy) engine->cancel.store(true);
+    engine->gate.cancel();  // between jobs a no-op: the next job's start clears it
     return MI_OK;
   });
 }
@@ -816,9 +801,9 @@ mi_status mi_generate(mi_engine* engine, const mi_gen_params* params, mi_result*
     require(out_result, "out_result");
     const mi_gen_params p = read_input<mi_gen_params>(params, kGenParamsSizes, gen_params_defaults, "mi_gen_params");
     check_reserved(p);
-    const BusyGuard busy(*engine);
+    const mi::runtime::JobGate::Job job = engine->gate.begin(mi::runtime::JobGate::Kind::kEngine);
     auto result = std::make_unique<mi_result>();
-    result->generation = engine->adapter->generate(p, engine->cancel);
+    result->generation = engine->adapter->generate(p, *engine->gate.cancel_flag());
     const bool cancelled = result->generation.cancelled;
     *out_result = result.release();
     return cancelled ? MI_CANCELLED : MI_OK;
@@ -833,9 +818,9 @@ mi_status mi_engine_preload(mi_engine* engine, const mi_gen_params* params, mi_r
                                 ? read_input<mi_gen_params>(params, kGenParamsSizes, gen_params_defaults, "mi_gen_params")
                                 : gen_params_defaults();
     check_reserved(p);
-    const BusyGuard busy(*engine);
+    const mi::runtime::JobGate::Job job = engine->gate.begin(mi::runtime::JobGate::Kind::kEngine);
     auto result = std::make_unique<mi_result>();
-    result->generation = engine->adapter->preload(p, engine->cancel);
+    result->generation = engine->adapter->preload(p, *engine->gate.cancel_flag());
     const bool cancelled = result->generation.cancelled;
     if (out_result != nullptr) *out_result = result.release();
     return cancelled ? MI_CANCELLED : MI_OK;
@@ -846,9 +831,9 @@ mi_status mi_engine_release(mi_engine* engine, int32_t keep_host_copy, mi_releas
   return guarded([&] {
     require(engine, "engine");
     if (out != nullptr) check_size(out->struct_size, sizeof(mi_release_info), "mi_release_info");
-    const BusyGuard busy(*engine);
+    const mi::runtime::JobGate::Job job = engine->gate.begin(mi::runtime::JobGate::Kind::kEngine);
     bool cancelled = false;
-    const mi_release_info info = engine->adapter->release(keep_host_copy != 0, engine->cancel, &cancelled);
+    const mi_release_info info = engine->adapter->release(keep_host_copy != 0, *engine->gate.cancel_flag(), &cancelled);
     if (out != nullptr) write_output(out, info);
     return cancelled ? MI_CANCELLED : MI_OK;  // cancelled before it started: nothing was released
   });

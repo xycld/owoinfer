@@ -73,7 +73,7 @@ cmake --build <build> --target mossinfer_example_c
 - **Callbacks** (`progress_callback`, `plan_callback`, `preview_callback`) run synchronously on the thread that called `mi_generate()` (or `mi_engine_preload()`), so keep them short.
   - They must not throw or longjmp.
   - They must not call `mi_generate()`, `mi_engine_preload()`, `mi_engine_release()` or `mi_engine_free()` on the same engine.
-- **`mi_engine_free()` must not race** with a running job on that engine. Cancel first, then wait for the call to return.
+- **`mi_engine_free()` may race a running job** on another thread (2.1): it cancels the job, waits for its call to return, then frees. From a callback of the engine's running job it stays forbidden, and does nothing. Using the engine pointer after `mi_engine_free()` returns is the caller's bug.
 - **`mi_result` is independent of its engine.** It may outlive the engine, and it may be used from any thread, one at a time.
 - **The CUDA device is selected per call.** `mi_generate()` selects `device_index` on the calling thread, so engines may be driven from any thread.
   - `mi_engine_create()`, `mi_generate()` and `mi_engine_free()` restore the calling thread's current CUDA context before they return: none if the thread had none, else the caller's own.

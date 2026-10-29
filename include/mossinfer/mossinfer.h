@@ -38,7 +38,8 @@
  * - Callbacks run on the thread that called mi_generate() (or mi_engine_preload()), synchronously, while the GPU
  *   waits. Keep them short. They must not throw (C++), longjmp, or call mi_generate(), mi_engine_preload(),
  *   mi_engine_release() or mi_engine_free() on the same engine.
- * - mi_engine_free() must not race with a running job on that engine.
+ * - mi_engine_free() may be called while a job runs on that engine on another thread: it cancels the job, waits for it
+ *   to return, then frees (2.1). Using the engine after mi_engine_free() returns remains the caller's bug.
  * - mi_result objects are independent of their engine. They may outlive it and be used from any one thread at a time.
  */
 #ifndef MOSSINFER_MOSSINFER_H
@@ -350,7 +351,8 @@ MOSSINFER_API mi_status mi_engine_params_init(mi_engine_params* params, size_t s
  * context is restored before returning (also by mi_generate()). */
 MOSSINFER_API mi_status mi_engine_create(const mi_engine_params* params, mi_engine** out_engine);
 /* Releases the engine and its device memory. NULL is a no-op. Never fails and never throws: a CUDA error while
- * releasing is ignored, and mi_last_error_message() is left unchanged. */
+ * releasing is ignored, and mi_last_error_message() is left unchanged. A job running on another thread is cancelled
+ * and waited for first (2.1); called from a callback of the engine's running job (forbidden) it does nothing. */
 MOSSINFER_API void mi_engine_free(mi_engine* engine);
 
 /* Requests the generation running on `engine` to stop. It stops within one text-encoder layer, DiT block or decode
