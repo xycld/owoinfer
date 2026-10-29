@@ -124,8 +124,10 @@ std::int64_t nvfp4_big_cols(bool nvfp4_up_gate, bool bf16_ffn);
 // Bytes of QuantBlockBuffers::nvfp4_sf for L tokens: the swizzled scales of the widest input, [L, kFfnDim].
 std::size_t nvfp4_sf_bytes(std::int64_t l);
 
-// attention_q8 workspace bytes enough for any run of any subset of these rows (0 for kExact).
-std::size_t q8_attention_workspace_bytes(std::int64_t hw, std::span<const std::int64_t> text_lengths, AttentionMode mode);
+// attention_q8 workspace bytes enough for any run of any subset of these rows (0 for kExact); ref_tokens > 0: each sequence
+// also attends to that many reference keys (BlockRun::slot_rows).
+std::size_t q8_attention_workspace_bytes(std::int64_t hw, std::span<const std::int64_t> text_lengths, AttentionMode mode,
+                                         std::int64_t ref_tokens = 0);
 
 // The block on run `run` of `a` with weights `w` (any mix of bf16, INT8, INT4 and NVFP4 linears, dit_weights.h), bf16 pairs routed
 // by `route` as run_block_fused does. Operands 256-byte aligned (arena allocations, kArenaAlign weights). Buffers that

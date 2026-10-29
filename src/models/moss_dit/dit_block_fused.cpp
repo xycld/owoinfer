@@ -197,13 +197,21 @@ std::int64_t fused_big_cols(std::int64_t hw, std::span<const std::int64_t> text_
   return kFusedBigCols;
 }
 
+void tap_reference_kv(const Tensor& qkv, void* tap, cudaStream_t stream) {
+  constexpr std::size_t kRow = sizeof(std::uint16_t);
+  MI_CUDA_CHECK(cudaMemcpy2DAsync(tap, 2 * kDimB * kRow, static_cast<const std::uint16_t*>(qkv.data) + kDimB,
+                                  static_cast<std::size_t>(qkv.stride[0]) * kRow, 2 * kDimB * kRow,
+                                  static_cast<std::size_t>(qkv.dim(0)), cudaMemcpyDeviceToDevice, stream));
+}
+
 void run_block_fused(const BlockTensors& w, const FusedBlockBuffers& a, const BlockRun& run, const QkvGemm& qkv_gemm,
                      const FusedRouteSnapshot& snapshot, cudaStream_t stream) {
   const std::int64_t l = a.x.dim(0);
   const FusedRoute route = fused_route(run.t1 - run.t0, snapshot.validated);
   const std::int64_t big_cols = route.up_gate ? kFusedBigCols : kOpByOpBigCols;
   // A programming error (big not sized by fused_big_cols with this snapshot), never a route change during a forward.
-  if (qkv_gemm.gemm == nullptr || !a.big.is_contiguous() || a.big.numel() < l * big_cols || a.mod.numel() != 6 * kDimB) {
+  if (qkv_gemm.gemm == nullptr || !a.big.is_contiguous() || a.big.numel() < std::max(l * big_cols, slotted_big(l, run.slot_rows)) ||
+      a.mod.numel() != 6 * kDimB) {
     throw std::invalid_argument("mi::moss_dit::run_block_fused: buffers do not match x " + a.x.describe() + ": big " +
                                 a.big.describe() + " (" + std::to_string(big_cols) + " per token), mod " + a.mod.describe());
   }
@@ -211,8 +219,11 @@ void run_block_fused(const BlockTensors& w, const FusedBlockBuffers& a, const Bl
     if (!aligned256(p)) throw std::invalid_argument("mi::moss_dit::run_block_fused: operands must be 256-byte aligned");
   }
   const Tensor x = a.x.slice0(run.t0, run.t1), y = a.y.slice0(run.t0, run.t1);
-  const Tensor qkv = rows_of(a.big, 0, l, 3 * kDimB, run.t0, run.t1);
-  const Tensor attn = rows_of(a.big, l * 3 * kDimB, l, kDimB, run.t0, run.t1);
+  const std::int64_t slots = run.slot_rows;
+  const Tensor qkv = rows_of(a.big, slots * 3 * kDimB, l, 3 * kDimB, run.t0, run.t1);
+  const Tensor attn = rows_of(a.big, (l + 2 * slots) * 3 * kDimB, l, kDimB, run.t0, run.t1);
+  // The keys and values: the run's own rows, or with reference slots the run's key rows of the slotted region.
+  const Tensor kv = slots == 0 ? qkv : rows_of(a.big, 0, l + 2 * slots, 3 * kDimB, run.k0, run.k1);
   const auto linear = [&](const Tensor& out, const Tensor& in, const Tensor& weight) {
     qkv_gemm.gemm->linear(out, in, weight, nullptr, qkv_gemm.workspace, qkv_gemm.workspace_bytes, stream);
   };
@@ -221,8 +232,13 @@ void run_block_fused(const BlockTensors& w, const FusedBlockBuffers& a, const Bl
   linear(qkv, y, w.qkv);
   kernels::fused::qk_norm_rope_moss(qkv, static_cast<int>(kHeadsB), w.q_norm, w.k_norm, a.rope.slice0(run.t0, run.t1),
                                     stream);
-  attention::flash_fwd(heads(qkv, 0), heads(qkv, kDimB), heads(qkv, 2 * kDimB), heads(attn, 0), run.cu_seqlens,
-                       run.cu_seqlens, run.max_seqlen, false, kScale, a.lse, a.lse_bytes, stream);
+  if (run.kv_tap != nullptr) {
+    tap_reference_kv(qkv, run.kv_tap, stream);
+    if (run.tap_only) return;
+  }
+  attention::flash_fwd(heads(qkv, 0), heads(kv, kDimB), heads(kv, 2 * kDimB), heads(attn, 0), run.cu_seqlens,
+                       slots == 0 ? run.cu_seqlens : run.cu_seqlens_k, run.max_seqlen, false, kScale, a.lse, a.lse_bytes,
+                       stream);
   if (route.o) {
     kernels::fused::gemm_gated_residual(x, attn, w.o, vec(a.mod, 2), stream);
   } else {

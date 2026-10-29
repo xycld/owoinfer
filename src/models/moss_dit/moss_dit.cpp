@@ -120,25 +120,35 @@ struct MossDit::Activations {
   Tensor up_gate, ffn;  // bf16 [L, 2*kFfnDim], [L, kFfnDim]  (big buffer, FFN phase; kBigCols only)
   Tensor rope;          // bf16 [rope_rows, 128]
   Tensor cu_seqlens;    // int32 pool: zero-based cu_seqlens of every row run (see cu_pool_ints)
+  // Reference slots (slot_rows > 0, BlockRun::slot_rows): `big` holds the slotted qkv region [L + 2 slot_rows, 3*kDim]
+  // during attention (qkv and attn are its row and attn views), and cu_seqlens_k the key cu_seqlens pool.
+  std::int64_t slot_rows = 0;
+  Tensor cu_seqlens_k;
   void* lse = nullptr;
   std::size_t lse_bytes = 0;
   // step only: bf16 [6*kDim] block modulation, [2*kDim] head modulation.
   Tensor mod, head;
 
   Activations(StackPlan& p, std::int64_t tokens, std::int64_t rope_rows, std::int64_t rows, bool step,
-              std::int64_t big_cols = kBigCols) {
+              std::int64_t big_cols = kBigCols, std::int64_t slots = 0)
+      : slot_rows(slots) {
     if (step) x = p.tensor(DType::kBF16, {tokens, kDim});
     y = p.tensor(DType::kBF16, {tokens, kDim});
-    big = p.tensor(DType::kBF16, {tokens, big_cols});
+    // With slots, whole rows of big_cols more until the slotted attention phase fits.
+    const std::int64_t extra = slots > 0 ? (std::max<std::int64_t>(0, slotted_big(tokens, slots) - tokens * big_cols) +
+                                            big_cols - 1) / big_cols
+                                         : 0;
+    big = p.tensor(DType::kBF16, {tokens + extra, big_cols});
     auto* b = static_cast<std::uint16_t*>(big.data);
-    qkv = Tensor::view(b, DType::kBF16, Device::kCUDA, {tokens, kQkvDim});
-    attn = Tensor::view(b + tokens * kQkvDim, DType::kBF16, Device::kCUDA, {tokens, kDim});
+    qkv = Tensor::view(b + slots * kQkvDim, DType::kBF16, Device::kCUDA, {tokens, kQkvDim});
+    attn = Tensor::view(b + (tokens + 2 * slots) * kQkvDim, DType::kBF16, Device::kCUDA, {tokens, kDim});
     if (big_cols >= kBigCols) {
       up_gate = Tensor::view(b, DType::kBF16, Device::kCUDA, {tokens, kUpGateDim});
       ffn = Tensor::view(b + tokens * kUpGateDim, DType::kBF16, Device::kCUDA, {tokens, kFfnDim});
     }
     rope = p.tensor(DType::kBF16, {rope_rows, kernels::kMossRopeDim});
     cu_seqlens = p.tensor(DType::kI32, {cu_pool_ints(rows)});
+    if (slots > 0) cu_seqlens_k = p.tensor(DType::kI32, {cu_pool_ints(rows)});
     lse_bytes = attention::flash_fwd_workspace_bytes(tokens, kHeads);
     lse = p.bytes(lse_bytes);
     if (step) {
@@ -930,24 +940,66 @@ std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, st
 }
 
 std::size_t MossDit::workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
-                                     BlockPath path, const ComputeConfig& config, const FusedRouteSnapshot* pinned) {
+                                     BlockPath path, const ComputeConfig& config, const FusedRouteSnapshot* pinned,
+                                     std::int64_t ref_tokens) {
   const std::int64_t total = token_offsets(height, width, text_lengths).back(), hw = height * width;
   const FusedRouteSnapshot route =
       path == BlockPath::kOpByOp ? FusedRouteSnapshot{} : (pinned != nullptr ? *pinned : fused_route_snapshot());
   StackPlan plan(nullptr);
   Activations(plan, total, total, static_cast<std::int64_t>(text_lengths.size()), true,
               config.quantized ? quant_big_cols(hw, text_lengths, config.bf16_up_gate, route, nvfp4_cols(config))
-                               : big_cols(path, hw, text_lengths, route));
-  if (config.quantized) quant_buffers(plan, config, total, q8_attention_workspace_bytes(hw, text_lengths, config.attention));
+                               : big_cols(path, hw, text_lengths, route),
+              ref_tokens);
+  if (config.quantized) {
+    quant_buffers(plan, config, total, q8_attention_workspace_bytes(hw, text_lengths, config.attention, ref_tokens));
+  }
   TimeScratch{plan};
   return plan.total();
+}
+
+std::size_t MossDit::reference_cache_bytes(std::int64_t ref_tokens) {
+  return static_cast<std::size_t>(kLayers) * static_cast<std::size_t>(ref_tokens) * 2 * kDim * sizeof(std::uint16_t);
+}
+
+std::size_t MossDit::prefill_workspace_bytes(std::int64_t ref_tokens, BlockPath path, const ComputeConfig& config,
+                                             const FusedRouteSnapshot* pinned) {
+  const FusedRouteSnapshot route =
+      path == BlockPath::kOpByOp ? FusedRouteSnapshot{} : (pinned != nullptr ? *pinned : fused_route_snapshot());
+  // One sequence of R tokens without text (prefill_references' allocations, in order).
+  const std::int64_t none[] = {0};
+  StackPlan plan(nullptr);
+  Activations(plan, ref_tokens, ref_tokens, 1, true,
+              config.quantized ? quant_big_cols(ref_tokens, none, config.bf16_up_gate, route, nvfp4_cols(config))
+                               : big_cols(path, ref_tokens, none, route));
+  if (config.quantized) quant_buffers(plan, config, ref_tokens, q8_attention_workspace_bytes(ref_tokens, none, config.attention));
+  TimeScratch{plan};
+  return plan.total();
+}
+
+std::size_t MossDit::prefill_stack_bytes(std::int64_t ref_tokens) const {
+  const ComputeConfig config = lora_ != nullptr ? compute_config(quant_, config_.attention, int4_route_, lora_) : config_;
+  const FusedRouteSnapshot* route = request_route_ ? &*request_route_ : nullptr;
+  return prefill_workspace_bytes(ref_tokens, path_, config, route) + blocks_->buffer_bytes();
+}
+
+void MossDit::set_references(const RefKv* refs) {
+  if (refs != nullptr) {
+    const Tensor& t = refs->kv;
+    check_device(t, DType::kBF16, "reference cache");
+    if (t.rank != 3 || t.dim(0) != kLayers || t.dim(1) < 1 || t.dim(1) > kMaxReferenceTokens || t.dim(2) != 2 * kDim) {
+      fail("the reference cache must be [42, R, 6144] with 1 <= R <= " + std::to_string(kMaxReferenceTokens) + ", got " +
+           t.describe());
+    }
+  }
+  refs_ = refs;
 }
 
 std::size_t MossDit::forward_stack_bytes(std::int64_t height, std::int64_t width,
                                         std::span<const std::int64_t> text_lengths) const {
   const ComputeConfig config = lora_ != nullptr ? compute_config(quant_, config_.attention, int4_route_, lora_) : config_;
   const FusedRouteSnapshot* route = request_route_ ? &*request_route_ : nullptr;
-  return workspace_bytes(height, width, text_lengths, path_, config, route) + blocks_->buffer_bytes();
+  return workspace_bytes(height, width, text_lengths, path_, config, route, refs_ != nullptr ? refs_->tokens() : 0) +
+         blocks_->buffer_bytes();
 }
 
 void embed_video(kernels::Gemm& gemm, void* gemm_workspace, std::size_t gemm_workspace_bytes, const Tensor& latents,
@@ -989,6 +1041,12 @@ void MossDit::run_block(int bi, const Block& b, const Activations& a, const Run&
   const Tensor qkv = a.qkv.slice0(run.t0, run.t1);
   const Tensor q = heads_view(qkv, 0), k = heads_view(qkv, kDim), v = heads_view(qkv, 2 * kDim);
   const Tensor rope = a.rope.slice0(run.t0, run.t1);
+  // The keys and values attention reads: the run's own, or with reference slots its key rows of the slotted region.
+  Tensor kv_rows = qkv;
+  if (run.slot_rows > 0) {
+    kv_rows = Tensor::view(a.big.data, DType::kBF16, Device::kCUDA, {a.qkv.dim(0) + 2 * run.slot_rows, kQkvDim})
+                  .slice0(run.k0, run.k1);
+  }
 
   const auto inputs = [&](BlockGemm g, const Tensor& in) {
     if (linear_input_hook_) linear_input_hook_(bi, g, in, stream);
@@ -1000,9 +1058,18 @@ void MossDit::run_block(int bi, const Block& b, const Activations& a, const Run&
   kernels::rms_norm_moss(k, b.k_norm, k, stream);
   kernels::moss_rope_apply(q, rope, q, stream);
   kernels::moss_rope_apply(k, rope, k, stream);
+  if (run.kv_tap != nullptr) {
+    tap_reference_kv(qkv, run.kv_tap, stream);
+    if (run.tap_only) return;
+  }
   const Tensor attn = a.attn.slice0(run.t0, run.t1);
-  attention::flash_fwd(q, k, v, heads_view(attn, 0), run.cu_seqlens, run.cu_seqlens, run.max_seqlen, false,
-                       kAttnScale, a.lse, a.lse_bytes, stream);
+  if (run.slot_rows == 0) {
+    attention::flash_fwd(q, k, v, heads_view(attn, 0), run.cu_seqlens, run.cu_seqlens, run.max_seqlen, false,
+                         kAttnScale, a.lse, a.lse_bytes, stream);
+  } else {
+    attention::flash_fwd(q, heads_view(kv_rows, kDim), heads_view(kv_rows, 2 * kDim), heads_view(attn, 0), run.cu_seqlens,
+                         run.cu_seqlens_k, run.max_seqlen, false, kAttnScale, a.lse, a.lse_bytes, stream);
+  }
   inputs(BlockGemm::kO, attn);
   linear(y, attn, b.o, stream);
   kernels::gated_residual(x, y, vec(mod, 2), x, stream);
@@ -1062,6 +1129,13 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   if (total > kMaxRunRows) {
     fail("a forward of " + std::to_string(total) + " joint tokens exceeds " + std::to_string(kMaxRunRows));
   }
+  // Reference keys (set_references): each run's sequences take a slot next to them, which covers every run of one
+  // latent and at most 2 rows (a run is then {row 0}, {row 1} or both, and a block has one run).
+  const std::int64_t ref_tokens = refs_ != nullptr ? refs_->tokens() : 0;
+  if (ref_tokens > 0 && (num_latents != 1 || rows.size() > 2)) {
+    fail("a forward with reference images takes one latent and at most 2 rows, got " + std::to_string(num_latents) +
+         " latents and " + std::to_string(rows.size()) + " rows");
+  }
 
   // One route for the whole forward (its big buffer, graph keys and every block): an install_fused_check meanwhile, e.g.
   // another pipeline's poisoning, applies from the next forward on instead of failing this one's buffer check.
@@ -1079,10 +1153,14 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   StackPlan plan(&arena_);
   Activations a(plan, total, total, static_cast<std::int64_t>(rows.size()), true,
                 quantized ? quant_big_cols(hw, lengths, config_.bf16_up_gate, route, nvfp4_cols(config_))
-                          : big_cols(path_, hw, lengths, route));
+                          : big_cols(path_, hw, lengths, route),
+                ref_tokens);
   // Quantized blocks: per-token activation scales and the 8-bit attention workspace (workspace_bytes' order).
   QuantBlockBuffers qa;
-  if (quantized) qa = quant_buffers(plan, config_, total, q8_attention_workspace_bytes(hw, lengths, config_.attention), lora_);
+  if (quantized) {
+    qa = quant_buffers(plan, config_, total, q8_attention_workspace_bytes(hw, lengths, config_.attention, ref_tokens),
+                       lora_);
+  }
   // Streamed blocks: device buffers after the activations; the first copies overlap the setup below.
   BlockWeights::Pass weights(*blocks_, stream, cancel_);
 
@@ -1091,7 +1169,7 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   std::vector<std::vector<Run>> block_runs(kLayers);
   {
     std::map<std::pair<std::size_t, std::size_t>, Run> unique;
-    std::vector<std::int32_t> cu;
+    std::vector<std::int32_t> cu, cu_k;
     for (int bi = 0; bi < kLayers; ++bi) {
       const auto skips = [&](std::size_t r) { return rows[r].skip.test(static_cast<std::size_t>(bi)); };
       for (std::size_t r0 = 0; r0 < rows.size();) {
@@ -1109,8 +1187,25 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
             cu.push_back(static_cast<std::int32_t>(off[r] - off[r0]));
             if (r < r1) max_len = std::max(max_len, off[r + 1] - off[r]);
           }
-          const Run run{off[r0], off[r1], a.cu_seqlens.slice0(at, at + static_cast<std::int64_t>(r1 - r0) + 1),
-                        static_cast<int>(max_len)};
+          Run run;
+          run.t0 = off[r0];
+          run.t1 = off[r1];
+          run.cu_seqlens = a.cu_seqlens.slice0(at, at + static_cast<std::int64_t>(r1 - r0) + 1);
+          run.max_seqlen = static_cast<int>(max_len);
+          if (ref_tokens > 0) {
+            // The first sequence takes slot A when the run starts at row 0, every other one slot B (after the last
+            // row): its keys are [slot A | own] or [own | slot B], contiguous rows of the slotted region.
+            const bool slot_a = r0 == 0, slot_b = r1 - r0 == 2 || !slot_a;
+            run.slot_rows = ref_tokens;
+            run.k0 = slot_a ? off[r0] : ref_tokens + off[r0];
+            run.k1 = ref_tokens + off[r1] + (slot_b ? ref_tokens : 0);
+            run.cu_seqlens_k = a.cu_seqlens_k.slice0(at, at + static_cast<std::int64_t>(r1 - r0) + 1);
+            run.max_seqlen = static_cast<int>(max_len + ref_tokens);
+            cu_k.resize(cu.size() - (r1 - r0) - 1);
+            for (std::size_t r = r0; r <= r1; ++r) {
+              cu_k.push_back(static_cast<std::int32_t>(off[r] - off[r0] + static_cast<std::int64_t>(r - r0) * ref_tokens));
+            }
+          }
           it = unique.emplace(std::make_pair(r0, r1), run).first;
         }
         block_runs[static_cast<std::size_t>(bi)].push_back(it->second);
@@ -1118,10 +1213,20 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
       }
     }
     write_params(a.cu_seqlens.data, cu.data(), cu.size() * sizeof(std::int32_t), stream);
+    if (ref_tokens > 0) write_params(a.cu_seqlens_k.data, cu_k.data(), cu_k.size() * sizeof(std::int32_t), stream);
     if (varlen_debug_checks()) {
       for (const auto& [key, run] : unique) {
         validate_cu_seqlens(run.cu_seqlens, run.max_seqlen, run.t1 - run.t0, stream, "moss_dit::forward");
+        if (ref_tokens > 0) validate_cu_seqlens(run.cu_seqlens_k, run.max_seqlen, run.k1 - run.k0, stream, "moss_dit::forward");
       }
+    }
+  }
+  // Which slots each block's run reads (one run per block with references): their k and v columns are filled from the
+  // cache before the block.
+  std::vector<std::uint8_t> slot_use(ref_tokens > 0 ? kLayers : 0);
+  for (std::size_t bi = 0; bi < slot_use.size(); ++bi) {
+    for (const Run& run : block_runs[bi]) {
+      slot_use[bi] |= (run.k0 == 0 ? 1 : 0) | (run.k1 > run.slot_rows + run.t1 ? 2 : 0);
     }
   }
 
@@ -1190,8 +1295,9 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   bool use_graphs = false;
   // attention_q8's debug checks synchronize the stream: never inside a capture.
   const bool capturable = !(config_.attention != AttentionMode::kExact && varlen_debug_checks());
+  // A forward with references runs eagerly (its slot copies are outside the captured blocks).
   if (path_ == BlockPath::kFusedGraphs && !graphs_paused_ && !blocks_->residency().streamed() && stream != nullptr &&
-      capturable) {
+      capturable && ref_tokens == 0) {
     key.height = height;
     key.width = width;
     key.text_lengths = lengths;
@@ -1231,6 +1337,18 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     }
     const Block& b = weights.acquire(bi);
     const std::vector<Run>& runs = block_runs[static_cast<std::size_t>(bi)];
+    if (ref_tokens > 0) {
+      // Block bi's reference keys and values into the k | v columns of the slots its run reads.
+      const std::uint16_t* cached = static_cast<const std::uint16_t*>(refs_->kv.data) +
+                                    static_cast<std::size_t>(bi) * static_cast<std::size_t>(ref_tokens) * 2 * kDim;
+      for (const int s : {1, 2}) {
+        if (!(slot_use[static_cast<std::size_t>(bi)] & s)) continue;
+        const std::int64_t row0 = s == 1 ? 0 : ref_tokens + total;
+        MI_CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::uint16_t*>(a.big.data) + row0 * kQkvDim + kDim,
+                                        kQkvDim * sizeof(std::uint16_t), cached, 2 * row_bytes, 2 * row_bytes,
+                                        static_cast<std::size_t>(ref_tokens), cudaMemcpyDeviceToDevice, stream));
+      }
+    }
     if (!use_graphs) {
       run_blocks(bi, b, runs, stream);
     } else {
@@ -1258,6 +1376,102 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     linear(proj, yv, final_linear_, stream);
     tokens_to_latent(proj, out[r], stream);
   }
+}
+
+void MossDit::prefill_references(std::span<const Tensor> latents, const RefKv& out, cudaStream_t stream) {
+  if (latents.empty()) fail("prefill_references needs at least one reference latent");
+  std::int64_t total = 0;
+  for (const Tensor& l : latents) {
+    check_device(l, DType::kF32, "reference latent");
+    if (l.rank != 3 || l.dim(0) != kLatentChannels || l.dim(1) < 1 || l.dim(2) < 1) {
+      fail("a reference latent must be [128, h, w], got " + l.describe());
+    }
+    total += l.dim(1) * l.dim(2);
+    if (total > kMaxReferenceTokens) fail("reference images exceed " + std::to_string(kMaxReferenceTokens) + " tokens");
+  }
+  check_device(out.kv, DType::kBF16, "reference cache");
+  if (out.kv.rank != 3 || out.kv.dim(0) != kLayers || out.kv.dim(1) != total || out.kv.dim(2) != 2 * kDim) {
+    fail("the reference cache must be [42, " + std::to_string(total) + ", 6144], got " + out.kv.describe());
+  }
+  if (linear_input_hook_) throw std::logic_error("moss_dit: prefill_references does not run with a linear-input hook");
+
+  // forward()'s setup for one sequence of `total` tokens without text (prefill_workspace_bytes' allocations).
+  if (lora_ != nullptr) refresh_config(config_.attention);
+  const FusedRouteSnapshot route = path_ == BlockPath::kOpByOp ? FusedRouteSnapshot{}
+                                   : request_route_              ? *request_route_
+                                                                 : fused_route_snapshot();
+  const bool quantized = config_.quantized;
+  const std::int64_t none[] = {0};
+  runtime::StackScope scope(arena_);
+  StackPlan plan(&arena_);
+  Activations a(plan, total, total, 1, true,
+                quantized ? quant_big_cols(total, none, config_.bf16_up_gate, route, nvfp4_cols(config_))
+                          : big_cols(path_, total, none, route));
+  QuantBlockBuffers qa;
+  if (quantized) qa = quant_buffers(plan, config_, total, q8_attention_workspace_bytes(total, none, config_.attention), lora_);
+  BlockWeights::Pass weights(*blocks_, stream, cancel_);
+
+  const std::int32_t cu[] = {0, static_cast<std::int32_t>(total)};
+  write_params(a.cu_seqlens.data, cu, sizeof(cu), stream);
+  Run run;
+  run.t0 = 0;
+  run.t1 = total;
+  run.cu_seqlens = a.cu_seqlens.slice0(0, 2);
+  run.max_seqlen = static_cast<int>(total);
+
+  // The t = 0 modulation (ComfyUI preprocess_refs: timestep_embedding(zeros)), each reference's RoPE table and video
+  // embedding (an input extension's channels zero: [latents | 0] through its embedder).
+  time_modulation(0.0f, a.mod, a.head, stream);
+  std::int64_t at = 0;
+  for (std::size_t i = 0; i < latents.size(); ++i) {
+    const Tensor& l = latents[i];
+    const std::int64_t n = l.dim(1) * l.dim(2);
+    kernels::moss_rope_table_reference(a.rope.slice0(at, at + n), static_cast<int>(l.dim(1)), static_cast<int>(l.dim(2)),
+                                       static_cast<int>(i), stream);
+    if (input_ext_ == nullptr) {
+      embed_video(gemm_, gemm_workspace_, kernels::Gemm::kWorkspaceBytes, l, nullptr, a.big.data, video_embedder_.w,
+                  video_embedder_.bias, a.x.slice0(at, at + n), stream);
+    } else {
+      const std::int64_t cin = input_ext_->weight.dim(1);
+      const Tensor t = Tensor::view(a.big.data, DType::kBF16, Device::kCUDA, {n, cin});
+      latent_to_tokens(l, t, 0, stream);
+      MI_CUDA_CHECK(cudaMemset2DAsync(static_cast<std::uint16_t*>(a.big.data) + kLatentChannels,
+                                      static_cast<std::size_t>(cin) * sizeof(std::uint16_t), 0,
+                                      static_cast<std::size_t>(cin - kLatentChannels) * sizeof(std::uint16_t),
+                                      static_cast<std::size_t>(n), stream));
+      const Tensor x = a.x.slice0(at, at + n);
+      gemm_.linear(x, t, input_ext_->weight, &input_ext_->bias, gemm_workspace_, kernels::Gemm::kWorkspaceBytes, stream);
+    }
+    at += n;
+  }
+
+  const FusedBlockBuffers fused{a.x, a.y, a.big, a.rope, a.mod, a.lse, a.lse_bytes};
+  qa.f = fused;
+  const QkvGemm qkv_gemm{&gemm_, gemm_workspace_, kernels::Gemm::kWorkspaceBytes};
+  for (int bi = 0; bi < kLayers; ++bi) {
+    if (cancel_ != nullptr) {
+      if (bi >= 2) MI_CUDA_CHECK(cudaEventSynchronize(block_done_[bi % 2]));
+      if (cancel_->load()) {
+        MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+        throw Cancelled();
+      }
+    }
+    const Block& b = weights.acquire(bi);
+    Run tap = run;
+    tap.kv_tap = static_cast<std::uint16_t*>(out.kv.data) +
+                 static_cast<std::size_t>(bi) * static_cast<std::size_t>(total) * 2 * kDim;
+    tap.tap_only = bi == kLayers - 1;  // the last block's keys and values are all the cache needs of it
+    if (quantized) {
+      run_block_quant(b, qa, tap, qkv_gemm, route, config_.attention, stream, bi);
+    } else if (path_ == BlockPath::kOpByOp) {
+      run_block(bi, b, a, tap, stream);
+    } else {
+      run_block_fused(b, fused, tap, qkv_gemm, route, stream);
+    }
+    weights.release(bi);
+    if (cancel_ != nullptr) MI_CUDA_CHECK(cudaEventRecord(block_done_[bi % 2], stream));
+  }
+  weights.finish();
 }
 
 }  // namespace mi::moss_dit
