@@ -8,7 +8,7 @@
 ```
 moss-server                     # speak the protocol on stdin/stdout
 moss-server --parent-pid <pid>  # the same, and exit when process <pid> (the launcher) exits
-moss-server --version           # "moss-server 1.0.0 (protocol 1, ABI 1)"
+moss-server --version           # "moss-server 2.0.0 (protocol 1, ABI 1)"
 ```
 
 ### `--parent-pid`
@@ -82,13 +82,13 @@ Params (all optional):
 
 ```
 >> {"id": 1, "method": "hello", "params": {"client": "launcher", "protocol_version": 1}}
-<< {"id": 1, "result": {"protocol_version": 1, "server": "moss-server", "version": "1.0.0", "abi_version": 1,
+<< {"id": 1, "result": {"protocol_version": 1, "server": "moss-server", "version": "2.0.0", "abi_version": 1,
     "capabilities": {"preview": true, "comfyui_models": false, "model_files": true, "lora": true, "tiers": true,
                      "samplers": true, "image_input": true, "hires": true, "distill": true, "system_cuda": true,
-                     "control": true, "accel": true, "preload": true, "release": true, "certificate_dirs": true,
+                     "control": true, "accel": true, "preload": true, "release": true, "certificate_dirs": false,
                      "te_host_pin": true, "progress_fraction": true, "inspect": true},
     "values": {"mode": ["min_memory", "balanced", "max_speed"], "block_path": ["default", "op_by_op", "fused", "fused_graphs"],
-               "tier": ["auto", "reference", "high", "turbo"], "attention": ["default", "exact", ...], ...,
+               "tier": ["reference", "high", "turbo"], "attention": ["default", "exact", ...], ...,
                "sampler": ["euler", "ab2", ...], ..., "step_cache": ["off", "fbcache"]},
     "probe": {"driver_cuda_version": 13040, "runtime_cuda_version": 13040, "driver_compatible": true,
               "device_count": 1, "supported_device_count": 1, "build_flavour": "cu13", "recommended_flavour": "cu13",
@@ -130,7 +130,7 @@ The server's environment steers the search: `MOSSINFER_CUDA_LIBS` (`auto`: the b
 | `accel` | `MI_CAP_ACCEL` | true | `generate`'s `cfg_truncation`, `step_cache`, `step_cache_threshold` |
 | `preload` | `MI_CAP_PRELOAD` | true | the `preload` method |
 | `release` | `MI_CAP_RELEASE` | true | the `release` method; the report's `dit_load` |
-| `certificate_dirs` | `MI_CAP_CERTIFICATE_DIRS` | true | `load`'s `certificate_dirs` |
+| `certificate_dirs` | `MI_CAP_CERTIFICATE_DIRS` | false | reserved since 2.0: `load`'s `certificate_dirs` is ignored |
 | `te_host_pin` | `MI_CAP_TE_HOST_PIN` | true | `load`'s `te_host_pin` |
 | `progress_fraction` | `MI_CAP_PROGRESS_FRACTION` | true | `fraction` and `eta_seconds` in `progress` events and in `status` |
 | `inspect` | `MI_CAP_INSPECT` | true | the `inspect` method |
@@ -144,6 +144,7 @@ Creates the engine. A loaded engine is released first, because two engines would
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `model` | string | required | bundle directory (`{text_encoder, tokenizer, transformer, vae}`) |
+| `tier` | string | required | `"reference"`, `"high"`, `"turbo"` ([c-api.md](c-api.md#tier-and-attention)). Absent or null: `invalid_params` (`"tier" is required: reference, high or turbo`), checked once every other parameter is valid. |
 | `mode` | string | `"balanced"` | `"min_memory"`, `"balanced"`, `"max_speed"` |
 | `device` | integer | 0 | CUDA ordinal |
 | `vram_budget_bytes` | integer | 0 (auto) | cap on the process's device memory, CUDA context included |
@@ -154,13 +155,12 @@ Creates the engine. A loaded engine is released first, because two engines would
 | `direct_io` | bool | false | direct I/O (`O_DIRECT`) for every weight read, whatever `dit_direct_io` says |
 | `dit_direct_io` | string | `"auto"` | how the DiT's load reads its files when `direct_io` is false: `"auto"` (adaptive: direct I/O unless the file system gains nothing from it or the files are already in the page cache), `"buffered"`, `"direct"`. Streamed DiT blocks read buffered unless `direct_io`. The report's `dit_load` says what a load used and why. |
 | `te_host_pin` | string | `"auto"` | whether a host-resident text encoder may hold a pinned copy: `"auto"` (where the machine clearly has the room), `"on"` (whenever it fits the host limit), `"off"`. A pinned copy that cannot be allocated streams instead, with a `done.warnings` line. |
-| `certificate_dirs` | array of strings | `[]` | extra quality-certificate directories, searched first, in order: non-empty paths, at most 16. A directory that does not exist is searched as empty. |
+| `certificate_dirs` | any | none | reserved since 2.0: accepted and ignored |
 | `block_path` | string | `"default"` (fused) | DiT block implementation: `"default"`, `"op_by_op"`, `"fused"`, `"fused_graphs"`. All give the same image; the path that ran is the report's `dit_blocks.path`. |
 | `dit_file` | string | `""` (the bundle's `transformer/`) | single-file DiT: INT8 ConvRot, INT4 ConvRot (`turbo`), mixed INT8/bf16 or bf16, ComfyUI layout |
 | `text_encoder_file` | string | `""` (the bundle's `text_encoder/`) | INT8 ConvRot or W4A8 text encoder |
 | `vae_file` | string | `""` (the bundle's `vae/`) | single FLUX.2 VAE file |
-| `tier` | string | `"auto"` | `"auto"`, `"reference"`, `"high"`, `"turbo"`. `turbo` runs an INT4 `dit_file` and is refused for any other DiT; `auto` refuses an INT4 DiT without a quality certificate, so choose `turbo` for INT4 files. |
-| `attention` | string | `"default"` (the tier's choice) | `"default"`, `"exact"`, `"q8_fp16"`, `"q8_fp16_f32acc"`, `"q8_fp8"`, `"q8_fp8_f32acc"` |
+| `attention` | string | `"default"` (the tier's default: `high` and `turbo` run `q8_fp8`, or `q8_fp16` on a GPU without FP8) | `"default"`, `"exact"`, `"q8_fp16"`, `"q8_fp16_f32acc"`, `"q8_fp8"`, `"q8_fp8_f32acc"` |
 | `lora_strict` | bool | false | unknown LoRA keys and lossy merges fail the generation (`model`) instead of being reported |
 | `time_embedding_file` | string | none | a step-embedder replacement (`time_embedding.safetensors`) applied to the loaded DiT |
 | `distill` | string | none | a distill bundle directory: the engine takes its time embedding. Send the same bundle as `generate`'s `distill` to use the rest. |
@@ -168,14 +168,14 @@ Creates the engine. A loaded engine is released first, because two engines would
 `tier` and `attention` take exactly the pipeline's spellings (`tier_name()`, `attention_name()`), plus `"default"` for an unset attention. The CLI's alias `q8` (= `q8_fp8`) is not accepted. The tokenizer and configs always come from `model`, which stays a bundle directory. A component file that does not exist fails `load` with `invalid_argument`, naming the parameter; a malformed one, or a folder or file of another model ([supported models](integration.md#supported-models)), fails the first `generate` with `model`. The tiers are described in [c-api.md](c-api.md#tier-and-attention): a combination the tier refuses (e.g. `"reference"` with an INT8 `dit_file`) is accepted by `generate` and then ends in `done` with `"status": "error"` and the code `invalid_argument`. After a run, the report's `quality` and `models` objects say what ran.
 
 ```
->> {"id": 2, "method": "load", "params": {"model": "/models/MOSS-Image/base", "mode": "balanced"}}
+>> {"id": 2, "method": "load", "params": {"model": "/models/MOSS-Image/base", "tier": "reference", "mode": "balanced"}}
 << {"event": "log", "id": 2, "level": "info", "message": "engine created for /models/MOSS-Image/base (mode balanced, device 0); weights load on the first generate"}
 << {"id": 2, "result": {"model": "/models/MOSS-Image/base", "mode": "balanced", "device": 0}}
 ```
 
 `load` checks the path and initializes CUDA. The weights load during the first `generate` (the `dit_load` phase), or during a `preload`, and then stay resident as the plan allows.
 
-`te_host_pin` takes the pipeline's spellings (`te_host_pin_name()`); `dit_direct_io` has the server's own. Certificates are searched in this order: each of `certificate_dirs`, `<cache_dir>/quality_certs`, the DiT file's sidecar, then the package's `share/mossinfer/quality_certs` ([c-api.md](c-api.md#tier-and-attention)).
+`te_host_pin` takes the pipeline's spellings (`te_host_pin_name()`); `dit_direct_io` has the server's own.
 
 ### `generate`
 
@@ -217,7 +217,7 @@ The params are those of `parameters.json`, plus `output`:
 | `resize` | string | `"crop"`, or `"fit"`, `"stretch"` (the pipeline's `resize_mode_name()` spellings) |
 | `hires` | object | none. The hires fix: `{"width": int, "height": int, "strength": number, "steps": int}`. `width` and `height` are required and positive (multiples of 16, at most 4096 per side and 4.2 MP); `strength` defaults to 0.45, `steps` to 0 (= `steps`). Other or repeated members are rejected. |
 | `distill` | string | none. A distill bundle directory: its LoRA is appended at strength 1, its dataspace sampler and step count and CFG 1 apply when `sampler`, `steps` and `cfg` are absent (`"euler"` counts as absent and cannot be forced with a dataspace bundle; any other sampler can). A bundle with a time embedding needs the same bundle in `load`'s `distill` (or its file in `time_embedding_file`); otherwise the generation ends in `done` with `invalid_argument`. |
-| `control` | object | none. A control adapter ([c-api.md](c-api.md#control-adapters)): `{"adapter": string, "lora_strength": number, "images": [{"kind": string, "path": string, "strength": number, "start": number, "end": number}]}`. `adapter` (the file) is required; `lora_strength` (its LoRA part) defaults to 1. `images` defaults to `[]`, at most 16, one per kind: `kind` (one of the adapter's, e.g. `"depth"`) and `path` (a PNG or JPEG file, decoded by the server as RGB, see [Security](#security)) are required; `strength` defaults to 1 (0 to 10), `start` and `end` to 0 and 1 (0 ≤ `start` ≤ `end` ≤ 1: the share of the steps the control is active in). Other or repeated members are rejected. Lossy: the run is uncertified. |
+| `control` | object | none. A control adapter ([c-api.md](c-api.md#control-adapters)): `{"adapter": string, "lora_strength": number, "images": [{"kind": string, "path": string, "strength": number, "start": number, "end": number}]}`. `adapter` (the file) is required; `lora_strength` (its LoRA part) defaults to 1. `images` defaults to `[]`, at most 16, one per kind: `kind` (one of the adapter's, e.g. `"depth"`) and `path` (a PNG or JPEG file, decoded by the server as RGB, see [Security](#security)) are required; `strength` defaults to 1 (0 to 10), `start` and `end` to 0 and 1 (0 ≤ `start` ≤ `end` ≤ 1: the share of the steps the control is active in). Other or repeated members are rejected. It changes the image. |
 | `cfg_truncation` | number in [0, 1] | 1 (off). Lossy: classifier-free guidance only for the first `cfg_truncation` share of the steps; no effect without CFG (`cfg` 1). |
 | `step_cache` | string | `"off"`, or `"fbcache"` (the First-Block Cache: DiT blocks after the first are skipped while block 0's output barely changes). Lossy. |
 | `step_cache_threshold` | number in (0, 1] | absent = the engine's default for the loaded model: 0.02 on the base model, 0.03 on the SFT model and the files derived from it. The step cache's relative-change threshold: larger is faster and further from the uncached image. Ignored without `step_cache`. The report's `accelerators.step_cache_threshold` and `step_cache_threshold_source` say which ran. |
@@ -245,7 +245,7 @@ A complete run. Lines are shortened; a real `plan` and `report` are longer:
 << {"event": "progress", "id": "g1", "phase": "denoise", "step": 1, "total_steps": 2, "step_seconds": 0.12715, "elapsed_seconds": 8.42648, "fraction": 0.98, "eta_seconds": 0.17}
 << {"event": "progress", "id": "g1", "phase": "denoise", "step": 2, "total_steps": 2, "step_seconds": 0.116925, "elapsed_seconds": 8.54342, "fraction": 0.994, "eta_seconds": 0.05}
 << {"event": "progress", "id": "g1", "phase": "decode", "step": 0, "total_steps": 2, "step_seconds": 0, "elapsed_seconds": 8.54358, "fraction": 0.994, "eta_seconds": 0.05}
-<< {"event": "done", "id": "g1", "status": "ok", "image": "/tmp/apple.png", "report": {"request": {...}, "seed_used": 7, "steps_run": 2, "cancelled": false, "image": "/tmp/apple.png", ...}, "certified": true, "warnings": []}
+<< {"event": "done", "id": "g1", "status": "ok", "image": "/tmp/apple.png", "report": {"request": {...}, "seed_used": 7, "steps_run": 2, "cancelled": false, "image": "/tmp/apple.png", ...}, "warnings": []}
 ```
 
 With a preview (`"preview_output": "/tmp/preview.png"`), each denoise step that gets one sends a `preview` right before its `progress`:
@@ -262,7 +262,7 @@ With a preview (`"preview_output": "/tmp/preview.png"`), each denoise step that 
 | `plan` | `explanation` (several lines of text), `plan` (object: residencies, arena, per-phase peaks, time estimate). Sent once, before the first phase. |
 | `progress` | `phase` (`text_encoder`, `dit_load`, `denoise`, `decode`, in that order), `step`, `total_steps`, `step_seconds`, `elapsed_seconds`, `fraction`, `eta_seconds` |
 | `preview` | `step`, `total_steps`, `image` (the `preview_output` path), `width`, `height`. Only with `preview_output`. |
-| `done` | `status`, `warnings`, `certified` (with a result), plus fields that depend on `status` (below) |
+| `done` | `status`, `warnings`, plus fields that depend on `status` (below) |
 | `log` | `level` (`info`, `warning`), `message`; `id` when it belongs to a request |
 
 `progress` is sent at each phase start (`step` 0) and after every sampling step.
@@ -286,12 +286,10 @@ The fields of `done` depend on `status`:
 | `"cancelled"` | `steps_run`, `report` (no image is written) |
 | `"error"` | `error: {code, message}`, plus `report` when only the PNG write failed |
 
-`certified` (a boolean) is present whenever there is a result: with `"ok"`, `"cancelled"`, and an `"error"` that carries a `report`. It says whether the run as a whole is certified, the report's `models.dit.certified` (`mi_tier_info.run_certified`): false whenever LoRAs (a `distill` bundle's included), a `control` adapter or lossy accelerators make the run uncertified, on every tier, and for a run cancelled before its tier was resolved. Show it rather than the tier's own status, which stays certified on `reference`.
-
 `warnings` is always present: an array of strings for the launcher to show, empty when there is nothing to say.
 - One entry per LoRA warning, `"LoRA <module>: <reason>"` (e.g. an adapter requantized on INT8 GEMMs), and per warning on the control adapter's LoRA part, `"control adapter LoRA <module>: <reason>"`.
-- `"lossy accelerators (<the active ones>), uncertified: CFG truncated on N steps, step cache reused C of D DiT calls"` when `cfg_truncation` (with CFG) or `step_cache` is active, with only the active accelerators' parts.
-- `"step_cache_threshold has no effect without step_cache \"fbcache\""` and `"cfg_truncation has no effect without CFG (cfg 1)"` for settings that change nothing, as `moss-infer generate` warns. A control adapter, like any LoRA, gets no such line: the report's `quality.reason` and `models.dit.certified` say that the run is uncertified.
+- `"lossy accelerators (<the active ones>): CFG truncated on N steps, step cache reused C of D DiT calls"` when `cfg_truncation` (with CFG) or `step_cache` is active, with only the active accelerators' parts.
+- `"step_cache_threshold has no effect without step_cache \"fbcache\""` and `"cfg_truncation has no effect without CFG (cfg 1)"` for settings that change nothing, as `moss-infer generate` warns. A control adapter, like any LoRA, gets no such line: the report's `quality.config.lora` is `"active"`.
 - `"prompt truncated to K of N tokens (D dropped; max_sequence_length M)"`, and the same for the `"negative prompt"`, when the text encoder cut the end of a prompt.
 - One entry per accelerator warning of the engine (`mi_result_message(MI_MESSAGE_ACCEL_WARNING)`): a step-cache threshold that moves the base model's composition, or a cache that never engaged.
 - `"image input: <note>"` when the image input has a remark, e.g. an init image not used at strength 1 without a mask.
@@ -305,7 +303,7 @@ The fields of `done` depend on `status`:
 - `timings_s`, `memory_gib`, `host_memory_gib`, `hardware`
 - `dit_stream`: DiT block streaming (`streamed`, `resident_blocks`, `buffers`, `source`, `bytes`, `copy_s`, `stall_s`, `stalls`, `h2d_gbps`, `hidden`, and per-step `steps`, each with `cached`)
 - `tokens`: per prompt, `total`, `kept`, `template`, `prompt`, `dropped`, `max_length`, `truncated`
-- `quality` (tier, configuration, certificate, GPU class) and `models` (DiT, text encoder and VAE sources, DiT linears, requested and effective tier, certified, text-encoder precision)
+- `quality` (tier, configuration, engine numerics, cuBLASLt copy, GPU class, model paths) and `models` (DiT, text encoder and VAE sources, DiT linears, tier, text-encoder precision)
 - `loras` (per file: adapters, side branch, merged, unknown keys, strength), `lora_warnings`, `lora_notes`
 - `control` (`null` without `control`: the adapter, kinds, base model, inputs, its LoRA part, encodes, encode schedule) and `accelerators` (`lossy`, `active`, `step_cache_threshold`, `step_cache_threshold_source`, `cfg_truncated_steps`, `step_cache_calls`, `step_cache_reused`, `cached_steps`, `step_cache_diffs`, `warnings`)
 - `dit_load` (how the call's last DiT load read the weights: `source` `"files"`, `"host_copy"` or `null`, `io`, `note`, `bytes`, `seconds`, `gbps`) and, after a `preload`, `preload_note`
@@ -326,13 +324,13 @@ Like `generate`, it answers at once with `{"accepted": true}`, then sends events
 << {"event": "plan", "id": "p1", "explanation": "Mode balanced ...", "plan": {...}}
 << {"event": "progress", "id": "p1", "phase": "dit_load", "step": 0, "total_steps": 0, "step_seconds": 0, "elapsed_seconds": 0.1, "fraction": 0.045, "eta_seconds": 2.1}
 << {"event": "progress", "id": "p1", "phase": "decode", "step": 0, "total_steps": 0, "step_seconds": 0, "elapsed_seconds": 2.1, "fraction": 0.95, "eta_seconds": 0.1}
-<< {"event": "done", "id": "p1", "status": "ok", "report": {...}, "preload_note": "", "dit_load": {"source": "files", "io": "direct", "bytes": 10000000000, "seconds": 2.0, "note": ""}, "certified": true, "warnings": []}
+<< {"event": "done", "id": "p1", "status": "ok", "report": {...}, "preload_note": "", "dit_load": {"source": "files", "io": "direct", "bytes": 10000000000, "seconds": 2.0, "note": ""}, "warnings": []}
 ```
 
 `done` has `status` `"ok"` (with `report`), `"cancelled"` (with `steps_run` 0 and `report`) or `"error"` (with `error`). With a result it also carries, at the top level:
 - `preload_note`: what the preload did not load and why; `""` otherwise;
 - `dit_load`: `{"source": "files" | "host_copy" | null, "io": "direct" | "buffered" | null, "bytes", "seconds", "note"}`. `source` is `null` when the DiT was already resident or was not loaded;
-- `certified` and `warnings`, as for `generate`.
+- `warnings`, as for `generate`.
 
 ### `release`
 
@@ -393,9 +391,9 @@ Params: `path` (string, required): a file. Says what it is to the engine (`mi_in
 >> {"id": 5, "method": "inspect", "params": {"path": "/models/moss_image_sft_int4_convrot.safetensors"}}
 << {"id": 5, "result": {"path": "/models/moss_image_sft_int4_convrot.safetensors", "kind": "dit", "loadable": true,
     "file_bytes": 3000000000, "tensors": 700, "note": "", "precision": "w4a4", "quantization": "int4_convrot256",
-    "tiers": ["turbo"], "tier_reasons": {"auto": "the loaded DiT is INT4 ConvRot (the Turbo tier) and no certificate covers it (...)",
-    "reference": "tier reference runs bf16 weights exactly, ...", "high": "the loaded DiT is INT4 ConvRot, ...",
-    "turbo": "Turbo tier: INT4 ConvRot GEMMs, q8_fp8 attention; uncertified (no certificate looked up)"}}}
+    "tiers": ["turbo"], "tier_reasons": {"reference": "tier reference runs bf16 weights exactly, ...",
+    "high": "the loaded DiT is INT4 ConvRot, which runs the Turbo tier; use tier turbo",
+    "turbo": "Turbo tier: INT4 ConvRot GEMMs, q8_fp8 attention"}}}
 >> {"id": 6, "method": "inspect", "params": {"path": "/models/moss_image_color_depth_control.safetensors"}}
 << {"id": 6, "result": {"path": "...", "kind": "control_adapter", "loadable": true, "file_bytes": 300000000, "tensors": 500,
     "note": "", "control_kinds": ["color", "depth"], "base_model": "moss-base", "adapter_types": ["lora"], "lora_rank": 64,
@@ -403,7 +401,7 @@ Params: `path` (string, required): a file. Says what it is to the engine (`mi_in
 ```
 
 Every answer has `path`, `kind` (`"dit"`, `"text_encoder"`, `"vae"`, `"lora"`, `"control_adapter"` or `"unknown"`), `loadable` (the loader for that role accepts the file), `file_bytes`, `tensors` and `note` (why not loadable, or what an unknown file is instead, e.g. a GGUF file or a distill bundle file; `""` for none). By kind:
-- `dit`: `precision` (`"bf16"`, `"int8"`, `"w4a4"` or `"nvfp4"`; `null` when not loadable), `quantization` (its block linears as the engine runs them, e.g. `"int8_convrot256"`; `""` when not loadable), `tiers` (the `load` `tier` values the engine accepts for it with the bundle's text encoder and every attention kernel available, without a certificate: `auto` runs `reference` on a bf16 DiT and exact attention on an INT8 one, and is refused (not listed) for an INT4 or NVFP4 DiT (an NVFP4 DiT is judged for an RTX 50 with this build's kernels); with a certificate on a certified GPU and package `auto` may run a lossy configuration, see integration.md's [Shipped certificates](integration.md#shipped-certificates); on a GPU without the 8-bit kernels `high` and `turbo` run exact attention, and `high` on a bf16 DiT is refused) and `tier_reasons` (for each tier, what it would run or why it is refused).
+- `dit`: `precision` (`"bf16"`, `"int8"`, `"w4a4"` or `"nvfp4"`; `null` when not loadable), `quantization` (its block linears as the engine runs them, e.g. `"int8_convrot256"`; `""` when not loadable), `tiers` (exactly the `load` `tier` values `generate` accepts for it with the bundle's text encoder and no explicit `attention`: the engine's own decision, the same on every GPU it supports; an NVFP4 DiT is judged for an RTX 50 with this build's kernels) and `tier_reasons` (for `reference`, `high` and `turbo`: what the tier runs, e.g. `"High tier: INT8 ConvRot GEMMs, q8_fp8 attention"` (`q8_fp16` on a GPU without FP8), or why it is refused).
 - `text_encoder`: `precision` (`"bf16"`, `"int8"` or `"w4a8"`) and `quantization`.
 - `lora`: `base_model` (the metadata, `""` when absent), `adapter_types` (`"lora"`, `"loha"`, `"lokr"`, `"full"`), `lora_rank` (the largest low-rank rank), `lora_adapters` (on the DiT) and `lora_unknown_keys`. A file in the LoRA naming conventions that the LoRA reader refuses (a LoRA for another model, a malformed one) is a `lora` with `loadable` false and the reader's message as `note`.
 - `control_adapter`: `control_kinds` (in channel order: exactly the strings `generate`'s `control.images[].kind` takes) and the `lora` fields of its LoRA part.
@@ -446,8 +444,8 @@ send({"id": 3, "method": "shutdown"})
 | ctest name | Label | What it runs |
 |---|---|---|
 | `server_protocol` | `cpu` | No GPU or weights needed (details below) |
-| `package_install_tree` | `cpu` | `tests/server/test_install_tree.py`: installs the build twice (full, and `--component Unspecified` without CUDA libraries), asks each tree's `hello` which cuBLASLt it uses under `MOSSINFER_CUDA_LIBS` `auto` / `system` / `bundled` and `MOSSINFER_CUBLASLT` (a bundled copy found, a system copy outside the tree, clean errors for a missing copy or file and a bad policy), and runs `check_package.py` on both trees. The full tree is installed from a temporary certificate source (`MOSSINFER_QUALITY_CERTS_SOURCE`) with one fake `*.mossinfer-cert.json` and a `README.md`: only the certificate lands in `share/mossinfer/quality_certs/`, `check_package.py` lists it and refuses a stray file and an unparsable certificate there; the slim tree from the build's own source (none yet: no directory, and the install does not fail), then again from the fake source (the default component carries certificates). With `MOSSINFER_GPU_TESTS=1`, the installed `moss-server` also runs a 256², 2-step `high`-tier generate whose quality reason names the fake certificate: the install tree was searched. |
-| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt; `fraction` and `eta_seconds` in every `progress`: the fraction in [0, 1) and never decreasing, the eta known and not negative, and from `text_encoder` to the final `decode` the fraction past one half and the eta smaller), cancel mid-run (a `status` mid-run with `fraction` and a known `eta_seconds`), the engine reused after a cancel, cancel on shutdown; and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params`; a 256² img2img from a PNG path (4 steps at strength 0.5: 2 run, `total_steps` 2) and the strength-1 note in `done.warnings`; a 256², 4-step generate with the color/depth `control` adapter (`$MOSS_COMMUNITY_MODELS`, skipped when absent) and a depth PNG plus `step_cache` `fbcache` (the report's `control` and `accelerators`, uncertified, the accelerator line in `done.warnings`, `done.certified` false), then a kind the adapter lacks (`done` with `invalid_argument`), then `cfg_truncation` at CFG 1 and a threshold without the step cache (the two no-effect warnings, `done.certified` true); `preload` → `release` → `generate` at 256², 2 steps (the `preload` events, their `fraction` and `eta_seconds` as for `generate` and the following generations' too, and `done` with `dit_load` and `preload_note`, `release` answering `busy` during the preload, the release's stats, the next generate loading from the host copy, a `cancel` sent right after a second `release`: one of the documented outcomes, the text encoder's copy kept, and a 2-step generate after it running every step) |
+| `package_install_tree` | `cpu` | `tests/server/test_install_tree.py`: installs the build twice (full, and `--component Unspecified` without CUDA libraries), asks each tree's `hello` which cuBLASLt it uses under `MOSSINFER_CUDA_LIBS` `auto` / `system` / `bundled` and `MOSSINFER_CUBLASLT` (a bundled copy found, a system copy outside the tree, clean errors for a missing copy or file and a bad policy), and runs `check_package.py` on both trees. Neither tree has a `share/mossinfer/quality_certs/` directory. |
+| `server_protocol_gpu` | `gpu` | With `MOSSINFER_GPU_TESTS=1`: a 256², 2-step generate (events, PNG, report with `dit_blocks` and `dit_stream`, `busy`, validation, NUL in the prompt; `fraction` and `eta_seconds` in every `progress`: the fraction in [0, 1) and never decreasing, the eta known and not negative, and from `text_encoder` to the final `decode` the fraction past one half and the eta smaller), cancel mid-run (a `status` mid-run with `fraction` and a known `eta_seconds`), the engine reused after a cancel, cancel on shutdown; a `high` load of the bf16 bundle (8-bit attention in the report's `quality`; with `attention` `"exact"` the generate ends in `invalid_argument` with the Reference tier's reason); and a 256², 3-step `euler_ancestral` + `karras` generate with `preview_output` (one `preview` event per step before its `progress`, the preview PNG's size and no metadata), the `generation` chunk of the image, a truncated prompt in `done.warnings`, then `include_prompts` false and `save_metadata` false; an invalid `generate` sent while one runs gets `invalid_params`; a 256² img2img from a PNG path (4 steps at strength 0.5: 2 run, `total_steps` 2) and the strength-1 note in `done.warnings`; a 256², 4-step generate with the color/depth `control` adapter (`$MOSS_COMMUNITY_MODELS`, skipped when absent) and a depth PNG plus `step_cache` `fbcache` (the report's `control` and `accelerators`, the LoRA part in `quality.config.lora`, the accelerator line in `done.warnings`, no `done.certified`), then a kind the adapter lacks (`done` with `invalid_argument`), then `cfg_truncation` at CFG 1 and a threshold without the step cache (the two no-effect warnings, nothing lossy); `preload` → `release` → `generate` at 256², 2 steps (the `preload` events, their `fraction` and `eta_seconds` as for `generate` and the following generations' too, and `done` with `dit_load` and `preload_note`, `release` answering `busy` during the preload, the release's stats, the next generate loading from the host copy, a `cancel` sent right after a second `release`: one of the documented outcomes, the text encoder's copy kept, and a 2-step generate after it running every step) |
 
 `server_protocol` covers:
 - `hello` (the capabilities, `values` and `probe.cublaslt` included), `status`, and idle `cancel` / `unload`
@@ -455,11 +453,11 @@ send({"id": 3, "method": "shutdown"})
 - `inspect` without an engine: a bf16 DiT (precision, quantization, tiers and their reasons), a LoRA with `base_model`, a control adapter whose `control_kinds` `generate` accepts, an oversized header and a GGUF file as results; a missing file (`io`), a directory, a missing or empty `path` and an unknown param (`invalid_params`); eight inspects, a `status` and a `shutdown` sent at once: every request answered exactly once, each inspect with its result or `busy`, all before `shutdown`'s answer; two inspects sent on reading two answers, twenty times: never `busy`
 - malformed input of every kind, unknown methods and params (an unknown or non-string `block_path` included), and NUL in strings
 - `load` errors mapped from engine statuses
-- the P6 `load` params: bad `tier` / `attention` names (`"q8"` and `"auto"` included) and types, every valid name, missing component files
+- the P6 `load` params: bad `tier` / `attention` names (`"q8"` and `"auto"` included) and types, a missing or null `tier` (`invalid_params`), every valid name, missing component files
 - the image, hires and distill params: bad paths, types and names, a mask without an init image, a `binary01` mask with other values, bad `hires` shapes (not an object, a missing, unknown or repeated member, a non-integer size, not multiples of 16, a bad strength), a missing `distill` directory, the bundle's dataspace sampler with an image; messages name the protocol's parameters (`init_image`, `mask`, `distill`, `hires`), never the C fields; `load`'s `time_embedding_file` and `distill` errors; every valid combination reaches `no_engine`
 - the control and accelerator params: `control` shapes (not an object, no or an empty `adapter`, unknown and repeated members in `control` and its images, a missing `kind` or `path`, non-number strengths and windows), a missing adapter or image file, the ranges, a repeated kind, more than 16 images, bad `cfg_truncation`, `step_cache` names and types, the threshold rules; messages name `control.adapter`, `control.images[i].path` and so on, never the C fields; valid combinations (an unknown kind and an undecodable image included: those are the generation's to check) reach `no_engine`; file paths containing `control_adapter`, `image_path`, `mask_path`, `distill_dir` and `dataspace_path` come back unchanged in the messages while the field names are renamed
 - the P6 `generate` params, checked without an engine: bad enum names and types, bad numbers, the `dataspace` sampler without or with a missing file (the message names `dataspace`), repeated members in `params` and in a `loras` entry, bad `loras` shapes (not an array, a string element, no or empty `path`, unknown members, a bad `strength`, a missing file), `preview_every` without `preview_output`, and every valid name
-- the 1.1 `load` params: `certificate_dirs` shapes (not an array, an empty, non-string or NUL-containing entry), bad `dit_direct_io` and `te_host_pin` names and types, every valid value reaching the engine, 17 directories refused by the engine and 16 accepted
+- the 2.0 `load` params: `certificate_dirs` of any shape accepted and ignored, bad `dit_direct_io` and `te_host_pin` names and types, every valid value reaching the engine
 - `preload` and `release` params: `generate`'s output, preview and metadata params rejected as unknown in `preload`, its request validated as for `generate` (a prompt optional, `generate` still requiring one), `keep_host_copy` types, and `no_engine` for every valid request
 - `shutdown`, end of input, and `--version` / usage errors
 - stdout set up with stderr sent to a file, to `DEVNULL`, merged into stdout, or closed. On Linux, `/proc` shows exactly one fd on the protocol pipe, at 3 or higher, close-on-exec.

@@ -8,7 +8,9 @@ The reference documents are:
 
 This page does not repeat them. It explains how the pieces fit together, and which choices the launcher has to make.
 
-Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what stays compatible.
+Version 2.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what stays compatible, and [Migrating from 1.x](#migrating-from-1x) for what changed.
+
+MossInfer is a low-level engine: it runs what the caller asks for, refuses what the hardware or the files cannot run with the reason, and reports what ran. It does not choose for the caller. The launcher picks the tier, the memory mode and the budgets; [Performance](#performance) says what each costs and gives.
 
 ## Support status
 
@@ -21,13 +23,13 @@ Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what
 | Models | MOSS-Image Base and SFT only: the official Hugging Face folders (bf16), read in place, and fine-tunes with the same architecture; other models are refused when they load. See [Supported models](#supported-models). |
 | Component model files | a single-file DiT, text encoder or VAE next to the bundle folder: ComfyUI and community files, INT8 ConvRot, INT4 ConvRot and NVFP4 DiT (NVFP4 on RTX 50 only), INT8 ConvRot and W4A8 text encoder (`dit_file`, `text_encoder_file`, `vae_file`) |
 | Generation | text-to-image with the official app's parameters: prompt, negative prompt, size, steps, CFG, shift, seed, skip layers, skip-layer guidance |
-| Quality tier | `auto` (default: the fastest configuration with a quality certificate; see [Shipped certificates](#shipped-certificates) for what the packages certify. Without a certificate, the bf16 bundle runs Reference and quantized files run their own GEMMs with exact attention, uncertified), `reference` (bf16, exact), `high` (the loaded weights plus 8-bit attention), `turbo` (an INT4 or NVFP4 DiT file, chosen explicitly); the tier that ran is reported |
+| Quality tier | required, the caller's choice: `reference` (the DiT's bf16 GEMMs, exact attention), `high` (the loaded DiT's INT8 or bf16 GEMMs, 8-bit attention), `turbo` (a 4-bit DiT: INT4, or NVFP4 on an RTX 50, 8-bit attention); a tier the loaded files cannot run is refused with the reason, and the tier that ran is reported |
 | Image input | img2img (an init image and a denoise strength) and inpainting (a mask), with crop / fit / stretch resizing; pixels (library) or PNG / JPEG files (both surfaces) |
 | Hires fix | a second pass at a larger size from the first pass upscaled, with its own strength and steps |
 | Distill bundles | few-step distilled checkpoints shipped as a bundle folder (time embedding, LoRA, data-space sampler parameters), applied per engine and per generation |
-| Control adapters | a control adapter file (a LoRA with a widened DiT input embedder, e.g. the MOSS-Image color / depth control) with one conditioning image per kind, each with a strength and a step window; pixels (library) or PNG / JPEG files (both surfaces). Lossy and opt-in: a run with one is uncertified. |
-| Lossy accelerators | CFG truncation and a step cache (First-Block Cache), off by default. Lossy and opt-in: they change the image, and a run with either is uncertified. |
-| Attention mode | exact (FlashAttention-2) or one of four 8-bit modes, as an override of the tier's choice |
+| Control adapters | a control adapter file (a LoRA with a widened DiT input embedder, e.g. the MOSS-Image color / depth control) with one conditioning image per kind, each with a strength and a step window; pixels (library) or PNG / JPEG files (both surfaces). Opt-in. |
+| Lossy accelerators | CFG truncation and a step cache (First-Block Cache), off by default. Opt-in: they change the image. |
+| Attention mode | exact (FlashAttention-2) or one of four 8-bit modes, as an override of the tier's default |
 | LoRAs | a list of files with strengths per generation, applied at run time: kohya, PEFT / diffusers, LyCORIS LoHa and LoKr, and full deltas; per-file reports and warnings |
 | Samplers and schedulers | 9 samplers (Euler, AB2, Euler ancestral, Heun, DPM++ 2M, DPM++ 2M SDE, ER-SDE, RES multistep, data-space), 7 schedulers, noise layout and source, eta, s_noise, flow multiplier |
 | Preview | a latent preview image during sampling, every N steps (library: a callback with RGB8; server: a PNG rewritten in place and a `preview` event) |
@@ -38,7 +40,6 @@ Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what
 | Run-time control | progress: the phase and step, and the whole job's share done and time left over every phase, the text encoder and model loads included (`fraction`, `eta_seconds`); cancel from any thread, one job (generation, preload or release) at a time per engine, device probe and build recommendation |
 | Preload | load the models for a request before the first generation (`mi_engine_preload()`, server `preload`), so the first image starts sampling at once; the next generation of a like request loads nothing and gives the same bits |
 | Soft unload | free the VRAM and keep the engine (`mi_engine_release()`, server `release`), optionally with the DiT kept in RAM for a fast reload over PCIe (`keep_host_copy`); the embedding cache survives it. See [Fast switching](#fast-switching). |
-| Certificate directories | extra quality-certificate directories per engine (`certificate_dirs`), searched before the cache folder, the DiT's sidecar and the package's `share/mossinfer/quality_certs/`, where packages install their certificates |
 | System CUDA reuse | a compatible cuBLASLt from the user's CUDA install, used by the `-system-cuda` package or on request (`MOSSINFER_CUDA_LIBS=system`); the probe reports which copy runs (verified on Linux; see [CUDA libraries](#cuda-libraries)) |
 | Output | PNG file (both surfaces), or RGB8 in memory (library), plus a JSON report per image |
 | File inspection | what a file is before anything loads, without an engine or a GPU (`mi_inspect_file()`, server `inspect`): DiT, text encoder, VAE, LoRA or control adapter, whether the engine accepts it and why not; a DiT's precision, quantization and the tiers it allows; a LoRA's rank, adapters and `base_model`; a control adapter's kinds |
@@ -46,10 +47,10 @@ Version 1.0.0 (ABI 1, server protocol 1). See [Versioning](#versioning) for what
 
 ### Control adapters and accelerators
 
-They run on all three surfaces: `mi_gen_params` (`MI_CAP_CONTROL`, `MI_CAP_ACCEL`; [c-api.md](c-api.md#control-adapters)), `generate`'s `control`, `cfg_truncation`, `step_cache` and `step_cache_threshold` ([server-protocol.md](server-protocol.md#generate)), and `moss-infer generate`. All of them are lossy and opt-in, and a run with any of them is uncertified:
-- **Control adapters:** a control adapter file (`--control <file>`) and its LoRA strength (`--control-scale S`, default 1). Each conditioning image (`--control-image <kind>=<png|jpg>`) gives the input of one of the adapter's kinds, with a strength (`--control-strength X`, default 1, 0 to 10) and a step window (`--control-start X` / `--control-end X`, default 0 / 1: the share of the steps it applies to). A kind without an image gets no control. Like any LoRA, the adapter makes the run uncertified.
-- **Lossy accelerators**, off by default: CFG truncation (`--cfg-truncation X`, 0 to 1, default 1 = off) drops the negative branch from step X · steps on; the step cache (`--step-cache fbcache`, default `off`) reuses DiT blocks 1..41 from the last full call while block 0's output changed by less than the threshold (`--step-cache-threshold`; default 0.02 on the base model and 0.03 on the SFT model and its derived files, and the report's `accelerators.step_cache_threshold` and `step_cache_threshold_source` say which ran). Both change the image and make the run uncertified. The tier is resolved as if they were off, so `auto` picks the same tier. The step cache's gain depends on the model, precision, step count and size: on an RTX 5090 at 1024², 50 steps, threshold 0.03 reused 27–30 % of the DiT calls with bf16 and INT8, and none with INT4 Turbo (its own rounding noise keeps block 0's change above the threshold; the report warns when the cache never engaged).
-- The report records them in `control` and `accelerators`, and `dit_stream.steps[i].cached` marks the steps that reused the cache. The server adds a `done.warnings` line for the accelerators. Show the run's certified status from `mi_tier_info.run_certified` (server: `done.certified`); `mi_tier_info.certified` is about the tier and stays 1 on Reference.
+They run on all three surfaces: `mi_gen_params` (`MI_CAP_CONTROL`, `MI_CAP_ACCEL`; [c-api.md](c-api.md#control-adapters)), `generate`'s `control`, `cfg_truncation`, `step_cache` and `step_cache_threshold` ([server-protocol.md](server-protocol.md#generate)), and `moss-infer generate`. All of them change the image and are opt-in:
+- **Control adapters:** a control adapter file (`--control <file>`) and its LoRA strength (`--control-scale S`, default 1). Each conditioning image (`--control-image <kind>=<png|jpg>`) gives the input of one of the adapter's kinds, with a strength (`--control-strength X`, default 1, 0 to 10) and a step window (`--control-start X` / `--control-end X`, default 0 / 1: the share of the steps it applies to). A kind without an image gets no control.
+- **Lossy accelerators**, off by default: CFG truncation (`--cfg-truncation X`, 0 to 1, default 1 = off) drops the negative branch from step X · steps on; the step cache (`--step-cache fbcache`, default `off`) reuses DiT blocks 1..41 from the last full call while block 0's output changed by less than the threshold (`--step-cache-threshold`; default 0.02 on the base model and 0.03 on the SFT model and its derived files, and the report's `accelerators.step_cache_threshold` and `step_cache_threshold_source` say which ran). Both change the image; the tier is resolved as if they were off. The step cache's gain depends on the model, precision, step count and size: on an RTX 5090 at 1024², 50 steps, threshold 0.03 reused 27–30 % of the DiT calls with bf16 and INT8, and none with INT4 Turbo (its own rounding noise keeps block 0's change above the threshold; the report warns when the cache never engaged).
+- The report records them in `control` and `accelerators`, and `dit_stream.steps[i].cached` marks the steps that reused the cache. The server adds a `done.warnings` line for the accelerators.
 
 ### Planned: integrate now, enabled later
 
@@ -70,7 +71,7 @@ These are designed and partly built. The launcher can prepare for them now (see 
 | One generation split across several GPUs | not supported. One engine per GPU is the intended pattern (not yet tested on multi-GPU machines). |
 | Several generations at once on one engine | not supported: queue them in the launcher |
 | A ComfyUI checkpoint or models folder as the model path | not supported: the model path is a bundle folder; ComfyUI files load as component files |
-| An uncertified Turbo run under tier `auto` | not supported: `auto` refuses an INT4 or NVFP4 DiT without a quality certificate (none ships). Choose `turbo` explicitly. |
+| An automatic tier | not supported since 2.0: the caller chooses `reference`, `high` or `turbo` |
 | NVFP4 DiT files on GPUs other than the RTX 50 series (compute capability 12.0) | not supported: refused (`MI_ERR_MODEL`) with `NVFP4 needs an RTX 50 GPU (compute capability 12.0); use the INT8 file …`. There is no bf16 decode fallback. A build without the sm_120a NVFP4 kernels (`MOSSINFER_NVFP4=OFF`, CUDA < 12.8) refuses them on an RTX 50 too. |
 | Pixel data over the server protocol | not supported: the server takes image file paths |
 | Server output other than PNG | not supported |
@@ -94,7 +95,7 @@ hf download OpenMOSS-Team/MOSS-Image-Base --revision 32edbc8a53ff3117ed52af34ce2
 hf download OpenMOSS-Team/MOSS-Image-SFT  --revision 2c7954437269461767f533b006823e8f85973a60 --local-dir MOSS-Image/sft  --exclude 'assets/*'
 ```
 
-- **Fine-tunes** with the same architecture (the same config values, tensor names and shapes; class names may differ) load and run like the official folders. No quality certificate applies to them: certificates identify the official files.
+- **Fine-tunes** with the same architecture (the same config values, tensor names and shapes; class names may differ) load and run like the official folders.
 - **How the engine checks.** It identifies a model by its architecture, from configs and safetensors headers only (no hashing): the folder's `transformer/config.json`, `text_encoder/config.json` and `vae/config.json`, and the tensor names and shapes of the DiT and text-encoder files. Anything else fails the first generation with `MI_ERR_MODEL` (server: `model`), and `moss-infer index` refuses it too. The message names what was found, e.g.: `MOSS-Image/x is not a supported MOSS-Image model (found transformer num_layers 40 (MOSS-Image: 42)). Supported: OpenMOSS-Team/MOSS-Image-Base and -SFT; see docs/integration.md#supported-models`. A folder without `transformer/config.json` or `text_encoder/config.json` is reported as incomplete (`… (incomplete download, or not the model folder?)`), also `MI_ERR_MODEL`. A LoRA, control adapter or distill bundle file given as the DiT or text encoder is named as such.
 
 **Community files verified during 1.0/1.1 development.** Files loaded next to an official folder. The last column names the run:
@@ -102,12 +103,12 @@ hf download OpenMOSS-Team/MOSS-Image-SFT  --revision 2c7954437269461767f533b0068
 - **4090L:** RTX 4090 Laptop, the 1.1 development tree (2026-10-23); images generated end to end.
 - **Tests:** the GPU test suite loads the file and checks its results against reference values.
 
-The table will be verified again on the RTX 5090 before 1.1 ships. The revision is the one whose files were tested (same SHA-256); copies of the same file under another name work the same.
+The revision is the one whose files were tested (same SHA-256); copies of the same file under another name work the same.
 
 | Repository (revision) | File | What it is | How it loads | Verified by |
 |---|---|---|---|---|
 | `Comfy-Org/MOSS-Image` (`24147db`) | `diffusion_models/moss_image_sft_int8_convrot.safetensors` | SFT DiT, INT8 ConvRot | `dit_file`, tier `high` | E25, 4090L |
-| `Comfy-Org/MOSS-Image` (`24147db`) | `diffusion_models/moss_image_base_int8_convrot.safetensors` | base DiT, INT8 ConvRot | `dit_file`, tier `high` | 5090 certification (sm_120) |
+| `Comfy-Org/MOSS-Image` (`24147db`) | `diffusion_models/moss_image_base_int8_convrot.safetensors` | base DiT, INT8 ConvRot | `dit_file`, tier `high` | RTX 5090 (sm_120) |
 | `Comfy-Org/MOSS-Image` (`24147db`) | `text_encoders/qwen3.5_9b_int8_convrot.safetensors` | text encoder, INT8 ConvRot | `text_encoder_file` | 4090L, tests |
 | `Comfy-Org/MOSS-Image` (`24147db`) | `text_encoders/qwen3.5_9b_w4a8_gptq.safetensors` | text encoder, W4A8 GPTQ | `text_encoder_file` | 4090L, tests |
 | `Comfy-Org/MOSS-Image` (`24147db`) | `vae/flux2-vae.safetensors` | full FLUX.2 VAE (decoder and encoder) | `vae_file` | 4090L, tests |
@@ -202,7 +203,7 @@ cmake --build --preset linux-cuda13 -j8
 CUDA_VISIBLE_DEVICES="" ctest --preset linux-cuda13 -L '^cpu$'
 cmake --install build-linux-cuda13                # -> build-linux-cuda13/install
 cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-cuda13/install-system-cuda
-(cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-1.0.0-linux-cu13-x86_64.{tar.gz,zip}
+(cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-2.0.0-linux-cu13-x86_64.{tar.gz,zip}
 ```
 
 - **glibc:** the archive needs the glibc of the machine that built it, or a newer one. Build on the oldest distribution you want to support. CI uses Ubuntu 22.04, which gives glibc 2.35. A build from a rolling distribution such as Arch will not start on Ubuntu LTS.
@@ -219,13 +220,12 @@ cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-
 | Windows: `bin/vcruntime140*.dll`, `bin/msvcp140.dll` | the MSVC runtime, so users need no Visual C++ Redistributable |
 | `include/mossinfer/mossinfer.h` | the C API header |
 | `share/cmake/MossInfer/` | the CMake package: `find_package(MossInfer)` |
-| `share/mossinfer/quality_certs/` | the quality certificates the package ships (`*.mossinfer-cert.json`), searched by the engine from its own location; absent when there are none |
 | `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`, `share/doc/mossinfer/` | licences (see [Licensing](#licensing-and-redistribution)) |
 
 **Two variants per flavour.**
-- **Full** (`mossinfer-…-cu13-x86_64.zip`): bundles cuBLASLt and the CUDA EULA. It runs on any machine with a suitable driver, and uses its own cuBLASLt by default (`auto`, see [CUDA libraries](#cuda-libraries)): results are reproducible across machines, and quality certificates measured with that cuBLASLt apply.
+- **Full** (`mossinfer-…-cu13-x86_64.zip`): bundles cuBLASLt and the CUDA EULA. It runs on any machine with a suitable driver, and uses its own cuBLASLt by default (`auto`, see [CUDA libraries](#cuda-libraries)): results are reproducible across machines.
 - **System CUDA** (`mossinfer-…-cu13-x86_64-system-cuda.zip`): the same files without cuBLASLt and the EULA, several hundred MB smaller. It runs only where a compatible cuBLASLt is installed. It is made from the release presets, which link the CUDA runtime statically; a tree installed the same way from a build with a shared cudart (the dev preset) also needs a system cudart.
-- **Users with a CUDA toolkit** can use its cuBLASLt instead in two ways: download the smaller `-system-cuda` archive, or keep the full one and set `MOSSINFER_CUDA_LIBS=system`. A system copy of another cuBLASLt version can change result bits, and certificates measured with the bundled copy do not apply to it (see Reproducibility below).
+- **Users with a CUDA toolkit** can use its cuBLASLt instead in two ways: download the smaller `-system-cuda` archive, or keep the full one and set `MOSSINFER_CUDA_LIBS=system`. A system copy of another cuBLASLt version can change result bits (see Reproducibility below).
 - **Which to offer:** the launcher decides from the probe. Run the probe of any installed copy with `MOSSINFER_CUDA_LIBS=system` (`hello`'s `probe.cublaslt`, or `mi_probe()`): when `source` is `"system"`, the machine has a compatible copy and the `-system-cuda` archive works there; otherwise offer the full one. A launcher that installs once for many machines ships the full archive.
 
 **Ship the tree as it is.**
@@ -271,7 +271,6 @@ Both variables choose code that the process loads and runs. Treat them like `LD_
 **Reproducibility.**
 - A different cuBLASLt version can change the bits of a result.
 - The engine reruns its fused-kernel self-check for each cuBLASLt version, so the correctness check always covers the copy in use.
-- Quality certificates are bound to the cuBLASLt version they were measured with. A run with another version (a system copy) finds no usable certificate, so tier `auto` runs Reference, and the report's reason names the certificate, the cuBLASLt version it was measured with and the one loaded.
 - Each report records the copy (`quality.cublaslt`).
 - The default (`auto` in a full package) and `MOSSINFER_CUDA_LIBS=bundled` run the release's own library, so results can be compared across machines.
 
@@ -283,25 +282,39 @@ The engine reads the official Hugging Face model folders in place, with no conve
 - **The folder can be read-only.** The engine writes nothing into it. An optional `moss.mossidx` index, made with `moss-infer index <folder>`, makes the first load slightly faster. Without one, the engine builds the index in memory.
 - **To save disk with both models,** hard-link SFT's `text_encoder/*.safetensors` and `vae/*.safetensors` to Base's. They are byte-identical.
 - **ComfyUI and quantized files** load as component files next to the bundle folder: `dit_file` (INT8 ConvRot, INT4 ConvRot, NVFP4 (RTX 50 only), mixed INT8/bf16 or bf16 DiT), `text_encoder_file` (INT8 ConvRot or W4A8) and `vae_file`. The tokenizer and configs still come from the folder. A file as the model path itself (`MI_MODEL_FORMAT_COMFYUI`, or a file with `MI_MODEL_FORMAT_AUTO`) returns `MI_ERR_NOT_SUPPORTED`, and the server answers `not_supported`, while `MI_CAP_COMFYUI_MODELS` is unset.
-- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 or NVFP4 DiT runs only under `turbo`, which must be chosen explicitly: offer it for INT4 and NVFP4 files, and only for them. Runtime LoRAs on NVFP4 linears run as side branches: their Δ is stored in bf16 (rounded once, unlike the INT8 path, which adds it unrounded inside the GEMM) and added in the NVFP4 GEMM's epilogue; LoHa, LoKr and full-delta adapters on NVFP4 linears are refused, as on INT4 ones. A quality certificate lets `auto` pick a lossy configuration. Certificates are searched in the engine's `certificate_dirs`, then `<cache_dir>/quality_certs/`, then the DiT's sidecar `<dit>.mossinfer-cert.json`, then the install tree's `share/mossinfer/quality_certs/`; the first usable one wins (see [Shipped certificates](#shipped-certificates)); the report's `quality` object says which one ran and whether it was certified.
+- **Quantized weights are lossy.** An INT8 DiT runs the `high` tier's INT8 GEMMs, and `reference` refuses it. An INT4 or NVFP4 DiT runs only under `turbo`: offer it for INT4 and NVFP4 files, and only for them. Runtime LoRAs on NVFP4 linears run as side branches: their Δ is stored in bf16 (rounded once, unlike the INT8 path, which adds it unrounded inside the GEMM) and added in the NVFP4 GEMM's epilogue; LoHa, LoKr and full-delta adapters on NVFP4 linears are refused, as on INT4 ones. The report's `quality` object says what ran.
 - **Paths name regular files and folders.** On Windows the engine refuses device and pipe paths (`\\.\…`, `\\?\…` other than a drive or `UNC\` path, DOS device names such as `NUL` or `COM1`, and the `pipe`, `mailslot` and `IPC$` shares) with `MI_ERR_INVALID_ARGUMENT` (the server: `invalid_params`) before opening anything. UNC paths to file shares (`\\nas\models\…`) are allowed: opening one authenticates to the named host with the engine process's account, as any Windows program does. A `moss-server` that takes paths from less-trusted clients (another user, a network front end) must not pass them through unchecked: restrict them to the folders it serves, so a client cannot make the engine authenticate to a host of its choosing.
 - **Sort files before loading them** with `mi_inspect_file()` / `inspect`: it names each file's role (DiT, text encoder, VAE, LoRA, control adapter), says whether the engine accepts it (and why not: a GGUF or FP8 file, a W4A8 DiT to convert with `moss-infer quantize`, an NVFP4 DiT in a build without the NVFP4 kernels), and gives a DiT's tiers, so the tier menu offers `turbo` for exactly the INT4 and NVFP4 files. Inspection judges an NVFP4 file for an RTX 50 (it never looks at the GPU); on other GPUs the load refuses it.
 
-### Shipped certificates
+## Performance
 
-Packages install these certificates to `share/mossinfer/quality_certs/`. Each one holds only for its GPU class, the exact model file and the cuBLASLt version it was measured with.
+The launcher sets three things: the tier (with the DiT file it loads), the memory mode and, when it shares the GPU or the RAM, the budgets. The engine plans everything else within them. **For everyday use, load an INT8 DiT (`dit_file`) with tier `high`:** 2.4 times the speed of the bf16 Reference in 40 % less VRAM.
 
-| GPU | Model file | Configuration under `auto` | Package |
+| Tier | Runs | Gives |
+|---|---|---|
+| `reference` | the DiT's bf16 GEMMs, exact attention | the official numerics, bit-reproducible run to run |
+| `high` | the loaded DiT's INT8 or bf16 GEMMs, 8-bit attention | with an INT8 DiT, the everyday configuration; with the bf16 bundle, the 8-bit attention alone |
+| `turbo` | a 4-bit DiT (INT4, or NVFP4 on an RTX 50), 8-bit attention | the fastest steps and the smallest weights |
+
+RTX 5090, SFT, 1024², 50 steps, every model resident:
+
+| Configuration | Denoise step | Speed | VRAM peak |
 |---|---|---|---|
-| RTX 50 series (sm_120) | SFT bundle, bf16 `transformer/` | `high`: bf16 weights, 8-bit attention (q8_fp16 or q8_fp8) | cu13 full, bundled cuBLASLt 13.6.0 |
-| RTX 50 series (sm_120) | Comfy-Org `moss_image_sft_bf16.safetensors` (the bundle's weights in one file) | `high`: bf16 weights, 8-bit attention (q8_fp16 or q8_fp8) | cu13 full, bundled cuBLASLt 13.6.0 |
-| RTX 50 series (sm_120) | Comfy-Org `moss_image_sft_int8_convrot.safetensors` | `high`: INT8 GEMMs with exact, q8_fp16 or q8_fp8 attention | cu13 full, bundled cuBLASLt 13.6.0 |
-| RTX 50 series (sm_120) | Comfy-Org `moss_image_base_int8_convrot.safetensors` | `high`: INT8 GEMMs with exact or q8_fp8 attention | cu13 full, bundled cuBLASLt 13.6.0 |
+| bf16 bundle, `reference` | 0.466 s | 1.0× | 11.7 GiB |
+| INT8 DiT, `high` (q8_fp8) | 0.192 s | 2.4× | 7.2 GiB |
+| NVFP4 DiT, `turbo` (q8_fp8) | 0.143 s | 3.3× | below INT8 |
 
-- **Other files and configurations:** the base model's bf16 bundle is not certified with 8-bit attention, and its INT8 file not with q8_fp16 attention. INT4 and NVFP4 files are not certified either: Turbo has to be chosen explicitly.
-- **Other packages:** the cu12 package bundles cuBLASLt 12.8, and a system copy may be any version. Neither carries an sm_120 certificate, so `auto` runs the uncertified default there: Reference for the bf16 bundle, a quantized file's own GEMMs with exact attention, and an INT4 file is refused (choose `turbo`).
-- **Other GPUs:** RTX 40 and 30 series certificates are planned.
-- **How they're made:** 23 evaluation prompts are rendered at the same seeds as our bf16 engine and compared with it and with the official images. The gates and their limits are in `src/pipeline/quality_cert.h`, and the engine refuses a certificate that doesn't meet them. The Comfy-Org bf16 file holds the bundle's tensors byte for byte (q, k and v stored as one fused tensor, which the engine builds at load anyway). Its entries carry the bundle's measurements, because the engine renders all 23 prompts bit-identically from either file in both configurations.
+The gain holds at 2048²: INT8 `high` runs 1.18 s per step against 2.77 s for bf16. 8-bit attention runs at every size; `attention` picks another kernel (`exact`, or the fp32-accumulating variants) when the caller wants one.
+
+**Memory modes** trade host RAM for speed. `balanced` (the default) keeps the process near 8 GiB of private RAM, `min_memory` near 4 GiB (more streaming and parking, the lowest peaks), and `max_speed` uses what the machine has free (the text encoder held in RAM, pinned where there is room, and a larger embedding cache, so a new prompt starts sooner).
+
+**VRAM budgets.** A DiT that does not fit stays exact: its blocks stream to the GPU every step, from the page cache or a pinned copy in RAM, and each step pays the part of the copy not hidden behind compute. Streaming from disk instead of RAM costs several seconds per step, so leave RAM free for the page cache. An INT8 DiT moves half the bytes of the bf16 one: on 8 to 12 GiB cards it is also the fast choice. Leave `vram_budget_bytes` at 0 unless the GPU is shared; the engine plans against the memory that is actually free.
+
+**How to go faster:**
+- Keep one engine alive: the DiT stays resident between generations, and repeated prompts reuse their embeddings (a `cache_dir` keeps them, and the measured transfer rates, across runs).
+- `preload` before the first generation, and `release` with `keep_host_copy` to give the VRAM back and reload over PCIe without reading the files again ([Fast switching](#fast-switching)).
+- `block_path` `fused_graphs` replays CUDA graphs when every DiT block is resident; all block paths give the same image.
+- The lossy accelerators (step cache, CFG truncation) are opt-in: they change the image, so offer them as settings, off by default.
 
 ## Picking the build: cu12 or cu13
 
@@ -340,7 +353,7 @@ The full protocol, with an example of every message, is in [server-protocol.md](
 
 **Lifecycle.**
 1. `hello`: check `protocol_version == 1` and `abi_version`, and pick the flavour (see above). Fill the settings' menus from `values`. `inspect` `{"path": ...}` classifies the user's model files at any time, before `load` too.
-2. `load` `{"model": "<folder>", "mode": "balanced", "cache_dir": "<launcher cache dir>/mossinfer"}`. This returns quickly. The weights load during `generate`: the DiT in the first `dit_load` phase, and the text encoder streams in `text_encoder` whenever the prompt is not in the embedding cache.
+2. `load` `{"model": "<folder>", "dit_file": "<INT8 DiT>", "tier": "high", "mode": "balanced", "cache_dir": "<launcher cache dir>/mossinfer"}`. `tier` is required. This returns quickly. The weights load during `generate`: the DiT in the first `dit_load` phase, and the text encoder streams in `text_encoder` whenever the prompt is not in the embedding cache.
 3. `generate` `{"prompt": ..., "output": "<path>.png", ...}`. The answer is immediate: `{"accepted": true}`. Then come `plan` once, `progress` at each phase start and after each step, `preview` before a step's `progress` when `preview_output` is set, and finally `done` with `status` `ok`, `cancelled` or `error`. Show `done.warnings` (LoRA losses, a truncated prompt) next to the image.
 4. `cancel` `{"id": <the generate request's id>}` from the UI's stop button. The id must match exactly, JSON type included (`"g1"` is not `1`). The generation stops within one block or layer, and `done` arrives with `"status": "cancelled"`.
 5. `release` frees the VRAM and keeps the engine, so the next `generate` needs no `load` (see [Fast switching](#fast-switching)). `unload` frees the engine too. `load` with different settings replaces the engine: the old one is released first, so if the new `load` fails, no engine is loaded.
@@ -376,7 +389,8 @@ A `release` that keeps a host copy reads the DiT's files into RAM and takes seco
 - **`model`:** the folder is not a MOSS-Image model folder, or its files are damaged.
 - **`io`:** a file could not be read, or the PNG could not be written.
 - **`not_supported`:** a feature that this build does not enable, e.g. a ComfyUI file as the model path.
-- **`invalid_argument` in `done`:** a tier combination the engine refuses, e.g. `reference` with an INT8 `dit_file`. The message names the conflict.
+- **`invalid_params` from `load` without a `tier`:** the tier is required since 2.0 (`reference`, `high` or `turbo`).
+- **`invalid_argument` in `done`:** a tier the loaded files cannot run, e.g. `reference` with an INT8 `dit_file`. The message names the reason.
 
 **Images from untrusted sources.** moss-server decodes `init_image`, `mask` and `control` image files in-process with stb_image, which is hardened (at most 64 MiB per file, 16384 pixels per side and 64,000,000 pixels, checked before any pixel allocation) but not memory-safe. When the images come from a network, web uploads or other users' files, decode them in the launcher with a memory-safe decoder and pass pixels through the C API (`mi_gen_params.init_image` / `mask`, `mi_control_image.image`), or run moss-server sandboxed. Files the user created or trusts are the case the server's file input is meant for; downloads are untrusted.
 
@@ -387,7 +401,7 @@ A `release` that keeps a host copy reads the DiT's files into RAM and takes seco
 With CMake:
 
 ```cmake
-find_package(MossInfer 1.0 REQUIRED CONFIG)   # CMAKE_PREFIX_PATH=<unpacked package>
+find_package(MossInfer 2.0 REQUIRED CONFIG)   # CMAKE_PREFIX_PATH=<unpacked package>
 target_link_libraries(launcher PRIVATE MossInfer::mossinfer)
 ```
 
@@ -414,17 +428,16 @@ Bindings in other languages can follow the frozen struct layouts in [c-api.md](c
 |---|---|---|
 | Memory mode | `mode`: `min_memory` / `balanced` / `max_speed` | Default `balanced`; it already adapts to free VRAM. Offer `min_memory` for "share the GPU with other apps / games", and `max_speed` for machines with plenty of RAM. |
 | VRAM limit | `vram_budget_bytes` (0 = automatic) | Leave it automatic. Expose it as an advanced option, e.g. to keep room for another app. |
-| Cache folder | `cache_dir` | **Always set it** to a folder the launcher owns. It holds the prompt-embedding cache and a small hardware profile, which spare later runs a short measurement and a self-check. Several processes may use one folder at once, engines of other versions included: every file is written under a unique temporary name and renamed into place, so none reads a partial file. An embedding entry in another format version is a miss and stays until the size cap ages it out; a hardware profile or file-hash cache of another version or GPU is ignored and rewritten, which costs a measurement or a re-hash. Sharing the folder shares embedding-cache hits between engines that compute the same embeddings (the same text encoder, numerics and kind of GPU). It does not share the GPU: each engine plans against the VRAM free when it plans, so two engines on one GPU still compete for memory. |
+| Cache folder | `cache_dir` | **Always set it** to a folder the launcher owns. It holds the prompt-embedding cache and a small hardware profile, which spare later runs a short measurement and a self-check. Several processes may use one folder at once, engines of other versions included: every file is written under a unique temporary name and renamed into place, so none reads a partial file. An embedding entry in another format version is a miss and stays until the size cap ages it out; a hardware profile of another version or GPU is ignored and rewritten, which costs a measurement. Sharing the folder shares embedding-cache hits between engines that compute the same embeddings (the same text encoder, numerics and kind of GPU). It does not share the GPU: each engine plans against the VRAM free when it plans, so two engines on one GPU still compete for memory. |
 | GPU | `device_index` / `device` | From `hello`'s device list. Supported devices only. |
 | Model | `model_path` / `model` | The Base or SFT folder. |
 | Model files | `dit_file`, `text_encoder_file`, `vae_file` | Optional file pickers next to the model folder, empty by default (the folder's own components). Offer them when `MI_CAP_MODEL_FILES` / `model_files` is set. |
-| Quality tier | `tier`: `auto` / `reference` / `high` / `turbo` | Default **Auto**. Show the tier that ran (`mi_result_tier()`, or the report's `quality` and `models`), and mark uncertified runs from `run_certified` (server: `done.certified`, the report's `models.dit.certified`). `mi_tier_info.certified` is about the tier: it stays 1 on Reference even with LoRAs, a control adapter or accelerators. Offer `turbo` only when the DiT file is INT4 or NVFP4 (`mi_file_info.precision` `W4A4` or `NVFP4`), and select it for such a file: `auto` refuses an uncertified 4-bit DiT. |
+| Quality tier | `tier`: `reference` / `high` / `turbo` (required) | The launcher chooses; the engine has no default. Recommended: an INT8 DiT with `high`. Build the menu from the DiT's `tiers` (`mi_inspect_file()` / `inspect`, the engine's own decision) and pre-select `high` for a bf16 or INT8 DiT and `turbo` for an INT4 or NVFP4 one. Show the tier that ran (`mi_result_tier()`, or the report's `quality` and `models`). |
 | Distill bundle | `distill_dir` / `distill` (engine) | An optional folder picker. Set the same bundle on the engine and on each generation (the engine takes its time embedding). Leave steps, CFG and the sampler unset to get the bundle's. |
-| Attention | `attention`: `default` / `exact` / `q8_fp8` / ... | An advanced setting, default `default` (the tier's choice). |
+| Attention | `attention`: `default` / `exact` / `q8_fp8` / ... | An advanced setting, default `default` (the tier's default: 8-bit for `high` and `turbo`). |
 | LoRA strictness | `lora_strict` | Off. Turn it on only for workflows where a partly applied LoRA must fail instead of warn. |
 | Text-encoder pinning | `te_host_pin`: `auto` / `on` / `off` | An advanced setting, default `auto`. A pinned copy of a host-resident text encoder uploads faster and holds page-locked RAM: `off` on machines that need the RAM for other applications, `on` where RAM is plentiful. Offer it when `MI_CAP_TE_HOST_PIN` / `te_host_pin` is set. |
 | DiT reads | `dit_direct_io`: `auto` / `buffered` / `direct` | An advanced setting, default `auto` (direct I/O unless the file system gains nothing from it or the files are already cached). `buffered` when the model sits on storage that handles direct I/O badly; `direct_io` (all reads direct) is for cold-cache measurements only. |
-| Extra certificate folders | `certificate_dirs` (at most 16) | An advanced setting, empty by default: folders of quality certificates the user downloaded, searched before the launcher's cache folder and the package's own. Offer it when `MI_CAP_CERTIFICATE_DIRS` / `certificate_dirs` is set. |
 
 **Per-image settings** (`generate` / `mi_gen_params`) mirror the official app's `parameters.json`, and so do the defaults:
 - 1024×1024, 50 steps, CFG 3.0, shift 5.0 (steps and CFG are left unset by `mi_gen_params_init()` and an absent server field, and resolve to these unless a distill bundle applies: see [c-api.md](c-api.md#unset-markers));
@@ -443,9 +456,9 @@ Width and height must be multiples of 16, at most 4096 per side, and at most 4.2
 | Init image | `init_image` (pixels) or `init_image_path` / `init_image` (path) | An optional image picker with a denoise strength slider, pre-filled with `MI_DEFAULT_DENOISE_STRENGTH` (0.75, what an unset strength resolves to; 1 without a mask ignores the image). The output size stays `width` × `height` and the image is resized to it (crop by default): set the size from the image to keep its aspect ratio. `moss-infer` does that itself; the C API and the server do not. |
 | Inpainting mask | `mask` / `mask_path` / `mask`, `mask_encoding` | A mask painter next to the init image. Pass 0/1 masks with `binary01`, 0/255 masks with `u8`. |
 | Hires fix | `hires_width`, `hires_height`, `hires_strength`, `hires_steps` / `hires` | Off by default; a target size (or a scale rounded to multiples of 16) with a strength (default 0.45). |
-| Control adapter and images | `control_adapter`, `control_lora_strength`, `control_images` (`{kind, image or image_path, strength, start, end}` each, at most 16) / `control` | An advanced setting, off by default: an adapter file picker, then one image picker per kind the adapter has (`mi_file_report_control_kind()` / `inspect`'s `control_kinds` before a run, `MI_TEXT_CONTROL_KINDS` / the report's `control.kinds` after one), each with a strength slider (default 1) and a step window (default 0 to 1). The images are resized to the output size like an init image. Mark the result uncertified from `run_certified` / `done.certified`. |
-| CFG truncation | `cfg_truncation` | An advanced setting, default 1 (off). Lossy: mark the result uncertified from `run_certified` / `done.certified`. No effect at CFG 1 (the server's `done.warnings` says so). |
-| Step cache | `step_cache` (`off` / `fbcache`), `step_cache_threshold` | An advanced setting, default off; the threshold left unset (0 in the C API, absent on the server) takes the engine's per-model default (0.02 base, 0.03 SFT and derived files). Higher thresholds are faster and change the image more. Lossy: mark the result uncertified from `run_certified` / `done.certified` (`mi_accel_info.lossy` and the report's `accelerators.lossy` say an accelerator was requested). |
+| Control adapter and images | `control_adapter`, `control_lora_strength`, `control_images` (`{kind, image or image_path, strength, start, end}` each, at most 16) / `control` | An advanced setting, off by default: an adapter file picker, then one image picker per kind the adapter has (`mi_file_report_control_kind()` / `inspect`'s `control_kinds` before a run, `MI_TEXT_CONTROL_KINDS` / the report's `control.kinds` after one), each with a strength slider (default 1) and a step window (default 0 to 1). The images are resized to the output size like an init image. |
+| CFG truncation | `cfg_truncation` | An advanced setting, default 1 (off). Lossy: it changes the image. No effect at CFG 1 (the server's `done.warnings` says so). |
+| Step cache | `step_cache` (`off` / `fbcache`), `step_cache_threshold` | An advanced setting, default off; the threshold left unset (0 in the C API, absent on the server) takes the engine's per-model default (0.02 base, 0.03 SFT and derived files). Higher thresholds are faster and change the image more (`mi_accel_info.lossy` and the report's `accelerators.lossy` say an accelerator was requested). |
 | Preview | `preview_callback` + `preview_interval` / `preview_output` + `preview_every` | On. Every step is fine for small images; use about 5 for large ones, because each preview is a full-size device-to-host copy plus (server) a PNG write, on the generating thread while the GPU waits. The preview is coarse (no VAE). On Windows, do not keep the server's preview file open: the server renames each new preview over it, a held file makes that fail, and the server then logs a warning and goes on. |
 
 Leave `block_path`, `direct_io`, `noise_layout`, `flow_multiplier` and the skip-layer guidance fields (`slg_*`) at their defaults unless you have a reason to change them. `block_path` changes speed only, never the image.
@@ -474,7 +487,6 @@ Features are announced by a capability bit. Check `mi_capabilities()`, or `capab
 | Lossy accelerators | `MI_CAP_ACCEL` (0x800) | `"accel"` | set | `cfg_truncation`, `step_cache`, `step_cache_threshold` |
 | Preload | `MI_CAP_PRELOAD` (0x1000) | `"preload"` | set | `mi_engine_preload()` / `preload` |
 | Soft unload | `MI_CAP_RELEASE` (0x2000) | `"release"` | set | `mi_engine_release()` / `release`, the report's `dit_load` |
-| Certificate directories | `MI_CAP_CERTIFICATE_DIRS` (0x4000) | `"certificate_dirs"` | set | `certificate_dirs` |
 | Text-encoder pinning | `MI_CAP_TE_HOST_PIN` (0x8000) | `"te_host_pin"` | set | `te_host_pin` |
 | File inspection | `MI_CAP_INSPECT` (0x20000) | `"inspect"` | set | `mi_inspect_file()` / `inspect` |
 
@@ -484,7 +496,7 @@ Future features will arrive the same way: **new trailing struct fields, new enum
 
 Every result carries a JSON report: `mi_result_report_json()`, or `done.report` from the server. It holds:
 - the request and the seed used;
-- the tier that ran, the quality object (certificate, configuration, engine numerics, the cuBLASLt copy in use) and the model sources;
+- the tier that ran, the quality object (configuration, engine numerics, the cuBLASLt copy in use, GPU class) and the model sources;
 - the prompt token counts, and the LoRA reports, warnings and notes;
 - the execution plan: what was resident, and the memory per phase;
 - timings per phase, and VRAM and RAM peaks;
@@ -501,16 +513,24 @@ Attach it to bug reports, together with the server's stderr log and `hello`'s `p
 ## Versioning
 
 - **Version numbers.**
-  - `mi_version()` returns the release version (`1.0.0`).
+  - `mi_version()` returns the release version (`2.0.0`).
   - `mi_abi_version()` and `MI_ABI_VERSION` give the binary interface version (1).
   - The server's `hello` reports its `protocol_version` (1).
 - **Additive changes keep ABI 1:** new functions, new fields at the end of structs, new enum values, new optional server parameters and events.
   - A newer library accepts structs from programs built against an older header: their `struct_size` is smaller, the library reads only those bytes, and the missing fields take their defaults. It writes only `struct_size` bytes of output structs.
-  - This is implemented: 1.0.0 accepts the 0.1.0 sizes of `mi_engine_params` (80 bytes) and `mi_gen_params` (168 bytes) as well as its own (136 and 320, and 120 and 240 from an earlier 0.2.0 header). Any other size returns `MI_ERR_ABI_MISMATCH`. A 0.1.0 program keeps the 0.1.0 behaviour: its PNGs carry no metadata. See [c-api.md](c-api.md#struct-sizes).
-- **Incompatible changes raise `MI_ABI_VERSION`.** On Linux the shared library's SONAME follows the ABI (`libmossinfer.so.1`).
-- **From 1.0, releases with the same MAJOR version are source and binary compatible.** A launcher built against a 1.x header runs with any later 1.y library: additions arrive as new functions, enum values and trailing struct fields (versioned by `struct_size`). Only a new MAJOR version may raise the ABI.
-  - **Build time:** the CMake package (`SameMajorVersion`) satisfies a request from any release with the same MAJOR and at least the requested version: `find_package(MossInfer 1.0)` finds every 1.x, but not 2.0. Request the oldest 1.x whose header has what you use.
+  - This is implemented: every earlier size of `mi_engine_params` and `mi_gen_params` is accepted ([c-api.md](c-api.md#struct-sizes)); any other size returns `MI_ERR_ABI_MISMATCH`. A 0.1.0 `mi_gen_params` keeps the 0.1.0 behaviour (its PNGs carry no metadata). The 0.1.0 `mi_engine_params` (80 bytes) has no `tier` field, so since 2.0 it creates no engine.
+- **Incompatible binary changes raise `MI_ABI_VERSION`.** On Linux the shared library's SONAME follows the ABI (`libmossinfer.so.1`). 2.0 keeps ABI 1: no symbol, field, offset or enum value moved; retired fields stay in place as reserved.
+- **Releases with the same MAJOR version are source and binary compatible.** A launcher built against a 2.x header runs with any later 2.y library: additions arrive as new functions, enum values and trailing struct fields (versioned by `struct_size`). A behaviour change that callers must act on raises the MAJOR version, as 2.0 did.
+  - **Build time:** the CMake package (`SameMajorVersion`) satisfies a request from any release with the same MAJOR and at least the requested version: `find_package(MossInfer 2.0)` finds every 2.x, but not 1.x or 3.0.
 - **Server clients:** unknown parameters are rejected with `invalid_params`, so a typo never goes unnoticed. Send only parameters that the server's version documents. Ignore unknown fields in responses and events, because new ones will appear.
+
+### Migrating from 1.x
+
+2.0 makes the caller choose. The binary layout is unchanged, so a 1.x program loads 2.0 and needs two edits:
+- **Pass a tier.** `mi_engine_params.tier` (server: `load`'s `tier`, CLI: `--tier`) is required: `MI_TIER_REFERENCE`, `MI_TIER_HIGH` or `MI_TIER_TURBO`. `MI_TIER_AUTO`, the zero default, now fails `mi_engine_create()` with `MI_ERR_INVALID_ARGUMENT`; a `load` without `tier` is `invalid_params`. What 1.x `auto` ran without a certificate: `REFERENCE` for the bf16 bundle, `HIGH` with `attention` `EXACT` for an INT8 DiT. For speed, use `HIGH` with its default 8-bit attention.
+- **Treat the certificate fields as inert.** The engine reads no quality certificates and packages ship none. `certificate_dirs` is ignored, `MI_CAP_CERTIFICATE_DIRS` is never set, `mi_tier_info.certified` and `run_certified` are 0, `MI_TEXT_CERTIFICATE` is `""`, and the server's `done` has no `certified`. The report's `models.dit` has `tier` instead of `tier_requested`, `tier_effective` and `certified`; its `quality` object keeps what ran (tier, configuration, numerics, cuBLASLt, GPU class, model paths) without `reason` or `certificate`.
+
+`hello`'s `values.tier` lists exactly the accepted names, and `inspect`'s `tiers` exactly the tiers `generate` accepts for a DiT. The server protocol stays version 1.
 
 ## Licensing and redistribution
 
