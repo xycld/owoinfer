@@ -109,8 +109,19 @@ std::size_t attention_q8_workspace_bytes(const Options& o, std::int64_t total_q,
 // batch and num_heads must be <= 65535 (grid dimensions); with total_q == 0 nothing runs and workspace may be null.
 // Throws std::invalid_argument for unsupported arguments (head_dim != 128, bad dtypes/strides, too many tokens),
 // std::runtime_error when !supported(o.variant).
+// MOSS's per-head RMS norm and RoPE of q and k (kernels::fused::qk_norm_rope_moss), run inside the pre-pass: attention_q8
+// with norm_rope gives the bits of qk_norm_rope_moss on q's and k's columns followed by attention_q8 without it, in one
+// pass over q, k and v instead of four. k is rewritten in place normed and roped, as qk_norm_rope_moss does; q keeps its
+// input values (only its INT8 copy is normed and roped). q_norm, k_norm: contiguous bf16 [128]; table: bf16
+// [total_q, 128] = [sin(64) | cos(64)] per token (kernels::moss_rope_table), row stride a multiple of 8, 16-byte
+// aligned. Needs num_heads == num_kv_heads, cu_seqlens_k the same tensor as cu_seqlens_q, and q and k rows of one
+// stride (the columns of a fused QKV projection output). The norm's mean factor is that of a run of total_q tokens.
+struct QkNormRope {
+  Tensor q_norm, k_norm, table;
+};
+
 void attention_q8(const Options& o, const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out,
                   const Tensor& cu_seqlens_q, const Tensor& cu_seqlens_k, int max_seqlen, float scale, void* workspace,
-                  std::size_t workspace_bytes, cudaStream_t stream);
+                  std::size_t workspace_bytes, cudaStream_t stream, const QkNormRope* norm_rope = nullptr);
 
 }  // namespace mi::attention_q8

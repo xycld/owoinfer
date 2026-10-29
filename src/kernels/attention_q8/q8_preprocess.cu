@@ -28,7 +28,8 @@
 //     per-channel amax from the same stats pass as the K sum;
 //   - an all-zero V channel gets scale 1 (upstream divides by its amax 0 and writes NaN);
 //   - the fp16 V for the fp16-PV kernels is converted inside the K quantization kernel;
-//   - with debug checks the statistics pass also measures the fp16 variants' per-channel |V| max.
+//   - with debug checks the statistics pass also measures the fp16 variants' per-channel |V| max;
+//   - with QkNormRope the statistics pass also applies MOSS's q / k norm + RoPE and quantizes Q (no Q kernel).
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -36,6 +37,8 @@
 
 #include "core/cuda_check.h"
 #include "kernels/attention_q8/q8_kernels.h"
+#include "kernels/basic/detail.h"
+#include "kernels/basic/norm.h"
 
 // Vendored SageAttention device helpers (after the engine headers: they define global macros such as div_ceil).
 #include "csrc/numeric_conversion.cuh"
@@ -102,6 +105,152 @@ __global__ void __launch_bounds__(256) kv_stats_partial(PrepParams p) {
 
 // k_mean = bf16(sum / len), v_scale = amax / v_range and v_recp = v_range / amax (upstream's two roundings) per
 // (sequence, kv head, channel), summing the chunks in order.
+// kv_stats_partial with the MOSS per-head RMS norm + RoPE (kernels::fused::qk_norm_rope_moss) of q and k and the Q
+// quantization (quant_int8<kWarpQ, false, false>) folded in, bit for bit: the same CTA per (chunk, head, sequence)
+// and thread layout (16 rows x 16 lanes of 8 channels), so the partial sums keep their order. k is written back
+// normed and roped (the K quantization reads it after the mean); q is quantized from registers and never written.
+// qk_norm_rope_moss's layout is one warp per (token, head), lane l holding channels 4l..4l+3; here a lane holds two
+// such quads (channels 8l..8l+7 = its lanes 2l and 2l+1), so its shuffle tree (offsets 16, 8, 4, 2, 1) becomes
+// offsets 8, 4, 2, 1 on each quad's partial, then the two quads added at lane 0, and its RoPE partner (lane ^ 16)
+// is lane ^ 8. Q blocks of kWarpQ tokens are kWarpQ / 16 consecutive row steps of the CTA (512 % kWarpQ == 0).
+constexpr unsigned kRow16 = 0xffffffffu;  // both rows of a warp take every shuffle (invalid tokens compute on zeros)
+
+__device__ __forceinline__ void load_row8_bf16(const __nv_bfloat16* p, float* x, bool valid) {
+  if (valid) {
+    load_row8(p, x);
+  } else {
+#pragma unroll
+    for (int j = 0; j < kPack; ++j) x[j] = 0.f;
+  }
+}
+
+// rms_norm_moss over the 128 channels of one (token, head) held by 16 lanes, then RoPE; y: 8 bf16-rounded outputs.
+__device__ __forceinline__ void norm_rope8(const float* x, const float* w, const float* si, const float* co, float r_factor,
+                                           int lane, float* y) {
+  using namespace kernels::detail;
+  float quad[2];
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const float* e = x + 4 * h;
+    quad[h] = add(add(add(mul(e[0], e[0]), mul(e[1], e[1])), mul(e[2], e[2])), mul(e[3], e[3]));
+  }
+#pragma unroll
+  for (int off = 8; off > 0; off >>= 1) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) quad[h] = add(quad[h], __shfl_down_sync(kRow16, quad[h], off, 16));
+  }
+  const float total = __shfl_sync(kRow16, add(quad[0], quad[1]), 0, 16);
+  const float r = rsqrtf(add(mul(total, r_factor), kernels::kRmsNormEps));
+  float n[kPack];
+#pragma unroll
+  for (int j = 0; j < kPack; ++j) n[j] = rbf(mul(rbf(mul(x[j], r)), w[j]));
+  const bool lo_half = lane < 8;
+#pragma unroll
+  for (int j = 0; j < kPack; ++j) {
+    const float other = __shfl_xor_sync(kRow16, n[j], 8, 16);
+    const float lo = lo_half ? n[j] : other, hi = lo_half ? other : n[j];
+    y[j] = lo_half ? rbf(add(rbf(mul(lo, co[j])), rbf(mul(-hi, si[j])))) : rbf(add(rbf(mul(hi, co[j])), rbf(mul(lo, si[j]))));
+  }
+}
+
+template <bool kAmax, int kWarpQ>
+__global__ void __launch_bounds__(256) norm_rope_stats_partial(PrepParams p, int q_blocks) {
+  constexpr int kSteps = kWarpQ / 16;  // row steps (16 tokens each) per Q block
+  static_assert(kStatsChunk % kWarpQ == 0 && kWarpQ % 16 == 0, "Q blocks must tile a stats chunk");
+  const int c = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
+  const int lane = threadIdx.x % kLanes, row = threadIdx.x / kLanes, warp = threadIdx.x / 32;
+  const int start = p.cu_k[b], len = p.cu_k[b + 1] - start;
+  auto* q = static_cast<const __nv_bfloat16*>(p.q);
+  auto* k = static_cast<__nv_bfloat16*>(const_cast<void*>(p.k));
+  const auto* v = static_cast<const __nv_bfloat16*>(p.v);
+  const auto* tab = static_cast<const __nv_bfloat16*>(p.table);
+  float wq[kPack], wk[kPack];
+  load_row8(static_cast<const __nv_bfloat16*>(p.q_norm) + lane * kPack, wq);
+  load_row8(static_cast<const __nv_bfloat16*>(p.k_norm) + lane * kPack, wk);
+  const int pair = (lane & 7) * kPack;  // RoPE table index of channel 8 * lane (channel mod 64)
+  float sum[kPack] = {}, amax[kPack] = {};
+  __shared__ float s_warp_max[2][8];
+  for (int step0 = 0; step0 < kStatsChunk / 16; step0 += kSteps) {
+    float qy[kSteps][kPack];
+    float qmax = 0.0000001f;
+    int qrow[kSteps];
+    bool qvalid[kSteps];
+#pragma unroll
+    for (int s = 0; s < kSteps; ++s) {
+      const int t = c * kStatsChunk + (step0 + s) * 16 + row;
+      const bool valid = t < len;
+      const std::int64_t tok = start + t;
+      float x[kPack], si[kPack], co[kPack];
+      load_row8_bf16(tab + tok * p.table_row + pair, si, valid);
+      load_row8_bf16(tab + tok * p.table_row + 64 + pair, co, valid);
+      load_row8_bf16(q + tok * p.q_row + h * p.q_head + lane * kPack, x, valid);
+      norm_rope8(x, wq, si, co, p.norm_factor, lane, qy[s]);
+      load_row8_bf16(k + tok * p.k_row + h * p.k_head + lane * kPack, x, valid);
+      float ky[kPack];
+      norm_rope8(x, wk, si, co, p.norm_factor, lane, ky);
+      qrow[s] = static_cast<int>(tok);
+      qvalid[s] = valid;
+      if (valid) {
+        __nv_bfloat162 packed[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) packed[j] = __floats2bfloat162_rn(ky[2 * j], ky[2 * j + 1]);
+        *reinterpret_cast<uint4*>(k + tok * p.k_row + h * p.k_head + lane * kPack) = *reinterpret_cast<const uint4*>(packed);
+#pragma unroll
+        for (int j = 0; j < kPack; ++j) sum[j] += ky[j];
+        if constexpr (kAmax) {
+          load_row8(v + tok * p.v_row + h * p.v_head + lane * kPack, x);
+#pragma unroll
+          for (int j = 0; j < kPack; ++j) amax[j] = fmaxf(amax[j], fabsf(x[j]));
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < kPack; ++j) qmax = fmaxf(qmax, fabsf(qy[s][j]));
+    }
+    // The Q block's absmax over the CTA (exact in any order), as quant_int8's blockReduceMax.
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) qmax = fmaxf(qmax, __shfl_xor_sync(0xffffffffu, qmax, off));
+    const int buf = (step0 / kSteps) & 1;
+    if (threadIdx.x % 32 == 0) s_warp_max[buf][warp] = qmax;
+    __syncthreads();
+    float block_max = s_warp_max[buf][0];
+#pragma unroll
+    for (int i = 1; i < 8; ++i) block_max = fmaxf(block_max, s_warp_max[buf][i]);
+    const int bx = (c * kStatsChunk + step0 * 16) / kWarpQ;
+    if (threadIdx.x == 0 && bx < q_blocks) p.q_scale[(static_cast<std::int64_t>(b) * p.heads + h) * q_blocks + bx] = block_max / 127.0f;
+    const float qs = 127.0f / block_max;
+#pragma unroll
+    for (int s = 0; s < kSteps; ++s) {
+      if (!qvalid[s]) continue;
+      char4 o[2];
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        o[j] = make_char4(float_to_int8_rn(qy[s][4 * j] * qs), float_to_int8_rn(qy[s][4 * j + 1] * qs),
+                          float_to_int8_rn(qy[s][4 * j + 2] * qs), float_to_int8_rn(qy[s][4 * j + 3] * qs));
+      }
+      *reinterpret_cast<float2*>(p.q_i8 + (static_cast<std::int64_t>(qrow[s]) * p.heads + h) * kHeadDim + lane * kPack) =
+          *reinterpret_cast<const float2*>(o);
+    }
+  }
+  __shared__ float s_sum[16][kHeadDim];
+  __shared__ float s_amax[16][kHeadDim];
+#pragma unroll
+  for (int j = 0; j < kPack; ++j) {
+    s_sum[row][lane * kPack + j] = sum[j];
+    if constexpr (kAmax) s_amax[row][lane * kPack + j] = amax[j];
+  }
+  __syncthreads();
+  if (threadIdx.x < kHeadDim) {
+    float s = 0, a = 0;
+    for (int r = 0; r < 16; ++r) {
+      s += s_sum[r][threadIdx.x];
+      if constexpr (kAmax) a = fmaxf(a, s_amax[r][threadIdx.x]);
+    }
+    const std::int64_t at = ((static_cast<std::int64_t>(b) * p.kv_heads + h) * p.chunks + c) * kHeadDim + threadIdx.x;
+    p.part_sum[at] = s;
+    if constexpr (kAmax) p.part_amax[at] = a;
+  }
+}
+
 template <bool kAmax>
 __global__ void kv_stats_finalize(PrepParams p) {
   const int h = blockIdx.x, b = blockIdx.y, ch = threadIdx.x;
@@ -219,7 +368,22 @@ __global__ void __launch_bounds__(kCtaK * kLanes) v_fp8_transpose_quant(PrepPara
 
 void preprocess(const PrepParams& p, cudaStream_t stream) {
   const dim3 stats_grid(p.chunks, p.kv_heads, p.batch);
-  if (p.fp8 || p.v_amax) {
+  // Q: per warp of rows, laid out for the attention kernel's CTA_Q / WARP_Q blocks of the longest sequence.
+  const int q_blocks = (p.max_seqlen + kCtaQ - 1) / kCtaQ * (kCtaQ / p.warp_q);
+  if (p.norm_rope) {
+    // q and k normed and roped, Q quantized, and the K sums (V amax) in one pass.
+    const bool amax = p.fp8 || p.v_amax;
+    if (p.warp_q == 16) {
+      if (amax) norm_rope_stats_partial<true, 16><<<stats_grid, 256, 0, stream>>>(p, q_blocks);
+      else norm_rope_stats_partial<false, 16><<<stats_grid, 256, 0, stream>>>(p, q_blocks);
+    } else {
+      if (amax) norm_rope_stats_partial<true, 32><<<stats_grid, 256, 0, stream>>>(p, q_blocks);
+      else norm_rope_stats_partial<false, 32><<<stats_grid, 256, 0, stream>>>(p, q_blocks);
+    }
+    MI_CUDA_CHECK_LAUNCH();
+    if (amax) kv_stats_finalize<true><<<dim3(p.kv_heads, p.batch), kHeadDim, 0, stream>>>(p);
+    else kv_stats_finalize<false><<<dim3(p.kv_heads, p.batch), kHeadDim, 0, stream>>>(p);
+  } else if (p.fp8 || p.v_amax) {
     kv_stats_partial<true><<<stats_grid, 256, 0, stream>>>(p);
     MI_CUDA_CHECK_LAUNCH();
     kv_stats_finalize<true><<<dim3(p.kv_heads, p.batch), kHeadDim, 0, stream>>>(p);
@@ -230,10 +394,10 @@ void preprocess(const PrepParams& p, cudaStream_t stream) {
   }
   MI_CUDA_CHECK_LAUNCH();
 
-  // Q: per warp of rows, laid out for the attention kernel's CTA_Q / WARP_Q blocks of the longest sequence.
-  const int q_blocks = (p.max_seqlen + kCtaQ - 1) / kCtaQ * (kCtaQ / p.warp_q);
   const dim3 q_grid(q_blocks, p.heads, p.batch);
-  if (p.warp_q == 16) {
+  if (p.norm_rope) {
+    // Q was quantized by the statistics pass.
+  } else if (p.warp_q == 16) {
     quant_int8<16, false, false><<<q_grid, 16 * kLanes, 0, stream>>>(p, p.q, p.q_row, p.q_head, p.cu_q, p.heads, p.q_i8,
                                                                      p.q_scale, q_blocks);
   } else {

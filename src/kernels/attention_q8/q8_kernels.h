@@ -28,6 +28,14 @@ struct PrepParams {
   float v_range = 0;    // fp8: e4m3 V range; fp16 with v_amax: 1 (v_scale = amax)
   std::int64_t padded_k = 0;  // fp8: columns per (head, channel) row of the V buffer
   int chunks = 0;             // stats chunks per sequence: ceil(max_seqlen / kStatsChunk)
+  // Fused prologue (attention_q8's QkNormRope): q and k are normed and roped inside the statistics pass, k written
+  // back in place. Needs heads == kv_heads, cu_q == cu_k and equal q / k row strides.
+  bool norm_rope = false;
+  const void* q_norm = nullptr;  // bf16 [128]
+  const void* k_norm = nullptr;  // bf16 [128]
+  const void* table = nullptr;   // bf16 [total, 128] = [sin(64) | cos(64)] per token
+  std::int64_t table_row = 0;
+  float norm_factor = 0;  // rms_norm_moss's mean factor for the run: float(rows) / float(rows * 128), rows = total * heads
   // Outputs (workspace).
   std::int8_t* q_i8 = nullptr;
   std::int8_t* k_i8 = nullptr;

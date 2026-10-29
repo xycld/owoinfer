@@ -200,7 +200,7 @@ std::size_t attention_q8_workspace_bytes(const Options& o, std::int64_t total_q,
 
 void attention_q8(const Options& o, const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out,
                   const Tensor& cu_seqlens_q, const Tensor& cu_seqlens_k, int max_seqlen, float scale, void* workspace,
-                  std::size_t workspace_bytes, cudaStream_t stream) {
+                  std::size_t workspace_bytes, cudaStream_t stream, const QkNormRope* norm_rope) {
   check_qkvo(q, "q");
   check_qkvo(k, "k");
   check_qkvo(v, "v");
@@ -219,6 +219,22 @@ void attention_q8(const Options& o, const Tensor& q, const Tensor& k, const Tens
   require(cu_seqlens_q.dim(0) - 1 <= kMaxGridYz, "batch must be <= 65535 (grid z)");
   require(max_seqlen > 0, "max_seqlen must be positive");
   require(std::isfinite(scale) && scale > 0, "scale must be finite and positive");
+  if (norm_rope != nullptr) {
+    const auto vec128 = [](const Tensor& t) {
+      return t.dtype == DType::kBF16 && t.device == Device::kCUDA && t.rank == 1 && t.dim(0) == kHeadDim &&
+             t.is_contiguous() && reinterpret_cast<std::uintptr_t>(t.data) % 16 == 0;
+    };
+    const Tensor& tab = norm_rope->table;
+    const std::int64_t tab_row = tab.rank == 2 && tab.dim(0) > 1 ? tab.stride[0] : kHeadDim;
+    require(vec128(norm_rope->q_norm) && vec128(norm_rope->k_norm), "norm_rope: q_norm and k_norm must be contiguous "
+                                                                     "16-byte aligned bf16 [128] device vectors");
+    require(tab.dtype == DType::kBF16 && tab.device == Device::kCUDA && tab.rank == 2 && tab.dim(0) == total_q &&
+                tab.dim(1) == kHeadDim && tab.stride[1] == 1 && tab_row % 8 == 0 &&
+                reinterpret_cast<std::uintptr_t>(tab.data) % 16 == 0,
+            "norm_rope: table must be a bf16 [total_q, 128] device tensor, 16-byte aligned rows");
+    require(kv_heads == heads && cu_seqlens_k.data == cu_seqlens_q.data && k.stride[0] == q.stride[0],
+            "norm_rope needs num_heads == num_kv_heads, one cu_seqlens tensor and q and k rows of one stride");
+  }
   const int batch = static_cast<int>(cu_seqlens_q.dim(0) - 1);
   const Layout l = layout(o.variant, total_q, total_k, batch, max_seqlen, static_cast<int>(heads), static_cast<int>(kv_heads));
   // The vendored kernels index with 32-bit element offsets: unsigned into the int8/fp16/fp8 buffers and the bf16
@@ -294,6 +310,16 @@ void attention_q8(const Options& o, const Tensor& q, const Tensor& k, const Tens
   pp.v_recp = reinterpret_cast<float*>(base + l.v_recp);
   pp.part_sum = reinterpret_cast<float*>(base + l.part_sum);
   pp.part_amax = reinterpret_cast<float*>(base + l.part_amax);
+  if (norm_rope != nullptr) {
+    // qk_norm_rope_moss's mean factor for a [total_q, heads, 128] head view: rows = total_q * heads.
+    const std::int64_t rows = total_q * heads;
+    pp.norm_rope = true;
+    pp.q_norm = norm_rope->q_norm.data;
+    pp.k_norm = norm_rope->k_norm.data;
+    pp.table = norm_rope->table.data;
+    pp.table_row = norm_rope->table.dim(0) > 1 ? norm_rope->table.stride[0] : kHeadDim;
+    pp.norm_factor = static_cast<float>(rows) / static_cast<float>(rows * kHeadDim);
+  }
   detail::preprocess(pp, stream);
   if (check_v) {
     std::vector<float> amax(static_cast<std::size_t>(batch) * kv_heads * kHeadDim);

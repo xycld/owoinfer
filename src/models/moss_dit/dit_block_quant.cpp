@@ -411,12 +411,15 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
       }
     }
   }
-  kernels::fused::qk_norm_rope_moss(qkv, static_cast<int>(kH), w.q_norm, w.k_norm, a.rope.slice0(run.t0, run.t1), stream);
   if (attention != AttentionMode::kExact) {
+    // QK-norm + RoPE inside the 8-bit attention's pre-pass (the bits of qk_norm_rope_moss first; q stays un-normed).
+    const attention_q8::QkNormRope norm_rope{w.q_norm, w.k_norm, a.rope.slice0(run.t0, run.t1)};
     attention_q8::attention_q8(q8_options(attention), heads(qkv, 0), heads(qkv, kD), heads(qkv, 2 * kD), heads(attn, 0),
                                run.cu_seqlens, run.cu_seqlens, run.max_seqlen, kScale, qa.attn_workspace,
-                               qa.attn_workspace_bytes, stream);
+                               qa.attn_workspace_bytes, stream, &norm_rope);
   } else {
+    kernels::fused::qk_norm_rope_moss(qkv, static_cast<int>(kH), w.q_norm, w.k_norm, a.rope.slice0(run.t0, run.t1),
+                                      stream);
     attention::flash_fwd(heads(qkv, 0), heads(qkv, kD), heads(qkv, 2 * kD), heads(attn, 0), run.cu_seqlens,
                          run.cu_seqlens, run.max_seqlen, false, kScale, a.lse, a.lse_bytes, stream);
   }

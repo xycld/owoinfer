@@ -27,6 +27,7 @@
 #include "core/tensor.h"
 #include "core/varlen.h"
 #include "kernels/attention_q8/attention_q8.h"
+#include "kernels/fused/qk_norm_rope.h"
 #include "reference_gpu.h"
 #include "util/npy.h"
 
@@ -503,6 +504,57 @@ TEST(GpuAttentionQ8, StridedQkvViewsMatchContiguous) {
     std::vector<std::uint16_t> got(static_cast<std::size_t>(n * hd));
     MI_CUDA_CHECK(cudaMemcpy2D(got.data(), hd * 2, wide_out.get(), 2 * hd * 2, hd * 2, n, cudaMemcpyDeviceToHost));
     EXPECT_EQ(got, want) << q8::variant_name(v);
+  }
+}
+
+// The QK-norm + RoPE prologue (QkNormRope) equals kernels::fused::qk_norm_rope_moss on the fused QKV columns followed
+// by attention_q8, bit for bit: the output and k (rewritten in place) for every variant, at lengths that are not
+// multiples of a Q block or a stats chunk, in one batch.
+TEST(GpuAttentionQ8, NormRopePrologueEqualsSeparateKernels) {
+  const Problem p = make_problem(24, 24, {1300, 515, 33});
+  Buffers buf(p);
+  buf.fill_random(p, 41);
+  const std::int64_t n = p.total(), hd = p.heads * kDim;
+  mi::DeviceBuffer qkv(static_cast<std::size_t>(n * 3 * hd * 2)), sep(qkv.size()), fused(qkv.size()),
+      norms(2 * kDim * 2), table(static_cast<std::size_t>(n * kDim * 2));
+  for (int i = 0; i < 3; ++i) {
+    const auto& src = i == 0 ? buf.q : i == 1 ? buf.k : buf.v;
+    MI_CUDA_CHECK(cudaMemcpy2D(static_cast<char*>(qkv.get()) + i * hd * 2, 3 * hd * 2, src.get(), hd * 2, hd * 2, n,
+                               cudaMemcpyDeviceToDevice));
+  }
+  auto* nw = static_cast<__nv_bfloat16*>(norms.get());
+  fill_bf16<<<1, 256>>>(nw, 2 * kDim, 2 * kDim, 7, 0.3f, 1.f);
+  fill_bf16<<<1024, 256>>>(static_cast<__nv_bfloat16*>(table.get()), n * kDim, kDim, 8, 0.6f, 0.f);
+  MI_CUDA_CHECK_LAUNCH();
+  const Tensor q_norm = Tensor::view(nw, DType::kBF16, Device::kCUDA, {kDim});
+  const Tensor k_norm = Tensor::view(nw + kDim, DType::kBF16, Device::kCUDA, {kDim});
+  const Tensor tab = Tensor::view(table.get(), DType::kBF16, Device::kCUDA, {n, kDim});
+  const auto view = [&](void* base, std::int64_t col) {
+    Tensor t = Tensor::view(static_cast<char*>(base) + col * 2, DType::kBF16, Device::kCUDA, {n, p.heads, kDim});
+    t.stride[0] = 3 * hd;
+    return t;
+  };
+  const auto k_cols = [&](const mi::DeviceBuffer& b) {
+    std::vector<std::uint16_t> h(static_cast<std::size_t>(n * hd));
+    MI_CUDA_CHECK(cudaMemcpy2D(h.data(), hd * 2, static_cast<const char*>(b.get()) + hd * 2, 3 * hd * 2, hd * 2, n,
+                               cudaMemcpyDeviceToHost));
+    return h;
+  };
+  for (Variant v : kVariants) {
+    if (!runnable(v)) continue;
+    MI_CUDA_CHECK(cudaMemcpy(sep.get(), qkv.get(), qkv.size(), cudaMemcpyDeviceToDevice));
+    MI_CUDA_CHECK(cudaMemcpy(fused.get(), qkv.get(), qkv.size(), cudaMemcpyDeviceToDevice));
+    mi::kernels::fused::qk_norm_rope_moss(Tensor::view(sep.get(), DType::kBF16, Device::kCUDA, {n, 3 * hd}), p.heads,
+                                          q_norm, k_norm, tab, nullptr);
+    q8::attention_q8({v}, view(sep.get(), 0), view(sep.get(), hd), view(sep.get(), 2 * hd), buf.tout(p), buf.tcu(p),
+                     buf.tcu(p), p.max_seqlen(), p.scale(), buf.ws.get(), buf.ws.size(), nullptr);
+    const auto want = buf.download_out(p);
+    const q8::QkNormRope norm_rope{q_norm, k_norm, tab};
+    MI_CUDA_CHECK(cudaMemset(buf.ws.get(), 0x7f, buf.ws.size()));
+    q8::attention_q8({v}, view(fused.get(), 0), view(fused.get(), hd), view(fused.get(), 2 * hd), buf.tout(p),
+                     buf.tcu(p), buf.tcu(p), p.max_seqlen(), p.scale(), buf.ws.get(), buf.ws.size(), nullptr, &norm_rope);
+    EXPECT_EQ(buf.download_out(p), want) << q8::variant_name(v);
+    EXPECT_EQ(k_cols(fused), k_cols(sep)) << q8::variant_name(v) << " k";
   }
 }
 
