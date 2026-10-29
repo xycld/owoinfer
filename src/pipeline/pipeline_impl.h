@@ -1115,7 +1115,9 @@ struct Pipeline::Impl {
   // Host latents [128, H / 16, W / 16] of an RGB image at its own size (sides multiples of 16): the VAE encoder `e`'s
   // posterior mean (loaded as needed), on the arena stack with what the resident models leave (encode_within: exact
   // tiling when the untiled encode does not fit, same bytes). The tiling used is appended to pass.encode_schedule.
-  std::vector<float> encode_image(const EncoderSource& e, const Image& im, PassReport& pass, Timings& tm);
+  // `cancel` (optional) is checked between the encoder's bands (flux2_vae_encoder::Cancelled).
+  std::vector<float> encode_image(const EncoderSource& e, const Image& im, PassReport& pass, Timings& tm,
+                                  const std::atomic<bool>* cancel = nullptr);
   // VAE decode (P:428-438) of host latents [128, H / 16, W / 16] to RGB8 `out` [H, W, 3] by the loaded decoder
   // (ensure_vae first): untiled when it fits the arena next to the resident models, else tiled, with the same bytes
   // either way (kDecodeMode). Returns the tiling used (nullopt: untiled). Throws flux2_vae::Cancelled (`cancel`).
@@ -1127,7 +1129,7 @@ struct Pipeline::Impl {
   // The request's control images at H x W (resized by req.resize, a grayscale map replicated to RGB after the resize,
   // encoded by `e`): per kind of the adapter its latent times its strength (empty: no image). Counted in r.control.
   std::vector<std::vector<float>> encode_controls(const EncoderSource& e, const control::ControlFile& ctl, const Request& req,
-                                                  int H, int W, Result& r);
+                                                  int H, int W, Result& r, const std::atomic<bool>* cancel = nullptr);
   // The plan explanation's lines on the models (the tier that runs, the DiT's remarks, a replaced step embedder) and on
   // the control adapter (its LoRA strength, its images and their windows).
   void explain_models(const DitSource& src, Result& r) const;

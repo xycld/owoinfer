@@ -114,6 +114,7 @@ bool contains(Range outer, Range inner) { return inner.empty() || (outer.a <= in
 struct LevelExec {
   int level = 0;
   std::int64_t h = 0, w = 0;  // level resolution
+  const std::atomic<bool>* cancel = nullptr;  // EncodeOptions::cancel
   const std::vector<Conv>* convs = nullptr;
   const std::vector<Norm>* norms = nullptr;
   bool alias_in = false;  // kIn is the input checkpoint itself (no copy)
@@ -349,6 +350,7 @@ void run_level(LevelExec& e, std::int64_t band) {
     const Op& nop = prog[idx];
     if (!e.dry()) vae::group_norm_accum_zero(e.accum, 1, kGroups, e.stream);
     for (std::int64_t c0 = 0; c0 < e.h; c0 += band) {
+      if (!e.dry() && e.cancel != nullptr && e.cancel->load()) throw Cancelled();
       const Tensor core = run_ops(e, prog, idx, nop.in, {c0, std::min(e.h, c0 + band)}, false);
       if (!e.dry()) vae::group_norm_accumulate(core, kGroups, e.accum, e.stream);
     }
@@ -898,6 +900,8 @@ void Flux2VaeEncoder::encode(const Tensor& rgb, const Tensor& latents, const Enc
     e.strip = mid + ll.strip;
     e.math = options.conv;
     e.stream = stream;
+    e.cancel = options.cancel;
+    if (e.cancel != nullptr && e.cancel->load()) throw Cancelled();
     run_level(e, band);
     if (hook) hook(kStageNames[lv], act(ckpt[lv + 1], e.h / 2, e.w / 2, kLevelOut[lv]));
   }

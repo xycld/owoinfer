@@ -1135,7 +1135,8 @@ bool Pipeline::Impl::prepare_dit(DitSource& src, const moss_dit::Residency& resi
   return true;
 }
 
-std::vector<float> Pipeline::Impl::encode_image(const EncoderSource& e, const Image& im, PassReport& pass, Timings& tm) {
+std::vector<float> Pipeline::Impl::encode_image(const EncoderSource& e, const Image& im, PassReport& pass, Timings& tm,
+                                                const std::atomic<bool>* cancel) {
   Impl& m = *this;
   const cudaStream_t stream = streams.compute();
   m.ensure_encoder(e, encode_need_of(im.height, im.width), tm);
@@ -1144,7 +1145,7 @@ std::vector<float> Pipeline::Impl::encode_image(const EncoderSource& e, const Im
   const Tensor lat = m.arena->alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, im.height / 16, im.width / 16});
   const Tensor rgb = Tensor::view(const_cast<std::uint8_t*>(im.pixels.data()), DType::kU8, Device::kCPU, {im.height, im.width, 3});
   const flux2_vae_encoder::TilePlan used =
-      m.encoder->encode_within(rgb, lat, flux2_vae_encoder::EncodeOptions{}, m.arena->available(), stream);
+      m.encoder->encode_within(rgb, lat, flux2_vae_encoder::EncodeOptions{.cancel = cancel}, m.arena->available(), stream);
   std::vector<float> z(static_cast<std::size_t>(lat.numel()));
   MI_CUDA_CHECK(cudaMemcpyAsync(z.data(), lat.data, lat.nbytes(), cudaMemcpyDeviceToHost, stream));
   MI_CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1198,7 +1199,8 @@ void Pipeline::Impl::refine_texts(std::span<const std::shared_ptr<const Embeddin
 }
 
 std::vector<std::vector<float>> Pipeline::Impl::encode_controls(const EncoderSource& e, const control::ControlFile& ctl,
-                                                                const Request& req, int H, int W, Result& r) {
+                                                                const Request& req, int H, int W, Result& r,
+                                                                const std::atomic<bool>* cancel) {
   Timings& tm = r.timings;
   std::vector<std::vector<float>> out(static_cast<std::size_t>(ctl.groups()));
   for (const Request::ControlImage& c : req.control.images) {
@@ -1216,7 +1218,7 @@ std::vector<std::vector<float>> Pipeline::Impl::encode_controls(const EncoderSou
       tm.image_ops_s += since(ti);
     }
     PassReport enc;
-    std::vector<float> z = encode_image(e, im, enc, tm);
+    std::vector<float> z = encode_image(e, im, enc, tm, cancel);
     if (c.strength != 1.0) {
       const float s = static_cast<float>(c.strength);
       for (float& v : z) v *= s;

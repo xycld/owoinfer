@@ -187,6 +187,8 @@ struct Session::Run {
   Tensor ctl_extra;                                    // [L, G * 128, h, w]: latent 0 the run's control latents
   std::optional<control::PassInputs> ctl_in;
   bool ctl_dirty = false;  // ctl_extra holds a crop's or a call's control: rewritten before the run's are used again
+  enum class Control { kNone, kRun, kCall };
+  Control last_control = Control::kNone;  // the control source of the last full (non-crop) call
   std::optional<accel::FirstBlockCache> cache;
   runtime::StagingLayout layout;
   runtime::StagingBlock block;
@@ -277,7 +279,7 @@ struct Session::State {
   // embedding-cache hit), into r.plan. `encoder`: the VAE encoder the call uses.
   Pipeline::Impl::Planned plan(const Pipeline::Impl::CallModels& models, const Pipeline::Impl::CallDit& d, const Shape& sh,
                                int H, int W, const EncoderSource* encoder, std::vector<std::int64_t> te_lengths,
-                               std::size_t& denoise, Result& r) const {
+                               std::size_t& denoise, Result& r, std::size_t staging_growth = 0) const {
     const bool ctl_encode = models.ctl != nullptr && !request.control.images.empty();
     denoise = denoise_need(sh, H, W, d, models.ctl, request.accel.step_cache_on());
     Pipeline::Impl::PlanCall pc;
@@ -295,6 +297,7 @@ struct Session::State {
     const std::size_t lat = latent_bytes_of(H, W), img = image_bytes_of(H, W);
     pc.host_buffers = static_cast<std::size_t>(sh.host_tokens) * qwen35_text::kHidden * 2 + 2 * lat + img;
     if (ctl_encode) pc.host_buffers += request.control.images.size() * (lat + img);
+    pc.host_buffers += staging_growth;  // a run's pinned staging grown beyond what the session holds
     return m.plan_call(models, pc, d.block_path, r);
   }
 
@@ -308,11 +311,12 @@ struct Session::State {
     m.setup_arena(r.plan, planned.kept, true, planned.drop_resident, r);
   }
 
-  // setup_models, then switch_merges for a loaded DiT of the call's source (as Pipeline::run).
-  Pipeline::Impl::CallModels models_for(const Request& q, Result& r) {
+  // setup_models, then for a run (the only call that runs the DiT) switch_merges for a loaded DiT of the call's source,
+  // as Pipeline::run.
+  Pipeline::Impl::CallModels models_for(const Request& q, Result& r, bool for_run = false) {
     check_user_paths(m.options, q);
     Pipeline::Impl::CallModels models = m.setup_models(q, r);
-    if (m.dit && m.dit_src == models.src && m.dit_merge_key != models.merge_key) m.switch_merges(models.merge_key, r.timings);
+    if (for_run && m.dit && m.dit_src == models.src && m.dit_merge_key != models.merge_key) m.switch_merges(models.merge_key, r.timings);
     return models;
   }
 
@@ -417,12 +421,15 @@ void Session::validate(const RunSpec& spec, const SessionOptions& options) {
   }
   if (moss) {
     if (n > 2 || latents != 1) throw std::invalid_argument("MOSS guidance takes 1 or 2 rows (cond, uncond) on latent 0.");
+    if (!spec.rows[0].skip_layers.empty()) {
+      throw std::invalid_argument("MOSS guidance: rows[0] is the cond row, which skips no blocks (mi_generate's layout).");
+    }
     if (spec.output != StepOutput::kRows && n == 2 && spec.cfg == 1.0) {
       throw std::invalid_argument("Guided outputs with an uncond row need cfg != 1.");
     }
   } else {
     if (spec.output != StepOutput::kRows) throw std::invalid_argument("Guided outputs need MOSS guidance.");
-    if (spec.cfg != 3.0 || !spec.slg_layers.empty() || spec.slg_scale != 0.0 || spec.slg_start != 0.0 ||
+    if (spec.cfg != kDefaultRunCfg || !spec.slg_layers.empty() || spec.slg_scale != 0.0 || spec.slg_start != 0.0 ||
         spec.slg_stop != 1.0 || spec.cfg_truncation != 1.0) {
       throw std::invalid_argument("HOST guidance keeps cfg, slg_* and cfg_truncation at their defaults (the host guides).");
     }
@@ -517,6 +524,7 @@ std::vector<std::shared_ptr<const Conditioning>> Session::encode_texts(std::span
     if (m.te->options().source == qwen35_text::WeightSource::kFile && m.learner && !m.options.direct_io) {
       m.learner->observe_te_stream(planner::weights_cached_from_stream(st.weight_bytes, st.weight_load_s, st.weight_wait_s, r.hardware));
     }
+    if (m.learner) m.learner->end_generation();  // this call's observations committed (as a generate's end)
     for (std::size_t k = 0; k < missing.size(); ++k) {
       auto e = std::make_shared<Embedding>();
       e->hidden = qwen35_text::kHidden;
@@ -569,7 +577,7 @@ void Session::begin_run(const RunSpec& spec) {
   const Shape sh = run_shape(spec, g, n, false);
 
   // Models, the DiT's call setup and the plan, as Pipeline::run plans the equivalent request.
-  const Pipeline::Impl::CallModels models = s.models_for(req, r);
+  const Pipeline::Impl::CallModels models = s.models_for(req, r, true);
   const Request previous = std::exchange(s.request, req);  // the plan reads the run's control images
   struct Restore {
     State& s;
@@ -583,38 +591,62 @@ void Session::begin_run(const RunSpec& spec) {
   const bool ctl_encode = models.ctl != nullptr && !spec.control_images.empty();
   const EncoderSource* enc = ctl_encode ? &m.encoder_source(*models.b, r.timings.index_load_s) : nullptr;
   if (enc != nullptr) r.vae_encoder_source = util::path_utf8(enc->file);
+  // The run's rows (by row bit), outputs and staging slots (MOSS's fixed role slots: out[1] without an uncond row has
+  // no slot), and the pinned staging the run needs: its growth counts in the plan's host buffers.
+  for (const auto& [bit, k] : evaluated_rows(spec, g, false)) R.row_bits |= 1u << bit;
+  R.outputs = spec.output == StepOutput::kRows ? std::bit_width(R.row_bits) : 1;
+  int slots = 0;
+  for (int k = 0; k < R.outputs; ++k) {
+    const bool used = spec.output != StepOutput::kRows || (R.row_bits & (1u << k)) != 0;
+    R.slot[static_cast<std::size_t>(k)] = used ? slots++ : -1;
+  }
+  const std::size_t latent = latent_bytes_of(H, W);
+  const std::size_t ctl_bytes =
+      models.ctl != nullptr ? static_cast<std::size_t>(R.latents) * static_cast<std::size_t>(models.ctl->groups()) * latent : 0;
+  R.layout = runtime::StagingLayout::plan(static_cast<std::size_t>(R.latents) * latent, slots, latent, ctl_bytes);
+  const std::size_t growth = R.layout.bytes > s.staging.bytes() ? R.layout.bytes - s.staging.bytes() : 0;
   std::size_t denoise = 0;
-  // The batch rule (a latent batch never makes the DiT stream more than its latent-0 rows alone) and the crop rule
-  // (MI_RUN_CROPS's bound never does either): each plans its reference first, then the run's own plan decides.
-  int batch_ref = -1, crop_ref = -1;
+  // The batch rule (a latent batch never makes the DiT stream more bytes per step than its latent-0 rows alone) and the
+  // crop rule (MI_RUN_CROPS's bound never keeps fewer DiT blocks resident): each plans its reference first, then the
+  // run's own plan decides.
+  std::optional<std::size_t> batch_ref;
+  int crop_ref = -1;
   if (R.latents > 1) {
-    s.plan(models, d, run_shape(spec, g, n, true), H, W, enc, {}, denoise, r);
-    batch_ref = resident_blocks(r.plan.dit);
+    s.plan(models, d, run_shape(spec, g, n, true), H, W, enc, {}, denoise, r, growth);
+    batch_ref = r.plan.dit.stream_bytes;
   }
   if (spec.crops) {
     Shape plain = sh;
     plain.crops = false;
-    s.plan(models, d, plain, H, W, enc, {}, denoise, r);
+    s.plan(models, d, plain, H, W, enc, {}, denoise, r, growth);
     crop_ref = resident_blocks(r.plan.dit);
   }
-  const Pipeline::Impl::Planned planned = s.plan(models, d, sh, H, W, enc, {}, denoise, r);
+  const Pipeline::Impl::Planned planned = s.plan(models, d, sh, H, W, enc, {}, denoise, r, growth);
   const int blocks = resident_blocks(r.plan.dit);
-  if (blocks < batch_ref) {
-    throw std::invalid_argument("A latent batch of " + std::to_string(R.latents) + " would keep " + std::to_string(blocks) +
-                                " DiT blocks resident, fewer than the " + std::to_string(batch_ref) +
-                                " of its latent-0 rows alone: run one latent per run instead.");
+  if (batch_ref && r.plan.dit.stream_bytes > *batch_ref) {
+    throw std::invalid_argument("A latent batch of " + std::to_string(R.latents) + " would stream " +
+                                std::to_string(r.plan.dit.stream_bytes) + " bytes of DiT weights per step, more "
+                                "than the " + std::to_string(*batch_ref) + " of its latent-0 rows alone: run one latent per "
+                                "run instead.");
   }
   if (blocks < crop_ref) {
     throw std::invalid_argument("MI_RUN_CROPS's crop workspace would keep " + std::to_string(blocks) +
                                 " DiT blocks resident, fewer than the " + std::to_string(crop_ref) + " without it.");
   }
   s.apply_plan(models, planned, r);
+  s.staging.ensure(R.layout.bytes, s.staging_budget());  // planned: before any load
+  R.block = s.staging.block();
 
   // Control images (encoded before the DiT load, as Pipeline::run), then the DiT.
   std::vector<std::vector<float>> ctl_lat;
   if (ctl_encode) {
     s.enter(Phase::kDecode);
-    ctl_lat = m.encode_controls(*enc, *models.ctl, req, H, W, r);
+    try {
+      ctl_lat = m.encode_controls(*enc, *models.ctl, req, H, W, r, s.gate.cancel_flag());
+    } catch (const flux2_vae_encoder::Cancelled&) {
+      throw SessionCancelled("the control-image encode was cancelled");
+    }
+    if (s.cancelled()) throw SessionCancelled("the run was cancelled");
   }
   s.enter(Phase::kDitLoad);
   const moss_dit::Residency residency = m.dit_residency(r.plan.dit);
@@ -646,9 +678,7 @@ void Session::begin_run(const RunSpec& spec) {
     dr.text = refined_of.at(row.conditioning.get());
     dr.latent = row.latent;
     dr.skip = R.moss ? (bit == 2 ? g.slg_layers : bit == 1 ? moss_dit::SkipSet{} : skip_set(row.skip_layers)) : skip_set(row.skip_layers);
-    R.row_bits |= 1u << bit;
   }
-  R.outputs = spec.output == StepOutput::kRows ? std::bit_width(R.row_bits) : 1;
   const std::int64_t lat = moss_dit::kLatentChannels;
   R.x = R.latents == 1 ? arena.alloc_tensor(DType::kF32, {lat, R.h, R.w})
                        : arena.alloc_tensor(DType::kF32, {R.latents, lat, R.h, R.w});
@@ -682,20 +712,8 @@ void Session::begin_run(const RunSpec& spec) {
   MI_CUDA_CHECK(cudaStreamSynchronize(stream));
   m.sample_memory();
 
-  // The host side: the pinned staging (grown to the largest run), the device-pointer check and the step bookkeeping.
-  // Output k's staging slot: none for a row the run lacks (MOSS's fixed role slots: out[1] without an uncond row).
-  int slots = 0;
-  for (int k = 0; k < R.outputs; ++k) {
-    const bool used = spec.output != StepOutput::kRows || (R.row_bits & (1u << k)) != 0;
-    R.slot[static_cast<std::size_t>(k)] = used ? slots++ : -1;
-  }
-  const std::size_t latent = static_cast<std::size_t>(lat * R.h * R.w) * sizeof(float);
-  R.layout = runtime::StagingLayout::plan(R.x.nbytes(), slots, latent, R.ctl != nullptr ? R.ctl_extra.nbytes() : 0);
-  s.staging.ensure(R.layout.bytes, s.staging_budget());
-  R.block = s.staging.block();
-  int device = 0;
-  MI_CUDA_CHECK(cudaGetDevice(&device));
-  R.check = std::make_unique<runtime::DevicePointerCheck>(device);
+  // The device-pointer check (the engine's device) and the step bookkeeping.
+  R.check = std::make_unique<runtime::DevicePointerCheck>(s.options.device);
   R.stepped.assign(static_cast<std::size_t>(n), 0);
   s.shape = sh;
   clear.keep = true;
@@ -706,31 +724,37 @@ void Session::begin_run(const RunSpec& spec) {
 
 RunInfo Session::run_info() const {
   const State& s = *s_;
-  if (!s.run) throw std::logic_error("no run is open");
-  const Run& R = *s.run;
   RunInfo i;
-  i.latent_height = static_cast<int>(R.h);
-  i.latent_width = static_cast<int>(R.w);
-  i.steps = R.schedule->steps();
-  i.outputs = R.outputs;
-  i.rows = R.row_bits;
-  i.schedule_matches = R.schedule_matches;
-  i.off_schedule_calls = R.schedule->off_schedule_calls();
-  i.calls = R.schedule->calls();
-  i.control_channels = R.ctl != nullptr ? R.ctl->groups() * control::kGroupChannels : 0;
-  i.latents = R.latents;
-  i.staging_bytes = R.layout.bytes;
+  s.gate.read_run([&] {
+    const Run& R = *s.run;
+    i.latent_height = static_cast<int>(R.h);
+    i.latent_width = static_cast<int>(R.w);
+    i.steps = R.schedule->steps();
+    i.outputs = R.outputs;
+    i.rows = R.row_bits;
+    i.schedule_matches = R.schedule_matches;
+    i.off_schedule_calls = R.schedule->off_schedule_calls();
+    i.calls = R.schedule->calls();
+    i.control_channels = R.ctl != nullptr ? R.ctl->groups() * control::kGroupChannels : 0;
+    i.latents = R.latents;
+    i.staging_bytes = R.layout.bytes;
+  });
   return i;
 }
 
 const std::vector<float>& Session::run_sigmas() const {
-  if (!s_->run) throw std::logic_error("no run is open");
-  return s_->run->schedule->sigmas();
+  const std::vector<float>* sigmas = nullptr;
+  s_->gate.read_run([&] { sigmas = &s_->run->schedule->sigmas(); });
+  return *sigmas;
 }
 
 StagingViews Session::staging() const {
-  if (!s_->run) throw std::logic_error("no run is open");
-  const Run& R = *s_->run;
+  StagingViews v;
+  s_->gate.read_run([&] { v = staging_views(*s_->run); });
+  return v;
+}
+
+StagingViews Session::staging_views(const Run& R) {
   StagingViews v;
   std::byte* base = R.block.base;
   const std::int64_t lat = moss_dit::kLatentChannels;
@@ -792,7 +816,7 @@ StepReport Session::step(const StepArgs& a) {
   const std::int64_t hc = x.dim(-2), wc = x.dim(-1);
   const bool crop = hc != R.h || wc != R.w;
   if (crop && R.moss) throw std::invalid_argument("Crop calls (x smaller than the run's size) need HOST guidance.");
-  const StagingViews views = staging();
+  const StagingViews views = staging_views(R);
   const auto same_memory = [&](const Tensor& t, const std::string& what) {
     if ((t.device == Device::kCUDA) != device) throw std::invalid_argument(what + ": tensors must all be device or all host memory.");
   };
@@ -823,6 +847,12 @@ StepReport Session::step(const StepArgs& a) {
     same_memory(o, what);
     host_slot(o, views.out[static_cast<std::size_t>(k)], what);
     if (overlaps(o, x)) throw std::invalid_argument(what + " overlaps x.");
+    if (a.control.data != nullptr && overlaps(o, a.control)) throw std::invalid_argument(what + " overlaps control.");
+    for (const int j : out_index) {
+      if (j < k && overlaps(o, a.out[static_cast<std::size_t>(j)])) {
+        throw std::invalid_argument(what + " overlaps out[" + std::to_string(j) + "].");
+      }
+    }
   }
   const int channels = R.ctl != nullptr ? R.ctl->groups() * control::kGroupChannels : 0;
   if (a.control.data != nullptr) {
@@ -894,6 +924,12 @@ StepReport Session::step(const StepArgs& a) {
         return rank3 ? Tensor::view(p, DType::kF32, Device::kCUDA, {channels, hh, ww})
                      : Tensor::view(p, DType::kF32, Device::kCUDA, {l, channels, hh, ww});
       };
+      // The DiT's control input changed source since the last full call: the next reuse needs a full call.
+      if (!crop && R.cache && R.last_control != Run::Control::kNone &&
+          R.last_control != (a.control.data != nullptr ? Run::Control::kCall : Run::Control::kRun)) {
+        R.cache->invalidate();
+      }
+      if (!crop) R.last_control = a.control.data != nullptr ? Run::Control::kCall : Run::Control::kRun;
       if (a.control.data != nullptr && device) {
         m.control_ext.extra = a.control;
       } else if (a.control.data != nullptr) {
@@ -911,6 +947,7 @@ StepReport Session::step(const StepArgs& a) {
           if (l > 1) MI_CUDA_CHECK(cudaMemsetAsync(R.ctl_extra.data, 0, R.ctl_extra.nbytes(), stream));
           R.ctl_in->rewrite(first, stream);
           R.ctl_dirty = false;
+          if (R.cache) R.cache->invalidate();
         }
         // A control window opened or closed: the DiT's input changed, so the next call runs in full (as mi_generate).
         if (R.ctl_in->apply(first, pos.step, n, stream) > 0 && R.cache) R.cache->invalidate();
@@ -948,9 +985,10 @@ StepReport Session::step(const StepArgs& a) {
     throw SessionCancelled("the step was cancelled");
   } catch (...) {
     sync_quietly(stream);
+    if (R.cache) R.cache->invalidate();
     throw;
   }
-  R.schedule->commit(pos);
+  s.gate.locked([&] { R.schedule->commit(pos); });  // run_info reads the counters under the gate
   R.stepped[static_cast<std::size_t>(pos.step)] = 1;
   StepReport rep;
   rep.step = pos.step;
@@ -1030,9 +1068,7 @@ void Session::vae_encode(const Image& image, const Tensor& latents) {
   }
   expect_tensor(latents, DType::kF32, {moss_dit::kLatentChannels, H / 16, W / 16}, "latents");
   if (latents.device == Device::kCUDA) {
-    int device = 0;
-    MI_CUDA_CHECK(cudaGetDevice(&device));
-    runtime::DevicePointerCheck(device).check(latents.data, latents.nbytes(), "latents");
+    runtime::DevicePointerCheck(s.options.device).check(latents.data, latents.nbytes(), "latents");
   }
   Pipeline::Impl& m = s.m;
   Result r;
@@ -1046,7 +1082,12 @@ void Session::vae_encode(const Image& image, const Tensor& latents) {
   std::size_t denoise = 0;
   s.apply_plan(models, s.plan(models, d, *s.shape, H, W, &enc, {}, denoise, r), r);
   PassReport pass;
-  const std::vector<float> z = m.encode_image(enc, image, pass, r.timings);
+  std::vector<float> z;
+  try {
+    z = m.encode_image(enc, image, pass, r.timings, s.gate.cancel_flag());
+  } catch (const flux2_vae_encoder::Cancelled&) {
+    throw SessionCancelled("the encode was cancelled");
+  }
   MI_CUDA_CHECK(cudaMemcpy(latents.data, z.data(), latents.nbytes(), cudaMemcpyDefault));
   s.finish_report(r);
 }
@@ -1063,9 +1104,7 @@ void Session::vae_decode(const Tensor& latents, const Tensor& rgb) {
   }
   expect_tensor(rgb, DType::kU8, {H, W, 3}, "rgb");
   if (latents.device == Device::kCUDA || rgb.device == Device::kCUDA) {
-    int device = 0;
-    MI_CUDA_CHECK(cudaGetDevice(&device));
-    const runtime::DevicePointerCheck check(device);
+    const runtime::DevicePointerCheck check(s.options.device);
     if (latents.device == Device::kCUDA) check.check(latents.data, latents.nbytes(), "latents");
     if (rgb.device == Device::kCUDA) check.check(rgb.data, rgb.nbytes(), "rgb");
   }
@@ -1083,13 +1122,17 @@ void Session::vae_decode(const Tensor& latents, const Tensor& rgb) {
   MI_CUDA_CHECK(cudaMemcpy(lat.data(), latents.data, latents.nbytes(), cudaMemcpyDefault));
   m.ensure_vae(*models.vs, r.plan.vae.stack_bytes, r.plan.dit.park_for_decode, r.timings);
   std::vector<std::uint8_t> out;
+  struct ResetCancel {
+    Pipeline::Impl& m;
+    ~ResetCancel() {
+      if (m.vae) m.vae->set_cancel(nullptr);
+    }
+  } reset_cancel{m};
   try {
     m.decode_image(lat, H, W, out, s.gate.cancel_flag(), r.timings);
   } catch (const flux2_vae::Cancelled&) {
-    if (m.vae) m.vae->set_cancel(nullptr);
     throw SessionCancelled("the decode was cancelled");
   }
-  if (m.vae) m.vae->set_cancel(nullptr);
   MI_CUDA_CHECK(cudaMemcpy(rgb.data, out.data(), rgb.nbytes(), cudaMemcpyDefault));
   s.finish_report(r);
 }

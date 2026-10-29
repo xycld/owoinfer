@@ -110,6 +110,10 @@ TEST(Session, RefusesGuidanceMismatches) {
   ml.guidance = GuidanceMode::kMoss;
   ml.rows[1].latent = 1;
   refused(ml, options(3, 2), "on latent 0");
+  RunSpec cond_skip = host_spec(2);
+  cond_skip.guidance = GuidanceMode::kMoss;
+  cond_skip.rows[0].skip_layers = {5};
+  refused(cond_skip, options(), "rows[0] is the cond row, which skips no blocks");
   RunSpec g1 = host_spec(2);
   g1.guidance = GuidanceMode::kMoss;
   g1.output = StepOutput::kGuidedDenoised;

@@ -46,6 +46,9 @@ inline constexpr std::int64_t kMaxCallTokens = moss_dit::kMaxRunRows;
 // Rows of a run and of a call (MI_MAX_ROWS), latents included.
 inline constexpr int kMaxSessionRows = moss_dit::kMaxRows;
 
+// mi_run_params.cfg's default: a HOST run keeps it (the host guides).
+inline constexpr double kDefaultRunCfg = 3.0;
+
 // A session call stopped by the gate's cancel flag (JobGate::cancel, or an ending that cancels the call in flight):
 // MI_CANCELLED. The session and an open run stay usable.
 struct SessionCancelled : std::runtime_error {
@@ -73,6 +76,8 @@ struct SessionOptions {
   // Before each phase a call runs (kTextEncoder: encode_texts; kDitLoad: begin_run; kDecode: the VAE calls and control
   // image encodes); returning false cancels the call. Never kDenoise.
   std::function<bool(Phase)> on_phase;
+  // The engine's device (mi_engine_params.device_index): host device tensors must be its memory.
+  int device = 0;
 };
 
 enum class GuidanceMode {
@@ -110,7 +115,7 @@ struct RunSpec {
   bool exact_sigma = false;  // MI_RUN_EXACT_SIGMA: refuse a sigma that is not an exact schedule entry
   bool crops = false;        // MI_RUN_CROPS: the plan reserves crop_workspace_bound (refused when it costs residency)
   // MOSS only (HOST keeps these defaults).
-  double cfg = 3.0;
+  double cfg = kDefaultRunCfg;
   std::vector<int> slg_layers;
   double slg_scale = 0.0;
   double slg_start = 0.0;
@@ -189,6 +194,8 @@ class Session {
   // the gate must outlive the session. Throws std::invalid_argument for invalid options (nothing opened).
   Session(Pipeline& pipeline, runtime::JobGate& gate, SessionOptions options);
   // close(), errors swallowed (from the running call's own thread nothing is closed: call close() first).
+  // P2: the C ABI must make destroying the session from the running call's own thread impossible (mi_engine_free stays
+  // forbidden from a callback; mi_session_close returns MI_ERR_BUSY there and keeps the session).
   ~Session();
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;
@@ -208,7 +215,8 @@ class Session {
   // (the spec, the token cap, a batch or crop bound that would keep fewer DiT blocks resident), planner::BudgetError,
   // SessionCancelled (no run), JobGate::Busy / Refused.
   void begin_run(const RunSpec& spec);
-  // The open run's facts, schedule and staging views (std::logic_error without a run). Not jobs: read between steps.
+  // The open run's facts, schedule and staging views, read under the gate (JobGate::read_run: Refused without an open
+  // run or once its ending began). Not jobs: they do not wait for a step. The views stay valid until end_run.
   RunInfo run_info() const;
   const std::vector<float>& run_sigmas() const;
   StagingViews staging() const;
@@ -235,6 +243,7 @@ class Session {
  private:
   struct State;
   struct Run;
+  static StagingViews staging_views(const Run& run);
   std::unique_ptr<State> s_;
 };
 

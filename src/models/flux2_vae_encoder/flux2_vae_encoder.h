@@ -38,6 +38,8 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <atomic>
+#include <stdexcept>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -65,6 +67,11 @@ enum class LatentMode {
   kSample,  // mean + std * noise, noise = torch.randn([1, 32, H/8, W/8], generator=torch.Generator("cpu").manual_seed(seed))
 };
 
+// An encode saw EncodeOptions::cancel. The encoder stays usable.
+struct Cancelled : std::runtime_error {
+  Cancelled() : std::runtime_error("flux2_vae_encoder: encode cancelled") {}
+};
+
 struct EncodeOptions {
   LatentMode mode = LatentMode::kMean;
   std::uint64_t seed = 0;  // kSample only
@@ -73,7 +80,9 @@ struct EncodeOptions {
   // through the encoder's 30-conv chain (below the 0.99999 bar at 1456^2 and up). kTf32 is ~2.3x faster.
   vae::ConvMath conv = vae::ConvMath::kTf32x3;
   vae::AttnPrecision attention = vae::AttnPrecision::kTf32x3;
-  bool fast_linears = false;  // attention linears in TF32 instead of strict fp32
+  bool fast_linears = false;
+  // Checked before each level and between bands (Cancelled; the work queued so far completes). nullptr: none.
+  const std::atomic<bool>* cancel = nullptr;  // attention linears in TF32 instead of strict fp32
 };
 
 // Debug/parity hook, called with each checkpoint: "down_blocks.0" ... "down_blocks.2" (after the downsampler),
