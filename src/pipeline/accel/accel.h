@@ -24,9 +24,9 @@
 // with a row the cache has not computed yet (the first call, the SLG row entering its window, a changed skip set) runs
 // every block, as does the call after invalidate() (the pipeline's: a control input's step window opened or closed);
 // a row absent from a call loses its residuals, so a row identity that comes back never gets a stale R. The decision
-// needs one device-to-host synchronization per call. Works with every block path (CUDA graphs: block 0 replays, the hook runs
-// between graphs), streamed blocks (a reuse ends the streaming pass after block 0), LoRA side branches and INT8/INT4
-// blocks: the hook only reads and writes the residual stream.
+// needs one device-to-host synchronization per call. Works with every block path (CUDA graphs: block 0 replays, the
+// hook runs between graphs), streamed blocks (a reuse ends the streaming pass after block 0), LoRA side branches and
+// INT8/INT4 blocks: the hook only reads and writes the residual stream.
 // TeaCache (Liu et al. 2024, "Timestep Embedding Tells: It's Time to Cache for Video Diffusion Model") is not offered:
 // its skip test rescales the modulated-input distance with a polynomial fitted per model, and no fit for MOSS-Image
 // exists; FBCache needs no calibration.
