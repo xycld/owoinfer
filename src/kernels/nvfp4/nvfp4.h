@@ -84,16 +84,20 @@ void quantize_nvfp4(const __nv_bfloat16* x, std::int64_t ldx, const Nvfp4Act& ou
 // norm_weight, mod_scale, mod_shift: contiguous 16-byte aligned bf16 [k]. Layout rules as quantize_nvfp4, plus
 // kernels::rms_norm_moss's row-length limit, and the same row-count requirement as
 // quant::rms_norm_modulate_rotate_quantize: bit-exact only against a norm over the same m rows (one call per tensor
-// the reference normalizes as one).
+// the reference normalizes as one). y (optional): the bf16 norm output is also stored there (row stride ldy, 16-byte
+// aligned, ldy % 8 == 0, not overlapping x), bit for bit kernels::rms_norm_modulate_moss's (a LoRA side branch's input).
 void rms_norm_modulate_quantize_nvfp4(const __nv_bfloat16* x, std::int64_t ldx, const __nv_bfloat16* norm_weight,
                                       const __nv_bfloat16* mod_scale, const __nv_bfloat16* mod_shift,
-                                      const Nvfp4Act& out, std::int64_t m, int k, cudaStream_t stream);
+                                      const Nvfp4Act& out, std::int64_t m, int k, cudaStream_t stream,
+                                      __nv_bfloat16* y = nullptr, std::int64_t ldy = 0);
 
 // The ffn_down input, fused: kernels::situ_glu of the [hidden | gate] ffn_up_gate output (bf16 [m, 2F], row stride
 // ld: the E1 GEMM output), then quantize_nvfp4 of the bf16 [m, F] result, bit for bit, without storing it. k = F.
-// Needs F % 32 == 0, F <= kMaxQuantizeK, 16-byte aligned up_gate with ld % 8 == 0 and ld >= 2F.
+// Needs F % 32 == 0, F <= kMaxQuantizeK, 16-byte aligned up_gate with ld % 8 == 0 and ld >= 2F. ffn (optional): the
+// bf16 [m, F] SiTU-GLU output is also stored there (row stride ldf, 16-byte aligned, ldf % 8 == 0, not overlapping
+// up_gate), bit for bit kernels::situ_glu's.
 void situ_glu_quantize_nvfp4(const __nv_bfloat16* up_gate, std::int64_t ld, const Nvfp4Act& out, std::int64_t m,
-                             int f, cudaStream_t stream);
+                             int f, cudaStream_t stream, __nv_bfloat16* ffn = nullptr, std::int64_t ldf = 0);
 
 // ---- GEMMs (sm_120a) ----
 
