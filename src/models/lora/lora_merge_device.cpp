@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,21 @@ std::size_t chunk_bytes(const Plan& p, std::int64_t rows, bool host_weight) {
          (host_weight ? align_up(static_cast<std::size_t>(rows * p.k) * sizeof(std::uint16_t)) : 0);
 }
 
+// Rows per chunk for `scratch_bytes` of scratch: the most that fit (whole row tiles, or all n rows), counting the
+// chunk regions' real alignment padding; 0 when not even one row tile (or all n rows below one tile) fits.
+std::int64_t chunk_rows(const Plan& p, std::int64_t n, bool host_weight, std::size_t scratch_bytes) {
+  const std::size_t fixed = fixed_bytes(p);
+  if (scratch_bytes < fixed) return 0;
+  const std::size_t per_row = static_cast<std::size_t>(p.rank) * sizeof(float) + (host_weight ? static_cast<std::size_t>(p.k) * 2 : 0);
+  if (per_row == 0) return n;  // nothing to merge
+  std::int64_t chunk = std::min(n, static_cast<std::int64_t>((scratch_bytes - fixed) / per_row));
+  if (chunk < n) chunk = chunk / kRowTile * kRowTile;
+  while (chunk > 0 && fixed + chunk_bytes(p, chunk, host_weight) > scratch_bytes) {
+    chunk = chunk % kRowTile == 0 ? chunk - kRowTile : chunk / kRowTile * kRowTile;
+  }
+  return chunk;
+}
+
 std::int64_t rows_of(const LoraStack& stack, std::string_view module) {
   const TargetModule* t = stack.model().find(module);
   if (t == nullptr) fail("no module '" + std::string(module) + "' in the model");
@@ -70,6 +86,11 @@ bool device_mergeable(const LoraStack& stack, std::string_view module) { return 
 std::size_t device_merge_min_scratch(const LoraStack& stack, std::string_view module, bool host_weight) {
   const Plan p = plan_of(stack, module);
   return fixed_bytes(p) + chunk_bytes(p, std::min(kRowTile, rows_of(stack, module)), host_weight);
+}
+
+std::int64_t device_merge_chunk_rows(const LoraStack& stack, std::string_view module, bool host_weight,
+                                     std::size_t scratch_bytes) {
+  return chunk_rows(plan_of(stack, module), rows_of(stack, module), host_weight, scratch_bytes);
 }
 
 std::size_t device_merge_full_scratch(const LoraStack& stack, std::string_view module, bool host_weight) {
@@ -92,15 +113,8 @@ int merge_bf16_device(const LoraStack& stack, std::string_view module, std::uint
     fail("merge_bf16_device: null weight or unaligned scratch for '" + std::string(module) + "'");
   }
   const std::size_t fixed = fixed_bytes(p);
-  std::int64_t chunk = 0;
-  if (scratch_bytes >= fixed) {
-    const std::size_t per_row = static_cast<std::size_t>(p.rank) * sizeof(float) + (host_weight ? static_cast<std::size_t>(k) * 2 : 0);
-    // Alignment padding of the two chunk regions: up to 2 * kAlign.
-    const std::size_t room = scratch_bytes - fixed;
-    chunk = room > 2 * kAlign ? static_cast<std::int64_t>((room - 2 * kAlign) / per_row) : 0;
-    chunk = std::min(n, chunk / kRowTile * kRowTile);
-  }
-  if (chunk <= 0 || fixed + chunk_bytes(p, chunk, host_weight) > scratch_bytes) {
+  const std::int64_t chunk = chunk_rows(p, n, host_weight, scratch_bytes);
+  if (chunk <= 0) {
     fail("merge_bf16_device: " + std::to_string(scratch_bytes) + " bytes of scratch are too few for '" +
          std::string(module) + "' (" + std::to_string(device_merge_min_scratch(stack, module, host_weight)) + " needed)");
   }
@@ -117,6 +131,15 @@ int merge_bf16_device(const LoraStack& stack, std::string_view module, std::uint
   std::vector<std::byte> head(p.bounds.size() * sizeof(int) + p.coef.size() * sizeof(float));
   std::memcpy(head.data(), p.bounds.data(), p.bounds.size() * sizeof(int));
   std::memcpy(head.data() + p.bounds.size() * sizeof(int), p.coef.data(), p.coef.size() * sizeof(float));
+  // On an exception once work is queued (a CUDA error, a bad factor read between chunks), wait for that work before
+  // the caller frees or reuses the scratch and the weight.
+  struct SyncOnThrow {
+    cudaStream_t stream;
+    int pending = std::uncaught_exceptions();
+    ~SyncOnThrow() {
+      if (std::uncaught_exceptions() > pending) static_cast<void>(cudaStreamSynchronize(stream));
+    }
+  } sync_on_throw{stream};
   MI_CUDA_CHECK(cudaMemsetAsync(bad, 0, sizeof(int), stream));
   MI_CUDA_CHECK(cudaMemcpyAsync(params, head.data(), head.size(), cudaMemcpyHostToDevice, stream));
   {

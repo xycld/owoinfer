@@ -659,6 +659,30 @@ TEST(LoraKernels, DeviceMergeEqualsHostMerge) {
                                    nullptr), LoraError);
     MI_CUDA_CHECK(cudaFreeHost(pinned));
   }
+  // Exactly the minimum and exactly the full scratch, for both weight locations: one row tile per chunk at the
+  // minimum, every row in one chunk at full, one byte less than the minimum is too few; the merge is the same.
+  for (const bool host : {false, true}) {
+    const std::size_t lo = device_merge_min_scratch(s, module, host), hi = device_merge_full_scratch(s, module, host);
+    EXPECT_EQ(device_merge_chunk_rows(s, module, host, hi), kD) << host;
+    EXPECT_EQ(device_merge_chunk_rows(s, module, host, hi - 1), kD - 32) << host;
+    EXPECT_EQ(device_merge_chunk_rows(s, module, host, lo), 32) << host;
+    EXPECT_EQ(device_merge_chunk_rows(s, module, host, lo - 1), 0) << host;
+    for (const std::size_t bytes : {lo, hi}) {
+      DeviceBuffer sb(bytes);
+      std::uint16_t* wp = nullptr;
+      if (host) {
+        MI_CUDA_CHECK(cudaMallocHost(&wp, base.size() * 2));
+      } else {
+        MI_CUDA_CHECK(cudaMalloc(&wp, base.size() * 2));
+      }
+      MI_CUDA_CHECK(cudaMemcpy(wp, base.data(), base.size() * 2, cudaMemcpyDefault));
+      EXPECT_EQ(merge_bf16_device(s, module, wp, kD, kD, host, sb.get(), bytes, nullptr), 3) << host << " " << bytes;
+      U16 got(base.size());
+      MI_CUDA_CHECK(cudaMemcpy(got.data(), wp, got.size() * 2, cudaMemcpyDefault));
+      EXPECT_EQ(got, want) << host << " " << bytes;
+      MI_CUDA_CHECK(host ? cudaFreeHost(wp) : cudaFree(wp));
+    }
+  }
   // Strength 0 everywhere: nothing to merge.
   s.set_strength(0, 0.0f);
   s.set_strength(1, 0.0f);

@@ -23,6 +23,10 @@ bool device_mergeable(const LoraStack& stack, std::string_view module);
 std::size_t device_merge_min_scratch(const LoraStack& stack, std::string_view module, bool host_weight);
 // Scratch that merges `module` in one chunk.
 std::size_t device_merge_full_scratch(const LoraStack& stack, std::string_view module, bool host_weight);
+// Rows merge_bf16_device takes per chunk with `scratch_bytes` of scratch (all of the module's rows from
+// device_merge_full_scratch on; 0 below device_merge_min_scratch).
+std::int64_t device_merge_chunk_rows(const LoraStack& stack, std::string_view module, bool host_weight,
+                                     std::size_t scratch_bytes);
 
 // merge_bf16 of `module` into the bf16 weight w [n, k] (rows contiguous) on the GPU, bit for bit: w in device memory
 // (merged in place), or with host_weight in pinned host memory (row chunks uploaded, merged and downloaded back). The
@@ -30,6 +34,8 @@ std::size_t device_merge_full_scratch(const LoraStack& stack, std::string_view m
 // Runs on `stream` and synchronizes it. Returns the number of adapters merged (0: w untouched). Throws LoraError for a
 // module that is not device_mergeable, a shape mismatch, too little scratch or a non-finite merged value (w is then
 // partially merged and must be discarded, as with merge_bf16); weights::FormatError for a non-finite factor.
+// The module's bias is not touched: with no bias delta merge_bf16 only widens it to fp32 and rounds it back, which
+// gives the same bits for every finite bias (merge_bf16 also refuses a non-finite bias; this path never reads it).
 int merge_bf16_device(const LoraStack& stack, std::string_view module, std::uint16_t* w, std::int64_t n, std::int64_t k,
                       bool host_weight, void* scratch, std::size_t scratch_bytes, cudaStream_t stream);
 
