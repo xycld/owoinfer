@@ -80,9 +80,9 @@ struct EncodeOptions {
   // through the encoder's 30-conv chain (below the 0.99999 bar at 1456^2 and up). kTf32 is ~2.3x faster.
   vae::ConvMath conv = vae::ConvMath::kTf32x3;
   vae::AttnPrecision attention = vae::AttnPrecision::kTf32x3;
-  bool fast_linears = false;
+  bool fast_linears = false;  // attention linears in TF32 instead of strict fp32
   // Checked before each level and between bands (Cancelled; the work queued so far completes). nullptr: none.
-  const std::atomic<bool>* cancel = nullptr;  // attention linears in TF32 instead of strict fp32
+  const std::atomic<bool>* cancel = nullptr;
 };
 
 // Debug/parity hook, called with each checkpoint: "down_blocks.0" ... "down_blocks.2" (after the downsampler),

@@ -947,7 +947,6 @@ StepReport Session::step(const StepArgs& a) {
           if (l > 1) MI_CUDA_CHECK(cudaMemsetAsync(R.ctl_extra.data, 0, R.ctl_extra.nbytes(), stream));
           R.ctl_in->rewrite(first, stream);
           R.ctl_dirty = false;
-          if (R.cache) R.cache->invalidate();
         }
         // A control window opened or closed: the DiT's input changed, so the next call runs in full (as mi_generate).
         if (R.ctl_in->apply(first, pos.step, n, stream) > 0 && R.cache) R.cache->invalidate();

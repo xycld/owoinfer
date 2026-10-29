@@ -227,7 +227,9 @@ class Session {
   StepReport step(const StepArgs& args);
 
   // The gate's ending sequence for the run: a step in flight is cancelled and waited for. Releases the run's stack,
-  // step cache and control latents; models, LoRAs and the staging stay. nullopt when no run was open.
+  // step cache and control latents; models, LoRAs and the staging stay. nullopt when no run was open. With no run
+  // open it still waits for any session call in flight (encode_texts, vae_*: the gate cannot tell them from a
+  // begin_run, whose run it would end).
   std::optional<RunResult> end_run();
 
   // RGB8 (3 channels, sides multiples of 16, the request bounds) -> model-space latents [128, H/16, W/16] F32 (host
