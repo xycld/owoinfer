@@ -38,7 +38,9 @@ std::vector<float> engine_sigmas(SchedulerKind kind, int steps, const FlowSampli
     throw std::invalid_argument("engine_sigmas: denoise strength must be in [0, 1], got " + num(strength));
   }
   std::vector<float> sigmas = make_schedule(kind, steps, fs).sigmas;
-  const int start = strength_start_step(static_cast<int>(sigmas.size()) - 1, strength);
+  const int n = static_cast<int>(sigmas.size()) - 1;
+  const int start = strength_start_step(n, strength);
+  if (start >= n) return {};  // no step left (mi_generate runs no DiT)
   sigmas.erase(sigmas.begin(), sigmas.begin() + start);
   return sigmas;
 }

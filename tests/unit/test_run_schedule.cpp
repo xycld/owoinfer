@@ -54,22 +54,29 @@ TEST(RunSchedule, EngineSigmasAtStrengthOneAreMakeSchedule) {
 }
 
 TEST(RunSchedule, EngineSigmasCropTheHeadAsImg2Img) {
-  // Pipeline::run's img2img: the strength-1 schedule without its first strength_start_step steps (not the
-  // k-diffusion tail of a longer schedule, which make_schedule's own `denoise` argument computes).
-  const FlowSampling fs{3.0, 1.0};
-  for (const SchedulerKind k : {SchedulerKind::kMoss, SchedulerKind::kKarras, SchedulerKind::kSimple}) {
-    const std::vector<float> full = mi::pipeline::make_schedule(k, 20, fs).sigmas;
-    const int n = static_cast<int>(full.size()) - 1;
-    for (const double strength : {0.5, 0.33, 0.01}) {
-      const int start = mi::pipeline::strength_start_step(n, strength);
-      const std::vector<float> want(full.begin() + start, full.end());
-      EXPECT_EQ(mi::pipeline::first_schedule_difference(mi::pipeline::engine_sigmas(k, 20, fs, strength), want),
-                mi::pipeline::kSchedulesEqual)
-          << mi::pipeline::scheduler_name(k) << " strength " << strength;
+  // Pipeline::run's img2img: the strength-1 schedule without its first strength_start_step steps (crop_schedule;
+  // not the k-diffusion tail of a longer schedule, which make_schedule's own `denoise` argument computes).
+  for (const FlowSampling fs : {FlowSampling{5.0, 1.0}, FlowSampling{3.0, 1000.0}}) {
+    for (const SchedulerKind k : {SchedulerKind::kMoss, SchedulerKind::kSimple, SchedulerKind::kNormal,
+                                  SchedulerKind::kKarras, SchedulerKind::kExponential, SchedulerKind::kBeta,
+                                  SchedulerKind::kSgmUniform}) {
+      for (const int steps : {1, 2, 20, 50}) {
+        const std::vector<float> full = mi::pipeline::make_schedule(k, steps, fs).sigmas;
+        const int n = static_cast<int>(full.size()) - 1;
+        for (const double strength : {1.0, 0.75, 0.5, 0.1}) {
+          const int start = mi::pipeline::strength_start_step(n, strength);
+          const std::vector<float> want =
+              start < n ? std::vector<float>(full.begin() + start, full.end()) : std::vector<float>{};
+          EXPECT_EQ(mi::pipeline::first_schedule_difference(mi::pipeline::engine_sigmas(k, steps, fs, strength), want),
+                    mi::pipeline::kSchedulesEqual)
+              << mi::pipeline::scheduler_name(k) << " " << steps << " steps, strength " << strength;
+        }
+        EXPECT_TRUE(mi::pipeline::engine_sigmas(k, steps, fs, 0.0).empty());  // no step left
+      }
     }
-    EXPECT_EQ(mi::pipeline::engine_sigmas(k, 20, fs, 0.5).size(), static_cast<std::size_t>(n - n / 2 + 1));
-    EXPECT_EQ(mi::pipeline::engine_sigmas(k, 20, fs, 0.0), std::vector<float>{full.back()});  // no step left
   }
+  const FlowSampling fs{3.0, 1.0};
+  EXPECT_EQ(mi::pipeline::engine_sigmas(SchedulerKind::kKarras, 20, fs, 0.5).size(), 11u);
   EXPECT_NE(mi::pipeline::first_schedule_difference(
                 mi::pipeline::engine_sigmas(SchedulerKind::kKarras, 20, fs, 0.5),
                 mi::pipeline::make_schedule(SchedulerKind::kKarras, 20, fs, 0.5).sigmas),
