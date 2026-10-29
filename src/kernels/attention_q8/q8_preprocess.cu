@@ -103,8 +103,6 @@ __global__ void __launch_bounds__(256) kv_stats_partial(PrepParams p) {
   }
 }
 
-// k_mean = bf16(sum / len), v_scale = amax / v_range and v_recp = v_range / amax (upstream's two roundings) per
-// (sequence, kv head, channel), summing the chunks in order.
 // kv_stats_partial with the MOSS per-head RMS norm + RoPE (kernels::fused::qk_norm_rope_moss) of q and k and the Q
 // quantization (quant_int8<kWarpQ, false, false>) folded in, bit for bit: the same CTA per (chunk, head, sequence)
 // and thread layout (16 rows x 16 lanes of 8 channels), so the partial sums keep their order. k is written back
@@ -171,6 +169,18 @@ __global__ void __launch_bounds__(256) norm_rope_stats_partial(PrepParams p, int
   float sum[kPack] = {}, amax[kPack] = {};
   __shared__ float s_warp_max[2][8];
   for (int step0 = 0; step0 < kStatsChunk / 16; step0 += kSteps) {
+    // Q blocks from here on start at or past the sequence's end (CTA-uniform): their tokens are all invalid, so their
+    // scale is the empty block's 1e-7 / 127 and they add nothing to the partial sums.
+    const int block_start = c * kStatsChunk + step0 * 16;
+    if (block_start >= len) {
+      if (threadIdx.x == 0) {
+        const int end = min(q_blocks, (c + 1) * kStatsChunk / kWarpQ);
+        for (int bx = block_start / kWarpQ; bx < end; ++bx) {
+          p.q_scale[(static_cast<std::int64_t>(b) * p.heads + h) * q_blocks + bx] = 0.0000001f / 127.0f;
+        }
+      }
+      break;
+    }
     float qy[kSteps][kPack];
     float qmax = 0.0000001f;
     int qrow[kSteps];
@@ -251,6 +261,8 @@ __global__ void __launch_bounds__(256) norm_rope_stats_partial(PrepParams p, int
   }
 }
 
+// k_mean = bf16(sum / len), v_scale = amax / v_range and v_recp = v_range / amax (upstream's two roundings) per
+// (sequence, kv head, channel), summing the chunks in order.
 template <bool kAmax>
 __global__ void kv_stats_finalize(PrepParams p) {
   const int h = blockIdx.x, b = blockIdx.y, ch = threadIdx.x;
