@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -53,9 +54,10 @@ TEST(Exchange, StagingLayoutAlignsEveryTensor) {
   EXPECT_EQ(l.control_bytes, 0u);
   EXPECT_EQ(l.bytes, 1024u + 3 * 768u);
   const StagingLayout c = StagingLayout::plan(2 * kMiB, 8, kMiB, 100);
-  EXPECT_EQ(c.out[7], 2 * kMiB + 7 * kMiB);
-  EXPECT_EQ(c.control, 2 * kMiB + 8 * kMiB);
-  EXPECT_EQ(c.bytes, c.control + 256);
+  EXPECT_EQ(c.control, 2 * kMiB);  // x, control, outputs
+  EXPECT_EQ(c.out[0], 2 * kMiB + 256);
+  EXPECT_EQ(c.out[7], 2 * kMiB + 256 + 7 * kMiB);
+  EXPECT_EQ(c.bytes, 2 * kMiB + 256 + 8 * kMiB);
   EXPECT_THROW(StagingLayout::plan(1000, 0, 600, 0), std::invalid_argument);
   EXPECT_THROW(StagingLayout::plan(1000, 9, 600, 0), std::invalid_argument);
   EXPECT_THROW(StagingLayout::plan(0, 1, 600, 0), std::invalid_argument);
@@ -80,8 +82,8 @@ TEST_F(GpuExchange, AcceptsDeviceMemoryInsideItsAllocation) {
   EXPECT_NO_THROW(check.check(d, kMiB, "x"));
   EXPECT_NO_THROW(check.check(p + 4096, kMiB - 4096, "out[0]"));
   const std::string past = refusal([&] { check.check(p + 4096, kMiB, "out[1]"); });
-  EXPECT_TRUE(contains(past, "out[1] needs 1048576 bytes")) << past;
-  EXPECT_TRUE(contains(refusal([&] { check.check(d, kMiB + 1, "x"); }), "allocation has 1048576"));
+  EXPECT_TRUE(contains(past, "out[1] needs 1048576 bytes, but only 1044480 are mapped")) << past;
+  EXPECT_TRUE(contains(refusal([&] { check.check(d, kMiB + 1, "x"); }), "only 1048576 are mapped"));
   MI_CUDA_CHECK(cudaFree(d));
 }
 
@@ -120,6 +122,61 @@ TEST_F(GpuExchange, RefusesHostManagedAndOtherDevicesMemory) {
   EXPECT_TRUE(contains(other, "x is memory of device 0")) << other;
   EXPECT_TRUE(contains(other, "device memory of device 1")) << other;
   MI_CUDA_CHECK(cudaFree(d));
+}
+
+TEST_F(GpuExchange, VmmTensorsMustBeMappedThroughout) {
+#ifdef _WIN32
+  GTEST_SKIP() << "driver API through dlopen: Linux only in this test";
+#else
+  // torch's expandable segments: allocations mapped back to back into one reservation, the rest of it unmapped. The
+  // pointer attributes' range is the whole reservation here; the check must follow the mapped allocations instead.
+  void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+  ASSERT_NE(lib, nullptr);
+  const auto granularity = reinterpret_cast<decltype(&cuMemGetAllocationGranularity)>(dlsym(lib, "cuMemGetAllocationGranularity"));
+  const auto reserve = reinterpret_cast<decltype(&cuMemAddressReserve)>(dlsym(lib, "cuMemAddressReserve"));
+  const auto create = reinterpret_cast<decltype(&cuMemCreate)>(dlsym(lib, "cuMemCreate"));
+  const auto map = reinterpret_cast<decltype(&cuMemMap)>(dlsym(lib, "cuMemMap"));
+  const auto set_access = reinterpret_cast<decltype(&cuMemSetAccess)>(dlsym(lib, "cuMemSetAccess"));
+  const auto unmap = reinterpret_cast<decltype(&cuMemUnmap)>(dlsym(lib, "cuMemUnmap"));
+  const auto release = reinterpret_cast<decltype(&cuMemRelease)>(dlsym(lib, "cuMemRelease"));
+  const auto address_free = reinterpret_cast<decltype(&cuMemAddressFree)>(dlsym(lib, "cuMemAddressFree"));
+  const auto attribute = reinterpret_cast<decltype(&cuPointerGetAttribute)>(dlsym(lib, "cuPointerGetAttribute"));
+  ASSERT_TRUE(granularity && reserve && create && map && set_access && unmap && release && address_free && attribute);
+  CUmemAllocationProp prop{};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = 0;
+  std::size_t g = 0;
+  ASSERT_EQ(granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM), CUDA_SUCCESS);
+  CUdeviceptr base = 0;
+  ASSERT_EQ(reserve(&base, 4 * g, 0, 0, 0), CUDA_SUCCESS);
+  CUmemGenericAllocationHandle a = 0, b = 0;
+  ASSERT_EQ(create(&a, g, &prop, 0), CUDA_SUCCESS);
+  ASSERT_EQ(create(&b, g, &prop, 0), CUDA_SUCCESS);
+  ASSERT_EQ(map(base, g, 0, a, 0), CUDA_SUCCESS);
+  ASSERT_EQ(map(base + g, g, 0, b, 0), CUDA_SUCCESS);
+  CUmemAccessDesc access{};
+  access.location = prop.location;
+  access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  ASSERT_EQ(set_access(base, 2 * g, &access, 1), CUDA_SUCCESS);
+  std::size_t range = 0;
+  ASSERT_EQ(attribute(&range, CU_POINTER_ATTRIBUTE_RANGE_SIZE, base + g), CUDA_SUCCESS);
+  std::printf("[exchange] VMM: granularity %zu, the attributes' range at chunk B: %zu bytes (the reservation: %zu)\n", g,
+              range, 4 * g);
+  const auto at = [&](std::size_t offset) { return reinterpret_cast<void*>(static_cast<std::uintptr_t>(base + offset)); };
+  const DevicePointerCheck check(0);
+  EXPECT_NO_THROW(check.check(at(0), 2 * g, "x"));              // both chunks
+  EXPECT_NO_THROW(check.check(at(g / 2), g, "out[0]"));         // across the chunk boundary
+  const std::string past = refusal([&] { check.check(at(g + g / 2), g, "out[1]"); });  // into the unmapped part
+  EXPECT_TRUE(contains(past, ("out[1] needs " + std::to_string(g) + " bytes, but only " + std::to_string(g / 2) +
+                              " are mapped").c_str()))
+      << past;
+  EXPECT_TRUE(contains(refusal([&] { check.check(at(2 * g + 16), 64, "control"); }), "control is not CUDA memory"));
+  EXPECT_EQ(unmap(base, 2 * g), CUDA_SUCCESS);
+  EXPECT_EQ(release(a), CUDA_SUCCESS);
+  EXPECT_EQ(release(b), CUDA_SUCCESS);
+  EXPECT_EQ(address_free(base, 4 * g), CUDA_SUCCESS);
+#endif
 }
 
 TEST_F(GpuExchange, RefusesMemoryOfAnotherContext) {

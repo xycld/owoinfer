@@ -3,6 +3,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <iterator>
 
@@ -67,8 +68,10 @@ struct Driver {
   decltype(&cuDeviceGetAttribute) device_attribute = nullptr;
   decltype(&cuDeviceTotalMem_v2) device_total_mem = nullptr;
   decltype(&cuDeviceGetPCIBusId) device_pci_bus_id = nullptr;
-  // Pointer attributes (pointer_info()); optional, not part of `ok`.
+  // Pointer attributes and extents (pointer_info(), mapped_device_bytes()); optional, not part of `ok`.
   decltype(&cuPointerGetAttributes) pointer_attributes = nullptr;
+  decltype(&cuMemGetAddressRange_v2) mem_address_range = nullptr;
+  decltype(&cuGetErrorName) error_name = nullptr;
   bool ok = false;
 };
 
@@ -96,6 +99,8 @@ const Driver& driver() {
     r.device_total_mem = lib.symbol<decltype(r.device_total_mem)>("cuDeviceTotalMem_v2");
     r.device_pci_bus_id = lib.symbol<decltype(r.device_pci_bus_id)>("cuDeviceGetPCIBusId");
     r.pointer_attributes = lib.symbol<decltype(r.pointer_attributes)>("cuPointerGetAttributes");
+    r.mem_address_range = lib.symbol<decltype(r.mem_address_range)>("cuMemGetAddressRange_v2");
+    r.error_name = lib.symbol<decltype(r.error_name)>("cuGetErrorName");
     // cuInit creates no context; it fails without a driver or with no visible device (CUDA_VISIBLE_DEVICES="").
     r.ok = init != nullptr && r.device_get != nullptr && r.primary_retain != nullptr && r.primary_release != nullptr &&
            r.primary_state != nullptr && r.push != nullptr && r.pop != nullptr && r.get_current != nullptr &&
@@ -221,35 +226,51 @@ std::optional<bool> primary_context_active(int device_ordinal) {
   return active != 0;
 }
 
-std::optional<void*> primary_context(int device_ordinal) {
+std::optional<void*> retain_primary_context(int device_ordinal) {
   const Driver& d = driver();
   CUdevice dev = 0;
   CUcontext ctx = nullptr;
   if (!d.ok || d.device_get(&dev, device_ordinal) != CUDA_SUCCESS || d.primary_retain(&ctx, dev) != CUDA_SUCCESS) {
     return std::nullopt;
   }
-  d.primary_release(dev);  // the caller's runtime holds its own reference: the handle stays valid
   return ctx;
 }
+
+void release_primary_context(int device_ordinal) {
+  const Driver& d = driver();
+  CUdevice dev = 0;
+  if (d.ok && d.device_get(&dev, device_ordinal) == CUDA_SUCCESS) d.primary_release(dev);
+}
+
+namespace {
+
+std::string error_text(const Driver& d, CUresult r) {
+  const char* name = nullptr;
+  if (d.error_name != nullptr && d.error_name(r, &name) == CUDA_SUCCESS && name != nullptr) return name;
+  return "CUresult " + std::to_string(static_cast<int>(r));
+}
+
+CUdeviceptr device_address(const void* p) { return static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(p)); }
+
+}  // namespace
 
 std::optional<PointerInfo> pointer_info(const void* ptr) {
   const Driver& d = driver();
   if (!d.ok || d.pointer_attributes == nullptr) return std::nullopt;
   // Zeroed first: an address the driver does not know gets the attributes' null values (and CUDA_SUCCESS), and
-  // IS_MANAGED may be written as a one-byte bool.
+  // IS_MANAGED may be written as a one-byte bool. Every attribute here exists since CUDA 9.2 (R396), older than the
+  // R450 the driver table requires.
   unsigned int type = 0, managed = 0;
   int ordinal = -1;
   CUcontext ctx = nullptr;
-  CUdeviceptr start = 0;
-  std::size_t size = 0;
   CUpointer_attribute attrs[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
-                                 CU_POINTER_ATTRIBUTE_CONTEXT, CU_POINTER_ATTRIBUTE_IS_MANAGED,
-                                 CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, CU_POINTER_ATTRIBUTE_RANGE_SIZE};
-  void* data[] = {&type, &ordinal, &ctx, &managed, &start, &size};
+                                 CU_POINTER_ATTRIBUTE_CONTEXT, CU_POINTER_ATTRIBUTE_IS_MANAGED};
+  void* data[] = {&type, &ordinal, &ctx, &managed};
   PointerInfo out;
-  if (d.pointer_attributes(static_cast<unsigned>(std::size(attrs)), attrs, data,
-                           static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(ptr))) != CUDA_SUCCESS) {
-    return out;  // unknown memory
+  if (const CUresult r = d.pointer_attributes(static_cast<unsigned>(std::size(attrs)), attrs, data, device_address(ptr));
+      r != CUDA_SUCCESS) {
+    out.driver_error = error_text(d, r);
+    return out;
   }
   out.memory_type = type == CU_MEMORYTYPE_DEVICE ? PointerInfo::kDevice
                     : type == CU_MEMORYTYPE_HOST ? PointerInfo::kHost
@@ -257,9 +278,31 @@ std::optional<PointerInfo> pointer_info(const void* ptr) {
   out.device = ordinal;
   out.context = ctx;
   out.managed = managed != 0;
-  out.range_start = static_cast<std::uintptr_t>(start);
-  out.range_size = size;
   return out;
+}
+
+std::optional<std::size_t> mapped_device_bytes(const void* ptr, std::size_t want, int device) {
+  const Driver& d = driver();
+  if (!d.ok || d.mem_address_range == nullptr || d.pointer_attributes == nullptr) return std::nullopt;
+  const CUdeviceptr begin = device_address(ptr);
+  CUdeviceptr at = begin;
+  while (at - begin < want) {
+    CUdeviceptr base = 0;
+    std::size_t size = 0;
+    if (d.mem_address_range(&base, &size, at) != CUDA_SUCCESS || size == 0 || base > at || at - base >= size) break;
+    if (at != begin) {
+      // A further allocation: device memory of the same device (a reservation may map another device's memory).
+      unsigned int type = 0;
+      int ordinal = -1;
+      CUpointer_attribute attrs[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL};
+      void* data[] = {&type, &ordinal};
+      if (d.pointer_attributes(2, attrs, data, at) != CUDA_SUCCESS || type != CU_MEMORYTYPE_DEVICE || ordinal != device) {
+        break;
+      }
+    }
+    at = base + size;
+  }
+  return std::min<std::size_t>(static_cast<std::size_t>(at - begin), want);
 }
 
 ScopedCurrentContext::ScopedCurrentContext() noexcept {

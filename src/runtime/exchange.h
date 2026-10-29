@@ -22,13 +22,18 @@ namespace mi::runtime {
 
 // Checks a host's device tensors: [ptr, ptr + bytes) must be device memory of `device` that the engine's kernels may
 // use, i.e. not managed, in the device's primary context (the CUDA runtime's, which torch and CuPy allocate in) or in
-// none (context-independent memory: VMM, as torch's expandable segments, and memory pools), and inside one allocation.
-// One driver call per check (cuPointerGetAttributes); where libcuda lacks it, the runtime's memory type and device
-// only. Construct it while the engine's runtime holds the device's primary context (any time after its first CUDA
-// call there): it looks the context's handle up once.
+// none (context-independent memory: VMM, as torch's expandable segments, and memory pools), and mapped throughout:
+// inside one allocation, or across VMM allocations mapped back to back into one reservation (never into its unmapped
+// part, which the pointer attributes' range would include). Two driver calls per check (cuPointerGetAttributes,
+// cuMemGetAddressRange), plus one pair per further VMM allocation the tensor spans; where libcuda lacks them, the
+// runtime's memory type and device only. It holds a reference to the device's primary context (retained at
+// construction, released at destruction), so the handle it compares with stays valid.
 class DevicePointerCheck {
  public:
   explicit DevicePointerCheck(int device);
+  ~DevicePointerCheck();
+  DevicePointerCheck(const DevicePointerCheck&) = delete;
+  DevicePointerCheck& operator=(const DevicePointerCheck&) = delete;
   // Throws std::invalid_argument naming `what` (e.g. "x", "out[1]") and the reason.
   void check(const void* ptr, std::size_t bytes, std::string_view what) const;
   int device() const { return device_; }
@@ -73,16 +78,16 @@ struct StagingBlock {
   bool owned = false;
 };
 
-// Where a step's tensors sit in a staging block: x, then each output, then the control latent, each at a kArenaAlign
-// (256-byte) boundary.
+// Where a step's tensors sit in a staging block: x, then the control latent, then each output, each at a kArenaAlign
+// (256-byte) boundary. A call may use a slot for a smaller shape (a crop) from the same offset.
 inline constexpr std::size_t kMaxStagingOutputs = 8;
 struct StagingLayout {
   std::size_t x = 0, x_bytes = 0;
+  std::size_t control = 0, control_bytes = 0;  // control_bytes 0: no control slot
   std::array<std::size_t, kMaxStagingOutputs> out{};
   std::size_t out_bytes = 0;  // each output
   int outputs = 0;
-  std::size_t control = 0, control_bytes = 0;  // control_bytes 0: no control slot
-  std::size_t bytes = 0;                       // the block bytes the layout needs
+  std::size_t bytes = 0;      // the block bytes the layout needs
   // x_bytes: the latents (L latents of a batch); out_bytes: one output; outputs in [1, kMaxStagingOutputs].
   // Throws std::invalid_argument otherwise.
   static StagingLayout plan(std::size_t x_bytes, int outputs, std::size_t out_bytes, std::size_t control_bytes);

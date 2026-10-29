@@ -22,7 +22,11 @@ std::string mib(std::size_t bytes) {
 }  // namespace
 
 DevicePointerCheck::DevicePointerCheck(int device) : device_(device) {
-  if (const std::optional<void*> ctx = backend::primary_context(device)) primary_ = *ctx;
+  if (const std::optional<void*> ctx = backend::retain_primary_context(device)) primary_ = *ctx;
+}
+
+DevicePointerCheck::~DevicePointerCheck() {
+  if (primary_ != nullptr) backend::release_primary_context(device_);
 }
 
 void DevicePointerCheck::check(const void* ptr, std::size_t bytes, std::string_view what) const {
@@ -39,6 +43,7 @@ void DevicePointerCheck::check(const void* ptr, std::size_t bytes, std::string_v
     if (a.device != device_) refuse(what, device_, "is memory of device " + std::to_string(a.device));
     return;
   }
+  if (!info->driver_error.empty()) refuse(what, device_, "could not be queried (cuPointerGetAttributes: " + info->driver_error + ")");
   switch (info->memory_type) {
     case backend::PointerInfo::kUnknown: refuse(what, device_, "is not CUDA memory (pageable host memory?)");
     case backend::PointerInfo::kHost: refuse(what, device_, "is page-locked host memory");
@@ -50,10 +55,10 @@ void DevicePointerCheck::check(const void* ptr, std::size_t bytes, std::string_v
   if (info->context != nullptr && primary_ != nullptr && info->context != primary_) {
     refuse(what, device_, "belongs to a CUDA context other than the device's primary context");
   }
-  const auto p = reinterpret_cast<std::uintptr_t>(ptr);
-  if (info->range_size > 0 && (p < info->range_start || bytes > info->range_size - (p - info->range_start))) {
-    refuse(what, device_, "needs " + std::to_string(bytes) + " bytes, but its allocation has " +
-                              std::to_string(info->range_start + info->range_size - p) + " from that address");
+  // The whole tensor mapped: through one allocation, or VMM allocations mapped back to back.
+  if (const std::optional<std::size_t> mapped = backend::mapped_device_bytes(ptr, bytes, device_); mapped && *mapped < bytes) {
+    refuse(what, device_, "needs " + std::to_string(bytes) + " bytes, but only " + std::to_string(*mapped) +
+                              " are mapped device memory from that address");
   }
 }
 
@@ -93,12 +98,13 @@ StagingLayout StagingLayout::plan(std::size_t x_bytes, int outputs, std::size_t 
   l.outputs = outputs;
   l.control_bytes = control_bytes;
   std::size_t at = align_up(x_bytes);
+  l.control = control_bytes > 0 ? at : 0;
+  at += align_up(control_bytes);
   for (int k = 0; k < outputs; ++k) {
     l.out[static_cast<std::size_t>(k)] = at;
     at += align_up(out_bytes);
   }
-  l.control = control_bytes > 0 ? at : 0;
-  l.bytes = at + align_up(control_bytes);
+  l.bytes = at;
   return l;
 }
 
