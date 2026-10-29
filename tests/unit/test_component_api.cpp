@@ -1116,8 +1116,9 @@ TEST_F(GpuComponentApi, RunEndFromAnotherThreadMidStep) {
   open_and_encode(q, conds);
   begin_moss_run(engine_, q, conds);
   std::size_t n_sigmas = 0;
-  const float* s = mi_run_sigmas(engine_, &n_sigmas);
-  ASSERT_NE(s, nullptr);
+  const float* run_s = mi_run_sigmas(engine_, &n_sigmas);
+  ASSERT_NE(run_s, nullptr);
+  const std::vector<float> s(run_s, run_s + n_sigmas);  // the engine's copy goes with mi_run_end
   mi_engine* const e = engine_;
   mi_status last = MI_OK;
   std::string message;
