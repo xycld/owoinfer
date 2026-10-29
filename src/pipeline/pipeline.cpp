@@ -1946,8 +1946,13 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
         m.dit->prefill_references(lat, ref_kv, stream);
         MI_CUDA_CHECK(cudaStreamSynchronize(stream));
       } catch (const moss_dit::Cancelled&) {
+        // Before the pass's first step: its starting latents (at this pass's size), as a cancel inside a step leaves them.
         tm.reference_prefill_s += since(tp);
         r.cancelled = true;
+        pass.steps_run = 0;
+        r.latents.resize(static_cast<std::size_t>(latents.numel()));
+        MI_CUDA_CHECK(cudaMemcpyAsync(r.latents.data(), latents.data, latents.nbytes(), cudaMemcpyDeviceToHost, stream));
+        MI_CUDA_CHECK(cudaStreamSynchronize(stream));
         return false;
       }
       tm.reference_prefill_s += since(tp);

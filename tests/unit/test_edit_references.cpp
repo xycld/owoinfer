@@ -11,6 +11,7 @@
 // skip without them.
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +35,7 @@
 #include "runtime/device_arena.h"
 #include "runtime/stream_set.h"
 #include "util/npy.h"
+#include "weights/test_seams.h"
 
 namespace {
 
@@ -540,6 +542,23 @@ TEST(GpuEditPipeline, AlternatingRequests) {
   h.hires.width = h.hires.height = 640;
   h.hires.steps = 2;
   EXPECT_EQ(run(h).prefills, 2);
+  {
+    // A cancel inside the second pass's prefill: the result's latents are that pass's starting latents (its size), no
+    // step of it ran.
+    std::atomic<bool> stop_flag{false};
+    mi::weights::testing::cancel_at_reference_prefill(&stop_flag, 2);
+    mi::pipeline::GenerateControl c;
+    c.cancel = &stop_flag;
+    const mi::pipeline::Result res = p.generate(h, c);
+    mi::weights::testing::cancel_at_reference_prefill(nullptr, 0);
+    EXPECT_TRUE(res.cancelled);
+    EXPECT_EQ(res.references.prefills, 1);
+    EXPECT_EQ(res.first_pass.steps_run, 3);
+    EXPECT_TRUE(res.hires.ran);
+    EXPECT_EQ(res.hires.steps_run, 0);
+    EXPECT_EQ(res.width, 640);
+    EXPECT_EQ(res.latents.size(), std::size_t{128} * (640 / 16) * (640 / 16));
+  }
   // An explicit merge on INT8 (no pristine copies): it reloads the DiT, a strength change reloads it again (no in-place
   // re-merge), and so does going back to the default placement, whose bits are the side branch's again.
   mi::pipeline::Request mq = request(true, true);

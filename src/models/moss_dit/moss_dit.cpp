@@ -20,6 +20,7 @@
 #include "models/moss_dit/dit_kernels.h"
 #include "models/moss_dit/nvfp4_support.h"
 #include "runtime/pinned_ring.h"
+#include "weights/test_seams.h"
 #include "weights/upload.h"
 
 namespace mi::moss_dit {
@@ -1465,6 +1466,7 @@ void MossDit::prefill_references(std::span<const Tensor> latents, const RefKv& o
   const FusedBlockBuffers fused{a.x, a.y, a.big, a.rope, a.mod, a.lse, a.lse_bytes};
   qa.f = fused;
   const QkvGemm qkv_gemm{&gemm_, gemm_workspace_, kernels::Gemm::kWorkspaceBytes};
+  weights::testing::before_reference_prefill();
   for (int bi = 0; bi < kLayers; ++bi) {
     if (cancel_ != nullptr) {
       if (bi >= 2) MI_CUDA_CHECK(cudaEventSynchronize(block_done_[bi % 2]));
