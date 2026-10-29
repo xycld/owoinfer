@@ -334,10 +334,16 @@ bool OutputFile::sync() {
 bool OutputFile::publish(const std::filesystem::path& target) {
   if (!ok_ || handle_ == nullptr) return false;
   // FILE_RENAME_INFO: the flags (a BOOLEAN ReplaceIfExists before Windows 10 1607's DWORD Flags), the root directory
-  // (none), the name's length in bytes and the name: the target's file name alone renames within the same folder.
+  // (none), the name's length in bytes and the name. The name must be a full path: SetFileInformationByHandle turns
+  // a Win32 path into an NT one, so a bare file name would move the file into the current directory. It is the
+  // target's name in this file's own folder as its final path gives it (\\?\ form): the rename never leaves the folder
+  // the file was created in, whatever the target's path text resolves to now.
   constexpr DWORD kReplaceIfExists = 0x1, kPosixSemantics = 0x2;
   constexpr auto kFileRenameInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
-  const std::wstring name = target.filename().native();
+  const std::filesystem::path folder = final_path(static_cast<HANDLE>(handle_)).parent_path();
+  if (folder.empty()) return false;
+  const std::filesystem::path destination = folder / target.filename();
+  const std::wstring& name = destination.native();
   std::vector<std::uint64_t> buf((offsetof(FILE_RENAME_INFO, FileName) + (name.size() + 1) * sizeof(wchar_t) + 7) / 8);
   auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buf.data());
   info->RootDirectory = nullptr;
@@ -363,6 +369,10 @@ bool OutputFile::publish(const std::filesystem::path& target) {
     if (!renamed && error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION) break;
   }
   if (!renamed) return false;
+  // The handle's final path must now be the destination: a rename that went anywhere else is a failure, never a
+  // success with no file at the target.
+  const std::filesystem::path now = final_path(static_cast<HANDLE>(handle_));
+  if (!iequals(now.native(), destination.native())) return false;
   path_ = target;
   return close();
 }

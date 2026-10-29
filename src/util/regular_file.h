@@ -159,12 +159,13 @@ class OutputFile {
   bool seek(std::uint64_t offset);  // the position of the next write (past the end: the gap reads as zeros)
   bool sync();                      // the data to stable storage (fsync; FlushFileBuffers) through the same descriptor
   bool close();
-  // A temporary file (kTemporary) renamed over `target`, beside it, replacing it atomically, then closed; false (the
-  // file left in place) when anything failed. Windows: through the open handle (opened with DELETE access):
-  // SetFileInformationByHandle(FileRenameInfoEx, REPLACE_IF_EXISTS | POSIX_SEMANTICS) to the target's name in the same
-  // folder (FileRenameInfo with ReplaceIfExists where the file system has no Ex), retried for about 200 ms while
-  // another process holds the target; nothing reopens the path. POSIX: close, then rename(2) (util::rename_replace).
-  bool publish(const std::filesystem::path& target);
+  // A temporary file (kTemporary) renamed over `target`, beside it, replacing it atomically, then closed; false when
+  // anything failed (the caller then discards it). Windows: through the open handle (opened
+  // with DELETE access): SetFileInformationByHandle(FileRenameInfoEx, REPLACE_IF_EXISTS | POSIX_SEMANTICS) to the full
+  // path of the target's name in the file's own folder (its final path's; FileRenameInfo with ReplaceIfExists where the
+  // file system has no Ex), retried for about 200 ms while another process holds the target, then the handle's final
+  // path checked to be that destination; nothing reopens the path. POSIX: close, then rename(2) (util::rename_replace).
+  [[nodiscard]] bool publish(const std::filesystem::path& target);
   // Deletes the file this object created (a temporary not published) and closes it: Windows through the open handle
   // (FileDispositionInfo), POSIX close then unlink(2). Nothing for a file it did not create.
   void discard();

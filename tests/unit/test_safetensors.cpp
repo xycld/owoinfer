@@ -1189,6 +1189,52 @@ TEST(RegularFile, WindowsFileInfoFromHandle) {
   EXPECT_EQ(mi::util::file_info(dir.path()).kind, mi::util::FileKind::kDirectory);
   EXPECT_EQ(mi::util::file_info(R"(\\.\pipe\x)").kind, mi::util::FileKind::kOther);  // refused by its text, unopened
 }
+
+// OutputFile::publish on Windows renames through the temporary's handle: the bytes appear at the target, in the
+// target's folder (never in the current directory), and the temporary is gone; an existing target is replaced, also
+// while another handle has it open with the engine readers' share mode (that reader keeps the old bytes); discard
+// leaves nothing and the target as it was.
+TEST(RegularFile, WindowsPublishRenamesInPlace) {
+  namespace fs = std::filesystem;
+  using Create = mi::util::OutputFile::Create;
+  TempDir dir("win_publish");
+  const fs::path target = dir.path() / "entry.bin";
+  const auto publish = [&](std::string_view bytes) {
+    mi::util::OutputFile out(target, Create::kTemporary);
+    EXPECT_TRUE(out.is_open());
+    const fs::path tmp = out.path();
+    EXPECT_TRUE(out.write(bytes));
+    const bool published = out.publish(target);
+    EXPECT_FALSE(mi::util::file_info(tmp).exists()) << tmp.string();
+    return published;
+  };
+  const auto contents = [&] {
+    std::string text;
+    EXPECT_EQ(mi::util::read_replaceable_file(target, 64, text), mi::util::ReadStatus::kOk);
+    return text;
+  };
+  ASSERT_TRUE(publish("first"));
+  EXPECT_EQ(contents(), "first");
+  EXPECT_FALSE(mi::util::file_info(fs::current_path() / "entry.bin").exists());
+  EXPECT_FALSE(mi::testing::temporary_left(target));
+  ASSERT_TRUE(publish("second"));
+  EXPECT_EQ(contents(), "second");
+  {
+    const FileReader reader(target);
+    ASSERT_TRUE(publish("third"));
+    char old[6] = {};
+    reader.read_at(0, old, sizeof old);
+    EXPECT_EQ(std::string(old, sizeof old), "second");
+  }
+  EXPECT_EQ(contents(), "third");
+  mi::util::OutputFile dropped(target, Create::kTemporary);
+  const fs::path dropped_path = dropped.path();
+  EXPECT_TRUE(dropped.write("x", 1));
+  dropped.discard();
+  EXPECT_FALSE(mi::util::file_info(dropped_path).exists());
+  EXPECT_EQ(contents(), "third");
+  EXPECT_FALSE(mi::testing::temporary_left(target));
+}
 #endif
 
 #ifdef __linux__
