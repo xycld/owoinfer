@@ -1060,6 +1060,24 @@ TEST(QuantConvert, LoraEdgeCasesAndCleanup) {
   }
   fs::remove(out);
 
+  // moss-edit-lora (Moss-Image-Edit): bare `<m>.lora_A / .lora_B` keys and the module's alpha from adapter_config
+  // (8 at rank 4: coefficient 2), the same bits as the runtime stack's rule.
+  write_st(dir.path() / "edit.safetensors", {make("layers.0.proj.o.lora_A", DType::kF32, {4, kD}, down),
+                                             make("layers.0.proj.o.lora_B", DType::kF32, {kD, 4}, up)},
+           R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"modules\": {\"layers.0.proj.o\": {\"alpha\": 8}}}"})");
+  opt.loras = {{dir.path() / "edit.safetensors", 1.0f}};
+  EXPECT_EQ(mi::quant::convert(dir.path(), out, opt).lora_modules, 1);
+  {
+    const auto m = mi::quant::open_quant_model(out);
+    std::vector<float> w = widen(d.w["layers.0.proj.o"]);
+    std::vector<double> acc(static_cast<std::size_t>(kD));
+    for (std::int64_t r = 0; r < kD; ++r) mi::quant::lora_merge_row(w.data() + r * kD, kD, up.data() + r * 4, down.data(), 4, 2.0f, acc.data());
+    std::vector<float> s_ref;
+    const auto q_ref = ref_quant(w, kD, kD, s_ref);
+    EXPECT_EQ(bytes_i8(mi::quant::read_tensor(m, m.find_linear("layers.0.proj.o")->weight)), q_ref);
+  }
+  fs::remove(out);
+
   // Non-finite alpha, a coefficient that overflows, a non-finite strength.
   for (const auto& [tag, alpha, strength] : {std::tuple{"nan_alpha", std::numeric_limits<float>::quiet_NaN(), 1.0f},
                                              std::tuple{"inf_alpha", std::numeric_limits<float>::infinity(), 1.0f},

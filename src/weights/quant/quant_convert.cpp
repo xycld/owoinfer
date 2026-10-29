@@ -200,7 +200,7 @@ struct LoraKey {
 };
 
 // kohya `diffusion_model.<m>.lora_{down,up}.weight` + `<m>.alpha` (the distill repos' style) and PEFT
-// `<prefix><m>.lora_{A,B}.weight`.
+// `<prefix><m>.lora_{A,B}.weight`, and moss-edit-lora's bare `<m>.lora_{A,B}`.
 std::optional<LoraKey> parse_lora_key(std::string_view name) {
   for (std::string_view p : {"model.diffusion_model.", "diffusion_model.", "base_model.model.", "transformer."}) {
     if (name.starts_with(p)) {
@@ -209,7 +209,9 @@ std::optional<LoraKey> parse_lora_key(std::string_view name) {
     }
   }
   const std::pair<std::string_view, const char*> suffixes[] = {
-      {".lora_down.weight", "down"}, {".lora_up.weight", "up"}, {".lora_A.weight", "down"}, {".lora_B.weight", "up"}, {".alpha", "alpha"}};
+      {".lora_down.weight", "down"}, {".lora_up.weight", "up"}, {".lora_A.weight", "down"}, {".lora_B.weight", "up"},
+      {".lora_A", "down"},  // moss-edit-lora: bare PEFT names, alphas in adapter_config
+      {".lora_B", "up"},     {".alpha", "alpha"}};
   for (const auto& [s, part] : suffixes) {
     if (name.ends_with(s) && name.size() > s.size()) return LoraKey{std::string(name.substr(0, name.size() - s.size())), part};
   }
@@ -240,8 +242,10 @@ LoraFileInfo load_lora(const LoraInput& in, LoraMap& out) {
   }
   // The shared alpha rule (lora_metadata_alpha): without an alpha tensor, the diffusers / PEFT metadata alpha.
   std::optional<double> meta_alpha;
+  std::map<std::string, double> config_alphas;  // moss-edit-lora: per module
   try {
     meta_alpha = lora_metadata_alpha(f.metadata());
+    config_alphas = lora_adapter_config_alphas(f.metadata());
   } catch (const QuantError& e) {
     throw weights::FormatError(in.file, "", e.what());
   }
@@ -264,6 +268,7 @@ LoraFileInfo load_lora(const LoraInput& in, LoraMap& out) {
     lf.down = to_floats(read(*p.down), p.down->dtype);
     lf.up = to_floats(read(*p.up), p.up->dtype);
     std::optional<double> alpha = meta_alpha;
+    if (const auto it = config_alphas.find(m); it != config_alphas.end()) alpha = it->second;
     if (p.alpha != nullptr) {
       if (p.alpha->numel() != 1) throw weights::FormatError(in.file, p.alpha->name, "alpha must be a scalar");
       alpha = to_floats(read(*p.alpha), p.alpha->dtype)[0];
