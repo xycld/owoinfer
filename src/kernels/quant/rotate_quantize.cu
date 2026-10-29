@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "core/cuda_check.h"
 #include "kernels/basic/detail.h"
@@ -119,8 +120,9 @@ __device__ __forceinline__ void store16(__nv_bfloat16* p, const float (&v)[16]) 
 }
 
 // kVT == 0: standalone rotate_quantize. kVT > 0: the MOSS RMSNorm + modulate prologue first (torch reduce with
-// 32 * kVT threads per row).
-template <int kPairsPerWarp, int kVT>
+// 32 * kVT threads per row); with kStoreY its bf16 output also goes to a.y (a separate instantiation, so the kernels
+// without it compile as before).
+template <int kPairsPerWarp, int kVT, bool kStoreY>
 __global__ void rotate_quantize_kernel(RotateArgs a) {
   extern __shared__ float tiles[];  // warps x 2 x kHalfFloats (sized at launch: occupancy)
   __shared__ float warp_max[kMaxWarps];
@@ -164,7 +166,7 @@ __global__ void rotate_quantize_kernel(RotateArgs a) {
       load16(a.mod_shift + c0, sh);
 #pragma unroll
       for (int j = 0; j < 16; ++j) v[i][j] = kernels::detail::moss_modulate(v[i][j], r, w[j], sc[j], sh[j]);
-      if (a.y != nullptr) store16(a.y + row * a.ldy + c0, v[i]);
+      if constexpr (kStoreY) store16(a.y + row * a.ldy + c0, v[i]);
     }
   }
 
@@ -227,7 +229,7 @@ BlockShape block_shape(int groups) {
   return {4, (pairs + 3) / 4};
 }
 
-template <int kVT>
+template <int kVT, bool kStoreY = false>
 void launch_rows(const char* op, const RotateArgs& a, std::int64_t m, cudaStream_t stream) {
   const BlockShape bs = block_shape(a.k / kConvRotGroup);
   if (bs.warps > kMaxWarps) fail(op, "row too long");
@@ -235,9 +237,9 @@ void launch_rows(const char* op, const RotateArgs& a, std::int64_t m, cudaStream
   const dim3 grid(static_cast<unsigned>(m)), block(static_cast<unsigned>(32 * bs.warps));
   const std::size_t smem = sizeof(float) * 2 * kHalfFloats * static_cast<std::size_t>(bs.warps);  // <= 35 KB
   switch (bs.pairs_per_warp) {
-    case 1: rotate_quantize_kernel<1, kVT><<<grid, block, smem, stream>>>(a); break;
-    case 2: rotate_quantize_kernel<2, kVT><<<grid, block, smem, stream>>>(a); break;
-    default: rotate_quantize_kernel<4, kVT><<<grid, block, smem, stream>>>(a); break;
+    case 1: rotate_quantize_kernel<1, kVT, kStoreY><<<grid, block, smem, stream>>>(a); break;
+    case 2: rotate_quantize_kernel<2, kVT, kStoreY><<<grid, block, smem, stream>>>(a); break;
+    default: rotate_quantize_kernel<4, kVT, kStoreY><<<grid, block, smem, stream>>>(a); break;
   }
   MI_CUDA_CHECK_LAUNCH();
 }
@@ -297,12 +299,20 @@ void rms_norm_modulate_rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx,
   a.mod_scale = mod_scale;
   a.mod_shift = mod_shift;
   a.factor = static_cast<float>(m) / static_cast<float>(m * k);
-  switch (bw) {
-    case 32: launch_rows<1>(op, a, m, stream); break;
-    case 64: launch_rows<2>(op, a, m, stream); break;
-    case 128: launch_rows<4>(op, a, m, stream); break;
-    case 256: launch_rows<8>(op, a, m, stream); break;
-    default: launch_rows<16>(op, a, m, stream); break;
+  const auto launch = [&](auto store_y) {
+    constexpr bool kY = decltype(store_y)::value;
+    switch (bw) {
+      case 32: launch_rows<1, kY>(op, a, m, stream); break;
+      case 64: launch_rows<2, kY>(op, a, m, stream); break;
+      case 128: launch_rows<4, kY>(op, a, m, stream); break;
+      case 256: launch_rows<8, kY>(op, a, m, stream); break;
+      default: launch_rows<16, kY>(op, a, m, stream); break;
+    }
+  };
+  if (y != nullptr) {
+    launch(std::true_type{});
+  } else {
+    launch(std::false_type{});
   }
 }
 

@@ -562,7 +562,8 @@ TEST(LoraSideBranch, SharedFusedQkvEqualsSeparateAdapters) {
   EXPECT_EQ(of, os);
 }
 
-// rms_norm_modulate_moss then rotate_quantize give the fused norm + rotate kernel's bits (same row count per call, as
+// rms_norm_modulate_moss then rotate_quantize give the fused norm + rotate kernel's bits at every reduce width
+// (m = 1, 2, 7, 12 and >= 16 give 512, 256, 128, 64 and 32 threads per row at k = 3072; same row count per call, as
 // quant.h requires), and the fused kernel's optional norm output (the INT8 path's side-branch input) is
 // rms_norm_modulate_moss's, written at its row stride and nowhere else; storing it leaves q and the scales unchanged.
 TEST(LoraKernels, SplitNormRotateEqualsFused) {
@@ -570,7 +571,7 @@ TEST(LoraKernels, SplitNormRotateEqualsFused) {
   constexpr std::int64_t k = 3072, ldy = k + 8;
   const U16 nw = rand_bf16(k, 61, 0.3f), sc = rand_bf16(k, 62, 0.2f), sh = rand_bf16(k, 63, 0.2f);
   Dev dnw(nw, mi::DType::kBF16, {k}), dsc(sc, mi::DType::kBF16, {k}), dsh(sh, mi::DType::kBF16, {k});
-  for (const std::int64_t m : {1LL, 37LL, 300LL, 4242LL}) {
+  for (const std::int64_t m : {1LL, 2LL, 7LL, 12LL, 37LL, 300LL, 4242LL}) {
     const U16 x = rand_bf16(static_cast<std::size_t>(m * k), 64 + static_cast<std::uint32_t>(m), 6.0f);
     Dev dx(x, mi::DType::kBF16, {m, k}), y(U16{}, mi::DType::kBF16, {m, k});
     Dev q1(std::vector<std::int8_t>{}, mi::DType::kI8, {m, k}), q2(std::vector<std::int8_t>{}, mi::DType::kI8, {m, k});
