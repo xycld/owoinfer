@@ -626,6 +626,32 @@ TEST(MappedFile, ViewMatchesFileContents) {
   expect_pattern(moved.data() + 1000, 1000, 500);
 }
 
+// check_unchanged, through the descriptor the map keeps: quiet while the file is as mapped (a moved map too); a file
+// written since (its modification time moved) or, on POSIX, truncated below the end the caller reads to is an IoError
+// before the map is read, never a SIGBUS.
+TEST(MappedFile, CheckUnchangedSeesWritesAndTruncation) {
+  TempDir dir("mm_check");
+  const auto path = make_pattern_file(dir, 300000);
+  {
+    MappedFile m(path);
+    EXPECT_NO_THROW(m.check_unchanged(300000));
+    std::filesystem::last_write_time(path, std::filesystem::last_write_time(path) + std::chrono::seconds(5));
+    EXPECT_THROW(m.check_unchanged(300000), IoError);
+  }
+#ifndef _WIN32  // Windows refuses to truncate a mapped file
+  MappedFile m(path);
+  const MappedFile moved(std::move(m));
+  EXPECT_NO_THROW(moved.check_unchanged(300000));
+  std::filesystem::resize_file(path, 1000);
+  try {
+    moved.check_unchanged(300000);
+    ADD_FAILURE() << "a truncated map passed";
+  } catch (const IoError& e) {
+    EXPECT_EQ(std::string(e.what()), mi::util::path_utf8(path) + ": the file changed while it was mapped; load it again");
+  }
+#endif
+}
+
 TEST(MappedFile, EmptyAndMissingFiles) {
   TempDir dir("mm_empty");
   std::ofstream(dir.path() / "e.bin", std::ios::binary).close();

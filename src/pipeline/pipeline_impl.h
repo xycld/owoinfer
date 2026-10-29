@@ -498,57 +498,88 @@ struct Pipeline::Impl {
     return *it->second;
   }
 
-  // The component files (options.dit_file, text_encoder_file, vae_file) against the stamps of the state read from them,
-  // at the start of each call (setup_models: one util::file_info per file). A file replaced under the same path,
-  // written in place or truncated drops that state: its source, the models loaded from it (the arena is released when
-  // one is loaded: a mapped file is never read again), a soft unload's host copy of it, the LoRA stack checked against
-  // the DiT. The call then opens the file anew, so it never runs stale weights, and a file that no longer reads (a
-  // truncated one) is a clear error instead of a fault in a mapping. The control adapter and the LoRA files carry
-  // their stamps in their keys (setup_models).
+  // The files the loaded state was read from, against their stamps, at the start of each call (setup_models): the
+  // component files (options.dit_file, text_encoder_file, vae_file: one util::file_info each, against the stamp their
+  // source was opened with) and the open bundles' weight files (one each, against the size and modification time
+  // their index recorded; about 10 files). A file replaced under the same path, written in place or truncated drops
+  // the state read from it (forget_sources): the call then opens it anew, so it never runs stale weights, and a file
+  // that no longer reads (a truncated one) is a clear error instead of a fault in a mapping. A file that cannot be
+  // queried now (gone for a moment, a share that dropped) changes nothing: what is loaded keeps serving, and a load
+  // that needs the file reports it. The control adapter and the LoRA files carry their stamps in their keys.
   void check_component_files() {
-    // A file that cannot be queried now (gone for a moment, a share that dropped) changes nothing: what is loaded keeps
-    // serving, and a load that needs the file reports it.
     const auto changed = [](const std::filesystem::path& file, const util::FileInfo& stamp) {
       const util::FileInfo now = util::file_info(file);
       return now.exists() && now != stamp;
     };
+    std::set<const void*> gone;
     if (!options.dit_file.empty()) {
       const auto it = dit_sources.find(file_key(options.dit_file));
-      if (it != dit_sources.end() && changed(options.dit_file, it->second->stamp)) {
-        const DitSource* old = it->second.get();
-        if (dit_src == old) release_arena();
-        if (dit_lost == old) dit_lost = nullptr;
-        if (dit_parked == old) dit_parked = nullptr;
-        if (dit_host_src == old) {
-          dit_host.reset();
-          dit_host_src = nullptr;
-        }
-        lora_files_key.clear();  // the stack was built for this DiT: rebuilt for the new one
-        dit_sources.erase(it);
-      }
+      if (it != dit_sources.end() && changed(options.dit_file, it->second->stamp)) gone.insert(it->second.get());
     }
     if (!options.text_encoder_file.empty()) {
       const auto it = te_sources.find(file_key(options.text_encoder_file));
-      if (it != te_sources.end() && changed(options.text_encoder_file, it->second->stamp)) {
-        const TeSource* old = it->second.get();
-        if (te_src == old) release_arena();
-        if (te_kept_src == old) drop_te_host();
-        te_sources.erase(it);
-      }
+      if (it != te_sources.end() && changed(options.text_encoder_file, it->second->stamp)) gone.insert(it->second.get());
     }
     if (!options.vae_file.empty() && vae_file && changed(options.vae_file, vae_file_stamp)) {
       // The decoder's source, and the encoder sources that read the file (its own encoder, or the header that sent a
       // decoder-only file's encodes to the bundle's VAE).
       const std::string key = file_key(options.vae_file);
-      const auto from_file = [&](const auto& entry) { return entry.first.starts_with(key + "|"); };
-      const auto v = vae_sources.find(key);
-      bool loaded = v != vae_sources.end() && vae_src == v->second.get();
-      for (const auto& e : encoder_sources) loaded = loaded || (from_file(e) && encoder_src == e.second.get());
-      if (loaded) release_arena();
-      if (v != vae_sources.end()) vae_sources.erase(v);
-      std::erase_if(encoder_sources, from_file);
-      vae_file.reset();
+      if (const auto v = vae_sources.find(key); v != vae_sources.end()) gone.insert(v->second.get());
+      for (const auto& [k, e] : encoder_sources) {
+        if (k.starts_with(key + "|")) gone.insert(e.get());
+      }
+      gone.insert(vae_file.get());
     }
+    for (const auto& [key, b] : bundles) {
+      const weights::ModelIndex& index = b->index;
+      bool stale = false;
+      for (std::uint32_t i = 0; i < index.files.size() && !stale; ++i) {
+        const util::FileInfo now = util::file_info(index.file_path(i));
+        stale = now.exists() && (now.size != index.files[i].size || now.mtime_ns != index.files[i].mtime_ns);
+      }
+      if (!stale) continue;
+      // Its sources (they point at its index) and the encoder sources that read its VAE file directly.
+      gone.insert(b.get());
+      for (const auto& [k, d] : dit_sources) {
+        if (d->index == &index) gone.insert(d.get());
+      }
+      for (const auto& [k, t] : te_sources) {
+        if (t->index == &index) gone.insert(t.get());
+      }
+      for (const auto& [k, v] : vae_sources) {
+        if (v->index == &index) gone.insert(v.get());
+      }
+      const std::string bundle_key = "bundle:" + util::path_utf8(util::path_key(b->dir));
+      for (const auto& [k, e] : encoder_sources) {
+        if (k.ends_with(bundle_key)) gone.insert(e.get());
+      }
+    }
+    if (!gone.empty()) forget_sources(gone);
+  }
+
+  // Drops the sources, bundles and VAE file index in `gone` and everything loaded from them: the models (the arena is
+  // released when one is loaded: a mapped file is never read again), a soft unload's host copy, the text encoder's
+  // kept host copy, the LoRA stack checked against a dropped DiT.
+  void forget_sources(const std::set<const void*>& gone) {
+    const auto in = [&](const void* p) { return p != nullptr && gone.count(p) != 0; };
+    if (in(dit_src) || in(te_src) || in(vae_src) || in(encoder_src)) release_arena();
+    if (in(dit_lost)) dit_lost = nullptr;
+    if (in(dit_parked)) dit_parked = nullptr;
+    if (in(dit_host_src)) {
+      dit_host.reset();
+      dit_host_src = nullptr;
+    }
+    if (in(te_kept_src)) drop_te_host();
+    if (std::any_of(dit_sources.begin(), dit_sources.end(), [&](const auto& e) { return in(e.second.get()); })) {
+      lora_files_key.clear();  // the stack was built for that DiT: rebuilt for the new one
+    }
+    const auto dropped = [&](const auto& e) { return in(e.second.get()); };
+    std::erase_if(dit_sources, dropped);
+    std::erase_if(te_sources, dropped);
+    std::erase_if(vae_sources, dropped);
+    std::erase_if(encoder_sources, dropped);
+    std::erase_if(bundles, dropped);
+    if (in(vae_file.get())) vae_file.reset();
   }
 
   // The DiT of this call: options.dit_file, else the bundle's transformer.

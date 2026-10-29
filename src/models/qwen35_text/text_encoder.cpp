@@ -360,6 +360,7 @@ struct TextEncoder::Impl {
   const weights::WeightGroup* final_norm = nullptr;
   std::unique_ptr<weights::MappedFile> embed_map;
   const std::byte* embed_rows = nullptr;
+  std::uint64_t embed_end = 0;  // where the table ends in its file (MappedFile::check_unchanged)
   std::int64_t vocab = 0;
   std::size_t weight_bytes = 0;
   EncodeStats stats;
@@ -474,6 +475,7 @@ struct TextEncoder::Impl {
         std::memcpy(host.data() + i * kRowBytes, rows.data() + u * kHidden, kRowBytes);
       }
     } else {
+      embed_map->check_unchanged(embed_end);  // never a fault in a truncated file's map, nor rows of a rewritten one
       std::size_t row = 0;
       for (const auto& s : seqs) {
         for (std::int32_t id : s) {
@@ -867,6 +869,7 @@ TextEncoder::TextEncoder(const weights::ModelIndex& index, runtime::DeviceArena&
     fail("tensor " + embed.name + " lies outside its file");
   }
   m.embed_rows = m.embed_map->data() + embed.offset;
+  m.embed_end = embed.offset + embed.nbytes;
   if (options.streaming) m.create_streaming_resources();
 }
 

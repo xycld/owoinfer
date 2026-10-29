@@ -135,7 +135,7 @@ inline constexpr int kResidencySamples = 64;
 double page_cache_fraction(const std::filesystem::path& path);
 
 // Read-only view of a whole regular file (anything else throws IoError, as FileReader). Empty files map to a
-// null/zero-size view.
+// null/zero-size view. The file stays open while it is mapped (check_unchanged).
 class MappedFile {
  public:
   explicit MappedFile(const std::filesystem::path& path);
@@ -148,11 +148,23 @@ class MappedFile {
   const std::byte* data() const { return data_; }
   std::size_t size() const { return size_; }
 
+  // Throws IoError "<path>: the file changed while it was mapped" when the file, queried through the descriptor the
+  // map keeps (one fstat; a handle on Windows), is now shorter than `end` or was written since it was mapped: reading
+  // the map then would fault (SIGBUS past a truncation) or give bytes of another file. Called before reading the map.
+  void check_unchanged(std::uint64_t end) const;
+
  private:
   void unmap() noexcept;
 
+  std::filesystem::path path_;
   const std::byte* data_ = nullptr;
   std::size_t size_ = 0;
+  std::int64_t mtime_ = 0;  // when mapped (st_mtim; FILETIME ticks)
+#ifdef _WIN32
+  void* file_ = nullptr;
+#else
+  int fd_ = -1;
+#endif
 };
 
 }  // namespace mi::weights

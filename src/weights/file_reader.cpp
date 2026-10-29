@@ -514,7 +514,15 @@ void FileReader::read_at(std::uint64_t offset, void* dst, std::size_t size) cons
 
 #ifdef _WIN32
 
-MappedFile::MappedFile(const std::filesystem::path& path) {
+namespace {
+std::int64_t last_write(HANDLE f) {
+  FILETIME t{};
+  if (!GetFileTime(f, nullptr, nullptr, &t)) return -1;
+  return static_cast<std::int64_t>((std::uint64_t{t.dwHighDateTime} << 32) | t.dwLowDateTime);
+}
+}  // namespace
+
+MappedFile::MappedFile(const std::filesystem::path& path) : path_(path) {
   void* handle = nullptr;
   const util::OpenStatus status = util::open_regular_file(path, FILE_ATTRIBUTE_NORMAL, handle);
   if (status == util::OpenStatus::kNotRegular) throw IoError(util::path_utf8(path) + ": " + util::kNotRegularFile);
@@ -527,30 +535,48 @@ MappedFile::MappedFile(const std::filesystem::path& path) {
     fail(path, "cannot stat", code);
   }
   size_ = static_cast<std::size_t>(sz.QuadPart);
+  mtime_ = last_write(f);
   if (size_ == 0) {
     CloseHandle(f);
     return;
   }
   HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
   int code = static_cast<int>(GetLastError());
-  CloseHandle(f);
-  if (m == nullptr) fail(path, "CreateFileMapping failed", code);
+  if (m == nullptr) {
+    CloseHandle(f);
+    fail(path, "CreateFileMapping failed", code);
+  }
   void* view = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
   code = static_cast<int>(GetLastError());
   CloseHandle(m);  // the view keeps the mapping alive
-  if (view == nullptr) fail(path, "MapViewOfFile failed", code);
+  if (view == nullptr) {
+    CloseHandle(f);
+    fail(path, "MapViewOfFile failed", code);
+  }
   data_ = static_cast<const std::byte*>(view);
+  file_ = f;  // kept for check_unchanged
+}
+
+void MappedFile::check_unchanged(std::uint64_t end) const {
+  if (file_ == nullptr) return;
+  LARGE_INTEGER sz;
+  const HANDLE f = static_cast<HANDLE>(file_);
+  if (!GetFileSizeEx(f, &sz) || static_cast<std::uint64_t>(sz.QuadPart) < end || last_write(f) != mtime_) {
+    throw IoError(util::path_utf8(path_) + ": the file changed while it was mapped; load it again");
+  }
 }
 
 void MappedFile::unmap() noexcept {
   if (data_ != nullptr) UnmapViewOfFile(data_);
+  if (file_ != nullptr) CloseHandle(static_cast<HANDLE>(file_));
   data_ = nullptr;
   size_ = 0;
+  file_ = nullptr;
 }
 
 #else
 
-MappedFile::MappedFile(const std::filesystem::path& path) {
+MappedFile::MappedFile(const std::filesystem::path& path) : path_(path) {
   int fd = -1;
   const util::OpenStatus status = util::open_regular_file(path, 0, fd);
   if (status == util::OpenStatus::kNotRegular) throw IoError(util::path_utf8(path) + ": " + util::kNotRegularFile);
@@ -563,21 +589,36 @@ MappedFile::MappedFile(const std::filesystem::path& path) {
     fail(path, "cannot stat", code);
   }
   size_ = static_cast<std::size_t>(st.st_size);
-  if (size_ != 0) {
-    void* p = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+  mtime_ = static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec;
+  if (size_ == 0) {
+    ::close(fd);
+    return;
+  }
+  void* p = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (p == MAP_FAILED) {
     int code = errno;
     ::close(fd);
-    if (p == MAP_FAILED) fail(path, "mmap failed", code);
-    data_ = static_cast<const std::byte*>(p);
-  } else {
-    ::close(fd);
+    fail(path, "mmap failed", code);
+  }
+  data_ = static_cast<const std::byte*>(p);
+  fd_ = fd;  // kept for check_unchanged
+}
+
+void MappedFile::check_unchanged(std::uint64_t end) const {
+  if (fd_ < 0) return;
+  struct stat st;
+  if (::fstat(fd_, &st) != 0 || static_cast<std::uint64_t>(st.st_size) < end ||
+      static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec != mtime_) {
+    throw IoError(util::path_utf8(path_) + ": the file changed while it was mapped; load it again");
   }
 }
 
 void MappedFile::unmap() noexcept {
   if (data_ != nullptr) ::munmap(const_cast<std::byte*>(data_), size_);
+  if (fd_ >= 0) ::close(fd_);
   data_ = nullptr;
   size_ = 0;
+  fd_ = -1;
 }
 
 #endif
@@ -585,13 +626,29 @@ void MappedFile::unmap() noexcept {
 MappedFile::~MappedFile() { unmap(); }
 
 MappedFile::MappedFile(MappedFile&& other) noexcept
-    : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)) {}
+    : path_(std::move(other.path_)),
+      data_(std::exchange(other.data_, nullptr)),
+      size_(std::exchange(other.size_, 0)),
+      mtime_(other.mtime_) {
+#ifdef _WIN32
+  file_ = std::exchange(other.file_, nullptr);
+#else
+  fd_ = std::exchange(other.fd_, -1);
+#endif
+}
 
 MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
   if (this != &other) {
     unmap();
+    path_ = std::move(other.path_);
     data_ = std::exchange(other.data_, nullptr);
     size_ = std::exchange(other.size_, 0);
+    mtime_ = other.mtime_;
+#ifdef _WIN32
+    file_ = std::exchange(other.file_, nullptr);
+#else
+    fd_ = std::exchange(other.fd_, -1);
+#endif
   }
   return *this;
 }

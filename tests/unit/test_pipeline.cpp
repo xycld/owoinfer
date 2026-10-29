@@ -1732,6 +1732,58 @@ TEST(PipelineEndToEnd, ReplacedComponentFilesLoadAnew) {
   const mi::pipeline::Result restored = pipe.generate(req);
   EXPECT_EQ(bit_mismatches(restored.latents, with_control.latents), 0u);
 }
+
+// A bundle weight file changed while the engine holds it (here the shard with the bf16 text encoder's embedding
+// table, which the encoder maps): written in place, the bundle and the encoder load anew (the same image); truncated,
+// the next generate is a clean error naming it, not a SIGBUS in the map; restored, the next generate runs again.
+TEST(PipelineEndToEnd, ChangedBundleFileLoadsAnew) {
+  const fs::path sft = weights_root() / "sft";
+  const fs::path small_vae = "/workspace/Models/community/comfy-org/flux2-vae_small.safetensors";
+  const fs::path shard = "text_encoder/model-00001-of-00004.safetensors";  // holds embed_tokens
+  for (const fs::path& f : {sft / shard, kInt8Dit, small_vae}) {
+    if (!fs::is_regular_file(f)) GTEST_SKIP() << f.string() << " not present";
+  }
+  mi::testing::TempDir bundle("pipe_changed_bundle");
+  for (const char* rel : {"model_index.json", "transformer/config.json", "vae/config.json", "tokenizer/tokenizer.json",
+                          "tokenizer/tokenizer_config.json", "text_encoder/config.json",
+                          "text_encoder/model.safetensors.index.json", "text_encoder/model-00002-of-00004.safetensors",
+                          "text_encoder/model-00003-of-00004.safetensors",
+                          "text_encoder/model-00004-of-00004.safetensors"}) {
+    fs::create_directories((bundle.path() / rel).parent_path());
+    fs::create_symlink(sft / rel, bundle.path() / rel);
+  }
+  const fs::path copy = bundle.path() / shard;
+  if (!clone_file(sft / shard, copy)) GTEST_SKIP() << "the test folder's file system cannot clone files";
+
+  mi::pipeline::Request req;
+  req.model = bundle.path();
+  req.prompt = "a lighthouse on a cliff at night";
+  req.height = req.width = 256;
+  req.steps = 3;
+  mi::pipeline::PipelineOptions options;
+  options.dit_file = kInt8Dit;
+  options.vae_file = small_vae;
+  options.tier = mi::planner::Tier::kHigh;
+  options.mode = mi::planner::Mode::kMinMemory;  // the bf16 encoder streamed: little host memory
+  mi::pipeline::Pipeline pipe(options);
+  const mi::pipeline::Result first = pipe.generate(req);
+  ASSERT_FALSE(first.rgb.empty());
+  fs::last_write_time(copy, fs::last_write_time(copy) + std::chrono::seconds(5));  // written in place
+  const mi::pipeline::Result touched = pipe.generate(req);
+  EXPECT_EQ(bit_mismatches(touched.latents, first.latents), 0u);
+  EXPECT_GT(touched.timings.index_load_s, 0.0) << "the bundle was not opened again";
+  fs::resize_file(copy, 4096);
+  try {
+    pipe.generate(req);
+    ADD_FAILURE() << "a truncated bundle file generated";
+  } catch (const std::exception& e) {
+    EXPECT_NE(std::string(e.what()).find(copy.string()), std::string::npos) << e.what();
+  }
+  ASSERT_TRUE(clone_file(sft / shard, copy));
+  const mi::pipeline::Result restored = pipe.generate(req);
+  EXPECT_EQ(bit_mismatches(restored.latents, first.latents), 0u);
+  EXPECT_TRUE(restored.rgb == first.rgb);
+}
 #endif
 
 // The High tier on the Comfy-Org INT8 file keeps its 8-bit attention with runtime LoRAs, in either order: the tier is
