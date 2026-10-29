@@ -663,7 +663,7 @@ TEST(QuantModel, RejectsInvalidStoredScales) {
     EXPECT_THROW(mi::quant::to_model_index(m), mi::quant::QuantError) << tag;
     EXPECT_THROW(mi::quant::convert(p, dir.path() / "out.safetensors", {}), mi::quant::QuantError) << tag;
     EXPECT_FALSE(fs::exists(dir.path() / "out.safetensors"));
-    EXPECT_FALSE(fs::exists(dir.path() / "out.safetensors.partial"));
+    EXPECT_FALSE(mi::testing::temporary_left(dir.path() / "out.safetensors"));
   }
   // W6A8 group scales: 0 decodes to zeros, a negative one (0xB8 = -1.0) is refused.
   for (const std::uint8_t srel3 : {std::uint8_t{0x00}, std::uint8_t{0xB8}}) {
@@ -894,7 +894,7 @@ TEST(QuantConvert, SyntheticDitWithLoraKeepAndFusion) {
   EXPECT_EQ(st.quantized, 10);
   EXPECT_EQ(st.kept_bf16, 2);
   EXPECT_EQ(st.lora_modules, 5);
-  EXPECT_FALSE(fs::exists(fs::path(out) += ".partial"));
+  EXPECT_FALSE(mi::testing::temporary_left(out));
 
   const mi::weights::SafetensorsFile f(out);
   EXPECT_EQ(f.metadata().at("mossinfer_kept_bf16"), R"(["layers.1.proj.ffn_down", "layers.1.proj.ffn_up_gate"])");
@@ -1032,7 +1032,7 @@ TEST(QuantConvert, LoraEdgeCasesAndCleanup) {
   const fs::path out = dir.path() / "out.safetensors";
   auto expect_no_output = [&](const char* what) {
     EXPECT_FALSE(fs::exists(out)) << what;
-    EXPECT_FALSE(fs::exists(fs::path(out) += ".partial")) << what;
+    EXPECT_FALSE(mi::testing::temporary_left(out)) << what;
   };
 
   // PEFT `base_model.model.` keys merge like kohya ones.

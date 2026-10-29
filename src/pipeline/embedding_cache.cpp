@@ -360,23 +360,18 @@ void EmbeddingCache::write_disk(const EmbeddingKey& key, const Embedding& value)
   put_le<std::uint64_t>(header + 56, key.numerics);
   put_le<std::uint64_t>(header + 48, header_hash(header));
 
-  // Unique per process and thread, so concurrent writers (other processes too) never share a temporary file.
-  const std::size_t tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
-  const auto stamp = static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count());
-  fs::path tmp = path;
-  tmp += ".tmp" + hex16(tid ^ stamp) + std::to_string(++tmp_counter_);
-  bool ok = false;
-  {
-    util::OutputFile out(tmp);
-    out.write(header, kHeaderBytes);
-    out.write(key.tokens.data(), n * 4);
-    out.write(value.data.data(), value.data.size() * 2);
-    ok = out.close();
-  }
+  // A new temporary file (concurrent writers, other processes too, never share one), renamed over the entry.
+  util::OutputFile out(path, util::OutputFile::Create::kTemporary);
+  const fs::path tmp = out.path();
+  const bool created = out.is_open();
+  out.write(header, kHeaderBytes);
+  out.write(key.tokens.data(), n * 4);
+  out.write(value.data.data(), value.data.size() * 2);
+  const bool ok = out.close();
   std::error_code ec;
   if (ok) util::rename_replace(tmp, path, ec);
   if (!ok || ec) {
-    fs::remove(tmp, ec);
+    if (created) fs::remove(tmp, ec);
     std::lock_guard<std::mutex> lock(mu_);
     ++stats_.disk_errors;
     return;

@@ -623,7 +623,7 @@ TEST(Nvfp4Convert, GptqThroughHessianSource) {
   const q::HessianFileInfo info = q::write_hessian_file(dir.path(), hfile, opt);
   EXPECT_EQ(info.units, 7u);
   EXPECT_EQ(info.capture.calibration, R"({"set": "test"})");
-  EXPECT_FALSE(fs::exists(fs::path(hfile) += ".partial"));
+  EXPECT_FALSE(mi::testing::temporary_left(hfile));
   q::ConvertOptions from_file = opt;
   from_file.threads = 2;
   from_file.nvfp4->hessians = nullptr;

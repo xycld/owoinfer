@@ -29,19 +29,6 @@
 #include "weights/quant/quant_codec.h"
 #include "weights/safetensors.h"
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#else
-#include <fcntl.h>
-#include <unistd.h>
-#endif
-
 namespace mi::quant {
 
 namespace fs = std::filesystem;
@@ -52,45 +39,33 @@ namespace {
 
 [[noreturn]] void fail(const std::string& msg) { throw QuantError("mi::quant: " + msg); }
 
-// Flushes a closed file's data to stable storage, so the rename that publishes it cannot outrun its bytes.
-void sync_file(const fs::path& path) {
-#ifdef _WIN32
-  const DWORD flags = FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
-  HANDLE h = util::is_windows_device_path(path)
-                 ? INVALID_HANDLE_VALUE
-                 : CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
-  const bool ok = h != INVALID_HANDLE_VALUE && FlushFileBuffers(h);
-  if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-#else
-  const int fd = ::open(path.c_str(), O_RDONLY);
-  const bool ok = fd >= 0 && ::fsync(fd) == 0;
-  if (fd >= 0) ::close(fd);
-#endif
-  if (!ok) fail("cannot flush " + util::path_utf8(path) + " to disk");
-}
-
-// The output while it is written: removed unless commit() published it.
+// The output while it is written: a new temporary file next to it (util::OutputFile::Create::kTemporary), removed
+// unless commit() published it.
 class PartialFile {
  public:
-  explicit PartialFile(fs::path path) : path_(std::move(path)) {}
+  explicit PartialFile(const fs::path& target) : file_(target, util::OutputFile::Create::kTemporary) {
+    if (!file_.is_open()) fail("cannot create a temporary file next to " + util::path_utf8(target));
+  }
   PartialFile(const PartialFile&) = delete;
   PartialFile& operator=(const PartialFile&) = delete;
   ~PartialFile() {
     if (!committed_) {
+      file_.close();
       std::error_code ec;
-      fs::remove(path_, ec);
+      fs::remove(file_.path(), ec);
     }
   }
-  const fs::path& path() const { return path_; }
+  util::OutputFile& file() { return file_; }
+  const fs::path& path() const { return file_.path(); }
   void commit(const fs::path& final_path) {
     std::error_code ec;
-    util::rename_replace(path_, final_path, ec);
-    if (ec) throw fs::filesystem_error("cannot rename", path_, final_path, ec);
+    util::rename_replace(path(), final_path, ec);
+    if (ec) throw fs::filesystem_error("cannot rename", path(), final_path, ec);
     committed_ = true;
   }
 
  private:
-  fs::path path_;
+  util::OutputFile file_;
   bool committed_ = false;
 };
 
@@ -384,8 +359,9 @@ constexpr std::string_view kAttentionConfig = "{\"attention\": \"comfy_kitchen_i
 
 class Writer {
  public:
-  Writer(const fs::path& path, const std::vector<OutTensor>& tensors, const std::string& header) : path_(path), out_(path) {
-    if (!out_.is_open()) fail("cannot create " + util::path_utf8(path));
+  Writer(util::OutputFile& out, const std::vector<OutTensor>& tensors, const std::string& header)
+      : path_(out.path()), out_(out) {
+    const fs::path& path = path_;
     std::uint64_t len = header.size();
     char lb[8];
     for (int i = 0; i < 8; ++i) lb[i] = static_cast<char>((len >> (8 * i)) & 0xFF);
@@ -401,17 +377,20 @@ class Writer {
     if (!out_.seek(t.offset) || !out_.write(data, size)) fail("write failed: " + util::path_utf8(path_));
     written_ += size;
   }
-  // Writes the final header over the first one (same length), then closes.
+  // Writes the final header over the first one (same length), flushes the file to stable storage (so the rename that
+  // publishes it cannot outrun its bytes), then closes it.
   std::uint64_t finish(const std::string& header) {
     if (written_ != planned_) fail("internal: wrote " + std::to_string(written_) + " tensor bytes, planned " + std::to_string(planned_));
-    if (!out_.seek(8) || !out_.write(header) || !out_.close()) fail("write failed: " + util::path_utf8(path_));
+    if (!out_.seek(8) || !out_.write(header)) fail("write failed: " + util::path_utf8(path_));
+    if (!out_.sync()) fail("cannot flush " + util::path_utf8(path_) + " to disk");
+    if (!out_.close()) fail("write failed: " + util::path_utf8(path_));
     if (util::file_info(path_).size != end_) fail("output size mismatch (internal)");
     return end_;
   }
 
  private:
   fs::path path_;
-  util::OutputFile out_;
+  util::OutputFile& out_;
   std::uint64_t end_ = 0, written_ = 0, planned_ = 0;
 };
 
@@ -743,7 +722,6 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   // The boundary check of every path the conversion takes (util::check_user_path), before any file-system call.
   util::check_user_path(input, "input");
   util::check_user_path(output, "output");
-  util::check_user_path(fs::path(output) += ".partial", "output");
   for (const LoraInput& li : options.loras) util::check_user_path(li.file, "LoRA");
   if (!valid_convrot_group(options.group)) fail("--group must be a power of 4 in [4, 1024]");
   if (options.threads < 0) fail("--threads must be >= 0");
@@ -1010,8 +988,8 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   for (std::size_t i = 0; i < tensors.size(); ++i) tensors[i].offset = data_start + rel[i];
 
   // The output is created before any long work, so an unwritable destination fails at once.
-  PartialFile partial(fs::path(output) += ".partial");
-  Writer writer(partial.path(), tensors, header0);
+  PartialFile partial(output);
+  Writer writer(partial.file(), tensors, header0);
   constexpr std::int64_t kBatch = 64;  // rows widened (and LoRA-merged) per quantize call
 
   int done = 0;
@@ -1215,7 +1193,6 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   const std::string header = build_header(hex64(stats.source_xxh64), capture, hessian_hex);
   if (header.size() != header0.size()) fail("internal: header size changed");
   stats.bytes_written = writer.finish(header);
-  sync_file(partial.path());
   // The result must read back before it is published.
   {
     const weights::SafetensorsFile check(partial.path());
@@ -1238,7 +1215,6 @@ std::vector<HessianUnit> nvfp4_hessian_units(const fs::path& input, const Conver
 HessianFileInfo write_hessian_file(const fs::path& input, const fs::path& path, const ConvertOptions& options) {
   util::check_user_path(input, "input");
   util::check_user_path(path, "Hessian file");
-  util::check_user_path(fs::path(path) += ".partial", "Hessian file");
   if (!options.nvfp4 || !needs_hessian(options.nvfp4->recipe) || !options.nvfp4->hessians) {
     fail("a Hessian file needs nvfp4 output with a gptq recipe and a calibration capture");
   }
@@ -1288,8 +1264,8 @@ HessianFileInfo write_hessian_file(const fs::path& input, const fs::path& path, 
   };
   const std::string header0 = build_header(HessianCapture{});
   for (std::size_t i = 0; i < tensors.size(); ++i) tensors[i].offset = 8 + header0.size() + rel[i];
-  PartialFile partial(fs::path(path) += ".partial");
-  Writer writer(partial.path(), tensors, header0);
+  PartialFile partial(path);
+  Writer writer(partial.file(), tensors, header0);
   std::vector<char> seen(units.size(), 0);
   std::vector<float> packed;
   info.capture = options.nvfp4->hessians(units, [&](std::size_t u, const float* h) {
@@ -1310,7 +1286,6 @@ HessianFileInfo write_hessian_file(const fs::path& input, const fs::path& path, 
   const std::string header = build_header(info.capture);
   if (header.size() != header0.size()) fail("internal: Hessian file header size changed");
   const std::uint64_t size = writer.finish(header);
-  sync_file(partial.path());
   // The result must read back before it is published.
   {
     const weights::SafetensorsFile check(partial.path());

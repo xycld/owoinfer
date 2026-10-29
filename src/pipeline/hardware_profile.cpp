@@ -8,18 +8,11 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
-#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <vector>
-
-#ifdef _WIN32
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
 
 #include "core/cuda_check.h"
 #include "kernels/fused/fused_gemm.h"
@@ -141,14 +134,6 @@ std::optional<moss_dit::FusedCheck> fused_check_from(const json::Value& v) {
   }
 }
 
-int process_id() {
-#ifdef _WIN32
-  return _getpid();
-#else
-  return static_cast<int>(getpid());
-#endif
-}
-
 }  // namespace
 
 std::string hardware_key() {
@@ -205,13 +190,11 @@ bool write_profile(const std::filesystem::path& path, const std::string& key, co
   doc += "}\n";
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
-  // Unique per process and call: concurrent writers never share a temporary file; the rename replaces atomically.
-  char suffix[64];
-  std::snprintf(suffix, sizeof(suffix), ".tmp.%d.%08x", process_id(), static_cast<unsigned>(std::random_device{}()));
-  std::filesystem::path tmp = path;  // not path.string(): the ANSI code page on Windows
-  tmp += suffix;
+  // A new temporary file (concurrent writers never share one); the rename replaces atomically.
+  util::OutputFile out(path, util::OutputFile::Create::kTemporary);
+  if (!out.is_open()) return false;
+  const std::filesystem::path tmp = out.path();
   {
-    util::OutputFile out(tmp);
     if (!out.write(doc) || !out.close()) {
       std::filesystem::remove(tmp, ec);
       return false;

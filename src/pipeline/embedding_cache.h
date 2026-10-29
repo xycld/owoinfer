@@ -131,7 +131,6 @@ class EmbeddingCache {
   std::unordered_multimap<std::uint64_t, Lru::iterator> map_;
   std::filesystem::path disk_dir_;
   std::size_t max_disk_bytes_;
-  std::uint64_t tmp_counter_ = 0;
   EmbeddingCacheStats stats_;
 };
 

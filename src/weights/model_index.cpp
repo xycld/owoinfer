@@ -506,15 +506,20 @@ void write_index(const ModelIndex& index, const fs::path& path) {
   o << "]\n}\n";
 
   // Write-then-rename so a crash never leaves a half-written index that parses as stale.
-  fs::path tmp = path;
-  tmp += ".tmp";
-  {
-    util::OutputFile out(tmp);
-    if (!out.write(o.str()) || !out.close()) throw IndexError("cannot write " + path_utf8(tmp));
-  }
+  util::OutputFile out(path, util::OutputFile::Create::kTemporary);
+  const fs::path tmp = out.path();
+  if (!out.is_open()) throw IndexError("cannot create a temporary file next to " + path_utf8(path));
   std::error_code ec;
+  if (!out.write(o.str()) || !out.close()) {
+    fs::remove(tmp, ec);
+    throw IndexError("cannot write " + path_utf8(tmp));
+  }
   util::rename_replace(tmp, path, ec);
-  if (ec) throw fs::filesystem_error("cannot rename", tmp, path, ec);
+  if (ec) {
+    std::error_code ignored;
+    fs::remove(tmp, ignored);
+    throw fs::filesystem_error("cannot rename", tmp, path, ec);
+  }
 }
 
 ModelIndex load_index(const fs::path& path, const fs::path& bundle_dir, ComponentSet skip) {

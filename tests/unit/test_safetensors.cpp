@@ -880,6 +880,23 @@ TEST(RegularFile, FileInfoAndOutputFile) {
   EXPECT_FALSE(refused.is_open());
   EXPECT_FALSE(refused.write("x", 1));
   EXPECT_FALSE(refused.close());
+#ifdef __linux__
+  // An output naming a FIFO is refused unopened (without a reader, an open for writing would block).
+  EXPECT_FALSE(mi::util::OutputFile(dir.path() / "fifo").is_open());
+#endif
+  // Temporaries: a new name beside the target each time ("<target>.tmp-<hex>"), created exclusively; synced and
+  // closed through the same descriptor.
+  using Create = mi::util::OutputFile::Create;
+  mi::util::OutputFile t1(out_path, Create::kTemporary), t2(out_path, Create::kTemporary);
+  ASSERT_TRUE(t1.is_open() && t2.is_open());
+  EXPECT_NE(t1.path(), t2.path());
+  EXPECT_EQ(t1.path().parent_path(), out_path.parent_path());
+  EXPECT_EQ(mi::util::path_utf8(t1.path().filename()).rfind("out.bin.tmp-", 0), 0u);
+  EXPECT_TRUE(t1.write("x", 1));
+  EXPECT_TRUE(t1.sync());
+  EXPECT_TRUE(t1.close());
+  EXPECT_EQ(file_info(t1.path()).size, 1u);
+  EXPECT_TRUE(mi::testing::temporary_left(out_path));
 }
 
 #ifdef _WIN32

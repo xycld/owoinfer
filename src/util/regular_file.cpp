@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <random>
 #include <stdexcept>
 #include <string>
 
@@ -27,6 +29,17 @@
 namespace mi::util {
 
 namespace {
+
+// "<path>.tmp-<16 hex digits>" (OutputFile::Create::kTemporary).
+std::filesystem::path temporary_name(const std::filesystem::path& path) {
+  std::random_device rd;
+  const auto v = (static_cast<unsigned long long>(rd()) << 32) ^ rd();
+  char hex[24];
+  std::snprintf(hex, sizeof hex, ".tmp-%016llx", v);
+  std::filesystem::path out = path;
+  out += hex;
+  return out;
+}
 
 bool is_sep(wchar_t c) { return c == L'\\' || c == L'/'; }
 
@@ -244,11 +257,25 @@ OpenStatus open_regular_file(const std::filesystem::path& path, unsigned long fl
   return OpenStatus::kOk;
 }
 
-OutputFile::OutputFile(const std::filesystem::path& path) {
-  if (is_windows_device_path(path)) return;
+OutputFile::OutputFile(const std::filesystem::path& path, Create create) {
   // FILE_READ_ATTRIBUTES for handle_info (GENERIC_WRITE does not include it).
-  HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
-                         FILE_ATTRIBUTE_NORMAL | kSqos, nullptr);
+  const DWORD access = GENERIC_WRITE | FILE_READ_ATTRIBUTES;
+  HANDLE h = INVALID_HANDLE_VALUE;
+  if (create == Create::kTemporary) {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+      path_ = temporary_name(path);
+      if (is_windows_device_path(path_)) return;
+      h = CreateFileW(path_.c_str(), access, FILE_SHARE_READ, nullptr, CREATE_NEW,
+                      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | kSqos, nullptr);
+      if (h != INVALID_HANDLE_VALUE || (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS)) {
+        break;
+      }
+    }
+  } else {
+    path_ = path;
+    if (is_windows_device_path(path)) return;
+    h = CreateFileW(path.c_str(), access, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | kSqos, nullptr);
+  }
   if (h == INVALID_HANDLE_VALUE) return;
   if (!handle_info(h).regular()) {  // a reparse point to a pipe or a device: refused before any byte is written
     CloseHandle(h);
@@ -278,6 +305,11 @@ bool OutputFile::seek(std::uint64_t offset) {
   LARGE_INTEGER to;
   to.QuadPart = static_cast<LONGLONG>(offset);
   ok_ = ok_ && SetFilePointerEx(static_cast<HANDLE>(handle_), to, nullptr, FILE_BEGIN);
+  return ok_;
+}
+
+bool OutputFile::sync() {
+  ok_ = ok_ && FlushFileBuffers(static_cast<HANDLE>(handle_));
   return ok_;
 }
 
@@ -353,25 +385,63 @@ FileInfo file_info(const std::filesystem::path& path) {
 
 std::filesystem::path resolved_path(const std::filesystem::path& path) { return std::filesystem::weakly_canonical(path); }
 
-OutputFile::OutputFile(const std::filesystem::path& path) : out_(path, std::ios::binary | std::ios::trunc) {
-  ok_ = static_cast<bool>(out_);
+OutputFile::OutputFile(const std::filesystem::path& path, Create create) {
+  if (create == Create::kTemporary) {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+      path_ = temporary_name(path);
+      fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY, 0666);
+      if (fd_ >= 0 || errno != EEXIST) break;
+    }
+  } else {
+    path_ = path;
+    struct stat st {};
+    if (::stat(path.c_str(), &st) == 0 && !S_ISREG(st.st_mode)) return;  // a device or FIFO is never opened
+    fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOCTTY | O_NONBLOCK, 0666);
+  }
+  if (fd_ < 0) return;
+  struct stat st {};
+  const int fl = ::fcntl(fd_, F_GETFL);
+  if (::fstat(fd_, &st) != 0 || !S_ISREG(st.st_mode) || fl < 0 || ::fcntl(fd_, F_SETFL, fl & ~O_NONBLOCK) != 0) {
+    ::close(fd_);
+    fd_ = -1;
+    return;
+  }
+  ok_ = true;
 }
 
-OutputFile::~OutputFile() = default;
+OutputFile::~OutputFile() {
+  if (fd_ >= 0) ::close(fd_);
+}
 
 bool OutputFile::write(const void* data, std::size_t size) {
-  if (ok_) ok_ = static_cast<bool>(out_.write(static_cast<const char*>(data), static_cast<std::streamsize>(size)));
+  const auto* p = static_cast<const char*>(data);
+  while (ok_ && size > 0) {
+    const ssize_t n = ::write(fd_, p, std::min<std::size_t>(size, std::size_t{1} << 30));
+    if (n < 0 && errno == EINTR) continue;
+    ok_ = n > 0;
+    if (ok_) {
+      p += n;
+      size -= static_cast<std::size_t>(n);
+    }
+  }
   return ok_;
 }
 
 bool OutputFile::seek(std::uint64_t offset) {
-  if (ok_) ok_ = static_cast<bool>(out_.seekp(static_cast<std::streamoff>(offset)));
+  ok_ = ok_ && ::lseek(fd_, static_cast<off_t>(offset), SEEK_SET) == static_cast<off_t>(offset);
+  return ok_;
+}
+
+bool OutputFile::sync() {
+  ok_ = ok_ && ::fsync(fd_) == 0;
   return ok_;
 }
 
 bool OutputFile::close() {
-  if (out_.is_open()) out_.close();
-  ok_ = ok_ && static_cast<bool>(out_);
+  if (fd_ >= 0) {
+    ok_ = ::close(fd_) == 0 && ok_;
+    fd_ = -1;
+  }
   return ok_;
 }
 

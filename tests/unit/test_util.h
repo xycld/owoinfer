@@ -69,6 +69,18 @@ class TempDir {
 };
 
 // Byte at absolute position `i` of a synthetic data section.
+// Whether a temporary file of `target` (util::OutputFile::Create::kTemporary, "<target>.tmp-<16 hex digits>") is left
+// beside it.
+inline bool temporary_left(const std::filesystem::path& target) {
+  const std::filesystem::path dir = target.has_parent_path() ? target.parent_path() : std::filesystem::path(".");
+  const std::string prefix = util::path_utf8(target.filename()) + ".tmp-";
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    if (util::path_utf8(it->path().filename()).rfind(prefix, 0) == 0) return true;
+  }
+  return false;
+}
+
 inline std::uint8_t pattern_byte(std::uint64_t i) { return static_cast<std::uint8_t>((i * 131 + 7) >> 1); }
 
 inline void write_raw(const std::filesystem::path& path, const std::string& header, std::uint64_t data_bytes,

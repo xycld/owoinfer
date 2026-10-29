@@ -3,16 +3,13 @@
 // caller; a directory would fail later with a less clear error. Every reader of such paths opens through here:
 // weights::FileReader and MappedFile (safetensors files, the supported-model checks, images, hashes) and
 // read_replaceable_file (caches, the model index). Their metadata is queried through file_info and their outputs are
-// written through OutputFile, never through std::filesystem or std::ofstream on Windows.
+// written through OutputFile, never through std::filesystem or std::ofstream.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string_view>
-#ifndef _WIN32
-#include <fstream>
-#endif
 
 namespace mi::util {
 
@@ -132,32 +129,42 @@ OpenStatus open_regular_file(const std::filesystem::path& path, unsigned long fl
 OpenStatus open_regular_file(const std::filesystem::path& path, int flags, int& fd);
 #endif
 
-// A file the engine writes under a user-supplied path (an image, the converter's output, a cache entry's, the hardware
-// profile's or the model index's temporary file), created or truncated. POSIX: std::ofstream (binary, trunc).
-// Windows: refused without opening anything for is_windows_device_path; else CreateFileW(GENERIC_WRITE |
-// FILE_READ_ATTRIBUTES, FILE_SHARE_READ, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT |
-// SECURITY_IDENTIFICATION), whose handle must be a disk file that is no directory or device (file_info's checks): a
-// reparse point redirecting the path to a pipe is refused before a byte is written, and the pipe's server could not
-// impersonate the open. Every call returns false once any call failed (is_open() false too when the open failed or
-// was refused).
+// A file the engine writes under a user-supplied path, through its own descriptor (handle) from open to close:
+//   - kReplace: an output the caller names (an image, a report), created or truncated. POSIX: stat(2) first (an
+//     existing device or FIFO is never opened), then open(O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOCTTY |
+//     O_NONBLOCK) (a FIFO swapped in since cannot block the open). Windows: refused without opening anything for
+//     is_windows_device_path; else CreateFileW(GENERIC_WRITE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, CREATE_ALWAYS,
+//     FILE_ATTRIBUTE_NORMAL | kUserPathSqos).
+//   - kTemporary: a new file next to `path` (a cache entry's, the hardware profile's, the model index's, a PNG's or
+//     the converter's temporary file, renamed over its target once complete), named "<path>.tmp-<16 hex digits>" from
+//     std::random_device, created exclusively and never through a link: POSIX O_CREAT | O_EXCL | O_NOFOLLOW, Windows
+//     CREATE_NEW | FILE_FLAG_OPEN_REPARSE_POINT; a name that exists (planted or another writer's) is never opened,
+//     another is drawn (16 tries). path() is the name created.
+// Either way the open file must be a regular file (fstat; file_info's handle checks) before a byte is written: a
+// reparse point redirecting the path to a pipe is refused, and the pipe's server could not impersonate the open. Every
+// call returns false once any call failed (is_open() false too when the open failed or was refused).
 class OutputFile {
  public:
-  explicit OutputFile(const std::filesystem::path& path);
+  enum class Create { kReplace, kTemporary };
+  explicit OutputFile(const std::filesystem::path& path, Create create = Create::kReplace);
   ~OutputFile();
   OutputFile(const OutputFile&) = delete;
   OutputFile& operator=(const OutputFile&) = delete;
 
+  const std::filesystem::path& path() const { return path_; }
   bool is_open() const { return ok_; }
   bool write(const void* data, std::size_t size);
   bool write(std::string_view text) { return write(text.data(), text.size()); }
   bool seek(std::uint64_t offset);  // the position of the next write (past the end: the gap reads as zeros)
-  bool close();                     // flushes and closes
+  bool sync();                      // the data to stable storage (fsync; FlushFileBuffers) through the same descriptor
+  bool close();
 
  private:
+  std::filesystem::path path_;
 #ifdef _WIN32
   void* handle_ = nullptr;
 #else
-  std::ofstream out_;
+  int fd_ = -1;
 #endif
   bool ok_ = false;
 };
