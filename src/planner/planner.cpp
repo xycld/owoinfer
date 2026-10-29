@@ -349,7 +349,10 @@ class Planner {
     c.time.text_encoder_s = te_seconds(c.te);
     c.time.dit_load_s = c.parks() ? static_cast<double>(s_.dit_bytes) / (reload_rate_gbps() * 1e9) : 0;
     c.time.denoise_s = step_seconds(c.dit) * r_.steps;
-    if (r_.reference_prefills > 0) c.time.denoise_s += prefill_seconds(c.dit) * r_.reference_prefills;
+    if (r_.reference_prefills > 0) {
+      c.time.reference_prefill_s = prefill_seconds(c.dit) * r_.reference_prefills;
+      c.time.denoise_s += c.time.reference_prefill_s;
+    }
     c.time.decode_s = decode_seconds(c.vae);
   }
 

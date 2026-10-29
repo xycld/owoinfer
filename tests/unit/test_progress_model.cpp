@@ -523,3 +523,30 @@ TEST(ProgressModel, UnexpectedDecodeInPreload) {
 }
 
 }  // namespace
+
+// Reference images: each pass's prefill (the plan's reference_prefill_s, inside denoise_s) is that denoise segment's
+// work before its first step, and the steps are priced without it.
+TEST(ProgressModel, ReferencePrefillIsTheFirstUnitOfEachPass) {
+  mi::planner::ExecutionPlan plan = resident_plan();
+  const double denoise = plan.time.denoise_s;
+  plan.time.reference_prefill_s = 2.0;
+  plan.time.denoise_s = denoise + 2.0;
+  JobShape shape;
+  shape.total_steps = shape.first_steps = 20;
+  HeldModels warm;
+  warm.warm = true;
+  std::vector<ProgressSegment> s = mi::api::generate_segments(plan, slow_disk(), warm, ModelBytes{}, shape);
+  ASSERT_EQ(s[2].phase, MI_PHASE_DENOISE);
+  EXPECT_NEAR(s[2].seconds, 2.0, 1e-9);
+  EXPECT_NEAR(s[2].step_seconds, denoise / 20, 1e-9);
+  // A hires fix: one prefill per pass.
+  shape.hires = true;
+  shape.first_steps = 10;
+  shape.first_pixel_share = 0.5;
+  shape.encodes_image = true;  // the reference encode: no VAE encoder load in the second pass
+  s = mi::api::generate_segments(plan, slow_disk(), warm, ModelBytes{}, shape);
+  ASSERT_EQ(s[4].phase, MI_PHASE_DENOISE);
+  EXPECT_NEAR(s[2].seconds, 1.0, 1e-9);
+  EXPECT_NEAR(s[4].seconds, 1.0, 1e-9);
+  EXPECT_NEAR(s[2].step_seconds * 10 + s[4].step_seconds * 10, denoise, 1e-9);
+}

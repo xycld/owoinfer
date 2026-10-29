@@ -355,6 +355,7 @@ struct TimeEstimate {
   double text_encoder_s = 0;
   double dit_load_s = 0;  // per-generation reloads (parking)
   double denoise_s = 0;
+  double reference_prefill_s = 0;  // of denoise_s: the reference prefills (RequestShape; not in the plan JSON)
   double decode_s = 0;
   double total_s() const { return text_encoder_s + dit_load_s + denoise_s + decode_s; }
 };

@@ -998,7 +998,8 @@ JobShape job_shape(const pipeline::Request& q) {
   }
   // The pipeline's img2img condition (an init image at strength 1 without a mask is not used), and control images.
   s.encodes_image = (q.init_image != nullptr && (q.denoise_strength < 1.0 || q.mask != nullptr)) ||
-                    (q.control.enabled() && !q.control.images.empty() && s.total_steps > 0);
+                    (q.control.enabled() && !q.control.images.empty() && s.total_steps > 0) ||
+                    (q.references.enabled() && s.total_steps > 0);  // reference images: encoded before the DiT load
   // A LoRA change may re-merge or reload the DiT: the progress prices a load whenever the stack differs.
   for (const lora::LoraSpec& l : q.loras) s.merge_key += util::path_utf8(l.path) + '\n' + std::to_string(l.strength) + '\n';
   if (q.control.enabled()) {
