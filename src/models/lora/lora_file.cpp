@@ -486,8 +486,6 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
                  " is stored INT4 / NVFP4, which cannot take a merge (use lora_placement default or side_branch)");
           }
           t.side_branch = false;
-        } else if (branchable && options.placement == Placement::kDefault && edit) {
-          t.side_branch = base != BaseFormat::kBf16;  // merged on bf16 only: INT8 requantization misses the oracle
         }
         // A merged block module of an edit adapter keeps no pristine copy (every block linear: the whole DiT's size).
         t.keep_pristine = !(edit && !t.side_branch && tm->block >= 0);

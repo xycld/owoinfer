@@ -141,10 +141,11 @@ struct FileReport {
 
 // Where low-rank adapters on the block GEMMs go (the request's lora_placement), a fixed rule per module, decided when
 // the stack is parsed:
-//   kDefault     ordinary LoRAs on the side branch; a moss-edit-lora file (Moss-Image-Edit, FileReport::format)
-//                merged where its module is stored bf16, on the side branch on INT8 / INT4 / NVFP4 (for INT8 a DiT file
-//                with the adapter baked in, moss-infer quantize --lora, is the zero-per-step-cost path)
-//   kMerge       every low-rank block adapter merged; one on an INT4 / NVFP4 module is a LoraError naming it
+//   kDefault     every low-rank block adapter on the side branch, moss-edit-lora files (Moss-Image-Edit) included:
+//                strength changes are instant and loads fast (a DiT file with the adapter baked in, moss-infer
+//                quantize --lora, has no per-step cost)
+//   kMerge       every low-rank block adapter merged (no per-step cost, a slower load; an edit adapter's strength or
+//                placement change reloads the DiT); one on an INT4 / NVFP4 module is a LoraError naming it
 //   kSideBranch  every low-rank block adapter on the side branch
 // Other adapters (LoHa / LoKr / full deltas, non-block modules) are merged whatever the placement.
 enum class Placement : std::uint8_t { kDefault, kMerge, kSideBranch };

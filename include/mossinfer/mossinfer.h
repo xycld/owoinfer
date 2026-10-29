@@ -433,11 +433,12 @@ typedef struct mi_image {
 
 /* Where the low-rank adapters of `loras` on the DiT's block GEMMs go (MI_CAP_REFERENCE_IMAGES), a fixed rule per
  * module and base precision:
- *   DEFAULT      ordinary LoRAs on the side branch (strength changes are instant, the weights untouched); an edit
- *                adapter (moss-edit-lora) merged into the weights at load on bf16 blocks, on the side branch on INT8 /
- *                INT4 / NVFP4 (INT8 with no per-step cost: a DiT file with the adapter baked in, quantize --lora)
- *   MERGE        every low-rank block adapter merged (INT8: requantized, one MI_MESSAGE_LORA_WARNING per file, refused
- *                with lora_strict; an INT4 / NVFP4 module is MI_ERR_MODEL)
+ *   DEFAULT      every low-rank block adapter on the side branch, edit adapters (moss-edit-lora) included: strength
+ *                changes are instant, loads fast, the weights untouched (for INT8 with no per-step cost: a DiT file
+ *                with the adapter baked in, quantize --lora)
+ *   MERGE        every low-rank block adapter merged: no per-step cost (about 6.5 % faster per step than the side
+ *                branch on bf16 for the edit adapter), a load tens of seconds slower (INT8: requantized, one
+ *                MI_MESSAGE_LORA_WARNING per file, refused with lora_strict; an INT4 / NVFP4 module is MI_ERR_MODEL)
  *   SIDE_BRANCH  every low-rank block adapter on the side branch
  * Merging costs nothing per step but a load-time merge; an edit adapter's merged blocks keep no pristine copy, so its
  * strength or placement changes reload the DiT. Merged blocks that stream need a pinned host copy: when the host

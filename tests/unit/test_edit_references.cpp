@@ -449,10 +449,10 @@ TEST_F(EditDit, BitExactInvariants) {
   EXPECT_THROW(model_->set_references(&bad), std::invalid_argument);
 }
 
-// One engine, requests alternating without and with references (INT8 DiT, the edit adapter on the side branch: its default there): the
-// no-reference ones stay bit-identical to the first, the reference ones to each other, the DiT is loaded once (a
-// reference changes no load key), a cancel during a reference pass leaves nothing behind, a hires fix computes the
-// references once per pass, and repeated requests take the same arena; an explicit merge reloads on every change.
+// One engine, requests alternating without and with references (INT8 DiT, the edit adapter on the side branch, the
+// default): the no-reference ones stay bit-identical to the first, the reference ones to each other, the DiT is loaded
+// once (a reference changes no load key), a cancel during a reference pass leaves nothing behind, a hires fix computes
+// the references once per pass, and repeated requests take the same arena; an explicit merge reloads on every change.
 TEST(GpuEditPipeline, AlternatingRequests) {
   const fs::path com = "/workspace/Models/community";
   const fs::path dit = com / "comfy-org/moss_image_sft_int8_convrot.safetensors";
