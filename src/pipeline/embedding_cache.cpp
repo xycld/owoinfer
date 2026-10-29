@@ -12,7 +12,6 @@
 #include <utility>
 
 #include "util/regular_file.h"
-#include "util/rename_replace.h"
 #include "util/replaceable_file.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
@@ -155,6 +154,8 @@ EmbeddingCache::EmbeddingCache(EmbeddingCacheOptions options)
       disk_dir_.clear();
       ++stats_.disk_errors;
     }
+    // The folder its entries must lie in (util::touch_file_in, remove_file_in), resolved once.
+    if (!disk_dir_.empty()) disk_dir_resolved_ = util::resolved_path(disk_dir_);
   }
 }
 
@@ -287,8 +288,7 @@ std::shared_ptr<const Embedding> EmbeddingCache::read_disk(const EmbeddingKey& k
     ++(stats_.*field);
   };
   const auto reject = [&] {
-    std::error_code rm;
-    fs::remove(path, rm);
+    util::remove_file_in(disk_dir_resolved_, path);
     count(&EmbeddingCacheStats::disk_rejects);
     return nullptr;
   };
@@ -338,8 +338,7 @@ std::shared_ptr<const Embedding> EmbeddingCache::read_disk(const EmbeddingKey& k
     return reject();
   }
   if (tokens != key.tokens) return nullptr;
-  std::error_code ec;
-  fs::last_write_time(path, fs::file_time_type::clock::now(), ec);  // disk LRU recency
+  util::touch_file_in(disk_dir_resolved_, path);  // disk LRU recency
   return value;
 }
 
@@ -362,16 +361,11 @@ void EmbeddingCache::write_disk(const EmbeddingKey& key, const Embedding& value)
 
   // A new temporary file (concurrent writers, other processes too, never share one), renamed over the entry.
   util::OutputFile out(path, util::OutputFile::Create::kTemporary);
-  const fs::path tmp = out.path();
-  const bool created = out.is_open();
   out.write(header, kHeaderBytes);
   out.write(key.tokens.data(), n * 4);
   out.write(value.data.data(), value.data.size() * 2);
-  const bool ok = out.close();
-  std::error_code ec;
-  if (ok) util::rename_replace(tmp, path, ec);
-  if (!ok || ec) {
-    if (created) fs::remove(tmp, ec);
+  if (!out.publish(path)) {
+    out.discard();
     std::lock_guard<std::mutex> lock(mu_);
     ++stats_.disk_errors;
     return;
@@ -386,23 +380,20 @@ void EmbeddingCache::write_disk(const EmbeddingKey& key, const Embedding& value)
 void EmbeddingCache::trim_disk() {
   struct File {
     fs::path path;
-    fs::file_time_type time;
+    std::int64_t time;
     std::uint64_t size;
   };
   std::vector<File> files;
   std::uint64_t total = 0;
-  std::error_code ec;
-  for (fs::directory_iterator it(disk_dir_, ec), end; !ec && it != end; it.increment(ec)) {
-    std::error_code fe;
-    // The entry's own type, from the listing (no open): a link is not an entry the cache wrote.
-    if (it->path().extension() != kExtension || it->symlink_status(fe).type() != fs::file_type::regular) continue;
-    const std::uint64_t size = it->file_size(fe);
-    const fs::file_time_type time = it->last_write_time(fe);
-    if (fe) continue;
-    files.push_back({it->path(), time, size});
-    total += size;
+  // The entries' own types, sizes and times, from the listing (nothing opened): a link is not an entry the cache wrote.
+  std::vector<util::DirEntry> entries;
+  const bool listed = util::list_directory(disk_dir_, entries);
+  for (const util::DirEntry& e : entries) {
+    if (e.name.extension() != kExtension || !e.info.regular()) continue;
+    files.push_back({disk_dir_ / e.name, e.info.mtime_ns, e.info.size});
+    total += e.info.size;
   }
-  if (ec) {
+  if (!listed) {
     std::lock_guard<std::mutex> lock(mu_);
     ++stats_.disk_errors;
     return;
@@ -411,8 +402,7 @@ void EmbeddingCache::trim_disk() {
   std::sort(files.begin(), files.end(), [](const File& a, const File& b) { return a.time < b.time; });
   for (const File& f : files) {
     if (total <= max_disk_bytes_) break;
-    std::error_code rm;
-    if (fs::remove(f.path, rm)) total -= f.size;
+    if (util::remove_file_in(disk_dir_resolved_, f.path)) total -= f.size;
   }
 }
 

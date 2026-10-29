@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "util/rename_replace.h"
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -21,6 +23,7 @@
 #include <cerrno>
 #include <thread>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -258,8 +261,8 @@ OpenStatus open_regular_file(const std::filesystem::path& path, unsigned long fl
 }
 
 OutputFile::OutputFile(const std::filesystem::path& path, Create create) {
-  // FILE_READ_ATTRIBUTES for handle_info (GENERIC_WRITE does not include it).
-  const DWORD access = GENERIC_WRITE | FILE_READ_ATTRIBUTES;
+  // FILE_READ_ATTRIBUTES for handle_info (GENERIC_WRITE does not include it); DELETE for publish and discard.
+  const DWORD access = GENERIC_WRITE | FILE_READ_ATTRIBUTES | (create == Create::kTemporary ? DELETE : 0);
   HANDLE h = INVALID_HANDLE_VALUE;
   if (create == Create::kTemporary) {
     for (int attempt = 0; attempt < 16; ++attempt) {
@@ -311,6 +314,124 @@ bool OutputFile::seek(std::uint64_t offset) {
 bool OutputFile::sync() {
   ok_ = ok_ && FlushFileBuffers(static_cast<HANDLE>(handle_));
   return ok_;
+}
+
+bool OutputFile::publish(const std::filesystem::path& target) {
+  if (!ok_ || handle_ == nullptr) return false;
+  // FILE_RENAME_INFO: the flags (a BOOLEAN ReplaceIfExists before Windows 10 1607's DWORD Flags), the root directory
+  // (none), the name's length in bytes and the name: the target's file name alone renames within the same folder.
+  constexpr DWORD kReplaceIfExists = 0x1, kPosixSemantics = 0x2;
+  constexpr auto kFileRenameInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
+  const std::wstring name = target.filename().native();
+  std::vector<std::uint64_t> buf((offsetof(FILE_RENAME_INFO, FileName) + (name.size() + 1) * sizeof(wchar_t) + 7) / 8);
+  auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buf.data());
+  info->RootDirectory = nullptr;
+  info->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
+  std::memcpy(info->FileName, name.c_str(), (name.size() + 1) * sizeof(wchar_t));
+  const auto size = static_cast<DWORD>(buf.size() * sizeof(std::uint64_t));
+  const auto set_name = [&](FILE_INFO_BY_HANDLE_CLASS cls, DWORD flags) {
+    std::memcpy(buf.data(), &flags, sizeof flags);
+    return SetFileInformationByHandle(static_cast<HANDLE>(handle_), cls, info, size) != 0;
+  };
+  bool renamed = false;
+  for (int attempt = 0; !renamed && attempt < 200; ++attempt) {
+    if (attempt > 0) Sleep(1);
+    renamed = set_name(kFileRenameInfoEx, kReplaceIfExists | kPosixSemantics);
+    const DWORD error = renamed ? 0 : GetLastError();
+    if (!renamed && (error == ERROR_INVALID_PARAMETER || error == ERROR_NOT_SUPPORTED)) {
+      renamed = set_name(FileRenameInfo, kReplaceIfExists);  // no FileRenameInfoEx on this file system
+    }
+    if (!renamed && error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION) break;
+  }
+  if (!renamed) return false;
+  path_ = target;
+  return close();
+}
+
+void OutputFile::discard() {
+  if (handle_ != nullptr) {
+    FILE_DISPOSITION_INFO del{TRUE};
+    SetFileInformationByHandle(static_cast<HANDLE>(handle_), FileDispositionInfo, &del, sizeof del);
+  }
+  close();
+}
+
+bool list_directory(const std::filesystem::path& dir, std::vector<DirEntry>& out) {
+  out.clear();
+  if (dir.empty() || is_windows_device_path(dir)) return false;
+  HANDLE h = CreateFileW(dir.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, kShareAll, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_BACKUP_SEMANTICS | kSqos, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  bool listed = handle_info(h).directory();
+  std::vector<std::uint64_t> buf(std::size_t{64} << 10 >> 3);  // 8-byte aligned for the records
+  for (bool first = true; listed; first = false) {
+    const FILE_INFO_BY_HANDLE_CLASS cls = first ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo;
+    if (!GetFileInformationByHandleEx(h, cls, buf.data(), static_cast<DWORD>(buf.size() * sizeof(std::uint64_t)))) {
+      listed = GetLastError() == ERROR_NO_MORE_FILES;
+      break;
+    }
+    const auto* p = reinterpret_cast<const std::byte*>(buf.data());
+    for (;;) {
+      const auto* e = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(p);
+      const std::wstring name(e->FileName, e->FileNameLength / sizeof(wchar_t));
+      if (name != L"." && name != L"..") {
+        DirEntry d;
+        d.name = name;
+        d.link = (e->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        d.info.kind = d.link || (e->FileAttributes & FILE_ATTRIBUTE_DEVICE) != 0 ? FileKind::kOther
+                      : (e->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0  ? FileKind::kDirectory
+                                                                              : FileKind::kRegular;
+        if (d.info.regular()) d.info.size = static_cast<std::uint64_t>(e->EndOfFile.QuadPart);
+        d.info.mtime_ns = (e->LastWriteTime.QuadPart - 116444736000000000LL) * 100;
+        d.info.id = static_cast<std::uint64_t>(e->FileId.QuadPart);
+        out.push_back(std::move(d));
+      }
+      if (e->NextEntryOffset == 0) break;
+      p += e->NextEntryOffset;
+    }
+  }
+  CloseHandle(h);
+  return listed;
+}
+
+namespace {
+
+// `path` opened without following a final reparse point, if it is a plain regular file in the folder `dir`.
+HANDLE open_file_in(const std::filesystem::path& dir, const std::filesystem::path& path, DWORD access) {
+  if (is_windows_device_path(path)) return INVALID_HANDLE_VALUE;
+  HANDLE h = CreateFileW(path.c_str(), access | FILE_READ_ATTRIBUTES, kShareAll, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_OPEN_REPARSE_POINT | kSqos, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return h;
+  FILE_ATTRIBUTE_TAG_INFO tag{};
+  const bool plain = handle_info(h).regular() &&
+                     GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag) &&
+                     (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 && final_path(h).parent_path() == dir;
+  if (!plain) {
+    CloseHandle(h);
+    return INVALID_HANDLE_VALUE;
+  }
+  return h;
+}
+
+}  // namespace
+
+bool touch_file_in(const std::filesystem::path& dir, const std::filesystem::path& path) {
+  HANDLE h = open_file_in(dir, path, FILE_WRITE_ATTRIBUTES);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  FILETIME now;
+  GetSystemTimeAsFileTime(&now);
+  const bool ok = SetFileTime(h, nullptr, nullptr, &now) != 0;
+  CloseHandle(h);
+  return ok;
+}
+
+bool remove_file_in(const std::filesystem::path& dir, const std::filesystem::path& path) {
+  HANDLE h = open_file_in(dir, path, DELETE);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  FILE_DISPOSITION_INFO del{TRUE};
+  const bool ok = SetFileInformationByHandle(h, FileDispositionInfo, &del, sizeof del) != 0;
+  CloseHandle(h);
+  return ok;
 }
 
 bool OutputFile::close() {
@@ -383,7 +504,11 @@ FileInfo file_info(const std::filesystem::path& path) {
   return info;
 }
 
-std::filesystem::path resolved_path(const std::filesystem::path& path) { return std::filesystem::weakly_canonical(path); }
+std::filesystem::path resolved_path(const std::filesystem::path& path) {
+  std::error_code ec;
+  std::filesystem::path resolved = std::filesystem::weakly_canonical(path, ec);
+  return ec ? path.lexically_normal() : resolved;
+}
 
 OutputFile::OutputFile(const std::filesystem::path& path, Create create) {
   if (create == Create::kTemporary) {
@@ -407,6 +532,7 @@ OutputFile::OutputFile(const std::filesystem::path& path, Create create) {
     return;
   }
   ok_ = true;
+  created_ = true;
 }
 
 OutputFile::~OutputFile() {
@@ -435,6 +561,56 @@ bool OutputFile::seek(std::uint64_t offset) {
 bool OutputFile::sync() {
   ok_ = ok_ && ::fsync(fd_) == 0;
   return ok_;
+}
+
+bool OutputFile::publish(const std::filesystem::path& target) {
+  if (!close()) return false;
+  std::error_code ec;
+  rename_replace(path_, target, ec);
+  if (ec) return false;
+  path_ = target;
+  created_ = false;
+  return true;
+}
+
+void OutputFile::discard() {
+  close();
+  if (created_) ::unlink(path_.c_str());
+  created_ = false;
+}
+
+bool list_directory(const std::filesystem::path& dir, std::vector<DirEntry>& out) {
+  out.clear();
+  DIR* d = dir.empty() ? nullptr : ::opendir(dir.c_str());
+  if (d == nullptr) return false;
+  errno = 0;
+  while (const dirent* e = ::readdir(d)) {
+    const std::string_view name = e->d_name;
+    if (name == "." || name == "..") continue;
+    DirEntry entry;
+    entry.name = std::string(name);
+    struct stat st {};
+    if (::fstatat(::dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+      entry.link = S_ISLNK(st.st_mode);
+      entry.info.kind = S_ISREG(st.st_mode) ? FileKind::kRegular : S_ISDIR(st.st_mode) ? FileKind::kDirectory : FileKind::kOther;
+      if (entry.info.regular()) entry.info.size = static_cast<std::uint64_t>(st.st_size);
+      entry.info.mtime_ns = static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec;
+      entry.info.id = static_cast<std::uint64_t>(st.st_ino);
+    }
+    out.push_back(std::move(entry));
+    errno = 0;
+  }
+  const bool listed = errno == 0;
+  ::closedir(d);
+  return listed;
+}
+
+bool touch_file_in(const std::filesystem::path&, const std::filesystem::path& path) {
+  return ::utimensat(AT_FDCWD, path.c_str(), nullptr, 0) == 0;
+}
+
+bool remove_file_in(const std::filesystem::path&, const std::filesystem::path& path) {
+  return ::unlink(path.c_str()) == 0;
 }
 
 bool OutputFile::close() {

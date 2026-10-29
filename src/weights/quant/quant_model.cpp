@@ -439,10 +439,12 @@ void check_text_tensor(const IndexedTensor& t) {
 
 std::vector<fs::path> component_files(const fs::path& dir) {
   std::vector<fs::path> files;
-  for (const auto& e : fs::directory_iterator(dir)) {
-    if (util::path_utf8(e.path().filename()).ends_with(".safetensors") && util::file_info(e.path()).regular()) {
-      files.push_back(e.path());
-    }
+  std::vector<util::DirEntry> entries;
+  if (!util::list_directory(dir, entries)) fail(util::path_utf8(dir) + ": cannot list the folder");
+  for (const util::DirEntry& e : entries) {
+    // A link is followed by file_info (its open carries SQOS); a plain entry's type comes from the listing.
+    const bool regular = e.link ? util::file_info(dir / e.name).regular() : e.info.regular();
+    if (util::path_utf8(e.name).ends_with(".safetensors") && regular) files.push_back(dir / e.name);
   }
   std::sort(files.begin(), files.end());
   if (files.empty()) fail(util::path_utf8(dir) + ": no .safetensors files");

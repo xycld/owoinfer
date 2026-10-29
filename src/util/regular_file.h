@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string_view>
+#include <vector>
 
 namespace mi::util {
 
@@ -158,6 +159,15 @@ class OutputFile {
   bool seek(std::uint64_t offset);  // the position of the next write (past the end: the gap reads as zeros)
   bool sync();                      // the data to stable storage (fsync; FlushFileBuffers) through the same descriptor
   bool close();
+  // A temporary file (kTemporary) renamed over `target`, beside it, replacing it atomically, then closed; false (the
+  // file left in place) when anything failed. Windows: through the open handle (opened with DELETE access):
+  // SetFileInformationByHandle(FileRenameInfoEx, REPLACE_IF_EXISTS | POSIX_SEMANTICS) to the target's name in the same
+  // folder (FileRenameInfo with ReplaceIfExists where the file system has no Ex), retried for about 200 ms while
+  // another process holds the target; nothing reopens the path. POSIX: close, then rename(2) (util::rename_replace).
+  bool publish(const std::filesystem::path& target);
+  // Deletes the file this object created (a temporary not published) and closes it: Windows through the open handle
+  // (FileDispositionInfo), POSIX close then unlink(2). Nothing for a file it did not create.
+  void discard();
 
  private:
   std::filesystem::path path_;
@@ -167,6 +177,29 @@ class OutputFile {
   int fd_ = -1;
 #endif
   bool ok_ = false;
+  bool created_ = false;  // POSIX: opened by this object and not published (discard unlinks it)
 };
+
+// An entry of a folder as the listing gives it, without opening the entry: the name, and the kind, size, modification
+// time and id of the entry itself (a link or junction is not followed: link true, kind kOther; volume unset).
+struct DirEntry {
+  std::filesystem::path name;
+  FileInfo info;
+  bool link = false;
+};
+
+// The entries of the folder `dir` (not . and ..) into `out`; false when it cannot be listed. Windows: through one
+// handle on the folder (FILE_LIST_DIRECTORY, opened with kUserPathSqos and checked to be a directory, as file_info
+// opens) with GetFileInformationByHandleEx(FileIdBothDirectoryInfo): neither the folder nor any entry is opened by
+// name again. POSIX: opendir(3), readdir(3), fstatat(AT_SYMLINK_NOFOLLOW) per entry.
+bool list_directory(const std::filesystem::path& dir, std::vector<DirEntry>& out);
+
+// Sets the modification time of `path` to now, or deletes it: a file in the folder whose resolved_path is `dir` (a
+// cache folder, resolved once). Windows: through one handle opened without following a final reparse point
+// (FILE_FLAG_OPEN_REPARSE_POINT, kUserPathSqos) that must be a plain regular file (no reparse point) whose final
+// path's folder is `dir`: SetFileTime, or SetFileInformationByHandle(FileDispositionInfo). POSIX: utimensat(2) /
+// unlink(2) of the path. False when refused or failed.
+bool touch_file_in(const std::filesystem::path& dir, const std::filesystem::path& path);
+bool remove_file_in(const std::filesystem::path& dir, const std::filesystem::path& path);
 
 }  // namespace mi::util

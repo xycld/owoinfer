@@ -130,6 +130,7 @@ class EmbeddingCache {
   Lru lru_;  // most recently used first
   std::unordered_multimap<std::uint64_t, Lru::iterator> map_;
   std::filesystem::path disk_dir_;
+  std::filesystem::path disk_dir_resolved_;  // util::resolved_path(disk_dir_)
   std::size_t max_disk_bytes_;
   EmbeddingCacheStats stats_;
 };

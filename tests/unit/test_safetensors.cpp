@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -897,6 +898,57 @@ TEST(RegularFile, FileInfoAndOutputFile) {
   EXPECT_TRUE(t1.close());
   EXPECT_EQ(file_info(t1.path()).size, 1u);
   EXPECT_TRUE(mi::testing::temporary_left(out_path));
+  // publish renames the temporary over its target; discard deletes it.
+  EXPECT_TRUE(t2.write("pub", 3));
+  EXPECT_TRUE(t2.publish(out_path));
+  EXPECT_EQ(t2.path(), out_path);
+  ASSERT_EQ(mi::util::read_replaceable_file(out_path, 64, text), mi::util::ReadStatus::kOk);
+  EXPECT_EQ(text, "pub");
+  mi::util::OutputFile t3(out_path, Create::kTemporary);
+  const fs::path t3_path = t3.path();
+  t3.discard();
+  EXPECT_FALSE(file_info(t3_path).exists());
+}
+
+// list_directory: every entry but . and .., with its own type, size and time from the listing (a link not followed);
+// touch_file_in and remove_file_in act on a plain file in the folder (on Windows only there: a link or a file
+// elsewhere is refused).
+TEST(RegularFile, ListTouchAndRemoveInFolder) {
+  namespace fs = std::filesystem;
+  TempDir dir("list_dir");
+  const auto file = make_pattern_file(dir, 1234);
+  fs::create_directory(dir.path() / "sub");
+  std::error_code ec;
+  fs::create_symlink(file, dir.path() / "link.bin", ec);  // Windows: only with the privilege or developer mode
+  std::vector<mi::util::DirEntry> entries;
+  ASSERT_TRUE(mi::util::list_directory(dir.path(), entries));
+  std::map<std::string, mi::util::DirEntry> by_name;
+  for (const auto& e : entries) by_name[mi::util::path_utf8(e.name)] = e;
+  ASSERT_EQ(by_name.size(), ec ? 2u : 3u);
+  EXPECT_EQ(by_name["data.bin"].info.kind, mi::util::FileKind::kRegular);
+  EXPECT_EQ(by_name["data.bin"].info.size, 1234u);
+  EXPECT_EQ(by_name["data.bin"].info.mtime_ns, mi::util::file_info(file).mtime_ns);
+  EXPECT_FALSE(by_name["data.bin"].link);
+  EXPECT_EQ(by_name["sub"].info.kind, mi::util::FileKind::kDirectory);
+  if (!ec) {
+    EXPECT_TRUE(by_name["link.bin"].link);
+    EXPECT_FALSE(by_name["link.bin"].info.regular());
+  }
+  EXPECT_FALSE(mi::util::list_directory(dir.path() / "missing", entries));
+  EXPECT_FALSE(mi::util::list_directory(file, entries));
+
+  const fs::path folder = mi::util::resolved_path(dir.path());
+  const std::int64_t before = mi::util::file_info(file).mtime_ns;
+  fs::last_write_time(file, fs::last_write_time(file) - std::chrono::hours(1));
+  ASSERT_TRUE(mi::util::touch_file_in(folder, file));
+  EXPECT_GE(mi::util::file_info(file).mtime_ns, before);
+#ifdef _WIN32
+  if (!ec) EXPECT_FALSE(mi::util::remove_file_in(folder, dir.path() / "link.bin"));  // a link is never acted on
+  EXPECT_FALSE(mi::util::remove_file_in(mi::util::resolved_path(dir.path() / "sub"), file));  // nor a file elsewhere
+#endif
+  EXPECT_TRUE(mi::util::remove_file_in(folder, file));
+  EXPECT_FALSE(mi::util::file_info(file).exists());
+  EXPECT_FALSE(mi::util::remove_file_in(folder, file));
 }
 
 #ifdef _WIN32

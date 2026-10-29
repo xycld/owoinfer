@@ -21,7 +21,6 @@
 #include "util/json.h"
 #include "util/path.h"
 #include "util/regular_file.h"
-#include "util/rename_replace.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
 #include "weights/model_index.h"
@@ -49,18 +48,12 @@ class PartialFile {
   PartialFile(const PartialFile&) = delete;
   PartialFile& operator=(const PartialFile&) = delete;
   ~PartialFile() {
-    if (!committed_) {
-      file_.close();
-      std::error_code ec;
-      fs::remove(file_.path(), ec);
-    }
+    if (!committed_) file_.discard();
   }
   util::OutputFile& file() { return file_; }
   const fs::path& path() const { return file_.path(); }
   void commit(const fs::path& final_path) {
-    std::error_code ec;
-    util::rename_replace(path(), final_path, ec);
-    if (ec) throw fs::filesystem_error("cannot rename", path(), final_path, ec);
+    if (!file_.publish(final_path)) fail("cannot rename " + util::path_utf8(path()) + " to " + util::path_utf8(final_path));
     committed_ = true;
   }
 
@@ -377,13 +370,12 @@ class Writer {
     if (!out_.seek(t.offset) || !out_.write(data, size)) fail("write failed: " + util::path_utf8(path_));
     written_ += size;
   }
-  // Writes the final header over the first one (same length), flushes the file to stable storage (so the rename that
-  // publishes it cannot outrun its bytes), then closes it.
+  // Writes the final header over the first one (same length) and flushes the file to stable storage (so the rename
+  // that publishes it cannot outrun its bytes); it stays open for PartialFile::commit.
   std::uint64_t finish(const std::string& header) {
     if (written_ != planned_) fail("internal: wrote " + std::to_string(written_) + " tensor bytes, planned " + std::to_string(planned_));
     if (!out_.seek(8) || !out_.write(header)) fail("write failed: " + util::path_utf8(path_));
     if (!out_.sync()) fail("cannot flush " + util::path_utf8(path_) + " to disk");
-    if (!out_.close()) fail("write failed: " + util::path_utf8(path_));
     if (util::file_info(path_).size != end_) fail("output size mismatch (internal)");
     return end_;
   }

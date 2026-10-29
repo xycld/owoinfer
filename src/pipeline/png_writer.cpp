@@ -12,7 +12,6 @@
 
 #include "util/path.h"
 #include "util/regular_file.h"
-#include "util/rename_replace.h"
 
 namespace mi::pipeline {
 namespace {
@@ -277,21 +276,9 @@ void write_png_rgb8(const std::filesystem::path& path, std::span<const std::uint
   // Write a sibling temporary file and rename it over `path`, so a failed or interrupted write never leaves a
   // truncated image under the final name (rename within one directory replaces atomically on POSIX).
   util::OutputFile out(path, util::OutputFile::Create::kTemporary);
-  if (!out.is_open()) throw std::runtime_error("cannot write " + util::path_utf8(path));
-  const std::filesystem::path tmp = out.path();
-  {
-    if (!out.write(png.data(), png.size()) || !out.close()) {
-      std::error_code ignored;
-      std::filesystem::remove(tmp, ignored);
-      throw std::runtime_error("cannot write " + util::path_utf8(path));
-    }
-  }
-  std::error_code ec;
-  util::rename_replace(tmp, path, ec);
-  if (ec) {
-    std::error_code ignored;
-    std::filesystem::remove(tmp, ignored);
-    throw std::runtime_error("cannot write " + util::path_utf8(path) + ": " + ec.message());
+  if (!out.write(png.data(), png.size()) || !out.publish(path)) {
+    out.discard();
+    throw std::runtime_error("cannot write " + util::path_utf8(path));
   }
 }
 

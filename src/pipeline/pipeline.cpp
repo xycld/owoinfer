@@ -174,9 +174,10 @@ std::uint64_t weight_bytes(const std::filesystem::path& p) {
   const util::FileInfo info = util::file_info(p);
   if (!info.directory()) return info.size;
   std::uint64_t total = 0;
-  std::error_code ec;
-  for (const auto& e : std::filesystem::directory_iterator(p, ec)) {
-    if (e.path().extension() == ".safetensors") total += util::file_info(e.path()).size;
+  std::vector<util::DirEntry> entries;
+  util::list_directory(p, entries);
+  for (const util::DirEntry& e : entries) {
+    if (e.name.extension() == ".safetensors") total += e.link ? util::file_info(p / e.name).size : e.info.size;
   }
   return total;
 }

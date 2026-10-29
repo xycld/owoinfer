@@ -16,7 +16,6 @@
 #include "util/json.h"
 #include "util/path.h"
 #include "util/regular_file.h"
-#include "util/rename_replace.h"
 #include "util/replaceable_file.h"
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
@@ -77,8 +76,10 @@ std::vector<IndexedTensor> load_component_tensors(ModelIndex& index, Component c
   if (!util::file_info(dir).directory()) throw IndexError("bundle is missing directory " + path_utf8(dir));
 
   std::vector<std::string> shards, shard_indexes;
-  for (const auto& e : fs::directory_iterator(dir)) {
-    std::string n = path_utf8(e.path().filename());
+  std::vector<util::DirEntry> entries;  // names only: each shard is opened as a regular file when it is read
+  if (!util::list_directory(dir, entries)) throw IndexError("cannot list " + path_utf8(dir));
+  for (const util::DirEntry& e : entries) {
+    std::string n = path_utf8(e.name);
     if (ends_with(n, kShardIndexSuffix)) shard_indexes.push_back(n);
     else if (ends_with(n, kShardSuffix)) shards.push_back(n);
   }
@@ -507,18 +508,9 @@ void write_index(const ModelIndex& index, const fs::path& path) {
 
   // Write-then-rename so a crash never leaves a half-written index that parses as stale.
   util::OutputFile out(path, util::OutputFile::Create::kTemporary);
-  const fs::path tmp = out.path();
-  if (!out.is_open()) throw IndexError("cannot create a temporary file next to " + path_utf8(path));
-  std::error_code ec;
-  if (!out.write(o.str()) || !out.close()) {
-    fs::remove(tmp, ec);
-    throw IndexError("cannot write " + path_utf8(tmp));
-  }
-  util::rename_replace(tmp, path, ec);
-  if (ec) {
-    std::error_code ignored;
-    fs::remove(tmp, ignored);
-    throw fs::filesystem_error("cannot rename", tmp, path, ec);
+  if (!out.write(o.str()) || !out.publish(path)) {
+    out.discard();
+    throw IndexError("cannot write " + path_utf8(path));
   }
 }
 

@@ -18,7 +18,6 @@
 #include "kernels/fused/fused_gemm.h"
 #include "util/json.h"
 #include "util/regular_file.h"
-#include "util/rename_replace.h"
 #include "util/replaceable_file.h"
 
 namespace mi::pipeline {
@@ -192,17 +191,8 @@ bool write_profile(const std::filesystem::path& path, const std::string& key, co
   std::filesystem::create_directories(path.parent_path(), ec);
   // A new temporary file (concurrent writers never share one); the rename replaces atomically.
   util::OutputFile out(path, util::OutputFile::Create::kTemporary);
-  if (!out.is_open()) return false;
-  const std::filesystem::path tmp = out.path();
-  {
-    if (!out.write(doc) || !out.close()) {
-      std::filesystem::remove(tmp, ec);
-      return false;
-    }
-  }
-  util::rename_replace(tmp, path, ec);
-  if (ec) {
-    std::filesystem::remove(tmp, ec);
+  if (!out.write(doc) || !out.publish(path)) {
+    out.discard();
     return false;
   }
   return true;

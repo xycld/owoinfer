@@ -826,10 +826,10 @@ namespace {
 std::uint64_t weight_bytes(const fs::path& file, const fs::path& folder) {
   if (!file.empty()) return util::file_info(file).size;
   std::uint64_t total = 0;
-  std::error_code ec;
-  if (!util::file_info(folder).directory()) return 0;
-  for (fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
-    if (it->path().extension() == ".safetensors") total += util::file_info(it->path()).size;
+  std::vector<util::DirEntry> entries;
+  util::list_directory(folder, entries);
+  for (const util::DirEntry& e : entries) {
+    if (e.name.extension() == ".safetensors") total += e.link ? util::file_info(folder / e.name).size : e.info.size;
   }
   return total;
 }
