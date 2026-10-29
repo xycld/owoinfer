@@ -540,34 +540,32 @@ std::optional<double> lora_metadata_alpha(const std::map<std::string, std::strin
 }
 
 namespace {
-// The adapter_config header as JSON (null when absent).
-json::Value adapter_config(const std::map<std::string, std::string>& metadata) {
+// The adapter_config header when it declares the moss-edit-lora format, else null: an absent header, one that is not
+// JSON (or past the parse limit), not an object or of another format is an ordinary LoRA's, read as 2.0 read it.
+json::Value edit_adapter_config(const std::map<std::string, std::string>& metadata) {
   const auto it = metadata.find("adapter_config");
   if (it == metadata.end()) return {};
   json::Value v;
   try {
     v = json::parse(it->second, json::ParseLimits{1 << 22});
-  } catch (const json::ParseError& e) {
-    fail(std::string("malformed adapter_config: ") + e.what());
+  } catch (const json::ParseError&) {
+    return {};
   }
-  if (!v.is_object()) fail("adapter_config is not a JSON object");
+  if (!v.is_object()) return {};
+  const json::Value* f = v.find("format");
+  if (f == nullptr || !f->is_string() || f->as_string() != "moss-edit-lora") return {};
   return v;
 }
 }  // namespace
 
 std::string lora_adapter_config_format(const std::map<std::string, std::string>& metadata) {
-  const json::Value v = adapter_config(metadata);
-  if (!v.is_object()) return {};
-  const json::Value* f = v.find("format");
-  return f != nullptr && f->is_string() ? f->as_string() : std::string();
+  return edit_adapter_config(metadata).is_object() ? "moss-edit-lora" : std::string();
 }
 
 std::map<std::string, double> lora_adapter_config_alphas(const std::map<std::string, std::string>& metadata) {
   std::map<std::string, double> out;
-  const json::Value v = adapter_config(metadata);
+  const json::Value v = edit_adapter_config(metadata);
   if (!v.is_object()) return out;
-  const json::Value* f = v.find("format");
-  if (f == nullptr || !f->is_string() || f->as_string() != "moss-edit-lora") return out;
   const json::Value* mods = v.find("modules");
   if (mods == nullptr || !mods->is_object()) fail("adapter_config (moss-edit-lora) has no modules object");
   for (const auto& [name, spec] : mods->as_object()) {

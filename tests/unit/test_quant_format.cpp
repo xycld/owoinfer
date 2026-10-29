@@ -1078,6 +1078,23 @@ TEST(QuantConvert, LoraEdgeCasesAndCleanup) {
   }
   fs::remove(out);
 
+  // An ordinary LoRA whose adapter_config is not a moss-edit-lora header (here not JSON) merges as in 2.0 (alpha / rank 1).
+  write_st(dir.path() / "junk.safetensors", {make("base_model.model.layers.0.proj.o.lora_A.weight", DType::kF32, {4, kD}, down),
+                                             make("base_model.model.layers.0.proj.o.lora_B.weight", DType::kF32, {kD, 4}, up)},
+           R"({"adapter_config":"not json {"})");
+  opt.loras = {{dir.path() / "junk.safetensors", 1.0f}};
+  EXPECT_EQ(mi::quant::convert(dir.path(), out, opt).lora_modules, 1);
+  {
+    const auto m = mi::quant::open_quant_model(out);
+    std::vector<float> w = widen(d.w["layers.0.proj.o"]);
+    std::vector<double> acc(static_cast<std::size_t>(kD));
+    for (std::int64_t r = 0; r < kD; ++r) mi::quant::lora_merge_row(w.data() + r * kD, kD, up.data() + r * 4, down.data(), 4, 1.0f, acc.data());
+    std::vector<float> s_ref;
+    const auto q_ref = ref_quant(w, kD, kD, s_ref);
+    EXPECT_EQ(bytes_i8(mi::quant::read_tensor(m, m.find_linear("layers.0.proj.o")->weight)), q_ref);
+  }
+  fs::remove(out);
+
   // Non-finite alpha, a coefficient that overflows, a non-finite strength.
   for (const auto& [tag, alpha, strength] : {std::tuple{"nan_alpha", std::numeric_limits<float>::quiet_NaN(), 1.0f},
                                              std::tuple{"inf_alpha", std::numeric_limits<float>::infinity(), 1.0f},

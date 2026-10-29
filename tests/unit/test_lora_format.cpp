@@ -479,11 +479,29 @@ TEST(LoraFormat, MossEditLoraAdapterConfig) {
   EXPECT_NE(s.reports()[0].notes.back().find("adapter_config (moss-edit-lora) applied to 2 modules"), std::string::npos);
   std::map<std::string, std::string> md{{"adapter_config", R"({"format": "other", "modules": {"q": {"alpha": 2}}})"}};
   EXPECT_TRUE(quant::lora_adapter_config_alphas(md).empty());  // only the moss-edit-lora format's
-  EXPECT_EQ(quant::lora_adapter_config_format(md), "other");
+  EXPECT_EQ(quant::lora_adapter_config_format(md), "");
   md["adapter_config"] = R"({"format": "moss-edit-lora", "modules": {"q": {"alpha": "x"}}})";
   EXPECT_THROW(quant::lora_adapter_config_alphas(md), quant::QuantError);
-  md["adapter_config"] = "not json";
-  EXPECT_THROW(quant::lora_adapter_config_format(md), quant::QuantError);
+  md["adapter_config"] = R"({"format": "moss-edit-lora"})";
+  EXPECT_THROW(quant::lora_adapter_config_alphas(md), quant::QuantError);  // no modules object
+}
+
+// An ordinary LoRA whose adapter_config header is not a moss-edit-lora one (not JSON, not an object, another format, a
+// modules entry of the wrong shape) loads as in 2.0: no format, no alphas from it, no error.
+TEST(LoraFormat, ForeignAdapterConfigIgnored) {
+  TempDir dir("lora_junk_cfg");
+  const auto t = low_rank("diffusion_model.layers.0.proj.o", ".lora_down.weight", ".lora_up.weight", kD, kD, 4, 1);
+  for (const char* cfg : {R"(not json)", R"([1, 2])", R"(\"text\")", R"({\"format\": \"peft\", \"modules\": 3})",
+                          R"({\"r\": 4, \"lora_alpha\": \"x\"})"}) {
+    SCOPED_TRACE(cfg);
+    write_st(dir.path() / "k.safetensors", t, std::string(R"({"adapter_config":")") + cfg + "\"}");
+    const LoraStack s = open1(dir.path() / "k.safetensors");
+    EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.o").at(0)->alpha_scale, 1.0);
+    EXPECT_EQ(s.reports()[0].format, "");
+    EXPECT_TRUE(s.reports()[0].unknown.empty());
+    EXPECT_TRUE(s.reports()[0].warnings.empty());
+    EXPECT_TRUE(s.reports()[0].notes.empty());
+  }
 }
 
 // On an INT8 base every merged adapter of a block GEMM is reported as a warning; strict turns warnings into errors.

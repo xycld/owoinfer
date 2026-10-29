@@ -163,9 +163,10 @@ void lora_merge_row(float* w, std::int64_t k, const float* up_row, const float* 
 //   refused rather than half-applied).
 // - Without one, a "moss-edit-lora" file (Moss-Image-Edit adapters: bare `<module>.lora_A` / `.lora_B` keys) declares
 //   each module's alpha in its `adapter_config` header ({"format": "moss-edit-lora", "modules": {<module>: {"alpha":
-//   ...}}}): lora_adapter_config_alphas returns them by module name as written (empty for a file without such a header;
-//   QuantError for malformed metadata or a non-finite alpha), and lora_adapter_config_format the header's format ("" for
-//   none).
+//   ...}}}): lora_adapter_config_alphas returns them by module name as written (QuantError for a moss-edit-lora header
+//   without a modules object or with a non-finite alpha), and lora_adapter_config_format "moss-edit-lora" for such a
+//   file. Any other adapter_config (absent, not JSON, not an object, another format) is an ordinary LoRA's: "", no
+//   alphas, never an error.
 // - Without either, alpha / rank = 1.
 // (ComfyUI reads only the alpha tensors and ignores the metadata; for every file surveyed the two agree.)
 std::optional<double> lora_metadata_alpha(const std::map<std::string, std::string>& metadata);
