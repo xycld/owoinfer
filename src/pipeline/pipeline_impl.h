@@ -666,7 +666,7 @@ struct Pipeline::Impl {
       const auto t0 = Clock::now();
       std::unique_ptr<DitSource> d = open();
       d->files = dit_files(*d->index);
-      d->lineage = dit_lineage(*d->index);
+      d->lineage = d->pending ? d->pending->lineage : dit_lineage(*d->index);  // a GGUF stand-in: its converted file's
       it = dit_sources.emplace(key, std::move(d)).first;
       load_s += since(t0);
     }

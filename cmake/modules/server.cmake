@@ -27,7 +27,8 @@ if(NOT MOSSINFER_ONLY AND EXISTS ${CMAKE_SOURCE_DIR}/tools/server/main.cpp)
   target_compile_options(moss-server PRIVATE ${MOSSINFER_WARN})
   if(TARGET mossinfer)
     # The shared library exports mi_* only, so the server brings its own copy of the JSON parser.
-    target_sources(moss-server PRIVATE ${CMAKE_SOURCE_DIR}/src/util/json.cpp)
+    # ... and of the user-file boundary (the image headers a check reads: check_user_path, open_regular_file).
+    target_sources(moss-server PRIVATE ${CMAKE_SOURCE_DIR}/src/util/json.cpp ${CMAKE_SOURCE_DIR}/src/util/regular_file.cpp)
     target_include_directories(moss-server PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(moss-server PRIVATE mossinfer Threads::Threads)
   else()

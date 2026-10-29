@@ -227,6 +227,27 @@ class Server:
                 pass
 
 
+
+def assert_check_beside_status(test, server, load, image, events=None):
+    """A check naming `image` (a FIFO, a UNC-style path) and a status sent right after it: both answered, the status
+    without waiting for the check (every file access of a check runs on its own thread, never on the request loop)."""
+    cid = server.send("check", {"load": load, "generate": {"prompt": "x", "width": 256, "height": 256,
+                                                           "init_image": image}}, id="fc")
+    sid = server.send("status", id="fs")
+    got = {}
+    deadline = time.monotonic() + 30
+    while len(got) < 2:
+        msg = server.read(max(0.1, deadline - time.monotonic()))
+        if "event" in msg:
+            if events is not None:
+                events.append(msg)
+            continue
+        got[msg["id"]] = msg
+    test.assertIn("result", got[sid], got)
+    test.assertTrue("result" in got[cid] or "error" in got[cid], got)
+    return got[cid]
+
+
 class ProtocolTestBase(unittest.TestCase):
     def setUp(self):
         if not SERVER or not os.path.isfile(SERVER):
@@ -238,6 +259,11 @@ class ProtocolTestBase(unittest.TestCase):
         self.server.close()
         self.assertEqual(self.server.bad_lines, [], "stdout carried non-protocol lines")
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make_fifo(self):
+        path = os.path.join(self.tmp, "fifo-%d.png" % len(os.listdir(self.tmp)))
+        os.mkfifo(path)
+        return path
 
     def assertError(self, msg, code, id=None):
         self.assertIn("error", msg, msg)
@@ -773,6 +799,9 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertEqual(r["error"], real["error"])
         r = s.call("check", {"load": load, "generate": {"prompt": "x", "bogus": 1}})["result"]
         self.assertEqual(r["refused_by"], "load")
+        # A FIFO and a UNC-style path as images: answered, never blocking the request loop.
+        for image in ([self.make_fifo()] if POSIX else []) + ["//nas.invalid/share/x.png"]:
+            assert_check_beside_status(self, s, load, image)
 
     def test_inspect(self):
         s = self.server
@@ -1257,6 +1286,12 @@ class GpuProtocolTest(ProtocolTestBase):
             self.assertError(busy, "busy", "c1")
         r = self.server.call("check", {"load": {"model": base, "tier": "reference"}, "generate": request}, id="c2")
         self.assertEqual((r["result"]["ok"], r["result"]["planned"]), (True, True), r)
+        # While the job runs the check sniffs its images' headers (on its thread): a FIFO and a UNC-style path never
+        # block the request loop, and are refused by the check itself.
+        for image in ([self.make_fifo()] if POSIX else []) + ["//nas.invalid/share/x.png"]:
+            r = assert_check_beside_status(self, self.server, {"model": base, "tier": "reference"}, image, events)
+            if "result" in r:
+                self.assertFalse(r["result"]["ok"], r)
         self.assertEqual(self.wait_done(gid, events)["status"], "ok")
 
     def test_tier_high_runs_8bit_attention(self):

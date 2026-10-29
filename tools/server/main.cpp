@@ -19,7 +19,6 @@
 #include <cstdlib>
 #include <limits>
 #include <filesystem>
-#include <fstream>
 #include <list>
 #include <mutex>
 #include <optional>
@@ -56,6 +55,8 @@
 #include "mossinfer/mossinfer.h"
 #include "names.h"
 #include "util/json.h"
+#include "util/path.h"
+#include "util/regular_file.h"
 
 namespace {
 
@@ -1005,19 +1006,22 @@ class Server {
     p.only({"load", "generate"});
     if (p.find("load") == nullptr) throw RequestError("invalid_params", "\"load\" (load's parameters) is required");
     if (p.find("generate") == nullptr) throw RequestError("invalid_params", "\"generate\" (generate's parameters) is required");
-    // A check decodes its image inputs: next to a running job, only up to kCheckPixelsBusy pixels in all.
-    if (generating()) {
-      const std::uint64_t pixels = image_pixels(*p.find("generate"));
-      if (pixels > kCheckPixelsBusy) {
-        throw RequestError("busy", "a job is running and this check would decode " + std::to_string(pixels / 1000000) +
-                                       " MP of images (at most " + std::to_string(kCheckPixelsBusy / 1000000) +
-                                       " MP while a job runs); send it again after the job's done event");
-      }
-    }
-    // The parameters are read on the thread: Params point into the request line's document.
+    // The parameters are read on the thread: Params point into the request line's document. Every file access (the
+    // image headers too) happens there, never on the request loop.
     auto doc = std::make_shared<Value>(*p.find("load"));
     auto gen = std::make_shared<Value>(*p.find("generate"));
-    return on_thread(checks_, 1, id, "check", [this, doc, gen] { return check_json(Params(doc.get()), Params(gen.get())); });
+    return on_thread(checks_, 1, id, "check", [this, doc, gen] {
+      // A check decodes its image inputs: next to a running job, only up to kCheckPixelsBusy pixels in all.
+      if (generating()) {
+        const std::uint64_t pixels = image_pixels(*gen);
+        if (pixels > kCheckPixelsBusy) {
+          throw RequestError("busy", "a job is running and this check would decode " + std::to_string(pixels / 1000000) +
+                                         " MP of images (at most " + std::to_string(kCheckPixelsBusy / 1000000) +
+                                         " MP while a job runs); send it again after the job's done event");
+        }
+      }
+      return check_json(Params(doc.get()), Params(gen.get()));
+    });
   }
 
   // Pixels of the images a check would decode (generate's init_image, mask, control.images[].path,
@@ -1048,16 +1052,38 @@ class Server {
     return total;
   }
 
-  // width * height from a PNG's IHDR or a JPEG's first SOF marker; 0 when neither is found in the first 64 KiB.
+  // width * height from a PNG's IHDR or a JPEG's first SOF marker; 0 when neither is found in the first 64 KiB. The
+  // path passes the boundary check and the engine's open of user files (util::check_user_path, open_regular_file: a
+  // device, pipe or other non-regular file is never opened, nor blocked on); what they refuse counts 0 pixels (the
+  // check itself refuses it).
   static std::uint64_t image_header_pixels(const std::string& path_utf8) {
-    // A regular file only (never a device or a pipe, whose read could block the request loop).
-    const std::filesystem::path path(std::u8string(path_utf8.begin(), path_utf8.end()));
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(path, ec)) return 0;
-    std::ifstream f(path, std::ios::binary);
+    const std::filesystem::path path = mi::util::path_from_utf8(path_utf8);
     std::string b(std::size_t{64} << 10, '\0');
-    f.read(b.data(), static_cast<std::streamsize>(b.size()));
-    b.resize(static_cast<std::size_t>(f.gcount()));
+    std::size_t got = 0;
+    try {
+      mi::util::check_user_path(path, "image");
+#ifdef _WIN32
+      void* h = nullptr;
+      if (mi::util::open_regular_file(path, 0, h) != mi::util::OpenStatus::kOk) return 0;
+      DWORD n = 0;
+      const BOOL ok = ReadFile(static_cast<HANDLE>(h), b.data(), static_cast<DWORD>(b.size()), &n, nullptr);
+      CloseHandle(static_cast<HANDLE>(h));
+      if (!ok) return 0;
+      got = n;
+#else
+      int fd = -1;
+      if (mi::util::open_regular_file(path, 0, fd) != mi::util::OpenStatus::kOk) return 0;
+      while (got < b.size()) {
+        const ssize_t n = ::read(fd, b.data() + got, b.size() - got);
+        if (n <= 0) break;
+        got += static_cast<std::size_t>(n);
+      }
+      ::close(fd);
+#endif
+    } catch (const std::exception&) {
+      return 0;
+    }
+    b.resize(got);
     const auto byte = [&](std::size_t i) { return static_cast<std::uint64_t>(static_cast<unsigned char>(b[i])); };
     const auto be = [&](std::size_t i, int n) {
       std::uint64_t v = 0;

@@ -13,11 +13,14 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "pipeline/gguf_dit.h"
+#include "pipeline/pipeline.h"
 #include "test_util.h"
 #include "util/json.h"
 #include "util/path.h"
@@ -444,6 +447,21 @@ TEST_F(GpuCheckAgreement, GgufBeforeAndAfterItsConversion) {
   const Real real_lora = run_real(e, with_vae_lora);
   EXPECT_EQ(real_lora.status, pending_lora.info.status);
   EXPECT_EQ(real_lora.message, pending_lora.message);
+  // The pending conversion's lineage (the step cache's default threshold) is the converted file's.
+  {
+    const fs::path gguf_file = mi::util::path_from_utf8(gguf_);
+    const mi::pipeline::GgufDitInfo info = mi::pipeline::inspect_gguf_dit(gguf_file);
+    const mi::quant::QuantSpec target = mi::pipeline::gguf_target(info, mi::planner::Tier::kHigh);
+    const fs::path other = dir.path() / "other";  // an empty cache: the conversion is pending there
+    fs::create_directories(other);
+    const std::string pending_lineage = mi::pipeline::gguf_pending_conversion(gguf_file, info, target, other).lineage;
+    const std::optional<fs::path> converted = mi::pipeline::gguf_cached_file(gguf_file, target, dir.path() / "cache");
+    ASSERT_TRUE(converted.has_value());
+    const mi::pipeline::DitFileInfo f = mi::pipeline::inspect_dit_file(*converted, std::string_view());
+    ASSERT_NE(f.quant, nullptr);
+    EXPECT_EQ(pending_lineage, mi::pipeline::dit_lineage(f.quant->index));
+    EXPECT_EQ(pending_lineage, "sft");
+  }
   const Checked hit = run_check(e, g);
   EXPECT_EQ(hit.info.status, MI_OK) << hit.message;
   EXPECT_EQ(hit.info.planned, 1);

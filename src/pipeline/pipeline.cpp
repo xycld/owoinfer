@@ -84,8 +84,13 @@ std::vector<int> parse_layers(const json::Value& v, const char* name) {
 
 }  // namespace
 
-std::string dit_lineage(const weights::ModelIndex& index) {
+std::string dit_lineage_of(const void* bf16, std::size_t bytes) {
   constexpr std::uint64_t kBase = 0x06b5ba6b83f6335cULL, kSft = 0x8b85f7f1ea6f9562ULL;
+  const std::uint64_t h = xxh64(bf16, bytes);
+  return h == kBase ? "base" : h == kSft ? "sft" : "";
+}
+
+std::string dit_lineage(const weights::ModelIndex& index) {
   const weights::WeightGroup* g = index.find_group(weights::Component::kTransformer, "globals");
   if (g == nullptr) return {};
   for (const weights::IndexedTensor& t : g->tensors) {
@@ -93,8 +98,7 @@ std::string dit_lineage(const weights::ModelIndex& index) {
     try {
       std::vector<std::byte> bytes(static_cast<std::size_t>(t.nbytes));
       weights::FileReader(index.file_path(t.file)).read_at(t.offset, bytes.data(), bytes.size());
-      const std::uint64_t h = xxh64(bytes.data(), bytes.size());
-      return h == kBase ? "base" : h == kSft ? "sft" : "";
+      return dit_lineage_of(bytes.data(), bytes.size());
     } catch (const std::exception&) {
       return {};  // unreadable weights fail at the load, with a better error
     }

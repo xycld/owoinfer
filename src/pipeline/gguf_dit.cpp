@@ -17,6 +17,7 @@
 #include "util/xxh64.h"
 #include "weights/file_reader.h"
 #include "weights/gguf.h"
+#include "weights/quant/quant_codec.h"
 #include "weights/quant/quant_convert.h"
 #include "weights/safetensors.h"
 #include "weights/supported_model.h"
@@ -289,6 +290,26 @@ GgufPendingConversion gguf_pending_conversion(const fs::path& file, const GgufDi
   p.target = target;
   for (const quant::QuantLinear& l : model.linears) p.gemms.push_back(l.name);
   p.converted_bytes = converted_bytes(model, target);
+  // The model lineage of the converted file (dit_lineage of its video_embedder.weight): the converter's bf16 rounding of
+  // the dequantized GGUF tensor ("" when it cannot be read: the load would tell).
+  if (const weights::IndexedTensor* t = model.find_tensor("video_embedder.weight");
+      t != nullptr && t->dtype == weights::DType::kBF16 && !t->shape.empty()) {
+    try {
+      const auto g = model.gguf_types.find(t->name);
+      if (g != model.gguf_types.end()) {
+        std::vector<std::byte> b(static_cast<std::size_t>(t->nbytes));
+        weights::FileReader(model.file_path(t->file)).read_at(t->offset, b.data(), b.size());
+        const std::int64_t k = t->shape.back(), numel = t->numel();
+        std::vector<float> f(static_cast<std::size_t>(numel));
+        weights::dequantize_gguf_rows(g->second, b.data(), numel / k, k, f.data());
+        std::vector<std::uint16_t> v(f.size());
+        for (std::size_t i = 0; i < f.size(); ++i) v[i] = quant::float_to_bf16(f[i]);
+        p.lineage = dit_lineage_of(v.data(), v.size() * 2);
+      }
+    } catch (const std::exception&) {
+      p.lineage.clear();
+    }
+  }
   p.seconds = gguf_conversion_seconds(p.converted_bytes);
   const std::uint64_t need = kSpaceMargin + p.converted_bytes;
   std::error_code ec;
@@ -330,7 +351,7 @@ GgufCachedFile gguf_converted_file(const fs::path& file, const GgufDitInfo& info
       r.lock = take_lock(lock_path, util::FileLock::Mode::kShared, hooks);
     } catch (const weights::IoError&) {
       // A read-only cache folder: a valid entry is used without the lock (gguf_unlocked_remark); a conversion cannot be.
-      if (r.converted || !valid()) throw;
+      if (r.converted || lock_creatable(c) || !valid()) throw;  // only a lock file that cannot be created falls back
       r.unlocked = true;
       return r;
     }

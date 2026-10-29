@@ -96,7 +96,11 @@ struct GgufPendingConversion {
   std::vector<std::string> gemms;     // the block GEMM modules it converts to `target` (the other tensors stay bf16)
   std::uint64_t converted_bytes = 0;  // the converted file's size (the cache directory needs this much free)
   double seconds = 0;                 // estimated conversion time on this machine (gguf_conversion_seconds)
+  std::string lineage;                // the converted DiT's dit_lineage ("base", "sft" or "")
 };
+
+// dit_lineage of a DiT whose video_embedder.weight holds `bytes` of bf16 (defined in pipeline.cpp).
+std::string dit_lineage_of(const void* bf16, std::size_t bytes);
 
 // The converted file of `file` for `target` that gguf_converted_file would use, when the cache already holds it (a
 // valid entry for the GGUF's current identity); nullopt otherwise. Reads only: no folder is created, no lock taken.
