@@ -476,6 +476,13 @@ void validate(const Request& r) {
                                   std::to_string(refs.max_edge) + "; at most " + std::to_string(kMaxReferenceTokens) +
                                   " (lower the max edge or use fewer images).");
     }
+    // The references act only inside sampling steps (a request without one plans no DiT).
+    if (schedule_steps(r) == 0) {
+      throw std::invalid_argument("Reference images need a sampling step; none runs at denoise strength " +
+                                  json_number(r.denoise_strength) +
+                                  (r.hires.enabled() ? " and hires strength " + json_number(r.hires.strength) : std::string()) +
+                                  " (raise the strength or drop the reference images).");
+    }
   }
   accel::validate(r.accel);
 }

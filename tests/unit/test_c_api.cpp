@@ -1851,6 +1851,26 @@ TEST(CApi, ReferenceImages) {
               g.reference_max_edge = 2048;
             }).find("tokens"),
             std::string::npos);
+  // No sampling step (denoise strength 0, a hires pass of strength 0 too): the references would act on nothing.
+  const mi_image init = rgb_image(rgb, 48, 32, 3);
+  EXPECT_NE(refused("strength 0", [&](mi_gen_params& g) {
+              g.init_image = &init;
+              g.denoise_strength = 0.0;
+            }).find("Reference images need a sampling step; none runs at denoise strength 0 ("),
+            std::string::npos);
+  EXPECT_NE(refused("strength 0, hires 0", [&](mi_gen_params& g) {
+              g.init_image = &init;
+              g.denoise_strength = 0.0;
+              g.hires_width = g.hires_height = 512;
+              g.hires_strength = 0.0;
+            }).find("none runs at denoise strength 0 and hires strength 0 ("),
+            std::string::npos);
+  mi_gen_params hires_steps = p;
+  hires_steps.init_image = &init;
+  hires_steps.denoise_strength = 0.0;
+  hires_steps.hires_width = hires_steps.hires_height = 512;
+  hires_steps.hires_strength = 0.5;
+  EXPECT_EQ(mi_gen_params_validate(&hires_steps), MI_OK) << last_error();  // the hires pass samples
 }
 
 TEST(CApi, ControlAndAccelerators) {
