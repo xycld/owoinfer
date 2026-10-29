@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -87,12 +89,21 @@ TEST(ServerShm, CreateWritesTheHeaderAndAttachChecksTheToken) {
   EXPECT_EQ(bytes, r.bytes());
   EXPECT_EQ(offset, shm::kPayloadOffset);
   EXPECT_EQ(std::memcmp(h + 16, r.token().bytes.data(), 16), 0);
-  for (std::size_t i = 48; i < shm::kHeaderBytes; ++i) EXPECT_EQ(h[i], std::byte{0}) << i;
+#ifndef _WIN32
+  struct stat ns {};
+  ASSERT_EQ(stat("/proc/self/ns/pid", &ns), 0);
+  std::uint64_t header_ns = 0;
+  std::memcpy(&header_ns, h + 48, 8);
+  EXPECT_EQ(header_ns, static_cast<std::uint64_t>(ns.st_ino));  // the creator's PID namespace
+#endif
+  for (std::size_t i = 56; i < shm::kHeaderBytes; ++i) EXPECT_EQ(h[i], std::byte{0}) << i;
 
   // A client's mapping sees the server's writes and vice versa.
   shm::Attachment a = shm::Attachment::open(r.name(), r.token());
   EXPECT_EQ(a.server_pid(), self_pid());
   EXPECT_EQ(a.payload_bytes(), r.payload_bytes());
+  EXPECT_EQ(a.region_bytes(), r.bytes());
+  EXPECT_GE(a.mapped_bytes(), a.region_bytes());
   r.payload()[5] = std::byte{42};
   EXPECT_EQ(a.payload()[5], std::byte{42});
   a.payload()[6] = std::byte{7};
@@ -191,8 +202,13 @@ pid_t dead_pid() {
   return child;
 }
 
-// An shm object with `size` bytes whose header names `header_pid` (0 bytes: no header).
-void make_object(const std::string& name, std::size_t size, std::uint32_t header_pid) {
+std::uint64_t own_pid_namespace() {
+  struct stat st {};
+  return stat("/proc/self/ns/pid", &st) == 0 ? static_cast<std::uint64_t>(st.st_ino) : 0;
+}
+
+// An shm object with `size` bytes whose header names `header_pid` and PID namespace `ns` (0 bytes: no header).
+void make_object(const std::string& name, std::size_t size, std::uint32_t header_pid, std::uint64_t ns = own_pid_namespace()) {
   const int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
   ASSERT_GE(fd, 0) << name;
   if (size > 0) {
@@ -200,6 +216,7 @@ void make_object(const std::string& name, std::size_t size, std::uint32_t header
     std::byte header[shm::kHeaderBytes] = {};
     std::memcpy(header, shm::kMagic, 8);
     std::memcpy(header + 12, &header_pid, 4);
+    std::memcpy(header + 48, &ns, 8);
     ASSERT_EQ(pwrite(fd, header, sizeof(header), 0), static_cast<ssize_t>(sizeof(header)));
   }
   close(fd);
@@ -211,29 +228,82 @@ bool exists(const std::string& name) {
 }
 
 TEST(ServerShm, SweepRemovesOnlyADeadServersRegions) {
+  ASSERT_NE(own_pid_namespace(), 0u) << "/proc/self/ns/pid unreadable";
+  // This test's own prefix: a concurrent test's (or server's) regions are never looked at.
+  const std::string prefix = "mossinfer-ut" + std::to_string(getpid()) + "-";
   const pid_t dead = dead_pid();
-  const std::string tag = std::to_string(dead);
-  const std::string stale = "/mossinfer-" + tag + "-0-sweeptest", unfinished = "/mossinfer-" + tag + "-1-sweeptest";
-  const std::string foreign = "/mossinfer-" + tag + "-2-sweeptest", odd = "/mossinfer-x" + tag + "-sweeptest";
-  for (const std::string& n : {stale, unfinished, foreign, odd}) shm_unlink(n.c_str());
+  const std::string at = "/" + prefix + std::to_string(dead);
+  const std::string stale = at + "-0", unfinished = at + "-1", foreign = at + "-2", other_ns = at + "-3";
+  const std::string odd = "/" + prefix + "x" + std::to_string(dead) + "-4";
+  for (const std::string& n : {stale, unfinished, foreign, other_ns, odd}) shm_unlink(n.c_str());
   make_object(stale, 8192, static_cast<std::uint32_t>(dead));
-  make_object(unfinished, 0, 0);                               // killed before ftruncate
-  make_object(foreign, 8192, static_cast<std::uint32_t>(dead) + 1);  // its header names another pid
-  make_object(odd, 8192, static_cast<std::uint32_t>(dead));         // not mossinfer-<digits>-
-  shm::Region live = shm::Region::create(4096);                    // this process: alive
-  const std::vector<std::string> removed = shm::sweep_stale();
+  make_object(unfinished, 0, 0);                                                  // killed before ftruncate
+  make_object(foreign, 8192, static_cast<std::uint32_t>(dead) + 1);                // its header names another pid
+  make_object(other_ns, 8192, static_cast<std::uint32_t>(dead), own_pid_namespace() + 1);  // another PID namespace
+  make_object(odd, 8192, static_cast<std::uint32_t>(dead));                        // not <prefix><digits>-
+  shm::CreateOptions o;
+  o.name_for_tests = [&](int attempt) { return prefix + std::to_string(getpid()) + "-live-" + std::to_string(attempt); };
+  shm::Region live = shm::Region::create(4096, o);  // this process: alive
+  // Everything here is seconds old: a server's sweep (10 minutes) leaves it all.
+  EXPECT_TRUE(shm::sweep_stale(prefix).empty());
+  EXPECT_TRUE(exists(stale));
+  // The default prefix never matches this test's names.
+  for (const std::string& n : shm::sweep_stale(shm::kNamePrefix, std::chrono::seconds(0))) {
+    EXPECT_EQ(n.find(prefix), std::string::npos) << n;
+  }
+  const std::vector<std::string> removed = shm::sweep_stale(prefix, std::chrono::seconds(0));
   const auto was_removed = [&](const std::string& n) { return std::find(removed.begin(), removed.end(), n) != removed.end(); };
   EXPECT_TRUE(was_removed(stale));
   EXPECT_TRUE(was_removed(unfinished));
   EXPECT_FALSE(was_removed(foreign));
+  EXPECT_FALSE(was_removed(other_ns));
   EXPECT_FALSE(was_removed(odd));
   EXPECT_FALSE(was_removed(live.name()));
+  EXPECT_EQ(removed.size(), 2u);
   EXPECT_FALSE(exists(stale));
   EXPECT_FALSE(exists(unfinished));
   EXPECT_TRUE(exists(foreign));
+  EXPECT_TRUE(exists(other_ns));
   EXPECT_TRUE(exists(live.name()));
-  shm_unlink(foreign.c_str());
-  shm_unlink(odd.c_str());
+  for (const std::string& n : {foreign, other_ns, odd}) shm_unlink(n.c_str());
+}
+
+TEST(ServerShm, ATooSmallDevShmIsAnErrorNotASigbus) {
+  // The reservation failing as on a full tmpfs: ENOSPC with the size needed, and no name left behind.
+  const std::string name = "mossinfer-ut" + std::to_string(getpid()) + "-nospace";
+  shm::CreateOptions o;
+  o.name_for_tests = [&](int) { return name; };
+  std::size_t asked = 0;
+  o.allocate_for_tests = [&](std::size_t bytes) {
+    asked = bytes;
+    return ENOSPC;
+  };
+  try {
+    shm::Region::create(3 * 1024 * 1024, o);
+    FAIL() << "expected ENOSPC";
+  } catch (const std::system_error& e) {
+    EXPECT_EQ(e.code().value(), ENOSPC);
+    EXPECT_NE(std::string(e.what()).find("/dev/shm too small (4 MiB needed"), std::string::npos) << e.what();
+  }
+  EXPECT_GE(asked, std::size_t{3 * 1024 * 1024 + 4096});
+  EXPECT_FALSE(exists("/" + name));
+  // Another reservation error keeps its own words.
+  o.allocate_for_tests = [](std::size_t) { return EIO; };
+  try {
+    shm::Region::create(4096, o);
+    FAIL() << "expected EIO";
+  } catch (const std::system_error& e) {
+    EXPECT_EQ(e.code().value(), EIO);
+    EXPECT_NE(std::string(e.what()).find("posix_fallocate"), std::string::npos) << e.what();
+  }
+  EXPECT_FALSE(exists("/" + name));
+  // Without the seam the blocks are reserved: the whole region is allocated on tmpfs, not sparse.
+  shm::CreateOptions plain;
+  plain.name_for_tests = [&](int) { return name; };
+  shm::Region r = shm::Region::create(2 * 1024 * 1024, plain);
+  struct stat st {};
+  ASSERT_EQ(stat(("/dev/shm/" + name).c_str(), &st), 0);
+  EXPECT_GE(static_cast<std::size_t>(st.st_blocks) * 512, r.bytes());
 }
 #endif
 

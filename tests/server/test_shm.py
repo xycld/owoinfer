@@ -19,6 +19,8 @@ CLIENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shm_client.py
 POSIX = os.name == "posix"
 TIMEOUT = 30.0
 MIB = 1 << 20
+# This run's region names (the helper's --prefix): sweeps here never touch another test's or a real server's regions.
+PREFIX = "mossinfer-t%d-" % os.getpid()
 
 
 def pythons():
@@ -43,7 +45,8 @@ class Helper:
     """A running shm_helper: one command line in, one answer line out."""
 
     def __init__(self):
-        self.proc = subprocess.Popen([HELPER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        self.proc = subprocess.Popen([HELPER, "--prefix", PREFIX], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     text=True, bufsize=1)
 
     def cmd(self, line):
         self.proc.stdin.write(line + "\n")
@@ -71,8 +74,9 @@ class Helper:
                 f.close()
 
 
-def sweep():
-    out = subprocess.run([HELPER, "sweep"], capture_output=True, text=True, timeout=TIMEOUT, check=True).stdout
+def sweep(min_age_s=0):
+    out = subprocess.run([HELPER, "--prefix", PREFIX, "sweep", "--min-age-s", str(min_age_s)], capture_output=True,
+                         text=True, timeout=TIMEOUT, check=True).stdout
     return set(out.split())
 
 
@@ -132,7 +136,7 @@ class ShmTest(unittest.TestCase):
         _, other, _, _ = self.helper.create(4096)
         self.assertNotEqual(name, other)
         pid = self.helper.cmd("pid")
-        self.assertTrue(name.lstrip("/").replace("Local\\", "").startswith("mossinfer-%s-" % pid), name)
+        self.assertTrue(name.lstrip("/").replace("Local\\", "").startswith(PREFIX + pid + "-"), name)
 
     @unittest.skipUnless(POSIX, "named regions outlive their process on Linux only")
     def test_sigkill_leaves_only_unnamed_regions_for_the_next_sweep(self):
@@ -143,6 +147,9 @@ class ShmTest(unittest.TestCase):
         self.assertEqual(self.helper.cmd("unlink %d" % named[0]), "ok")
         self.helper.kill()
         self.assertFalse(os.path.exists(shm_path(named[1])))
+        self.assertTrue(os.path.exists(shm_path(unnamed[1])))
+        # A server's own sweep leaves regions younger than 10 minutes alone (another PID namespace may own them).
+        self.assertNotIn(unnamed[1], sweep(600))
         self.assertTrue(os.path.exists(shm_path(unnamed[1])))
         self.assertIn(unnamed[1], sweep())
         self.assertFalse(os.path.exists(shm_path(unnamed[1])))

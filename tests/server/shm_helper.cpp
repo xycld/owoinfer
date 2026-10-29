@@ -6,7 +6,10 @@
 //   unlink <index>           Region::unlink (the first request naming the region) -> "ok"
 //   free <index>             destroys the region -> "ok"
 //   pid                      -> the process id
-// `shm_helper sweep` instead runs sweep_stale() once (a new server's start) and prints each removed name.
+// `shm_helper sweep [--min-age-s N]` instead runs sweep_stale() once (a new server's start) and prints each removed
+// name. `--prefix P` first (both modes): the region names start with P instead of mossinfer- and the sweep looks at
+// those only, so concurrent tests never see each other's regions.
+#include <chrono>
 #include <cstdio>
 #include <iostream>
 #include <memory>
@@ -27,9 +30,24 @@
 namespace shm = mi::server::shm;
 
 int main(int argc, char** argv) {
-  if (argc > 1 && std::string(argv[1]) == "sweep") {
-    for (const std::string& name : shm::sweep_stale()) std::printf("%s\n", name.c_str());
+  std::string prefix(shm::kNamePrefix);
+  int arg = 1;
+  if (argc > arg + 1 && std::string(argv[arg]) == "--prefix") {
+    prefix = argv[arg + 1];
+    arg += 2;
+  }
+  if (argc > arg && std::string(argv[arg]) == "sweep") {
+    long long min_age = 600;
+    if (argc > arg + 2 && std::string(argv[arg + 1]) == "--min-age-s") min_age = std::stoll(argv[arg + 2]);
+    for (const std::string& name : shm::sweep_stale(prefix, std::chrono::seconds(min_age))) std::printf("%s\n", name.c_str());
     return 0;
+  }
+  shm::CreateOptions options;
+  int created = 0;
+  if (prefix != shm::kNamePrefix) {
+    options.name_for_tests = [&](int attempt) {
+      return prefix + std::to_string(MI_GETPID()) + "-" + std::to_string(created) + "-" + std::to_string(attempt);
+    };
   }
   std::vector<std::unique_ptr<shm::Region>> regions;
   std::string line;
@@ -41,7 +59,8 @@ int main(int argc, char** argv) {
     try {
       if (cmd == "create") {
         in >> n;
-        regions.push_back(std::make_unique<shm::Region>(shm::Region::create(n)));
+        regions.push_back(std::make_unique<shm::Region>(shm::Region::create(n, options)));
+        ++created;
         const shm::Region& r = *regions.back();
         std::printf("%zu %s %s %zu\n", regions.size() - 1, r.name().c_str(), r.token().hex().c_str(), r.bytes());
       } else if (cmd == "pattern" || cmd == "verify") {
