@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <new>
 #include <regex>
 #include <span>
 #include <string>
@@ -897,7 +898,7 @@ TEST_F(GpuComponentApi, MossRunPlansAndSamplesAsGenerate) {
 
   // An adopted staging block: page-aligned caller memory, registered as pinned.
   const std::size_t bytes = (info.staging_bytes + 4095) / 4096 * 4096;
-  void* block = std::aligned_alloc(4096, bytes);
+  void* block = ::operator new(bytes, std::align_val_t{4096});  // page-aligned (std::aligned_alloc is not in MSVC)
   ASSERT_NE(block, nullptr);
   EXPECT_EQ(mi_run_adopt_staging(engine_, static_cast<char*>(block) + 64, bytes - 64), MI_ERR_INVALID_ARGUMENT);
   EXPECT_EQ(mi_run_adopt_staging(engine_, block, info.staging_bytes - 1), MI_ERR_INVALID_ARGUMENT);
@@ -962,7 +963,7 @@ TEST_F(GpuComponentApi, MossRunPlansAndSamplesAsGenerate) {
 
   mi_result* done = nullptr;
   ASSERT_EQ(mi_run_end(engine_, &done), MI_OK) << last_error();
-  std::free(block);  // mi_run_end unregistered it
+  ::operator delete(block, std::align_val_t{4096});  // mi_run_end unregistered it
   ASSERT_NE(done, nullptr);
   EXPECT_STREQ(mi_result_text(done, MI_TEXT_COMPONENT_NOTE), "");
   EXPECT_EQ(mi_result_rgb(done, nullptr), nullptr);
