@@ -101,7 +101,7 @@ util::FileLock take_lock(const fs::path& path, util::FileLock::Mode mode, const 
 
 // The cache folder's stale entries, each removed under the exclusive lock of the converted file it belongs to (a file
 // in use, whose lock a load holds shared, and one being written are never touched): converted files whose recorded
-// source no longer exists, or that an earlier version of `source` gave for `target_name` (another key); temporaries of
+// source is gone from its folder (the folder itself still there), or that an earlier version of `source` gave for `target_name` (another key); temporaries of
 // conversions that ended without publishing; lock files of converted files that are gone. Files without the
 // importer's metadata are left alone. `keep` is the call's own file. Best effort: what cannot be removed stays.
 void sweep(const fs::path& dir, const fs::path& resolved_dir, const std::string& keep, const std::string& source,
@@ -127,8 +127,11 @@ void sweep(const fs::path& dir, const fs::path& resolved_dir, const std::string&
       const fs::path p = dir / util::path_from_utf8(name);
       const std::string src = cache_metadata(p, "mossinfer_gguf_source");
       if (src.empty()) continue;
-      stale = !util::file_info(util::path_from_utf8(src)).exists() ||
-              (src == source && cache_metadata(p, "mossinfer_gguf_target") == target_name);
+      // Gone only when its folder is there without it: a missing folder (an unplugged drive, an unreachable share) may
+      // be back later, and its conversion is worth keeping.
+      const fs::path sp = util::path_from_utf8(src);
+      stale = (src == source && cache_metadata(p, "mossinfer_gguf_target") == target_name) ||
+              (!util::file_info(sp).exists() && util::file_info(sp.parent_path()).directory());
     }
     if (!stale || owner == keep) continue;
     util::FileLock lock;
@@ -212,7 +215,9 @@ GgufCachedFile gguf_converted_file(const fs::path& file, const GgufDitInfo& info
   for (;;) {
     r.lock = take_lock(lock_path, util::FileLock::Mode::kShared, hooks);
     if (valid()) {
-      sweep(dir, resolved_dir, name, source, target_name);
+      // Only after a conversion published: a cache-hit load probes no recorded source (on Windows a \\nas\... source
+      // would contact that host on every load).
+      if (r.converted) sweep(dir, resolved_dir, name, source, target_name);
       return r;
     }
     r.lock.unlock();

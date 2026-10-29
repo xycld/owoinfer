@@ -13,9 +13,9 @@
 // The cache folder is shared by processes. Each converted file has a lock file "<file>.lock" (util::FileLock): a load
 // holds it shared for as long as it uses the file, the conversion that writes it holds it exclusive (a second process
 // loading the same GGUF waits, then finds the file), and an entry is removed only under its exclusive lock (never one in
-// use). Each call sweeps the folder: converted files whose recorded source no longer exists or was replaced by a newer
-// version (same path, same target), temporaries of conversions that ended without publishing, and lock files of entries
-// that are gone. The folder's contents are trusted as the model: only the engine's account may write it.
+// use). A call that converted sweeps the folder (a cache hit never does: it probes no recorded source path): converted
+// files whose recorded source is gone from a folder that still exists, or was replaced by a newer version (same path,
+// same target), temporaries of conversions that ended without publishing, and lock files of entries that are gone. The folder's contents are trusted as the model: only the engine's account may write it.
 #pragma once
 
 #include <atomic>

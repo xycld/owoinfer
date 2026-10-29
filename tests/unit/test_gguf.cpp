@@ -854,43 +854,57 @@ TEST(GgufDit, ConvertedFileCache) {
   EXPECT_TRUE(fs::exists(b));
 
   // A file in use (its lock held shared, as a pipeline's DiT source holds it) is never removed by a sweep; once
-  // released, the next call removes it.
-  fs::path d;
+  // released, the next conversion's sweep removes it.
   {
     mi::pipeline::GgufDitInfo info;
     const mi::pipeline::GgufCachedFile held = mi::pipeline::gguf_converted_file(src, info, int8, cache);
     EXPECT_EQ(held.path, c);
     fs::last_write_time(src, fs::last_write_time(src) + std::chrono::seconds(5));
-    d = converted_path(src, int8, cache, converted);
+    const fs::path d = converted_path(src, int8, cache, converted);
     EXPECT_TRUE(converted);
     EXPECT_TRUE(fs::exists(c));  // in use
+    EXPECT_TRUE(fs::exists(d));
   }
-  EXPECT_EQ(converted_path(src, int8, cache, converted), d);
-  EXPECT_FALSE(fs::exists(c));
 
-  // The converted file of a GGUF that no longer exists goes; so do temporaries of conversions that died and lock files
-  // of entries that are gone. A file without the importer's metadata stays.
-  const fs::path other = dir.path() / "other.gguf";
+  // Stale entries: the converted file of a GGUF that no longer exists in its folder, a temporary of a conversion that
+  // died, a lock file of an entry that is gone. Kept: the file of a GGUF whose folder is missing (an unplugged drive,
+  // an unreachable share), a file without the importer's metadata.
+  const fs::path other = dir.path() / "other.gguf", away = dir.path() / "drive" / "away.gguf";
   write_file(other, gguf_bytes(tiny_gguf().ts));
+  write_file(away, gguf_bytes(tiny_gguf().ts));
   const fs::path e = converted_path(other, int8, cache, converted);
+  const fs::path f = converted_path(away, int8, cache, converted);
   fs::remove(other);
+  fs::remove_all(dir.path() / "drive");
   const fs::path dead_tmp = fs::path(b.string() + ".tmp-0123456789abcdef");  // the bf16 entry, not in use
   const fs::path orphan_lock = cache / "gguf" / "gguf-gone.int8_convrot256.0000000000000000.safetensors.lock";
   const fs::path foreign = cache / "gguf" / "mine.safetensors";
   write_file(dead_tmp, "x");
   write_file(orphan_lock, "");
   mi::quant::convert(src, foreign, mi::quant::ConvertOptions{});  // the converter's own file: no importer metadata
-  EXPECT_EQ(converted_path(src, int8, cache, converted), d);
+  const std::vector<std::string> before = cache_files(cache);
+
+  // A cache-hit load never sweeps (it probes no recorded source path): everything stays.
+  const fs::path current = converted_path(src, int8, cache, converted);
   EXPECT_FALSE(converted);
+  EXPECT_EQ(cache_files(cache), before);
+
+  // The next conversion's sweep: the stale entries go, c (released) and the older version too.
+  fs::last_write_time(src, fs::last_write_time(src) + std::chrono::seconds(5));
+  const fs::path g = converted_path(src, int8, cache, converted);
+  EXPECT_TRUE(converted);
+  EXPECT_FALSE(fs::exists(c));
+  EXPECT_FALSE(fs::exists(current));
   EXPECT_FALSE(fs::exists(e));
+  EXPECT_TRUE(fs::exists(f));  // its folder is missing: maybe only for now
   EXPECT_FALSE(fs::exists(dead_tmp));
   EXPECT_FALSE(fs::exists(orphan_lock));
   EXPECT_TRUE(fs::exists(foreign));
-  const std::vector<std::string> want = {b.filename().string(), b.filename().string() + ".lock", d.filename().string(),
-                                         d.filename().string() + ".lock", "mine.safetensors"};
-  std::vector<std::string> sorted = want;
-  std::sort(sorted.begin(), sorted.end());
-  EXPECT_EQ(cache_files(cache), sorted);
+  std::vector<std::string> want = {b.filename().string(), b.filename().string() + ".lock",
+                                   f.filename().string(), f.filename().string() + ".lock",
+                                   g.filename().string(), g.filename().string() + ".lock", "mine.safetensors"};
+  std::sort(want.begin(), want.end());
+  EXPECT_EQ(cache_files(cache), want);
 }
 
 // NVFP4 output is refused for a GGUF input as the modules are planned: convert, and nvfp4_hessian_units /
