@@ -227,16 +227,16 @@ struct PipelineOptions {
   moss_dit::BlockPath block_path = moss_dit::BlockPath::kFused;
   // P6/P7a model sources, each used instead of the bundle's component (empty: the bundle's); the tokenizer and configs
   // always come from the bundle. Each file is identified as its component by its shapes before the bundle is indexed,
-  // and the bundle's index then leaves that component out (weights::components_to_skip): its folder needs only its
-  // config.
+  // and the bundle's index then leaves that component out (weights::BuildOptions::skip): its folder's weights are not
+  // read, so the folder needs only its config.
   //   dit_file: a single-file DiT (INT8 ConvRot G = 256, mixed INT8/bf16, or bf16 safetensors: the Comfy-Org /
   //     community files and `moss-infer quantize` output).
   //   text_encoder_file: an INT8 ConvRot or W4A8 Qwen3.5 text encoder (qwen35_text::QuantTextModel); its embeddings
   //     are cached under its own identity and numerics. Held in RAM it is pinned (the plan's host-resident residency).
-  //   vae_file: a single FLUX.2 VAE file (flux2_vae::index_vae_file: e.g. the full decoder), decoded with the
-  //     bundle's latent statistics when the bundle has its VAE weights, else with the file's own rounded to bf16 as
-  //     the bundle stores them (the same values). img2img with a decoder-only file encodes with the bundle's VAE,
-  //     which it then needs.
+  //   vae_file: a single FLUX.2 VAE file (flux2_vae::index_vae_file: e.g. the full decoder), decoded (and, when it
+  //     holds an encoder, encoded) with its own latent statistics rounded to bf16 as the bundle stores them: the
+  //     official pipeline's values for the Comfy-Org files. img2img with a decoder-only file encodes with the bundle's
+  //     vae/diffusion_pytorch_model.safetensors, read directly, which it then needs.
   std::filesystem::path dit_file;
   std::filesystem::path text_encoder_file;
   std::filesystem::path vae_file;

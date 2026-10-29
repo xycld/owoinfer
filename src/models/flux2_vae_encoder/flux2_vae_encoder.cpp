@@ -14,11 +14,11 @@
 
 #include "core/cuda_check.h"
 #include "kernels/vae/attention.h"
+#include "models/flux2_vae/vae_file.h"
 #include "pipeline/rng_torch_compat.h"
 #include "util/path.h"
 #include "weights/file_reader.h"
 #include "weights/model_index.h"
-#include "weights/quant/quant_codec.h"
 #include "weights/safetensors.h"
 
 namespace mi::flux2_vae_encoder {
@@ -549,20 +549,13 @@ class Loader {
   }
 
   // A tensor whose numel matches `shape` (the original layout stores the attention linears as [C, C, 1, 1]).
-  // bf16_rounded: its values rounded to bf16 (round to nearest even), still F32.
-  Tensor plain(const std::string& dname, std::initializer_list<std::int64_t> shape, bool bf16_rounded = false) {
+  Tensor plain(const std::string& dname, std::initializer_list<std::int64_t> shape) {
     const weights::TensorInfo& t = info(dname, shape);
     Tensor dst = Tensor::view(nullptr, DType::kF32, Device::kCUDA, shape);
     bytes_ += align_up(dst.nbytes());
     if (arena_ == nullptr) return dst;
     dst.data = arena_->alloc_persistent(dst.nbytes());
     read(t);
-    for (std::size_t i = 0; bf16_rounded && i + sizeof(float) <= host_.size(); i += sizeof(float)) {
-      float v = 0;
-      std::memcpy(&v, host_.data() + i, sizeof v);
-      v = quant::bf16_to_float(quant::float_to_bf16(v));
-      std::memcpy(host_.data() + i, &v, sizeof v);
-    }
     MI_CUDA_CHECK(cudaMemcpyAsync(dst.data, host_.data(), dst.nbytes(), cudaMemcpyHostToDevice, stream_));
     return dst;
   }
@@ -672,11 +665,9 @@ void assemble(Loader& ld, Flux2VaeEncoder::Weights& w) {
   w.quant_conv = ld.conv("quant_conv", kMomentCh, kMomentCh, 1);
 }
 
-// The file's own latent statistics as the MOSS-Image bundle stores them, rounded to bf16: a VAE file's fp32 originals
-// then equal the bundle's bit for bit; the bundle's own are bf16 values already and stay as they are.
 void assemble_bn(Loader& ld, Flux2VaeEncoder::Weights& w) {
-  w.bn_mean = ld.plain("bn.running_mean", {kLatentChannels}, true);
-  w.bn_var = ld.plain("bn.running_var", {kLatentChannels}, true);
+  w.bn_mean = ld.plain("bn.running_mean", {kLatentChannels});
+  w.bn_var = ld.plain("bn.running_var", {kLatentChannels});
 }
 
 void check_lt(cublasStatus_t st, const char* what) {
@@ -710,7 +701,8 @@ std::size_t Flux2VaeEncoder::persistent_bytes(const std::filesystem::path& vae_f
 }
 
 Flux2VaeEncoder::Flux2VaeEncoder(const std::filesystem::path& vae_file, runtime::DeviceArena& arena,
-                                 runtime::StreamSet& streams, bool direct_io, const weights::ModelIndex* latent_stats)
+                                 runtime::StreamSet& streams, bool direct_io, const weights::ModelIndex* latent_stats,
+                                 bool round_stats)
     : arena_(arena) {
   const auto t0 = std::chrono::steady_clock::now();
   check_lt(cublasLtCreate(&lt_), "cublasLtCreate");
@@ -720,22 +712,17 @@ Flux2VaeEncoder::Flux2VaeEncoder(const std::filesystem::path& vae_file, runtime:
     runtime::StackScope scope(arena);
     Loader ld(vae_file, &arena, s, direct_io);
     assemble(ld, w_);
-    if (latent_stats == nullptr) {
-      assemble_bn(ld, w_);
+    if (latent_stats == nullptr && !round_stats) {
+      assemble_bn(ld, w_);  // as stored
     } else {
-      // The statistics from the index's VAE "decoder" group (the bundle's: what the official pipeline normalizes with).
-      const weights::WeightGroup* g = latent_stats->find_group(weights::Component::kVae, "decoder");
-      if (g == nullptr) throw std::runtime_error("mi::flux2_vae_encoder: latent_stats index has no VAE decoder group");
-      for (auto [name, dst] : {std::pair<const char*, Tensor*>{"bn.running_mean", &w_.bn_mean}, {"bn.running_var", &w_.bn_var}}) {
-        const auto it = std::find_if(g->tensors.begin(), g->tensors.end(), [&](const weights::IndexedTensor& t) { return t.name == name; });
-        if (it == g->tensors.end() || it->dtype != weights::DType::kF32 || it->numel() != kLatentChannels ||
-            it->file >= latent_stats->files.size())
-          throw std::runtime_error(std::string("mi::flux2_vae_encoder: latent statistics '") + name + "' missing or not F32 [128]");
-        std::vector<float> host(kLatentChannels);
-        weights::FileReader(latent_stats->bundle_dir / latent_stats->files[it->file].path).read_at(it->offset, host.data(), it->nbytes);
+      // The statistics of the index's VAE "decoder" group, or the file's own rounded to bf16 on the host (round_stats:
+      // a single VAE file, read_latent_stats), before their upload.
+      const flux2_vae::LatentStats st = latent_stats != nullptr ? flux2_vae::read_latent_stats(*latent_stats, round_stats)
+                                                                : flux2_vae::read_latent_stats(flux2_vae::index_vae_file(vae_file), true);
+      for (auto [v, dst] : {std::pair<const std::vector<float>*, Tensor*>{&st.mean, &w_.bn_mean}, {&st.var, &w_.bn_var}}) {
         *dst = arena.alloc_persistent_tensor(DType::kF32, {kLatentChannels});
-        MI_CUDA_CHECK(cudaMemcpyAsync(dst->data, host.data(), it->nbytes, cudaMemcpyHostToDevice, s));
-        load_stats_.bytes += it->nbytes;
+        MI_CUDA_CHECK(cudaMemcpyAsync(dst->data, v->data(), v->size() * sizeof(float), cudaMemcpyHostToDevice, s));
+        load_stats_.bytes += v->size() * sizeof(float);
       }
     }
     MI_CUDA_CHECK(cudaStreamSynchronize(s));

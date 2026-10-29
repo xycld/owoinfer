@@ -186,8 +186,20 @@ TEST(ModelIndex, DetectsStaleFilesAndBadVersions) {
   // size change -> stale (restore mtime first so only size differs).
   fs::last_write_time(shard, fs::last_write_time(shard) - std::chrono::hours(1));
   EXPECT_NO_THROW(load_index(b.root() / "moss.mossidx"));
+  // A file gone: its component's weights are missing, which no rebuild mends.
   fs::remove(shard);
-  EXPECT_THROW(load_index(b.root() / "moss.mossidx"), StaleIndexError);
+  try {
+    load_index(b.root() / "moss.mossidx");
+    FAIL() << "expected IndexError";
+  } catch (const StaleIndexError& e) {
+    FAIL() << "a missing file is not staleness: " << e.what();
+  } catch (const IndexError& e) {
+    EXPECT_NE(std::string(e.what()).find("missing weights for vae (vae/diffusion_pytorch_model.safetensors): add them or "
+                                         "pass its component file"),
+              std::string::npos)
+        << e.what();
+    EXPECT_EQ(std::string(e.what()).find("rebuild"), std::string::npos) << e.what();
+  }
 }
 
 TEST(ModelIndex, RejectsUnclassifiedAndInconsistentBundles) {
@@ -424,8 +436,13 @@ TEST(ModelIndex, SkippedComponentsNeedOnlyTheirConfigs) {
       fs::remove(b.root() / rel);
     }
   }
-  // Every component skipped: configs only.
-  EXPECT_TRUE(build_index(b.root(), {.skip = ComponentSet{te_dit}.add(Component::kVae)}).groups.empty());
+  // Every component skipped: configs only (the VAE's weights unreadable, then gone, as the others').
+  const ComponentSet all = ComponentSet{te_dit}.add(Component::kVae);
+  write_text(b.root() / "vae/diffusion_pytorch_model.safetensors", "not a safetensors file");
+  EXPECT_TRUE(build_index(b.root(), {.skip = all}).groups.empty());
+  EXPECT_TRUE(build_index(b.root(), {.skip = all}).files.empty());
+  fs::remove_all(b.root() / "vae");
+  EXPECT_TRUE(build_index(b.root(), {.skip = all}).groups.empty());
 
   // A component not skipped: today's error.
   const std::string no_weights = "expected one .safetensors file or a shard index, found 0 files and no index";
@@ -442,35 +459,6 @@ TEST(ModelIndex, SkippedComponentsNeedOnlyTheirConfigs) {
   EXPECT_NE(index_error(b.root(), {.skip = te_dit}).find("transformer/config.json"), std::string::npos);
 }
 
-// The index decision for replaced components: the text encoder and the DiT are left out; a replaced VAE only when the
-// bundle has no VAE weights (the bundle's latent statistics decode a VAE file whenever they are there).
-TEST(ModelIndex, ComponentsToSkip) {
-  Bundle b("mi_toskip");
-  b.build();
-  const ComponentSet te = ComponentSet{}.add(Component::kTextEncoder);
-  const ComponentSet dit = ComponentSet{}.add(Component::kTransformer);
-  const ComponentSet vae = ComponentSet{}.add(Component::kVae);
-  const ComponentSet all = ComponentSet{te}.add(Component::kTransformer).add(Component::kVae);
-  const auto skip = [&](ComponentSet replaced) { return components_to_skip(b.root(), replaced).bits; };
-  EXPECT_EQ(skip({}), 0u);
-  EXPECT_EQ(skip(te), te.bits);
-  EXPECT_EQ(skip(dit), dit.bits);
-  EXPECT_EQ(skip(vae), 0u);
-  EXPECT_EQ(skip(all), ComponentSet{te}.add(Component::kTransformer).bits);
-  // No VAE weights (the config alone, then no folder): the replaced VAE is left out too.
-  fs::remove(b.root() / "vae/diffusion_pytorch_model.safetensors");
-  EXPECT_EQ(skip(vae), vae.bits);
-  EXPECT_EQ(skip(all), all.bits);
-  EXPECT_EQ(skip(te), te.bits);  // not replaced: indexed, and build_index reports the missing weights
-  EXPECT_THROW(build_index(b.root(), {.skip = components_to_skip(b.root(), te)}), IndexError);
-  // A shard index alone counts as weights: indexed, so the broken VAE is reported.
-  write_text(b.root() / "vae/diffusion_pytorch_model.safetensors.index.json", R"({"weight_map":{}})");
-  EXPECT_EQ(skip(vae), 0u);
-  fs::remove_all(b.root() / "vae");
-  EXPECT_EQ(skip(vae), vae.bits);
-  EXPECT_NO_THROW(build_index(b.root(), {.skip = components_to_skip(b.root(), all)}));
-}
-
 // A .mossidx built for the whole bundle serves a run that skips components: their stored files, groups and exclusions
 // are dropped unread (their files may be gone) and the rest keep their checksums under renumbered file ids. An index
 // built without a component serves only runs that skip it.
@@ -483,7 +471,7 @@ TEST(ModelIndex, LoadIndexSkipsComponents) {
     const ModelIndex full = build_index(b.root(), {.checksum = true});
     write_index(full, b.root() / "moss.mossidx");
     fs::remove(b.root() / "text_encoder/model-00002-of-00002.safetensors");
-    EXPECT_THROW(load_index(b.root() / "moss.mossidx"), StaleIndexError);
+    EXPECT_THROW(load_index(b.root() / "moss.mossidx"), IndexError);  // missing weights for text_encoder
     const ModelIndex loaded = load_index(b.root() / "moss.mossidx", {}, te);
     const ModelIndex fresh = build_index(b.root(), {.skip = te});
     ASSERT_EQ(loaded.files.size(), 2u);  // transformer, vae
@@ -709,8 +697,8 @@ TEST(ModelIndex, NonAsciiPathsRoundTrip) {
   fs::remove(b.root() / "vae" / mi::util::path_from_utf8(vae_name));
   try {
     load_index(b.root() / "moss.mossidx");
-    ADD_FAILURE() << "expected StaleIndexError";
-  } catch (const StaleIndexError& e) {
+    ADD_FAILURE() << "expected IndexError";
+  } catch (const IndexError& e) {  // missing weights for vae
     EXPECT_NE(std::string(e.what()).find(vae_name), std::string::npos) << e.what();
   }
 }

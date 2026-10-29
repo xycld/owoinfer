@@ -140,13 +140,6 @@ struct BuildOptions {
 // Throws FormatError / IoError / IndexError on malformed or unreadable bundles or unclassified tensors.
 ModelIndex build_index(const std::filesystem::path& bundle_dir, const BuildOptions& options = {});
 
-// What a bundle's index leaves out (BuildOptions::skip) when component files replace the components in `replaced`:
-// the text encoder and the DiT, and the VAE when the bundle's vae folder holds no weights (no *.safetensors, no shard
-// index). A bundle VAE that is there stays indexed: a VAE file is decoded with the bundle's latent statistics
-// (flux2_vae/vae_file.h). The caller identifies each file as its component by its shapes first. Lists one directory,
-// only for a replaced VAE.
-ComponentSet components_to_skip(const std::filesystem::path& bundle_dir, ComponentSet replaced);
-
 void write_index(const ModelIndex& index, const std::filesystem::path& path);
 
 // Loads and validates a .mossidx: version, internal consistency, staleness against the files in

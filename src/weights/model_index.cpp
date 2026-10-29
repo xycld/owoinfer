@@ -474,24 +474,6 @@ ModelIndex build_index(const fs::path& bundle_dir, const BuildOptions& options) 
   return index;
 }
 
-ComponentSet components_to_skip(const fs::path& bundle_dir, ComponentSet replaced) {
-  ComponentSet skip;
-  for (Component c : {Component::kTextEncoder, Component::kTransformer}) {
-    if (replaced.has(c)) skip.add(c);
-  }
-  if (replaced.has(Component::kVae)) {
-    bool weights = false;
-    std::error_code ec;
-    for (fs::directory_iterator it(bundle_dir / component_name(Component::kVae), ec), end; !ec && it != end && !weights; it.increment(ec)) {
-      const std::string n = path_utf8(it->path().filename());
-      weights = ends_with(n, kShardSuffix) || ends_with(n, kShardIndexSuffix);
-    }
-    // A folder that cannot be listed stays indexed: build_index reports it.
-    if (!weights && (!ec || ec == std::errc::no_such_file_or_directory)) skip.add(Component::kVae);
-  }
-  return skip;
-}
-
 void write_index(const ModelIndex& index, const fs::path& path) {
   std::ostringstream o;
   o << "{\n\"format\": " << quote(kFormatName) << ",\n\"version\": " << kIndexVersion << ",\n\"files\": [\n";
@@ -576,7 +558,11 @@ ModelIndex load_index(const fs::path& path, const fs::path& bundle_dir, Componen
       kept_id.push_back(static_cast<std::int64_t>(index.files.size()));
       const fs::path p = index.bundle_dir / path_from_utf8(file.path);
       std::error_code ec;
-      if (!fs::is_regular_file(p, ec)) throw StaleIndexError(where + ": file " + file.path + " no longer exists; rebuild with `moss-infer index`");
+      // Gone: its component's weights are missing (rebuilding cannot help); a skipped component's are never looked at.
+      if (!fs::is_regular_file(p, ec)) {
+        const std::string folder = file.path.substr(0, file.path.find('/'));
+        fail("missing weights for " + folder + " (" + file.path + "): add them or pass its component file");
+      }
       if (fs::file_size(p) != file.size || util::file_mtime_ns(p) != file.mtime_ns) {
         throw StaleIndexError(where + ": " + file.path + " changed since the index was built; rebuild with `moss-infer index`");
       }

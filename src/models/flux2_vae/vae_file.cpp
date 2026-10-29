@@ -1,10 +1,15 @@
 #include "models/flux2_vae/vae_file.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <set>
+#include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #include "util/path.h"
+#include "weights/file_reader.h"
+#include "weights/quant/quant_codec.h"
 #include "weights/safetensors.h"
 
 namespace mi::flux2_vae {
@@ -113,6 +118,24 @@ weights::ModelIndex index_vae_file(const std::filesystem::path& file) {
   index.groups.push_back(std::move(g));
   if (excluded.tensors) index.excluded.push_back(excluded);
   return index;
+}
+
+LatentStats read_latent_stats(const weights::ModelIndex& index, bool bf16_rounded) {
+  constexpr std::int64_t kChannels = 128;
+  const weights::WeightGroup* g = index.find_group(weights::Component::kVae, "decoder");
+  if (g == nullptr) throw std::runtime_error("mi::flux2_vae: the index has no VAE decoder group for the latent statistics");
+  LatentStats st;
+  for (auto [name, dst] : {std::pair<const char*, std::vector<float>*>{"bn.running_mean", &st.mean}, {"bn.running_var", &st.var}}) {
+    const auto it = std::find_if(g->tensors.begin(), g->tensors.end(), [&](const weights::IndexedTensor& t) { return t.name == name; });
+    if (it == g->tensors.end() || it->dtype != weights::DType::kF32 || it->numel() != kChannels || it->file >= index.files.size())
+      throw std::runtime_error(std::string("mi::flux2_vae: latent statistics '") + name + "' missing or not F32 [128]");
+    dst->resize(kChannels);
+    weights::FileReader(index.file_path(it->file)).read_at(it->offset, dst->data(), dst->size() * sizeof(float));
+    if (bf16_rounded) {
+      for (float& v : *dst) v = quant::bf16_to_float(quant::float_to_bf16(v));
+    }
+  }
+  return st;
 }
 
 }  // namespace mi::flux2_vae

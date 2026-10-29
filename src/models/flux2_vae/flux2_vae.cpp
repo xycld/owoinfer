@@ -15,8 +15,8 @@
 #include "kernels/vae/attention.h"
 #include "models/flux2_vae/flux2_vae_internal.h"
 #include "models/flux2_vae/torch_group_norm.h"
+#include "models/flux2_vae/vae_file.h"
 #include "runtime/pinned_ring.h"
-#include "weights/quant/quant_codec.h"
 #include "weights/safetensors.h"
 #include "weights/upload.h"
 
@@ -103,18 +103,6 @@ weights::WeightGroup stats_part(const weights::ModelIndex& index) {
     s.tensors.push_back(*it);
   }
   return s;
-}
-
-// An index's own latent statistics as the MOSS-Image bundle stores them: F32 values rounded to bf16 (round to nearest
-// even), in place through the host. A VAE file's fp32 originals then equal the bundle's bit for bit; the bundle's own
-// are bf16 values already and stay as they are.
-void round_to_bf16(const Tensor& t, cudaStream_t s) {
-  std::vector<float> host(static_cast<std::size_t>(t.numel()));
-  MI_CUDA_CHECK(cudaMemcpyAsync(host.data(), t.data, t.nbytes(), cudaMemcpyDeviceToHost, s));
-  MI_CUDA_CHECK(cudaStreamSynchronize(s));
-  for (float& v : host) v = quant::bf16_to_float(quant::float_to_bf16(v));
-  MI_CUDA_CHECK(cudaMemcpyAsync(t.data, host.data(), t.nbytes(), cudaMemcpyHostToDevice, s));
-  MI_CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
 void check_lt(cublasStatus_t st, const char* what) {
@@ -216,7 +204,7 @@ std::size_t Flux2VaeDecoder::persistent_bytes(const weights::ModelIndex& index, 
 
 Flux2VaeDecoder::Flux2VaeDecoder(const weights::ModelIndex& index, runtime::DeviceArena& arena,
                                  runtime::StreamSet& streams, bool bf16_weights, bool direct_io,
-                                 const weights::ModelIndex* latent_stats)
+                                 const weights::ModelIndex* latent_stats, bool round_stats)
     : arena_(arena), config_(decoder_config(index)), has_bf16_(bf16_weights) {
   const auto t0 = std::chrono::steady_clock::now();
   const int mid = config_.mid();
@@ -233,7 +221,20 @@ Flux2VaeDecoder::Flux2VaeDecoder(const weights::ModelIndex& index, runtime::Devi
     // The largest tensor is 9.4 MB (full decoder): a small ring suffices and keeps the pinned allocation cheap.
     runtime::PinnedRing ring(streams.copy(), 2, std::size_t{16} << 20);
     m = weights::upload_group(readers, group, arena, ring);
-    m.merge(weights::upload_group(stats_readers, stats, arena, ring));
+    if (round_stats) {
+      // A VAE file's statistics, rounded on the host before their upload (read_latent_stats).
+      const LatentStats st = read_latent_stats(stats_index, true);
+      const std::size_t bytes = weights::group_device_bytes(stats);
+      std::vector<weights::UploadPiece> pieces;
+      m.merge(weights::plan_group_upload(stats, arena.alloc_persistent(bytes), bytes, pieces));
+      for (const weights::UploadPiece& p : pieces) {
+        const std::vector<float>& v = p.tensor->name == "bn.running_mean" ? st.mean : st.var;
+        MI_CUDA_CHECK(cudaMemcpyAsync(p.dst, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice, streams.copy()));
+      }
+      MI_CUDA_CHECK(cudaStreamSynchronize(streams.copy()));
+    } else {
+      m.merge(weights::upload_group(stats_readers, stats, arena, ring));
+    }
     ring.synchronize();
   }
   load_stats_.bytes = group.total_bytes + stats.total_bytes;
@@ -272,10 +273,6 @@ Flux2VaeDecoder::Flux2VaeDecoder(const weights::ModelIndex& index, runtime::Devi
 
   bn_mean_ = take("bn.running_mean", {kLatentChannels});
   bn_var_ = take("bn.running_var", {kLatentChannels});
-  if (latent_stats == nullptr) {
-    round_to_bf16(bn_mean_, streams.compute());
-    round_to_bf16(bn_var_, streams.compute());
-  }
   post_quant_conv_ = make_conv("post_quant_conv", 32, 32, 1);
   conv_in_ = make_conv("decoder.conv_in", mid, 32, 3);
   for (int i = 0; i < 2; ++i) mid_resnets_[i] = make_resnet("decoder.mid_block.resnets." + std::to_string(i), mid, mid);
