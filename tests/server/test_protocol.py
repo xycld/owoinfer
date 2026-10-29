@@ -20,6 +20,7 @@ import threading
 import time
 import unittest
 import zlib
+from array import array
 
 SERVER = os.environ.get("MOSS_SERVER", "")
 GPU = os.environ.get("MOSSINFER_GPU_TESTS", "0") == "1"
@@ -29,6 +30,10 @@ GPU_TIMEOUT = 300.0
 
 
 POSIX = os.name == "posix"
+
+# The shared-memory client as an integration attaches (tests/server/shm_client.py); -I leaves this directory off the path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import shm_client  # noqa: E402
 
 
 def process_gone(pid):
@@ -294,10 +299,11 @@ class CpuProtocolTest(ProtocolTestBase):
                                                "system_cuda": True, "control": True, "accel": True,
                                                "preload": True, "release": True, "certificate_dirs": False,
                                                "te_host_pin": True, "progress_fraction": True, "inspect": True,
-                                               "references": True, "check": True})
+                                               "references": True, "check": True, "components": True})
         self.assertEqual(set(res["values"]), {"mode", "block_path", "tier", "attention", "dit_direct_io", "te_host_pin",
                                               "sampler", "scheduler", "noise_layout", "noise_source", "resize",
-                                              "mask_encoding", "step_cache", "lora_placement"})
+                                              "mask_encoding", "step_cache", "lora_placement", "guidance", "output",
+                                              "dtype"})
         self.assertEqual(res["values"]["tier"], ["reference", "high", "turbo"])  # exactly the accepted names
         self.assertEqual(res["values"]["mode"], ["min_memory", "balanced", "max_speed"])
         probe = res["probe"]
@@ -753,6 +759,58 @@ class CpuProtocolTest(ProtocolTestBase):
         self.assertIn("vram_budget_bytes", r["error"]["message"])
         self.assertEqual(self.server.call("status")["result"]["state"], "unloaded")
 
+    def test_component_methods_without_a_session(self):
+        """The component methods (docs/server-protocol.md, component session): params are checked first, then the
+        state: session_open needs an engine, every other one an open session; session_close and run_end without one."""
+        self.assertError(self.server.call("session_open", {}, id=1), "no_engine", 1)
+        self.assertError(self.server.call("session_open", {"max_rows": 9}, id=2), "invalid_params", 2)
+        self.assertError(self.server.call("session_open", {"plan_request": {"output": "x.png"}}, id=3), "invalid_params", 3)
+        self.assertError(self.server.call("session_open", {"plan_request": 5}, id=4), "invalid_params", 4)
+        self.assertEqual(self.server.call("session_close")["result"], {"closed": False})
+        valid = [("shm_alloc", {"bytes": 4096}), ("shm_free", {"name": "/mossinfer-1-0-00"}),
+                 ("encode_text", {"prompts": ["a cat", ""]}),
+                 ("conditioning_import", {"shm": "/x", "dtype": "bf16", "shape": [3, 4096]}),
+                 ("conditioning_free", {"conditionings": [1, 2]}),
+                 ("initial_noise", {"seed": 7, "width": 384, "height": 384, "shm": "/x"}),
+                 ("run_begin", {"width": 384, "height": 384, "rows": [{"conditioning": 1}, {"conditioning": 2,
+                                "skip_layers": [22], "latent": 0}], "guidance": "moss", "output": "guided_velocity",
+                                "exact_sigma": True, "steps": 4, "sigmas": [1.0, 0.5, 0.0],
+                                "control_images": [{"kind": "depth", "path": "/x.png"}], "step_cache": "fbcache",
+                                "step_cache_threshold": 0.2}),
+                 ("denoise_step", {"sigma": 0.5, "step": 1, "rows": 3, "shape": [1, 8, 8], "control": True,
+                                   "control_changed": True}),
+                 ("run_end", {}), ("vae_encode", {"shm": "/a", "out_shm": "/b", "width": 64, "height": 32}),
+                 ("vae_decode", {"shm": "/a", "out_shm": "/b", "width": 64, "height": 32})]
+        for i, (method, params) in enumerate(valid):
+            self.assertError(self.server.call(method, params, id=i), "no_session", i)
+        bad = [("shm_alloc", {}), ("shm_alloc", {"bytes": 0}), ("shm_alloc", {"bytes": "1"}), ("shm_free", {}),
+               ("encode_text", {}), ("encode_text", {"prompts": []}), ("encode_text", {"prompts": ["x"] * 9}),
+               ("encode_text", {"prompts": [1]}), ("encode_text", {"prompts": ["a\u0000b"]}),
+               ("encode_text", {"prompts": ["x"], "max_sequence_length": 0}),
+               ("conditioning_import", {"shm": "/x", "shape": [3, 4095]}),
+               ("conditioning_import", {"shm": "/x", "shape": [0, 4096]}),
+               ("conditioning_import", {"shm": "/x", "dtype": "f16", "shape": [1, 4096]}),
+               ("conditioning_free", {"conditionings": "1"}), ("conditioning_free", {"conditionings": [1.5]}),
+               ("initial_noise", {"width": 384, "height": 384, "shm": "/x"}),
+               ("initial_noise", {"seed": -1, "width": 384, "height": 384, "shm": "/x"}),
+               ("initial_noise", {"seed": 1, "width": 380, "height": 384, "shm": "/x"}),
+               ("run_begin", {}), ("run_begin", {"rows": []}), ("run_begin", {"rows": [{}]}),
+               ("run_begin", {"rows": [{"conditioning": 1, "skip": [22]}]}),
+               ("run_begin", {"rows": [{"conditioning": 1, "latent": 8}]}),
+               ("run_begin", {"rows": [{"conditioning": 1}], "sigmas": [1.0]}),
+               ("run_begin", {"rows": [{"conditioning": 1}], "sigmas": [1.0, "0"]}),
+               ("run_begin", {"rows": [{"conditioning": 1}], "control_images": [{"kind": "depth"}]}),
+               ("run_begin", {"rows": [{"conditioning": 1}], "step_cache_threshold": 0}),
+               ("run_begin", {"rows": [{"conditioning": 1}], "certified": True}),
+               ("denoise_step", {}), ("denoise_step", {"sigma": "1"}), ("denoise_step", {"sigma": 1, "shape": [1, 8]}),
+               ("denoise_step", {"sigma": 1, "shape": [1, 0, 8]}), ("denoise_step", {"sigma": 1, "rows": 256}),
+               ("run_end", {"now": True}), ("vae_encode", {"shm": "/a", "out_shm": "/b", "width": 60, "height": 32}),
+               ("vae_decode", {"shm": "/a", "width": 64, "height": 32, "extra": 1})]
+        for i, (method, params) in enumerate(bad):
+            self.assertError(self.server.call(method, params, id="b%d" % i), "invalid_params", "b%d" % i)
+        st = self.server.call("status")["result"]
+        self.assertNotIn("session", st)
+
     def test_hello_values_are_accepted(self):
         """Every value hello lists passes the server's validation; a value it does not list is refused, and the
         refusal names exactly the listed values."""
@@ -762,10 +820,17 @@ class CpuProtocolTest(ProtocolTestBase):
         base = {"prompt": "a cat", "output": os.path.join(self.tmp, "x.png")}
         ds = os.path.join(self.tmp, "dataspace.safetensors")
         write_dataspace(ds, [1000, 750, 500, 250])
+        # The component methods' names: run_begin's guidance and output, conditioning_import's dtype (no session).
+        component = {"guidance": ("run_begin", {"rows": [{"conditioning": 1}]}),
+                     "output": ("run_begin", {"rows": [{"conditioning": 1}]}),
+                     "dtype": ("conditioning_import", {"shm": "/x", "shape": [1, 4096]})}
         for param, names in values.items():
             self.assertTrue(names, param)
             for v in names:
-                if param in load_params:
+                if param in component:
+                    method, params = component[param]
+                    self.assertError(self.server.call(method, dict(params, **{param: v}), id=v), "no_session", v)
+                elif param in load_params:
                     # Through the server to the engine's own checks (here: the missing bundle).
                     r = self.server.call("load", dict({"model": missing, "tier": "high"}, **{param: v}), id=v)
                     self.assertError(r, "invalid_argument", v)
@@ -777,6 +842,8 @@ class CpuProtocolTest(ProtocolTestBase):
             if len(names) == 2:
                 listed = '"%s" or "%s"' % tuple(names)
             method, params = ("load", {"model": missing}) if param in load_params else ("generate", dict(base))
+            if param in component:
+                method, params = component[param]
             r = self.server.call(method, dict(params, **{param: "not-a-value"}), id=param)
             self.assertError(r, "invalid_params", param)
             self.assertEqual(r["error"]["message"], '"%s" must be %s' % (param, listed))
@@ -1528,6 +1595,463 @@ class GpuProtocolTest(ProtocolTestBase):
         self.assertEqual(len(late), 1)
         self.assertEqual(late[0]["status"], "cancelled")
         self.assertEqual(self.server.proc.wait(timeout=TIMEOUT), 0)
+
+
+
+def png_rgb(path):
+    """(width, height, RGB8 bytes) of an 8-bit RGB, non-interlaced PNG (what generate writes)."""
+    chunks = png_chunks(path)
+    ihdr = chunks[0][1]
+    w, h = int.from_bytes(ihdr[0:4], "big"), int.from_bytes(ihdr[4:8], "big")
+    assert ihdr[8:13] == bytes([8, 2, 0, 0, 0]), "not an 8-bit RGB PNG: %r" % ihdr[8:13]
+    raw = zlib.decompress(b"".join(body for kind, body in chunks if kind == b"IDAT"))
+    stride = 3 * w
+    out = bytearray()
+    prev = bytearray(stride)
+    pos = 0
+    for _ in range(h):
+        f, line = raw[pos], bytearray(raw[pos + 1:pos + 1 + stride])
+        pos += 1 + stride
+        for i in range(stride):
+            a = line[i - 3] if i >= 3 else 0
+            b = prev[i]
+            c = prev[i - 3] if i >= 3 else 0
+            if f == 1:
+                line[i] = (line[i] + a) & 255
+            elif f == 2:
+                line[i] = (line[i] + b) & 255
+            elif f == 3:
+                line[i] = (line[i] + ((a + b) >> 1)) & 255
+            elif f == 4:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        out += line
+        prev = line
+    return w, h, bytes(out)
+
+
+class ShmRegion:
+    """A client's mapping of a moss-server region (shm_client.attach: the header and token checked)."""
+
+    def __init__(self, shm):
+        self.name = shm["name"]
+        self.buf, self.offset, self.keep = shm_client.attach(shm["name"], shm["token"], shm["bytes"])
+
+    def floats(self, at, n):
+        return array("f", bytes(self.buf[at:at + 4 * n]))
+
+    def payload_floats(self, n):
+        return self.floats(self.offset, n)
+
+    def write(self, at, data):
+        raw = data.tobytes() if isinstance(data, array) else bytes(data)
+        self.buf[at:at + len(raw)] = raw
+
+    def close(self):
+        self.buf.close()
+
+
+# fp32 arithmetic with one rounding per op (array("f") rounds each double result to the nearest float; a double holds
+# a product or sum of two floats exactly or rounds it innocuously), as the engine's samplers and the C API tests do.
+def f32_mul(k, v):
+    return array("f", [k * a for a in v])
+
+
+def f32_add(u, v):
+    return array("f", [a + b for a, b in zip(u, v)])
+
+
+def f32_sub(u, v):
+    return array("f", [a - b for a, b in zip(u, v)])
+
+
+def f32(x):
+    return array("f", [x])[0]
+
+
+def cfg_velocity(c, u, g):
+    """u + g (c - u), velocity space, one rounding per op."""
+    return f32_add(u, f32_mul(g, f32_sub(c, u)))
+
+
+def euler_velocity(x, v, s, sn):
+    """Euler on moss (velocity): x + fp32(sn - s) v."""
+    return f32_add(x, f32_mul(f32(sn - s), v))
+
+
+def start_latents(noise, s0):
+    """s0 * noise (+ (1 - s0) * 0): mi_generate's start without an init image."""
+    keep = f32(1.0 - s0)
+    return array("f", [f32(s0 * a) + f32(keep * 0.0) for a in noise])
+
+
+@unittest.skipUnless(GPU, "set MOSSINFER_GPU_TESTS=1 (and hold the GPU lock) for the GPU tests")
+class GpuComponentTest(ProtocolTestBase):
+    """The component methods on the GPU (design §7.5): the base bundle, tier reference, 384^2."""
+
+    SIZE = 384
+
+    def load_base(self):
+        base = os.path.join(WEIGHTS, "base")
+        if not os.path.isdir(os.path.join(base, "transformer")):
+            self.skipTest("weights not present: " + base)
+        r = self.server.call("load", {"model": base, "tier": "reference", "mode": "balanced"})
+        self.assertIn("result", r, r)
+        return base
+
+    def ok(self, method, params=None, timeout=GPU_TIMEOUT, id=None):
+        r = self.server.response(self.server.send(method, params, id=id), timeout=timeout)
+        self.assertIn("result", r, r)
+        return r["result"]
+
+    def collect(self, ids, timeout=GPU_TIMEOUT):
+        """Responses to every id in `ids` (events skipped), in arrival order."""
+        got = []
+        want = set(ids)
+        deadline = time.monotonic() + timeout
+        while want:
+            msg = self.server.read(max(0.1, deadline - time.monotonic()))
+            if "event" in msg:
+                continue
+            self.assertIn(msg["id"], want, msg)
+            want.discard(msg["id"])
+            got.append(msg)
+        return got
+
+    def generate_rgb(self, seed, size=None, **extra):
+        size = size or self.SIZE
+        out = os.path.join(self.tmp, "g%d_%d_%d.png" % (seed, size, len(os.listdir(self.tmp))))
+        params = dict({"prompt": self.PROMPT, "negative_prompt": self.NEGATIVE, "width": size, "height": size,
+                       "steps": self.STEPS, "seed": seed, "output": out}, **extra)
+        gid = self.server.send("generate", params)
+        self.assertEqual(self.server.response(gid)["result"], {"accepted": True})
+        deadline = time.monotonic() + GPU_TIMEOUT
+        while True:
+            msg = self.server.read(max(0.1, deadline - time.monotonic()))
+            if msg.get("event") == "done" and msg["id"] == gid:
+                break
+        self.assertEqual(msg["status"], "ok", msg)
+        return png_rgb(out)[2]
+
+    PROMPT = "a red apple on a wooden table, studio light"
+    NEGATIVE = "blurry"
+    STEPS = 4
+
+    def scratch(self, nbytes):
+        r = self.ok("shm_alloc", {"bytes": nbytes})["shm"]
+        return r, ShmRegion(r)
+
+    def noise(self, seed, size=None):
+        size = size or self.SIZE
+        n = 128 * (size // 16) ** 2
+        shm, region = self.scratch(4 * n)
+        self.assertEqual(self.ok("initial_noise", {"seed": seed, "width": size, "height": size, "shm": shm["name"]}),
+                         {"shape": [128, size // 16, size // 16]})
+        v = region.payload_floats(n)
+        region.close()
+        self.ok("shm_free", {"name": shm["name"]})
+        return v
+
+    def decode(self, latents, size=None):
+        size = size or self.SIZE
+        lat, lr = self.scratch(4 * len(latents))
+        rgb, rr = self.scratch(3 * size * size)
+        lr.write(lr.offset, latents)
+        self.ok("vae_decode", {"shm": lat["name"], "out_shm": rgb["name"], "width": size, "height": size})
+        out = bytes(rr.buf[rr.offset:rr.offset + 3 * size * size])
+        lr.close()
+        rr.close()
+        self.ok("shm_free", {"name": lat["name"]})
+        self.ok("shm_free", {"name": rgb["name"]})
+        return out
+
+    def begin(self, params):
+        r = self.ok("run_begin", params)
+        region = ShmRegion(r["shm"])
+        if POSIX:
+            st = os.stat("/dev/shm/" + r["shm"]["name"].lstrip("/"))
+            self.assertEqual(st.st_mode & 0o777, 0o600)
+        return r, region
+
+    def step(self, params, id=None):
+        return self.ok("denoise_step", params, id=id)
+
+    def end(self):
+        r = self.ok("run_end")
+        self.assertTrue(r["ended"], r)
+        return r
+
+    def sample(self, run, region, rows_out, n, sigmas, x, combine, denoised=False, shape=None):
+        """Euler over the run's schedule: each step writes x, calls denoise_step and reads the outputs; `combine`
+        turns them into the prediction (velocity, or denoised with `denoised`)."""
+        tensors = run["tensors"]
+        for i in range(len(sigmas) - 1):
+            region.write(tensors["x"], x)
+            params = {"sigma": sigmas[i]}
+            if shape is not None:
+                params["shape"] = shape
+            info = self.step(params)
+            self.assertEqual(info["step"], i)
+            self.assertTrue(info["on_schedule"])
+            outs = [region.floats(tensors["out"][k], n) if tensors["out"][k] is not None else None for k in rows_out]
+            pred = combine(outs, x)
+            if denoised:
+                dt = f32(sigmas[i + 1] - sigmas[i])
+                e = f32_sub(x, pred)
+                x = f32_add(x, array("f", [f32(a / sigmas[i]) * dt for a in e]))
+            else:
+                x = euler_velocity(x, pred, sigmas[i], sigmas[i + 1])
+        return x
+
+    def open_session(self, **params):
+        r = self.ok("session_open", params, timeout=TIMEOUT)
+        return r
+
+    def test_component_runs_reproduce_generate(self):
+        """A client over shm reproduces generate's bits (design §7.5): MOSS guidance with the guided velocity, with
+        the rows and the client's CFG, HOST rows with the client's CFG, the guided denoised output (euler on simple), a
+        latent batch of 2 (two seeds in one run, HOST rows), and crop calls (a 256^2 crop of a 384^2 run with crops,
+        equal to generate at 256^2)."""
+        self.load_base()
+        size, lat = self.SIZE, self.SIZE // 16
+        n = 128 * lat * lat
+        refs = {7: self.generate_rgb(7), 8: self.generate_rgb(8)}
+        ref_simple = self.generate_rgb(7, scheduler="simple")
+        ref_crop = self.generate_rgb(7, size=256)
+        self.assertEqual(len(refs[7]), 3 * size * size)
+        self.assertNotEqual(refs[7], refs[8])  # the comparisons below can fail
+        self.assertNotEqual(refs[7], ref_simple)
+        self.assertEqual(self.open_session(max_rows=4, max_latents=2), {"max_rows": 4, "max_latents": 2})
+        conds = self.ok("encode_text", {"prompts": [self.PROMPT, self.NEGATIVE]})["conditionings"]
+        self.assertEqual([c["id"] for c in conds], [1, 2])
+        self.assertTrue(all(c["engine_encoded"] and c["tokens"] > 0 for c in conds), conds)
+        c, u = conds[0]["id"], conds[1]["id"]
+        rows = [{"conditioning": c}, {"conditioning": u, "skip_layers": [22]}]
+        noise7, noise8 = self.noise(7), self.noise(8)
+        guided = lambda outs, x: outs[0]
+        cfg = lambda outs, x: cfg_velocity(outs[0], outs[1], 3.0)
+        cases = [("MOSS guided velocity", {"guidance": "moss", "output": "guided_velocity", "exact_sigma": True}, [0], guided),
+                 ("MOSS rows, client CFG", {"guidance": "moss", "output": "rows"}, [0, 1], cfg),
+                 ("HOST rows, client CFG", {"guidance": "host", "output": "rows"}, [0, 1], cfg)]
+        for name, params, outs, combine in cases:
+            with self.subTest(name):
+                run, region = self.begin(dict({"width": size, "height": size, "rows": rows, "steps": self.STEPS}, **params))
+                self.assertEqual(run["info"]["latent_height"], lat)
+                self.assertEqual(run["info"]["staging_bytes"] + 4096 <= run["shm"]["bytes"], True)
+                self.assertTrue(run["adopted"], run)  # pinned in place on Linux
+                self.assertTrue(run["info"]["schedule_matches"])
+                s = run["sigmas"]
+                self.assertEqual(len(s), self.STEPS + 1)
+                x = self.sample(run, region, outs, n, s, start_latents(noise7, s[0]), combine)
+                end = self.end()
+                self.assertEqual(end["report"]["component"]["calls"], self.STEPS)
+                region.close()
+                self.assertEqual(self.decode(x), refs[7], "RGB bytes differ from generate's")
+        with self.subTest("MOSS guided denoised, euler on simple"):
+            run, region = self.begin({"width": size, "height": size, "rows": rows, "steps": self.STEPS,
+                                      "scheduler": "simple", "guidance": "moss", "output": "guided_denoised"})
+            s = run["sigmas"]
+            x = self.sample(run, region, [0], n, s, start_latents(noise7, s[0]), guided, denoised=True)
+            self.end()
+            region.close()
+            self.assertEqual(self.decode(x), ref_simple, "RGB bytes differ from generate's")
+        with self.subTest("latent batch of 2, HOST rows"):
+            batch_rows = rows + [dict(r, latent=1) for r in rows]
+            run, region = self.begin({"width": size, "height": size, "rows": batch_rows, "steps": self.STEPS,
+                                      "guidance": "host", "output": "rows"})
+            self.assertEqual(run["info"]["latents"], 2)
+            s = run["sigmas"]
+            xs = [start_latents(noise7, s[0]), start_latents(noise8, s[0])]
+            t = run["tensors"]
+            for i in range(self.STEPS):
+                region.write(t["x"], xs[0] + xs[1])
+                info = self.step({"sigma": s[i]})
+                self.assertEqual(info["rows"], 15)
+                o = [region.floats(t["out"][k], n) for k in range(4)]
+                xs = [euler_velocity(xs[j], cfg_velocity(o[2 * j], o[2 * j + 1], 3.0), s[i], s[i + 1]) for j in (0, 1)]
+            self.end()
+            region.close()
+            self.assertEqual(self.decode(xs[0]), refs[7], "image 0 of the batch differs from generate's")
+            self.assertEqual(self.decode(xs[1]), refs[8], "image 1 of the batch differs from generate's")
+        with self.subTest("crop calls"):
+            run, region = self.begin({"width": size, "height": size, "rows": rows, "steps": self.STEPS,
+                                      "guidance": "host", "output": "rows", "crops": True})
+            s = run["sigmas"]
+            noise_c = self.noise(7, 256)
+            x = self.sample(run, region, [0, 1], 128 * 16 * 16, s, start_latents(noise_c, s[0]), cfg, shape=[1, 16, 16])
+            self.end()
+            region.close()
+            self.assertEqual(self.decode(x, 256), ref_crop, "RGB bytes of the crop run differ from generate's at 256^2")
+        self.assertEqual(self.ok("conditioning_free", {"conditionings": [c, u]}), {"freed": 2})
+        self.assertEqual(self.ok("session_close"), {"closed": True})
+
+    def test_control_per_call(self):
+        """A per-call control latent (the client's vae_encode of the control image, the depth group of the adapter's
+        channels, zeros elsewhere, MI_STEP_CONTROL_CHANGED on the first call): generate's control run bit for bit."""
+        community = os.environ.get("MOSS_COMMUNITY_MODELS") or "/workspace/Models/community"
+        adapter = os.path.join(community, "comfy-org", "moss_image_color_depth_control.safetensors")
+        if not os.path.isfile(adapter):
+            self.skipTest("no control adapter: " + adapter + " (set MOSS_COMMUNITY_MODELS)")
+        self.load_base()
+        size, lat = self.SIZE, self.SIZE // 16
+        n = 128 * lat * lat
+        kinds = self.ok("inspect", {"path": adapter})["control_kinds"]
+        pixel = lambda x, y: (230,) * 3 if (x - 190) ** 2 + (y - 200) ** 2 < 90 ** 2 else (40 + y // 4,) * 3
+        depth = os.path.join(self.tmp, "depth.png")
+        write_png(depth, size, size, pixel)
+        ref = self.generate_rgb(7, control={"adapter": adapter, "images": [{"kind": "depth", "path": depth}]})
+        self.open_session(control_adapter=adapter)
+        conds = self.ok("encode_text", {"prompts": [self.PROMPT, self.NEGATIVE]})["conditionings"]
+        img, ir = self.scratch(3 * size * size)
+        ir.write(ir.offset, bytes(v for y in range(size) for x in range(size) for v in pixel(x, y)))
+        lt, lr = self.scratch(4 * n)
+        self.ok("vae_encode", {"shm": img["name"], "out_shm": lt["name"], "width": size, "height": size})
+        depth_latent = lr.payload_floats(n)
+        control = array("f", bytes(4 * n * len(kinds)))
+        control[n * kinds.index("depth"):n * (kinds.index("depth") + 1)] = depth_latent
+        run, region = self.begin({"width": size, "height": size, "steps": self.STEPS, "guidance": "moss",
+                                  "output": "guided_velocity", "rows": [{"conditioning": conds[0]["id"]},
+                                                                        {"conditioning": conds[1]["id"], "skip_layers": [22]}]})
+        self.assertEqual(run["info"]["control_channels"], 128 * len(kinds))
+        t = run["tensors"]
+        s = run["sigmas"]
+        x = start_latents(self.noise(7), s[0])
+        for i in range(self.STEPS):
+            region.write(t["x"], x)
+            region.write(t["control"], control)
+            self.step({"sigma": s[i], "control": True, "control_changed": i == 0})
+            x = euler_velocity(x, region.floats(t["out"][0], n), s[i], s[i + 1])
+        self.end()
+        region.close()
+        self.assertEqual(self.decode(x), ref, "RGB bytes differ from generate's control run")
+
+    def pipelined_steps(self, sigma, count, prefix):
+        return [self.server.send("denoise_step", {"sigma": sigma, "step": 0}, id="%s%d" % (prefix, i)) for i in range(count)]
+
+    def test_run_end_interrupts_steps_and_cancel_skips_queued_ones(self):
+        """run_end during an in-flight denoise_step: the step answers cancelled first, the queued ones cancelled unrun,
+        then run_end; the next run_begin loads nothing. cancel {id} of a step queued behind another answers it
+        cancelled without reaching the engine (its run's call count says so)."""
+        self.load_base()
+        self.open_session()
+        conds = self.ok("encode_text", {"prompts": [self.PROMPT]})["conditionings"]
+        params = {"width": 1024, "height": 1024, "steps": 4, "rows": [{"conditioning": conds[0]["id"]}]}
+        run, region = self.begin(params)
+        sigma = run["sigmas"][0]
+        ids = self.pipelined_steps(sigma, 1, "s")
+        # The first step is running (status names it) before the others and run_end are sent: a 1024^2 bf16 step
+        # takes long enough that run_end reaches it in flight.
+        deadline = time.monotonic() + TIMEOUT
+        while self.ok("status")["session"]["running_id"] != ids[0] and time.monotonic() < deadline:
+            time.sleep(0.001)
+        ids += self.pipelined_steps(sigma, 5, "q")
+        end_id = self.server.send("run_end", id="end")
+        got = self.collect(ids + [end_id])
+        self.assertEqual([m["id"] for m in got], ids + [end_id], "answers out of order")
+        self.assertEqual(got[0]["error"], {"code": "cancelled", "message": "the run is ending"}, got[0])
+        for m in got[1:-1]:
+            self.assertEqual(m["error"], {"code": "cancelled", "message": "the run is ending (not started)"}, m)
+        self.assertTrue(got[-1]["result"]["ended"])
+        self.assertEqual(got[-1]["result"]["report"]["component"]["calls"], 0)
+        region.close()
+        # The next run plans as before and loads nothing (the DiT stayed resident).
+        run, region = self.begin(params)
+        sigma = run["sigmas"][0]
+        ids = self.pipelined_steps(sigma, 3, "c")
+        cancel = self.server.send("cancel", {"id": ids[2]}, id="k")
+        got = self.collect(ids + [cancel])
+        by_id = {m["id"]: m for m in got}
+        self.assertEqual(by_id["k"]["result"], {"cancelling": True, "generating_id": ids[2]})
+        self.assertIn("result", by_id[ids[0]], by_id)
+        self.assertIn("result", by_id[ids[1]], by_id)
+        self.assertEqual(by_id[ids[2]]["error"], {"code": "cancelled", "message": "cancelled (not started)"})
+        end = self.end()
+        self.assertEqual(end["report"]["component"]["calls"], 2)
+        self.assertIsNone(end["report"]["dit_load"]["source"], end["report"]["dit_load"])
+        region.close()
+        self.assertEqual(self.ok("run_end"), {"ended": False})
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the thread count comes from /proc")
+    def test_steps_create_no_threads(self):
+        """One worker thread per session: 1000 steps create no threads."""
+        self.load_base()
+        self.open_session(max_rows=1)
+        conds = self.ok("encode_text", {"prompts": ["x"]})["conditionings"]
+        run, region = self.begin({"width": 64, "height": 64, "steps": 4, "rows": [{"conditioning": conds[0]["id"]}]})
+        sigma = run["sigmas"][0]
+
+        def threads():
+            with open("/proc/%d/status" % self.server.proc.pid) as f:
+                return int(next(line for line in f if line.startswith("Threads:")).split()[1])
+
+        self.collect(self.pipelined_steps(sigma, 5, "w"))  # warm: whatever the engine starts lazily
+        before = threads()
+        for b in range(20):
+            got = self.collect(self.pipelined_steps(sigma, 50, "t%d_" % b))
+            self.assertTrue(all("result" in m for m in got), got[:2])
+        self.assertEqual(threads(), before)
+        self.end()
+        region.close()
+
+    def scratch_path(self, shm):
+        return "/dev/shm/" + shm["name"].lstrip("/")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "named regions outlive their process on Linux only")
+    def test_sigkill_leaves_nothing_after_the_next_start(self):
+        """SIGKILL mid-run before and after the first step, with a scratch region before and after it is named:
+        nothing remains in /dev/shm once the next server has started. A wrong token is refused by the client."""
+        self.load_base()
+        self.open_session()
+        conds = self.ok("encode_text", {"prompts": ["x"]})["conditionings"]
+        for named in (False, True):
+            with self.subTest(named=named):
+                if named:
+                    self.server.close()
+                    self.server = Server()
+                    self.load_base()
+                    self.open_session()
+                    conds = self.ok("encode_text", {"prompts": ["x"]})["conditionings"]
+                scratch = self.ok("shm_alloc", {"bytes": 4 * 128 * 16})["shm"]
+                wrong = ("0" if scratch["token"][0] != "0" else "1") + scratch["token"][1:]
+                with self.assertRaises(ValueError):
+                    shm_client.attach(scratch["name"], wrong, scratch["bytes"])
+                run, region = self.begin({"width": 64, "height": 64, "steps": 4,
+                                          "rows": [{"conditioning": conds[0]["id"]}]})
+                paths = [self.scratch_path(scratch), self.scratch_path(run["shm"])]
+                self.assertTrue(all(os.path.exists(p) for p in paths))
+                if named:
+                    self.ok("initial_noise", {"seed": 1, "width": 64, "height": 64, "shm": scratch["name"]})
+                    self.step({"sigma": run["sigmas"][0]})
+                    self.assertFalse(any(os.path.exists(p) for p in paths), "named regions are unlinked")
+                region.close()
+                self.server.proc.kill()
+                self.server.proc.wait(TIMEOUT)
+                nxt = Server()
+                try:
+                    self.assertEqual(nxt.call("hello")["result"]["server"], "moss-server")  # swept before the loop
+                    self.assertFalse(any(os.path.exists(p) for p in paths), paths)
+                finally:
+                    nxt.close()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the region's name is visible on Linux only")
+    def test_unnamed_scratch_region_goes_after_60_s(self):
+        self.load_base()
+        self.open_session()
+        kept = self.ok("shm_alloc", {"bytes": 4096})["shm"]
+        lost = self.ok("shm_alloc", {"bytes": 4096})["shm"]
+        self.ok("initial_noise", {"seed": 1, "width": 16, "height": 16, "shm": kept["name"]})  # 2 KiB: names it
+        self.assertTrue(os.path.exists(self.scratch_path(lost)))
+        deadline = time.monotonic() + 75
+        while os.path.exists(self.scratch_path(lost)) and time.monotonic() < deadline:
+            time.sleep(1)
+        self.assertFalse(os.path.exists(self.scratch_path(lost)), "a never-named region outlived 60 s")
+        self.assertError(self.server.call("shm_free", {"name": lost["name"]}, id="f1"), "invalid_params", "f1")
+        self.assertEqual(self.ok("shm_free", {"name": kept["name"]}), {"freed": True})
+        st = self.ok("status")
+        self.assertEqual(st["session"], {"run": False, "queued": 0, "running_id": None})
+        self.assertEqual(self.ok("session_close"), {"closed": True})
+        self.assertNotIn("session", self.ok("status"))
 
 
 if __name__ == "__main__":

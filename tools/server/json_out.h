@@ -78,6 +78,16 @@ inline std::string num(double d) {
   return std::string(buf, res.ptr);
 }
 
+// A JSON number that reads back as exactly `d` (the shortest such text); null for NaN and infinities. For values a
+// client feeds back bit for bit (a run's sigmas: a float widened to double reads back as that float).
+inline std::string exact_num(double d) {
+  if (!std::isfinite(d)) return "null";
+  char buf[32];
+  const std::to_chars_result res = std::to_chars(buf, buf + sizeof(buf), d);
+  if (res.ec != std::errc()) return "null";  // cannot happen: a double's shortest form fits
+  return std::string(buf, res.ptr);
+}
+
 // A JSON document from the engine (report, plan) as one line: raw newlines can only be whitespace between tokens
 // (inside strings they are escaped), so dropping them keeps the document intact. NULL (the library could not render
 // the document) becomes null.

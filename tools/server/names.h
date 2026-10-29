@@ -123,6 +123,25 @@ inline constexpr Name<mi_lora_placement> kLoraPlacementNames[] = {
     {"side_branch", MI_LORA_PLACEMENT_SIDE_BRANCH},
 };
 
+// The component API's run and tensor enums (run_begin's guidance and output, conditioning_import's dtype): the server's
+// own spellings, the C names in lower case.
+inline constexpr Name<mi_guidance> kGuidanceNames[] = {
+    {"host", MI_GUIDANCE_HOST},
+    {"moss", MI_GUIDANCE_MOSS},
+};
+
+inline constexpr Name<mi_step_output> kStepOutputNames[] = {
+    {"rows", MI_STEP_OUTPUT_ROWS},
+    {"guided_velocity", MI_STEP_OUTPUT_GUIDED_VELOCITY},
+    {"guided_denoised", MI_STEP_OUTPUT_GUIDED_DENOISED},
+};
+
+// mi_conditioning_create's dtypes.
+inline constexpr Name<mi_dtype> kDtypeNames[] = {
+    {"f32", MI_DTYPE_F32},
+    {"bf16", MI_DTYPE_BF16},
+};
+
 // A table's names, for hello's "values".
 template <class E, std::size_t N>
 constexpr std::array<std::string_view, N> names_of(const Name<E> (&table)[N]) {
@@ -146,10 +165,14 @@ inline constexpr auto kResizes = names_of(kResizeNames);
 inline constexpr auto kMaskEncodings = names_of(kMaskEncodingNames);
 inline constexpr auto kStepCaches = names_of(kStepCacheNames);
 inline constexpr auto kLoraPlacements = names_of(kLoraPlacementNames);
+inline constexpr auto kGuidances = names_of(kGuidanceNames);
+inline constexpr auto kStepOutputs = names_of(kStepOutputNames);
+inline constexpr auto kDtypes = names_of(kDtypeNames);
 }  // namespace detail
 
 // The parameter each table validates, for hello's "values": load's (mode .. te_host_pin), then generate's and
-// preload's (sampler .. step_cache).
+// preload's (sampler .. lora_placement), then the component methods' (run_begin's guidance and output,
+// conditioning_import's dtype).
 struct ValueTable {
   std::string_view param;
   std::span<const std::string_view> names;
@@ -169,6 +192,9 @@ inline constexpr ValueTable kValueTables[] = {
     {"mask_encoding", detail::kMaskEncodings},
     {"step_cache", detail::kStepCaches},
     {"lora_placement", detail::kLoraPlacements},
+    {"guidance", detail::kGuidances},
+    {"output", detail::kStepOutputs},
+    {"dtype", detail::kDtypes},
 };
 
 }  // namespace mi::server

@@ -23,8 +23,12 @@ endif()
 
 if(NOT MOSSINFER_ONLY AND EXISTS ${CMAKE_SOURCE_DIR}/tools/server/main.cpp)
   find_package(Threads REQUIRED)
-  add_executable(moss-server ${CMAKE_SOURCE_DIR}/tools/server/main.cpp)
+  add_executable(moss-server ${CMAKE_SOURCE_DIR}/tools/server/main.cpp ${CMAKE_SOURCE_DIR}/tools/server/shm.cpp)
   target_compile_options(moss-server PRIVATE ${MOSSINFER_WARN})
+  # The component methods' shared-memory regions (tools/server/shm.cpp): glibc before 2.34 keeps shm_open in librt.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(moss-server PRIVATE rt)
+  endif()
   if(TARGET mossinfer)
     # The shared library exports mi_* only, so the server brings its own copy of the JSON parser.
     # ... and of the user-file boundary (the image headers a check reads: check_user_path, open_regular_file).

@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <clocale>
+#include <cmath>
 #include <cstdio>
 #include <iterator>
 #include <limits>
@@ -190,6 +191,16 @@ TEST(ServerJson, EnumNamesAreThePipelines) {
     EXPECT_EQ(mi::moss_dit::block_path_name(mi::moss_dit::parse_block_path(n.name)), n.name);
   }
   EXPECT_EQ(i, 4);
+  // The component methods' tables: the server's own names, each C value once, in the C enum's order.
+  i = 0;
+  for (const auto& n : mi::server::kGuidanceNames) EXPECT_EQ(static_cast<int>(n.value), i++);
+  EXPECT_EQ(i, 2);
+  i = 0;
+  for (const auto& n : mi::server::kStepOutputNames) EXPECT_EQ(static_cast<int>(n.value), i++);
+  EXPECT_EQ(i, 3);
+  i = 0;
+  for (const auto& n : mi::server::kDtypeNames) EXPECT_EQ(static_cast<int>(n.value), i++);
+  EXPECT_EQ(i, 2);
 }
 
 // hello's "values": every enum table, each under the parameter it validates, with the table's names in order.
@@ -199,7 +210,7 @@ TEST(ServerJson, HelloValuesAreTheTables) {
     ASSERT_EQ(listed.size(), std::size(table));
     for (std::size_t i = 0; i < listed.size(); ++i) EXPECT_EQ(listed[i], table[i].name);
   };
-  ASSERT_EQ(std::size(s::kValueTables), 14u);
+  ASSERT_EQ(std::size(s::kValueTables), 17u);
   for (const s::ValueTable& t : s::kValueTables) {
     SCOPED_TRACE(t.param);
     if (t.param == "mode") same(t.names, s::kModeNames);
@@ -216,8 +227,23 @@ TEST(ServerJson, HelloValuesAreTheTables) {
     else if (t.param == "mask_encoding") same(t.names, s::kMaskEncodingNames);
     else if (t.param == "step_cache") same(t.names, s::kStepCacheNames);
     else if (t.param == "lora_placement") same(t.names, s::kLoraPlacementNames);
+    else if (t.param == "guidance") same(t.names, s::kGuidanceNames);
+    else if (t.param == "output") same(t.names, s::kStepOutputNames);
+    else if (t.param == "dtype") same(t.names, s::kDtypeNames);
     else ADD_FAILURE() << "unexpected parameter";
   }
+}
+
+// exact_num: the shortest text that reads back as the same double, so a float sigma survives the round trip; null for
+// NaN and infinities.
+TEST(ServerJson, ExactNumRoundTrips) {
+  for (const float f : {0.0f, 1.0f, 0.9973f, 1e-7f, 0.123456789f, 3.4e38f}) {
+    const std::string s = mi::server::exact_num(static_cast<double>(f));
+    EXPECT_EQ(static_cast<float>(std::stod(s)), f) << s;
+    EXPECT_EQ(std::stod(s), static_cast<double>(f)) << s;
+  }
+  EXPECT_EQ(mi::server::exact_num(std::nan("")), "null");
+  EXPECT_EQ(mi::server::exact_num(std::numeric_limits<double>::infinity()), "null");
 }
 
 // The report of a done event: a NULL from mi_result_report_json() becomes JSON null instead of a crash.

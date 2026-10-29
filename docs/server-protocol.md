@@ -67,8 +67,10 @@ Unknown members in `params` are rejected (`invalid_params`), so a typo cannot be
 | `method_not_found` | unknown `method` |
 | `invalid_params` | wrong parameter type or value, unknown parameter, a string containing NUL (`\u0000`: the C API's strings are NUL-terminated), or a generation request the engine rejects (the message uses the official app's wording) |
 | `unsupported_protocol` | `hello` asked for another protocol version |
-| `no_engine` | a valid `generate`, `preload` or `release` before `load` |
-| `busy` | a valid `generate`, `preload` or `release`, or `load` or `unload`, while a job (a generation, preload or release) runs; an `inspect` while two run |
+| `no_engine` | a valid `generate`, `preload`, `release` or `session_open` before `load` |
+| `no_session` | a valid component call (other than `session_open` and `session_close`) without an open session |
+| `cancelled` | a component call cancelled before it started or while it ran (`cancel`, `run_end`, `session_close`) |
+| `busy` | a valid `generate`, `preload` or `release`, or `load` or `unload`, while a job (a generation, preload or release) runs; an `inspect` while two run; `session_open` while a session is open; the engine's `MI_ERR_BUSY` for a component call |
 | `invalid_argument`, `abi_mismatch`, `not_supported`, `out_of_memory`, `model`, `io`, `cuda`, `internal` | the engine's `mi_status` (`MI_ERR_<CODE>`), with `mi_last_error_message()` as the message |
 
 ## Methods
@@ -87,7 +89,7 @@ Params (all optional):
                      "samplers": true, "image_input": true, "hires": true, "distill": true, "system_cuda": true,
                      "control": true, "accel": true, "preload": true, "release": true, "certificate_dirs": false,
                      "te_host_pin": true, "progress_fraction": true, "inspect": true, "references": true,
-                     "check": true},
+                     "check": true, "components": true},
     "values": {"mode": ["min_memory", "balanced", "max_speed"], "block_path": ["default", "op_by_op", "fused", "fused_graphs"],
                "tier": ["reference", "high", "turbo"], "attention": ["default", "exact", ...], ...,
                "sampler": ["euler", "ab2", ...], ..., "step_cache": ["off", "fbcache"]},
@@ -136,8 +138,10 @@ The server's environment steers the search: `MOSSINFER_CUDA_LIBS` (`auto`: the b
 | `te_host_pin` | `MI_CAP_TE_HOST_PIN` | true | `load`'s `te_host_pin` |
 | `progress_fraction` | `MI_CAP_PROGRESS_FRACTION` | true | `fraction` and `eta_seconds` in `progress` events and in `status` |
 | `inspect` | `MI_CAP_INSPECT` | true | the `inspect` method |
+| `check` | `MI_CAP_CHECK` | true | the `check` method |
+| `components` | `MI_CAP_COMPONENTS` | true | the [component session](#component-session) methods and their shared-memory regions |
 
-`values` lists the accepted names of every enum-like string parameter, in the C enum's order, from the same tables the server validates against (`tools/server/names.h`), so a launcher can fill its menus from them: `load`'s `mode`, `block_path`, `tier`, `attention`, `dit_direct_io` and `te_host_pin`, and `generate`'s (and `preload`'s) `sampler`, `scheduler`, `noise_layout`, `noise_source`, `resize`, `mask_encoding` and `step_cache`. A name outside the list is `invalid_params`, and the message lists the names. Gate a feature's values on its capability as before (e.g. `turbo` needs an INT4 DiT, `inspect` says which files are).
+`values` lists the accepted names of every enum-like string parameter, in the C enum's order, from the same tables the server validates against (`tools/server/names.h`), so a launcher can fill its menus from them: `load`'s `mode`, `block_path`, `tier`, `attention`, `dit_direct_io` and `te_host_pin`, `generate`'s (and `preload`'s) `sampler`, `scheduler`, `noise_layout`, `noise_source`, `resize`, `mask_encoding`, `step_cache` and `lora_placement`, and the component methods' `guidance`, `output` (`run_begin`'s) and `dtype` (`conditioning_import`'s). A name outside the list is `invalid_params`, and the message lists the names. Gate a feature's values on its capability as before (e.g. `turbo` needs an INT4 DiT, `inspect` says which files are).
 
 ### `load`
 
@@ -444,6 +448,68 @@ Releases the engine and its device memory, and answers `{"unloaded": true}`, or 
 
 Cancels a running job and waits for it to finish. That job's `done` event (a release's response) comes first. The server then answers `{}` and exits with status 0.
 
+## Component session
+
+With the `components` capability, the server exposes the C API's component calls ([c-api.md](c-api.md), `mi_session_open` … `mi_session_close`): a client owns the sampling loop, and each model evaluation is one `denoise_step`. Tensors travel through **shared-memory regions** that the server creates, never through the JSON lines. The params mirror the C structs field for field; names, ranges and defaults are the C API's, and its conventions apply (flow sigmas, model-space latents F32 `[L, 128, h, w]`, RGB8 images, conditioning `[tokens, 4096]`). Runs use the engine's tier and attention (`load`'s).
+
+| Method | Params | Answer |
+|---|---|---|
+| `session_open` | `max_rows` (1–8, default 3), `max_latents` (1–`max_rows`, default 1), `control_adapter` (path), `plan_request` (object: `preload`'s params) | at once: `{"max_rows", "max_latents"}` |
+| `session_close` | none | `{"closed": true}`, or `{"closed": false}` without a session |
+| `shm_alloc` | `bytes` (the payload, 1 to 2^34) | at once: `{"shm": {"name", "token", "bytes"}}`, a scratch region |
+| `shm_free` | `name` | at once: `{"freed": true}` |
+| `encode_text` | `prompts` (1–8 strings, `""` allowed), `max_sequence_length` (1–4096, default 4096) | `{"conditionings": [{"id", "tokens", "engine_encoded", "prompt_tokens": {"total_tokens", "kept_tokens", "prompt_tokens", "dropped_tokens", "max_length", "truncated"}}]}` |
+| `conditioning_import` | `shm` (a scratch region), `dtype` (`"f32"` default, or `"bf16"`), `shape` (`[tokens, 4096]`, 1 ≤ tokens ≤ 4096) | one conditioning as above, `engine_encoded` false (`mi_conditioning_create`, copied from the payload) |
+| `conditioning_free` | `conditionings` (ids) | `{"freed": n}`; an unknown id frees nothing (`invalid_params`) |
+| `initial_noise` | `seed` (0 to 2^53−1), `width`, `height` (multiples of 16), `noise_layout` (default `"official"`), `shm` | `mi_generate`'s initial noise, F32 `[128, height/16, width/16]`, in the payload: `{"shape"}` |
+| `run_begin` | below | `{"sigmas", "info", "shm", "tensors", "adopted"}` |
+| `denoise_step` | `sigma` (required), `step` (−1 default: from sigma), `rows` (HOST row mask, 0 = every row), `shape` (`[L, h, w]`: absent = the run's size; smaller = a crop call), `control` (bool: the client wrote the control slot), `control_changed` (bool: `MI_STEP_CONTROL_CHANGED`) | `{"step", "rows", "cached", "on_schedule", "seconds"}` |
+| `run_end` | none | `{"ended": true, "report", "warnings", "note"}` (`generate`'s `done` without an image; `note`: `MI_TEXT_COMPONENT_NOTE`), or `{"ended": false}` without a run |
+| `vae_encode` | `shm` (RGB8 `[height][width][3]`), `width`, `height` (multiples of 16), `out_shm` (another region) | latents F32 `[128, height/16, width/16]` in `out_shm`: `{"shape"}` |
+| `vae_decode` | `shm` (latents F32 `[128, height/16, width/16]`), `width`, `height`, `out_shm` | RGB8 `[height][width][3]` in `out_shm`: `{"shape"}` |
+
+`run_begin`'s params are `mi_run_params`': `width`, `height` (default 1024), `rows` (required: `[{"conditioning": id, "skip_layers": [blocks] or "22, 24", "latent": index}]`), `guidance` (`"host"` default, or `"moss"`), `output` (`"rows"` default, `"guided_velocity"`, `"guided_denoised"`), `exact_sigma` and `crops` (bools: `MI_RUN_EXACT_SIGMA`, `MI_RUN_CROPS`), `sigmas` (2 to 10001 numbers; absent: the engine's schedule from `scheduler`, `steps`, `shift`, `flow_multiplier`, `denoise_strength`), `cfg`, `slg_layers`, `slg_scale`, `slg_start`, `slg_stop`, `loras` (as `generate`'s), `control_lora_strength`, `control_images` (as `generate`'s `control.images`), `control_resize`, `cfg_truncation`, `step_cache`, `step_cache_threshold`. `hello`'s `values` lists `guidance`, `output` (`run_begin`'s) and `dtype` (`conditioning_import`'s). The answer:
+- `sigmas`: the run's schedule, each number exactly the float the engine holds (send it back as a step's `sigma` for an exact entry);
+- `info`: `latent_channels`, `latent_height`, `latent_width`, `steps`, `outputs`, `rows` (bit k: row k exists), `latents`, `control_channels`, `schedule_matches`, `staging_bytes` (`mi_run_info`);
+- `shm`: the run's region `{"name", "token", "bytes"}`; `tensors`: the byte offsets in it, from the region's start, of `x`, `control` (`null` without an adapter) and `out` (one per output slot; `null` for a slot the run lacks, e.g. MOSS's `out[1]` without an uncond row);
+- `adopted`: the region is the engine's own staging (`mi_run_adopt_staging`, pinned in place). False where the system refuses to pin it (possible on Windows): each step then copies through the engine's staging, with a `log` warning.
+
+**A step.** Write x (and with `control`, the control latent) at their offsets, send `denoise_step`, read the outputs from the `out` slots when it answers. A crop call writes its smaller tensors packed at the start of each slot and names its `shape`. The outputs a call does not evaluate are left as they were: read the answer's `rows`.
+
+```
+>> {"id": 10, "method": "session_open", "params": {"max_rows": 2}}
+<< {"id": 10, "result": {"max_rows": 2, "max_latents": 1}}
+>> {"id": 11, "method": "encode_text", "params": {"prompts": ["a red apple", "blurry"]}}
+<< {"id": 11, "result": {"conditionings": [{"id": 1, "tokens": 9, ...}, {"id": 2, "tokens": 6, ...}]}}
+>> {"id": 12, "method": "run_begin", "params": {"width": 1024, "height": 1024, "steps": 30, "guidance": "moss",
+    "output": "guided_velocity", "rows": [{"conditioning": 1}, {"conditioning": 2, "skip_layers": [22]}]}}
+<< {"id": 12, "result": {"sigmas": [1, 0.99, ...], "info": {...}, "shm": {"name": "/mossinfer-4242-3-9f...", "token": "5c...",
+    "bytes": 6295552}, "tensors": {"x": 4096, "control": null, "out": [2101248]}, "adopted": true}}
+>> {"id": 13, "method": "denoise_step", "params": {"sigma": 1}}
+<< {"id": 13, "result": {"step": 0, "rows": 3, "cached": false, "on_schedule": true, "seconds": 0.21}}
+>> {"id": 42, "method": "run_end"}
+<< {"id": 42, "result": {"ended": true, "report": {...}, "warnings": [], "note": ""}}
+```
+
+**Order and threads.** One worker thread per session runs its calls (everything above except `session_open`, `shm_alloc` and `shm_free`, which answer at once) in the order they arrive; there is no thread per call. A call is validated when it arrives (`invalid_params` at once), then queued; its answer comes when it has run, so `status`, `cancel` and other requests sent meanwhile may be answered first: match by `id`. A client may send its steps without waiting for each answer. Engine errors are the `mi_status` codes, with `mi_last_error_message()`. Without a session, these methods answer `no_session`; `session_open` without an engine `no_engine`, and with a session open `busy`. `encode_text`, `vae_*` and a second `run_begin` during a run, and `generate` or `preload` while a session call runs or a run is open, get the engine's `busy`.
+
+**Cancel and interrupts.**
+- `cancel {"id"}` of a session call still queued: it is answered `{"code": "cancelled", "message": "cancelled (not started)"}` without reaching the engine. Of the running call: `mi_cancel` (a step stops within one DiT block and answers `cancelled`; the run stays usable). Without an `id`, `cancel` stops the running `generate`, `preload` or `release`, else the running session call. The answer is `{"cancelling": true, "generating_id": <the call's id>}`. `run_end` and `session_close` are not cancelled.
+- `run_end` while steps are queued or running (the client's interrupt): queued steps are answered `cancelled` ("the run is ending (not started)") without running, a step in flight is cancelled and answers `cancelled` ("the run is ending"), and `run_end`'s answer comes last, after the run has ended (`mi_run_end`). The models stay loaded: the next `run_begin` of the same shape loads nothing.
+- `session_close` cancels every queued and running call of the session (answered `cancelled`, "the session is closing"), then ends an open run and closes the session; its answer comes last. `load`, `unload`, `shutdown` and the end of input close an open session the same way (without an answer of their own for it).
+- `status` carries `"session": {"run": <a run is open>, "queued": <calls waiting>, "running_id": <id or null>}` while a session is open.
+- Session calls that load (`run_begin`), encode text or run the VAE send `progress` events with their `id` (`phase`, `step`, `total_steps`, `step_seconds`, `elapsed_seconds`); steps send none.
+
+### Shared memory
+
+Every region is created by the server, exclusively and for the current user only: one per run (by `run_begin`, sized for its staging) and the scratch regions of `shm_alloc` (inputs and outputs of `conditioning_import`, `initial_noise` and `vae_*`).
+- **Layout.** A 64-byte header, little-endian: 0 magic `"MOSSSHM\0"`; 8 u32 layout version 1; 12 u32 the server's pid; 16 the 16-byte token (from the OS CSPRNG; 32 lowercase hex characters in JSON); 32 u64 the region's bytes; 40 u64 the payload offset, 4096; 48 u64 the server's PID-namespace inode (0 on Windows); 56..63 zero. The payload starts at 4096, page-aligned (for pinning). A scratch call's tensor starts at the payload; a run's slots are at the offsets of `tensors`, each 256-byte aligned and sized for the run's full latent size.
+- **The client checks** the magic, the version and the token before use, and that the region's bytes lie between 4096 and the size it mapped (on Windows, a name recreated after its server died opens an empty mapping).
+- **Linux.** The name is `/mossinfer-<server pid>-<seq>-<16 hex>`, created with `shm_open(O_CREAT | O_EXCL | O_RDWR, 0600)` and its blocks reserved (a `/dev/shm` too small, as a container's 64 MiB default, is an error at creation: `out_of_memory`). Attach with `os.open("/dev/shm/" + name[1:])` and `mmap.mmap`. Do not use `multiprocessing.shared_memory` before Python 3.13: its resource tracker unlinks the region and warns at exit; on 3.13 and later, `SharedMemory(name[1:], track=False)` is fine.
+- **Windows.** `Local\mossinfer-<pid>-<seq>-<16 hex>` (a page-file mapping; a DACL granting the current user only; a name that exists gets a new suffix). Attach with `mmap.mmap(-1, bytes, tagname=name)`, then check the token. A mapping vanishes with its last handle.
+- **Lifetime.** Attach to a region before naming it in a request: the first request naming it removes its name (the run's first `denoise_step`; the first `conditioning_import`, `initial_noise` or `vae_*` naming a scratch region), so that from then on a crash of either process leaks nothing; the mappings stay valid. `shm_free`, `run_end` (the run's region), `session_close` and exit destroy what is left, and a scratch region never named is removed 60 s after its creation. A server that starts removes the regions of servers that died before their client attached: a region whose name's pid is dead and whose header names that pid and the server's PID namespace; files that never got a header after 10 minutes unchanged; never a region of another PID namespace (a container sharing `/dev/shm`).
+- **Pinning.** The run's region is the engine's pinned staging (`adopted`), so a step copies nothing on the server's side. A client that moves tensors to and from a GPU pins its own mapping too (e.g. `torch.cuda.cudart().cudaHostRegister`).
+
 ## Client sketch (Python)
 
 ```python
@@ -490,6 +556,15 @@ send({"id": 3, "method": "shutdown"})
 - stdout set up with stderr sent to a file, to `DEVNULL`, merged into stdout, or closed. On Linux, `/proc` shows exactly one fd on the protocol pipe, at 3 or higher, close-on-exec.
 - stdin closed
 - `--parent-pid` for the server's own parent and for another process, and for a process that is already gone
+- the component methods without an engine or session: every method's params checked first (bad shapes, ranges, names and unknown members are `invalid_params`), then `no_engine` for `session_open` and `no_session` for the others; `session_close` without a session; `hello`'s `guidance`, `output` and `dtype` accepted
+
+With `MOSSINFER_GPU_TESTS=1`, `GpuComponentTest` (the base bundle, tier `reference`) covers the component session (design §7.5):
+- a client over shared memory reproduces `generate`'s RGB bytes at 384², 4 steps: MOSS guidance with `guided_velocity`, MOSS and HOST `rows` with the client's CFG, `guided_denoised` (euler on `simple`), a latent batch of 2 (two seeds in one HOST run, each image `generate`'s), and crop calls (a 256² crop of a 384² run with `crops`, `generate`'s 256² image); the noise from `initial_noise`, the decode by `vae_decode`; each run's region user-only (0600)
+- a per-call control latent (the client's `vae_encode` of the depth image in the adapter's depth channels, zeros elsewhere): `generate`'s control run bit for bit (skipped without the color/depth adapter)
+- `run_end` while a step runs and five are queued: the running step answers `cancelled` ("the run is ending") first, the queued ones `cancelled` unrun, then `run_end` with no calls counted; the next run loads nothing (`dit_load.source` null); `cancel {"id"}` of a step queued behind two others answers it `cancelled` unrun (two calls counted)
+- 1000 steps leave the server's thread count unchanged
+- SIGKILL with a run region and a scratch region, before they are named and after (unlinked at once): nothing is left in `/dev/shm` once the next server answers `hello`; a wrong token is refused by the client helper
+- a scratch region never named is gone after 60 s, a named one stays until `shm_free`; `status`'s `session`
 
 ```
 MOSS_SERVER=<build>/moss-server python3 tests/server/test_protocol.py

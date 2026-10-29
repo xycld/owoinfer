@@ -2,10 +2,12 @@
 // built only on the public C API (mossinfer.h).
 //
 // Threads: the main thread reads and answers requests; a job (generate, preload, release) runs on one worker thread, so
-// cancel and status are answered while it runs; an inspect runs on a short-lived thread of its own. Every protocol
+// cancel and status are answered while it runs; an inspect runs on a short-lived thread of its own. An open component
+// session (session_open .. session_close) has one persistent worker thread of its own that runs its calls in order. Every protocol
 // line goes through emit() under one mutex. stdout carries protocol lines only: at startup the protocol stream gets
 // a private, non-inheritable copy of fd 1 and fd 1 is pointed at stderr (or at the null device when stderr is
 // unusable), so anything else printing to stdout (the engine, a library) never reaches the protocol stream.
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cmath>
@@ -17,9 +19,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <functional>
 #include <limits>
 #include <filesystem>
 #include <list>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -54,6 +61,7 @@
 #include "json_out.h"
 #include "mossinfer/mossinfer.h"
 #include "names.h"
+#include "shm.h"
 #include "util/json.h"
 #include "util/path.h"
 #include "util/regular_file.h"
@@ -365,30 +373,6 @@ class Params {
     if (v == nullptr) return std::nullopt;
     const std::string k0(key);
     if (!v->is_object()) throw bad(key, "an object {\"adapter\", \"lora_strength\"?, \"images\"?}");
-    // Each member once; strings non-empty and without NUL characters.
-    const auto members = [](const mi::json::Value& obj, const std::string& field,
-                            std::initializer_list<std::string_view> known) {
-      const mi::json::Object& o = obj.as_object();
-      for (std::size_t i = 0; i < o.size(); ++i) {
-        bool ok = false;
-        for (const std::string_view n : known) ok = ok || o[i].first == n;
-        if (!ok) throw RequestError("invalid_params", "\"" + field + "\" has an unknown member \"" + o[i].first + "\"");
-        for (std::size_t j = 0; j < i; ++j) {
-          if (o[j].first == o[i].first) {
-            throw RequestError("invalid_params", "\"" + field + "\" has \"" + o[i].first + "\" more than once");
-          }
-        }
-      }
-    };
-    const auto nonempty = [](const mi::json::Value& m, const std::string& field, const std::string& what) {
-      if (!m.is_string() || m.as_string().empty()) throw bad(field, "a non-empty string (" + what + ")");
-      if (m.as_string().find('\0') != std::string::npos) throw bad(field, "a string without NUL characters");
-      return m.as_string();
-    };
-    const auto numeric = [](const mi::json::Value& m, const std::string& field) {
-      if (!m.is_number()) throw bad(field, "a number");
-      return m.as_double();
-    };
     members(*v, k0, {"adapter", "lora_strength", "images"});
     Control c;
     bool have_adapter = false;
@@ -398,27 +382,18 @@ class Params {
         have_adapter = true;
       } else if (k == "lora_strength") {
         c.lora_strength = numeric(m, k0 + ".lora_strength");
-      } else if (!m.is_array()) {
-        throw bad(k0 + ".images", "an array of {\"kind\", \"path\", \"strength\"?, \"start\"?, \"end\"?} objects");
       } else {
-        for (const Value& e : m.as_array()) {
-          const std::string item = k0 + ".images[" + std::to_string(c.images.size()) + "]";
-          if (!e.is_object()) throw bad(item, "an object {\"kind\", \"path\", \"strength\"?, \"start\"?, \"end\"?}");
-          members(e, item, {"kind", "path", "strength", "start", "end"});
-          ControlImage im;
-          for (const auto& [ik, iv] : e.as_object()) {
-            if (ik == "kind") im.kind = nonempty(iv, item + ".kind", "one of the adapter's kinds, e.g. depth");
-            else if (ik == "path") im.path = nonempty(iv, item + ".path", "the image file");
-            else (ik == "strength" ? im.strength : ik == "start" ? im.start : im.end) = numeric(iv, item + "." + ik);
-          }
-          if (im.kind.empty()) throw RequestError("invalid_params", "\"" + item + ".kind\" is required");
-          if (im.path.empty()) throw RequestError("invalid_params", "\"" + item + ".path\" (the image file) is required");
-          c.images.push_back(std::move(im));
-        }
+        c.images = control_image_list(m, k0 + ".images");
       }
     }
     if (!have_adapter) throw RequestError("invalid_params", "\"" + k0 + ".adapter\" (the control adapter file) is required");
     return c;
+  }
+  // run_begin's `control_images`: control's "images" array on its own.
+  std::optional<std::vector<ControlImage>> control_images(std::string_view key) const {
+    const Value* v = find(key);
+    if (v == nullptr) return std::nullopt;
+    return control_image_list(*v, std::string(key));
   }
   // `references`: {"images": [path, ...] (1 or more, in order), "max_edge": integer (optional)}.
   struct References {
@@ -460,6 +435,50 @@ class Params {
  private:
   static RequestError bad(std::string_view key, const std::string& what) {
     return RequestError("invalid_params", "\"" + std::string(key) + "\" must be " + what);
+  }
+  // Each member of an object once, and only the known ones.
+  static void members(const mi::json::Value& obj, const std::string& field, std::initializer_list<std::string_view> known) {
+    const mi::json::Object& o = obj.as_object();
+    for (std::size_t i = 0; i < o.size(); ++i) {
+      bool ok = false;
+      for (const std::string_view n : known) ok = ok || o[i].first == n;
+      if (!ok) throw RequestError("invalid_params", "\"" + field + "\" has an unknown member \"" + o[i].first + "\"");
+      for (std::size_t j = 0; j < i; ++j) {
+        if (o[j].first == o[i].first) {
+          throw RequestError("invalid_params", "\"" + field + "\" has \"" + o[i].first + "\" more than once");
+        }
+      }
+    }
+  }
+  // A non-empty string without NUL characters.
+  static std::string nonempty(const mi::json::Value& m, const std::string& field, const std::string& what) {
+    if (!m.is_string() || m.as_string().empty()) throw bad(field, "a non-empty string (" + what + ")");
+    if (m.as_string().find('\0') != std::string::npos) throw bad(field, "a string without NUL characters");
+    return m.as_string();
+  }
+  static double numeric(const mi::json::Value& m, const std::string& field) {
+    if (!m.is_number()) throw bad(field, "a number");
+    return m.as_double();
+  }
+  // [{"kind": string, "path": path, "strength", "start", "end": numbers (optional)}], named `field` in messages.
+  static std::vector<ControlImage> control_image_list(const mi::json::Value& m, const std::string& field) {
+    if (!m.is_array()) throw bad(field, "an array of {\"kind\", \"path\", \"strength\"?, \"start\"?, \"end\"?} objects");
+    std::vector<ControlImage> images;
+    for (const Value& e : m.as_array()) {
+      const std::string item = field + "[" + std::to_string(images.size()) + "]";
+      if (!e.is_object()) throw bad(item, "an object {\"kind\", \"path\", \"strength\"?, \"start\"?, \"end\"?}");
+      members(e, item, {"kind", "path", "strength", "start", "end"});
+      ControlImage im;
+      for (const auto& [ik, iv] : e.as_object()) {
+        if (ik == "kind") im.kind = nonempty(iv, item + ".kind", "one of the adapter's kinds, e.g. depth");
+        else if (ik == "path") im.path = nonempty(iv, item + ".path", "the image file");
+        else (ik == "strength" ? im.strength : ik == "start" ? im.start : im.end) = numeric(iv, item + "." + ik);
+      }
+      if (im.kind.empty()) throw RequestError("invalid_params", "\"" + item + ".kind\" is required");
+      if (im.path.empty()) throw RequestError("invalid_params", "\"" + item + ".path\" (the image file) is required");
+      images.push_back(std::move(im));
+    }
+    return images;
   }
   const mi::json::Object* obj_ = nullptr;
 };
@@ -556,6 +575,19 @@ class Server {
       else if (m == "inspect") result = inspect(params, id);
       else if (m == "check") result = check(params, id);
       else if (m == "unload") result = unload(params);
+      else if (m == "session_open") result = session_open(params);
+      else if (m == "session_close") result = session_close(params, id);
+      else if (m == "shm_alloc") result = shm_alloc(params);
+      else if (m == "shm_free") result = shm_free(params);
+      else if (m == "encode_text") result = encode_text(params, id);
+      else if (m == "conditioning_import") result = conditioning_import(params, id);
+      else if (m == "conditioning_free") result = conditioning_free(params, id);
+      else if (m == "initial_noise") result = initial_noise(params, id);
+      else if (m == "run_begin") result = run_begin(params, id);
+      else if (m == "denoise_step") result = denoise_step(params, id);
+      else if (m == "run_end") result = run_end(params, id);
+      else if (m == "vae_encode") result = vae_encode(params, id);
+      else if (m == "vae_decode") result = vae_decode(params, id);
       else if (m == "shutdown") {
         params.only({});
         stop();
@@ -574,9 +606,10 @@ class Server {
     return true;
   }
 
-  // Cancels a running job, waits for it and for the inspects (they have no cancel: each reads one file's header and
-  // small tensors), and releases the engine.
+  // Closes an open session (its calls cancelled), cancels a running job, waits for it and for the inspects (they have no
+  // cancel: each reads one file's header and small tensors), and releases the engine.
   void stop() {
+    close_session(nullptr);
     request_cancel();
     join_worker();
     join_inspections();
@@ -661,6 +694,7 @@ class Server {
            ",\"te_host_pin\":" + tf(caps & MI_CAP_TE_HOST_PIN) + ",\"progress_fraction\":" +
            tf(caps & MI_CAP_PROGRESS_FRACTION) + ",\"inspect\":" + tf(caps & MI_CAP_INSPECT) +
            ",\"references\":" + tf(caps & MI_CAP_REFERENCE_IMAGES) + ",\"check\":" + tf(caps & MI_CAP_CHECK) +
+           ",\"components\":" + tf(caps & MI_CAP_COMPONENTS) +
            "},\"values\":{" + values + "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
@@ -723,7 +757,8 @@ class Server {
     if (generating()) throw busy_error();
     const mi_engine_params& e = r.e;
     const std::string& model = *r.model;
-    // The old engine goes first: two engines would hold two arenas.
+    // The old engine goes first: two engines would hold two arenas. Its session is closed first.
+    close_session(nullptr);
     join_worker();
     mi_engine_free(engine_);
     engine_ = nullptr;
@@ -956,6 +991,13 @@ class Server {
   std::string cancel(const Params& p) {
     p.only({"id"});
     const Value* want = p.find("id");
+    // A session call: the named one (queued or running), or without an id the running one when no job runs.
+    if (session_ != nullptr && (want != nullptr || !generating())) {
+      const std::string wanted = want != nullptr ? id_json(want) : std::string();
+      if (const std::optional<std::string> hit = cancel_session_call(want != nullptr ? &wanted : nullptr)) {
+        return "{\"cancelling\":true,\"generating_id\":" + *hit + "}";
+      }
+    }
     if (!generating()) return "{\"cancelling\":false}";
     const std::string running_id = job_->id;
     if (want != nullptr && id_json(want) != running_id) return "{\"cancelling\":false,\"generating_id\":" + running_id + "}";
@@ -987,6 +1029,7 @@ class Server {
       }
       s += std::string(",\"cancelling\":") + tf(job_->cancel.load());
     }
+    if (session_ != nullptr) s += ",\"session\":" + session_status(*session_);
     return s + "}";
   }
 
@@ -1273,12 +1316,902 @@ class Server {
   std::string unload(const Params& p) {
     p.only({});
     if (generating()) throw busy_error();
+    close_session(nullptr);
     join_worker();
     const bool had = engine_ != nullptr;
     mi_engine_free(engine_);
     engine_ = nullptr;
     model_.clear();
     return std::string("{\"unloaded\":") + tf(had) + "}";
+  }
+
+  // ---------------------------------------------------------------- component session (MI_CAP_COMPONENTS)
+  //
+  // The engine's component API (mi_session_open .. mi_session_close) behind methods of the same names, tensors through
+  // shared-memory regions the server creates (shm.h). One persistent worker thread per session runs every session call
+  // in order (encode_text, conditioning_*, initial_noise, run_begin, denoise_step, run_end, vae_*, session_close); the
+  // request loop validates a call's params, queues it and goes on reading, so cancel, status and run_end are answered
+  // while a call runs. A queued call that is cancelled is answered "cancelled" without reaching the engine.
+
+  // One queued session call.
+  struct SessionTask {
+    enum class Kind { kCall, kStep, kRunEnd, kClose };
+    std::string id;  // JSON of the request id
+    Kind kind = Kind::kCall;
+    std::function<std::string()> run;  // the result object; throws RequestError
+    bool silent = false;               // no response (a close the server made itself)
+    // Guarded by Session::mu.
+    bool cancelled = false;
+    std::string cancel_reason;
+  };
+
+  // A scratch region of shm_alloc, removed 60 s after its creation unless a request named it before.
+  struct Scratch {
+    std::shared_ptr<mi::server::shm::Region> region;
+    std::chrono::steady_clock::time_point deadline;
+    bool named = false;
+  };
+  static constexpr std::chrono::seconds kScratchUnnamedLifetime{60};
+  static constexpr std::uint64_t kMaxScratchBytes = std::uint64_t{1} << 34;
+
+  // The open run as the worker sees it: the region, and the engine's staging views and their offsets in the region.
+  struct RunState {
+    bool open = false;
+    std::shared_ptr<mi::server::shm::Region> region;
+    bool adopted = false;  // the region is the engine's staging (mi_run_adopt_staging); else copies through the engine's
+    bool guided = false;   // a guided output (out[0] each call), not the rows'
+    mi_run_info info{};
+    mi_tensor x{}, control{};
+    std::array<mi_tensor, MI_MAX_ROWS> out{};
+    std::size_t x_at = 0, control_at = 0;  // offsets in the region (from its start)
+    std::array<std::size_t, MI_MAX_ROWS> out_at{};
+  };
+
+  struct Session {
+    Output* out = nullptr;
+    mi_engine* engine = nullptr;
+    std::int32_t max_rows = 0, max_latents = 0;
+    std::thread worker;
+    std::mutex mu;
+    std::condition_variable cv;
+    // Guarded by mu.
+    std::deque<std::shared_ptr<SessionTask>> queue;
+    std::shared_ptr<SessionTask> running;
+    bool stop = false;
+    std::map<std::string, Scratch> scratch;  // by name
+    std::shared_ptr<mi::server::shm::Region> run_region;
+    // The worker's.
+    RunState run;
+    std::map<std::int64_t, mi_conditioning*> conditionings;
+    std::int64_t next_conditioning = 1;
+    std::atomic<bool> run_open{false};
+    ~Session() {
+      for (auto& [id, c] : conditionings) mi_conditioning_free(c);
+    }
+  };
+
+  static RequestError no_session() {
+    return RequestError("no_session", "no component session is open; send \"session_open\" first");
+  }
+  // The engine's verdict on a session call, with its message (read on the calling thread: it is thread-local).
+  [[noreturn]] static void throw_call(mi_status s) {
+    throw RequestError(status_code(s), mi_last_error_message());
+  }
+
+  Session& session() {
+    if (session_ == nullptr) throw no_session();
+    return *session_;
+  }
+
+  // Queues a call on the session's worker; it answers it.
+  std::optional<std::string> enqueue(const std::string& id, SessionTask::Kind kind, std::function<std::string()> run) {
+    Session& s = session();
+    auto t = std::make_shared<SessionTask>();
+    t->id = id;
+    t->kind = kind;
+    t->run = std::move(run);
+    {
+      const std::lock_guard<std::mutex> lock(s.mu);
+      s.queue.push_back(std::move(t));
+    }
+    s.cv.notify_all();
+    return std::nullopt;
+  }
+
+  // Before each phase of a session call (text_encoder, dit_load, decode): a progress event with the call's id, and a
+  // cancel that reached the call before the engine marked it running lands now.
+  static void on_session_progress(const mi_progress* p, void* user) {
+    Session& s = *static_cast<Session*>(user);
+    std::string id;
+    {
+      const std::lock_guard<std::mutex> lock(s.mu);
+      if (s.running == nullptr) return;
+      if (s.running->cancelled) mi_cancel(s.engine);
+      id = s.running->id;
+    }
+    s.out->emit("{\"event\":\"progress\",\"id\":" + id + ",\"phase\":\"" + phase_name(p->phase) + "\",\"step\":" +
+                std::to_string(p->step) + ",\"total_steps\":" + std::to_string(p->total_steps) +
+                ",\"step_seconds\":" + num(p->step_seconds) + ",\"elapsed_seconds\":" + num(p->elapsed_seconds) + "}");
+  }
+
+  // Removes the scratch regions never named within their lifetime; returns the next deadline of one still unnamed.
+  // Under s.mu.
+  static std::optional<std::chrono::steady_clock::time_point> expire_scratch(Session& s) {
+    const auto now = std::chrono::steady_clock::now();
+    std::optional<std::chrono::steady_clock::time_point> next;
+    for (auto it = s.scratch.begin(); it != s.scratch.end();) {
+      if (!it->second.named && it->second.deadline <= now) {
+        it = s.scratch.erase(it);
+        continue;
+      }
+      if (!it->second.named && (!next || it->second.deadline < *next)) next = it->second.deadline;
+      ++it;
+    }
+    return next;
+  }
+
+  // The session's worker: its calls in order until session_close (or a close the server makes) has run.
+  void session_loop(Session& s) {
+    for (;;) {
+      std::shared_ptr<SessionTask> t;
+      bool unrun = false;
+      std::string reason;
+      {
+        std::unique_lock<std::mutex> lock(s.mu);
+        for (;;) {
+          const auto next = expire_scratch(s);
+          if (!s.queue.empty() || s.stop) break;
+          if (next) s.cv.wait_until(lock, *next);
+          else s.cv.wait(lock);
+        }
+        if (s.queue.empty()) return;
+        t = std::move(s.queue.front());
+        s.queue.pop_front();
+        unrun = t->cancelled;  // cancelled while queued: answered without reaching the engine
+        reason = t->cancel_reason;
+        if (!unrun) s.running = t;
+      }
+      std::string line;
+      try {
+        if (unrun) {
+          line = "{\"id\":" + t->id + ",\"error\":" + error_json("cancelled", reason + " (not started)") + "}";
+        } else {
+          try {
+            line = "{\"id\":" + t->id + ",\"result\":" + t->run() + "}";
+          } catch (const RequestError& e) {
+            line = "{\"id\":" + t->id + ",\"error\":" + error_json(e.code, e.what()) + "}";
+          } catch (const std::exception& e) {
+            line = "{\"id\":" + t->id + ",\"error\":" + error_json("internal", e.what()) + "}";
+          }
+        }
+      } catch (...) {
+        line = "{\"id\":" + t->id + ",\"error\":" + error_json("internal", "the call could not build its answer") + "}";
+      }
+      {
+        const std::lock_guard<std::mutex> lock(s.mu);
+        s.running.reset();
+      }
+      if (!t->silent) out_.emit(line);
+    }
+  }
+
+  // Cancels the named call (queued or running), or without a name the running one. Returns its id, or nothing when
+  // no such call is queued or running. run_end and session_close are not cancelled.
+  std::optional<std::string> cancel_session_call(const std::string* id) {
+    Session& s = *session_;
+    const std::lock_guard<std::mutex> lock(s.mu);
+    const auto cancellable = [](const SessionTask& t) {
+      return t.kind != SessionTask::Kind::kRunEnd && t.kind != SessionTask::Kind::kClose;
+    };
+    if (s.running != nullptr && cancellable(*s.running) && (id == nullptr || s.running->id == *id)) {
+      s.running->cancelled = true;
+      s.running->cancel_reason = "cancelled";
+      mi_cancel(s.engine);
+      return s.running->id;
+    }
+    if (id == nullptr) return std::nullopt;
+    for (const std::shared_ptr<SessionTask>& t : s.queue) {
+      if (t->id == *id && !t->cancelled && cancellable(*t)) {
+        t->cancelled = true;
+        t->cancel_reason = "cancelled";
+        return t->id;
+      }
+    }
+    return std::nullopt;
+  }
+
+  // status's "session": {"run": bool, "queued": n, "running_id": id | null}.
+  static std::string session_status(Session& s) {
+    const std::lock_guard<std::mutex> lock(s.mu);
+    return std::string("{\"run\":") + tf(s.run_open.load()) + ",\"queued\":" + std::to_string(s.queue.size()) +
+           ",\"running_id\":" + (s.running != nullptr ? s.running->id : std::string("null")) + "}";
+  }
+
+  // session_close, and the close the server makes itself (load, unload, shutdown, end of input; `id` null: no
+  // response): queued calls are answered cancelled, a running one is cancelled, then the worker closes the engine's
+  // session (mi_session_close ends an open run first) and destroys the regions. Waits for the worker.
+  void close_session(const std::string* id) {
+    if (session_ == nullptr) return;
+    Session& s = *session_;
+    auto t = std::make_shared<SessionTask>();
+    t->id = id != nullptr ? *id : "null";
+    t->silent = id == nullptr;
+    t->kind = SessionTask::Kind::kClose;
+    t->run = [&s] {
+      const mi_status st = mi_session_close(s.engine);
+      s.run_open.store(false);
+      s.run = RunState{};  // after the close: the run's end unregistered the adopted region
+      {
+        const std::lock_guard<std::mutex> lock(s.mu);
+        s.run_region.reset();
+        s.scratch.clear();
+      }
+      if (st != MI_OK) throw_call(st);
+      return std::string("{\"closed\":true}");
+    };
+    bool call_running = false;
+    {
+      const std::lock_guard<std::mutex> lock(s.mu);
+      for (const std::shared_ptr<SessionTask>& q : s.queue) {
+        if (!q->cancelled) {
+          q->cancelled = true;
+          q->cancel_reason = "the session is closing";
+        }
+      }
+      if (s.running != nullptr) {
+        s.running->cancelled = true;
+        s.running->cancel_reason = "the session is closing";
+        call_running = true;
+      }
+      s.queue.push_back(t);
+      s.stop = true;
+    }
+    if (call_running) mi_cancel(s.engine);  // (mi_session_close would cancel it too, once the worker reaches it)
+    s.cv.notify_all();
+    if (s.worker.joinable()) s.worker.join();
+    session_.reset();
+  }
+
+  // session_open {"max_rows", "max_latents", "control_adapter", "plan_request"}: mi_session_open, answered at once.
+  std::string session_open(const Params& p) {
+    p.only({"max_rows", "max_latents", "control_adapter", "plan_request"});
+    mi_session_params sp{};
+    if (const mi_status s = mi_session_params_init(&sp, sizeof sp); s != MI_OK) throw_status(s);
+    if (const auto v = p.integer("max_rows", 1, MI_MAX_ROWS)) sp.max_rows = static_cast<std::int32_t>(*v);
+    if (const auto v = p.integer("max_latents", 1, MI_MAX_ROWS)) sp.max_latents = static_cast<std::int32_t>(*v);
+    const std::optional<std::string> adapter = p.path("control_adapter");
+    if (adapter) sp.control_adapter = adapter->c_str();
+    Work plan;
+    if (const Value* v = p.find("plan_request")) {
+      if (!v->is_object()) throw RequestError("invalid_params", "\"plan_request\" must be an object (preload's params)");
+      const Params pp(v);
+      // preload's params: the request the session plans for before its first run.
+      pp.only({"prompt", "negative_prompt", "width", "height", "steps", "cfg", "shift", "seed", "uncond_skip_layers",
+               "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length", "sampler", "scheduler",
+               "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise", "dataspace", "loras", "init_image",
+               "mask", "mask_encoding", "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation",
+               "step_cache", "references", "lora_placement", "step_cache_threshold"});
+      request_params(pp, plan, true);
+      sp.plan_request = &plan.params;
+    }
+    if (engine_ == nullptr) throw RequestError("no_engine", "no model loaded; send \"load\" first");
+    if (session_ != nullptr) throw RequestError("busy", "a component session is open; send \"session_close\" first");
+    auto s = std::make_unique<Session>();
+    s->out = &out_;
+    s->engine = engine_;
+    s->max_rows = sp.max_rows;
+    s->max_latents = sp.max_latents;
+    sp.progress_callback = on_session_progress;
+    sp.user_data = s.get();
+    if (const mi_status st = mi_session_open(engine_, &sp); st != MI_OK) throw_call(st);
+    try {
+      s->worker = std::thread([this, raw = s.get()] { session_loop(*raw); });
+    } catch (...) {
+      mi_session_close(engine_);
+      throw;
+    }
+    session_ = std::move(s);
+    return "{\"max_rows\":" + std::to_string(session_->max_rows) + ",\"max_latents\":" +
+           std::to_string(session_->max_latents) + "}";
+  }
+
+  std::optional<std::string> session_close(const Params& p, const std::string& id) {
+    p.only({});
+    if (session_ == nullptr) return std::string("{\"closed\":false}");
+    close_session(&id);
+    return std::nullopt;
+  }
+
+  // shm_alloc {"bytes"}: a scratch region whose payload holds `bytes`, answered at once.
+  std::string shm_alloc(const Params& p) {
+    p.only({"bytes"});
+    const auto bytes = p.integer("bytes", 1, static_cast<std::int64_t>(kMaxScratchBytes));
+    if (!bytes) throw RequestError("invalid_params", "\"bytes\" (the payload size) is required");
+    Session& s = session();
+    std::shared_ptr<mi::server::shm::Region> region;
+    try {
+      region = std::make_shared<mi::server::shm::Region>(mi::server::shm::Region::create(static_cast<std::size_t>(*bytes)));
+    } catch (const std::system_error& e) {
+      throw RequestError(e.code() == std::errc::no_space_on_device ? "out_of_memory" : "io", e.what());
+    }
+    const std::string answer = region_json(*region);
+    {
+      const std::lock_guard<std::mutex> lock(s.mu);
+      s.scratch[region->name()] = Scratch{region, std::chrono::steady_clock::now() + kScratchUnnamedLifetime, false};
+    }
+    s.cv.notify_all();  // the worker's next removal deadline
+    return "{\"shm\":" + answer + "}";
+  }
+
+  std::string shm_free(const Params& p) {
+    p.only({"name"});
+    const std::optional<std::string> name = p.string("name");
+    if (!name) throw RequestError("invalid_params", "\"name\" (the region's name) is required");
+    Session& s = session();
+    const std::lock_guard<std::mutex> lock(s.mu);
+    const auto it = s.scratch.find(*name);
+    if (it == s.scratch.end()) throw RequestError("invalid_params", "no scratch region named \"" + *name + "\"");
+    s.scratch.erase(it);  // a call using it holds it until it returns
+    return "{\"freed\":true}";
+  }
+
+  static std::string region_json(const mi::server::shm::Region& r) {
+    return "{\"name\":" + str(r.name()) + ",\"token\":\"" + r.token().hex() + "\",\"bytes\":" + std::to_string(r.bytes()) + "}";
+  }
+
+  // The scratch region `key` names, for a call that needs `bytes` of its payload. The first request naming a region
+  // unlinks its name (the client has attached): from then on a crash leaks nothing.
+  std::shared_ptr<mi::server::shm::Region> named_scratch(const Params& p, std::string_view key, std::uint64_t bytes) {
+    const std::optional<std::string> name = p.string(key);
+    if (!name) throw RequestError("invalid_params", "\"" + std::string(key) + "\" (a region of shm_alloc) is required");
+    Session& s = session();
+    const std::lock_guard<std::mutex> lock(s.mu);
+    const auto it = s.scratch.find(*name);
+    if (it == s.scratch.end()) throw RequestError("invalid_params", "no scratch region named \"" + *name + "\"");
+    if (it->second.region->payload_bytes() < bytes) {
+      throw RequestError("invalid_params", "region \"" + *name + "\" holds " +
+                                               std::to_string(it->second.region->payload_bytes()) + " payload bytes; " +
+                                               std::to_string(bytes) + " needed");
+    }
+    it->second.region->unlink();
+    it->second.named = true;
+    return it->second.region;
+  }
+
+  // An image size of the VAE calls: multiples of 16.
+  static std::int32_t side(const Params& p, std::string_view key) {
+    const auto v = p.integer(key, 16, 16384);
+    if (!v || *v % 16 != 0) throw RequestError("invalid_params", "\"" + std::string(key) + "\" must be a multiple of 16 from 16 to 16384");
+    return static_cast<std::int32_t>(*v);
+  }
+
+  static mi_tensor host_tensor(void* data, mi_dtype dtype, std::initializer_list<std::int64_t> shape) {
+    mi_tensor t{};
+    t.data = data;
+    t.memory = MI_MEMORY_HOST;
+    t.dtype = dtype;
+    t.rank = static_cast<std::int32_t>(shape.size());
+    int i = 0;
+    for (const std::int64_t d : shape) t.shape[i++] = d;
+    return t;
+  }
+
+  // {"id", "tokens", "engine_encoded", "prompt_tokens": {...}} of a conditioning the session holds.
+  static std::string conditioning_json(std::int64_t id, const mi_conditioning* c) {
+    mi_conditioning_info info{};
+    info.struct_size = sizeof info;
+    if (const mi_status s = mi_conditioning_query(c, &info); s != MI_OK) throw_call(s);
+    mi_prompt_tokens t{};
+    t.struct_size = sizeof t;
+    if (const mi_status s = mi_conditioning_prompt_tokens(c, &t); s != MI_OK) throw_call(s);
+    return "{\"id\":" + std::to_string(id) + ",\"tokens\":" + std::to_string(info.tokens) + ",\"engine_encoded\":" +
+           tf(info.engine_encoded != 0) + ",\"prompt_tokens\":{\"total_tokens\":" + std::to_string(t.total_tokens) +
+           ",\"kept_tokens\":" + std::to_string(t.kept_tokens) + ",\"prompt_tokens\":" + std::to_string(t.prompt_tokens) +
+           ",\"dropped_tokens\":" + std::to_string(t.dropped_tokens) + ",\"max_length\":" + std::to_string(t.max_length) +
+           ",\"truncated\":" + tf(t.truncated != 0) + "}}";
+  }
+
+  // encode_text {"prompts": [string, ...] (1..8), "max_sequence_length"?} -> {"conditionings": [...]}.
+  std::optional<std::string> encode_text(const Params& p, const std::string& id) {
+    p.only({"prompts", "max_sequence_length"});
+    const Value* v = p.find("prompts");
+    if (v == nullptr || !v->is_array() || v->as_array().empty() || v->as_array().size() > 8) {
+      throw RequestError("invalid_params", "\"prompts\" must be an array of 1 to 8 strings");
+    }
+    auto prompts = std::make_shared<std::vector<std::string>>();
+    for (const Value& e : v->as_array()) {
+      if (!e.is_string()) throw RequestError("invalid_params", "\"prompts\" must be an array of 1 to 8 strings");
+      if (e.as_string().find('\0') != std::string::npos) {
+        throw RequestError("invalid_params", "\"prompts\" must be strings without NUL characters");
+      }
+      prompts->push_back(e.as_string());
+    }
+    const auto length = p.integer("max_sequence_length", 1, 4096);
+    Session& s = session();
+    return enqueue(id, SessionTask::Kind::kCall, [&s, prompts, length] {
+      mi_text_params tp{};
+      if (const mi_status st = mi_text_params_init(&tp, sizeof tp); st != MI_OK) throw_call(st);
+      std::vector<const char*> ptrs;
+      for (const std::string& q : *prompts) ptrs.push_back(q.c_str());
+      tp.prompts = ptrs.data();
+      tp.prompts_count = ptrs.size();
+      if (length) tp.max_sequence_length = static_cast<std::int32_t>(*length);
+      std::vector<mi_conditioning*> out(ptrs.size(), nullptr);
+      if (const mi_status st = mi_encode_text(s.engine, &tp, out.data()); st != MI_OK) throw_call(st);
+      std::string list;
+      for (mi_conditioning* c : out) {
+        const std::int64_t cid = s.next_conditioning++;
+        s.conditionings[cid] = c;
+        list += (list.empty() ? "" : ",") + conditioning_json(cid, c);
+      }
+      return "{\"conditionings\":[" + list + "]}";
+    });
+  }
+
+  // conditioning_import {"shm", "dtype", "shape": [S, 4096]}: a host's own embeddings from a scratch region's payload
+  // (mi_conditioning_create, copied).
+  std::optional<std::string> conditioning_import(const Params& p, const std::string& id) {
+    p.only({"shm", "dtype", "shape"});
+    const mi_dtype dtype = p.name("dtype", mi::server::kDtypeNames).value_or(MI_DTYPE_F32);
+    const Value* shape = p.find("shape");
+    if (shape == nullptr || !shape->is_array() || shape->as_array().size() != 2 || !shape->as_array()[0].is_int() ||
+        !shape->as_array()[1].is_int() || shape->as_array()[0].as_int() < 1 || shape->as_array()[0].as_int() > 4096 ||
+        shape->as_array()[1].as_int() != MI_TEXT_DIM) {
+      throw RequestError("invalid_params", "\"shape\" must be [tokens, 4096] with 1 <= tokens <= 4096");
+    }
+    const std::int64_t tokens = shape->as_array()[0].as_int();
+    const std::uint64_t bytes = static_cast<std::uint64_t>(tokens) * MI_TEXT_DIM * (dtype == MI_DTYPE_F32 ? 4 : 2);
+    std::shared_ptr<mi::server::shm::Region> region = named_scratch(p, "shm", bytes);
+    Session& s = session();
+    return enqueue(id, SessionTask::Kind::kCall, [&s, region, dtype, tokens] {
+      const mi_tensor t = host_tensor(region->payload(), dtype, {tokens, MI_TEXT_DIM});
+      mi_conditioning* c = nullptr;
+      if (const mi_status st = mi_conditioning_create(&t, &c); st != MI_OK) throw_call(st);
+      const std::int64_t cid = s.next_conditioning++;
+      s.conditionings[cid] = c;
+      return conditioning_json(cid, c);
+    });
+  }
+
+  // conditioning_free {"conditionings": [id, ...]} -> {"freed": n}. A run keeps what it needs of them.
+  std::optional<std::string> conditioning_free(const Params& p, const std::string& id) {
+    p.only({"conditionings"});
+    const Value* v = p.find("conditionings");
+    if (v == nullptr || !v->is_array()) throw RequestError("invalid_params", "\"conditionings\" must be an array of conditioning ids");
+    auto ids = std::make_shared<std::vector<std::int64_t>>();
+    for (const Value& e : v->as_array()) {
+      if (!e.is_int()) throw RequestError("invalid_params", "\"conditionings\" must be an array of conditioning ids");
+      ids->push_back(e.as_int());
+    }
+    Session& s = session();
+    return enqueue(id, SessionTask::Kind::kCall, [&s, ids] {
+      for (const std::int64_t c : *ids) {
+        if (s.conditionings.count(c) == 0) {
+          throw RequestError("invalid_params", "no conditioning " + std::to_string(c) + " (nothing freed)");
+        }
+      }
+      std::size_t freed = 0;
+      for (const std::int64_t c : *ids) {
+        const auto it = s.conditionings.find(c);
+        if (it == s.conditionings.end()) continue;  // listed twice
+        mi_conditioning_free(it->second);
+        s.conditionings.erase(it);
+        ++freed;
+      }
+      return "{\"freed\":" + std::to_string(freed) + "}";
+    });
+  }
+
+  // initial_noise {"seed", "width", "height", "noise_layout"?, "shm"}: mi_generate's initial noise, F32
+  // [128, height / 16, width / 16], into a scratch region's payload.
+  std::optional<std::string> initial_noise(const Params& p, const std::string& id) {
+    p.only({"seed", "width", "height", "noise_layout", "shm"});
+    const auto seed = p.integer("seed", 0, (std::int64_t{1} << 53) - 1);
+    if (!seed) throw RequestError("invalid_params", "\"seed\" (0 to 2^53-1) is required");
+    const mi_noise_layout layout = p.name("noise_layout", mi::server::kNoiseLayoutNames).value_or(MI_NOISE_LAYOUT_OFFICIAL);
+    const std::int32_t w = side(p, "width"), h = side(p, "height");
+    const std::uint64_t floats = std::uint64_t{MI_LATENT_CHANNELS} * (h / 16) * (w / 16);
+    std::shared_ptr<mi::server::shm::Region> region = named_scratch(p, "shm", floats * 4);
+    return enqueue(id, SessionTask::Kind::kCall, [region, seed = *seed, layout, w, h, floats] {
+      if (const mi_status st = mi_initial_noise(seed, layout, w, h, reinterpret_cast<float*>(region->payload()),
+                                                static_cast<std::size_t>(floats));
+          st != MI_OK) {
+        throw_call(st);
+      }
+      return "{\"shape\":[" + std::to_string(MI_LATENT_CHANNELS) + "," + std::to_string(h / 16) + "," +
+             std::to_string(w / 16) + "]}";
+    });
+  }
+
+  // vae_encode {"shm", "width", "height", "out_shm"}: RGB8 [height][width][3] in `shm` -> model-space latents F32
+  // [128, height / 16, width / 16] in `out_shm`.
+  std::optional<std::string> vae_encode(const Params& p, const std::string& id) {
+    p.only({"shm", "width", "height", "out_shm"});
+    const std::int32_t w = side(p, "width"), h = side(p, "height");
+    const std::uint64_t rgb = std::uint64_t{3} * w * h, lat = std::uint64_t{4} * MI_LATENT_CHANNELS * (h / 16) * (w / 16);
+    std::shared_ptr<mi::server::shm::Region> in = named_scratch(p, "shm", rgb);
+    std::shared_ptr<mi::server::shm::Region> out = named_scratch(p, "out_shm", lat);
+    if (in == out) throw RequestError("invalid_params", "\"shm\" and \"out_shm\" must be different regions");
+    Session& s = session();
+    return enqueue(id, SessionTask::Kind::kCall, [&s, in, out, w, h] {
+      mi_image image{};
+      image.pixels = reinterpret_cast<const std::uint8_t*>(in->payload());
+      image.width = w;
+      image.height = h;
+      image.channels = 3;
+      const mi_tensor t = host_tensor(out->payload(), MI_DTYPE_F32, {MI_LATENT_CHANNELS, h / 16, w / 16});
+      if (const mi_status st = mi_vae_encode(s.engine, &image, &t); st != MI_OK) throw_call(st);
+      return "{\"shape\":[" + std::to_string(MI_LATENT_CHANNELS) + "," + std::to_string(h / 16) + "," +
+             std::to_string(w / 16) + "]}";
+    });
+  }
+
+  // vae_decode {"shm", "width", "height", "out_shm"}: model-space latents F32 [128, height / 16, width / 16] in `shm`
+  // -> RGB8 [height][width][3] in `out_shm`.
+  std::optional<std::string> vae_decode(const Params& p, const std::string& id) {
+    p.only({"shm", "width", "height", "out_shm"});
+    const std::int32_t w = side(p, "width"), h = side(p, "height");
+    const std::uint64_t rgb = std::uint64_t{3} * w * h, lat = std::uint64_t{4} * MI_LATENT_CHANNELS * (h / 16) * (w / 16);
+    std::shared_ptr<mi::server::shm::Region> in = named_scratch(p, "shm", lat);
+    std::shared_ptr<mi::server::shm::Region> out = named_scratch(p, "out_shm", rgb);
+    if (in == out) throw RequestError("invalid_params", "\"shm\" and \"out_shm\" must be different regions");
+    Session& s = session();
+    return enqueue(id, SessionTask::Kind::kCall, [&s, in, out, w, h] {
+      const mi_tensor lt = host_tensor(in->payload(), MI_DTYPE_F32, {MI_LATENT_CHANNELS, h / 16, w / 16});
+      const mi_tensor rt = host_tensor(out->payload(), MI_DTYPE_U8, {h, w, 3});
+      if (const mi_status st = mi_vae_decode(s.engine, &lt, &rt); st != MI_OK) throw_call(st);
+      return "{\"shape\":[" + std::to_string(h) + "," + std::to_string(w) + ",3]}";
+    });
+  }
+
+  // run_begin's parameters, kept by the call until mi_run_begin has copied them.
+  struct RunRequest {
+    mi_run_params params{};
+    struct Row {
+      std::int64_t conditioning = 0;
+      std::vector<std::int32_t> skip;
+      std::int32_t latent = 0;
+    };
+    std::vector<Row> rows;
+    std::vector<float> sigmas;
+    std::vector<std::int32_t> slg;
+    std::vector<std::string> lora_paths;
+    std::vector<mi_lora> loras;
+    std::vector<Params::ControlImage> control;
+    std::vector<mi_control_image> control_images;  // points into control
+  };
+
+  // run_begin {"width", "height", "rows": [{"conditioning", "skip_layers"?, "latent"?}], "guidance"?, "output"?,
+  // "exact_sigma"?, "crops"?, "sigmas"? | "scheduler", "steps", "shift", "flow_multiplier", "denoise_strength", "cfg",
+  // "slg_*", "loras", "control_lora_strength", "control_images", "control_resize", "cfg_truncation", "step_cache",
+  // "step_cache_threshold"}: mi_run_begin, then the run's region (mi_run_adopt_staging) ->
+  // {"sigmas", "info", "shm", "tensors", "adopted"}.
+  std::optional<std::string> run_begin(const Params& p, const std::string& id) {
+    p.only({"width", "height", "rows", "guidance", "output", "exact_sigma", "crops", "sigmas", "scheduler", "steps",
+            "shift", "flow_multiplier", "denoise_strength", "cfg", "slg_layers", "slg_scale", "slg_start", "slg_stop",
+            "loras", "control_lora_strength", "control_images", "control_resize", "cfg_truncation", "step_cache",
+            "step_cache_threshold"});
+    auto rq = std::make_shared<RunRequest>();
+    mi_run_params& r = rq->params;
+    if (const mi_status s = mi_run_params_init(&r, sizeof r); s != MI_OK) throw_status(s);
+    constexpr std::int64_t kI32 = std::numeric_limits<std::int32_t>::max();
+    if (const auto v = p.integer("width", 0, kI32)) r.width = static_cast<std::int32_t>(*v);
+    if (const auto v = p.integer("height", 0, kI32)) r.height = static_cast<std::int32_t>(*v);
+    const Value* rows = p.find("rows");
+    if (rows == nullptr || !rows->is_array() || rows->as_array().empty()) {
+      throw RequestError("invalid_params", "\"rows\" must be a non-empty array of {\"conditioning\", \"skip_layers\"?, \"latent\"?}");
+    }
+    for (const Value& e : rows->as_array()) {
+      const std::string item = "rows[" + std::to_string(rq->rows.size()) + "]";
+      if (!e.is_object()) throw RequestError("invalid_params", "\"" + item + "\" must be an object");
+      const Params row(&e);
+      row.only({"conditioning", "skip_layers", "latent"});
+      RunRequest::Row out;
+      const auto c = row.integer("conditioning", 1, std::numeric_limits<std::int64_t>::max());
+      if (!c) throw RequestError("invalid_params", "\"" + item + ".conditioning\" (a conditioning id) is required");
+      out.conditioning = *c;
+      if (auto v = row.layers("skip_layers")) out.skip = std::move(*v);
+      if (const auto v = row.integer("latent", 0, MI_MAX_ROWS - 1)) out.latent = static_cast<std::int32_t>(*v);
+      rq->rows.push_back(std::move(out));
+    }
+    if (const auto v = p.name("guidance", mi::server::kGuidanceNames)) r.guidance = *v;
+    if (const auto v = p.name("output", mi::server::kStepOutputNames)) r.output = *v;
+    if (p.boolean("exact_sigma").value_or(false)) r.flags |= MI_RUN_EXACT_SIGMA;
+    if (p.boolean("crops").value_or(false)) r.flags |= MI_RUN_CROPS;
+    if (const Value* v = p.find("sigmas")) {
+      if (!v->is_array() || v->as_array().size() < 2 || v->as_array().size() > 10001) {
+        throw RequestError("invalid_params", "\"sigmas\" must be an array of 2 to 10001 numbers");
+      }
+      for (const Value& e : v->as_array()) {
+        if (!e.is_number()) throw RequestError("invalid_params", "\"sigmas\" must be an array of 2 to 10001 numbers");
+        rq->sigmas.push_back(static_cast<float>(e.as_double()));
+      }
+    }
+    if (const auto v = p.name("scheduler", mi::server::kSchedulerNames)) r.scheduler = *v;
+    if (const auto v = p.integer("steps", 1, 10000)) r.steps = static_cast<std::int32_t>(*v);
+    if (const auto v = p.number("shift")) r.shift = *v;
+    if (const auto v = p.number("flow_multiplier")) r.flow_multiplier = *v;
+    if (const auto v = p.number("denoise_strength")) r.denoise_strength = *v;
+    if (const auto v = p.number("cfg")) r.cfg = *v;
+    if (auto v = p.layers("slg_layers")) rq->slg = std::move(*v);
+    if (const auto v = p.number("slg_scale")) r.slg_scale = *v;
+    if (const auto v = p.number("slg_start")) r.slg_start = *v;
+    if (const auto v = p.number("slg_stop")) r.slg_stop = *v;
+    if (auto v = p.loras("loras")) {
+      for (auto& [path, strength] : *v) rq->lora_paths.push_back(std::move(path));
+      for (std::size_t i = 0; i < v->size(); ++i) rq->loras.push_back({rq->lora_paths[i].c_str(), (*v)[i].second});
+    }
+    if (const auto v = p.number("control_lora_strength")) r.control_lora_strength = *v;
+    if (auto v = p.control_images("control_images")) rq->control = std::move(*v);
+    for (const Params::ControlImage& im : rq->control) {
+      mi_control_image ci{};
+      ci.kind = im.kind.c_str();
+      ci.image_path = im.path.c_str();
+      ci.strength = im.strength.value_or(1.0);
+      ci.start = im.start.value_or(0.0);
+      ci.end = im.end.value_or(1.0);
+      rq->control_images.push_back(ci);
+    }
+    if (const auto v = p.name("control_resize", mi::server::kResizeNames)) r.control_resize = *v;
+    if (const auto v = p.number("cfg_truncation")) r.cfg_truncation = *v;
+    if (const auto v = p.name("step_cache", mi::server::kStepCacheNames)) r.step_cache = *v;
+    if (const auto v = p.number("step_cache_threshold")) {
+      if (!(*v > 0 && *v <= 1)) throw RequestError("invalid_params", "\"step_cache_threshold\" must be a number in (0, 1]");
+      r.step_cache_threshold = *v;
+    }
+    Session& s = session();
+    return enqueue(id, SessionTask::Kind::kCall, [this, &s, rq] { return begin_run(s, *rq); });
+  }
+
+  // The worker's part of run_begin.
+  std::string begin_run(Session& s, RunRequest& rq) {
+    namespace shm = mi::server::shm;
+    mi_run_params& r = rq.params;
+    std::vector<mi_run_row> rows;
+    for (std::size_t i = 0; i < rq.rows.size(); ++i) {
+      const auto it = s.conditionings.find(rq.rows[i].conditioning);
+      if (it == s.conditionings.end()) {
+        throw RequestError("invalid_params", "rows[" + std::to_string(i) + "].conditioning: no conditioning " +
+                                                 std::to_string(rq.rows[i].conditioning));
+      }
+      mi_run_row row{};
+      row.conditioning = it->second;
+      row.skip_layers = rq.rows[i].skip.empty() ? nullptr : rq.rows[i].skip.data();
+      row.skip_layers_count = rq.rows[i].skip.size();
+      row.latent = rq.rows[i].latent;
+      rows.push_back(row);
+    }
+    r.rows = rows.data();
+    r.rows_count = rows.size();
+    if (!rq.sigmas.empty()) {
+      r.sigmas = rq.sigmas.data();
+      r.sigmas_count = rq.sigmas.size();
+    }
+    if (!rq.slg.empty()) {
+      r.slg_layers = rq.slg.data();
+      r.slg_layers_count = rq.slg.size();
+    }
+    if (!rq.loras.empty()) {
+      r.loras = rq.loras.data();
+      r.loras_count = rq.loras.size();
+    }
+    if (!rq.control_images.empty()) {
+      r.control_images = rq.control_images.data();
+      r.control_images_count = rq.control_images.size();
+    }
+    if (const mi_status st = mi_run_begin(s.engine, &r); st != MI_OK) throw_call(st);
+    // From here an error ends the run again: a failed run_begin leaves none open.
+    RunState R;
+    R.guided = r.output != MI_STEP_OUTPUT_ROWS;
+    try {
+      R.info.struct_size = sizeof R.info;
+      if (const mi_status st = mi_run_query(s.engine, &R.info); st != MI_OK) throw_call(st);
+      std::size_t count = 0;
+      const float* sigmas = mi_run_sigmas(s.engine, &count);
+      if (sigmas == nullptr) throw_call(MI_ERR_INTERNAL);
+      std::string sig;
+      for (std::size_t i = 0; i < count; ++i) sig += (i ? "," : "") + mi::server::exact_num(sigmas[i]);
+      try {
+        R.region = std::make_shared<shm::Region>(shm::Region::create(static_cast<std::size_t>(R.info.staging_bytes)));
+      } catch (const std::system_error& e) {
+        throw RequestError(e.code() == std::errc::no_space_on_device ? "out_of_memory" : "io", e.what());
+      }
+      const mi_status adopt = mi_run_adopt_staging(s.engine, R.region->payload(), R.region->payload_bytes());
+      if (adopt != MI_OK && adopt != MI_ERR_NOT_SUPPORTED) throw_call(adopt);
+      R.adopted = adopt == MI_OK;
+      if (!R.adopted) out_.log("warning", std::string("run region not pinned, steps copy through the engine's staging: ") + mi_last_error_message(), "");
+      if (const mi_status st = mi_run_staging(s.engine, &R.x, R.out.data(), R.out.size(), &R.control); st != MI_OK) {
+        throw_call(st);
+      }
+      // Offsets in the region: the views' offsets in the engine's block (x first, at 0), after the header page.
+      const auto* base = R.adopted ? reinterpret_cast<const std::byte*>(R.region->payload())
+                                   : static_cast<const std::byte*>(R.x.data);
+      const auto at = [&](const mi_tensor& t) {
+        return shm::kPayloadOffset + static_cast<std::size_t>(static_cast<const std::byte*>(t.data) - base);
+      };
+      R.x_at = at(R.x);
+      if (R.control.data != nullptr) R.control_at = at(R.control);
+      std::string outs;
+      for (std::int32_t k = 0; k < R.info.outputs; ++k) {
+        const mi_tensor& o = R.out[static_cast<std::size_t>(k)];
+        if (o.data != nullptr) R.out_at[static_cast<std::size_t>(k)] = at(o);
+        outs += std::string(k ? "," : "") + (o.data != nullptr ? std::to_string(at(o)) : std::string("null"));
+      }
+      const mi_run_info& i = R.info;
+      std::string answer =
+          "{\"sigmas\":[" + sig + "],\"info\":{\"latent_channels\":" + std::to_string(i.latent_channels) +
+          ",\"latent_height\":" + std::to_string(i.latent_height) + ",\"latent_width\":" + std::to_string(i.latent_width) +
+          ",\"steps\":" + std::to_string(i.steps) + ",\"outputs\":" + std::to_string(i.outputs) + ",\"rows\":" +
+          std::to_string(i.rows) + ",\"latents\":" + std::to_string(i.latents) + ",\"control_channels\":" +
+          std::to_string(i.control_channels) + ",\"schedule_matches\":" + tf(i.schedule_matches != 0) +
+          ",\"staging_bytes\":" + std::to_string(i.staging_bytes) + "},\"shm\":" + region_json(*R.region) +
+          ",\"tensors\":{\"x\":" + std::to_string(R.x_at) + ",\"control\":" +
+          (R.control.data != nullptr ? std::to_string(R.control_at) : std::string("null")) + ",\"out\":[" + outs +
+          "]},\"adopted\":" + tf(R.adopted) + "}";
+      R.open = true;
+      {
+        const std::lock_guard<std::mutex> lock(s.mu);
+        s.run_region = R.region;
+      }
+      s.run = std::move(R);
+      s.run_open.store(true);
+      return answer;
+    } catch (...) {
+      mi_run_end(s.engine, nullptr);  // unregisters an adopted region before it is destroyed (R, on the way out)
+      throw;
+    }
+  }
+
+  // denoise_step {"sigma", "step"?, "rows"?, "shape"?: [L, h, w], "control"?, "control_changed"?}: one mi_denoise_step
+  // over the run region's slots -> {"step", "rows", "cached", "on_schedule", "seconds"}.
+  struct StepRequest {
+    float sigma = 0;
+    std::int32_t step = -1;
+    std::uint32_t rows = 0;
+    std::optional<std::array<std::int64_t, 3>> shape;
+    bool control = false, control_changed = false;
+  };
+
+  std::optional<std::string> denoise_step(const Params& p, const std::string& id) {
+    p.only({"sigma", "step", "rows", "shape", "control", "control_changed"});
+    StepRequest q;
+    const auto sigma = p.number("sigma");
+    if (!sigma) throw RequestError("invalid_params", "\"sigma\" is required");
+    q.sigma = static_cast<float>(*sigma);
+    if (const auto v = p.integer("step", -1, 10000)) q.step = static_cast<std::int32_t>(*v);
+    if (const auto v = p.integer("rows", 0, (1 << MI_MAX_ROWS) - 1)) q.rows = static_cast<std::uint32_t>(*v);
+    if (const Value* v = p.find("shape")) {
+      std::array<std::int64_t, 3> sh{};
+      if (!v->is_array() || v->as_array().size() != 3) throw RequestError("invalid_params", "\"shape\" must be [latents, h, w]");
+      for (std::size_t i = 0; i < 3; ++i) {
+        const Value& e = v->as_array()[i];
+        if (!e.is_int() || e.as_int() < 1 || e.as_int() > 1 << 16) {
+          throw RequestError("invalid_params", "\"shape\" must be [latents, h, w] of positive integers");
+        }
+        sh[i] = e.as_int();
+      }
+      q.shape = sh;
+    }
+    q.control = p.boolean("control").value_or(false);
+    q.control_changed = p.boolean("control_changed").value_or(false);
+    Session& s = session();
+    {
+      // The first step names the run region: the client has attached, so its name goes.
+      const std::lock_guard<std::mutex> lock(s.mu);
+      if (s.run_region != nullptr) s.run_region->unlink();
+    }
+    return enqueue(id, SessionTask::Kind::kStep, [&s, q] { return step(s, q); });
+  }
+
+  static std::string step(Session& s, const StepRequest& q) {
+    RunState& R = s.run;
+    if (!R.open) throw RequestError("invalid_argument", "no run is open; send \"run_begin\" first");
+    const std::int64_t L = R.info.latents, H = R.info.latent_height, W = R.info.latent_width;
+    std::int64_t h = H, w = W;
+    if (q.shape) {
+      if ((*q.shape)[0] != L || (*q.shape)[1] > H || (*q.shape)[2] > W) {
+        throw RequestError("invalid_params", "\"shape\" must be [" + std::to_string(L) + ", h <= " + std::to_string(H) +
+                                                 ", w <= " + std::to_string(W) + "]");
+      }
+      h = (*q.shape)[1];
+      w = (*q.shape)[2];
+    }
+    mi_step_params sp{};
+    if (const mi_status st = mi_step_params_init(&sp, sizeof sp); st != MI_OK) throw_call(st);
+    sp.sigma = q.sigma;
+    sp.step = q.step;
+    sp.rows = q.rows;
+    if (q.control_changed) sp.flags |= MI_STEP_CONTROL_CHANGED;
+    const auto shaped = [&](const mi_tensor& view, std::int64_t channels) {
+      return L == 1 ? host_tensor(view.data, MI_DTYPE_F32, {channels, h, w})
+                    : host_tensor(view.data, MI_DTYPE_F32, {L, channels, h, w});
+    };
+    sp.x = shaped(R.x, MI_LATENT_CHANNELS);
+    const std::size_t latent_bytes = static_cast<std::size_t>(MI_LATENT_CHANNELS * h * w) * sizeof(float);
+    const std::size_t control_bytes = static_cast<std::size_t>(L * R.info.control_channels * h * w) * sizeof(float);
+    if (q.control) {
+      if (R.control.data == nullptr) throw RequestError("invalid_params", "\"control\": the session has no control adapter");
+      sp.control = shaped(R.control, R.info.control_channels);
+    }
+    for (std::int32_t k = 0; k < R.info.outputs; ++k) {
+      const mi_tensor& o = R.out[static_cast<std::size_t>(k)];
+      if (o.data != nullptr) sp.out[k] = host_tensor(o.data, MI_DTYPE_F32, {MI_LATENT_CHANNELS, h, w});
+    }
+    std::byte* region = R.region->payload() - mi::server::shm::kPayloadOffset;
+    if (!R.adopted) {
+      std::memcpy(R.x.data, region + R.x_at, static_cast<std::size_t>(L) * latent_bytes);
+      if (q.control) std::memcpy(R.control.data, region + R.control_at, control_bytes);
+    }
+    mi_step_info info{};
+    info.struct_size = sizeof info;
+    if (const mi_status st = mi_denoise_step(s.engine, &sp, &info); st != MI_OK) {
+      if (st == MI_CANCELLED) {
+        std::string reason;
+        {
+          const std::lock_guard<std::mutex> lock(s.mu);
+          reason = s.running != nullptr ? s.running->cancel_reason : std::string();
+        }
+        throw RequestError("cancelled", reason.empty() ? std::string(mi_last_error_message()) : reason);
+      }
+      throw_call(st);
+    }
+    if (!R.adopted) {
+      for (std::int32_t k = 0; k < R.info.outputs; ++k) {
+        const bool written = R.guided ? k == 0 : (info.rows & (1u << k)) != 0;
+        if (written && R.out[static_cast<std::size_t>(k)].data != nullptr) {
+          std::memcpy(region + R.out_at[static_cast<std::size_t>(k)], R.out[static_cast<std::size_t>(k)].data, latent_bytes);
+        }
+      }
+    }
+    return "{\"step\":" + std::to_string(info.step) + ",\"rows\":" + std::to_string(info.rows) + ",\"cached\":" +
+           tf(info.cached != 0) + ",\"on_schedule\":" + tf(info.on_schedule != 0) + ",\"seconds\":" + num(info.seconds) + "}";
+  }
+
+  // run_end: queued steps are answered cancelled unrun and a step in flight is cancelled (the client's interrupt), then
+  // the worker ends the run (mi_run_end) and destroys its region -> {"ended", "report", "warnings", "note"}, generate's
+  // done without an image.
+  std::optional<std::string> run_end(const Params& p, const std::string& id) {
+    p.only({});
+    Session& s = session();
+    auto t = std::make_shared<SessionTask>();
+    t->id = id;
+    t->kind = SessionTask::Kind::kRunEnd;
+    t->run = [&s] {
+      mi_result* r = nullptr;
+      const mi_status st = mi_run_end(s.engine, &r);
+      s.run_open.store(false);
+      s.run = RunState{};  // the region after the run's end: mi_run_end unregistered it
+      {
+        const std::lock_guard<std::mutex> lock(s.mu);
+        s.run_region.reset();
+      }
+      if (st != MI_OK) throw_call(st);
+      if (r == nullptr) return std::string("{\"ended\":false}");
+      const std::unique_ptr<mi_result, void (*)(mi_result*)> owner(r, mi_result_free);
+      mi_gen_params defaults{};
+      mi_gen_params_init(&defaults, sizeof defaults);  // no request settings to warn about
+      return "{\"ended\":true,\"report\":" + one_line(mi_result_report_json(r)) + ",\"warnings\":" +
+             warnings_json(r, defaults) + ",\"note\":" + str(mi_result_text(r, MI_TEXT_COMPONENT_NOTE)) + "}";
+    };
+    bool step_running = false;
+    {
+      const std::lock_guard<std::mutex> lock(s.mu);
+      for (const std::shared_ptr<SessionTask>& q : s.queue) {
+        if (q->kind == SessionTask::Kind::kStep && !q->cancelled) {
+          q->cancelled = true;
+          q->cancel_reason = "the run is ending";
+        }
+      }
+      if (s.running != nullptr && s.running->kind == SessionTask::Kind::kStep) {
+        s.running->cancelled = true;
+        s.running->cancel_reason = "the run is ending";
+        step_running = true;
+      }
+      s.queue.push_back(std::move(t));
+    }
+    if (step_running) mi_cancel(s.engine);
+    s.cv.notify_all();
+    return std::nullopt;
   }
 
   // One job's inputs; owned by the worker thread.
@@ -1518,6 +2451,7 @@ class Server {
   }
 
   Output& out_;
+  std::unique_ptr<Session> session_;  // the open component session (the request loop's)
   mi_engine* engine_ = nullptr;
   std::string model_;
   mi_mode mode_ = MI_MODE_BALANCED;
@@ -1692,6 +2626,12 @@ int main(int argc, char** argv) {
   if (parent_pid > 0 && !start_parent_watchdog(parent_pid)) {
     std::fprintf(stderr, "moss-server: parent process %lld is not running\n", parent_pid);
     return 1;
+  }
+  // Regions a crashed server left before its client attached (shm.h; Linux only, nothing on Windows).
+  try {
+    mi::server::shm::sweep_stale();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "moss-server: shared-memory sweep failed: %s\n", e.what());
   }
   Output out(proto);
   Server server(out);
