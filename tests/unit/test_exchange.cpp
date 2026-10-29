@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -17,6 +18,7 @@
 #include <dlfcn.h>
 #endif
 
+#include "backend/cuda_driver.h"
 #include "core/cuda_check.h"
 #include "runtime/exchange.h"
 #include "test_runtime_kernels.h"
@@ -96,19 +98,17 @@ TEST_F(GpuExchange, ChecksFromAThreadWithoutACurrentContext) {
   const DevicePointerCheck check(0);
   std::string accepted = "not run", refused;
   bool had_context = true, has_context_after = true;
+  bool queried = false;
   std::thread([&] {
-    void* lib = nullptr;
-#ifndef _WIN32
-    lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
-#endif
-    const auto current = lib != nullptr ? reinterpret_cast<decltype(&cuCtxGetCurrent)>(dlsym(lib, "cuCtxGetCurrent")) : nullptr;
-    CUcontext ctx = nullptr;
-    had_context = current != nullptr && current(&ctx) == CUDA_SUCCESS && ctx != nullptr;
+    // The engine's own driver loader: cuCtxGetCurrent on every platform.
+    const std::optional<void*> before = mi::backend::current_context();
+    queried = before.has_value();
+    had_context = before.value_or(nullptr) != nullptr;
     accepted = refusal([&] { check.check(d, kMiB, "x"); });
     refused = refusal([&] { check.check(static_cast<std::byte*>(d) + 4096, kMiB, "out[0]"); });
-    ctx = nullptr;
-    has_context_after = current != nullptr && current(&ctx) == CUDA_SUCCESS && ctx != nullptr;
+    has_context_after = mi::backend::current_context().value_or(nullptr) != nullptr;
   }).join();
+  ASSERT_TRUE(queried) << "cuCtxGetCurrent unavailable";
   EXPECT_FALSE(had_context);
   EXPECT_EQ(accepted, "");
   EXPECT_TRUE(contains(refused, "out[0] needs 1048576 bytes, but only 1044480 are mapped")) << refused;

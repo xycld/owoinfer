@@ -52,6 +52,9 @@ std::optional<bool> primary_context_active(int device_ordinal);
 // retained) when libcuda is absent or a call fails.
 std::optional<void*> retain_primary_context(int device_ordinal);
 void release_primary_context(int device_ordinal);
+// The calling thread's current CUDA context (a CUcontext; nullptr: none). Empty when libcuda is absent or the call
+// fails.
+std::optional<void*> current_context();
 
 // What the driver knows about an address (cuPointerGetAttributes, one call): the component API checks a host's device
 // tensors against it. An address the driver does not know (pageable host memory) is kUnknown.
