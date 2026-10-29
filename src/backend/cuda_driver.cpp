@@ -242,6 +242,13 @@ void release_primary_context(int device_ordinal) {
   if (d.ok && d.device_get(&dev, device_ordinal) == CUDA_SUCCESS) d.primary_release(dev);
 }
 
+std::optional<void*> current_context() {
+  const Driver& d = driver();
+  CUcontext ctx = nullptr;
+  if (!d.ok || d.get_current(&ctx) != CUDA_SUCCESS) return std::nullopt;
+  return ctx;
+}
+
 namespace {
 
 std::string error_text(const Driver& d, CUresult r) {
