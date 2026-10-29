@@ -102,7 +102,21 @@ struct RotateArgs {
   const __nv_bfloat16* mod_scale;
   const __nv_bfloat16* mod_shift;
   float factor;  // torch MeanOps factor: float(rows) / float(rows * k)
+  __nv_bfloat16* y;  // optional copy of the bf16 norm output (row stride ldy)
+  std::int64_t ldy;
 };
+
+// 16 floats that are bf16 values, stored as 16 contiguous bf16 (32 bytes, exact).
+__device__ __forceinline__ void store16(__nv_bfloat16* p, const float (&v)[16]) {
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    uint4 raw;
+    auto* b = reinterpret_cast<__nv_bfloat162*>(&raw);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) b[i] = __floats2bfloat162_rn(v[8 * half + 2 * i], v[8 * half + 2 * i + 1]);
+    reinterpret_cast<uint4*>(p)[half] = raw;
+  }
+}
 
 // kVT == 0: standalone rotate_quantize. kVT > 0: the MOSS RMSNorm + modulate prologue first (torch reduce with
 // 32 * kVT threads per row).
@@ -150,6 +164,7 @@ __global__ void rotate_quantize_kernel(RotateArgs a) {
       load16(a.mod_shift + c0, sh);
 #pragma unroll
       for (int j = 0; j < 16; ++j) v[i][j] = kernels::detail::moss_modulate(v[i][j], r, w[j], sc[j], sh[j]);
+      if (a.y != nullptr) store16(a.y + row * a.ldy + c0, v[i]);
     }
   }
 
@@ -263,13 +278,19 @@ void rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx, std::int8_t* q, s
 
 void rms_norm_modulate_rotate_quantize(const __nv_bfloat16* x, std::int64_t ldx, const __nv_bfloat16* norm_weight,
                                        const __nv_bfloat16* mod_scale, const __nv_bfloat16* mod_shift, std::int8_t* q,
-                                       std::int64_t ldq, float* scale, std::int64_t m, int k, cudaStream_t stream) {
+                                       std::int64_t ldq, float* scale, std::int64_t m, int k, cudaStream_t stream,
+                                       __nv_bfloat16* y, std::int64_t ldy) {
   constexpr const char* op = "quant::rms_norm_modulate_rotate_quantize";
   RotateArgs a = check_rotate(op, x, ldx, q, ldq, scale, m, k);
   if (!aligned(norm_weight, 16) || !aligned(mod_scale, 16) || !aligned(mod_shift, 16) || norm_weight == nullptr ||
       mod_scale == nullptr || mod_shift == nullptr) {
     fail(op, "norm_weight, mod_scale and mod_shift must be 16-byte aligned device vectors");
   }
+  if (y != nullptr && (!aligned(y, 16) || ldy < k || ldy % 8 != 0)) {
+    fail(op, "y must be 16-byte aligned with ldy >= k and ldy % 8 == 0 (ldy " + std::to_string(ldy) + ")");
+  }
+  a.y = y;
+  a.ldy = ldy;
   if (m == 0) return;
   const int bw = torch_reduce_threads(op, m, k);
   a.weight = norm_weight;

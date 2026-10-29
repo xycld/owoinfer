@@ -562,26 +562,44 @@ TEST(LoraSideBranch, SharedFusedQkvEqualsSeparateAdapters) {
   EXPECT_EQ(of, os);
 }
 
-// The INT8 path materializes the norm output for a site with a side branch: rms_norm_modulate_moss then
-// rotate_quantize must give the fused norm + rotate kernel's bits (same row count per call, as quant.h requires).
+// rms_norm_modulate_moss then rotate_quantize give the fused norm + rotate kernel's bits (same row count per call, as
+// quant.h requires), and the fused kernel's optional norm output (the INT8 path's side-branch input) is
+// rms_norm_modulate_moss's, written at its row stride and nowhere else; storing it leaves q and the scales unchanged.
 TEST(LoraKernels, SplitNormRotateEqualsFused) {
   REQUIRE_GPU();
-  constexpr std::int64_t k = 3072;
+  constexpr std::int64_t k = 3072, ldy = k + 8;
   const U16 nw = rand_bf16(k, 61, 0.3f), sc = rand_bf16(k, 62, 0.2f), sh = rand_bf16(k, 63, 0.2f);
   Dev dnw(nw, mi::DType::kBF16, {k}), dsc(sc, mi::DType::kBF16, {k}), dsh(sh, mi::DType::kBF16, {k});
   for (const std::int64_t m : {1LL, 37LL, 300LL, 4242LL}) {
     const U16 x = rand_bf16(static_cast<std::size_t>(m * k), 64 + static_cast<std::uint32_t>(m), 6.0f);
     Dev dx(x, mi::DType::kBF16, {m, k}), y(U16{}, mi::DType::kBF16, {m, k});
     Dev q1(std::vector<std::int8_t>{}, mi::DType::kI8, {m, k}), q2(std::vector<std::int8_t>{}, mi::DType::kI8, {m, k});
+    Dev q3(std::vector<std::int8_t>{}, mi::DType::kI8, {m, k});
     Dev s1(std::vector<float>{}, mi::DType::kF32, {m}), s2(std::vector<float>{}, mi::DType::kF32, {m});
+    Dev s3(std::vector<float>{}, mi::DType::kF32, {m});
+    Dev y3(U16(static_cast<std::size_t>(m * ldy), 0x7fc1), mi::DType::kBF16, {m, ldy});
     kernels::quant::rms_norm_modulate_rotate_quantize(dx.bf(), k, dnw.bf(), dsc.bf(), dsh.bf(), static_cast<std::int8_t*>(q1.t.data),
                                                       k, static_cast<float*>(s1.t.data), m, static_cast<int>(k), nullptr);
     kernels::rms_norm_modulate_moss(dx.t, dnw.t, dsc.t, dsh.t, y.t, nullptr);
     kernels::quant::rotate_quantize(y.bf(), k, static_cast<std::int8_t*>(q2.t.data), k, static_cast<float*>(s2.t.data), m,
                                     static_cast<int>(k), nullptr);
+    kernels::quant::rms_norm_modulate_rotate_quantize(dx.bf(), k, dnw.bf(), dsc.bf(), dsh.bf(), static_cast<std::int8_t*>(q3.t.data),
+                                                      k, static_cast<float*>(s3.t.data), m, static_cast<int>(k), nullptr,
+                                                      y3.bf(), ldy);
     MI_CUDA_CHECK(cudaDeviceSynchronize());
     EXPECT_EQ(q1.get<std::int8_t>(), q2.get<std::int8_t>()) << m << " rows";
     EXPECT_EQ(s1.get<float>(), s2.get<float>()) << m << " rows";
+    EXPECT_EQ(q3.get<std::int8_t>(), q1.get<std::int8_t>()) << m << " rows";
+    EXPECT_EQ(s3.get<float>(), s1.get<float>()) << m << " rows";
+    const U16 want = y.get<std::uint16_t>(), got = y3.get<std::uint16_t>();
+    std::size_t bad = 0;
+    for (std::int64_t r = 0; r < m; ++r) {
+      for (std::int64_t c = 0; c < ldy; ++c) {
+        const std::uint16_t g = got[static_cast<std::size_t>(r * ldy + c)];
+        bad += c < k ? g != want[static_cast<std::size_t>(r * k + c)] : g != 0x7fc1;
+      }
+    }
+    EXPECT_EQ(bad, 0u) << m << " rows";
   }
 }
 
