@@ -54,6 +54,10 @@ inline constexpr double kDefaultRunCfg = 3.0;
 struct SessionCancelled : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
+// Session::adopt_staging: the CUDA runtime refused to register the caller's memory as pinned (MI_ERR_NOT_SUPPORTED).
+struct StagingNotPinned : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
 // The text encoder's last hidden state of one prompt, bf16 [tokens, moss_dit::kTextDim] on the host (the tensor before
 // the DiT's text refiner). Immutable: it may serve several runs and sessions; a run copies what it needs.
@@ -178,6 +182,7 @@ struct StepReport {
 // image, no latents) and the component facts of its report.
 struct RunResult {
   Result result;
+  RunSpec spec;  // the run's spec (what its report describes)
   GuidanceMode guidance = GuidanceMode::kHost;
   bool schedule_matches = false;
   std::int64_t off_schedule_calls = 0;
@@ -220,6 +225,14 @@ class Session {
   RunInfo run_info() const;
   const std::vector<float>& run_sigmas() const;
   StagingViews staging() const;
+
+  // Makes caller-owned host memory the open run's staging block (mi_run_adopt_staging; e.g. a shared-memory region
+  // another process maps): registered as pinned (cudaHostRegister, portable), laid out as the run's own block, so
+  // staging() then returns views into it; unregistered when the run ends. Before the run's first step call returns only,
+  // once per run. `base` page-aligned, `bytes` >= RunInfo::staging_bytes. A job on the run (JobGate::Busy while a step
+  // runs, Refused once the run's ending began); std::invalid_argument; StagingNotPinned when the registration is
+  // refused (the run's own staging stays in use).
+  void adopt_staging(void* base, std::size_t bytes);
 
   // One model evaluation (above). Every exit synchronizes the engine stream: on return the engine no longer reads x
   // or control and no longer writes out[]; on success (device tensors) the host stream is ordered after the outputs.

@@ -194,6 +194,8 @@ struct Session::Run {
   runtime::StagingBlock block;
   std::unique_ptr<runtime::DevicePointerCheck> check;
   std::vector<char> stepped;  // steps with a completed call
+  bool step_called = false;   // a step call started (adopt_staging is refused from then on)
+  bool adopted = false;       // `block` is the caller's memory, registered by adopt_staging (unregistered at the end)
   std::chrono::steady_clock::time_point started;
 };
 
@@ -773,10 +775,35 @@ StagingViews Session::staging_views(const Run& R) {
   return v;
 }
 
+void Session::adopt_staging(void* base, std::size_t bytes) {
+  State& s = *s_;
+  JobGate::Job job = s.gate.begin(JobGate::Kind::kRun);
+  Run& R = *s.run;
+  constexpr std::uintptr_t kPage = 4096;
+  if (base == nullptr || reinterpret_cast<std::uintptr_t>(base) % kPage != 0) {
+    throw std::invalid_argument("The adopted staging must start on a page boundary (4096 bytes).");
+  }
+  if (bytes < R.layout.bytes) {
+    throw std::invalid_argument("The adopted staging has " + std::to_string(bytes) + " bytes; the run needs " +
+                                std::to_string(R.layout.bytes) + " (mi_run_info.staging_bytes).");
+  }
+  if (R.adopted) throw std::invalid_argument("The run has adopted a staging block already.");
+  if (R.step_called) throw std::invalid_argument("A staging block is adopted before the run's first step only.");
+  const cudaError_t e = cudaHostRegister(base, bytes, cudaHostRegisterPortable);
+  if (e != cudaSuccess) {
+    cudaGetLastError();  // not sticky: clear it, the run's own staging stays in use
+    throw StagingNotPinned(std::string("The memory could not be registered as pinned (cudaHostRegister: ") +
+                           cudaGetErrorString(e) + "): the run's own staging stays in use.");
+  }
+  R.block = runtime::StagingBlock{static_cast<std::byte*>(base), bytes, false};
+  R.adopted = true;
+}
+
 StepReport Session::step(const StepArgs& a) {
   State& s = *s_;
   JobGate::Job job = s.gate.begin(JobGate::Kind::kRun);
   Run& R = *s.run;
+  R.step_called = true;
   Pipeline::Impl& m = s.m;
   State::CallScope scope(m, R.result);
   const auto t0 = Clock::now();
@@ -1010,6 +1037,7 @@ RunResult Session::State::finish_run() {
   CallScope scope(m, r);
   sync_quietly(m.streams.compute());
   clear_dit();
+  if (R.adopted && cudaHostUnregister(R.block.base) != cudaSuccess) cudaGetLastError();  // the caller's memory, idle now
   const int n = R.schedule->steps();
   if (R.cache) {
     r.accel.dit_calls = R.cache->calls();
@@ -1045,6 +1073,7 @@ RunResult Session::State::finish_run() {
     out.note += (out.note.empty() ? "" : " ") + std::string("Foreign conditioning (not encoded by this engine) on rows ") + list + ".";
   }
   out.result = std::move(r);
+  out.spec = std::move(R.spec);
   owned.reset();  // the run's stack, step cache and control latents
   return out;
 }
