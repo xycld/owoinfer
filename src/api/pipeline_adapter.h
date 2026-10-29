@@ -26,7 +26,15 @@ struct Request;
 struct Result;
 struct PipelineOptions;
 struct ReleaseReport;
+enum class SamplerKind;
+enum class SchedulerKind;
+enum class NoiseLayout;
+enum class ResizeMode;
+enum class Phase;
 }  // namespace mi::pipeline
+namespace mi::tok {
+struct PromptTokenReport;
+}  // namespace mi::tok
 
 namespace mi::api {
 
@@ -134,6 +142,15 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
 // `cancelled` (optional) receives ReleaseReport::cancelled: the release was cancelled before it started and released
 // nothing.
 mi_release_info to_release_info(const pipeline::ReleaseReport& report, bool* cancelled = nullptr);
+
+// The enum and token mappings the request and the component API share. The to_* conversions throw
+// std::invalid_argument naming the field for an unknown value.
+pipeline::SamplerKind to_sampler(mi_sampler s);
+pipeline::SchedulerKind to_scheduler(mi_scheduler s);
+pipeline::NoiseLayout to_noise_layout(mi_noise_layout l);
+pipeline::ResizeMode to_resize(mi_resize_mode m);
+mi_phase to_phase(pipeline::Phase phase);
+mi_prompt_tokens to_tokens(const tok::PromptTokenReport& t);
 
 // The mi_precision of a DiT's and of a text encoder's weights: one mapping for the results and mi_inspect_file().
 mi_precision to_precision(planner::Precision p);

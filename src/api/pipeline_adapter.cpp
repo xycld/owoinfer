@@ -99,47 +99,6 @@ fs::path existing_file(const char* utf8, const std::string& name) {
   return path;
 }
 
-pipeline::SamplerKind to_sampler(mi_sampler s) {
-  using K = pipeline::SamplerKind;
-  switch (s) {
-    case MI_SAMPLER_EULER: return K::kEuler;
-    case MI_SAMPLER_AB2: return K::kAb2;
-    case MI_SAMPLER_EULER_ANCESTRAL: return K::kEulerAncestral;
-    case MI_SAMPLER_HEUN: return K::kHeun;
-    case MI_SAMPLER_DPMPP_2M: return K::kDpmpp2m;
-    case MI_SAMPLER_DPMPP_2M_SDE: return K::kDpmpp2mSde;
-    case MI_SAMPLER_ER_SDE: return K::kErSde;
-    case MI_SAMPLER_RES_MULTISTEP: return K::kResMultistep;
-    case MI_SAMPLER_DATASPACE: return K::kDataSpace;
-    case MI_SAMPLER_MAX_ENUM: break;
-  }
-  unknown("sampler", static_cast<int>(s));
-}
-
-pipeline::SchedulerKind to_scheduler(mi_scheduler s) {
-  using K = pipeline::SchedulerKind;
-  switch (s) {
-    case MI_SCHEDULER_MOSS: return K::kMoss;
-    case MI_SCHEDULER_SIMPLE: return K::kSimple;
-    case MI_SCHEDULER_NORMAL: return K::kNormal;
-    case MI_SCHEDULER_KARRAS: return K::kKarras;
-    case MI_SCHEDULER_EXPONENTIAL: return K::kExponential;
-    case MI_SCHEDULER_BETA: return K::kBeta;
-    case MI_SCHEDULER_SGM_UNIFORM: return K::kSgmUniform;
-    case MI_SCHEDULER_MAX_ENUM: break;
-  }
-  unknown("scheduler", static_cast<int>(s));
-}
-
-pipeline::NoiseLayout to_noise_layout(mi_noise_layout l) {
-  switch (l) {
-    case MI_NOISE_LAYOUT_OFFICIAL: return pipeline::NoiseLayout::kOfficial;
-    case MI_NOISE_LAYOUT_BATCH_STREAM: return pipeline::NoiseLayout::kBatchStream;
-    case MI_NOISE_LAYOUT_MAX_ENUM: break;
-  }
-  unknown("noise_layout", static_cast<int>(l));
-}
-
 pipeline::NoiseSource to_noise_source(mi_noise_source s) {
   switch (s) {
     case MI_NOISE_SOURCE_PHILOX: return pipeline::NoiseSource::kPhilox;
@@ -212,16 +171,6 @@ fs::path model_dir(const mi_engine_params& p) {
   return path;
 }
 
-mi_phase to_phase(pipeline::Phase phase) {
-  switch (phase) {
-    case pipeline::Phase::kTextEncoder: return MI_PHASE_TEXT_ENCODER;
-    case pipeline::Phase::kDitLoad: return MI_PHASE_DIT_LOAD;
-    case pipeline::Phase::kDenoise: return MI_PHASE_DENOISE;
-    case pipeline::Phase::kDecode: return MI_PHASE_DECODE;
-  }
-  return MI_PHASE_TEXT_ENCODER;
-}
-
 // ---------------------------------------------------------------- pipeline types -> C structs
 
 mi_tier from_tier(planner::Tier t) {
@@ -257,18 +206,6 @@ mi_precision te_precision(const std::string& name) {
 std::int32_t count32(std::size_t n) {
   return n > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ? std::numeric_limits<std::int32_t>::max()
                                                                                 : static_cast<std::int32_t>(n);
-}
-
-mi_prompt_tokens to_tokens(const tok::PromptTokenReport& t) {
-  mi_prompt_tokens out{};
-  out.struct_size = sizeof out;
-  out.total_tokens = count32(t.total_tokens);
-  out.kept_tokens = count32(t.kept_tokens);
-  out.prompt_tokens = count32(t.total_tokens >= t.template_tokens ? t.prompt_tokens() : 0);
-  out.dropped_tokens = count32(t.total_tokens >= t.kept_tokens ? t.dropped_tokens() : 0);
-  out.max_length = count32(t.max_length);
-  out.truncated = t.truncated ? 1 : 0;
-  return out;
 }
 
 bool given(const char* utf8) { return utf8 != nullptr && *utf8 != '\0'; }
@@ -372,6 +309,77 @@ std::shared_ptr<const pipeline::Image> stand_in(int channels) {
   return std::make_shared<const pipeline::Image>(std::move(im));
 }
 
+mi_image_mode to_image_mode(const std::string& mode) {
+  if (mode == "img2img") return MI_IMAGE_MODE_IMG2IMG;
+  if (mode == "inpaint") return MI_IMAGE_MODE_INPAINT;
+  return MI_IMAGE_MODE_TXT2IMG;
+}
+
+}  // namespace
+
+pipeline::SamplerKind to_sampler(mi_sampler s) {
+  using K = pipeline::SamplerKind;
+  switch (s) {
+    case MI_SAMPLER_EULER: return K::kEuler;
+    case MI_SAMPLER_AB2: return K::kAb2;
+    case MI_SAMPLER_EULER_ANCESTRAL: return K::kEulerAncestral;
+    case MI_SAMPLER_HEUN: return K::kHeun;
+    case MI_SAMPLER_DPMPP_2M: return K::kDpmpp2m;
+    case MI_SAMPLER_DPMPP_2M_SDE: return K::kDpmpp2mSde;
+    case MI_SAMPLER_ER_SDE: return K::kErSde;
+    case MI_SAMPLER_RES_MULTISTEP: return K::kResMultistep;
+    case MI_SAMPLER_DATASPACE: return K::kDataSpace;
+    case MI_SAMPLER_MAX_ENUM: break;
+  }
+  unknown("sampler", static_cast<int>(s));
+}
+
+pipeline::SchedulerKind to_scheduler(mi_scheduler s) {
+  using K = pipeline::SchedulerKind;
+  switch (s) {
+    case MI_SCHEDULER_MOSS: return K::kMoss;
+    case MI_SCHEDULER_SIMPLE: return K::kSimple;
+    case MI_SCHEDULER_NORMAL: return K::kNormal;
+    case MI_SCHEDULER_KARRAS: return K::kKarras;
+    case MI_SCHEDULER_EXPONENTIAL: return K::kExponential;
+    case MI_SCHEDULER_BETA: return K::kBeta;
+    case MI_SCHEDULER_SGM_UNIFORM: return K::kSgmUniform;
+    case MI_SCHEDULER_MAX_ENUM: break;
+  }
+  unknown("scheduler", static_cast<int>(s));
+}
+
+pipeline::NoiseLayout to_noise_layout(mi_noise_layout l) {
+  switch (l) {
+    case MI_NOISE_LAYOUT_OFFICIAL: return pipeline::NoiseLayout::kOfficial;
+    case MI_NOISE_LAYOUT_BATCH_STREAM: return pipeline::NoiseLayout::kBatchStream;
+    case MI_NOISE_LAYOUT_MAX_ENUM: break;
+  }
+  unknown("noise_layout", static_cast<int>(l));
+}
+
+mi_phase to_phase(pipeline::Phase phase) {
+  switch (phase) {
+    case pipeline::Phase::kTextEncoder: return MI_PHASE_TEXT_ENCODER;
+    case pipeline::Phase::kDitLoad: return MI_PHASE_DIT_LOAD;
+    case pipeline::Phase::kDenoise: return MI_PHASE_DENOISE;
+    case pipeline::Phase::kDecode: return MI_PHASE_DECODE;
+  }
+  return MI_PHASE_TEXT_ENCODER;
+}
+
+mi_prompt_tokens to_tokens(const tok::PromptTokenReport& t) {
+  mi_prompt_tokens out{};
+  out.struct_size = sizeof out;
+  out.total_tokens = count32(t.total_tokens);
+  out.kept_tokens = count32(t.kept_tokens);
+  out.prompt_tokens = count32(t.total_tokens >= t.template_tokens ? t.prompt_tokens() : 0);
+  out.dropped_tokens = count32(t.total_tokens >= t.kept_tokens ? t.dropped_tokens() : 0);
+  out.max_length = count32(t.max_length);
+  out.truncated = t.truncated ? 1 : 0;
+  return out;
+}
+
 pipeline::ResizeMode to_resize(mi_resize_mode m) {
   switch (m) {
     case MI_RESIZE_CROP: return pipeline::ResizeMode::kCrop;
@@ -381,14 +389,6 @@ pipeline::ResizeMode to_resize(mi_resize_mode m) {
   }
   unknown("resize", static_cast<int>(m));
 }
-
-mi_image_mode to_image_mode(const std::string& mode) {
-  if (mode == "img2img") return MI_IMAGE_MODE_IMG2IMG;
-  if (mode == "inpaint") return MI_IMAGE_MODE_INPAINT;
-  return MI_IMAGE_MODE_TXT2IMG;
-}
-
-}  // namespace
 
 pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embedding, bool load_images, bool preload) {
   if (p.prompt == nullptr && !preload) throw std::invalid_argument("Enter a prompt.");
