@@ -66,7 +66,7 @@ cmake --build <build> --target mossinfer_example_c
 
 ## Threading model
 
-- **One job at a time per engine.** A job is `mi_generate()`, `mi_engine_preload()` or `mi_engine_release()`. A concurrent one on the same engine returns `MI_ERR_BUSY`. Separate engines may run concurrently, but they share the GPU and each one plans against its own budgets.
+- **One job at a time per engine.** A job is `mi_generate()`, `mi_engine_preload()`, `mi_engine_release()` or a [component call](#component-api). A concurrent one on the same engine returns `MI_ERR_BUSY`. Separate engines may run concurrently, but they share the GPU and each one plans against its own budgets.
 - **`mi_cancel(engine)` is thread-safe** and may be called from any thread, including from a callback.
   - A generation stops within one text-encoder layer, DiT block or decode band, and `mi_generate()` returns `MI_CANCELLED`. A preload stops between models and DiT weight groups (`MI_CANCELLED`). A release stops before it frees anything (`MI_CANCELLED`, nothing released), or, once it is freeing, stops the DiT's host copy between 64 MiB reads, keeps a text encoder's copy and still returns `MI_OK`.
   - A cancel only affects the job running at that moment. It is a no-op when the engine is idle, and it never carries over to the next job.
@@ -506,6 +506,64 @@ The kinds, in the order they are tried: `MI_FILE_KIND_CONTROL_ADAPTER` (a widene
 
 `mi_file_report_text()` gives `MI_FILE_TEXT_NOTE`, `MI_FILE_TEXT_QUANTIZATION` (a loadable DiT's block linears as the engine runs them: `bf16`, `int8_convrot256`, `int4_convrot256` or `mixed (...)`; a text encoder's `bf16`, `int8_convrot` or `w4a8`), `MI_FILE_TEXT_BASE_MODEL` (the `base_model` metadata of a LoRA or control adapter) and `MI_FILE_TEXT_ADAPTER_TYPES` (`lora`, `loha`, `lokr`, `full`, comma-separated). The strings are owned by the report; release it with `mi_file_report_free()`.
 
+## Component API
+
+The component API (`MI_CAP_COMPONENTS`, 2.1) is `mi_generate()` split into its parts, so the host owns the sampling loop: its own sampler, guidance, schedule and control scheduling, with the engine's text encoder, DiT and VAE. Each `mi_denoise_step()` is one model evaluation of every row the host names, in one batched forward. A host running the engine's sampler formulas gets `mi_generate()`'s bits.
+
+A session and its run are state of the engine: at most one session per engine and one run per session, so every call takes the `mi_engine*` and nothing can dangle. Conditionings are the only new handles.
+
+```c
+mi_session_params sp;  mi_session_params_init(&sp, sizeof sp);
+mi_session_open(engine, &sp);
+
+const char* prompts[2] = {"a red apple on a wooden table", ""};
+mi_text_params tp;  mi_text_params_init(&tp, sizeof tp);
+tp.prompts = prompts;  tp.prompts_count = 2;
+mi_conditioning* cond[2];
+mi_encode_text(engine, &tp, cond);
+
+const int32_t skip22[] = {22};
+const mi_run_row rows[2] = {{cond[0], NULL, 0, 0, 0}, {cond[1], skip22, 1, 0, 0}};
+mi_run_params rp;  mi_run_params_init(&rp, sizeof rp);
+rp.width = rp.height = 1024;  rp.steps = 50;
+rp.rows = rows;  rp.rows_count = 2;
+rp.guidance = MI_GUIDANCE_MOSS;                                   /* mi_generate's rows and windows */
+rp.output = mi_sampler_prediction(MI_SAMPLER_EULER, MI_SCHEDULER_MOSS);  /* guided velocity */
+rp.flags = MI_RUN_EXACT_SIGMA;
+mi_run_begin(engine, &rp);
+
+size_t n;  const float* s = mi_run_sigmas(engine, &n);
+mi_tensor x, v;  mi_run_staging(engine, &x, &v, 1, NULL);        /* pinned host views */
+mi_initial_noise(seed, MI_NOISE_LAYOUT_OFFICIAL, 1024, 1024, x.data, 128 * 64 * 64);
+for (size_t i = 0; i + 1 < n; ++i) {
+  mi_step_params st;  mi_step_params_init(&st, sizeof st);
+  st.sigma = s[i];  st.x = x;  st.out[0] = v;
+  mi_denoise_step(engine, &st, NULL);
+  /* x = x + h * v, h = fp32(s[i+1] - s[i]), one rounding per op */
+}
+mi_result* r;  mi_run_end(engine, &r);                            /* plan, tier, timings: no image */
+mi_vae_decode(engine, &x, &rgb);                                /* rgb: U8 [1024, 1024, 3] */
+mi_session_close(engine);
+```
+
+**Conventions.**
+- **Latents** are model space, F32 `[128, H/16, W/16]` per image (`[L, 128, h, w]` for a batch): the FLUX.2 VAE's 32 channels patchified 2 × 2 and batch-normed. That is ComfyUI's Flux2 `LATENT` as is: exchange it without any conversion, in either direction.
+- **FLOW.** x = (1 − σ)·x0 + σ·noise. Each output is the DiT's raw output (the velocity), so denoised = x − σ·out. The DiT's timestep is fp32(σ × 1000).
+- **No shift inside a step.** The engine applies no shift or multiplier to a call's σ: the host's model sampling has already applied them. The shift enters only the engine's own schedule (`mi_schedule()`, or `mi_run_params.sigmas` NULL).
+- **The schedule is a hint.** A call's σ may be anything: an exact entry gives its step, any other σ the interval it falls in (`off_schedule_calls` counts them). `MI_RUN_EXACT_SIGMA` refuses off-schedule sigmas, a reproduction's guard against a one-ulp slip. Calls are unbounded: correctors, midpoints and restarts all work.
+- **Rows.** `MI_GUIDANCE_HOST` (default): the host owns guidance and each call names its rows (`mi_step_params.rows`); every output is a row's raw velocity. `MI_GUIDANCE_MOSS`: `mi_generate()`'s layout, rows and windows, required for the guided outputs. A run has up to the session's `max_rows` rows over a latent batch of up to `max_latents`.
+- **Tier.** A run uses the engine's explicit tier and attention, as `mi_generate()` does. Every image-affecting parameter is explicit; defaults are fixed constants (the step cache's threshold is required when it is on).
+
+**Exchange.** Tensors are all device memory of the engine's device (`MI_MEMORY_DEVICE`, handed over by events on the host's `cuda_stream`, no copy) or all the run's pinned staging (`mi_run_staging()`; another host pointer is refused). `mi_run_adopt_staging()` makes caller-owned memory, e.g. a shared-memory region, the staging block. On return from `mi_denoise_step()`, whatever its status, the engine no longer touches x, control or the outputs.
+
+**Ownership and threading.**
+- Every array and string is read during the call only; a run copies what it keeps. A conditioning may be freed once `mi_run_begin()` has returned. Staging views are the engine's until `mi_run_end()`.
+- Every component call is a job of the engine, as `mi_generate()` is: one at a time (`MI_ERR_BUSY`), and `mi_cancel()` stops it. `mi_generate()`, preload and release work between runs; while a run is open they return `MI_ERR_BUSY`.
+- **Interrupts.** `mi_run_end()`, `mi_session_close()` and `mi_engine_free()` work at any moment from any thread: a step in flight is cancelled (`MI_CANCELLED`) and waited for, then the run ends; models stay loaded, so the next run loads nothing. From a callback of the running call, end and close return `MI_ERR_BUSY` and do nothing.
+- After a run or session ended, calls on it return `MI_ERR_INVALID_ARGUMENT` ("no run is open").
+
+**Performance.** One evaluation is one call: put every row of an evaluation (cond, uncond, the SLG row, the batch's latents) in the same `mi_denoise_step()`. A component run is planned as the equivalent `mi_generate()` request, holds the same memory and runs the same kernels, so a step costs what `mi_generate()`'s step costs. Splitting an evaluation over several calls costs speed and graph replay; it is never needed.
+
 ## Capabilities
 
 `mi_capabilities()` returns the features this build implements. A launcher checks the bits at startup and shows the matching UI only when a bit is set, so the same launcher works with older and newer builds.
@@ -530,6 +588,7 @@ The kinds, in the order they are tried: `MI_FILE_KIND_CONTROL_ADAPTER` (a widene
 | `MI_CAP_TE_HOST_PIN` | 0x8000 | set | `mi_engine_params.te_host_pin`, `MI_TEXT_TE_NOTE` |
 | `MI_CAP_PROGRESS_FRACTION` | 0x10000 | set | `mi_progress.fraction` and `eta_seconds` |
 | `MI_CAP_INSPECT` | 0x20000 | set | `mi_inspect_file()` and the `mi_file_report_*` accessors |
+| `MI_CAP_COMPONENTS` | 0x40000 | set | the [component API](#component-api): `mi_session_*`, `mi_encode_text()`, `mi_conditioning_*`, `mi_run_*`, `mi_denoise_step()`, `mi_vae_*`, `mi_schedule()`, `mi_sampler_prediction()`, `mi_initial_noise()`, `mi_image_resize()`, `MI_TEXT_COMPONENT_NOTE` |
 
 `MI_CAP_TIERS` covers `TURBO` as well. `mi_engine_params.dit_direct_io` has no bit of its own: it comes with the 160-byte `mi_engine_params`, which every library with `MI_CAP_PRELOAD` accepts.
 
@@ -578,7 +637,7 @@ A versioned struct only grows at the end, so a program built against an older he
 | `mi_probe_info` (output) | 576 (the first 0.2.0 size, up to `_reserved0`), 1624 (0.2.0 with the cuBLASLt fields) |
 | `mi_tier_info` (output) | 32 (0.2.0 and 1.0.0, up to `text_encoder_precision`), 40 (2.0.0, with `run_certified`) |
 | `mi_accel_info` (output) | 24 (a pre-release header, up to `lossy`), 32 (2.0.0, with `step_cache_threshold`) |
-| every other output struct | its one size so far (table below) |
+| every other struct | its one size so far (table below), the component structs (2.1) included |
 
 Any other size is `MI_ERR_ABI_MISMATCH`, and the message lists the accepted sizes. `mi_progress` is the other way round: the library fills it for the progress callback with its own size in `struct_size` (40 up to 1.0.0, 56 from 2.0.0), and the client reads the fields that size covers.
 - **`*_init(p, size)`** writes only the first `size` bytes: the defaults of the fields that layout has. The bytes after them are left alone.
@@ -622,8 +681,17 @@ The enums are 4 bytes. ABI 1 is defined by this table: a change to an existing e
 | `mi_control_info` | 48 | `struct_size` 0, `active` 8, `kinds_count` 12, `encodes` 16, `lora_adapters` 20, `lora_side_branch` 24, `lora_merged` 28, `lora_unknown_keys` 32, `lora_warnings` 36, `lora_notes` 40, `_reserved0` 44 |
 | `mi_accel_info` | 32 | `struct_size` 0, `cfg_truncated_steps` 8, `dit_calls` 12, `cached_calls` 16, `lossy` 20; then `step_cache_threshold` 24 |
 | `mi_file_info` | 56 | `struct_size` 0, `kind` 8, `loadable` 12, `file_bytes` 16, `tensor_count` 24, `precision` 28, `tiers` 32, `lora_rank` 36, `lora_adapters` 40, `lora_unknown_keys` 44, `control_kind_count` 48, `_reserved0` 52 |
+| `mi_tensor` | 56 | `data` 0, `memory` 8, `dtype` 12, `rank` 16, `_reserved0` 20, `shape[4]` 24 (no `struct_size`: frozen as it is) |
+| `mi_session_params` | 48 | `struct_size` 0, `plan_request` 8, `progress_callback` 16, `user_data` 24, `max_rows` 32, `max_latents` 36, `control_adapter` 40 |
+| `mi_text_params` | 32 | `struct_size` 0, `prompts` 8, `prompts_count` 16, `max_sequence_length` 24, `_reserved0` 28 |
+| `mi_conditioning_info` | 24 | `struct_size` 0, `tokens` 8, `text_dim` 12, `dtype` 16, `engine_encoded` 20 |
+| `mi_run_row` | 32 | `conditioning` 0, `skip_layers` 8, `skip_layers_count` 16, `latent` 24, `_reserved0` 28 (array element, no `struct_size`: frozen as it is) |
+| `mi_run_params` | 208 | `struct_size` 0, `width` 8, `height` 12, `rows` 16, `rows_count` 24, `sigmas` 32, `sigmas_count` 40, `scheduler` 48, `steps` 52, `shift` 56, `flow_multiplier` 64, `denoise_strength` 72, `guidance` 80, `output` 84, `flags` 88, `_reserved0` 92, `cfg` 96, `slg_layers` 104, `slg_layers_count` 112, `slg_scale` 120, `slg_start` 128, `slg_stop` 136, `loras` 144, `loras_count` 152, `control_lora_strength` 160, `control_images` 168, `control_images_count` 176, `cfg_truncation` 184, `step_cache` 192, `control_resize` 196, `step_cache_threshold` 200 |
+| `mi_run_info` | 64 | `struct_size` 0, `latent_channels` 8, `latent_height` 12, `latent_width` 16, `steps` 20, `outputs` 24, `rows` 28, `schedule_matches` 32, `off_schedule_calls` 36, `calls` 40, `control_channels` 44, `latents` 48, `_reserved0` 52, `staging_bytes` 56 |
+| `mi_step_params` | 592 | `struct_size` 0, `sigma` 8, `step` 12, `rows` 16, `flags` 20, `cuda_stream` 24, `control` 32, `x` 88, `out[8]` 144 |
+| `mi_step_info` | 32 | `struct_size` 0, `step` 8, `rows` 12, `cached` 16, `on_schedule` 20, `seconds` 24 |
 
-The 32-bit enums: `mi_status`, `mi_mode`, `mi_model_format`, `mi_block_path`, `mi_tier`, `mi_attention`, `mi_precision`, `mi_sampler`, `mi_scheduler`, `mi_noise_layout`, `mi_noise_source`, `mi_phase`, `mi_result_text_kind`, `mi_message_kind`, `mi_mask_encoding`, `mi_resize_mode`, `mi_image_mode`, `mi_step_cache`, `mi_direct_io`, `mi_te_host_pin`, `mi_dit_load_source`, `mi_load_io`, `mi_file_kind`, `mi_file_text_kind`.
+The 32-bit enums: `mi_status`, `mi_mode`, `mi_model_format`, `mi_block_path`, `mi_tier`, `mi_attention`, `mi_precision`, `mi_sampler`, `mi_scheduler`, `mi_noise_layout`, `mi_noise_source`, `mi_phase`, `mi_result_text_kind`, `mi_message_kind`, `mi_mask_encoding`, `mi_resize_mode`, `mi_image_mode`, `mi_step_cache`, `mi_direct_io`, `mi_te_host_pin`, `mi_dit_load_source`, `mi_load_io`, `mi_file_kind`, `mi_file_text_kind`, and since 2.1 `mi_memory`, `mi_dtype`, `mi_guidance`, `mi_step_output`.
 
 History, all with `MI_ABI_VERSION` 1:
 - 2026-10-21, during 0.1.0: the padding was made explicit; `mi_engine_params` grew `block_path` and `_reserved1` (72 → 80 bytes); `mi_dit_stream_stats` was added. Binaries built against an earlier header must be rebuilt.
@@ -636,6 +704,7 @@ History, all with `MI_ABI_VERSION` 1:
 - 2.0.0, whole-job progress: `mi_progress` grew to 56 bytes (`fraction`, `eta_seconds`), as trailing fields; the library sets `struct_size`, so a client built against the 40-byte layout reads what it knows. `MI_CAP_PROGRESS_FRACTION` was added.
 - 2.0.0, file inspection: `mi_inspect_file()`, the opaque `mi_file_report` with `mi_file_report_info()`, `_text()`, `_control_kind()`, `_tier_reason()` and `_free()`, `mi_file_info`, the enums `mi_file_kind` and `mi_file_text_kind`, and `MI_CAP_INSPECT` were added.
 - 2.0.0, explicit tiers (a major version: callers must act, the layout is unchanged): `MI_TIER_AUTO`, the zero default of `mi_engine_params.tier`, is refused by `mi_engine_create()`. Quality certificates are gone from the engine; their fields stay in place, reserved: `certificate_dirs` / `certificate_dirs_count` are ignored, `MI_CAP_CERTIFICATE_DIRS` is never set, `mi_tier_info.certified` and `run_certified` are 0, `MI_TEXT_CERTIFICATE` is `""`. The report's `models.dit` has `tier` instead of `tier_requested`, `tier_effective` and `certified`, and its `quality` object no longer has `reason`, `certificate` or the models' content hashes. The SONAME stays `libmossinfer.so.1` (`MI_ABI_VERSION` 1): no symbol, field, offset or enum value moved, so a 1.x binary loads and fails only where it relied on `AUTO`, with a clear `MI_ERR_INVALID_ARGUMENT`. Migration: [integration.md](integration.md#migrating-from-1x).
+- 2.1.0, the component API (additive): the structs `mi_tensor`, `mi_session_params`, `mi_text_params`, `mi_conditioning_info`, `mi_run_row`, `mi_run_params`, `mi_run_info`, `mi_step_params` and `mi_step_info`, the enums `mi_memory`, `mi_dtype`, `mi_guidance` and `mi_step_output`, the opaque `mi_conditioning`, 25 functions, `MI_CAP_COMPONENTS` (0x40000) and `MI_TEXT_COMPONENT_NOTE` (18) were added. `mi_engine_free()` now cancels and waits for a job running on another thread instead of leaving that race undefined.
 
 ## Symbol visibility
 
@@ -651,7 +720,8 @@ On ELF platforms `MOSSINFER_API` is always `visibility("default")`. The shared l
 
 | File | Role |
 |---|---|
-| `src/api/c_api.cpp` | the entry points, exception → status mapping, the busy/cancel state |
+| `src/api/c_api.cpp` | the entry points, exception → status mapping, the engine's job gate (`runtime::JobGate`: one job at a time, the cancel flag, the component run's ending sequence) |
+| `src/api/component_adapter.{h,cpp}` | the component API over `pipeline::Session`: the run, step and tensor conversions, the session calls on the engine's device, the run result as an `mi_result` |
 | `src/api/pipeline_adapter.{h,cpp}` | the only code that touches `pipeline::Pipeline`: converts the C structs into `Request` / `PipelineOptions`, and flattens `pipeline::Result` into C-API types and the JSON report |
 | `src/api/progress_model.{h,cpp}` | the whole-job progress (`mi_progress.fraction`, `eta_seconds`): the plan's phases with their time and load estimates, corrected from the measured phases and steps; pure host code |
 | `src/api/file_inspect.{h,cpp}` | `mi_inspect_file()`: the weights, quant and models readers and `pipeline::inspect_dit_file()` in the pipeline's order, without the device; the tiers from `planner::resolve_tier()` |
@@ -685,6 +755,7 @@ Label `cpu` (`tests/unit/test_c_api.cpp`):
 - **`ProgressModel.*`** (`tests/unit/test_progress_model.cpp`) covers the whole-job progress (`src/api/progress_model.h`) without a GPU: the fraction in range and never decreasing (also when a slow first step would lower it), the eta shrinking as steps run, a measured phase replacing its estimate, the steps after the first setting the price, an unknown eta (before the plan, a non-finite estimate), skipped and unexpected phases (a preload's unexpected `DECODE` does not pass the pending DiT load), the cold-load estimates (cold disk, measured direct I/O, a warm page cache, a soft unload's host copy, a warm engine, another residency, parking, the text encoder's copies, the VAE encoder), the warm / cold record (jobs, cancels with and without a new arena or with another DiT, jobs that do not use the DiT, other parking, an exception, a LoRA change, releases, a preload then a generation, a VRAM-resident text encoder after a preload and a cache hit), the hires fix's passes priced by pixel share, and a preload's load-only sequence.
 - **`CApiInspect.*`** (`tests/unit/test_c_api_inspect.cpp`) covers `mi_inspect_file()` on files written by the test: bf16, INT8 ConvRot and INT4 ConvRot DiTs (precision, quantization, the tier bits and reasons) and one that needs decoding; DiT headers with a GEMM or a scale of another shape (`HostileDitShapes`: refused before any scale is read); a fully NVFP4 DiT (`Nvfp4Dit`: its NVFP4 verdict or, with the NVFP4 kernels in the build, its scale validation, not a size refusal); an NVFP4 linear with a static input_scale (`DitLinearsText`: the quantization text and the note's remark, as indexed with no NVFP4 refusal); a LoRA with metadata and an unknown key, one for another model and a malformed one (both LoRAs, not loadable); control adapters with and without `control_channels`, without a LoRA part, with kinds that do not match and with a NaN in the embedder; a text encoder, and one with a 180 MiB F32 tensor (`TextEncoderTensorShapes`: refused by the importer's shape check before any read; skipped where the test folder has no sparse files); a narrowed VAE decoder; garbage, empty, truncated, oversized, deeply nested and lying headers, GGUF and pickle files, a file with `.alpha` parameters but no LoRA factors (a `LORA` the reader refuses); a FIFO (POSIX); NULL and empty paths, a missing file, a folder without search permission, a directory, `/dev/zero`, and every accessor's NULL, range and size checks. `CApi.GenerationFromAPipelineResult` checks the text encoder precision of every `qwen35_text::precision_name()`. `CommunityFiles` inspects the community files under `$MOSS_COMMUNITY_MODELS` (default `/workspace/Models/community`) when present, and skips otherwise.
 - **`c_abi_compat`** (`tests/c/test_abi_compat.c`, C11): a hand-written 0.1.0-layout `mi_engine_params` and `mi_gen_params` through `*_init`, `mi_gen_params_validate()` and `mi_engine_create()` (as far as the model path check). With weights, `c_abi_compat_gpu` (label `gpu`) also generates from them and checks that the PNG has no text chunks.
+- **`ComponentApi.*`** (`tests/unit/test_component_api.cpp`) covers the component API without a GPU: init defaults and sizes, calls without an engine, tensor descriptors, foreign conditioning (bf16 rounding to nearest even), the run spec's validation with its messages (rows, latents, guidance modes, the schedule, the step cache, control images, the shared `mi_gen_params` rules, the token cap), step arguments, `mi_schedule()` against the pipeline's schedule over every scheduler, steps, shift, multiplier and strength, `mi_sampler_prediction()`, `mi_initial_noise()`, `mi_image_resize()`, and the run result's mapping (the note, the report's `component` object). **`c_component_api`** (`tests/c/test_component_api.c`, C99) links every component symbol and checks the init sizes, the helpers and calls without an engine; `c_abi_layout` checks the component layouts too, and `c_abi_compat` that every 2.0 capability bit stays set.
 - **`CApiReport.*`** renders the report (through the adapter and the shared renderer) from a synthetic result under a comma-decimal C++ locale with digit grouping, and under a comma-decimal C locale where the system has one. It checks for valid JSON, exact numbers, `null` for NaN and infinity, the `dit_blocks` and `dit_stream` keys, `quality.cublaslt`, and that the document is the CLI's fields in braces.
 - **`PipelineReport.*`** (`tests/unit/test_pipeline_report.cpp`) covers the shared renderer itself: every key, the head/tail split around the image path, U+FFFD for ill-formed UTF-8, `null` for non-finite numbers, and the classic locale.
 - **`CudaLibs.*`** (`tests/unit/test_backend_cuda_libs.cpp`) covers the cuBLASLt search: `MOSSINFER_CUDA_LIBS` parsing, the compatibility rule, the candidate lists of each policy on Linux and Windows (injected environment and module directory), `MOSSINFER_CUBLASLT` as the only candidate, the error listing for a missing file and for a library without cuBLASLt's symbols, the system search on this machine, and the shim forwarding to the process's copy. `CApi.ProbeWithoutRequiringAGpu` checks the probe's cuBLASLt fields and the 576-byte size.
@@ -692,6 +763,7 @@ Label `cpu` (`tests/unit/test_c_api.cpp`):
 Label `gpu`:
 - **`GpuCApiProbe.*`**: after `mi_probe_device()`, the process holds no CUDA context. This is checked through the driver's primary-context state and NVML's process list.
 - **`GpuCApi.*`** covers the device probe, and a 256², 2-step generation with callbacks (the 56-byte `mi_progress`: `fraction` in [0, 1) and never decreasing, `eta_seconds` known and not negative; from `TEXT_ENCODER` to the final `DECODE` the fraction grows past one half and the eta shrinks), a concurrent call rejected as busy, the block path accessors and `mi_result_dit_stream()` (nothing streamed in balanced mode on a 16 GiB card), and PNG and report checks. It also covers cancel from another thread with no carry-over, and the caller's current context restored by create, generate and free. `SamplerPreviewMetadataAndTier` runs a 256², 3-step `DPMPP_2M` + `KARRAS` generation with `preview_interval` 2 (previews after steps 2 and 3, at the image size), checks the `generation` chunk of the saved PNG, `mi_result_tier()` (tier `REFERENCE` on the bf16 bundle runs exact attention; the reserved fields are 0), the texts, the prompt tokens, and the LoRA and message accessors' bounds. `OldSizeWritesNoMetadata` generates from a 168-byte `mi_gen_params` and checks that the PNG has no text chunks. `ImageToImageFromPixels` (256², 4 steps at strength 0.5: 2 run from step 2, `total_steps` 2, a 104-byte `mi_timings` gets 104 bytes), `InpaintBinary01Mask` (the kept half stays closer to the init image than the regenerated half), `HiresFix` (256 → 384, 2 + 2 steps) and `DistillTimeEmbeddingNeedsTheEngine` cover image input and the engine check. `ControlAdapterDepth` runs the color/depth control adapter (`$MOSS_COMMUNITY_MODELS/comfy-org/moss_image_color_depth_control.safetensors`, skipped when absent) with a generated grayscale depth image from pixels, 256², 3 steps, and checks `mi_result_control()` and the texts, then a kind the adapter lacks (`MI_ERR_INVALID_ARGUMENT` from `mi_generate()`, not from validation). `Accelerators` runs CFG truncation 0.5 with the step cache at threshold 0.5, 256², 6 steps, and checks `mi_result_accel()`, the cached steps and the diffs; then with the threshold unset, which runs the base model's default (0.02, source `default for the base model`). **`GpuCApiPreload.*`** create engines of their own, one at a time, at 256², 2 steps: `PreloadThenGenerate` (the plan before the first load step and the phases in order, with `fraction` and `eta_seconds` as for a generation; the generation after the preload prices no DiT load, a fresh engine's does; the generation after a preload loads no DiT and matches a fresh engine's image bit for bit), `ReleaseThenGenerate` (a blank-prompt preload; `release(1)`: the next load reads the host copy and gives the same bits; `release(0)`: the files again; release and preload are `MI_ERR_BUSY` during a generation) `CancelDuringPreload` (`MI_CANCELLED` from the first load step's callback, which stops it there, and from another thread; the engine stays usable) and `ReleaseCancelledBeforeItStarts` (through the adapter, a release with its cancel set on entry releases nothing and the next generation loads no DiT, with the same bits; then `mi_engine_release()` against a racing `mi_cancel()`: `MI_CANCELLED` with nothing released when the cancel lands first). `CApi.ReleaseInfo` covers the mapping of the early cancel on the CPU. **`GpuCApiModels.*`** create their own engine on the SFT bundle when the files exist under `/workspace/Models/community`: `DistillBundle` (the lodestones SFT 8-step bundle on the engine and the request: 8 data-space steps at CFG 1, its LoRA and time embedding) and `TurboInt4` (an INT4 DiT: tier `HIGH` refused with the reason, `TURBO` runs it as `W4A4` with 8-bit attention). Runtime LoRA files of one's own on the GPU are covered only by the distill bundle's LoRA; the repository has no small LoRA file.
+- **`GpuComponentApi.*`** (SFT bundle, INT8 DiT, `HIGH`, 512² and 1024²): an L = 1 MOSS run through the C API, sampled by the euler-on-moss host loop in an adopted staging block and decoded with `mi_vae_decode()`, has `mi_generate()`'s plan and RGB bytes; the state errors on the way (a second session or run, `mi_generate()` and `mi_encode_text()` during a run, end and close from a callback); `mi_run_end()` from another thread mid-step (`MI_CANCELLED`, then a new run that loads nothing); `mi_engine_free()` during a step.
 
 Run the GPU tests on a machine with a supported GPU:
 
