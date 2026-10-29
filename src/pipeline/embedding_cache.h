@@ -77,7 +77,7 @@ struct EmbeddingCacheStats {
   std::uint64_t evictions = 0;     // in-memory LRU evictions
   std::uint64_t disk_writes = 0;
   std::uint64_t disk_rejects = 0;  // files deleted because they failed a check
-  std::uint64_t disk_errors = 0;   // I/O failures (reads, writes, directory scans)
+  std::uint64_t disk_errors = 0;   // I/O failures (reads, writes, directory scans, refused touches and removals)
   std::size_t bytes = 0;           // current in-memory bytes
   std::size_t entries = 0;
 };

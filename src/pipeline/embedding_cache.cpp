@@ -152,8 +152,16 @@ EmbeddingCache::EmbeddingCache(EmbeddingCacheOptions options)
       disk_dir_.clear();
       ++stats_.disk_errors;
     }
-    // The folder its entries must lie in (util::touch_file_in, remove_file_in), resolved once.
+    // The folder its entries must lie in (util::touch_file_in, remove_file_in), resolved once. On Windows the entries'
+    // final paths are compared with it: a folder whose final path cannot be read (no \\?\ form) would refuse every
+    // touch and removal, and the cache would never trim, so it is not used.
     if (!disk_dir_.empty()) disk_dir_resolved_ = util::resolved_path(disk_dir_);
+#ifdef _WIN32
+    if (!disk_dir_.empty() && disk_dir_resolved_.native().rfind(LR"(\\?\)", 0) != 0) {
+      disk_dir_.clear();
+      ++stats_.disk_errors;
+    }
+#endif
   }
 }
 
@@ -286,7 +294,7 @@ std::shared_ptr<const Embedding> EmbeddingCache::read_disk(const EmbeddingKey& k
     ++(stats_.*field);
   };
   const auto reject = [&] {
-    util::remove_file_in(disk_dir_resolved_, path);
+    if (!util::remove_file_in(disk_dir_resolved_, path)) count(&EmbeddingCacheStats::disk_errors);
     count(&EmbeddingCacheStats::disk_rejects);
     return nullptr;
   };
@@ -336,7 +344,7 @@ std::shared_ptr<const Embedding> EmbeddingCache::read_disk(const EmbeddingKey& k
     return reject();
   }
   if (tokens != key.tokens) return nullptr;
-  util::touch_file_in(disk_dir_resolved_, path);  // disk LRU recency
+  if (!util::touch_file_in(disk_dir_resolved_, path)) count(&EmbeddingCacheStats::disk_errors);  // disk LRU recency
   return value;
 }
 
@@ -400,7 +408,12 @@ void EmbeddingCache::trim_disk() {
   std::sort(files.begin(), files.end(), [](const File& a, const File& b) { return a.time < b.time; });
   for (const File& f : files) {
     if (total <= max_disk_bytes_) break;
-    if (util::remove_file_in(disk_dir_resolved_, f.path)) total -= f.size;
+    if (util::remove_file_in(disk_dir_resolved_, f.path)) {
+      total -= f.size;
+    } else {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++stats_.disk_errors;
+    }
   }
 }
 
