@@ -1347,8 +1347,9 @@ MOSSINFER_API mi_status mi_run_query(const mi_engine* engine, mi_run_info* out);
 MOSSINFER_API const float* mi_run_sigmas(const mi_engine* engine, size_t* count);
 /* Makes caller-owned host memory the run's staging block, e.g. a shared-memory region another process also maps.
  * Call after mi_run_begin() and before the first mi_denoise_step() (refused once one has been called, whatever its
- * status), once per run. `base`: page-aligned (4096); `bytes` >= mi_run_info.staging_bytes. The engine registers it as
- * pinned (cudaHostRegister, portable) and lays x, out[] and control out at the same offsets as its own block;
+ * status), once per run. `base`: page-aligned (4096); `bytes` >= mi_run_info.staging_bytes. The engine registers the
+ * pages the layout uses as pinned (cudaHostRegister, portable; memory the caller registered already is used as it is
+ * and stays registered) and lays x, out[] and control out at the same offsets as its own block;
  * mi_run_staging() then returns views into it (offset = view.data - base). The memory must stay mapped until
  * mi_run_end(), which unregisters it. MI_ERR_NOT_SUPPORTED when the registration is refused (e.g. some Windows
  * file-mapping views): the engine's own staging stays in use, and the caller copies into it. Not a job a cancel

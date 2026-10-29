@@ -195,7 +195,8 @@ struct Session::Run {
   std::unique_ptr<runtime::DevicePointerCheck> check;
   std::vector<char> stepped;  // steps with a completed call
   bool step_called = false;   // a step call started (adopt_staging is refused from then on)
-  bool adopted = false;       // `block` is the caller's memory, registered by adopt_staging (unregistered at the end)
+  bool adopted = false;       // `block` is the caller's memory (adopt_staging)
+  bool registered = false;    // adopt_staging registered it as pinned (unregistered at the end)
   std::chrono::steady_clock::time_point started;
 };
 
@@ -789,14 +790,22 @@ void Session::adopt_staging(void* base, std::size_t bytes) {
   }
   if (R.adopted) throw std::invalid_argument("The run has adopted a staging block already.");
   if (R.step_called) throw std::invalid_argument("A staging block is adopted before the run's first step only.");
-  const cudaError_t e = cudaHostRegister(base, bytes, cudaHostRegisterPortable);
-  if (e != cudaSuccess) {
+  // Only what the layout uses is pinned (whole pages, within the caller's bytes). Memory the caller registered already
+  // is used as it is: neither registered nor unregistered here.
+  const std::size_t pinned = std::min(bytes, (R.layout.bytes + kPage - 1) / kPage * kPage);
+  const cudaError_t e = cudaHostRegister(base, pinned, cudaHostRegisterPortable);
+  if (e != cudaSuccess && e != cudaErrorHostMemoryAlreadyRegistered) {
     cudaGetLastError();  // not sticky: clear it, the run's own staging stays in use
     throw StagingNotPinned(std::string("The memory could not be registered as pinned (cudaHostRegister: ") +
                            cudaGetErrorString(e) + "): the run's own staging stays in use.");
   }
-  R.block = runtime::StagingBlock{static_cast<std::byte*>(base), bytes, false};
-  R.adopted = true;
+  if (e != cudaSuccess) cudaGetLastError();
+  // staging() and run_info() read the block under the gate.
+  s.gate.locked([&] {
+    R.block = runtime::StagingBlock{static_cast<std::byte*>(base), pinned, false};
+    R.adopted = true;
+    R.registered = e == cudaSuccess;
+  });
 }
 
 StepReport Session::step(const StepArgs& a) {
@@ -1037,7 +1046,7 @@ RunResult Session::State::finish_run() {
   CallScope scope(m, r);
   sync_quietly(m.streams.compute());
   clear_dit();
-  if (R.adopted && cudaHostUnregister(R.block.base) != cudaSuccess) cudaGetLastError();  // the caller's memory, idle now
+  if (R.registered && cudaHostUnregister(R.block.base) != cudaSuccess) cudaGetLastError();  // the caller's, idle now
   const int n = R.schedule->steps();
   if (R.cache) {
     r.accel.dit_calls = R.cache->calls();
