@@ -29,6 +29,10 @@ namespace kn = kernels::nvfp4;
 constexpr std::int64_t kD = 3072, kH = 24, kHd = 128, kF = 8192;
 static_assert(kFusedBigCols * 2 >= kF * 2 + kF, "the INT8 ffn_down input must fit next to the fused ffn output");
 static_assert(kInt4UnpackBytes >= 2 * kF * kD && kInt4UnpackBytes >= kD * kF, "every INT4 block weight fits unpacked");
+// Rows of a run from which the 8-bit attention takes QK-norm + RoPE into its pre-pass. Measured on sm_89 (prep +
+// attention, q8_fp8, 24 heads; separate vs fused): 256 rows 0.061 vs 0.091 ms, 2 x 1039 0.379 vs 0.396, 3 x 1039
+// 0.590 vs 0.559, 4111 1.815 vs 1.784, 2 x 4111 2.872 vs 2.633, 2 x 16399 33.50 vs 32.59.
+constexpr std::int64_t kFusedNormRopeMinTokens = 3072;
 // SDPA's default scale 1/sqrt(head_dim), computed in double and rounded once as torch does (as moss_dit.cpp).
 const float kScale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHd)));
 attention_q8::Variant variant_of(AttentionMode m) {
@@ -417,16 +421,26 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
       }
     }
   }
-  kernels::fused::qk_norm_rope_moss(qkv, static_cast<int>(kH), w.q_norm, w.k_norm, a.rope.slice0(run.t0, run.t1), stream);
+  const Tensor rope = a.rope.slice0(run.t0, run.t1);
+  // QK-norm + RoPE inside the 8-bit attention's pre-pass (the bits of qk_norm_rope_moss first; q stays un-normed) from
+  // kFusedNormRopeMinTokens rows on; below that its one CTA per (512-token chunk, head, row) underfills the GPU and
+  // the separate kernels are faster (both give the same bits). Only when attention reads k and v from this qkv with
+  // cu_seqlens_q == cu_seqlens_k and nothing reads the normed k first: no reference slots (kv is then the slotted
+  // region, with cu_seqlens_k) and no K/V tap (it copies the normed, roped k). Otherwise qk_norm_rope_moss runs before
+  // the tap and attention_q8 gets no norm_rope.
+  const bool fused_norm_rope = attention != AttentionMode::kExact && slots == 0 && run.kv_tap == nullptr &&
+                               m >= kFusedNormRopeMinTokens;
+  if (!fused_norm_rope) kernels::fused::qk_norm_rope_moss(qkv, static_cast<int>(kH), w.q_norm, w.k_norm, rope, stream);
   if (run.kv_tap != nullptr) {
     tap_reference_kv(qkv, run.kv_tap, stream);
     if (run.tap_only) return;
   }
   const Tensor& cu_k = slots == 0 ? run.cu_seqlens : run.cu_seqlens_k;
   if (attention != AttentionMode::kExact) {
+    const attention_q8::QkNormRope norm_rope{w.q_norm, w.k_norm, rope};
     attention_q8::attention_q8(q8_options(attention), heads(qkv, 0), heads(kv, kD), heads(kv, 2 * kD), heads(attn, 0),
                                run.cu_seqlens, cu_k, run.max_seqlen, kScale, qa.attn_workspace, qa.attn_workspace_bytes,
-                               stream);
+                               stream, fused_norm_rope ? &norm_rope : nullptr);
   } else {
     attention::flash_fwd(heads(qkv, 0), heads(kv, kD), heads(kv, 2 * kD), heads(attn, 0), run.cu_seqlens, cu_k,
                          run.max_seqlen, false, kScale, a.lse, a.lse_bytes, stream);

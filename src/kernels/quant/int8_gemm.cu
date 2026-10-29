@@ -1,4 +1,5 @@
 // Shared checks, tile choice and the plain INT8 GEMM (see quant.h).
+#include <algorithm>
 #include <atomic>
 #include <climits>
 #include <string>
@@ -14,21 +15,39 @@ using kernels::detail::fail;
 // No shared alignment helper exists (kernels/basic/detail.h has none); rotate_quantize.cu has its own aligned().
 bool aligned16(const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16 == 0; }
 
-// SMs of the current device, cached per device (int8_tile_for runs on every launch).
-int sm_count() {
+// A device attribute of the current device, cached per device (int8_tile_for and int8_band run on every launch).
+template <cudaDeviceAttr kAttr>
+int device_attribute() {
   constexpr int kMaxDevices = 64;
   static std::atomic<int> cached[kMaxDevices];
   int dev = 0;
   MI_CUDA_CHECK(cudaGetDevice(&dev));
   int n = dev >= 0 && dev < kMaxDevices ? cached[dev].load(std::memory_order_relaxed) : 0;
   if (n == 0) {
-    MI_CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
+    MI_CUDA_CHECK(cudaDeviceGetAttribute(&n, kAttr, dev));
     if (dev >= 0 && dev < kMaxDevices) cached[dev].store(n, std::memory_order_relaxed);
   }
   return n;
 }
 
+int sm_count() { return device_attribute<cudaDevAttrMultiProcessorCount>(); }
+
 }  // namespace
+
+int int8_band(const Problem& p, int tile_n) {
+  // Measured on sm_89 (64 MiB L2) at the DiT shapes, steady state at the 175 W cap: at M = 32798 (2048^2 with CFG)
+  // the wide bands run qkv 4.6 %, up_gate 7 %, down 3.7 %, o 1.3 % faster than the identity order (less DRAM traffic
+  // under the power cap). At M = 8222 (1024^2) qkv, o and up_gate (24 MiB activations) keep the identity order (the
+  // orders are within ~1-4 % either way there); ffn_down (64 MiB, over the floor) bands: 1.66 -> 1.61 ms. sm_80, sm_86
+  // and sm_120 (96 MiB L2: its 1024^2 ffn_down stays on the identity order) are unmeasured.
+  constexpr int kIdentity = 8;
+  const std::int64_t l2 = device_attribute<cudaDevAttrL2CacheSize>();
+  const std::int64_t activation = static_cast<std::int64_t>(p.m) * p.k;
+  if (activation <= std::max<std::int64_t>(l2 * 3 / 4, std::int64_t{48} << 20)) return kIdentity;
+  const std::int64_t band = l2 / 2 / (static_cast<std::int64_t>(tile_n) * p.k);
+  const std::int64_t n_tiles = (p.n + tile_n - 1) / tile_n;
+  return static_cast<int>(std::min(std::max<std::int64_t>(band, kIdentity), n_tiles));
+}
 
 Problem check_operands(const char* op, const Int8Operands& a) {
   if (a.m < 0 || a.n <= 0 || a.k <= 0 || a.m > INT32_MAX || a.n > INT32_MAX || a.k > kMaxInt8GemmK) {

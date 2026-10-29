@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 
 #include "core/cuda_check.h"
@@ -23,7 +24,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/default_gemm_universal_with_visitor.h"
 #include "cutlass/layout/permute.h"
-#include "kernels/fused/fused_gemm_impl.cuh"  // situ_value, kUpGateGroup, UpGatePermuteB
+#include "kernels/fused/fused_gemm_impl.cuh"  // situ_gate_factor, situ_hidden_factor, kUpGateGroup, UpGatePermuteB
 // The visitor headers rely on the GEMM and epilogue headers above being included first.
 #include "cutlass/epilogue/threadblock/fusion/visitors.hpp"
 #include "kernels/basic/detail.h"
@@ -73,8 +74,10 @@ __device__ __forceinline__ float dequant(float acc, float xs, float ws, float bi
   return add(mul(mul(acc, xs), ws), bias);
 }
 
-// MOSS _situ on bf16 values and the ffn_up_gate column permutation of the bf16 fused GEMMs, reused as they are.
-using fused::detail::situ_value;
+// MOSS _situ's factors on bf16 values and the ffn_up_gate column permutation of the bf16 fused GEMMs, reused as they
+// are.
+using fused::detail::situ_gate_factor;
+using fused::detail::situ_hidden_factor;
 using fused::detail::kUpGateGroup;
 using fused::detail::UpGatePermuteB;
 
@@ -108,13 +111,52 @@ CUTLASS_HOST_DEVICE int up_gate_row(int n, int half) {
   return ((n / kUpGateGroup) % 2) * half + (n / (2 * kUpGateGroup)) * kUpGateGroup + n % kUpGateGroup;
 }
 
+// SiTU's two bf16 factors (fused::detail::situ_gate_factor / situ_hidden_factor) tabulated for every bf16 input,
+// indexed by the input's bits: computed on the device by the same code (int8_gemm_situ.cu), so a lookup is the
+// computation bit for bit, NaN and inf inputs included. The epilogue's transcendentals (two tanhf, an expf and an
+// IEEE division per output) otherwise serialize after the main loop: ~12 % of the GEMM's time on sm_89.
+struct SituFactorTables {
+  // No defaults; SituGluNode::to_underlying_arguments throws on a null table (an argument list that leaves them out).
+  const std::uint16_t* gate;    // [65536] bf16 bits of situ_gate_factor(g)
+  const std::uint16_t* hidden;  // [65536] bf16 bits of situ_hidden_factor(h)
+};
+
+// The tables (static device memory of int8_gemm_situ.cu), filled on `stream` the first time per device (int8_gemm_situ.cu
+// says how): before every launch of a SituGlu epilogue (int8_gemm_situ_glu, quant4::int4_gemm_situ_glu).
+SituFactorTables situ_factor_tables(cudaStream_t stream);
+
+// A bf16-representable float's bits (exact: its low 16 bits are zero) and back.
+__device__ __forceinline__ std::uint32_t bf16_index(float v) { return __float_as_uint(v) >> 16; }
+__device__ __forceinline__ float bf16_entry(const std::uint16_t* table, std::uint32_t i) {
+  return __uint_as_float(static_cast<std::uint32_t>(__ldg(table + i)) << 16);
+}
+
 // The int8_gemm_situ_glu epilogue node: an access of 8 accumulator columns [8j, 8j + 8) = hidden 4j..4j+3 then gate
 // 4j..4j+3 gives 4 bf16 results, returned as their 8 bytes (the store writes them at byte column 8j of the output
-// declared as bytes, i.e. bf16 column 4j of [M, F]).
-struct SituGluNode : cutlass::epilogue::threadblock::VisitorImpl2x<> {
-  using VisitorImpl2x<>::VisitorImpl2x;
+// declared as bytes, i.e. bf16 column 4j of [M, F]). situ_value(h, g) = gate factor * hidden factor, from the tables.
+struct SituGluNode {
+  using Arguments = SituFactorTables;
+  using Params = Arguments;
+  struct SharedStorage {};
+
+  template <class ProblemShape>
+  static Params to_underlying_arguments(ProblemShape const&, Arguments const& args, void*) {
+    if (args.gate == nullptr || args.hidden == nullptr) {
+      throw std::invalid_argument("mi::kernels::quant: the SiTU-GLU epilogue needs situ_factor_tables()");
+    }
+    return args;
+  }
+  template <class ProblemShape>
+  static size_t get_workspace_size(ProblemShape const&, Arguments const&) {
+    return 0;
+  }
+
+  CUTLASS_HOST_DEVICE SituGluNode() {}
+  CUTLASS_HOST_DEVICE SituGluNode(Params const& params, SharedStorage const&) : params_ptr(&params) {}
+  Params const* params_ptr = nullptr;
 
   struct Callbacks : cutlass::epilogue::threadblock::EmptyCallbacks {
+    SituFactorTables t;
     template <class ElementAccumulator, class ElementXs, class ElementWs, int kFrag>
     CUTLASS_DEVICE cutlass::Array<std::uint8_t, kFrag> visit(int, int, int, int,
                                                             cutlass::Array<ElementAccumulator, kFrag> const&,
@@ -130,7 +172,8 @@ struct SituGluNode : cutlass::epilogue::threadblock::VisitorImpl2x<> {
         // The GEMM output is a bf16 tensor in the reference: round both halves before SiTU.
         const float h = rbf(dequant(__int2float_rn(acc[i]), xs[i], ws[i], 0.0f));
         const float gt = rbf(dequant(__int2float_rn(acc[g]), xs[g], ws[g], 0.0f));
-        words[i] = __bfloat16_as_ushort(__float2bfloat16_rn(situ_value(h, gt)));
+        const float v = mul(bf16_entry(t.gate, bf16_index(gt)), bf16_entry(t.hidden, bf16_index(h)));
+        words[i] = __bfloat16_as_ushort(__float2bfloat16_rn(v));
       }
       return out;
     }
@@ -138,7 +181,9 @@ struct SituGluNode : cutlass::epilogue::threadblock::VisitorImpl2x<> {
 
   template <class ProblemShape>
   CUTLASS_DEVICE auto get_callbacks(cutlass::gemm::GemmCoord, int, ProblemShape) {
-    return Callbacks();
+    Callbacks c;
+    c.t = *params_ptr;
+    return c;
   }
 };
 
@@ -213,8 +258,37 @@ struct UpGateScaleBroadcast {
   }
 };
 
+// Order of the output tiles over the CTAs (the kernel's threadblock swizzle): bands of `band` adjacent N tiles; within
+// a band the band's N tiles of one M tile are consecutive CTAs, then the next M tile's. The weight tiles of a band
+// stay in L2 while the activation streams through once per band. band = 8 is GemmIdentityThreadblockSwizzle<8>'s
+// order. The grid is (M tiles, N tiles), linearized x first (the order CTAs are launched in); the band travels in
+// the params' swizzle_log_tile (Int8Gemm::set_band). The tile order never changes a result: every output tile is
+// still one CTA's exact int32 sum and the same epilogue.
+struct BandedSwizzle {
+  using GemmCoord = cutlass::gemm::GemmCoord;
+  CUTLASS_HOST_DEVICE BandedSwizzle() {}
+  CUTLASS_HOST_DEVICE static GemmCoord get_tiled_shape(GemmCoord problem, GemmCoord tile, int split_k_slices) {
+    return {(problem.m() + tile.m() - 1) / tile.m(), (problem.n() + tile.n() - 1) / tile.n(), split_k_slices};
+  }
+  CUTLASS_HOST_DEVICE static dim3 get_grid_shape(GemmCoord tiled) { return dim3(tiled.m(), tiled.n(), tiled.k()); }
+  CUTLASS_HOST_DEVICE static int get_log_tile(GemmCoord) { return 8; }
+  CUTLASS_DEVICE static GemmCoord get_tile_offset(int band) {
+    const long long m_tiles = gridDim.x, n_tiles = gridDim.y;
+    const long long id = blockIdx.y * m_tiles + blockIdx.x, per_band = m_tiles * band;
+    const long long b = id / per_band, r = id - b * per_band;
+    const long long width = min(static_cast<long long>(band), n_tiles - b * band);
+    return {static_cast<int>(r / width), static_cast<int>(b * band + r % width), static_cast<int>(blockIdx.z)};
+  }
+};
+
+// GemmUniversalAdapter without the operand transposition (never needed here: row-major D) plus the band setter.
+template <class Kernel>
+struct Int8Gemm : cutlass::gemm::device::GemmUniversalBase<Kernel> {
+  void set_band(int band) { this->params_.swizzle_log_tile = band; }
+};
+
 // The kernel: DefaultGemmWithVisitor (default_gemm_universal_with_visitor.h) with a B-operand permutation, without
-// the stream-K selection.
+// the stream-K selection, in BandedSwizzle's tile order (GemmBase keeps CUTLASS's swizzle: only its Mma is used).
 template <class Tile, class Callbacks, class PermuteB = cutlass::layout::NoPermute>
 struct Int8Kernel {
   using GemmBase = typename cutlass::gemm::kernel::DefaultGemmUniversal<
@@ -226,8 +300,8 @@ struct Int8Kernel {
       cutlass::layout::NoPermute, cutlass::layout::NoPermute, PermuteB>::GemmKernel;
   using Epilogue =
       cutlass::epilogue::threadblock::EpilogueWithVisitorCallbacks<typename GemmBase::Epilogue, Callbacks, 1>;
-  using Kernel = cutlass::gemm::kernel::GemmWithEpilogueVisitor<typename GemmBase::Mma, Epilogue, Swizzle>;
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+  using Kernel = cutlass::gemm::kernel::GemmWithEpilogueVisitor<typename GemmBase::Mma, Epilogue, BandedSwizzle>;
+  using Gemm = Int8Gemm<Kernel>;
 };
 
 // Visitor nodes of one tile configuration.
@@ -270,6 +344,11 @@ Int8Tile resolve_tile(Int8Tile tile, const Problem& p);
 
 void check_status(cutlass::Status status, const char* op, const char* stage);
 
+// BandedSwizzle's band for an m x n x k problem in tiles of tile_n columns: 8 (the identity order) while the
+// activation fits in three quarters of L2 (or 48 MiB on smaller L2s: comfy-kitchen's measured crossovers for its banded
+// order), else as many N tiles as half of L2 holds, at least 8.
+int int8_band(const Problem& p, int tile_n);
+
 template <class Gemm>
 void launch(const char* op, const Problem& p, const Int8Operands& a,
             const typename Gemm::GemmKernel::FusionCallbacks::Arguments& cb, cudaStream_t stream) {
@@ -281,6 +360,7 @@ void launch(const char* op, const Problem& p, const Int8Operands& a,
   // define NDEBUG.
   if (Gemm::get_workspace_size(args) != 0) check_status(cutlass::Status::kErrorWorkspaceNull, op, "workspace");
   check_status(gemm.initialize(args, nullptr, stream), op, "initialize");
+  gemm.set_band(int8_band(p, Gemm::GemmKernel::Mma::Shape::kN));
   check_status(gemm.run(stream), op, "run");
   MI_CUDA_CHECK_LAUNCH();
 }

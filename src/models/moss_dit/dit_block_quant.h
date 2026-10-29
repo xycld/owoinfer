@@ -26,7 +26,9 @@
 //   LoRA GEMMs, Δ is rounded to bf16 once before the add.
 //   bf16 linear: exactly what run_block_fused does for it (cuBLASLt QKV; o / up_gate / down fused or op by op as the
 //   route says), so a file that keeps some linears bf16 runs them as the Reference tier does.
-//   QK-norm + RoPE: the fused kernel (kernels/fused/qk_norm_rope.h), as the bf16 block.
+//   QK-norm + RoPE: the fused kernel (kernels/fused/qk_norm_rope.h), as the bf16 block; with 8-bit attention the
+//   same bits inside attention_q8's pre-pass from 3072 rows on without reference slots or K/V tap
+//   (attention_q8::QkNormRope: q is then left un-normed).
 //   Runtime LoRA (P6 step 42): an active side-branch site adds Δ = Σ s_i B_i (A_i x) inside its GEMM (kernels/lora).
 //   An INT4 site runs the INT8 LoRA GEMM on its operands unpacked to INT8 (unpack_int4): the int32 dot products and
 //   the epilogue are the INT4 GEMM's, so the base result is bit for bit the plain INT4 one (at INT8 GEMM speed).

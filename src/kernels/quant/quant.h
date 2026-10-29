@@ -100,7 +100,10 @@ void int8_gemm_gated_residual(const Int8Operands& op, const __nv_bfloat16* bias,
 // y the bf16 int8_gemm output (no bias): both halves rounded to bf16, then MOSS _situ in the op order of
 // kernels::situ_glu. The [m, 2F] intermediate is never stored. The GEMM reads w's rows (and w_scale) permuted so that
 // each epilogue access holds 4 hidden columns and their 4 gate columns: F % 4 == 0. out: bf16 [m, F], row stride
-// ldo, 8-byte aligned, ldo % 4 == 0.
+// ldo, 8-byte aligned, ldo % 4 == 0. The epilogue reads SiTU's two bf16 factors from tables over every bf16 input
+// (256 KiB of static device memory, filled once per device by a small kernel: the first call outside a stream
+// capture fills them on `stream` and synchronizes it, the one host synchronization of these kernels): the same bits
+// as computing them.
 void int8_gemm_situ_glu(const Int8Operands& op, __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream,
                         Int8Tile tile = Int8Tile::kAuto);
 

@@ -16,7 +16,7 @@ void situ_glu(const Problem& p, const Int4Operands& a, __nv_bfloat16* out, std::
   auto* d = reinterpret_cast<std::uint8_t*>(out);
   const std::int64_t ldd = 2 * ldo;
   const typename N::SituGlu::Arguments cb{
-      {{}, {const_cast<float*>(a.x_scale), 0.f, {_1{}, _0{}, p.m}}, {a.w_scale}, {}},
+      {{}, {const_cast<float*>(a.x_scale), 0.f, {_1{}, _0{}, p.m}}, {a.w_scale}, quant::detail::situ_factor_tables(stream)},
       {d, {ldd, _1{}, ldd * p.m}}};
   launch<Gemm>("quant4::int4_gemm_situ_glu", p, a, cb, stream);
 }

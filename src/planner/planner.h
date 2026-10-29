@@ -291,7 +291,9 @@ struct Budgets {
   // Explicit cap on this process's device memory as NVML reports it (CUDA context included); 0 = auto
   // (vram_free - vram_reserve).
   std::size_t vram_budget = 0;
-  std::size_t context_bytes = std::size_t{512} << 20;  // device memory held outside the arena (context, modules)
+  // Device memory held outside the arena: the context and the loaded modules, their static device memory included
+  // (kernels/quant's SiTU factor tables, 256 KiB; counted here, not added, so plans stay as they were).
+  std::size_t context_bytes = std::size_t{512} << 20;
   std::size_t host_available = 0;     // host RAM the process can still get (Linux MemAvailable)
   std::size_t host_private_now = 0;   // the process's private memory before the generation (baseline)
   std::size_t host_budget = 0;        // explicit cap on host private memory; 0 = the mode's target

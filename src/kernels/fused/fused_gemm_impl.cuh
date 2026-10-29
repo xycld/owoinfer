@@ -55,13 +55,16 @@ using kernels::detail::mul;
 using kernels::detail::rbf;
 using kernels::detail::sigmoid_f32;
 
-// MOSS _situ (P:66-67) on bf16 values, the op order of kernels/basic/elementwise.cu situ_value.
-__device__ __forceinline__ float situ_value(float h, float g) {
-  constexpr float kInv25 = 1.0f / 25.0f;  // torch divides by a CPU scalar as a multiply by its fp32 reciprocal
-  const float left = rbf(mul(rbf(mul(4.0f, rbf(tanhf(rbf(mul(g, 0.25f)))))), rbf(sigmoid_f32(g))));
-  const float right = rbf(mul(25.0f, rbf(tanhf(rbf(mul(h, kInv25))))));
-  return mul(left, right);
+// MOSS _situ (P:66-67) on bf16 values, the op order of kernels/basic/elementwise.cu situ_value: the bf16 gate
+// factor of g times the bf16 hidden factor of h, in fp32.
+__device__ __forceinline__ float situ_gate_factor(float g) {
+  return rbf(mul(rbf(mul(4.0f, rbf(tanhf(rbf(mul(g, 0.25f)))))), rbf(sigmoid_f32(g))));
 }
+__device__ __forceinline__ float situ_hidden_factor(float h) {
+  constexpr float kInv25 = 1.0f / 25.0f;  // torch divides by a CPU scalar as a multiply by its fp32 reciprocal
+  return rbf(mul(25.0f, rbf(tanhf(rbf(mul(h, kInv25))))));
+}
+__device__ __forceinline__ float situ_value(float h, float g) { return mul(situ_gate_factor(g), situ_hidden_factor(h)); }
 
 __device__ __forceinline__ std::uint16_t bf16_bits_rn(float v) {
   return __bfloat16_as_ushort(__float2bfloat16_rn(v));

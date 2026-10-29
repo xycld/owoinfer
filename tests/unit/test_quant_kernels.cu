@@ -745,6 +745,17 @@ TEST(GpuQuantKernels, Int8GemmMatchesOracleAtModelShapes) {
   }
 }
 
+// The banded tile order with bands wider than 8 and a short last band: a 75 MiB activation (over 3/4 of any L2 up to
+// 96 MiB) bands at 128x256 tiles in L2 / 2 / (256 * 8192) N tiles, 16 on 64 MiB (40 = 16 + 16 + 8), 24 on 96 MiB
+// (24 + 16). Every epilogue against the oracle on rows spread over every M tile.
+TEST(GpuQuantKernels, Int8GemmWideBandsMatchOracle) {
+  GemmData d(9600, 10240, 8192, 77);
+  std::vector<int> rows;
+  for (int r = 0; r < 9600; r += 37) rows.push_back(r);
+  rows.push_back(9599);
+  check_gemm_against_oracle(d, rows, {Int8Tile::kAuto, Int8Tile::k128x256x64, Int8Tile::k256x128x64}, true, "wide bands");
+}
+
 // Row counts that are not tile multiples: 1, every M in 17..400 (small N/K, all rows), and tile-boundary row counts
 // at the DiT N/K with every tile.
 TEST(GpuQuantKernels, Int8GemmEdgeShapes) {
@@ -765,6 +776,50 @@ TEST(GpuQuantKernels, Int8GemmEdgeShapes) {
   quant::Int8Operands empty = one_group.ops();
   empty.m = 0;
   EXPECT_NO_THROW(quant::int8_gemm(empty, nullptr, as_bf16(out), 8, nullptr));
+}
+
+// The SiTU-GLU epilogue reads SiTU's two factors from tables over every bf16 input: every value goes through it.
+// acc = 1 in every column (x = e_0, every weight row e_0) and x_scale = 1, so the dequantized up_gate value of column c
+// is w_scale[c] exactly and w_scale places any bf16 value, NaN and inf included, in the hidden or the gate half.
+// Passes: every hidden value against gate 1, every gate value against hidden 1, every hidden value against a
+// permutation of every gate value. Against kernels::situ_glu on the same bf16 [1, 2F] values, bit for bit.
+TEST(GpuQuantKernels, Int8GemmSituGluEveryBf16Value) {
+  constexpr std::int64_t F = 65536, n = 2 * F, k = 16;
+  std::vector<std::int8_t> xh(k, 0), wh(static_cast<std::size_t>(n * k), 0);
+  xh[0] = 1;
+  for (std::int64_t i = 0; i < n; ++i) wh[static_cast<std::size_t>(i * k)] = 1;
+  Buf<std::int8_t> x(xh), w(wh);
+  Buf<float> xs(std::vector<float>{1.0f});
+  const std::uint16_t one = bf16_bits(1.0f);
+  for (int pass = 0; pass < 3; ++pass) {
+    std::vector<float> ws(static_cast<std::size_t>(n));
+    std::vector<std::uint16_t> y(static_cast<std::size_t>(n));
+    for (std::int64_t i = 0; i < F; ++i) {
+      const auto all = static_cast<std::uint16_t>(i), perm = static_cast<std::uint16_t>((i * 40503 + 12345) & 0xFFFF);
+      const std::uint16_t h = pass == 1 ? one : all, g = pass == 0 ? one : pass == 1 ? all : perm;
+      const auto at = static_cast<std::size_t>(i);
+      ws[at] = bf16_float(h);
+      ws[at + F] = bf16_float(g);
+      // The dequantization adds the zero bias: -0 arrives as +0.
+      y[at] = bf16_bits(ws[at] + 0.0f);
+      y[at + F] = bf16_bits(ws[at + F] + 0.0f);
+    }
+    Buf<float> wsb(ws);
+    Buf<std::uint16_t> yb(y), got(static_cast<std::size_t>(F)), ref(static_cast<std::size_t>(F));
+    quant::Int8Operands o;
+    o.x_q = x.get();
+    o.ldx = k;
+    o.x_scale = xs.get();
+    o.w = w.get();
+    o.w_scale = wsb.get();
+    o.m = 1;
+    o.n = n;
+    o.k = k;
+    quant::int8_gemm_situ_glu(o, as_bf16(got), F, nullptr);
+    mi::kernels::situ_glu(view_bf16(yb.get(), 1, n), view_bf16(ref.get(), 1, F), nullptr);
+    MI_CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(count_diff(got.download(), ref.download()), 0u) << "pass " << pass;
+  }
 }
 
 // Padded row strides everywhere (ldx > k, ldo > n, ldr > n, SiTU ldo > F) and K = 272: 4 full 64-deep k-tiles (2 of

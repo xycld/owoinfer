@@ -27,6 +27,7 @@
 #include "core/tensor.h"
 #include "core/varlen.h"
 #include "kernels/attention_q8/attention_q8.h"
+#include "kernels/fused/qk_norm_rope.h"
 #include "reference_gpu.h"
 #include "util/npy.h"
 
@@ -504,6 +505,126 @@ TEST(GpuAttentionQ8, StridedQkvViewsMatchContiguous) {
     MI_CUDA_CHECK(cudaMemcpy2D(got.data(), hd * 2, wide_out.get(), 2 * hd * 2, hd * 2, n, cudaMemcpyDeviceToHost));
     EXPECT_EQ(got, want) << q8::variant_name(v);
   }
+}
+
+// The QK-norm + RoPE prologue (QkNormRope) equals kernels::fused::qk_norm_rope_moss on the fused QKV columns followed
+// by attention_q8, bit for bit: the output and k (rewritten in place) for every variant. The run sits `skip` rows into
+// a larger QKV buffer and rope table (a crop / a later run of a forward: its pointers are offsets), the table rows
+// are `table_row` apart, and with `specials` some q, k, v elements are NaN, +-Inf and bf16 denormals.
+void check_norm_rope_prologue(const std::vector<int>& seqlens, std::int64_t skip, std::int64_t table_row, bool specials,
+                              const std::string& label) {
+  const Problem p = make_problem(24, 24, seqlens);
+  Buffers buf(p);
+  buf.fill_random(p, 41);
+  const std::int64_t n = p.total(), rows = n + skip, hd = p.heads * kDim;
+  mi::DeviceBuffer qkv(static_cast<std::size_t>(rows * 3 * hd * 2)), sep(qkv.size()), fused(qkv.size()),
+      norms(2 * kDim * 2), table(static_cast<std::size_t>(rows * table_row * 2));
+  MI_CUDA_CHECK(cudaMemset(qkv.get(), 0, qkv.size()));
+  for (int i = 0; i < 3; ++i) {
+    const auto& src = i == 0 ? buf.q : i == 1 ? buf.k : buf.v;
+    MI_CUDA_CHECK(cudaMemcpy2D(static_cast<char*>(qkv.get()) + (skip * 3 * hd + i * hd) * 2, 3 * hd * 2, src.get(),
+                               hd * 2, hd * 2, n, cudaMemcpyDeviceToDevice));
+  }
+  if (specials) {
+    const std::uint16_t vals[] = {0x7FC0, 0xFFC1, 0x7F80, 0xFF80, 0x0001, 0x8003, 0x007F, 0x0000, 0x8000};
+    int j = 0;
+    for (std::int64_t r = skip + 3; r < rows; r += 97) {
+      for (int col : {5, 130, 3 * 128 + 64, 24 * 128 + 7, 24 * 128 + 200, 48 * 128 + 9, 48 * 128 + 1000}) {
+        const std::uint16_t v = vals[j++ % 9];
+        MI_CUDA_CHECK(cudaMemcpy(static_cast<char*>(qkv.get()) + (r * 3 * hd + col) * 2, &v, 2, cudaMemcpyHostToDevice));
+      }
+    }
+  }
+  auto* nw = static_cast<__nv_bfloat16*>(norms.get());
+  fill_bf16<<<1, 256>>>(nw, 2 * kDim, 2 * kDim, 7, 0.3f, 1.f);
+  fill_bf16<<<1024, 256>>>(static_cast<__nv_bfloat16*>(table.get()), rows * table_row, static_cast<int>(table_row), 8,
+                           0.6f, 0.f);
+  MI_CUDA_CHECK_LAUNCH();
+  const Tensor q_norm = Tensor::view(nw, DType::kBF16, Device::kCUDA, {kDim});
+  const Tensor k_norm = Tensor::view(nw + kDim, DType::kBF16, Device::kCUDA, {kDim});
+  Tensor tab = Tensor::view(static_cast<char*>(table.get()) + skip * table_row * 2, DType::kBF16, Device::kCUDA, {n, kDim});
+  tab.stride[0] = table_row;
+  const auto base = [&](const mi::DeviceBuffer& b) { return static_cast<char*>(b.get()) + skip * 3 * hd * 2; };
+  const auto view = [&](const mi::DeviceBuffer& b, std::int64_t col) {
+    Tensor t = Tensor::view(base(b) + col * 2, DType::kBF16, Device::kCUDA, {n, p.heads, kDim});
+    t.stride[0] = 3 * hd;
+    return t;
+  };
+  const auto k_cols = [&](const mi::DeviceBuffer& b) {
+    std::vector<std::uint16_t> h(static_cast<std::size_t>(n * hd));
+    MI_CUDA_CHECK(cudaMemcpy2D(h.data(), hd * 2, base(b) + hd * 2, 3 * hd * 2, hd * 2, n, cudaMemcpyDeviceToHost));
+    return h;
+  };
+  for (Variant v : kVariants) {
+    if (!runnable(v)) continue;
+    const std::string tag = label + " " + q8::variant_name(v);
+    MI_CUDA_CHECK(cudaMemcpy(sep.get(), qkv.get(), qkv.size(), cudaMemcpyDeviceToDevice));
+    MI_CUDA_CHECK(cudaMemcpy(fused.get(), qkv.get(), qkv.size(), cudaMemcpyDeviceToDevice));
+    Tensor qkv_sep = Tensor::view(base(sep), DType::kBF16, Device::kCUDA, {n, 3 * hd});
+    mi::kernels::fused::qk_norm_rope_moss(qkv_sep, p.heads, q_norm, k_norm, tab, nullptr);
+    q8::attention_q8({v}, view(sep, 0), view(sep, hd), view(sep, 2 * hd), buf.tout(p), buf.tcu(p), buf.tcu(p),
+                     p.max_seqlen(), p.scale(), buf.ws.get(), buf.ws.size(), nullptr);
+    const auto want = buf.download_out(p);
+    const q8::QkNormRope norm_rope{q_norm, k_norm, tab};
+    MI_CUDA_CHECK(cudaMemset(buf.ws.get(), 0x7f, buf.ws.size()));
+    q8::attention_q8({v}, view(fused, 0), view(fused, hd), view(fused, 2 * hd), buf.tout(p), buf.tcu(p), buf.tcu(p),
+                     p.max_seqlen(), p.scale(), buf.ws.get(), buf.ws.size(), nullptr, &norm_rope);
+    EXPECT_EQ(buf.download_out(p), want) << tag;
+    EXPECT_EQ(k_cols(fused), k_cols(sep)) << tag << " k";
+  }
+}
+
+TEST(GpuAttentionQ8, NormRopePrologueEqualsSeparateKernels) {
+  check_norm_rope_prologue({1300, 515, 33}, 0, kDim, false, "three rows");
+  check_norm_rope_prologue({256}, 0, kDim, false, "256-token crop");
+  check_norm_rope_prologue({1039}, 211, 136, false, "one row, offset, table row 136");
+  check_norm_rope_prologue({700, 1100}, 5, 264, true, "NaN / Inf / denormal inputs");
+}
+
+// QkNormRope refuses what its fused pass cannot take: unequal head counts, two cu_seqlens tensors, q and k rows of
+// different strides, a table of the wrong rows or alignment.
+TEST(GpuAttentionQ8, NormRopePrologueRejectsBadArguments) {
+  const Problem p = make_problem(4, 4, {100, 60});
+  Buffers buf(p);
+  const std::int64_t n = p.total();
+  mi::DeviceBuffer norms(2 * kDim * 2), table(static_cast<std::size_t>((n + 1) * kDim * 2)), cu2(p.cu.size() * sizeof(int));
+  cu2.upload(p.cu.data(), p.cu.size() * sizeof(int));
+  auto* nw = static_cast<__nv_bfloat16*>(norms.get());
+  const Tensor q_norm = Tensor::view(nw, DType::kBF16, Device::kCUDA, {kDim});
+  const Tensor k_norm = Tensor::view(nw + kDim, DType::kBF16, Device::kCUDA, {kDim});
+  const Tensor tab = Tensor::view(table.get(), DType::kBF16, Device::kCUDA, {n, kDim});
+  const q8::QkNormRope ok{q_norm, k_norm, tab};
+  const Tensor other_cu = Tensor::view(cu2.get(), DType::kI32, Device::kCUDA, {static_cast<std::int64_t>(p.cu.size())});
+  const auto run = [&](const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& cu_k, const q8::QkNormRope& nr) {
+    q8::attention_q8({Variant::kInt8Fp16}, q, k, v, buf.tout(p), buf.tcu(p), cu_k, p.max_seqlen(), p.scale(),
+                     buf.ws.get(), buf.ws.size(), nullptr, &nr);
+  };
+  const Tensor q = buf.tq(p), k = buf.tk(p), v = buf.tv(p);
+  expect_invalid([&] { run(q, k, v, other_cu, ok); }, "one cu_seqlens tensor");
+  Tensor k_strided = Tensor::view(buf.k.get(), DType::kBF16, Device::kCUDA, {n / 2, p.kv_heads, kDim});
+  k_strided.stride[0] = 2 * p.kv_heads * kDim;
+  Tensor q_half = Tensor::view(buf.q.get(), DType::kBF16, Device::kCUDA, {n / 2, p.heads, kDim});
+  const Problem half = make_problem(4, 4, {80});
+  Buffers hb(half);
+  const auto run_half = [&](const Tensor& qq, const Tensor& kk, const Tensor& vv) {
+    const Tensor t = Tensor::view(table.get(), DType::kBF16, Device::kCUDA, {80, kDim});
+    const q8::QkNormRope nr{q_norm, k_norm, t};
+    q8::attention_q8({Variant::kInt8Fp16}, qq, kk, vv, hb.tout(half), hb.tcu(half), hb.tcu(half), half.max_seqlen(),
+                     half.scale(), hb.ws.get(), hb.ws.size(), nullptr, &nr);
+  };
+  expect_invalid([&] { run_half(q_half, k_strided, hb.tv(half)); }, "q and k rows of one stride");
+  const Problem gqa = make_problem(4, 2, {100, 60});
+  Buffers gb(gqa);
+  expect_invalid(
+      [&] {
+        q8::attention_q8({Variant::kInt8Fp16}, gb.tq(gqa), gb.tk(gqa), gb.tv(gqa), gb.tout(gqa), gb.tcu(gqa), gb.tcu(gqa),
+                         gqa.max_seqlen(), gqa.scale(), gb.ws.get(), gb.ws.size(), nullptr, &ok);
+      },
+      "num_heads == num_kv_heads");
+  const Tensor short_tab = Tensor::view(table.get(), DType::kBF16, Device::kCUDA, {n - 1, kDim});
+  expect_invalid([&] { run(q, k, v, buf.tcu(p), {q_norm, k_norm, short_tab}); }, "norm_rope: table");
+  const Tensor odd_tab = Tensor::view(static_cast<char*>(table.get()) + 2, DType::kBF16, Device::kCUDA, {n, kDim});
+  expect_invalid([&] { run(q, k, v, buf.tcu(p), {q_norm, k_norm, odd_tab}); }, "16-byte aligned rows");
 }
 
 // Run to run (and with a reused, dirty workspace) the output bits are identical: no atomics in any reduction.
