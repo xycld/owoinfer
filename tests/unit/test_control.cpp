@@ -654,13 +654,15 @@ TEST(GpuControlMerges, DeviceMergeEqualsHostMerge) {
   b.loras[1].strength = -0.6f;
   const auto run = [&](bool host) {
     moss_dit::MossDit::set_host_merges_for_tests(host);
+    struct Reset {  // a throw must not leave every later test's merges on the host
+      ~Reset() { moss_dit::MossDit::set_host_merges_for_tests(false); }
+    } reset;
     pl::Pipeline pipe;
     std::vector<std::vector<float>> out;
     out.push_back(pipe.generate(a).latents);
     const pl::Result rb = pipe.generate(b);
     EXPECT_EQ(rb.memory.dit_loads, 0) << "re-merged in place, host " << host;
     out.push_back(rb.latents);
-    moss_dit::MossDit::set_host_merges_for_tests(false);
     return out;
   };
   const auto device = run(false), host = run(true);

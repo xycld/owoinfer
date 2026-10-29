@@ -670,7 +670,8 @@ TEST(GpuEditPipeline, PlanFailureNamesThePlacement) {
   if (!fs::is_regular_file(dit) || !fs::is_regular_file(te) || !fs::is_regular_file(lora) || !fs::is_directory(bundle)) {
     GTEST_SKIP() << "the INT8 SFT DiT, the INT8 text encoder, the edit adapter or the SFT bundle not present";
   }
-  const auto options = [&](std::size_t vram, std::size_t host) {
+  const fs::path dit_bf16 = com / "comfy-org/moss_image_sft_bf16.safetensors";
+  const auto options = [&](std::size_t vram, std::size_t host, const fs::path& dit_file = {}) {
     mi::pipeline::PipelineOptions o;
     o.hardware = mi::planner::HardwareProfile{};
     o.hardware->h2d_gbps = 24;
@@ -684,7 +685,7 @@ TEST(GpuEditPipeline, PlanFailureNamesThePlacement) {
     o.mode = mi::planner::Mode::kMinMemory;
     o.vram_budget = vram;
     o.host_ram_budget = host;
-    o.dit_file = dit;
+    o.dit_file = dit_file.empty() ? dit : dit_file;
     o.text_encoder_file = te;
     return o;
   };
@@ -723,6 +724,21 @@ TEST(GpuEditPipeline, PlanFailureNamesThePlacement) {
     const mi::pipeline::Result res = p.generate(request(mi::lora::Placement::kSideBranch));
     EXPECT_EQ(res.steps_run, 1);
     EXPECT_EQ(res.dit_stream.source, "file");
+    // The default keeps an edit adapter on INT8 on the side branch: it plans and runs from the file too.
+    const mi::pipeline::Result def = p.generate(request(mi::lora::Placement::kDefault));
+    EXPECT_EQ(def.steps_run, 1);
+    EXPECT_EQ(def.dit_stream.source, "file");
+  }
+  if (fs::is_regular_file(dit_bf16)) {
+    // On a bf16 DiT the default merges the edit adapter, as merge does: the same plan failure naming side_branch
+    // (never a silent switch to the side branch, whose bits differ).
+    mi::pipeline::Pipeline p(options(std::size_t{3} << 30,
+                                     mi::planner::process_host_memory().private_bytes + (std::size_t{3} << 30), dit_bf16));
+    for (const mi::lora::Placement placement : {mi::lora::Placement::kDefault, mi::lora::Placement::kMerge}) {
+      const std::string e = plan_error(p, request(placement));
+      EXPECT_NE(e.find("not enough host memory"), std::string::npos) << e;
+      EXPECT_NE(e.find("use lora_placement side_branch"), std::string::npos) << e;
+    }
   }
   {
     // Too little GPU memory for any plan: the merges are not what failed.
