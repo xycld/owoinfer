@@ -58,24 +58,6 @@ namespace {
 
 using runtime::align_up;
 
-moss_dit::SkipSet skip_set(const std::vector<int>& layers) {
-  moss_dit::SkipSet s;
-  for (const int l : layers) s.set(static_cast<std::size_t>(l));
-  return s;
-}
-
-void check_layers(const std::vector<int>& layers, const char* name) {
-  for (std::size_t i = 0; i < layers.size(); ++i) {
-    if (layers[i] < 0 || std::count(layers.begin(), layers.end(), layers[i]) != 1) {
-      throw std::invalid_argument("SLG indices must be nonnegative and unique.");
-    }
-    if (layers[i] >= moss_dit::kLayers) {
-      throw std::invalid_argument(std::string(name) + " must contain integer block indices in [0, " +
-                                  std::to_string(moss_dit::kLayers) + ").");
-    }
-  }
-}
-
 std::string_view trim_ascii(std::string_view s) {
   const auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; };
   while (!s.empty() && ws(s.front())) s.remove_prefix(1);
@@ -207,14 +189,6 @@ std::uint64_t weight_bytes(const std::filesystem::path& p) {
     if (e.is_regular_file(ec) && e.path().extension() == ".safetensors") total += e.file_size(ec);
   }
   return total;
-}
-
-void check_user_paths(const PipelineOptions& o, const Request& r) {
-  check_option_paths(o);
-  const std::pair<const std::filesystem::path*, const char*> paths[] = {
-      {&r.model, "model"}, {&r.dataspace_path, "dataspace_path"}, {&r.control.adapter, "control_adapter"}};
-  for (const auto& [path, what] : paths) util::check_user_path(*path, what);
-  for (const lora::LoraSpec& l : r.loras) util::check_user_path(l.path, "loras");
 }
 
 }  // namespace
@@ -1222,6 +1196,55 @@ void Pipeline::Impl::refine_texts(std::span<const std::shared_ptr<const Embeddin
   tm.refine_s += since(tr);
 }
 
+std::vector<std::vector<float>> Pipeline::Impl::encode_controls(const EncoderSource& e, const control::ControlFile& ctl,
+                                                                const Request& req, int H, int W, Result& r) {
+  Timings& tm = r.timings;
+  std::vector<std::vector<float>> out(static_cast<std::size_t>(ctl.groups()));
+  for (const Request::ControlImage& c : req.control.images) {
+    auto ti = Clock::now();
+    Image im = resize_to(*c.image, W, H, req.resize);
+    tm.image_ops_s += since(ti);
+    if (im.channels == 1) {
+      // A grayscale map replicated to RGB (PIL convert("RGB")), after the resize: PIL's Lanczos filters each channel
+      // alone, so this gives the bytes of resizing the replicated image.
+      ti = Clock::now();
+      std::vector<std::uint8_t> rgb(im.pixels.size() * 3);
+      for (std::size_t i = 0; i < im.pixels.size(); ++i) rgb[3 * i] = rgb[3 * i + 1] = rgb[3 * i + 2] = im.pixels[i];
+      im.pixels = std::move(rgb);
+      im.channels = 3;
+      tm.image_ops_s += since(ti);
+    }
+    PassReport enc;
+    std::vector<float> z = encode_image(e, im, enc, tm);
+    if (c.strength != 1.0) {
+      const float s = static_cast<float>(c.strength);
+      for (float& v : z) v *= s;
+    }
+    out[static_cast<std::size_t>(ctl.kind_index(c.kind))] = std::move(z);
+    ++r.control.encodes;
+    r.control.encode_schedule += (r.control.encode_schedule.empty() ? "" : "; ") + enc.encode_schedule;
+  }
+  return out;
+}
+
+void Pipeline::Impl::explain_models(const DitSource& src, Result& r) const {
+  r.plan.explanation += "\nQuality: " + r.tier.reason + "; DiT " + r.dit_linears + " from " + r.dit_source + ".";
+  if (!src.remarks.empty()) r.plan.explanation += "\nDiT: " + src.remarks + ".";
+  if (time_embedding) {
+    r.plan.explanation += "\nDiT step embedder replaced (fp32) from " + util::path_utf8(options.time_embedding_file) + ".";
+  }
+}
+
+void Pipeline::Impl::explain_control(const Request::Control& control, Result& r) {
+  std::string inputs;
+  for (const Request::ControlImage& c : control.images) {
+    inputs += (inputs.empty() ? "" : ", ") + c.kind + " (strength " + json_number(c.strength) + ", steps " +
+              json_number(c.start) + "-" + json_number(c.end) + ")";
+  }
+  r.plan.explanation += "\nControl adapter " + r.control.adapter + " (LoRA strength " + json_number(control.lora_strength) +
+                        "): " + (inputs.empty() ? std::string("no images (zero control latents)") : inputs) + ".";
+}
+
 // generate(), or with `preload` the same up to the plan and the arena, then the loads of the models the plan keeps.
 Result Pipeline::run(const Request& req, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
@@ -1474,11 +1497,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   // Throws planner::BudgetError before any heavy work.
   const Impl::Planned planned = m.plan_call(models, pc, block_path, r);
   const bool kept = planned.kept, drop_resident = planned.drop_resident;
-  r.plan.explanation += "\nQuality: " + r.tier.reason + "; DiT " + r.dit_linears + " from " + r.dit_source + ".";
-  if (!src.remarks.empty()) r.plan.explanation += "\nDiT: " + src.remarks + ".";
-  if (m.time_embedding) {
-    r.plan.explanation += "\nDiT step embedder replaced (fp32) from " + util::path_utf8(m.options.time_embedding_file) + ".";
-  }
+  m.explain_models(src, r);
   if (!need_dit) r.plan.explanation += "\nNo sampling step (denoise strength 0): the DiT is neither planned nor loaded.";
   if (req.init_image != nullptr || hires) {
     std::string what = r.image_mode;
@@ -1496,15 +1515,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
     }
     r.plan.explanation += "\nImage: " + what + "; VAE encoder from " + r.vae_encoder_source + ".";
   }
-  if (ctl != nullptr) {
-    std::string inputs;
-    for (const Request::ControlImage& c : req.control.images) {
-      inputs += (inputs.empty() ? "" : ", ") + c.kind + " (strength " + json_number(c.strength) + ", steps " +
-                json_number(c.start) + "-" + json_number(c.end) + ")";
-    }
-    r.plan.explanation += "\nControl adapter " + r.control.adapter + " (LoRA strength " + json_number(req.control.lora_strength) +
-                          "): " + (inputs.empty() ? std::string("no images (zero control latents)") : inputs) + ".";
-  }
+  if (ctl != nullptr) Impl::explain_control(req.control, r);
   const planner::ExecutionPlan& plan = r.plan;
   if (m.cache) m.cache->set_max_bytes(plan.cache.host_bytes);
   // A DiT's merge memo (a control adapter's switch-back bits) goes when the host is tight (merge_memo_unaffordable). It
@@ -1633,33 +1644,9 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
       return finish();
     }
   }
-  // Control images at a pass size: per kind of the adapter its encoded latent times its strength (empty: no image).
+  // Control images at a pass size (Impl::encode_controls).
   std::vector<std::vector<float>> ctl_lat;
-  const auto encode_controls = [&](int H, int W) {
-    ctl_lat.assign(static_cast<std::size_t>(ctl->groups()), {});
-    for (const Request::ControlImage& c : req.control.images) {
-      Image im = sized(*c.image, H, W);
-      if (im.channels == 1) {
-        // A grayscale map replicated to RGB (PIL convert("RGB")), after the resize: PIL's Lanczos filters each channel
-        // alone, so this gives the bytes of resizing the replicated image.
-        const auto ti = Clock::now();
-        std::vector<std::uint8_t> rgb(im.pixels.size() * 3);
-        for (std::size_t i = 0; i < im.pixels.size(); ++i) rgb[3 * i] = rgb[3 * i + 1] = rgb[3 * i + 2] = im.pixels[i];
-        im.pixels = std::move(rgb);
-        im.channels = 3;
-        tm.image_ops_s += since(ti);
-      }
-      PassReport enc;
-      std::vector<float> z = encode_image(im, enc);
-      if (c.strength != 1.0) {
-        const float s = static_cast<float>(c.strength);
-        for (float& v : z) v *= s;
-      }
-      ctl_lat[static_cast<std::size_t>(ctl->kind_index(c.kind))] = std::move(z);
-      ++r.control.encodes;
-      r.control.encode_schedule += (r.control.encode_schedule.empty() ? "" : "; ") + enc.encode_schedule;
-    }
-  };
+  const auto encode_controls = [&](int H, int W) { ctl_lat = m.encode_controls(*enc_src, *ctl, req, H, W, r); };
   if (ctl_encode && sched1.num_steps() > 0) {
     encode_controls(H1, W1);
     if (cancel_requested()) {

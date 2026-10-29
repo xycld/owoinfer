@@ -18,6 +18,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -177,6 +178,34 @@ inline void check_option_paths(const PipelineOptions& o) {
       {&o.vae_file, "vae_file"},
       {&o.time_embedding_file, "time_embedding_file"}};
   for (const auto& [path, what] : paths) util::check_user_path(*path, what);
+}
+
+// The options' and the request's paths: check_option_paths, then the request's model, dataspace file, control adapter
+// and LoRA files.
+inline void check_user_paths(const PipelineOptions& o, const Request& r) {
+  check_option_paths(o);
+  const std::pair<const std::filesystem::path*, const char*> paths[] = {
+      {&r.model, "model"}, {&r.dataspace_path, "dataspace_path"}, {&r.control.adapter, "control_adapter"}};
+  for (const auto& [path, what] : paths) util::check_user_path(*path, what);
+  for (const lora::LoraSpec& l : r.loras) util::check_user_path(l.path, "loras");
+}
+
+inline moss_dit::SkipSet skip_set(const std::vector<int>& layers) {
+  moss_dit::SkipSet s;
+  for (const int l : layers) s.set(static_cast<std::size_t>(l));
+  return s;
+}
+
+inline void check_layers(const std::vector<int>& layers, const char* name) {
+  for (std::size_t i = 0; i < layers.size(); ++i) {
+    if (layers[i] < 0 || std::count(layers.begin(), layers.end(), layers[i]) != 1) {
+      throw std::invalid_argument("SLG indices must be nonnegative and unique.");
+    }
+    if (layers[i] >= moss_dit::kLayers) {
+      throw std::invalid_argument(std::string(name) + " must contain integer block indices in [0, " +
+                                  std::to_string(moss_dit::kLayers) + ").");
+    }
+  }
 }
 
 inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file) {
@@ -1094,6 +1123,14 @@ struct Pipeline::Impl {
   // The DiT's text refiner (encode_text) over each text-encoder state into out[i] (bf16 [S_i, kDim], kept by the
   // caller), with the uploaded inputs on a stack scope released on return.
   void refine_texts(std::span<const std::shared_ptr<const Embedding>> texts, std::span<const Tensor> out, Timings& tm);
+  // The request's control images at H x W (resized by req.resize, a grayscale map replicated to RGB after the resize,
+  // encoded by `e`): per kind of the adapter its latent times its strength (empty: no image). Counted in r.control.
+  std::vector<std::vector<float>> encode_controls(const EncoderSource& e, const control::ControlFile& ctl, const Request& req,
+                                                  int H, int W, Result& r);
+  // The plan explanation's lines on the models (the tier that runs, the DiT's remarks, a replaced step embedder) and on
+  // the control adapter (its LoRA strength, its images and their windows).
+  void explain_models(const DitSource& src, Result& r) const;
+  static void explain_control(const Request::Control& control, Result& r);
 
   // Private host memory the pipeline holds itself across calls (cache contents, text-encoder rings and host copy),
   // which the planner adds on its own and must not count twice. The planner adds the text encoder's share only when
