@@ -745,6 +745,17 @@ TEST(GpuQuantKernels, Int8GemmMatchesOracleAtModelShapes) {
   }
 }
 
+// The banded tile order with bands wider than 8 and a short last band: a 75 MiB activation (over 3/4 of any L2 up to
+// 96 MiB) bands at 128x256 tiles in L2 / 2 / (256 * 8192) N tiles, 16 on 64 MiB (40 = 16 + 16 + 8), 24 on 96 MiB
+// (24 + 16). Every epilogue against the oracle on rows spread over every M tile.
+TEST(GpuQuantKernels, Int8GemmWideBandsMatchOracle) {
+  GemmData d(9600, 10240, 8192, 77);
+  std::vector<int> rows;
+  for (int r = 0; r < 9600; r += 37) rows.push_back(r);
+  rows.push_back(9599);
+  check_gemm_against_oracle(d, rows, {Int8Tile::kAuto, Int8Tile::k128x256x64, Int8Tile::k256x128x64}, true, "wide bands");
+}
+
 // Row counts that are not tile multiples: 1, every M in 17..400 (small N/K, all rows), and tile-boundary row counts
 // at the DiT N/K with every tile.
 TEST(GpuQuantKernels, Int8GemmEdgeShapes) {
@@ -767,9 +778,6 @@ TEST(GpuQuantKernels, Int8GemmEdgeShapes) {
   EXPECT_NO_THROW(quant::int8_gemm(empty, nullptr, as_bf16(out), 8, nullptr));
 }
 
-// Padded row strides everywhere (ldx > k, ldo > n, ldr > n, SiTU ldo > F) and K = 272: 4 full 64-deep k-tiles (2 of
-// the 128-deep tile) plus a 16-deep residue; N = 264 is not a tile multiple either. Every tile, every row, against the
-// oracle; the padding of the outputs must stay untouched.
 // The SiTU-GLU epilogue reads SiTU's two factors from tables over every bf16 input: every value goes through it.
 // acc = 1 in every column (x = e_0, every weight row e_0) and x_scale = 1, so the dequantized up_gate value of column c
 // is w_scale[c] exactly and w_scale places any bf16 value, NaN and inf included, in the hidden or the gate half.
@@ -814,6 +822,9 @@ TEST(GpuQuantKernels, Int8GemmSituGluEveryBf16Value) {
   }
 }
 
+// Padded row strides everywhere (ldx > k, ldo > n, ldr > n, SiTU ldo > F) and K = 272: 4 full 64-deep k-tiles (2 of
+// the 128-deep tile) plus a 16-deep residue; N = 264 is not a tile multiple either. Every tile, every row, against the
+// oracle; the padding of the outputs must stay untouched.
 TEST(GpuQuantKernels, Int8GemmPaddedStridesAndKResidue) {
   constexpr std::int64_t m = 300, n = 264, k = 272, ldx = k + 48, ldo = n + 24, ldr = n + 40, ldf = n / 2 + 12;
   constexpr std::uint16_t kSentinel = 0x7FC1;

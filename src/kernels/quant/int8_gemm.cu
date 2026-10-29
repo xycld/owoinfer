@@ -37,7 +37,9 @@ int sm_count() { return device_attribute<cudaDevAttrMultiProcessorCount>(); }
 int int8_band(const Problem& p, int tile_n) {
   // Measured on sm_89 (64 MiB L2) at the DiT shapes, steady state at the 175 W cap: at M = 32798 (2048^2 with CFG)
   // the wide bands run qkv 4.6 %, up_gate 7 %, down 3.7 %, o 1.3 % faster than the identity order (less DRAM traffic
-  // under the power cap); at M = 8222 (1024^2) the activation fits and the orders are within ~1-4 % either way.
+  // under the power cap). At M = 8222 (1024^2) qkv, o and up_gate (24 MiB activations) keep the identity order (the
+  // orders are within ~1-4 % either way there); ffn_down (64 MiB, over the floor) bands: 1.66 -> 1.61 ms. sm_80, sm_86
+  // and sm_120 (96 MiB L2: its 1024^2 ffn_down stays on the identity order) are unmeasured.
   constexpr int kIdentity = 8;
   const std::int64_t l2 = device_attribute<cudaDevAttrL2CacheSize>();
   const std::int64_t activation = static_cast<std::int64_t>(p.m) * p.k;
