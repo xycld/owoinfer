@@ -569,7 +569,13 @@ TEST_F(MossDitTest, ForwardStackBytesIsWhatAForwardTakes) {
     const std::size_t before = arena_->used();
     model_->forward(lat.t, c.timestep, rows, outs, stream());
     MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
-    EXPECT_LE(arena_->high_water() - before, need) << "grid " << gh;
+    // Not over, and tight: the query replays the forward's allocations, each rounded to kArenaAlign as the arena
+    // rounds it, so at most one alignment unit per buffer apart (64 buffers bound a forward's allocations).
+    const std::size_t took = arena_->high_water() - before;
+    std::printf("[moss_dit] grid %lldx%lld: forward took %zu stack bytes, forward_stack_bytes %zu\n",
+                static_cast<long long>(gh), static_cast<long long>(gh), took, need);
+    EXPECT_LE(took, need) << "grid " << gh;
+    EXPECT_GE(took + 64 * mi::runtime::kArenaAlign, need) << "grid " << gh;
   }
 }
 

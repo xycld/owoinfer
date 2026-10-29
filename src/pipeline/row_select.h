@@ -1,6 +1,8 @@
 // The DiT rows of one model call under mi_generate's guidance layout, as a pure function: the rule denoise()'s ModelFn
 // applies inline (pipeline/sampler.cpp), written out for callers that evaluate one call at a time (the component API's
-// MOSS guidance mode). denoise() keeps its own copy of the rule; tests check the two agree.
+// MOSS guidance mode). denoise() keeps its own copy of the rule. The CPU tests check this function against tables of the
+// rule; the non-circular check against denoise() itself is the component API's GPU test, which records the rows of
+// every forward of an mi_generate run and of a component run.
 //   cond    always
 //   uncond  while cfg_active(step), with guidance.uncond_skip while skip_active(step)
 //   SLG     the cond prompt with guidance.slg_layers, while slg_active(step) and CFG is not truncated at this step
