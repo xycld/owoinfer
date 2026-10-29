@@ -182,30 +182,46 @@ void PassInputs::set(int group, std::vector<float> latents, double start, double
   g.written = -1;
 }
 
-int PassInputs::apply(const Tensor& extra, int step, int num_steps, cudaStream_t stream) {
-  const std::int64_t plane = kGroupChannels * h_ * w_;
+void PassInputs::check_extra(const Tensor& extra, const char* what) const {
   if (extra.device != Device::kCUDA || extra.dtype != DType::kF32 || !extra.is_contiguous() ||
-      extra.numel() != plane * groups()) {
-    throw std::invalid_argument("mi::control::PassInputs::apply: extra must be a contiguous CUDA f32 [" +
+      extra.numel() != kGroupChannels * h_ * w_ * groups()) {
+    throw std::invalid_argument(std::string("mi::control::PassInputs::") + what + ": extra must be a contiguous CUDA f32 [" +
                                 std::to_string(groups() * kGroupChannels) + ", " + std::to_string(h_) + ", " +
                                 std::to_string(w_) + "], got " + extra.describe());
   }
+}
+
+void PassInputs::write(const Tensor& extra, int group, int state, cudaStream_t stream) const {
+  const std::size_t bytes = static_cast<std::size_t>(kGroupChannels * h_ * w_) * sizeof(float);
+  void* dst = static_cast<std::byte*>(extra.data) + static_cast<std::size_t>(group) * bytes;
+  if (state == 1) {
+    MI_CUDA_CHECK(cudaMemcpyAsync(dst, groups_[static_cast<std::size_t>(group)].latents.data(), bytes,
+                                  cudaMemcpyHostToDevice, stream));
+  } else {
+    MI_CUDA_CHECK(cudaMemsetAsync(dst, 0, bytes, stream));
+  }
+}
+
+int PassInputs::apply(const Tensor& extra, int step, int num_steps, cudaStream_t stream) {
+  check_extra(extra, "apply");
   int written = 0;
-  const std::size_t bytes = static_cast<std::size_t>(plane) * sizeof(float);
   for (int i = 0; i < groups(); ++i) {
     Group& g = groups_[static_cast<std::size_t>(i)];
     const int want = !g.latents.empty() && window_active(g.start, g.end, step, num_steps) ? 1 : 0;
     if (want == g.written) continue;
-    void* dst = static_cast<std::byte*>(extra.data) + static_cast<std::size_t>(i) * bytes;
-    if (want == 1) {
-      MI_CUDA_CHECK(cudaMemcpyAsync(dst, g.latents.data(), bytes, cudaMemcpyHostToDevice, stream));
-    } else {
-      MI_CUDA_CHECK(cudaMemsetAsync(dst, 0, bytes, stream));
-    }
+    write(extra, i, want, stream);
     g.written = want;
     ++written;
   }
   return written;
+}
+
+void PassInputs::rewrite(const Tensor& extra, cudaStream_t stream) {
+  check_extra(extra, "rewrite");
+  for (int i = 0; i < groups(); ++i) {
+    const int state = groups_[static_cast<std::size_t>(i)].written;
+    if (state >= 0) write(extra, i, state, stream);
+  }
 }
 
 }  // namespace mi::control

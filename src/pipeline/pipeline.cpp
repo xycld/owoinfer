@@ -207,7 +207,8 @@ std::size_t denoise_stack_bytes(const DenoiseStack& d, moss_dit::BlockPath path,
     longest = std::max(longest, s);
   }
   refine_need += moss_dit::MossDit::encode_text_workspace_bytes(longest);
-  const std::size_t forward_bytes = moss_dit::MossDit::workspace_bytes(lh, lw, d.rows, path, config, &route);
+  const std::size_t forward_bytes = d.crops ? crop_workspace_bound(lh, lw, d.rows, path, config, route)
+                                            : moss_dit::MossDit::workspace_bytes(lh, lw, d.rows, path, config, &route);
   // A control adapter's input latents [G * 128, h, w] per latent (moss_dit::InputExtension::extra), next to the latents.
   const std::size_t latents = static_cast<std::size_t>(d.latents) * lat;
   const std::size_t control_bytes = static_cast<std::size_t>(d.control_groups) * latents;

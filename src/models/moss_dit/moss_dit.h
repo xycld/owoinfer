@@ -282,6 +282,9 @@ class MossDit {
   BlockPath block_path() const { return path_; }
   // CUDA-graph diagnostics of kFusedGraphs.
   const StepGraphStats& graph_stats() const { return graphs_.stats(); }
+  // While paused, kFusedGraphs forwards run eagerly and leave the cached graphs as they are (a component run's crop
+  // calls: one-off shapes neither capture graphs nor evict the run's). Set between forwards.
+  void set_graphs_paused(bool paused) { graphs_paused_ = paused; }
   // Device memory the cached CUDA graphs hold outside the arena now (graph_cache_bytes()'s per-graph bound each).
   std::size_t graph_bytes() const;
 
@@ -499,6 +502,7 @@ class MossDit {
   BlockPath path_ = BlockPath::kFused;
   StepGraphs graphs_{kGraphCapacity};  // per-block graphs of a few step shapes
   std::uint64_t last_step_hash_ = 0;  // step shape of the previous forward (graphs are captured once it repeats)
+  bool graphs_paused_ = false;
 };
 
 }  // namespace mi::moss_dit

@@ -91,6 +91,7 @@ struct DenoiseStack {
   int control_groups = 0;           // a control adapter's input groups (0: none)
   bool preview = false;
   bool from_image = false;
+  bool crops = false;  // a component run with crop calls: the forward at crop_workspace_bound
 };
 std::size_t denoise_stack_bytes(const DenoiseStack& d, moss_dit::BlockPath path, const moss_dit::ComputeConfig& config,
                                 const moss_dit::FusedRouteSnapshot& route);

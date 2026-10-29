@@ -167,6 +167,20 @@ TEST(ControlPassInputs, WritesOnlyChangedGroups) {
   for (float v : got) ASSERT_EQ(v, 0.0f);
   EXPECT_EQ(in.apply(extra, 3, 4, nullptr), 0);
 
+  // rewrite: the state the last apply left, written again over an overwritten buffer, the state unchanged.
+  EXPECT_EQ(in.apply(extra, 0, 4, nullptr), 1);  // group 0's window open again
+  MI_CUDA_CHECK(cudaMemset(buf.get(), 0x7F, buf.size()));
+  in.rewrite(extra, nullptr);
+  got = download(extra);
+  EXPECT_EQ(std::memcmp(got.data(), lat.data(), lat.size() * sizeof(float)), 0);
+  for (std::int64_t i = plane; i < 2 * plane; ++i) ASSERT_EQ(got[static_cast<std::size_t>(i)], 0.0f);
+  EXPECT_EQ(in.apply(extra, 1, 4, nullptr), 0);
+  PassInputs fresh(2, h, w);
+  MI_CUDA_CHECK(cudaMemset(buf.get(), 0x7F, buf.size()));
+  fresh.rewrite(extra, nullptr);  // before the first apply: nothing written
+  got = download(extra);
+  EXPECT_NE(got[0], 0.0f);
+
   // Channel order: the published file's kinds are [color, depth], so a depth image is group 1, channels [128, 256).
   if (fs::is_regular_file(kControlFile)) {
     const int depth = open_control_file(kControlFile).kind_index("depth");

@@ -109,6 +109,9 @@ class PassInputs {
   // latents are members, so the copies stay valid. Returns the number of groups written, which after the first call is
   // exactly the number of groups whose contents changed for this step (0: the DiT's input is the previous step's).
   int apply(const Tensor& extra, int step, int num_steps, cudaStream_t stream);
+  // Writes every group again as the last apply() left it, without changing that state: `extra` was overwritten in
+  // between (a component run's crop or per-call control). Nothing before the first apply().
+  void rewrite(const Tensor& extra, cudaStream_t stream);
   int groups() const { return static_cast<int>(groups_.size()); }
 
  private:
@@ -117,6 +120,9 @@ class PassInputs {
     double start = 0, end = 1;
     int written = -1;  // -1: never, 0: zeros, 1: the latent
   };
+  void check_extra(const Tensor& extra, const char* what) const;
+  // Group `group` of `extra` as `state` (1: its latent, 0: zeros).
+  void write(const Tensor& extra, int group, int state, cudaStream_t stream) const;
   std::vector<Group> groups_;
   std::int64_t h_ = 0, w_ = 0;
 };

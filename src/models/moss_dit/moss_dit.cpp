@@ -1198,7 +1198,8 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
   bool use_graphs = false;
   // attention_q8's debug checks synchronize the stream: never inside a capture.
   const bool capturable = !(config_.attention != AttentionMode::kExact && varlen_debug_checks());
-  if (path_ == BlockPath::kFusedGraphs && !blocks_->residency().streamed() && stream != nullptr && capturable) {
+  if (path_ == BlockPath::kFusedGraphs && !graphs_paused_ && !blocks_->residency().streamed() && stream != nullptr &&
+      capturable) {
     key.height = height;
     key.width = width;
     key.text_lengths = lengths;
