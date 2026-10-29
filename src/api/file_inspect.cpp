@@ -32,12 +32,14 @@
 #include "models/moss_dit/moss_dit.h"
 #include "models/moss_dit/nvfp4_support.h"
 #include "models/qwen35_text/quant_text_model.h"
+#include "pipeline/gguf_dit.h"
 #include "pipeline/pipeline.h"
 #include "planner/planner.h"
 #include "util/json.h"
 #include "util/path.h"
 #include "util/regular_file.h"
 #include "weights/file_reader.h"
+#include "weights/gguf.h"
 #include "weights/model_index.h"
 #include "weights/quant/quant_model.h"
 #include "weights/safetensors.h"
@@ -200,6 +202,26 @@ void inspect_control(const fs::path& path, const weights::SafetensorsFile& heade
   r.info.loadable = inspect_lora({path, 1.0f, file->consumed()}, r) ? 1 : 0;
 }
 
+// A GGUF DiT (pipeline/gguf_dit.h): the converter's header checks, and what the file runs as at each tier. Nothing is
+// converted here.
+void inspect_gguf(const fs::path& path, FileInspection& r) {
+  // A malformed GGUF or one of another model has no role; a MOSS-Image DiT is a DiT, loadable when its types are read.
+  std::optional<weights::GgufFile> header;
+  if (!accepts([&] { header.emplace(path); }, r.note)) return;
+  r.info.tensor_count = static_cast<std::int32_t>(header->tensors().size());
+  if (!accepts([&] { weights::check_supported_gguf_dit(*header); }, r.note)) return;
+  r.info.kind = MI_FILE_KIND_DIT;
+  std::optional<pipeline::GgufDitInfo> g;
+  if (!accepts([&] { g.emplace(pipeline::inspect_gguf_dit(path)); }, r.note)) return;
+  r.info.loadable = 1;
+  r.info.precision = MI_PRECISION_INT8;  // tier high's format (bf16 at tier reference: the tier reasons say so)
+  r.quantization = pipeline::gguf_runs_as(*g, quant::QuantSpec::int8_convrot(256)) +
+                   (g->reference ? " (tier high) or bf16 (tier reference)" : "");
+  r.note = "converted once at load into the cache directory (cache_dir), then loaded as that format: VRAM and speed are "
+           "the format's";
+  describe_dit_tiers(planner::Precision::kInt8, kNvfp4Kernels, r, &*g);
+}
+
 }  // namespace
 
 void describe_dit_linears(const pipeline::DitFileInfo& dit, FileInspection& r) {
@@ -208,7 +230,8 @@ void describe_dit_linears(const pipeline::DitFileInfo& dit, FileInspection& r) {
   if (!dit.remarks.empty()) r.note += (r.note.empty() ? "" : "; ") + dit.remarks;
 }
 
-void describe_dit_tiers(planner::Precision precision, bool nvfp4_kernels, FileInspection& r) {
+void describe_dit_tiers(planner::Precision precision, bool nvfp4_kernels, FileInspection& r,
+                        const pipeline::GgufDitInfo* gguf) {
   r.tier_reasons[MI_TIER_AUTO] = "MI_TIER_AUTO is reserved since 2.0: choose reference, high or turbo";
   constexpr std::pair<mi_tier, planner::Tier> kTiers[] = {{MI_TIER_REFERENCE, planner::Tier::kReference},
                                                           {MI_TIER_HIGH, planner::Tier::kHigh},
@@ -217,12 +240,18 @@ void describe_dit_tiers(planner::Precision precision, bool nvfp4_kernels, FileIn
   constexpr std::string_view kDefaultQ8 = "q8_fp8 attention";
   for (const auto& [c, t] : kTiers) {
     try {
-      std::string reason = planner::resolve_tier(t, std::nullopt, precision, {}, false, nvfp4_kernels).reason;
+      // A GGUF file runs as the format its conversion for the tier gives (gguf_target refuses the other tiers).
+      std::optional<quant::QuantSpec> target;
+      if (gguf != nullptr) target = pipeline::gguf_target(*gguf, t);
+      const planner::Precision p =
+          !target ? precision : target->quantized() ? planner::Precision::kInt8 : planner::Precision::kBf16;
+      std::string reason = planner::resolve_tier(t, std::nullopt, p, {}, false, nvfp4_kernels).reason;
       if (reason.ends_with(kDefaultQ8)) {
         reason.replace(reason.size() - kDefaultQ8.size(), kDefaultQ8.size(),
                        "8-bit attention (q8_fp8; q8_fp16 on GPUs without FP8)");
       }
       if (precision == planner::Precision::kNvfp4) reason += " (RTX 50 only)";
+      if (target) reason += " (" + pipeline::gguf_runs_as(*gguf, *target) + ")";
       r.tier_reasons[c] = std::move(reason);
       r.info.tiers |= 1u << c;
     } catch (const std::invalid_argument& e) {
@@ -239,6 +268,10 @@ FileInspection inspect_file(const fs::path& path) {
   r.info.file_bytes = regular_file_bytes(path);
   for (std::string& reason : r.tier_reasons) reason = "not a loadable DiT file";
 
+  if (weights::is_gguf_file(path)) {
+    inspect_gguf(path, r);
+    return r;
+  }
   std::optional<weights::SafetensorsFile> header;
   std::string header_why;
   if (!accepts([&] { header.emplace(path); }, header_why)) {

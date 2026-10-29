@@ -35,6 +35,7 @@
 #include "models/moss_dit/nvfp4_support.h"
 #include "models/qwen35_text/text_encoder.h"
 #include "pipeline/embedding_cache.h"
+#include "pipeline/gguf_dit.h"
 #include "pipeline/hardware_profile.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/samplers/sampler_driver.h"
@@ -44,6 +45,7 @@
 #include "runtime/stream_set.h"
 #include "tokenizer/qwen_bpe.h"
 #include "util/path.h"
+#include "weights/gguf.h"
 #include "util/regular_file.h"
 #include "weights/file_reader.h"
 #include "weights/model_index.h"
@@ -134,6 +136,7 @@ struct DitSource {
   planner::Precision precision = planner::Precision::kBf16;
   std::string linears;  // moss_dit::describe_linears
   std::string remarks;  // DitFileInfo::remarks (single file only)
+  std::string format;   // a GGUF file: what it runs as (gguf_runs_as, e.g. "GGUF Q4_K, runs as INT8 ConvRot"); else ""
   // The weight files the DiT is read from, and whether direct I/O gains on them (weights::direct_io_support of each;
   // the first that does not decides), checked once per source.
   std::vector<std::filesystem::path> files;
@@ -209,10 +212,24 @@ inline void check_layers(const std::vector<int>& layers, const char* name) {
   }
 }
 
-inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file) {
+inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file, planner::Tier tier,
+                                                const std::filesystem::path& cache_dir) {
   // NVFP4 linears run only on cc 12.0 with the sm_120a kernels (user decision D1); otherwise the file is refused as an
   // unsupported model (MI_ERR_MODEL).
   if (!std::filesystem::exists(file)) throw std::invalid_argument("DiT file not found: " + util::path_utf8(file));
+  // A GGUF file: its converted file for the tier (gguf_dit.h), loaded as any other DiT file and reported as the GGUF.
+  if (std::filesystem::is_regular_file(file) && weights::is_gguf_file(file)) {
+    const GgufDitInfo g = model_file_errors(file, [&] { return inspect_gguf_dit(file); });
+    const quant::QuantSpec target = gguf_target(g, tier);
+    const std::filesystem::path converted =
+        model_file_errors(file, [&] { return gguf_converted_file(file, g, target, cache_dir); });
+    std::unique_ptr<DitSource> d = open_dit_file(converted, tier, cache_dir);
+    d->path = file;
+    d->format = gguf_runs_as(g, target);
+    d->remarks = d->format + " (converted copy: " + util::path_utf8(converted) + ")" +
+                 (d->remarks.empty() ? "" : "; " + d->remarks);
+    return d;
+  }
   DitFileInfo info = inspect_dit_file(file, [] { return moss_dit::nvfp4_unsupported_reason(); });
   if (!info.refusal.empty()) throw weights::UnsupportedModelError(info.refusal);
   auto d = std::make_unique<DitSource>();
@@ -492,7 +509,7 @@ struct Pipeline::Impl {
   // options.dit_file's DiT (opened before the bundle is indexed: Impl::bundle).
   DitSource& dit_file_source(double& load_s) {
     return cached_dit("file:" + util::path_utf8(util::path_key(options.dit_file)), load_s,
-                      [&] { return open_dit_file(options.dit_file); });
+                      [&] { return open_dit_file(options.dit_file, options.tier, options.cache_dir); });
   }
   template <class Open>
   DitSource& cached_dit(const std::string& key, double& load_s, Open&& open) {

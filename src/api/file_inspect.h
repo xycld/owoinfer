@@ -11,6 +11,7 @@
 
 namespace mi::pipeline {
 struct DitFileInfo;
+struct GgufDitInfo;
 }
 
 namespace mi::api {
@@ -33,7 +34,10 @@ void describe_dit_linears(const pipeline::DitFileInfo& dit, FileInspection& r);
 
 // A loadable DiT's tier bits and reasons: planner::resolve_tier's verdict for each tier, with the bundle's bf16 text
 // encoder, no explicit attention and every 8-bit kernel available (each GPU the engine supports has one, so the bits
-// are generate's on every GPU), NVFP4 judged for an RTX 50 with `nvfp4_kernels` (this build's).
-void describe_dit_tiers(planner::Precision precision, bool nvfp4_kernels, FileInspection& r);
+// are generate's on every GPU), NVFP4 judged for an RTX 50 with `nvfp4_kernels` (this build's). A GGUF file (`gguf`):
+// each tier judged with the precision its conversion gives (pipeline::gguf_target; a tier it refuses is not set), the
+// reason ending in what the file runs as.
+void describe_dit_tiers(planner::Precision precision, bool nvfp4_kernels, FileInspection& r,
+                        const pipeline::GgufDitInfo* gguf = nullptr);
 
 }  // namespace mi::api

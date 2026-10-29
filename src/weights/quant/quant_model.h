@@ -57,6 +57,7 @@
 #include <vector>
 
 #include "core/tensor.h"
+#include "weights/gguf.h"
 #include "weights/model_index.h"
 #include "weights/safetensors.h"
 #include "weights/upload.h"
@@ -98,6 +99,8 @@ enum class Encoding : std::uint8_t {
   kW6A8,         // w6a8_int8: 6-bit codes [N, 3K/4], e4m3 group scales, F32 s_channel
   kW4A4,         // convrot_w4a4: signed nibbles [N, K/2], F32 per-row scale
   kNvfp4Raw,     // nvfp4: U8 [N, K/2] + swizzled F8_E4M3 block scales + F32 scalar tensor scale, used as stored
+  kGguf,         // a GGUF tensor of the ggml type QuantModel::gguf_types names: dequantized to fp32 (weights/gguf.h)
+                 // and quantized (or rounded to bf16) by the converter; the spec is bf16, the stored precision unknown
 };
 const char* encoding_name(Encoding e);
 
@@ -138,13 +141,18 @@ struct QuantModel {
   std::vector<weights::IndexedTensor> tensors;  // every other kept tensor under its canonical name, sorted by name
   std::vector<weights::ExcludedSummary> excluded;
   std::map<std::string, std::string> metadata;  // __metadata__ of the first file
+  // A GGUF file (open_gguf_dit): the ggml type of every stored tensor by IndexedTensor::name (a linear's weight, by its
+  // source name, and every kept tensor), whose dtype is then the dtype the converter writes (BF16; F32 for
+  // rope.bands) and whose nbytes the GGUF bytes. Empty for safetensors inputs.
+  std::map<std::string, std::uint32_t, std::less<>> gguf_types;
 
   const QuantLinear* find_linear(std::string_view name) const;
   const weights::IndexedTensor* find_tensor(std::string_view name) const;
   std::filesystem::path file_path(std::uint32_t id) const { return base_dir / util::path_from_utf8(files.at(id).path); }
 };
 
-// Opens a safetensors file, a diffusers component directory or a bundle root (then the component of `kind`).
+// Opens a safetensors file, a GGUF DiT (open_gguf_dit), a diffusers component directory or a bundle root (then the
+// component of `kind`).
 // Without `kind` a single file's kind is detected from its tensor names (bundle roots default to the DiT).
 // Text-encoder names are routed with weights::classify_tensor; a text-only Qwen3.5 checkpoint (`model.layers.*`) is
 // refused. A quantization config on an excluded module (visual, mtp, lm_head) is ignored, even when malformed.
@@ -157,6 +165,15 @@ QuantModel open_quant_model(const std::filesystem::path& path, std::optional<Mod
 // The same for a single safetensors file whose header the caller already parsed (not read again; base_dir is its
 // directory). Configs and tensors are read from file.path().
 QuantModel open_quant_model(const weights::SafetensorsFile& file, std::optional<ModelKind> kind = std::nullopt);
+
+// A MOSS-Image DiT in a GGUF file, for the converter (convert(): INT8 ConvRot or bf16 output; nothing reads it
+// directly): every tensor must be a MOSS-Image DiT tensor with its shape (weights::moss_dit_linears, the norms, an
+// optional rope.bands), under the official names, optionally prefixed `model.diffusion_model.` / `diffusion_model.`,
+// with q/k/v fused (`layers.N.proj.qkv`, split by row slices) or separate, and of a type weights::gguf_dequantizable
+// reads. The block GEMMs become kGguf linears, everything else kept tensors (written BF16; rope.bands F32). Names,
+// shapes and types are checked from the header before any tensor byte is read. Throws QuantError naming the file and
+// the first offending tensors.
+QuantModel open_gguf_dit(const weights::GgufFile& file);
 
 // The canonical DiT GEMM modules (6 per block: proj.q/k/v/o/ffn_up_gate/ffn_down) and TE GEMM modules
 // (language_model.layers.N.*), in the order a converter visits them.
@@ -226,7 +243,7 @@ void decode_rows(const QuantModel& model, const QuantLinear& l, std::int64_t row
 void decode_linear(const QuantModel& model, const QuantLinear& l, std::int8_t* q, float* scale, int threads = 0);
 
 // Rows of any linear in the original basis as fp32 (bf16 widened; quantized: decode + un-rotate; nvfp4:
-// dequantize_nvfp4_rows, comfy-kitchen's fp32 dequantization).
+// dequantize_nvfp4_rows, comfy-kitchen's fp32 dequantization; GGUF: weights::dequantize_gguf_rows).
 void dequantize_linear_rows(const QuantModel& model, const QuantLinear& l, std::int64_t row0, std::int64_t rows,
                             float* out);
 

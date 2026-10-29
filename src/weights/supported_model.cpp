@@ -14,6 +14,7 @@
 #include "util/json.h"
 #include "util/path.h"
 #include "weights/file_reader.h"
+#include "weights/gguf.h"
 #include "weights/safetensors.h"
 
 namespace mi::weights {
@@ -117,9 +118,10 @@ struct Names {
   }
 };
 
-Names read_names(const SafetensorsFile& file, std::initializer_list<std::string_view> prefixes, std::string_view layers_prefix) {
+Names read_names(const std::vector<TensorInfo>& tensors, std::initializer_list<std::string_view> prefixes,
+                 std::string_view layers_prefix) {
   Names n;
-  for (const TensorInfo& t : file.tensors()) {
+  for (const TensorInfo& t : tensors) {
     if (n.first.empty()) n.first = t.name;
     std::string_view name = t.name;
     for (std::string_view p : prefixes) {
@@ -161,9 +163,10 @@ void compare_layers(const Names& n, int expected, const char* what, std::vector<
 
 bool is_fp8(DType d) { return d == DType::kF8E4M3 || d == DType::kF8E5M2; }
 
-// GGUF files and PyTorch pickles (zip archives, or the pre-zip format that starts with a pickle PROTO opcode) are named
-// as such (SafetensorsFile would only call them malformed). A safetensors file's first 8 bytes are its header length,
-// which can take any value, so its header's opening '{' at byte 8 always wins.
+// GGUF files (but for a DiT, check_supported_dit_file reads them) and PyTorch pickles (zip archives, or the pre-zip
+// format that starts with a pickle PROTO opcode) are named as such (SafetensorsFile would only call them malformed). A
+// safetensors file's first 8 bytes are its header length, which can take any value, so its header's opening '{' at
+// byte 8 always wins.
 void refuse_other_container(const fs::path& file, const char* what) {
   char magic[9] = {};
   const FileReader in(file);  // IoError for a FIFO or a device, before any read could block
@@ -172,7 +175,9 @@ void refuse_other_container(const fs::path& file, const char* what) {
   if (magic[8] == '{') return;
   const std::string_view m(magic, 4);
   const auto proto = static_cast<unsigned char>(magic[1]);
-  if (m == "GGUF") refuse(file, what, {"a GGUF file (llama.cpp / ComfyUI-GGUF format); the engine reads safetensors files"});
+  if (m == "GGUF") {
+    refuse(file, what, {"a GGUF file (llama.cpp / ComfyUI-GGUF format); the engine reads GGUF files only as the DiT"});
+  }
   if (m == std::string_view("PK\x03\x04", 4) || (static_cast<unsigned char>(magic[0]) == 0x80 && proto >= 2 && proto <= 5)) {
     refuse(file, what, {"a PyTorch pickle (.bin / .pt / .ckpt); the engine reads safetensors files"});
   }
@@ -399,13 +404,42 @@ void check_supported_bundle(const fs::path& dir) {
 }
 
 void check_supported_dit_file(const fs::path& file) {
+  if (is_gguf_file(file)) {
+    check_supported_gguf_dit(GgufFile(file));
+    return;
+  }
   refuse_other_container(file, "DiT");
   check_supported_dit_file(SafetensorsFile(file));
 }
 
+void check_supported_gguf_dit(const GgufFile& g) {
+  const fs::path& file = g.path();
+  if (const auto arch = g.metadata().find("general.architecture"); arch != g.metadata().end() && arch->second != "moss_image") {
+    refuse(file, "DiT", {"a GGUF file of architecture '" + arch->second + "'"});
+  }
+  std::vector<TensorInfo> infos;
+  for (const GgufTensorInfo& t : g.tensors()) infos.push_back({t.name, DType::kU8, t.shape, t.offset, t.nbytes});
+  const Names n = read_names(infos, {"model.diffusion_model.", "diffusion_model."}, "layers.");
+  if (n.tensors.empty()) refuse(file, "DiT", {"a GGUF file without tensors"});
+  if (n.find("video_embedder.weight") == nullptr && n.find("layers.0.norm1.weight") == nullptr) {
+    refuse(file, "DiT", {"GGUF tensors such as '" + n.first + "'"});
+  }
+  const auto linear = [](const char* module) {
+    const DitLinear* l = find_moss_dit_linear(module);
+    return ExpectedTensor{std::string(module) + ".weight", {l->n, l->k}};
+  };
+  std::vector<std::string> found;
+  compare_tensors(n,
+                  {linear("video_embedder"), linear("text_embedder.proj"), linear("time_embedding.0"),
+                   linear("final_linear_video"), {"layers.0.norm1.weight", {3072}}, {"layers.0.q_norm.weight", {128}}},
+                  found);
+  compare_layers(n, 42, "blocks", found);
+  if (!found.empty()) refuse(file, "DiT", found);
+}
+
 void check_supported_dit_file(const SafetensorsFile& st) {
   const fs::path& file = st.path();
-  const Names n = read_names(st, {"model.diffusion_model.", "diffusion_model."}, "layers.");
+  const Names n = read_names(st.tensors(), {"model.diffusion_model.", "diffusion_model."}, "layers.");
   if (n.tensors.empty()) refuse(file, "DiT", {"no tensors"});
   refuse_other_role(st, "DiT", n);
   if (n.find("video_embedder.weight") == nullptr && n.find("layers.0.norm1.weight") == nullptr) {
@@ -453,7 +487,7 @@ void check_supported_text_encoder_file(const fs::path& file) {
 void check_supported_text_encoder_file(const SafetensorsFile& st) {
   const fs::path& file = st.path();
   // Qwen3_5Model (`[model.]language_model.*`) and text-only (`model.*`) names alike; the importer explains the layout.
-  const Names n = read_names(st, {"model.", "language_model."}, "layers.");
+  const Names n = read_names(st.tensors(), {"model.", "language_model."}, "layers.");
   if (n.tensors.empty()) refuse(file, "text encoder", {"no tensors"});
   refuse_other_role(st, "text encoder", n);
   if (n.has("video_embedder.")) refuse(file, "text encoder", {"DiT tensors such as '" + n.first + "'"});

@@ -482,6 +482,7 @@ const char* encoding_name(Encoding e) {
     case Encoding::kW6A8: return "w6a8";
     case Encoding::kW4A4: return "w4a4";
     case Encoding::kNvfp4Raw: return "nvfp4";
+    case Encoding::kGguf: return "gguf";
   }
   return "?";
 }
@@ -523,6 +524,10 @@ QuantModel open_quant_model_impl(const fs::path& path, std::optional<ModelKind> 
     paths.push_back(path);
     model.base_dir = path.parent_path();
   } else if (fs::is_regular_file(path)) {
+    if (weights::is_gguf_file(path)) {
+      if (kind && *kind != ModelKind::kDiT) fail(util::path_utf8(path) + ": a GGUF file; only a DiT is read from GGUF");
+      return open_gguf_dit(weights::GgufFile(path));
+    }
     paths.push_back(path);
     model.base_dir = path.parent_path();
   } else if (fs::is_directory(path)) {
@@ -917,7 +922,8 @@ void decode_rows(const QuantModel& model, const QuantLinear& l, std::int64_t row
       decode_int4_rows(wp, rows, l.k, q);
       break;
     case Encoding::kNvfp4Raw:
-      break;  // refused above
+    case Encoding::kGguf:
+      break;  // refused above (a GGUF linear's spec is bf16)
     case Encoding::kW4A8:
     case Encoding::kW6A8: {
       const std::vector<std::byte> sr = read_rows(model, *l.s_rel, row0, rows);
@@ -967,6 +973,10 @@ void dequantize_linear_rows(const QuantModel& model, const QuantLinear& l, std::
   if (!l.spec.quantized()) {
     if (row0 < 0 || rows < 0 || row0 + rows > l.n) fail("rows out of range for '" + l.name + "'");
     const std::vector<std::byte> w = read_rows(model, l.weight, row0, rows);
+    if (l.encoding == Encoding::kGguf) {
+      weights::dequantize_gguf_rows(model.gguf_types.at(l.weight.name), w.data(), rows, l.k, out);
+      return;
+    }
     for (std::size_t i = 0; i < static_cast<std::size_t>(rows * l.k); ++i) {
       std::uint16_t v;
       std::memcpy(&v, w.data() + 2 * i, 2);

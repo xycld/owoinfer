@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include "weights/gguf.h"
 #include "weights/model_index.h"
 #include "weights/safetensors.h"
 
@@ -30,11 +31,15 @@ void check_supported_bundle(const std::filesystem::path& dir);
 
 // A single-file DiT (dit_file), from its safetensors header: the MOSS-Image tensors that every supported format keeps
 // in bf16 (embedders, time embedding, final layer, head norms) with MOSS-Image shapes, and blocks 0..41.
-// ComfyUI's `model.diffusion_model.` / `diffusion_model.` prefixes are accepted. GGUF and pickle files, LoRAs, control
-// adapters and distill bundle files are named as such, and so are block weights the importer cannot read (FP8,
-// torchao). Throws UnsupportedModelError, or FormatError / IoError for an unreadable file (IoError "not a regular
-// file" for a FIFO, a device or a directory, refused before any read).
+// ComfyUI's `model.diffusion_model.` / `diffusion_model.` prefixes are accepted. A GGUF file is checked by
+// check_supported_gguf_dit. Pickle files, LoRAs, control adapters and distill bundle files are named as such, and so
+// are block weights the importer cannot read (FP8, torchao). Throws UnsupportedModelError, or FormatError / IoError for
+// an unreadable file (IoError "not a regular file" for a FIFO, a device or a directory, refused before any read).
 void check_supported_dit_file(const std::filesystem::path& file);
+// A GGUF DiT, from its header: general.architecture "moss_image" when present, and the same tensors and shapes as a
+// safetensors DiT (names and prefixes alike). Its tensor types and every other tensor are checked by the converter's
+// reader (quant::open_gguf_dit). Throws UnsupportedModelError.
+void check_supported_gguf_dit(const GgufFile& file);
 // The same on a header already parsed (messages name file.path()), for callers that also read the header themselves:
 // the file is a safetensors file by then, so only the GGUF / pickle container check of the path form is skipped.
 void check_supported_dit_file(const SafetensorsFile& file);
