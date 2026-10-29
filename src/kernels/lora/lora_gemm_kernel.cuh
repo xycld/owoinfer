@@ -63,29 +63,55 @@ struct GatedResidualFn {  // residual + bf16(bf16(acc) * gate), kernels::gated_r
   }
 };
 
-// SiTU-GLU on 8 accumulator columns (4 hidden + their 4 gates, the permuted B) -> 4 bf16 as 8 bytes.
-struct SituGluNode : cutlass::epilogue::threadblock::VisitorImpl2x<> {
-  using VisitorImpl2x<>::VisitorImpl2x;
+// SiTU-GLU on 8 accumulator columns (4 hidden + their 4 gates, the permuted B) -> 4 bf16 as 8 bytes, with SiTU's two
+// factors from quant's tables (quant::detail::situ_factor_tables: a lookup is fused::detail::situ_value's computation
+// bit for bit, without its transcendentals after the main loop).
+struct SituGluNode {
+  using Arguments = quant::detail::SituFactorTables;
+  using Params = Arguments;
+  struct SharedStorage {};
+
+  template <class ProblemShape>
+  static Params to_underlying_arguments(ProblemShape const&, Arguments const& args, void*) {
+    if (args.gate == nullptr || args.hidden == nullptr) {
+      throw std::invalid_argument("mi::kernels::lora: the SiTU-GLU epilogue needs quant::detail::situ_factor_tables()");
+    }
+    return args;
+  }
+  template <class ProblemShape>
+  static size_t get_workspace_size(ProblemShape const&, Arguments const&) {
+    return 0;
+  }
+
+  CUTLASS_HOST_DEVICE SituGluNode() {}
+  CUTLASS_HOST_DEVICE SituGluNode(Params const& params, SharedStorage const&) : params_ptr(&params) {}
+  Params const* params_ptr = nullptr;
+
   struct Callbacks : cutlass::epilogue::threadblock::EmptyCallbacks {
+    quant::detail::SituFactorTables t;
     template <class ElementAccumulator, int kFrag>
     CUTLASS_DEVICE cutlass::Array<std::uint8_t, kFrag> visit(int, int, int, int,
                                                             cutlass::Array<ElementAccumulator, kFrag> const&,
                                                             cutlass::Array<ElementAccumulator, kFrag> const& acc) {
+      using quant::detail::bf16_entry;
+      using quant::detail::bf16_index;
       constexpr int kG = fused::detail::kUpGateGroup;
       static_assert(kFrag == 2 * kG, "SituGluNode assumes accesses of 4 hidden + 4 gate columns");
       cutlass::Array<std::uint8_t, kFrag> out;
       auto* words = reinterpret_cast<std::uint16_t*>(&out);
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < kG; ++i) {
-        words[i] = fused::detail::bf16_bits_rn(fused::detail::situ_value(rbf(static_cast<float>(acc[i])),
-                                                                         rbf(static_cast<float>(acc[kG + i]))));
+        const float h = rbf(static_cast<float>(acc[i])), g = rbf(static_cast<float>(acc[kG + i]));
+        words[i] = fused::detail::bf16_bits_rn(mul(bf16_entry(t.gate, bf16_index(g)), bf16_entry(t.hidden, bf16_index(h))));
       }
       return out;
     }
   };
   template <class ProblemShape>
   CUTLASS_DEVICE auto get_callbacks(cutlass::gemm::GemmCoord, int, ProblemShape) {
-    return Callbacks();
+    Callbacks c;
+    c.t = *params_ptr;
+    return c;
   }
 };
 

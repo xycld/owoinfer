@@ -22,7 +22,7 @@ void situ_glu(const fused::detail::Problem& p, const Tensor& out, const Tensor& 
   // D as bytes: [M, 2F] bytes with a row stride of 2 * ldo bytes is exactly the bf16 [M, F] output.
   auto* d = static_cast<std::uint8_t*>(out.data);
   const std::int64_t ldd = 2 * p.ldo;
-  const typename K::FusionCallbacks::Arguments cb{{{}, {}}, {d, {ldd, _1{}, ldd * p.m}}};
+  const typename K::FusionCallbacks::Arguments cb{{{}, quant::detail::situ_factor_tables(stream)}, {d, {ldd, _1{}, ldd * p.m}}};
   prm.output_op = K::FusionCallbacks::to_underlying_arguments(prm.problem, cb, nullptr);
   launch<K>("gemm_situ_glu_lora", prm, stream);
 }
