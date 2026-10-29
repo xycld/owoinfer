@@ -459,6 +459,33 @@ TEST(LoraFormat, AlphaRuleSharedWithConverter) {
   EXPECT_THROW(quant::lora_metadata_alpha(md), quant::QuantError);
 }
 
+// moss-edit-lora (Moss-Image-Edit): bare .lora_A / .lora_B keys, each module's alpha from the adapter_config header
+// (here alpha != rank), q / k / v as separate modules of the fused qkv, and the file's format in its report.
+TEST(LoraFormat, MossEditLoraAdapterConfig) {
+  TempDir dir("lora_edit");
+  auto t = low_rank("layers.0.proj.q", ".lora_A", ".lora_B", kD, kD, 16, 1);
+  for (auto& x : low_rank("layers.0.proj.k", ".lora_A", ".lora_B", kD, kD, 16, 2)) t.push_back(x);
+  for (auto& x : low_rank("layers.0.proj.v", ".lora_A", ".lora_B", kD, kD, 16, 3)) t.push_back(x);
+  const std::string meta =
+      R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"format_version\": 1, \"modules\": {)"
+      R"(\"layers.0.proj.q\": {\"alpha\": 32.0, \"rank\": 16}, \"layers.0.proj.k\": {\"alpha\": 8, \"rank\": 16}}}"})";
+  write_st(dir.path() / "e.safetensors", t, meta);
+  const LoraStack s = open1(dir.path() / "e.safetensors");
+  EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.q").at(0)->alpha_scale, 2.0);
+  EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.k").at(0)->alpha_scale, 0.5);
+  EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.v").at(0)->alpha_scale, 1.0);  // no alpha: 1
+  EXPECT_EQ(s.reports()[0].format, "moss-edit-lora");
+  EXPECT_TRUE(s.reports()[0].unknown.empty());
+  EXPECT_NE(s.reports()[0].notes.back().find("adapter_config (moss-edit-lora) applied to 2 modules"), std::string::npos);
+  std::map<std::string, std::string> md{{"adapter_config", R"({"format": "other", "modules": {"q": {"alpha": 2}}})"}};
+  EXPECT_TRUE(quant::lora_adapter_config_alphas(md).empty());  // only the moss-edit-lora format's
+  EXPECT_EQ(quant::lora_adapter_config_format(md), "other");
+  md["adapter_config"] = R"({"format": "moss-edit-lora", "modules": {"q": {"alpha": "x"}}})";
+  EXPECT_THROW(quant::lora_adapter_config_alphas(md), quant::QuantError);
+  md["adapter_config"] = "not json";
+  EXPECT_THROW(quant::lora_adapter_config_format(md), quant::QuantError);
+}
+
 // On an INT8 base every merged adapter of a block GEMM is reported as a warning; strict turns warnings into errors.
 TEST(LoraFormat, Int8MergeWarnings) {
   TempDir dir("lora_warn");

@@ -534,6 +534,46 @@ std::optional<double> lora_metadata_alpha(const std::map<std::string, std::strin
   return a->as_double();
 }
 
+namespace {
+// The adapter_config header as JSON (null when absent).
+json::Value adapter_config(const std::map<std::string, std::string>& metadata) {
+  const auto it = metadata.find("adapter_config");
+  if (it == metadata.end()) return {};
+  json::Value v;
+  try {
+    v = json::parse(it->second, json::ParseLimits{1 << 22});
+  } catch (const json::ParseError& e) {
+    fail(std::string("malformed adapter_config: ") + e.what());
+  }
+  if (!v.is_object()) fail("adapter_config is not a JSON object");
+  return v;
+}
+}  // namespace
+
+std::string lora_adapter_config_format(const std::map<std::string, std::string>& metadata) {
+  const json::Value v = adapter_config(metadata);
+  if (!v.is_object()) return {};
+  const json::Value* f = v.find("format");
+  return f != nullptr && f->is_string() ? f->as_string() : std::string();
+}
+
+std::map<std::string, double> lora_adapter_config_alphas(const std::map<std::string, std::string>& metadata) {
+  std::map<std::string, double> out;
+  const json::Value v = adapter_config(metadata);
+  if (!v.is_object()) return out;
+  const json::Value* f = v.find("format");
+  if (f == nullptr || !f->is_string() || f->as_string() != "moss-edit-lora") return out;
+  const json::Value* mods = v.find("modules");
+  if (mods == nullptr || !mods->is_object()) fail("adapter_config (moss-edit-lora) has no modules object");
+  for (const auto& [name, spec] : mods->as_object()) {
+    const json::Value* a = spec.is_object() ? spec.find("alpha") : nullptr;
+    if (a == nullptr || a->is_null()) continue;
+    if (!a->is_number() || !std::isfinite(a->as_double())) fail("adapter_config module " + name + ": alpha is not a finite number");
+    out.emplace(name, a->as_double());
+  }
+  return out;
+}
+
 double lora_alpha_scale(std::optional<double> alpha, std::int64_t rank) {
   return alpha ? *alpha / static_cast<double>(rank) : 1.0;
 }

@@ -161,9 +161,16 @@ void lora_merge_row(float* w, std::int64_t k, const float* up_row, const float* 
 //   its lora_alpha applies (PEFT's scaling = lora_alpha / r). lora_metadata_alpha returns it, or nullopt when the
 //   header has none. Throws QuantError for malformed metadata or a non-empty alpha_pattern (per-module alphas are
 //   refused rather than half-applied).
+// - Without one, a "moss-edit-lora" file (Moss-Image-Edit adapters: bare `<module>.lora_A` / `.lora_B` keys) declares
+//   each module's alpha in its `adapter_config` header ({"format": "moss-edit-lora", "modules": {<module>: {"alpha":
+//   ...}}}): lora_adapter_config_alphas returns them by module name as written (empty for a file without such a header;
+//   QuantError for malformed metadata or a non-finite alpha), and lora_adapter_config_format the header's format ("" for
+//   none).
 // - Without either, alpha / rank = 1.
 // (ComfyUI reads only the alpha tensors and ignores the metadata; for every file surveyed the two agree.)
 std::optional<double> lora_metadata_alpha(const std::map<std::string, std::string>& metadata);
+std::map<std::string, double> lora_adapter_config_alphas(const std::map<std::string, std::string>& metadata);
+std::string lora_adapter_config_format(const std::map<std::string, std::string>& metadata);
 // alpha / rank in double (1 without alpha), as the Python float of the reference implementations.
 double lora_alpha_scale(std::optional<double> alpha, std::int64_t rank);
 // f32(strength * lora_alpha_scale(alpha, rank)), the product in double; infinity outside the fp32 range.

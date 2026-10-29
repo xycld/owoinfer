@@ -48,6 +48,8 @@ constexpr SuffixRule kSuffixes[] = {
     {".lora_up.weight", Part::kUp},
     {".lora_A.weight", Part::kDown},
     {".lora_B.weight", Part::kUp},
+    {".lora_A", Part::kDown},  // moss-edit-lora (Moss-Image-Edit): bare PEFT names, alphas in adapter_config
+    {".lora_B", Part::kUp},
     {".lora.down.weight", Part::kDown},
     {".lora.up.weight", Part::kUp},
     {".lora_linear_layer.down.weight", Part::kDown},
@@ -230,6 +232,14 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
     rep.file = util::path_utf8(spec.path.filename());
     const std::optional<double> meta_alpha = metadata_alpha(spec.path, f.st.metadata());
     int meta_alpha_used = 0;
+    std::map<std::string, double> config_alphas;  // moss-edit-lora: per module, by name as written
+    try {
+      config_alphas = quant::lora_adapter_config_alphas(f.st.metadata());
+      rep.format = quant::lora_adapter_config_format(f.st.metadata());
+    } catch (const quant::QuantError& e) {
+      throw FormatError(spec.path, "", e.what());
+    }
+    int config_alpha_used = 0;
 
     // Group tensors by (resolved) module name.
     std::map<std::string, ModuleParts> mods;   // canonical module or alias name -> parts
@@ -358,7 +368,12 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
         if (r > std::min(stored_rows, k)) throw FormatError(spec.path, down.name, "rank " + std::to_string(r) + " exceeds the module's dimensions");
         a.rank = divisor = r;
         a.parts = {down, up};
-        // Without an alpha tensor, diffusers' metadata alpha applies (PEFT: scaling = lora_alpha / r).
+        // Without an alpha tensor, a moss-edit-lora adapter_config's module alpha, else diffusers' metadata alpha
+        // (PEFT: scaling = lora_alpha / r).
+        if (const auto it = config_alphas.find(src); !alpha && it != config_alphas.end()) {
+          alpha = it->second;
+          ++config_alpha_used;
+        }
         if (!alpha && meta_alpha) {
           alpha = *meta_alpha;
           ++meta_alpha_used;
@@ -462,6 +477,10 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
       std::snprintf(buf, sizeof buf, "%.9g", *meta_alpha);
       rep.notes.push_back(std::string("lora_alpha ") + buf + " from lora_adapter_metadata applied to " +
                           std::to_string(meta_alpha_used) + " modules without an alpha tensor");
+    }
+    if (config_alpha_used > 0) {
+      rep.notes.push_back("alphas from adapter_config (moss-edit-lora) applied to " + std::to_string(config_alpha_used) +
+                          " modules");
     }
     rep.adapters = static_cast<int>(file_adapters.size());
     for (const Adapter& a : file_adapters) {

@@ -126,6 +126,7 @@ struct LoraSpec {
 
 struct FileReport {
   std::string file;
+  std::string format;    // its adapter_config format ("moss-edit-lora": a Moss-Image-Edit adapter), "" for none
   int adapters = 0;      // after the fused-qkv split
   int side_branch = 0;   // of them on the side branch
   int merged = 0;        // of them merged at load
