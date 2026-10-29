@@ -209,4 +209,47 @@ bool make_directories(const std::filesystem::path& dir);
 bool touch_file_in(const std::filesystem::path& dir, const std::filesystem::path& path);
 bool remove_file_in(const std::filesystem::path& dir, const std::filesystem::path& path);
 
+// An advisory lock on a lock file (a cache entry's "<entry>.lock"), between processes and between the handles of one
+// process: whoever reads the entry holds it shared, whoever writes or removes the entry holds it exclusive. The lock
+// file is created when missing, never opened through a link and must be a regular file.
+//   POSIX: open(O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK), flock(2) with LOCK_NB; once locked, the path must still
+//   name the locked file (another holder may have removed it under its exclusive lock), else it is opened again.
+//   Windows: CreateFileW(GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_ALWAYS,
+//   FILE_FLAG_OPEN_REPARSE_POINT | kUserPathSqos), checked to be a plain regular file, then LockFileEx on its first
+//   byte with LOCKFILE_FAIL_IMMEDIATELY. Without FILE_SHARE_DELETE, a lock file cannot be deleted while any process
+//   has it open.
+class FileLock {
+ public:
+  enum class Mode { kShared, kExclusive };
+  enum class Status {
+    kLocked,
+    kBusy,   // another holder's lock conflicts (Windows: or the file is being deleted); try again later
+    kError,  // the lock file cannot be created or opened, is no regular file, or the lock call failed
+  };
+  FileLock() = default;
+  ~FileLock() { unlock(); }
+  FileLock(FileLock&& other) noexcept;
+  FileLock& operator=(FileLock&& other) noexcept;
+  FileLock(const FileLock&) = delete;
+  FileLock& operator=(const FileLock&) = delete;
+
+  // Takes the lock on `path` without waiting (a held lock is released first).
+  Status try_lock(const std::filesystem::path& path, Mode mode);
+  bool locked() const;
+  const std::filesystem::path& path() const { return path_; }
+  void unlock();
+  // An exclusive holder deletes the lock file (a file of the folder `dir`, as remove_file_in) and unlocks. POSIX:
+  // unlinked, then unlocked; Windows: unlocked and closed, then deleted, which fails while another process has it
+  // open. False when it was not deleted.
+  bool unlock_and_remove(const std::filesystem::path& dir);
+
+ private:
+  std::filesystem::path path_;
+#ifdef _WIN32
+  void* handle_ = nullptr;
+#else
+  int fd_ = -1;
+#endif
+};
+
 }  // namespace mi::util

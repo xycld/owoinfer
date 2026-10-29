@@ -963,6 +963,56 @@ TEST(RegularFile, ListTouchAndRemoveInFolder) {
 #endif
 }
 
+// FileLock between two handles of one process (as between processes): shared locks coexist, an exclusive one excludes
+// every other; the lock file is created, never a link, a folder or a FIFO; its exclusive holder removes it.
+TEST(RegularFile, FileLockSharedExclusiveAndRemove) {
+  namespace fs = std::filesystem;
+  using Lock = mi::util::FileLock;
+  using Status = Lock::Status;
+  TempDir dir("file_lock");
+  const fs::path path = dir.path() / "entry.lock";
+  Lock a, b, c;
+  ASSERT_EQ(a.try_lock(path, Lock::Mode::kShared), Status::kLocked);
+  EXPECT_TRUE(mi::util::file_info(path).regular());
+  EXPECT_EQ(b.try_lock(path, Lock::Mode::kShared), Status::kLocked);
+  EXPECT_EQ(c.try_lock(path, Lock::Mode::kExclusive), Status::kBusy);
+  EXPECT_FALSE(c.locked());
+  a.unlock();
+  EXPECT_EQ(c.try_lock(path, Lock::Mode::kExclusive), Status::kBusy);  // b still holds it
+  Lock moved = std::move(b);
+  EXPECT_FALSE(b.locked());
+  EXPECT_TRUE(moved.locked());
+  moved = Lock();  // releases
+  ASSERT_EQ(c.try_lock(path, Lock::Mode::kExclusive), Status::kLocked);
+  EXPECT_EQ(a.try_lock(path, Lock::Mode::kShared), Status::kBusy);
+  EXPECT_EQ(a.try_lock(path, Lock::Mode::kExclusive), Status::kBusy);
+  EXPECT_TRUE(c.unlock_and_remove(mi::util::resolved_path(dir.path())));
+  EXPECT_FALSE(c.locked());
+  EXPECT_FALSE(mi::util::file_info(path).exists());
+  EXPECT_EQ(a.try_lock(path, Lock::Mode::kExclusive), Status::kLocked);  // created again
+  a.unlock();
+
+  EXPECT_EQ(a.try_lock(dir.path(), Lock::Mode::kShared), Status::kError);  // a folder
+  EXPECT_EQ(a.try_lock(dir.path() / "missing" / "x.lock", Lock::Mode::kShared), Status::kError);
+  std::error_code ec;
+  fs::create_symlink(path, dir.path() / "link.lock", ec);  // Windows: only with the privilege or developer mode
+  if (!ec) {
+    EXPECT_EQ(a.try_lock(dir.path() / "link.lock", Lock::Mode::kShared), Status::kError);
+  }
+#ifdef __linux__
+  ASSERT_EQ(::mkfifo((dir.path() / "fifo.lock").c_str(), 0600), 0);
+  EXPECT_EQ(a.try_lock(dir.path() / "fifo.lock", Lock::Mode::kShared), Status::kError);
+#endif
+#ifndef _WIN32
+  // A lock file removed while another handle had it open: the next lock is on the file the path names now.
+  Lock old;
+  ASSERT_EQ(old.try_lock(path, Lock::Mode::kShared), Status::kLocked);
+  ASSERT_TRUE(mi::util::remove_file_in(dir.path(), path));
+  EXPECT_EQ(a.try_lock(path, Lock::Mode::kExclusive), Status::kLocked);  // a new file, not the removed one
+  EXPECT_TRUE(mi::util::file_info(path).regular());
+#endif
+}
+
 #ifdef _WIN32
 namespace {
 

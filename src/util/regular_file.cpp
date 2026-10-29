@@ -8,6 +8,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "util/rename_replace.h"
 
@@ -25,6 +26,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -471,6 +473,49 @@ bool OutputFile::close() {
   return ok_;
 }
 
+FileLock::Status FileLock::try_lock(const std::filesystem::path& path, Mode mode) {
+  unlock();
+  if (path.empty() || is_windows_device_path(path)) return Status::kError;
+  HANDLE h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | kSqos, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    // Another handle with DELETE access (a remover), or a file whose deletion is pending (ERROR_ACCESS_DENIED for a
+    // path that no longer opens; one that does is a folder or a file this account may not write).
+    const DWORD e = GetLastError();
+    if (e == ERROR_SHARING_VIOLATION || e == ERROR_DELETE_PENDING) return Status::kBusy;
+    return e == ERROR_ACCESS_DENIED && !file_info(path).exists() ? Status::kBusy : Status::kError;
+  }
+  FILE_ATTRIBUTE_TAG_INFO tag{};
+  if (!handle_info(h).regular() || !GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag) ||
+      (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+    CloseHandle(h);
+    return Status::kError;
+  }
+  OVERLAPPED ov{};
+  const DWORD flags = LOCKFILE_FAIL_IMMEDIATELY | (mode == Mode::kExclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0);
+  if (!LockFileEx(h, flags, 0, 1, 0, &ov)) {
+    const DWORD e = GetLastError();
+    CloseHandle(h);
+    return e == ERROR_LOCK_VIOLATION || e == ERROR_IO_PENDING ? Status::kBusy : Status::kError;
+  }
+  handle_ = h;
+  path_ = path;
+  return Status::kLocked;
+}
+
+bool FileLock::locked() const { return handle_ != nullptr; }
+
+void FileLock::unlock() {
+  if (handle_ != nullptr) CloseHandle(static_cast<HANDLE>(handle_));  // releases the lock
+  handle_ = nullptr;
+}
+
+bool FileLock::unlock_and_remove(const std::filesystem::path& dir) {
+  if (handle_ == nullptr) return false;
+  unlock();
+  return remove_file_in(dir, path_);
+}
+
 #else
 
 OpenStatus open_regular_file(const std::filesystem::path& path, int flags, int& fd) {
@@ -650,6 +695,67 @@ bool OutputFile::close() {
   return ok_;
 }
 
+FileLock::Status FileLock::try_lock(const std::filesystem::path& path, Mode mode) {
+  unlock();
+  if (path.empty()) return Status::kError;
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY | O_NONBLOCK, 0666);
+    if (fd < 0) return Status::kError;
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+      ::close(fd);
+      return Status::kError;
+    }
+    int r = 0;
+    do {
+      r = ::flock(fd, (mode == Mode::kExclusive ? LOCK_EX : LOCK_SH) | LOCK_NB);
+    } while (r != 0 && errno == EINTR);
+    if (r != 0) {
+      const int e = errno;
+      ::close(fd);
+      errno = e;
+      return e == EWOULDBLOCK ? Status::kBusy : Status::kError;
+    }
+    struct stat now {};
+    if (::lstat(path.c_str(), &now) == 0 && now.st_dev == st.st_dev && now.st_ino == st.st_ino) {
+      fd_ = fd;
+      path_ = path;
+      return Status::kLocked;
+    }
+    ::close(fd);  // removed (or replaced) since it was opened: lock the file the path names now
+  }
+  return Status::kBusy;
+}
+
+bool FileLock::locked() const { return fd_ >= 0; }
+
+void FileLock::unlock() {
+  if (fd_ >= 0) ::close(fd_);  // releases the lock
+  fd_ = -1;
+}
+
+bool FileLock::unlock_and_remove(const std::filesystem::path& dir) {
+  if (fd_ < 0) return false;
+  const bool removed = remove_file_in(dir, path_);
+  unlock();
+  return removed;
+}
+
 #endif
+
+FileLock::FileLock(FileLock&& other) noexcept { *this = std::move(other); }
+
+FileLock& FileLock::operator=(FileLock&& other) noexcept {
+  if (this != &other) {
+    unlock();
+    path_ = std::move(other.path_);
+#ifdef _WIN32
+    handle_ = std::exchange(other.handle_, nullptr);
+#else
+    fd_ = std::exchange(other.fd_, -1);
+#endif
+  }
+  return *this;
+}
 
 }  // namespace mi::util
