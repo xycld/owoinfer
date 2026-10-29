@@ -213,8 +213,37 @@ struct UpGateScaleBroadcast {
   }
 };
 
+// Order of the output tiles over the CTAs (the kernel's threadblock swizzle): bands of `band` adjacent N tiles; within
+// a band the band's N tiles of one M tile are consecutive CTAs, then the next M tile's. The weight tiles of a band
+// stay in L2 while the activation streams through once per band. band = 8 is GemmIdentityThreadblockSwizzle<8>'s
+// order. The grid is (M tiles, N tiles), linearized x first (the order CTAs are launched in); the band travels in
+// the params' swizzle_log_tile (Int8Gemm::set_band). The tile order never changes a result: every output tile is
+// still one CTA's exact int32 sum and the same epilogue.
+struct BandedSwizzle {
+  using GemmCoord = cutlass::gemm::GemmCoord;
+  CUTLASS_HOST_DEVICE BandedSwizzle() {}
+  CUTLASS_HOST_DEVICE static GemmCoord get_tiled_shape(GemmCoord problem, GemmCoord tile, int split_k_slices) {
+    return {(problem.m() + tile.m() - 1) / tile.m(), (problem.n() + tile.n() - 1) / tile.n(), split_k_slices};
+  }
+  CUTLASS_HOST_DEVICE static dim3 get_grid_shape(GemmCoord tiled) { return dim3(tiled.m(), tiled.n(), tiled.k()); }
+  CUTLASS_HOST_DEVICE static int get_log_tile(GemmCoord) { return 8; }
+  CUTLASS_DEVICE static GemmCoord get_tile_offset(int band) {
+    const long long m_tiles = gridDim.x, n_tiles = gridDim.y;
+    const long long id = blockIdx.y * m_tiles + blockIdx.x, per_band = m_tiles * band;
+    const long long b = id / per_band, r = id - b * per_band;
+    const long long width = min(static_cast<long long>(band), n_tiles - b * band);
+    return {static_cast<int>(r / width), static_cast<int>(b * band + r % width), static_cast<int>(blockIdx.z)};
+  }
+};
+
+// GemmUniversalAdapter without the operand transposition (never needed here: row-major D) plus the band setter.
+template <class Kernel>
+struct Int8Gemm : cutlass::gemm::device::GemmUniversalBase<Kernel> {
+  void set_band(int band) { this->params_.swizzle_log_tile = band; }
+};
+
 // The kernel: DefaultGemmWithVisitor (default_gemm_universal_with_visitor.h) with a B-operand permutation, without
-// the stream-K selection.
+// the stream-K selection, in BandedSwizzle's tile order (GemmBase keeps CUTLASS's swizzle: only its Mma is used).
 template <class Tile, class Callbacks, class PermuteB = cutlass::layout::NoPermute>
 struct Int8Kernel {
   using GemmBase = typename cutlass::gemm::kernel::DefaultGemmUniversal<
@@ -226,8 +255,8 @@ struct Int8Kernel {
       cutlass::layout::NoPermute, cutlass::layout::NoPermute, PermuteB>::GemmKernel;
   using Epilogue =
       cutlass::epilogue::threadblock::EpilogueWithVisitorCallbacks<typename GemmBase::Epilogue, Callbacks, 1>;
-  using Kernel = cutlass::gemm::kernel::GemmWithEpilogueVisitor<typename GemmBase::Mma, Epilogue, Swizzle>;
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+  using Kernel = cutlass::gemm::kernel::GemmWithEpilogueVisitor<typename GemmBase::Mma, Epilogue, BandedSwizzle>;
+  using Gemm = Int8Gemm<Kernel>;
 };
 
 // Visitor nodes of one tile configuration.
@@ -270,6 +299,11 @@ Int8Tile resolve_tile(Int8Tile tile, const Problem& p);
 
 void check_status(cutlass::Status status, const char* op, const char* stage);
 
+// BandedSwizzle's band for an m x n x k problem in tiles of tile_n columns: 8 (the identity order) while the
+// activation fits in three quarters of L2 (or 48 MiB on smaller L2s: comfy-kitchen's measured crossovers for its banded
+// order), else as many N tiles as half of L2 holds, at least 8.
+int int8_band(const Problem& p, int tile_n);
+
 template <class Gemm>
 void launch(const char* op, const Problem& p, const Int8Operands& a,
             const typename Gemm::GemmKernel::FusionCallbacks::Arguments& cb, cudaStream_t stream) {
@@ -281,6 +315,7 @@ void launch(const char* op, const Problem& p, const Int8Operands& a,
   // define NDEBUG.
   if (Gemm::get_workspace_size(args) != 0) check_status(cutlass::Status::kErrorWorkspaceNull, op, "workspace");
   check_status(gemm.initialize(args, nullptr, stream), op, "initialize");
+  gemm.set_band(int8_band(p, Gemm::GemmKernel::Mma::Shape::kN));
   check_status(gemm.run(stream), op, "run");
   MI_CUDA_CHECK_LAUNCH();
 }
