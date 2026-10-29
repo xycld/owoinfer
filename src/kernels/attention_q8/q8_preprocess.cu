@@ -332,7 +332,11 @@ __global__ void __launch_bounds__(kCtaK * kLanes) v_fp8_transpose_quant(PrepPara
   int v_start = 0;
   for (int i = 0; i < b; ++i) v_start += (p.cu_k[i + 1] - p.cu_k[i] + kCtaK - 1) / kCtaK * kCtaK;
 
-  __shared__ __nv_bfloat16 s_load[kCtaK][kHeadDim];
+  // s_load rows padded by one bf16 pair (an odd number of 4-byte words): the transpose below reads one column of 32
+  // consecutive rows per warp, which then falls in 32 distinct banks instead of one (a 32-way conflict that made this
+  // kernel run at half the bandwidth of the other passes). The rows are then only 4-byte aligned: stored as words.
+  constexpr int kLoadRow = kHeadDim + 2;
+  __shared__ __nv_bfloat16 s_load[kCtaK][kLoadRow];
   __shared__ __nv_bfloat16 s_store[kHeadDim][kCtaK];
   const int r = t / kLanes, lane = t % kLanes;
   const int mod = r % 16;
@@ -343,7 +347,11 @@ __global__ void __launch_bounds__(kCtaK * kLanes) v_fp8_transpose_quant(PrepPara
     raw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.v) + (start + token) * p.v_row +
                                           h * p.v_head + lane * kPack);
   }
-  *reinterpret_cast<uint4*>(&s_load[srow][lane * kPack]) = raw;
+  auto* dst = reinterpret_cast<std::uint32_t*>(&s_load[srow][lane * kPack]);
+  dst[0] = raw.x;
+  dst[1] = raw.y;
+  dst[2] = raw.z;
+  dst[3] = raw.w;
   __syncthreads();
   const int row_base = t % kCtaK, col_base = t / kCtaK;
 #pragma unroll
