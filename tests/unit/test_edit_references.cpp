@@ -3,9 +3,10 @@
 //     is the image rows' arithmetic with the axis-0 coordinate i + 1 (= the text rows' axis-1 values at position i + 1);
 //   - the DiT against ComfyUI's implementation (PR #17296, tools/reference/edit_oracle.py) on the oracle's first step:
 //     the reference keys / values of blocks 0, 21 and 41 and both CFG calls' velocities, gated against the no-reference
-//     difference between the two implementations;
-//   - the reference path's own invariants, bit for bit: a row's output does not depend on the other row of its forward,
-//     set_references(nullptr) restores the no-reference forward, and the op-by-op prefill equals the fused one.
+//     difference between the two implementations; again under 8-bit attention (q8_fp8), against its own floor;
+//   - the reference path's own invariants, bit for bit: a row's output does not depend on the other row of its forward
+//     (exact and q8_fp8), set_references(nullptr) restores the no-reference forward, and the op-by-op prefill and
+//     forward equal the fused ones.
 // The DiT tests need the oracle's tensors as .npy (MOSS_EDIT_ORACLE: x, ctx_{cond,uncond}, out_{cond,uncond}[_noref],
 // kv_{0,21,41}, ref_latent_in), the SFT bf16 DiT file (MOSS_EDIT_DIT) and the chinoll adapter (MOSS_EDIT_LORA); they
 // skip without them.
@@ -225,13 +226,15 @@ class EditDit : public ::testing::Test {
     const mi::weights::ModelIndex& index = info_->quant->index;
     // The oracle's grid (74x55) with its two rows, the op-by-op path (the largest big buffer), the cache and the prefill.
     const std::int64_t lengths[] = {32, 10};
-    const md::ComputeConfig config = md::MossDit::compute_config(info_->quant.get(), md::AttentionMode::kExact,
-                                                                 md::Int4Route::kAuto, sb_.get());
+    // Both attention modes the tests run: exact and q8_fp8 (the quantized block path).
     std::size_t work = 0;
-    for (const md::BlockPath p : {md::BlockPath::kFused, md::BlockPath::kOpByOp}) {
-      work = std::max({work, md::MossDit::workspace_bytes(74, 55, lengths, p, config, nullptr, kRefTokens),
-                       md::MossDit::prefill_workspace_bytes(kRefTokens, p, config, nullptr),
-                       md::MossDit::encode_text_workspace_bytes(32)});
+    for (const md::AttentionMode mode : {md::AttentionMode::kExact, md::AttentionMode::kQ8Fp8}) {
+      const md::ComputeConfig config = md::MossDit::compute_config(info_->quant.get(), mode, md::Int4Route::kAuto, sb_.get());
+      for (const md::BlockPath p : {md::BlockPath::kFused, md::BlockPath::kOpByOp}) {
+        work = std::max({work, md::MossDit::workspace_bytes(74, 55, lengths, p, config, nullptr, kRefTokens),
+                         md::MossDit::prefill_workspace_bytes(kRefTokens, p, config, nullptr),
+                         md::MossDit::encode_text_workspace_bytes(32)});
+      }
     }
     work += 2 * md::MossDit::reference_cache_bytes(kRefTokens) + (std::size_t{64} << 20);
     const std::size_t free = mi::runtime::DeviceArena::free_device_bytes() - (std::size_t{512} << 20);
@@ -361,6 +364,66 @@ TEST_F(EditDit, OracleStepZero) {
   }
 }
 
+// 8-bit attention (q8_fp8, the quantized block path: the prefill's attention, and every forward's over the slots through
+// cu_seqlens_k with the workspace's total keys) against the oracle, gated against q8's own no-reference floor; then,
+// without the side branch, a row's bits with references do not depend on the other row of its forward.
+TEST_F(EditDit, OracleStepZeroQ8) {
+  if (!md::attention_supported(md::AttentionMode::kQ8Fp8)) GTEST_SKIP() << "q8_fp8 attention needs FP8 (sm_89+)";
+  struct RestoreExact {
+    ~RestoreExact() {
+      model_->set_lora(sb_.get());
+      model_->set_attention(md::AttentionMode::kExact);
+    }
+  } restore;
+  model_->set_attention(md::AttentionMode::kQ8Fp8);
+  const auto ref = upload_f32(load("ref_latent_in"), {128, 32, 24});
+  const auto x = upload_f32(load("x"), {128, 74, 55});
+  const auto cond = refine("ctx_cond"), uncond = refine("ctx_uncond");
+  DevTensor cache(mi::DType::kBF16, {md::kLayers, kRefTokens, 2 * md::kDim});
+  const md::RefKv refs{cache.t};
+  const Tensor refs_in[] = {ref->t};
+  model_->prefill_references(refs_in, refs, stream());
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  for (const int b : {0, 21, 41}) {
+    const auto want = load("kv_" + std::to_string(b)).to_vector<float>();
+    const Stats kv = compare(want, cache_block(cache, b));
+    std::printf("[edit parity q8] block %2d: K|V cosine %.6f rel L2 %.4f\n", b, kv.cosine, kv.rel_l2);
+    EXPECT_GE(kv.cosine, 0.995) << "block " << b;
+  }
+  md::SkipSet s22;
+  s22.set(22);
+  const md::Row rows[] = {{cond->t, md::SkipSet{}}, {uncond->t, s22}};
+  DevTensor o0(mi::DType::kF32, {128, 74, 55}), o1(mi::DType::kF32, {128, 74, 55});
+  DevTensor n0(mi::DType::kF32, {128, 74, 55}), n1(mi::DType::kF32, {128, 74, 55});
+  const Tensor with[] = {o0.t, o1.t}, without[] = {n0.t, n1.t};
+  model_->forward(x->t, 1000.0f, rows, without, stream());
+  model_->set_references(&refs);
+  model_->forward(x->t, 1000.0f, rows, with, stream());
+  model_->set_references(nullptr);
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  const char* names[] = {"cond", "uncond"};
+  for (int r = 0; r < 2; ++r) {
+    const std::string n = names[r];
+    const Stats floor = compare(load("out_" + n + "_noref").to_vector<float>(), download_f32(without[r]));
+    const Stats got = compare(load("out_" + n).to_vector<float>(), download_f32(with[r]));
+    std::printf("[edit parity q8] %-6s velocity: with references cosine %.6f rel L2 %.4f; no-reference floor cosine %.6f "
+                "rel L2 %.4f\n",
+                n.c_str(), got.cosine, got.rel_l2, floor.cosine, floor.rel_l2);
+    EXPECT_LE(got.rel_l2, 1.5 * floor.rel_l2 + 1e-3) << n;
+    EXPECT_GE(got.cosine, floor.cosine - 1e-3) << n;
+  }
+
+  model_->set_lora(nullptr);
+  DevTensor b0(mi::DType::kF32, {128, 74, 55}), b1(mi::DType::kF32, {128, 74, 55}), a0(mi::DType::kF32, {128, 74, 55});
+  const Tensor bo[] = {b0.t, b1.t};
+  model_->set_references(&refs);
+  model_->forward(x->t, 1000.0f, rows, bo, stream());
+  model_->forward(x->t, 1000.0f, std::span<const md::Row>(rows, 1), std::span<const Tensor>(&a0.t, 1), stream());
+  model_->set_references(nullptr);
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  EXPECT_EQ(download_f32(b0.t), download_f32(a0.t)) << "q8: the cond row depends on the uncond row of its forward";
+}
+
 // The stack queries the planner prices (workspace_bytes with reference tokens, prefill_workspace_bytes) are what a
 // forward with references and a prefill take: not over, and tight (one alignment unit per allocation).
 TEST_F(EditDit, StackBytesAreWhatTheCallsTake) {
@@ -441,6 +504,20 @@ TEST_F(EditDit, BitExactInvariants) {
   EXPECT_EQ(download_f32(b0->t), download_f32(a0->t)) << "the cond row depends on the uncond row of its forward";
   EXPECT_EQ(download_f32(n0->t), download_f32(n0b->t)) << "set_references(nullptr) does not restore the plain forward";
   EXPECT_NE(download_f32(n0->t), download_f32(a0->t));
+
+  // The op-by-op block path with references (its own slots and attention call): the fused path's bits, both rows.
+  {
+    auto p0 = out(), p1 = out();
+    const Tensor po[] = {p0->t, p1->t};
+    model_->set_block_path(md::BlockPath::kOpByOp);
+    model_->set_references(&refs);
+    model_->forward(x->t, 1000.0f, both, po, stream());
+    model_->set_references(nullptr);
+    model_->set_block_path(md::BlockPath::kFused);
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+    EXPECT_EQ(download_f32(p0->t), download_f32(b0->t)) << "op-by-op forward with references differs from the fused one (cond)";
+    EXPECT_EQ(download_f32(p1->t), download_f32(b1->t)) << "op-by-op forward with references differs from the fused one (uncond)";
+  }
 
   // Refusals: 3 rows, a latent batch of 2, a malformed cache.
   model_->set_references(&refs);
