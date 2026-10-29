@@ -3,6 +3,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
+#include <iterator>
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -64,6 +67,8 @@ struct Driver {
   decltype(&cuDeviceGetAttribute) device_attribute = nullptr;
   decltype(&cuDeviceTotalMem_v2) device_total_mem = nullptr;
   decltype(&cuDeviceGetPCIBusId) device_pci_bus_id = nullptr;
+  // Pointer attributes (pointer_info()); optional, not part of `ok`.
+  decltype(&cuPointerGetAttributes) pointer_attributes = nullptr;
   bool ok = false;
 };
 
@@ -90,6 +95,7 @@ const Driver& driver() {
     r.device_attribute = lib.symbol<decltype(r.device_attribute)>("cuDeviceGetAttribute");
     r.device_total_mem = lib.symbol<decltype(r.device_total_mem)>("cuDeviceTotalMem_v2");
     r.device_pci_bus_id = lib.symbol<decltype(r.device_pci_bus_id)>("cuDeviceGetPCIBusId");
+    r.pointer_attributes = lib.symbol<decltype(r.pointer_attributes)>("cuPointerGetAttributes");
     // cuInit creates no context; it fails without a driver or with no visible device (CUDA_VISIBLE_DEVICES="").
     r.ok = init != nullptr && r.device_get != nullptr && r.primary_retain != nullptr && r.primary_release != nullptr &&
            r.primary_state != nullptr && r.push != nullptr && r.pop != nullptr && r.get_current != nullptr &&
@@ -213,6 +219,47 @@ std::optional<bool> primary_context_active(int device_ordinal) {
     return std::nullopt;
   }
   return active != 0;
+}
+
+std::optional<void*> primary_context(int device_ordinal) {
+  const Driver& d = driver();
+  CUdevice dev = 0;
+  CUcontext ctx = nullptr;
+  if (!d.ok || d.device_get(&dev, device_ordinal) != CUDA_SUCCESS || d.primary_retain(&ctx, dev) != CUDA_SUCCESS) {
+    return std::nullopt;
+  }
+  d.primary_release(dev);  // the caller's runtime holds its own reference: the handle stays valid
+  return ctx;
+}
+
+std::optional<PointerInfo> pointer_info(const void* ptr) {
+  const Driver& d = driver();
+  if (!d.ok || d.pointer_attributes == nullptr) return std::nullopt;
+  // Zeroed first: an address the driver does not know gets the attributes' null values (and CUDA_SUCCESS), and
+  // IS_MANAGED may be written as a one-byte bool.
+  unsigned int type = 0, managed = 0;
+  int ordinal = -1;
+  CUcontext ctx = nullptr;
+  CUdeviceptr start = 0;
+  std::size_t size = 0;
+  CUpointer_attribute attrs[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                                 CU_POINTER_ATTRIBUTE_CONTEXT, CU_POINTER_ATTRIBUTE_IS_MANAGED,
+                                 CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, CU_POINTER_ATTRIBUTE_RANGE_SIZE};
+  void* data[] = {&type, &ordinal, &ctx, &managed, &start, &size};
+  PointerInfo out;
+  if (d.pointer_attributes(static_cast<unsigned>(std::size(attrs)), attrs, data,
+                           static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(ptr))) != CUDA_SUCCESS) {
+    return out;  // unknown memory
+  }
+  out.memory_type = type == CU_MEMORYTYPE_DEVICE ? PointerInfo::kDevice
+                    : type == CU_MEMORYTYPE_HOST ? PointerInfo::kHost
+                                                 : type == 0 ? PointerInfo::kUnknown : PointerInfo::kOther;
+  out.device = ordinal;
+  out.context = ctx;
+  out.managed = managed != 0;
+  out.range_start = static_cast<std::uintptr_t>(start);
+  out.range_size = size;
+  return out;
 }
 
 ScopedCurrentContext::ScopedCurrentContext() noexcept {

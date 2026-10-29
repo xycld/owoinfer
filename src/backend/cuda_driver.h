@@ -1,8 +1,10 @@
 // The CUDA driver API and NVML, loaded at run time (dlopen / LoadLibrary), never linked: the engine must load and the
 // probe must answer on machines without an NVIDIA driver. Used by the probe (free memory without leaving a CUDA
-// context behind) and by the C API (restoring the caller's current context).
+// context behind), by the C API (restoring the caller's current context) and by runtime/exchange.h (a host's device
+// pointers).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -44,6 +46,24 @@ std::optional<MemoryInfo> driver_memory_info(int device_ordinal);
 
 // Whether the primary context of `device_ordinal` is active (driver API). Empty when libcuda is absent or cuInit fails.
 std::optional<bool> primary_context_active(int device_ordinal);
+
+// The primary context of `device_ordinal` (a CUcontext), retained and released again: valid while something else (the
+// engine's CUDA runtime) holds the primary context. Empty when libcuda is absent or a call fails.
+std::optional<void*> primary_context(int device_ordinal);
+
+// What the driver knows about an address (cuPointerGetAttributes, one call): the component API checks a host's device
+// tensors against it. An address the driver does not know (pageable host memory) is kUnknown.
+struct PointerInfo {
+  enum Type { kUnknown, kDevice, kHost, kOther };
+  Type memory_type = kUnknown;    // kHost: pinned or registered host memory
+  int device = -1;                // device ordinal
+  void* context = nullptr;        // CUcontext; nullptr also for context-independent memory (VMM, memory pools)
+  bool managed = false;
+  std::uintptr_t range_start = 0;  // the allocation holding the address
+  std::size_t range_size = 0;
+};
+// Empty when libcuda or its cuPointerGetAttributes is absent.
+std::optional<PointerInfo> pointer_info(const void* ptr);
 
 // Saves the calling thread's current CUDA context and makes it current again on destruction, whatever the code in
 // between selected (cudaSetDevice). Without libcuda it falls back to the runtime's current device.
