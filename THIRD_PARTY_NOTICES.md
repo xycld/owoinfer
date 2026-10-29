@@ -17,7 +17,7 @@ the upstream licence file; its `VENDORED.md` lists what was kept and what was ch
 | PyTorch (Philox `randn`, `linspace`, reduction order) | BSD-3-Clause | Copyright (c) 2016- Facebook, Inc. and contributors | https://github.com/pytorch/pytorch | `src/pipeline/samplers/torch_cuda_randn.*`, `src/pipeline/rng_torch_compat.*` and helpers in `sampler_kernels.cu` reproduce its random-number and arithmetic order |
 | LyCORIS | Apache-2.0 | Copyright (c) KohakuBlueleaf and contributors | https://github.com/KohakuBlueleaf/LyCORIS | `src/models/lora/` follows its LoHa/LoKr weight definitions and scaling |
 | stb_image | MIT or public domain (Unlicense), at your choice | Copyright (c) 2017 Sean Barrett | https://github.com/nothings/stb (`013ac3beddff3dbffafd5177e7972067cd2b5083`) | `third_party/stb/` (`LICENSE`). Linked into the engine for PNG/JPEG decoding of init images and masks (`src/pipeline/pipeline_image.cpp`), and used by the tests |
-| ggml / llama.cpp (GGUF container, ggml block types) | MIT | Copyright (c) 2023-2024 The ggml authors | https://github.com/ggml-org/ggml, https://github.com/ggml-org/llama.cpp (`gguf-py`) | `src/weights/gguf.*` reads the GGUF format and reimplements the reference dequantization of the Q8_0, Q4_0, Q4_K, Q5_K and Q6_K block layouts (`dequantize_row_*`) and their operation order. No code is copied; `tests/data/gguf/` are outputs of the `gguf` Python package |
+| ggml / llama.cpp (GGUF container, ggml block types) | MIT | Copyright (c) 2023-2026 The ggml authors | https://github.com/ggml-org/ggml, https://github.com/ggml-org/llama.cpp (`gguf-py`) | `src/weights/gguf.*` reads the GGUF format; its dequantization of the Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K and Q6_K blocks is derived from ggml's block layouts and dequantization (`dequantize_row_*`, their operation order). `tests/data/gguf/` are outputs of the `gguf` Python package. Licence text below |
 | xxHash (XXH64 algorithm and constants) | BSD-2-Clause | Copyright (c) Yann Collet | https://github.com/Cyan4973/xxHash (specification) | `src/util/xxh64.h` is an independent implementation from the specification |
 | Unicode tables of HF `tokenizers` 0.23.3 | Apache-2.0 (tokenizers); Unicode License v3 (Unicode Character Database) | Copyright (c) Hugging Face, Inc.; Copyright (c) Unicode, Inc. | https://github.com/huggingface/tokenizers | `src/tokenizer/unicode_tables.inc` (generated data, measured from the library by `tools/gen/gen_unicode_tables.py`) |
 
@@ -61,7 +61,7 @@ FlashAttention-2 and SageAttention are vendored directly; see the table above.
 - Apache-2.0: `third_party/sageattention/LICENSE`. comfy-kitchen, torchsde, LyCORIS and HF `tokenizers` use the same licence text,
   https://www.apache.org/licenses/LICENSE-2.0.
 - MIT / Unlicense: `third_party/stb/LICENSE`.
-- BSD-2-Clause (xxHash) and Unicode License v3: reproduced below, since they have no file in this repository.
+- BSD-2-Clause (xxHash), MIT (ggml) and Unicode License v3: reproduced below, since they have no file in this repository.
 
 ## xxHash licence (BSD-2-Clause)
 
@@ -94,6 +94,34 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
 ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## ggml licence (MIT)
+
+From https://github.com/ggml-org/ggml/blob/master/LICENSE:
+
+```
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ## Unicode License v3

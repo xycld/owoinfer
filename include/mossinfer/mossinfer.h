@@ -494,7 +494,8 @@ typedef struct mi_progress {
   double eta_seconds;      /* estimated seconds remaining; < 0 when unknown (no estimate yet) */
 } mi_progress;
 
-/* Called when a phase starts and after every sampling step. */
+/* Called when a phase starts and after every sampling step; also during a GGUF dit_file's conversion (its first load,
+ * before planning and the plan callback): MI_PHASE_DIT_LOAD with step 0, fraction 0 and eta_seconds < 0. */
 typedef void (*mi_progress_fn)(const mi_progress* progress, void* user_data);
 /* Called once per generation, after planning and before the first phase. `explanation` is the plan in several
  * human-readable lines, `plan_json` the plan as one JSON object. Both are valid during the call only. */

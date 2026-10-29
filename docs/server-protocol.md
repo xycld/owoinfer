@@ -259,7 +259,7 @@ With a preview (`"preview_output": "/tmp/preview.png"`), each denoise step that 
 
 | Event | Fields |
 |---|---|
-| `plan` | `explanation` (several lines of text), `plan` (object: residencies, arena, per-phase peaks, time estimate). Sent once, before the first phase. |
+| `plan` | `explanation` (several lines of text), `plan` (object: residencies, arena, per-phase peaks, time estimate). Sent once, before the first phase. A GGUF `dit_file`'s first load converts it before planning: `progress` events with `phase` `"dit_load"`, `fraction` 0 and `eta_seconds` null come during the conversion, before `plan`. |
 | `progress` | `phase` (`text_encoder`, `dit_load`, `denoise`, `decode`, in that order), `step`, `total_steps`, `step_seconds`, `elapsed_seconds`, `fraction`, `eta_seconds` |
 | `preview` | `step`, `total_steps`, `image` (the `preview_output` path), `width`, `height`. Only with `preview_output`. |
 | `done` | `status`, `warnings`, plus fields that depend on `status` (below) |
