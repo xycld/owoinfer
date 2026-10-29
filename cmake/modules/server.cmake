@@ -50,6 +50,19 @@ if(NOT MOSSINFER_ONLY AND EXISTS ${CMAKE_SOURCE_DIR}/tools/server/main.cpp)
     set_target_properties(mossinfer_example_c PROPERTIES LINKER_LANGUAGE CXX)  # the static core is C++ and CUDA
   endif()
 
+  # The component API's host loop (examples/c/component_loop.c), C99. Its euler update must round every operation:
+  # no floating-point contraction (MSVC does not contract by default).
+  add_executable(mossinfer_example_component ${CMAKE_SOURCE_DIR}/examples/c/component_loop.c)
+  set_target_properties(mossinfer_example_component PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+  target_compile_options(mossinfer_example_component PRIVATE ${_mi_c_warn}
+    $<$<OR:$<C_COMPILER_ID:GNU>,$<C_COMPILER_ID:Clang>,$<C_COMPILER_ID:AppleClang>>:-ffp-contract=off>)
+  if(TARGET mossinfer)
+    target_link_libraries(mossinfer_example_component PRIVATE mossinfer)
+  else()
+    target_link_libraries(mossinfer_example_component PRIVATE mossinfer_core)
+    set_target_properties(mossinfer_example_component PROPERTIES LINKER_LANGUAGE CXX)
+  endif()
+
   if(MOSSINFER_TESTS)
     enable_testing()
     set(MOSSINFER_TEST_WEIGHTS "/workspace/Models/MOSS-Image" CACHE PATH "MOSS-Image weights root ({base,sft}) for GPU tests")
@@ -67,6 +80,11 @@ if(NOT MOSSINFER_ONLY AND EXISTS ${CMAKE_SOURCE_DIR}/tools/server/main.cpp)
              -DBUNDLE=${MOSSINFER_TEST_WEIGHTS}/base -DOUT=${CMAKE_BINARY_DIR}/c_example_minimal.png
              -P ${CMAKE_SOURCE_DIR}/tests/c/run_c_example.cmake)
     set_tests_properties(c_example_minimal PROPERTIES LABELS gpu SKIP_REGULAR_EXPRESSION "MOSSINFER_TEST_SKIPPED")
+    # The component loop at 256^2, 2 steps: exit status 3 when its image is not mi_generate's bit for bit.
+    add_test(NAME c_example_component COMMAND ${CMAKE_COMMAND} -DEXAMPLE=$<TARGET_FILE:mossinfer_example_component>
+             -DBUNDLE=${MOSSINFER_TEST_WEIGHTS}/base -DOUT=${CMAKE_BINARY_DIR}/c_example_component.png
+             -P ${CMAKE_SOURCE_DIR}/tests/c/run_c_example.cmake)
+    set_tests_properties(c_example_component PROPERTIES LABELS gpu SKIP_REGULAR_EXPRESSION "MOSSINFER_TEST_SKIPPED")
 
     # A program built against the 0.1 header (hand-written 0.1 struct layouts) against this library. No GPU needed.
     add_executable(mossinfer_abi_compat_c ${CMAKE_SOURCE_DIR}/tests/c/test_abi_compat.c)

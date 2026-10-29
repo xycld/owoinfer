@@ -592,6 +592,8 @@ mi_vae_decode(engine, &lat, &rgb);                              /* rgb: U8 [1024
 mi_session_close(engine);
 ```
 
+`examples/c/component_loop.c` (target `mossinfer_example_component`) is this loop in full: it compares its image with `mi_generate()`'s and prints `bit-identical: yes` and both per-step times. The host's update must round each operation, so the file is built without floating-point contraction (`-ffp-contract=off`). `moss-server` exposes the same calls over shared memory ([server-protocol.md](server-protocol.md#component-session)).
+
 **Conventions.**
 - **Latents** are model space, F32 `[128, H/16, W/16]` per image (`[L, 128, h, w]` for a batch): the FLUX.2 VAE's 32 channels patchified 2 × 2 and batch-normed. That is ComfyUI's Flux2 `LATENT` as is: exchange it without any conversion, in either direction.
 - **FLOW.** x = (1 − σ)·x0 + σ·noise. Each output is the DiT's raw output (the velocity), so denoised = x − σ·out. The DiT's timestep is fp32(σ × 1000).
