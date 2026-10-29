@@ -504,8 +504,11 @@ struct Pipeline::Impl {
   // truncated one) is a clear error instead of a fault in a mapping. The control adapter and the LoRA files carry
   // their stamps in their keys (setup_models).
   void check_component_files() {
+    // A file that cannot be queried now (gone for a moment, a share that dropped) changes nothing: what is loaded keeps
+    // serving, and a load that needs the file reports it.
     const auto changed = [](const std::filesystem::path& file, const util::FileInfo& stamp) {
-      return util::file_info(file) != stamp;
+      const util::FileInfo now = util::file_info(file);
+      return now.exists() && now != stamp;
     };
     if (!options.dit_file.empty()) {
       const auto it = dit_sources.find(file_key(options.dit_file));
