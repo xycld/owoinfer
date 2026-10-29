@@ -1105,7 +1105,8 @@ typedef enum mi_memory {
 
 typedef enum mi_dtype { MI_DTYPE_F32 = 0, MI_DTYPE_BF16 = 1, MI_DTYPE_U8 = 2, MI_DTYPE_MAX_ENUM = 0x7fffffff } mi_dtype;
 
-/* A dense row-major tensor (no strides). A fixed 56-byte layout without struct_size. */
+/* A dense row-major tensor (no strides); data aligned to its element size (4 bytes for F32: a misaligned pointer is
+ * refused). A fixed 56-byte layout without struct_size. */
 typedef struct mi_tensor {
   void* data;
   mi_memory memory;

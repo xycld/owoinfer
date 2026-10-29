@@ -1734,6 +1734,10 @@ mi_status mi_image_resize(const mi_image* image, int32_t width, int32_t height, 
         height < 1 || width > kMaxSide || height > kMaxSide) {
       throw std::invalid_argument("image sizes must be 1 to " + std::to_string(kMaxSide) + " on a side.");
     }
+    constexpr std::int64_t kMaxPixels = 64'000'000;  // the image-input pixel limit (mi_image)
+    if (std::int64_t{image->width} * image->height > kMaxPixels || std::int64_t{width} * height > kMaxPixels) {
+      throw std::invalid_argument("image sizes must be at most 64,000,000 pixels.");
+    }
     const mi::pipeline::ResizeMode m = mi::api::to_resize(mode);
     const std::size_t need = static_cast<std::size_t>(width) * height * image->channels;
     if (out_bytes < need) {

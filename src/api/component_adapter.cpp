@@ -111,6 +111,11 @@ Tensor to_tensor(const mi_tensor& t, const char* what) {
     case MI_MEMORY_DEVICE: device = Device::kCUDA; break;
     default: unknown(n + ".memory", static_cast<int>(t.memory));
   }
+  // A misaligned device pointer would fault in a kernel (a sticky error that ends the process's CUDA context).
+  if (reinterpret_cast<std::uintptr_t>(t.data) % dtype_size(dtype) != 0) {
+    throw std::invalid_argument(n + ".data must be aligned to its element size (" + std::to_string(dtype_size(dtype)) +
+                                " bytes).");
+  }
   if (t.rank < 1 || t.rank > 4) {
     throw std::invalid_argument(n + ".rank must be 1 to 4, not " + std::to_string(t.rank) + ".");
   }
