@@ -136,13 +136,11 @@ HANDLE open_attributes(const std::filesystem::path& path) {
                      FILE_FLAG_BACKUP_SEMANTICS | kSqos, nullptr);
 }
 
-// FILETIME ticks (100 ns since 1601) as nanoseconds since the Unix epoch, converted as std::filesystem::last_write_time's
-// value was (MSVC's file_clock counts the same ticks from the same epoch), so .mossidx files keep their stamps.
+// FILETIME ticks (100 ns since 1601) as nanoseconds since the Unix epoch: plain arithmetic, no time zone database
+// (clock_cast through utc_clock would read one and apply leap seconds).
 std::int64_t filetime_ns(FILETIME t) {
   const auto ticks = static_cast<std::int64_t>((std::uint64_t{t.dwHighDateTime} << 32) | t.dwLowDateTime);
-  const std::filesystem::file_time_type ft{std::filesystem::file_time_type::duration(ticks)};
-  const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(ft);
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(sys.time_since_epoch()).count();
+  return (ticks - 116444736000000000LL) * 100;
 }
 
 // What an open handle is (file_info).

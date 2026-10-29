@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -805,6 +804,7 @@ TEST(RegularFile, FileInfoAndOutputFile) {
   const mi::util::FileInfo info = file_info(file);
   EXPECT_EQ(info.kind, FileKind::kRegular);
   EXPECT_EQ(info.size, 1000u);
+#ifndef _WIN32  // Windows: WindowsFileInfoFromHandle checks the time against the handle's FILETIME
   const auto t = fs::last_write_time(file);
 #if defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE < 13
   const auto sys = fs::file_time_type::clock::to_sys(t);
@@ -812,6 +812,7 @@ TEST(RegularFile, FileInfoAndOutputFile) {
   const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(t);
 #endif
   EXPECT_EQ(info.mtime_ns, std::chrono::duration_cast<std::chrono::nanoseconds>(sys.time_since_epoch()).count());
+#endif
   EXPECT_EQ(file_info(file), info);
   fs::create_hard_link(file, dir.path() / "link.bin");
   EXPECT_TRUE(mi::util::same_file(file_info(dir.path() / "link.bin"), info));
@@ -1066,8 +1067,7 @@ TEST(RegularFile, WindowsFileInfoFromHandle) {
   const auto ticks = static_cast<std::int64_t>((std::uint64_t{bh.ftLastWriteTime.dwHighDateTime} << 32) |
                                                bh.ftLastWriteTime.dwLowDateTime);
   const std::int64_t unix_ns = (ticks - 116444736000000000LL) * 100;  // FILETIME epoch 1601 -> 1970
-  // The same instant up to the leap seconds MSVC's clock_cast accounts for (as .mossidx stamps always did).
-  EXPECT_LE(std::llabs(info.mtime_ns - unix_ns), 60LL * 1'000'000'000);
+  EXPECT_EQ(info.mtime_ns, unix_ns);
   ASSERT_TRUE(CreateHardLinkW((dir.path() / "link.bin").c_str(), file.c_str(), nullptr));
   EXPECT_TRUE(mi::util::same_file(mi::util::file_info(dir.path() / "link.bin"), info));
   EXPECT_EQ(mi::util::resolved_path(file), std::filesystem::path(final_path));
