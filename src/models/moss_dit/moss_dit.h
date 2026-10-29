@@ -99,6 +99,7 @@ using SkipSet = std::bitset<kLayers>;
 struct Row {
   Tensor text;  // refined text tokens from encode_text(): CUDA bf16 [S, kDim], S >= 1
   SkipSet skip;
+  int latent = 0;  // the row's latent in a batched forward's [L, 128, h, w] (0 for a single latent)
 };
 
 // Debug/parity hook, called after every block with the residual stream of all rows: CUDA bf16
@@ -214,7 +215,9 @@ std::vector<std::string> shadowed_by_time_embedding(const lora::LoraStack& stack
 struct InputExtension {
   Tensor weight;  // CUDA bf16 [kDim, kLatentChannels + C], C > 0
   Tensor bias;    // CUDA bf16 [kDim]
-  Tensor extra;   // CUDA fp32 [C, h, w], contiguous: on the forward's latent grid, the same for every row
+  // CUDA fp32 [C, h, w], contiguous: on the forward's latent grid, the same for every row; with a latent batch
+  // [L, C, h, w], latent l's rows reading extra[l]
+  Tensor extra;
 };
 
 // The video embedding of a forward (P:247-248): tokens = [latents | extra] flattened to bf16 [h*w, C_in] (each fp32
@@ -384,13 +387,23 @@ class MossDit {
   // The same for compute config `config`, under `route` (nullptr: a fresh snapshot) as a pinned request route.
   static std::size_t workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
                                      BlockPath path, const ComputeConfig& config, const FusedRouteSnapshot* route);
+  // Stack bytes the next forward() over a latent grid of height x width and these rows' text lengths takes on this
+  // model as it is set up now (block path, compute config with the active LoRA sites, pinned or fresh route, the
+  // streaming pass's block buffers): what a caller compares with the stack it reserved before a forward at a size it
+  // did not plan for (a crop of the planned grid, whose fused route and so its big buffer can be larger per token).
+  std::size_t forward_stack_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths) const;
   // Token offset of each row in the joint sequence, plus the total as the last element.
   static std::vector<std::int64_t> token_offsets(std::int64_t height, std::int64_t width,
                                                  std::span<const std::int64_t> text_lengths);
 
-  // One DiT evaluation for every row: latents CUDA fp32 [kLatentChannels, h, w] (shared by all rows),
-  // timestep as the pipeline passes it (scheduler timestep, fp32). out[r]: CUDA fp32
-  // [kLatentChannels, h, w] velocity of row r (= transformer(...).sample.float(), P:413).
+  // One DiT evaluation for every row: latents CUDA fp32 [kLatentChannels, h, w] (shared by all rows) or a latent batch
+  // [L, kLatentChannels, h, w] (row r reads latent rows[r].latent), timestep as the pipeline passes it (scheduler
+  // timestep, fp32, shared by all rows). out[r]: CUDA fp32 [kLatentChannels, h, w] velocity of row r
+  // (= transformer(...).sample.float(), P:413). Each distinct latent is embedded by its own video-embed GEMM, the ops
+  // of a single-latent forward, so a row's output does not depend on the other latents of the batch; with one latent
+  // (either shape) the forward is the single-latent one. An input extension's extra then is [L, C, h, w] (one per
+  // latent), the latents' rank. A forward of more than kMaxRunRows joint tokens (dit_block_fused.h) is refused
+  // (std::invalid_argument, before any work).
   void forward(const Tensor& latents, float timestep, std::span<const Row> rows, std::span<const Tensor> out,
                cudaStream_t stream, const BlockHook& hook = {});
 

@@ -20,11 +20,11 @@
 // x1 + R with R the row's residual of blocks 1..41 from that last full call (R = x_41 - x1). Otherwise every block runs
 // and r0_prev and R are refreshed. Residuals are bf16, as the reference keeps them in the model dtype. The comparison
 // is always against the last full call, so the drift accumulates and forces a recompute. Each row (identified by its
-// text tensor and skip set: cond, uncond, SLG) has its own residuals; a call with a row the cache has not computed yet
-// (the first call, the SLG row entering its window, a changed skip set) runs every block, as does the call after
-// invalidate() (the pipeline's: a control input's step window opened or closed); a row absent from a call loses its
-// residuals, so a row identity that comes back never gets a stale R. The decision needs one
-// device-to-host synchronization per call. Works with every block path (CUDA graphs: block 0 replays, the hook runs
+// text tensor, skip set and latent: cond, uncond, SLG, and per image of a latent batch) has its own residuals; a call
+// with a row the cache has not computed yet (the first call, the SLG row entering its window, a changed skip set) runs
+// every block, as does the call after invalidate() (the pipeline's: a control input's step window opened or closed);
+// a row absent from a call loses its residuals, so a row identity that comes back never gets a stale R. The decision
+// needs one device-to-host synchronization per call. Works with every block path (CUDA graphs: block 0 replays, the hook runs
 // between graphs), streamed blocks (a reuse ends the streaming pass after block 0), LoRA side branches and INT8/INT4
 // blocks: the hook only reads and writes the residual stream.
 // TeaCache (Liu et al. 2024, "Timestep Embedding Tells: It's Time to Cache for Video Diffusion Model") is not offered:
@@ -143,6 +143,7 @@ class FirstBlockCache final : public moss_dit::StepCacheHook {
     const void* text = nullptr;
     std::int64_t text_length = 0;
     moss_dit::SkipSet skip;
+    int latent = 0;      // the row's latent in a batched forward
     bool used = false;   // assigned to a row identity
     bool valid = false;  // first / rest hold a full call's residuals
     void* scratch = nullptr;  // x0 before block 0, then x1 after it (a full call)

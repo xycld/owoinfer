@@ -124,7 +124,10 @@ FirstBlockCache::FirstBlockCache(runtime::DeviceArena& arena, std::int64_t heigh
 FirstBlockCache::Slot& FirstBlockCache::slot_of(const moss_dit::Row& row) {
   const auto taken = [&](const Slot& s) { return std::find(current_.begin(), current_.end(), &s) != current_.end(); };
   for (Slot& s : slots_) {
-    if (s.used && s.text == row.text.data && s.text_length == row.text.dim(0) && s.skip == row.skip && !taken(s)) return s;
+    if (s.used && s.text == row.text.data && s.text_length == row.text.dim(0) && s.skip == row.skip &&
+        s.latent == row.latent && !taken(s)) {
+      return s;
+    }
   }
   // A new row identity: a free slot, else one no row of this call uses (its residuals are dropped).
   Slot* pick = nullptr;
@@ -141,6 +144,7 @@ FirstBlockCache::Slot& FirstBlockCache::slot_of(const moss_dit::Row& row) {
   pick->text = row.text.data;
   pick->text_length = row.text.dim(0);
   pick->skip = row.skip;
+  pick->latent = row.latent;
   pick->used = true;
   pick->valid = false;
   return *pick;

@@ -399,6 +399,180 @@ TEST_F(MossDitTest, VarlenBatchBitExactPerRow) {
   mi::set_varlen_debug_checks(checks);
 }
 
+// Latent batches: every latent of a [L, 128, h, w] forward is embedded by its own GEMM, so each row equals the same row
+// in a single-latent forward of its latent bit for bit (with mixed prompts and skip sets, L = 2 at 64x64 and L = 4,
+// 8 rows, at 32x48); a [1, 128, h, w] forward is the single-latent one.
+TEST_F(MossDitTest, LatentBatchRowsEqualSingleLatentForwards) {
+  Case c = load_case("g_layout_1024");
+  SkipSet s22;
+  s22.set(22);
+  struct Grid {
+    std::int64_t h, w;
+    int latents;
+  };
+  const Grid grids[] = {{c.h, c.w, 2}, {32, 48, 4}, {c.h, c.w, 1}};
+  for (const Grid& g : grids) {
+    const std::int64_t plane = 128 * g.h * g.w;
+    DevTensor batch(mi::DType::kF32, {g.latents, 128, g.h, g.w});
+    std::vector<float> lv(static_cast<std::size_t>(batch.t.numel()));
+    for (std::size_t i = 0; i < lv.size(); ++i) lv[i] = std::sin(0.37f * static_cast<float>(i) + 0.11f * static_cast<float>(i / plane));
+    batch.buf.upload(lv.data(), lv.size() * 4);
+    const auto latent = [&](int l) {
+      return Tensor::view(batch.t.ptr<float>() + l * plane, mi::DType::kF32, mi::Device::kCUDA, {128, g.h, g.w});
+    };
+    // Latent l's rows: cond and uncond with skip 22, the prompts swapped on odd latents.
+    std::vector<Row> rows;
+    for (int l = 0; l < g.latents; ++l) {
+      const Tensor& a = l % 2 == 0 ? c.cond->t : c.uncond->t;
+      const Tensor& b = l % 2 == 0 ? c.uncond->t : c.cond->t;
+      rows.push_back({a, SkipSet{}, l});
+      rows.push_back({b, s22, l});
+    }
+    std::vector<std::int64_t> lengths;
+    for (const Row& r : rows) lengths.push_back(r.text.dim(0));
+    ASSERT_LE(MossDit::workspace_bytes(g.h, g.w, lengths) + MossDit::stream_workspace_bytes(*index_, residency_),
+              arena_->available());
+    std::vector<std::unique_ptr<DevTensor>> batched, alone;
+    std::vector<Tensor> outs;
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+      batched.push_back(std::make_unique<DevTensor>(mi::DType::kF32, std::initializer_list<std::int64_t>{128, g.h, g.w}));
+      alone.push_back(std::make_unique<DevTensor>(mi::DType::kF32, std::initializer_list<std::int64_t>{128, g.h, g.w}));
+      outs.push_back(batched.back()->t);
+    }
+    model_->forward(batch.t, c.timestep, rows, outs, stream());
+    for (int l = 0; l < g.latents; ++l) {
+      const auto k = static_cast<std::size_t>(2 * l);
+      const Row single[] = {{rows[k].text, rows[k].skip}, {rows[k + 1].text, rows[k + 1].skip}};
+      const Tensor single_outs[] = {alone[k]->t, alone[k + 1]->t};
+      model_->forward(latent(l), c.timestep, single, single_outs, stream());
+    }
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+      const auto b = download_f32(batched[r]->t);
+      const auto a = download_f32(alone[r]->t);
+      std::size_t differ = 0;
+      for (std::size_t i = 0; i < a.size(); ++i) differ += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
+      EXPECT_EQ(differ, 0u) << "grid " << g.h << "x" << g.w << " L=" << g.latents << " row " << r << " (latent "
+                            << rows[r].latent << ")";
+    }
+  }
+}
+
+// An input extension (a control adapter's widened embedder) with a latent batch: extra [L, C, h, w], latent l's rows
+// embedding [latents[l] | extra[l]], each equal to a single-latent forward with extra[l].
+TEST_F(MossDitTest, LatentBatchInputExtensionPerLatent) {
+  Case c = load_case("g_layout_1024");
+  const std::int64_t h = 32, w = 48, ch = 128, plane = 128 * h * w, extra_plane = ch * h * w;
+  // A synthetic widened embedder: small weights, so the activations stay in range.
+  DevTensor weight(mi::DType::kBF16, {mi::moss_dit::kDim, 128 + ch}), bias(mi::DType::kBF16, {mi::moss_dit::kDim});
+  {
+    std::vector<std::uint16_t> hw(static_cast<std::size_t>(weight.t.numel())), hb(static_cast<std::size_t>(bias.t.numel()));
+    for (std::size_t i = 0; i < hw.size(); ++i) hw[i] = to_bf16(0.02f * std::sin(0.013f * static_cast<float>(i)));
+    for (std::size_t i = 0; i < hb.size(); ++i) hb[i] = to_bf16(0.01f * std::cos(0.7f * static_cast<float>(i)));
+    weight.buf.upload(hw.data(), hw.size() * 2);
+    bias.buf.upload(hb.data(), hb.size() * 2);
+  }
+  DevTensor batch(mi::DType::kF32, {2, 128, h, w}), extra(mi::DType::kF32, {2, ch, h, w});
+  {
+    std::vector<float> lv(static_cast<std::size_t>(batch.t.numel())), ev(static_cast<std::size_t>(extra.t.numel()));
+    for (std::size_t i = 0; i < lv.size(); ++i) lv[i] = std::sin(0.37f * static_cast<float>(i));
+    for (std::size_t i = 0; i < ev.size(); ++i) ev[i] = std::cos(0.21f * static_cast<float>(i));
+    batch.buf.upload(lv.data(), lv.size() * 4);
+    extra.buf.upload(ev.data(), ev.size() * 4);
+  }
+  const auto view = [](const Tensor& t, std::int64_t offset, std::int64_t channels, std::int64_t hh, std::int64_t ww) {
+    return Tensor::view(t.ptr<float>() + offset, mi::DType::kF32, mi::Device::kCUDA, {channels, hh, ww});
+  };
+  const Row rows[] = {{c.cond->t, SkipSet{}, 0}, {c.cond->t, SkipSet{}, 1}, {c.uncond->t, SkipSet{}, 0}};
+  DevTensor b0(mi::DType::kF32, {128, h, w}), b1(mi::DType::kF32, {128, h, w}), b2(mi::DType::kF32, {128, h, w});
+  DevTensor a0(mi::DType::kF32, {128, h, w}), a1(mi::DType::kF32, {128, h, w}), a2(mi::DType::kF32, {128, h, w});
+  const Tensor outs[] = {b0.t, b1.t, b2.t};
+  const mi::moss_dit::InputExtension batch_ext{weight.t, bias.t, extra.t};
+  model_->set_input_extension(&batch_ext);
+  model_->forward(batch.t, c.timestep, rows, outs, stream());
+  for (int l = 0; l < 2; ++l) {
+    const mi::moss_dit::InputExtension ext{weight.t, bias.t, view(extra.t, l * extra_plane, ch, h, w)};
+    model_->set_input_extension(&ext);
+    std::vector<Row> single = {{c.cond->t, SkipSet{}}};
+    std::vector<Tensor> single_outs = {l == 0 ? a0.t : a1.t};
+    if (l == 0) {
+      single.push_back({c.uncond->t, SkipSet{}});
+      single_outs.push_back(a2.t);
+    }
+    model_->forward(view(batch.t, l * plane, 128, h, w), c.timestep, single, single_outs, stream());
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+  }
+  // A rank-3 extra with a latent batch (no broadcasting) is refused.
+  const mi::moss_dit::InputExtension flat{weight.t, bias.t, view(extra.t, 0, ch, h, w)};
+  model_->set_input_extension(&flat);
+  EXPECT_THROW(model_->forward(batch.t, c.timestep, rows, outs, stream()), std::invalid_argument);
+  model_->set_input_extension(nullptr);
+  const std::pair<const DevTensor*, const DevTensor*> pairs[] = {{&b0, &a0}, {&b1, &a1}, {&b2, &a2}};
+  for (std::size_t r = 0; r < 3; ++r) {
+    const auto b = download_f32(pairs[r].first->t), a = download_f32(pairs[r].second->t);
+    EXPECT_EQ(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)), 0) << "row " << r;
+  }
+}
+
+TEST_F(MossDitTest, LatentBatchRefusals) {
+  Case c = load_case("g_layout_1024");
+  DevTensor batch(mi::DType::kF32, {2, 128, 32, 48}), out(mi::DType::kF32, {128, 32, 48});
+  const Tensor outs[] = {out.t};
+  const Row past_end[] = {{c.cond->t, SkipSet{}, 2}};
+  EXPECT_THROW(model_->forward(batch.t, c.timestep, past_end, outs, stream()), std::invalid_argument);
+  const Row second[] = {{c.cond->t, SkipSet{}, 1}};
+  EXPECT_THROW(model_->forward(c.latents->t, c.timestep, second, outs, stream()), std::invalid_argument);  // one latent
+  const Row negative[] = {{c.cond->t, SkipSet{}, -1}};
+  EXPECT_THROW(model_->forward(batch.t, c.timestep, negative, outs, stream()), std::invalid_argument);
+  DevTensor zero(mi::DType::kF32, {0, 128, 32, 48});
+  EXPECT_THROW(model_->forward(zero.t, c.timestep, second, outs, stream()), std::invalid_argument);
+  // More joint tokens than the fused route's self-check covers: refused before any work (8 rows of a 91x91 grid).
+  const std::int64_t g = 91;
+  DevTensor big(mi::DType::kF32, {8, 128, g, g});
+  std::vector<std::unique_ptr<DevTensor>> big_outs;
+  std::vector<Tensor> big_views;
+  std::vector<Row> rows;
+  for (int l = 0; l < 8; ++l) {
+    rows.push_back({c.cond->t, SkipSet{}, l});
+    big_outs.push_back(std::make_unique<DevTensor>(mi::DType::kF32, std::initializer_list<std::int64_t>{128, g, g}));
+    big_views.push_back(big_outs.back()->t);
+  }
+  ASSERT_GT(8 * (g * g + c.s_cond), mi::moss_dit::kMaxRunRows);
+  const std::size_t used = arena_->used();
+  try {
+    model_->forward(big.t, c.timestep, rows, big_views, stream());
+    FAIL() << "expected a refusal";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string(e.what()).find("joint tokens exceeds"), std::string::npos) << e.what();
+  }
+  EXPECT_EQ(arena_->used(), used);
+  EXPECT_EQ(cudaStreamQuery(stream()), cudaSuccess);
+}
+
+// forward_stack_bytes: what the next forward takes from the stack (the activations and, when blocks stream, their
+// buffers), measured as the stack's high-water mark of a forward.
+TEST_F(MossDitTest, ForwardStackBytesIsWhatAForwardTakes) {
+  Case c = load_case("g_layout_1024");
+  const Row rows[] = {{c.cond->t, SkipSet{}}, {c.uncond->t, c.uncond_skip}};
+  const std::int64_t lengths[] = {c.s_cond, c.s_uncond};
+  for (const std::int64_t gh : {std::int64_t{24}, c.h}) {
+    DevTensor lat(mi::DType::kF32, {128, gh, gh}), o0(mi::DType::kF32, {128, gh, gh}), o1(mi::DType::kF32, {128, gh, gh});
+    std::vector<float> lv(static_cast<std::size_t>(lat.t.numel()));
+    for (std::size_t i = 0; i < lv.size(); ++i) lv[i] = std::sin(0.37f * static_cast<float>(i));
+    lat.buf.upload(lv.data(), lv.size() * 4);
+    const Tensor outs[] = {o0.t, o1.t};
+    const std::size_t need = model_->forward_stack_bytes(gh, gh, lengths);
+    EXPECT_EQ(need, MossDit::workspace_bytes(gh, gh, lengths, model_->block_path(), model_->compute_config(), nullptr) +
+                        MossDit::stream_workspace_bytes(*index_, residency_));
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+    arena_->reset_high_water();
+    const std::size_t before = arena_->used();
+    model_->forward(lat.t, c.timestep, rows, outs, stream());
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream()));
+    EXPECT_LE(arena_->high_water() - before, need) << "grid " << gh;
+  }
+}
+
 // Cancel between blocks (the flag is set by the hook of block 10, so the check before block 11 must see it): forward
 // throws Cancelled without issuing block 11, the stack is released, and the next forward is bit-identical to an
 // uncancelled one (also while a never-set flag throttles the host). A flag already set when loading stops the

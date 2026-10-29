@@ -297,12 +297,15 @@ TEST(GpuAccel, KernelsMatchHostArithmetic) {
 }
 
 // A fake forward around the hook: x0 -> before_blocks; x = x0 + r0 (block 0) -> after_first_block; unless reused,
-// x = x1 + R (the other blocks) -> after_blocks. Returns the rows' final video tokens.
+// x = x1 + R (the other blocks) -> after_blocks. Returns the rows' final video tokens. Row r's residuals are scaled
+// by 1 + k and offset by -k with k = r, or k = its latent with by_latent (the same image, wherever its row sits).
 struct FakeDit {
   mi::runtime::DeviceArena& arena;
   std::int64_t video;
+  bool by_latent = false;
   std::vector<std::uint16_t> run(accel::FirstBlockCache& cache, const std::vector<Row>& rows, const std::vector<float>& r0,
                                  const std::vector<float>& rest, bool* reused) {
+    const auto k = [&](std::size_t r) { return static_cast<float>(by_latent ? rows[r].latent : static_cast<int>(r)); };
     const std::int64_t s = 4;  // text tokens per row
     std::vector<std::int64_t> off{0};
     for (std::size_t r = 0; r < rows.size(); ++r) off.push_back(off.back() + video + s);
@@ -325,14 +328,14 @@ struct FakeDit {
     upload();
     cache.before_blocks(dx, rows, off, video, nullptr);
     for (std::size_t r = 0; r < rows.size(); ++r) {
-      for (std::size_t i = 0; i < n; ++i) video_at(r, i) = to_bf16(from_bf16(video_at(r, i)) + r0[i % r0.size()] * (1.0f + static_cast<float>(r)));
+      for (std::size_t i = 0; i < n; ++i) video_at(r, i) = to_bf16(from_bf16(video_at(r, i)) + r0[i % r0.size()] * (1.0f + k(r)));
     }
     upload();
     *reused = cache.after_first_block(dx, rows, off, video, nullptr);
     if (!*reused) {
       download();
       for (std::size_t r = 0; r < rows.size(); ++r) {
-        for (std::size_t i = 0; i < n; ++i) video_at(r, i) = to_bf16(from_bf16(video_at(r, i)) + rest[i % rest.size()] - static_cast<float>(r));
+        for (std::size_t i = 0; i < n; ++i) video_at(r, i) = to_bf16(from_bf16(video_at(r, i)) + rest[i % rest.size()] - k(r));
       }
       upload();
     }
@@ -426,6 +429,44 @@ TEST(GpuAccel, FirstBlockCacheDecisionsAndReuse) {
   EXPECT_FALSE(reused);
   EXPECT_THROW(accel::FirstBlockCache(arena, 2, 4, 0, 0.1), std::invalid_argument);
   EXPECT_THROW(accel::FirstBlockCache(arena, 2, 4, 2, 0.0), std::invalid_argument);
+}
+
+// A latent batch: rows with the same text and skip set on different latents are different row identities, each with
+// its own residuals, also when a call evaluates them in another order or alone.
+TEST(GpuAccel, FirstBlockCacheKeysRowsByLatent) {
+  const std::int64_t video = 8;
+  mi::runtime::DeviceArena arena(std::size_t{64} << 20);
+  mi::runtime::StackScope scope(arena);
+  const Tensor cond = arena.alloc_tensor(mi::DType::kBF16, {4, mi::moss_dit::kDim});
+  const Row img0{cond, {}, 0}, img1{cond, {}, 1};
+  accel::FirstBlockCache cache(arena, 2, 4, 2, 0.1);
+  FakeDit dit{arena, video, true};
+  const std::vector<float> r0 = {0.5f, -0.25f, 1.0f};
+  const std::vector<float> rest = {2.0f, 0.75f, -1.5f, 0.125f};
+  bool reused = true;
+  const auto full = dit.run(cache, {img0, img1}, r0, rest, &reused);
+  EXPECT_FALSE(reused);
+  // Image 1 alone, in row 0: its own slot (image 0's has a residual half as large: relative change 0.5, no reuse).
+  const auto alone = dit.run(cache, {img1}, r0, rest, &reused);
+  EXPECT_TRUE(reused);
+  EXPECT_EQ(cache.diffs().back(), 0.0);
+  const auto n = static_cast<std::size_t>(video * mi::moss_dit::kDim);
+  for (std::size_t i = 0; i < n; ++i) {
+    const float x0 = from_bf16(to_bf16(0.5f + 0.001f * static_cast<float>(i % 97)));
+    const float x1 = from_bf16(to_bf16(x0 + r0[i % r0.size()] * 2.0f));
+    const float big_r = from_bf16(to_bf16(from_bf16(full[n + i]) - x1));  // image 1's R from the full call
+    ASSERT_EQ(alone[i], to_bf16(x1 + big_r)) << i;
+  }
+  // Image 0 was absent: it lost its residuals, so a call with both runs in full; then both reuse in either order.
+  dit.run(cache, {img1, img0}, r0, rest, &reused);
+  EXPECT_FALSE(reused);
+  dit.run(cache, {img0, img1}, r0, rest, &reused);
+  EXPECT_TRUE(reused);
+  EXPECT_EQ(cache.diffs().back(), 0.0);
+  // Image 0 alone: its own residuals.
+  dit.run(cache, {img0}, r0, rest, &reused);
+  EXPECT_TRUE(reused);
+  EXPECT_EQ(cache.diffs().back(), 0.0);
 }
 
 // ---- GPU: the real DiT ----
