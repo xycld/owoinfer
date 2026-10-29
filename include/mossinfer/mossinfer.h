@@ -1001,7 +1001,7 @@ typedef struct mi_file_info {
    * MI_FILE_TEXT_NOTE says why not. */
   int32_t loadable;
   uint64_t file_bytes;
-  int32_t tensor_count;     /* tensors in the safetensors header; 0 when the header cannot be read */
+  int32_t tensor_count;     /* tensors in the safetensors (or GGUF) header; 0 when the header cannot be read */
   /* A loadable DiT: BF16, INT8, W4A4 or NVFP4, as mi_tier_info.dit_precision; a loadable text encoder: BF16, INT8 or W4A8;
    * else BF16. */
   mi_precision precision;
@@ -1021,7 +1021,8 @@ typedef struct mi_file_info {
 typedef enum mi_file_text_kind {
   MI_FILE_TEXT_NOTE = 0,          /* why the file is not loadable or what it is instead, or a remark; "" for none */
   /* A loadable DiT: its block linears as the engine runs them, e.g. "bf16", "int8_convrot256", "int4_convrot256",
-   * "mixed (80 bf16, 172 int8_convrot256)"; a loadable text encoder: "bf16", "int8_convrot" or "w4a8"; else "". */
+   * "mixed (80 bf16, 172 int8_convrot256)"; a GGUF DiT: its types and the format it is converted to and runs as, e.g.
+   * "GGUF Q4_K, runs as INT8 ConvRot"; a loadable text encoder: "bf16", "int8_convrot" or "w4a8"; else "". */
   MI_FILE_TEXT_QUANTIZATION = 1,
   /* LoRA, control adapter: the file's base_model metadata (informational); "" if absent */
   MI_FILE_TEXT_BASE_MODEL = 2,

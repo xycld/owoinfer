@@ -5,7 +5,7 @@
 //   - tier turbo: refused (no 4-bit target), as is any other type (Q2_K, Q3_K, IQ*, custom types).
 // So VRAM and speed are the target format's. The converted file is kept in <cache_dir>/gguf/, found again by the GGUF
 // file's identity (size, modification time, XXH64 of its header, the target and the converter version): only the first
-// load converts (quant::convert, streamed one tensor at a time, a few hundred MB of host RAM); later loads read the
+// load converts (quant::convert, streamed one tensor at a time, under 0.6 GB of host RAM for a MOSS-Image DiT); later loads read the
 // converted file directly. A GGUF DiT therefore needs a cache directory.
 #pragma once
 

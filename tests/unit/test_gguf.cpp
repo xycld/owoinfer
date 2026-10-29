@@ -1,7 +1,7 @@
 // GGUF DiT import: the container reader (weights/gguf.h) on valid, malformed and hostile files, the dequantization
 // against gguf-py (tests/data/gguf, tools/reference/gen_gguf_vectors.py), the DiT reader and converter
 // (quant::open_gguf_dit, quant::convert), the supported-model check, inspection and the converted-file cache
-// (pipeline/gguf_dit.h). CPU only.
+// (pipeline/gguf_dit.h). CPU, but GpuGgufDit.* (a published GGUF DiT end to end, when present).
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -20,7 +20,10 @@
 
 #include "api/file_inspect.h"
 #include "pipeline/gguf_dit.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/report_json.h"
 #include "test_util.h"
+#include "util/json.h"
 #include "util/npy.h"
 #include "weights/file_reader.h"
 #include "weights/gguf.h"
@@ -189,6 +192,13 @@ std::vector<float> dequant(std::uint32_t type, const std::vector<std::byte>& raw
 
 bool same_bits(const std::vector<float>& a, const std::vector<float>& b) {
   return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+}
+
+std::size_t bit_mismatches(const std::vector<float>& a, const std::vector<float>& b) {
+  if (a.size() != b.size()) return std::max(a.size(), b.size());
+  std::size_t n = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) n += std::bit_cast<std::uint32_t>(a[i]) != std::bit_cast<std::uint32_t>(b[i]);
+  return n;
 }
 
 // ---- Dequantization -----------------------------------------------------------------------------------------
@@ -784,6 +794,90 @@ TEST(GgufDit, ConvertedFileCache) {
     ++files;
   }
   EXPECT_EQ(files, 2);
+}
+
+// ---- GPU: a published GGUF DiT end to end ---------------------------------------------------------------------
+
+fs::path weights_root() {
+  const char* env = std::getenv("MOSS_WEIGHTS");
+  return env != nullptr && *env != '\0' ? fs::path(env) : fs::path("/workspace/Models/MOSS-Image");
+}
+
+// leejet's Q4_K (MOSS_GGUF_DIT overrides): converted once into the cache directory, it runs exactly as the converted
+// INT8 file does when given directly (bit-identical latents, the same plan), LoRAs included; the cache serves the next
+// pipeline; a tier the file cannot run is refused before any conversion.
+TEST(GpuGgufDit, RunsBitIdenticalToItsConvertedInt8File) {
+  const char* env = std::getenv("MOSS_GGUF_DIT");
+  const fs::path gguf = env != nullptr && *env != '\0' ? fs::path(env)
+                                                       : community() / "gguf/leejet/MOSS-Image-SFT-GGUF/MOSS-Image-SFT-Q4_K.gguf";
+  const fs::path lora = community() / "axiomofmind/Moss-image-beauty-lora/pytorch_lora_weights.safetensors";
+  if (!fs::is_regular_file(weights_root() / "sft" / "moss.mossidx") || !fs::is_regular_file(gguf)) {
+    GTEST_SKIP() << "SFT bundle or GGUF DiT not present (" << gguf << ")";
+  }
+  mi::testing::TempDir dir("gpu_gguf");
+  const fs::path cache = dir.path() / "cache";
+  mi::pipeline::Request req;
+  req.model = weights_root() / "sft";
+  req.prompt = "a lighthouse on a cliff at night";
+  req.height = req.width = 256;
+  req.steps = 3;
+  req.decode = false;
+  const auto options = [&](const fs::path& dit) {
+    mi::pipeline::PipelineOptions o;
+    o.dit_file = dit;
+    o.cache_dir = cache;
+    o.embedding_cache = false;
+    o.tier = mi::planner::Tier::kHigh;
+    o.attention = mi::planner::AttentionMode::kQ8Fp16;  // runs on every supported GPU
+    return o;
+  };
+  {
+    mi::pipeline::PipelineOptions o = options(gguf);
+    o.tier = mi::planner::Tier::kTurbo;
+    mi::pipeline::Pipeline pipe(o);
+    EXPECT_THROW(pipe.generate(req), std::invalid_argument);
+    EXPECT_FALSE(fs::exists(cache / "gguf"));  // refused before converting
+  }
+  mi::pipeline::Result a, a_lora;
+  mi::pipeline::Request with_lora = req;
+  with_lora.loras.push_back({lora, 0.8f});
+  const bool have_lora = fs::is_regular_file(lora);
+  {
+    mi::pipeline::Pipeline pipe(options(gguf));
+    a = pipe.generate(req);
+    if (have_lora) a_lora = pipe.generate(with_lora);
+  }
+  EXPECT_EQ(a.dit_source, gguf.string());
+  EXPECT_EQ(a.dit_linears, "int8_convrot256");
+  EXPECT_EQ(a.dit_format.rfind("GGUF ", 0), 0u) << a.dit_format;
+  EXPECT_NE(a.dit_format.find(", runs as INT8 ConvRot"), std::string::npos) << a.dit_format;
+  EXPECT_EQ(a.plan.dit.precision, mi::planner::Precision::kInt8);
+  EXPECT_NE(a.plan.explanation.find("runs as INT8 ConvRot"), std::string::npos);
+  const mi::json::Value doc = mi::json::parse("{" + mi::pipeline::report_fields(req, a, "", "") + "}");
+  EXPECT_EQ(doc.at("models").at("dit").at("format").as_string(), a.dit_format);
+  std::vector<fs::path> converted;
+  for (const auto& e : fs::directory_iterator(cache / "gguf")) converted.push_back(e.path());
+  ASSERT_EQ(converted.size(), 1u);
+  const auto stamp = fs::last_write_time(converted[0]);
+
+  // The converted file as the DiT: the same plan and bit-identical latents.
+  mi::pipeline::Pipeline direct(options(converted[0]));
+  const mi::pipeline::Result b = direct.generate(req);
+  EXPECT_EQ(b.dit_format, "");
+  EXPECT_EQ(bit_mismatches(a.latents, b.latents), 0u);
+  EXPECT_EQ(a.plan.dit.precision, b.plan.dit.precision);
+  EXPECT_EQ(a.memory.arena_capacity, b.memory.arena_capacity);
+  if (have_lora) {
+    EXPECT_EQ(bit_mismatches(a_lora.latents, direct.generate(with_lora).latents), 0u);
+    EXPECT_GT(bit_mismatches(a_lora.latents, a.latents), 0u);
+  }
+  // A new pipeline finds the converted file (no new conversion).
+  mi::pipeline::Pipeline again(options(gguf));
+  EXPECT_EQ(bit_mismatches(again.generate(req).latents, a.latents), 0u);
+  EXPECT_EQ(fs::last_write_time(converted[0]), stamp);
+  std::size_t files = 0;
+  for (const auto& e : fs::directory_iterator(cache / "gguf")) files += e.is_regular_file() ? 1 : 0;
+  EXPECT_EQ(files, 1u);
 }
 
 }  // namespace

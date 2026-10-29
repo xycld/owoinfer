@@ -150,14 +150,14 @@ Creates the engine. A loaded engine is released first, because two engines would
 | `vram_budget_bytes` | integer | 0 (auto) | cap on the process's device memory, CUDA context included |
 | `vram_reserve_bytes` | integer | 384 MiB | |
 | `host_ram_budget_bytes` | integer | 0 (mode target) | |
-| `cache_dir` | string | none | embedding-cache disk spill |
+| `cache_dir` | string | none | embedding-cache disk spill; a GGUF `dit_file`'s converted file (required for one) |
 | `embedding_cache` | bool | true | |
 | `direct_io` | bool | false | direct I/O (`O_DIRECT`) for every weight read, whatever `dit_direct_io` says |
 | `dit_direct_io` | string | `"auto"` | how the DiT's load reads its files when `direct_io` is false: `"auto"` (adaptive: direct I/O unless the file system gains nothing from it or the files are already in the page cache), `"buffered"`, `"direct"`. Streamed DiT blocks read buffered unless `direct_io`. The report's `dit_load` says what a load used and why. |
 | `te_host_pin` | string | `"auto"` | whether a host-resident text encoder may hold a pinned copy: `"auto"` (where the machine clearly has the room), `"on"` (whenever it fits the host limit), `"off"`. A pinned copy that cannot be allocated streams instead, with a `done.warnings` line. |
 | `certificate_dirs` | any | none | reserved since 2.0: accepted and ignored |
 | `block_path` | string | `"default"` (fused) | DiT block implementation: `"default"`, `"op_by_op"`, `"fused"`, `"fused_graphs"`. All give the same image; the path that ran is the report's `dit_blocks.path`. |
-| `dit_file` | string | `""` (the bundle's `transformer/`) | single-file DiT: INT8 ConvRot, INT4 ConvRot (`turbo`), mixed INT8/bf16 or bf16, ComfyUI layout |
+| `dit_file` | string | `""` (the bundle's `transformer/`) | single-file DiT: INT8 ConvRot, INT4 ConvRot (`turbo`), mixed INT8/bf16 or bf16, ComfyUI layout; or a GGUF DiT, converted once into INT8 ConvRot or bf16 under `cache_dir` ([GGUF DiT files](integration.md#gguf-dit-files)) |
 | `text_encoder_file` | string | `""` (the bundle's `text_encoder/`) | INT8 ConvRot or W4A8 text encoder |
 | `vae_file` | string | `""` (the bundle's `vae/`) | single FLUX.2 VAE file |
 | `attention` | string | `"default"` (the tier's default: `high` and `turbo` run `q8_fp8`, or `q8_fp16` on a GPU without FP8) | `"default"`, `"exact"`, `"q8_fp16"`, `"q8_fp16_f32acc"`, `"q8_fp8"`, `"q8_fp8_f32acc"` |
