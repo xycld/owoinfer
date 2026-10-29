@@ -6,7 +6,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -385,15 +384,13 @@ constexpr std::string_view kAttentionConfig = "{\"attention\": \"comfy_kitchen_i
 
 class Writer {
  public:
-  Writer(const fs::path& path, const std::vector<OutTensor>& tensors, const std::string& header) : path_(path) {
-    out_.open(path, std::ios::binary | std::ios::trunc);
-    if (!out_) fail("cannot create " + util::path_utf8(path));
+  Writer(const fs::path& path, const std::vector<OutTensor>& tensors, const std::string& header) : path_(path), out_(path) {
+    if (!out_.is_open()) fail("cannot create " + util::path_utf8(path));
     std::uint64_t len = header.size();
     char lb[8];
     for (int i = 0; i < 8; ++i) lb[i] = static_cast<char>((len >> (8 * i)) & 0xFF);
     out_.write(lb, 8);
-    out_.write(header.data(), static_cast<std::streamsize>(header.size()));
-    if (!out_) fail("write failed: " + util::path_utf8(path));
+    if (!out_.write(header)) fail("write failed: " + util::path_utf8(path));
     for (const auto& t : tensors) {
       end_ = std::max(end_, t.offset + t.nbytes);
       planned_ += t.nbytes;
@@ -401,24 +398,20 @@ class Writer {
   }
   void write(const OutTensor& t, const void* data, std::size_t size) {
     if (size != t.nbytes) fail("internal: tensor '" + t.name + "' produced " + std::to_string(size) + " bytes, planned " + std::to_string(t.nbytes));
-    out_.seekp(static_cast<std::streamoff>(t.offset));
-    out_.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
-    if (!out_) fail("write failed: " + util::path_utf8(path_));
+    if (!out_.seek(t.offset) || !out_.write(data, size)) fail("write failed: " + util::path_utf8(path_));
     written_ += size;
   }
-  std::uint64_t finish() {
+  // Writes the final header over the first one (same length), then closes.
+  std::uint64_t finish(const std::string& header) {
     if (written_ != planned_) fail("internal: wrote " + std::to_string(written_) + " tensor bytes, planned " + std::to_string(planned_));
-    out_.flush();
-    if (!out_) fail("write failed: " + util::path_utf8(path_));
-    out_.close();
-    if (!out_) fail("cannot close " + util::path_utf8(path_));
-    if (fs::file_size(path_) != end_) fail("output size mismatch (internal)");
+    if (!out_.seek(8) || !out_.write(header) || !out_.close()) fail("write failed: " + util::path_utf8(path_));
+    if (util::file_info(path_).size != end_) fail("output size mismatch (internal)");
     return end_;
   }
 
  private:
   fs::path path_;
-  std::ofstream out_;
+  util::OutputFile out_;
   std::uint64_t end_ = 0, written_ = 0, planned_ = 0;
 };
 
@@ -557,7 +550,7 @@ void lora_merge_row(float* w, std::int64_t k, const float* up_row, const float* 
 
 namespace {
 
-// `inner` is `outer` or lies inside the directory `outer` (both weakly canonical).
+// `inner` is `outer` or lies inside the directory `outer` (both util::resolved_path).
 bool same_or_inside(const fs::path& inner, const fs::path& outer) {
   const fs::path rel = inner.lexically_relative(outer);
   return !rel.empty() && *rel.begin() != "..";
@@ -565,10 +558,10 @@ bool same_or_inside(const fs::path& inner, const fs::path& outer) {
 
 // The output must not replace, or be written into, anything the conversion reads.
 void check_output_path(const fs::path& input, const fs::path& output, const QuantModel& model, const ConvertOptions& options) {
-  const fs::path out = fs::weakly_canonical(output);
-  std::error_code ec;
+  const fs::path out = util::resolved_path(output);
+  const util::FileInfo out_info = util::file_info(output);
   auto clash = [&](const fs::path& in) {
-    if (fs::weakly_canonical(in) == out || (fs::exists(output, ec) && fs::equivalent(in, output, ec))) {
+    if (util::resolved_path(in) == out || util::same_file(util::file_info(in), out_info)) {
       fail("output " + util::path_utf8(output) + " would overwrite the input " + util::path_utf8(in));
     }
   };
@@ -576,7 +569,7 @@ void check_output_path(const fs::path& input, const fs::path& output, const Quan
   for (const LoraInput& li : options.loras) clash(li.file);
   if (options.nvfp4 && !options.nvfp4->hessian_file.empty()) clash(options.nvfp4->hessian_file);
   // A file written into the component directory read would become one of its shards the next time it is read.
-  if (fs::is_directory(input) && same_or_inside(out, fs::weakly_canonical(model.base_dir))) {
+  if (util::file_info(input).directory() && same_or_inside(out, util::resolved_path(model.base_dir))) {
     fail("output " + util::path_utf8(output) + " lies inside the input directory " + util::path_utf8(model.base_dir));
   }
 }
@@ -1221,17 +1214,7 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   if (expected_source && *expected_source != stats.source_xxh64) fail("internal: the input changed while it was converted");
   const std::string header = build_header(hex64(stats.source_xxh64), capture, hessian_hex);
   if (header.size() != header0.size()) fail("internal: header size changed");
-  stats.bytes_written = writer.finish();
-  {
-    std::fstream f(partial.path(), std::ios::binary | std::ios::in | std::ios::out);
-    if (!f) fail("cannot reopen " + util::path_utf8(partial.path()));
-    f.seekp(8);
-    f.write(header.data(), static_cast<std::streamsize>(header.size()));
-    f.flush();
-    if (!f) fail("cannot finalize " + util::path_utf8(partial.path()));
-    f.close();
-    if (!f) fail("cannot close " + util::path_utf8(partial.path()));
-  }
+  stats.bytes_written = writer.finish(header);
   sync_file(partial.path());
   // The result must read back before it is published.
   {
@@ -1326,17 +1309,7 @@ HessianFileInfo write_hessian_file(const fs::path& input, const fs::path& path, 
   check_capture(info.capture);
   const std::string header = build_header(info.capture);
   if (header.size() != header0.size()) fail("internal: Hessian file header size changed");
-  const std::uint64_t size = writer.finish();
-  {
-    std::fstream f(partial.path(), std::ios::binary | std::ios::in | std::ios::out);
-    if (!f) fail("cannot reopen " + util::path_utf8(partial.path()));
-    f.seekp(8);
-    f.write(header.data(), static_cast<std::streamsize>(header.size()));
-    f.flush();
-    if (!f) fail("cannot finalize " + util::path_utf8(partial.path()));
-    f.close();
-    if (!f) fail("cannot close " + util::path_utf8(partial.path()));
-  }
+  const std::uint64_t size = writer.finish(header);
   sync_file(partial.path());
   // The result must read back before it is published.
   {

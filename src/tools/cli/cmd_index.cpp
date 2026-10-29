@@ -5,6 +5,7 @@
 
 #include "tools/cli/commands.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "weights/model_index.h"
 #include "weights/supported_model.h"
 
@@ -29,7 +30,7 @@ int cmd_index(const std::vector<std::string>& args) {
     return 2;
   }
   if (out.empty()) out = bundle / "moss.mossidx";
-  if (!fs::is_directory(bundle)) throw std::invalid_argument("model bundle not found: " + util::path_utf8(bundle));
+  if (!util::file_info(bundle).directory()) throw std::invalid_argument("model bundle not found: " + util::path_utf8(bundle));
   weights::check_supported_bundle(bundle);
   weights::ModelIndex index = weights::build_index(bundle, options);
   weights::write_index(index, out);
@@ -44,7 +45,8 @@ int cmd_inspect(const std::vector<std::string>& args) {
     return 2;
   }
   const fs::path target = path_arg(args[0], "target");
-  weights::ModelIndex index = fs::is_directory(target) ? weights::build_index(target) : weights::load_index(target);
+  weights::ModelIndex index =
+      util::file_info(target).directory() ? weights::build_index(target) : weights::load_index(target);
   weights::print_summary(index, std::cout);
   return 0;
 }

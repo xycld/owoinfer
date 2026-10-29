@@ -12,9 +12,9 @@
 #include <vector>
 
 #include "util/checked_math.h"
-#include "util/file_time.h"
 #include "util/json.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "weights/file_reader.h"
 #include "weights/quant/nvfp4_codec.h"
 #include "weights/quant/quant_codec.h"
@@ -440,7 +440,9 @@ void check_text_tensor(const IndexedTensor& t) {
 std::vector<fs::path> component_files(const fs::path& dir) {
   std::vector<fs::path> files;
   for (const auto& e : fs::directory_iterator(dir)) {
-    if (e.is_regular_file() && util::path_utf8(e.path().filename()).ends_with(".safetensors")) files.push_back(e.path());
+    if (util::path_utf8(e.path().filename()).ends_with(".safetensors") && util::file_info(e.path()).regular()) {
+      files.push_back(e.path());
+    }
   }
   std::sort(files.begin(), files.end());
   if (files.empty()) fail(util::path_utf8(dir) + ": no .safetensors files");
@@ -522,18 +524,18 @@ QuantModel open_quant_model_impl(const fs::path& path, std::optional<ModelKind> 
   if (parsed != nullptr) {
     paths.push_back(path);
     model.base_dir = path.parent_path();
-  } else if (fs::is_regular_file(path)) {
+  } else if (const util::FileInfo info = util::file_info(path); info.regular()) {
     paths.push_back(path);
     model.base_dir = path.parent_path();
-  } else if (fs::is_directory(path)) {
+  } else if (info.directory()) {
     fs::path dir = path;
-    const bool bundle = fs::is_directory(path / "transformer") || fs::is_directory(path / "text_encoder");
+    const bool bundle = util::file_info(path / "transformer").directory() || util::file_info(path / "text_encoder").directory();
     if (bundle) {
       if (!kind) kind = ModelKind::kDiT;
       dir = path / (*kind == ModelKind::kDiT ? "transformer" : "text_encoder");
-      if (!fs::is_directory(dir)) fail(util::path_utf8(path) + ": bundle has no " + util::path_utf8(dir.filename()) + "/ directory");
+      if (!util::file_info(dir).directory()) fail(util::path_utf8(path) + ": bundle has no " + util::path_utf8(dir.filename()) + "/ directory");
     }
-    if (fs::is_regular_file(dir / "hf_quant_config.json")) {
+    if (util::file_info(dir / "hf_quant_config.json").regular()) {
       fail(util::path_utf8(dir) + ": hf_quant_config.json marks an NVIDIA ModelOpt export; only ComfyUI comfy_quant files are "
            "supported");
     }
@@ -557,7 +559,7 @@ QuantModel open_quant_model_impl(const fs::path& path, std::optional<ModelKind> 
     std::optional<weights::SafetensorsFile> owned;
     const weights::SafetensorsFile& file = parsed != nullptr ? *parsed : owned.emplace(p);
     const auto id = static_cast<std::uint32_t>(model.files.size());
-    model.files.push_back({util::path_utf8(p.lexically_relative(model.base_dir)), file.file_size(), util::file_mtime_ns(p)});
+    model.files.push_back({util::path_utf8(p.lexically_relative(model.base_dir)), file.file_size(), util::file_info(p).mtime_ns});
     if (id == 0) model.metadata = file.metadata();
     auto md = file.metadata().find("_quantization_metadata");
     if (md != file.metadata().end()) {

@@ -1,5 +1,7 @@
 #include "util/regular_file.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -14,7 +16,6 @@
 #include <windows.h>
 #else
 #include <cerrno>
-#include <chrono>
 #include <thread>
 
 #include <fcntl.h>
@@ -123,35 +124,162 @@ bool is_windows_device_path(const std::filesystem::path& path) {
 
 namespace {
 
-// A disk file that is neither a directory nor a device.
-bool regular_handle(HANDLE h) {
-  FILE_ATTRIBUTE_TAG_INFO tag{};
-  return GetFileType(h) == FILE_TYPE_DISK && GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag) &&
-         (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE)) == 0;
+// SECURITY_IDENTIFICATION on every open of a user path: were it a pipe after all, its server could identify the caller
+// but not impersonate it.
+constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+constexpr DWORD kSqos = SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
+
+// The attributes-only open of file_info: reads no data (BACKUP_SEMANTICS: a directory opens too).
+HANDLE open_attributes(const std::filesystem::path& path) {
+  return CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, kShareAll, nullptr, OPEN_EXISTING,
+                     FILE_FLAG_BACKUP_SEMANTICS | kSqos, nullptr);
+}
+
+// FILETIME ticks (100 ns since 1601) as nanoseconds since the Unix epoch, converted as std::filesystem::last_write_time's
+// value was (MSVC's file_clock counts the same ticks from the same epoch), so .mossidx files keep their stamps.
+std::int64_t filetime_ns(FILETIME t) {
+  const auto ticks = static_cast<std::int64_t>((std::uint64_t{t.dwHighDateTime} << 32) | t.dwLowDateTime);
+  const std::filesystem::file_time_type ft{std::filesystem::file_time_type::duration(ticks)};
+  const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(ft);
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(sys.time_since_epoch()).count();
+}
+
+// What an open handle is (file_info).
+FileInfo handle_info(HANDLE h) {
+  FileInfo info;
+  if (GetFileType(h) != FILE_TYPE_DISK) {
+    info.kind = FileKind::kOther;
+    return info;
+  }
+  BY_HANDLE_FILE_INFORMATION bh{};
+  if (!GetFileInformationByHandle(h, &bh)) return info;
+  if ((bh.dwFileAttributes & FILE_ATTRIBUTE_DEVICE) != 0) {
+    info.kind = FileKind::kOther;
+    return info;
+  }
+  info.kind = (bh.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? FileKind::kDirectory : FileKind::kRegular;
+  if (info.regular()) info.size = (std::uint64_t{bh.nFileSizeHigh} << 32) | bh.nFileSizeLow;
+  info.mtime_ns = filetime_ns(bh.ftLastWriteTime);
+  info.volume = bh.dwVolumeSerialNumber;
+  info.id = (std::uint64_t{bh.nFileIndexHigh} << 32) | bh.nFileIndexLow;
+  return info;
+}
+
+// The handle's final path (GetFinalPathNameByHandleW, \\?\ form); empty when it cannot be read.
+std::filesystem::path final_path(HANDLE h) {
+  std::wstring buf(MAX_PATH, L'\0');
+  constexpr DWORD kFlags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+  DWORD n = GetFinalPathNameByHandleW(h, buf.data(), static_cast<DWORD>(buf.size()), kFlags);
+  if (n >= buf.size()) {  // too small: n counts the terminator
+    buf.resize(n);
+    n = GetFinalPathNameByHandleW(h, buf.data(), static_cast<DWORD>(buf.size()), kFlags);
+  }
+  if (n == 0 || n >= buf.size()) return {};
+  buf.resize(n);
+  return buf;
 }
 
 }  // namespace
 
+FileInfo file_info(const std::filesystem::path& path) {
+  FileInfo info;
+  if (path.empty()) return info;
+  if (is_windows_device_path(path)) {
+    info.kind = FileKind::kOther;
+    return info;
+  }
+  HANDLE h = open_attributes(path);
+  if (h == INVALID_HANDLE_VALUE) {
+    if (GetLastError() == ERROR_PIPE_BUSY) info.kind = FileKind::kOther;  // a pipe with no free instance
+    return info;
+  }
+  info = handle_info(h);
+  CloseHandle(h);
+  return info;
+}
+
+std::filesystem::path resolved_path(const std::filesystem::path& path) {
+  const std::filesystem::path full = path_key(path);
+  if (is_windows_device_path(full)) return full;
+  std::filesystem::path prefix = full, rest;
+  for (;;) {
+    HANDLE h = open_attributes(prefix);
+    if (h != INVALID_HANDLE_VALUE) {
+      const FileInfo info = handle_info(h);
+      const std::filesystem::path resolved = info.regular() || info.directory() ? final_path(h) : std::filesystem::path();
+      CloseHandle(h);
+      if (resolved.empty()) return full;
+      return rest.empty() ? resolved : resolved / rest;
+    }
+    const DWORD error = GetLastError();
+    const std::filesystem::path parent = prefix.parent_path();
+    if ((error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) || parent == prefix || parent.empty()) return full;
+    rest = rest.empty() ? prefix.filename() : prefix.filename() / rest;
+    prefix = parent;
+  }
+}
+
 OpenStatus open_regular_file(const std::filesystem::path& path, unsigned long flags, void*& handle) {
   if (is_windows_device_path(path)) return OpenStatus::kNotRegular;
-  // SECURITY_IDENTIFICATION on every open: were it a pipe after all, its server could identify the caller but not
-  // impersonate it. The probe reads attributes only (BACKUP_SEMANTICS: a directory opens too, to be refused here).
-  const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-  const DWORD sqos = SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
-  HANDLE probe = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, share, nullptr, OPEN_EXISTING,
-                             FILE_FLAG_BACKUP_SEMANTICS | sqos, nullptr);
+  // The probe reads attributes only: a directory or a device is refused before the data open.
+  HANDLE probe = open_attributes(path);
   if (probe == INVALID_HANDLE_VALUE) return OpenStatus::kError;
-  const bool probed = regular_handle(probe);
+  const bool probed = handle_info(probe).regular();
   CloseHandle(probe);
   if (!probed) return OpenStatus::kNotRegular;
-  HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, share, nullptr, OPEN_EXISTING, flags | sqos, nullptr);
+  HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, kShareAll, nullptr, OPEN_EXISTING, flags | kSqos, nullptr);
   if (h == INVALID_HANDLE_VALUE) return OpenStatus::kError;
-  if (!regular_handle(h)) {  // replaced since the probe
+  if (!handle_info(h).regular()) {  // replaced since the probe
     CloseHandle(h);
     return OpenStatus::kNotRegular;
   }
   handle = h;
   return OpenStatus::kOk;
+}
+
+OutputFile::OutputFile(const std::filesystem::path& path) {
+  if (is_windows_device_path(path)) return;
+  // FILE_READ_ATTRIBUTES for handle_info (GENERIC_WRITE does not include it).
+  HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL | kSqos, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return;
+  if (!handle_info(h).regular()) {  // a reparse point to a pipe or a device: refused before any byte is written
+    CloseHandle(h);
+    return;
+  }
+  handle_ = h;
+  ok_ = true;
+}
+
+OutputFile::~OutputFile() {
+  if (handle_ != nullptr) CloseHandle(static_cast<HANDLE>(handle_));
+}
+
+bool OutputFile::write(const void* data, std::size_t size) {
+  const auto* p = static_cast<const char*>(data);
+  while (ok_ && size > 0) {
+    const DWORD want = static_cast<DWORD>(std::min<std::size_t>(size, std::size_t{1} << 30));
+    DWORD done = 0;
+    ok_ = WriteFile(static_cast<HANDLE>(handle_), p, want, &done, nullptr) && done == want;
+    p += done;
+    size -= done;
+  }
+  return ok_;
+}
+
+bool OutputFile::seek(std::uint64_t offset) {
+  LARGE_INTEGER to;
+  to.QuadPart = static_cast<LONGLONG>(offset);
+  ok_ = ok_ && SetFilePointerEx(static_cast<HANDLE>(handle_), to, nullptr, FILE_BEGIN);
+  return ok_;
+}
+
+bool OutputFile::close() {
+  if (handle_ != nullptr) {
+    ok_ = CloseHandle(static_cast<HANDLE>(handle_)) && ok_;
+    handle_ = nullptr;
+  }
+  return ok_;
 }
 
 #else
@@ -201,6 +329,43 @@ OpenStatus open_regular_file(const std::filesystem::path& path, int flags, int& 
   }
   fd = f;
   return OpenStatus::kOk;
+}
+
+
+FileInfo file_info(const std::filesystem::path& path) {
+  FileInfo info;
+  struct stat st {};
+  if (path.empty() || ::stat(path.c_str(), &st) != 0) return info;
+  info.kind = S_ISREG(st.st_mode) ? FileKind::kRegular : S_ISDIR(st.st_mode) ? FileKind::kDirectory : FileKind::kOther;
+  if (info.regular()) info.size = static_cast<std::uint64_t>(st.st_size);
+  info.mtime_ns = static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec;
+  info.volume = static_cast<std::uint64_t>(st.st_dev);
+  info.id = static_cast<std::uint64_t>(st.st_ino);
+  return info;
+}
+
+std::filesystem::path resolved_path(const std::filesystem::path& path) { return std::filesystem::weakly_canonical(path); }
+
+OutputFile::OutputFile(const std::filesystem::path& path) : out_(path, std::ios::binary | std::ios::trunc) {
+  ok_ = static_cast<bool>(out_);
+}
+
+OutputFile::~OutputFile() = default;
+
+bool OutputFile::write(const void* data, std::size_t size) {
+  if (ok_) ok_ = static_cast<bool>(out_.write(static_cast<const char*>(data), static_cast<std::streamsize>(size)));
+  return ok_;
+}
+
+bool OutputFile::seek(std::uint64_t offset) {
+  if (ok_) ok_ = static_cast<bool>(out_.seekp(static_cast<std::streamoff>(offset)));
+  return ok_;
+}
+
+bool OutputFile::close() {
+  if (out_.is_open()) out_.close();
+  ok_ = ok_ && static_cast<bool>(out_);
+  return ok_;
 }
 
 #endif

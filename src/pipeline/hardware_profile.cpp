@@ -8,7 +8,6 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
-#include <fstream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -25,6 +24,7 @@
 #include "core/cuda_check.h"
 #include "kernels/fused/fused_gemm.h"
 #include "util/json.h"
+#include "util/regular_file.h"
 #include "util/rename_replace.h"
 #include "util/replaceable_file.h"
 
@@ -211,10 +211,8 @@ bool write_profile(const std::filesystem::path& path, const std::string& key, co
   std::filesystem::path tmp = path;  // not path.string(): the ANSI code page on Windows
   tmp += suffix;
   {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    out << doc;
-    out.close();
-    if (!out) {
+    util::OutputFile out(tmp);
+    if (!out.write(doc) || !out.close()) {
       std::filesystem::remove(tmp, ec);
       return false;
     }

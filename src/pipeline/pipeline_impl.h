@@ -118,8 +118,8 @@ struct Bundle {
 // and its tokenizer. The folder has passed check_supported_bundle.
 inline std::unique_ptr<Bundle> open_bundle(const std::filesystem::path& dir, weights::ComponentSet skip) {
   const std::filesystem::path idx = dir / "moss.mossidx";
-  weights::ModelIndex index = std::filesystem::is_regular_file(idx) ? weights::load_index(idx, dir, skip)
-                                                                    : weights::build_index(dir, {.skip = skip});
+  weights::ModelIndex index = util::file_info(idx).regular() ? weights::load_index(idx, dir, skip)
+                                                             : weights::build_index(dir, {.skip = skip});
   auto b = std::unique_ptr<Bundle>(new Bundle{dir, std::move(index), tok::Tokenizer::load(dir / "tokenizer" / "tokenizer.json"), 0});
   if (!skip.has(weights::Component::kTextEncoder)) b->te_hash = text_encoder_hash(b->index);
   return b;
@@ -212,7 +212,7 @@ inline void check_layers(const std::vector<int>& layers, const char* name) {
 inline std::unique_ptr<DitSource> open_dit_file(const std::filesystem::path& file) {
   // NVFP4 linears run only on cc 12.0 with the sm_120a kernels (user decision D1); otherwise the file is refused as an
   // unsupported model (MI_ERR_MODEL).
-  if (!std::filesystem::exists(file)) throw std::invalid_argument("DiT file not found: " + util::path_utf8(file));
+  if (!util::file_info(file).exists()) throw std::invalid_argument("DiT file not found: " + util::path_utf8(file));
   DitFileInfo info = inspect_dit_file(file, [] { return moss_dit::nvfp4_unsupported_reason(); });
   if (!info.refusal.empty()) throw weights::UnsupportedModelError(info.refusal);
   auto d = std::make_unique<DitSource>();
@@ -467,7 +467,7 @@ struct Pipeline::Impl {
     auto it = bundles.find(key);
     if (it == bundles.end()) {
       const auto t0 = Clock::now();
-      if (!std::filesystem::is_directory(dir)) throw std::invalid_argument("model bundle not found: " + util::path_utf8(dir));
+      if (!util::file_info(dir).directory()) throw std::invalid_argument("model bundle not found: " + util::path_utf8(dir));
       weights::check_supported_bundle(dir);  // plain refusal of other models, before any weight file is read
       if (replaced.has(weights::Component::kTransformer)) dit_file_source(load_s);
       if (replaced.has(weights::Component::kTextEncoder)) te_file_source(load_s);
@@ -523,7 +523,7 @@ struct Pipeline::Impl {
   TeSource& te_file_source(double& load_s) {
     const std::filesystem::path& path = options.text_encoder_file;
     return cached_te("file:" + util::path_utf8(util::path_key(path)), load_s, [&] {
-      if (!std::filesystem::is_regular_file(path)) throw std::invalid_argument("text encoder file not found: " + util::path_utf8(path));
+      if (!util::file_info(path).regular()) throw std::invalid_argument("text encoder file not found: " + util::path_utf8(path));
       weights::check_supported_text_encoder_file(path);
       auto t = std::make_unique<TeSource>();
       t->path = path;
@@ -550,9 +550,7 @@ struct Pipeline::Impl {
   // decoder_config one whose shapes are no supported decoder's.
   const weights::ModelIndex& vae_file_index() {
     if (!vae_file) {
-      if (!std::filesystem::is_regular_file(options.vae_file)) {
-        throw std::invalid_argument("VAE file not found: " + util::path_utf8(options.vae_file));
-      }
+      if (!util::file_info(options.vae_file).regular()) throw std::invalid_argument("VAE file not found: " + util::path_utf8(options.vae_file));
       auto index = std::make_unique<weights::ModelIndex>(flux2_vae::index_vae_file(options.vae_file));
       flux2_vae::decoder_config(*index);
       vae_file = std::move(index);
@@ -607,7 +605,7 @@ struct Pipeline::Impl {
         e->file = options.vae_file;
       } else {
         e->file = b.dir / "vae" / "diffusion_pytorch_model.safetensors";
-        if (!std::filesystem::is_regular_file(e->file)) {
+        if (!util::file_info(e->file).regular()) {
           throw std::invalid_argument("img2img needs the VAE encoder, but the bundle has no " + util::path_utf8(e->file));
         }
         e->persistent = flux2_vae_encoder::Flux2VaeEncoder::persistent_bytes(e->file);
@@ -934,10 +932,10 @@ struct Pipeline::Impl {
       double cached = 0, total = 0;
       bool known = !src.files.empty();
       for (const std::filesystem::path& f : src.files) {
-        std::error_code ec;
-        const double bytes = static_cast<double>(std::filesystem::file_size(f, ec));
+        const util::FileInfo info = util::file_info(f);
+        const double bytes = static_cast<double>(info.size);
         const double fraction = weights::page_cache_fraction(f);
-        if (ec || fraction < 0) known = false;
+        if (!info.regular() || fraction < 0) known = false;
         cached += bytes * std::max(0.0, fraction);
         total += bytes;
       }

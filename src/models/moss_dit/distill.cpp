@@ -9,6 +9,7 @@
 #include <system_error>
 
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "weights/file_reader.h"
 #include "weights/quant/quant_codec.h"
 #include "weights/safetensors.h"
@@ -61,19 +62,11 @@ std::vector<float> read_floats(const fs::path& path, const weights::TensorInfo& 
 }  // namespace
 
 DistillBundle open_distill_bundle(const fs::path& dir) {
-  // error_code overloads: an unreadable path (permissions, a broken mount) is a DistillError, not a filesystem_error.
-  std::error_code ec;
-  if (!fs::is_directory(dir, ec)) {
-    fail("distill bundle not found (not a directory): " + util::path_utf8(dir) + (ec ? " (" + ec.message() + ")" : ""));
-  }
+  // An unreadable path (permissions, a broken mount) is a DistillError too.
+  if (!util::file_info(dir).directory()) fail("distill bundle not found (not a directory): " + util::path_utf8(dir));
   DistillBundle b;
   b.dir = dir;
-  const auto pick = [&](const char* name) {
-    std::error_code e;
-    const bool file = fs::is_regular_file(dir / name, e);
-    if (e && e != std::errc::no_such_file_or_directory) fail(util::path_utf8(dir / name) + ": " + e.message());
-    return file ? dir / name : fs::path();
-  };
+  const auto pick = [&](const char* name) { return util::file_info(dir / name).regular() ? dir / name : fs::path(); };
   b.time_embedding = pick("time_embedding.safetensors");
   b.lora = pick("lora.safetensors");
   b.dataspace = pick("dataspace.safetensors");

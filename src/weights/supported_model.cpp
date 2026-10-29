@@ -13,6 +13,7 @@
 
 #include "util/json.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "weights/file_reader.h"
 #include "weights/safetensors.h"
 
@@ -41,8 +42,7 @@ constexpr std::size_t kMaxListed = 4;  // differences named in one message
 // IndexError "<path>: not a regular file"): a type check before the open could be raced by a file replaced between
 // the check and the open, and a FIFO swapped in would then block the open.
 std::optional<json::Value> read_config(const fs::path& path) {
-  std::error_code ec;
-  if (!fs::exists(path, ec)) return std::nullopt;
+  if (!util::file_info(path).exists()) return std::nullopt;
   std::string text;
   try {
     const FileReader in(path);
@@ -307,8 +307,7 @@ const TeTensor* find_qwen35_text_tensor(std::string_view name) {
 }
 
 void check_supported_bundle(const fs::path& dir) {
-  std::error_code ec;
-  if (!fs::is_directory(dir, ec)) throw IndexError(path_utf8(dir) + ": not a directory");
+  if (!util::file_info(dir).directory()) throw IndexError(path_utf8(dir) + ": not a directory");
 
   // Class names only describe what was found: a folder whose architecture fields all match is accepted whatever its
   // classes are called. model_index.json naming another pipeline does make a missing config "another model".

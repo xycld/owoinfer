@@ -146,22 +146,19 @@ void write_npy_f32(const fs::path& path, const std::vector<float>& data, const s
   const std::size_t total = 10 + header.size() + 1;
   header.append((64 - total % 64) % 64, ' ');
   header += '\n';
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  util::OutputFile out(path);
   out.write("\x93NUMPY\x01\x00", 8);
   const std::uint16_t len = static_cast<std::uint16_t>(header.size());
   const char len_le[2] = {static_cast<char>(len & 0xff), static_cast<char>(len >> 8)};
   out.write(len_le, 2);
-  out.write(header.data(), static_cast<std::streamsize>(header.size()));
-  out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size() * sizeof(float)));
-  out.close();
-  if (!out) throw std::runtime_error("cannot write " + util::path_utf8(path));
+  out.write(header);
+  out.write(data.data(), data.size() * sizeof(float));
+  if (!out.close()) throw std::runtime_error("cannot write " + util::path_utf8(path));
 }
 
 void write_text_file(const fs::path& path, const std::string& text) {
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  out << text;
-  out.close();
-  if (!out) throw std::runtime_error("cannot write " + util::path_utf8(path));
+  util::OutputFile out(path);
+  if (!out.write(text) || !out.close()) throw std::runtime_error("cannot write " + util::path_utf8(path));
 }
 
 // <out>.<n><ext> for follow-up image n.

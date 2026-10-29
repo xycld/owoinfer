@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -23,6 +24,15 @@
 #include <sys/stat.h>
 
 #include <cerrno>
+#else
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <winioctl.h>
 #endif
 
 #include "test_util.h"
@@ -780,6 +790,181 @@ TEST(RegularFile, UserPathBoundary) {
   EXPECT_EQ(mi::util::path_key(dir.path() / "sub" / ".." / "data.bin"), std::filesystem::weakly_canonical(file));
 #endif
 }
+
+// util::file_info: one query that follows links, giving a regular file's size, its last write time (the value
+// std::filesystem::last_write_time converts to, as .mossidx files persist it) and its identity (a hard link shares it,
+// another file does not); a directory, a missing path, and on Linux a FIFO (kOther, never opened). A file replaced
+// under its path, or written in place, gets another stamp. util::resolved_path resolves as weakly_canonical does.
+// util::OutputFile writes, seeks past the end (the gap reads as zeros) and refuses a directory.
+TEST(RegularFile, FileInfoAndOutputFile) {
+  namespace fs = std::filesystem;
+  using mi::util::FileKind;
+  using mi::util::file_info;
+  TempDir dir("file_info");
+  const auto file = make_pattern_file(dir, 1000);
+  const mi::util::FileInfo info = file_info(file);
+  EXPECT_EQ(info.kind, FileKind::kRegular);
+  EXPECT_EQ(info.size, 1000u);
+  const auto t = fs::last_write_time(file);
+#if defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE < 13
+  const auto sys = fs::file_time_type::clock::to_sys(t);
+#else
+  const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(t);
+#endif
+  EXPECT_EQ(info.mtime_ns, std::chrono::duration_cast<std::chrono::nanoseconds>(sys.time_since_epoch()).count());
+  EXPECT_EQ(file_info(file), info);
+  fs::create_hard_link(file, dir.path() / "link.bin");
+  EXPECT_TRUE(mi::util::same_file(file_info(dir.path() / "link.bin"), info));
+  const fs::path other = dir.path() / "other.bin";
+  { std::ofstream(other, std::ios::binary) << "x"; }
+  EXPECT_FALSE(mi::util::same_file(file_info(other), info));
+  EXPECT_EQ(file_info(dir.path()).kind, FileKind::kDirectory);
+  const mi::util::FileInfo missing = file_info(dir.path() / "missing");
+  EXPECT_EQ(missing.kind, FileKind::kMissing);
+  EXPECT_FALSE(mi::util::same_file(missing, missing));
+  EXPECT_EQ(file_info({}).kind, FileKind::kMissing);
+  fs::rename(other, file);  // replaced under the same path
+  const mi::util::FileInfo replaced = file_info(file);
+  EXPECT_NE(replaced, info);
+  EXPECT_EQ(replaced.size, 1u);
+  { std::ofstream(file, std::ios::binary | std::ios::app) << "yz"; }  // written in place
+  EXPECT_NE(file_info(file), replaced);
+  EXPECT_EQ(mi::util::resolved_path(dir.path() / "sub" / ".." / "data.bin"), mi::util::resolved_path(file));
+#ifdef __linux__
+  ASSERT_EQ(::mkfifo((dir.path() / "fifo").c_str(), 0600), 0);
+  EXPECT_EQ(file_info(dir.path() / "fifo").kind, FileKind::kOther);
+#endif
+
+  const fs::path out_path = dir.path() / "out.bin";
+  {
+    mi::util::OutputFile out(out_path);
+    ASSERT_TRUE(out.is_open());
+    EXPECT_TRUE(out.write("abc", 3));
+    EXPECT_TRUE(out.seek(6));
+    EXPECT_TRUE(out.write(std::string_view("de")));
+    EXPECT_TRUE(out.seek(0));
+    EXPECT_TRUE(out.write("A", 1));
+    EXPECT_TRUE(out.close());
+  }
+  std::string text;
+  ASSERT_EQ(mi::util::read_replaceable_file(out_path, 64, text), mi::util::ReadStatus::kOk);
+  EXPECT_EQ(text, std::string("Abc\0\0\0de", 8));
+  mi::util::OutputFile refused(dir.path());
+  EXPECT_FALSE(refused.is_open());
+  EXPECT_FALSE(refused.write("x", 1));
+  EXPECT_FALSE(refused.close());
+}
+
+#ifdef _WIN32
+namespace {
+
+// Turns the empty directory `dir` into a junction (a mount point) to the NT path `target` (e.g. \??\pipe\name), as an
+// unprivileged user can in any folder they may write; false when the file system refuses.
+bool make_junction(const std::filesystem::path& dir, const std::wstring& target) {
+  HANDLE h = CreateFileW(dir.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  // REPARSE_DATA_BUFFER (ntifs.h) with its MountPointReparseBuffer: tag, data length, reserved, the substitute name's
+  // offset and length, the print name's, then the substitute name and an empty print name, each NUL-terminated.
+  std::vector<std::uint8_t> buf(16 + (target.size() + 2) * sizeof(wchar_t));
+  const auto put16 = [&](std::size_t at, std::size_t v) {
+    const auto x = static_cast<std::uint16_t>(v);
+    std::memcpy(buf.data() + at, &x, sizeof x);
+  };
+  const DWORD tag = IO_REPARSE_TAG_MOUNT_POINT;
+  std::memcpy(buf.data(), &tag, sizeof tag);
+  put16(4, buf.size() - 8);
+  put16(8, 0);
+  put16(10, target.size() * sizeof(wchar_t));
+  put16(12, (target.size() + 1) * sizeof(wchar_t));
+  put16(14, 0);
+  std::memcpy(buf.data() + 16, target.data(), target.size() * sizeof(wchar_t));
+  DWORD returned = 0;
+  const bool ok = DeviceIoControl(h, FSCTL_SET_REPARSE_POINT, buf.data(), static_cast<DWORD>(buf.size()), nullptr, 0,
+                                  &returned, nullptr) != 0;
+  CloseHandle(h);
+  return ok;
+}
+
+}  // namespace
+
+// The design limit of check_user_path (it classifies the text only): a junction inside a folder the engine reads can
+// lead an ordinary-looking path to a named pipe. The handle-based helpers refuse it (kOther, kNotRegular, no output
+// file), and their opens carry SECURITY_IDENTIFICATION, so the pipe's server cannot impersonate the engine: a junction
+// to the pipe itself, and a junction to the pipe namespace with the pipe's name below it (a cache folder redirected).
+TEST(RegularFile, WindowsJunctionToPipeIsRefused) {
+  TempDir dir("junction_pipe");
+  const std::wstring name = L"mi_test_pipe_" + std::to_wstring(GetCurrentProcessId());
+  // Enough instances for every open below (each client open takes one).
+  std::vector<HANDLE> servers;
+  for (int i = 0; i < 12; ++i) {
+    const DWORD first = i == 0 ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0;
+    HANDLE s = CreateNamedPipeW((L"\\\\.\\pipe\\" + name).c_str(), PIPE_ACCESS_DUPLEX | first, PIPE_TYPE_BYTE,
+                                PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, nullptr);
+    ASSERT_NE(s, INVALID_HANDLE_VALUE) << GetLastError();
+    servers.push_back(s);
+  }
+  struct Servers {
+    const std::vector<HANDLE>* h;
+    ~Servers() {
+      for (HANDLE s : *h) CloseHandle(s);
+    }
+  } closer{&servers};
+  const std::filesystem::path to_pipe = dir.path() / "model.safetensors";
+  const std::filesystem::path to_namespace = dir.path() / "cache";
+  std::filesystem::create_directory(to_pipe);
+  std::filesystem::create_directory(to_namespace);
+  if (!make_junction(to_pipe, L"\\??\\pipe\\" + name) || !make_junction(to_namespace, L"\\??\\pipe\\")) {
+    GTEST_SKIP() << "this file system refuses junctions (" << GetLastError() << ")";
+  }
+  const std::filesystem::path in_namespace = to_namespace / name;
+  for (const std::filesystem::path& p : {to_pipe, in_namespace}) {
+    SCOPED_TRACE(p.string());
+    EXPECT_NO_THROW(mi::util::check_user_path(p, "dit_file"));  // the text is an ordinary path
+    EXPECT_EQ(mi::util::file_info(p).kind, mi::util::FileKind::kOther);
+    void* handle = nullptr;
+    EXPECT_EQ(mi::util::open_regular_file(p, FILE_ATTRIBUTE_NORMAL, handle), mi::util::OpenStatus::kNotRegular);
+    EXPECT_FALSE(mi::util::OutputFile(p).is_open());
+    EXPECT_THROW(FileReader{p}, IoError);
+  }
+}
+
+// A regular file's info from its handle: the size, the last write time GetFileTime reports (as nanoseconds since the
+// Unix epoch), the volume serial number and file index GetFileInformationByHandle reports (a hard link shares them);
+// resolved_path is the final path GetFinalPathNameByHandleW gives, with a missing tail appended.
+TEST(RegularFile, WindowsFileInfoFromHandle) {
+  TempDir dir("win_file_info");
+  const auto file = make_pattern_file(dir, 4321);
+  HANDLE h = CreateFileW(file.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, 0, nullptr);
+  ASSERT_NE(h, INVALID_HANDLE_VALUE);
+  BY_HANDLE_FILE_INFORMATION bh{};
+  ASSERT_TRUE(GetFileInformationByHandle(h, &bh));
+  std::wstring final_path(1024, L'\0');
+  const DWORD n = GetFinalPathNameByHandleW(h, final_path.data(), static_cast<DWORD>(final_path.size()),
+                                            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+  CloseHandle(h);
+  ASSERT_GT(n, 0u);
+  final_path.resize(n);
+  const mi::util::FileInfo info = mi::util::file_info(file);
+  EXPECT_EQ(info.kind, mi::util::FileKind::kRegular);
+  EXPECT_EQ(info.size, 4321u);
+  EXPECT_EQ(info.volume, bh.dwVolumeSerialNumber);
+  EXPECT_EQ(info.id, (std::uint64_t{bh.nFileIndexHigh} << 32) | bh.nFileIndexLow);
+  const auto ticks = static_cast<std::int64_t>((std::uint64_t{bh.ftLastWriteTime.dwHighDateTime} << 32) |
+                                               bh.ftLastWriteTime.dwLowDateTime);
+  const std::int64_t unix_ns = (ticks - 116444736000000000LL) * 100;  // FILETIME epoch 1601 -> 1970
+  // The same instant up to the leap seconds MSVC's clock_cast accounts for (as .mossidx stamps always did).
+  EXPECT_LE(std::llabs(info.mtime_ns - unix_ns), 60LL * 1'000'000'000);
+  ASSERT_TRUE(CreateHardLinkW((dir.path() / "link.bin").c_str(), file.c_str(), nullptr));
+  EXPECT_TRUE(mi::util::same_file(mi::util::file_info(dir.path() / "link.bin"), info));
+  EXPECT_EQ(mi::util::resolved_path(file), std::filesystem::path(final_path));
+  EXPECT_EQ(mi::util::resolved_path(dir.path() / "new" / "out.bin"),
+            mi::util::resolved_path(dir.path()) / "new" / "out.bin");
+  EXPECT_EQ(mi::util::file_info(dir.path()).kind, mi::util::FileKind::kDirectory);
+  EXPECT_EQ(mi::util::file_info(R"(\\.\pipe\x)").kind, mi::util::FileKind::kOther);  // refused by its text, unopened
+}
+#endif
 
 #ifdef __linux__
 // A file under another process's lease (a write lease, broken by our open) is not waited on for the 45 s of the lease

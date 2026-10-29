@@ -86,7 +86,7 @@ cmake --build <build> --target mossinfer_example_c
 2. Selects the device.
 3. Creates the pipeline.
 
-The weights load on the first `mi_generate()`, or earlier with `mi_engine_preload()` ([Preload and soft unload](#preload-and-soft-unload)). The DiT stays resident across generations when the plan allows it, so the first call pays the load (several seconds, depending on storage and the page cache) and later ones do not.
+The weights load on the first `mi_generate()`, or earlier with `mi_engine_preload()` ([Preload and soft unload](#preload-and-soft-unload)). The DiT stays resident across generations when the plan allows it, so the first call pays the load (several seconds, depending on storage and the page cache) and later ones do not. On Windows, every query and open of a path the caller gives goes through a handle opened with identification-level SQOS and checked to be a disk file or folder, so a junction to a pipe is refused like a pipe path.
 
 | `mi_engine_params` field | Default | Meaning |
 |---|---|---|

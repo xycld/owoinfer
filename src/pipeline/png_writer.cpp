@@ -5,7 +5,6 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
-#include <fstream>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -281,10 +280,8 @@ void write_png_rgb8(const std::filesystem::path& path, std::span<const std::uint
   std::filesystem::path tmp = path;
   tmp += ".tmp-" + std::to_string(std::random_device{}());
   {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
-    out.close();
-    if (!out) {
+    util::OutputFile out(tmp);
+    if (!out.write(png.data(), png.size()) || !out.close()) {
       std::error_code ignored;
       std::filesystem::remove(tmp, ignored);
       throw std::runtime_error("cannot write " + util::path_utf8(path));

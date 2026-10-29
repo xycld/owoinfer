@@ -10,6 +10,7 @@
 
 #include "tokenizer/unicode.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "util/replaceable_file.h"
 
 namespace mi::tok {
@@ -391,9 +392,9 @@ Tokenizer& Tokenizer::operator=(Tokenizer&&) noexcept = default;
 Tokenizer::~Tokenizer() = default;
 
 Tokenizer Tokenizer::load(const std::filesystem::path& tokenizer_json) {
-  std::error_code ec;
-  const std::uintmax_t size = std::filesystem::file_size(tokenizer_json, ec);
-  if (ec) throw std::runtime_error("tokenizer: cannot open " + util::path_utf8(tokenizer_json));
+  const util::FileInfo info = util::file_info(tokenizer_json);
+  if (!info.regular()) throw std::runtime_error("tokenizer: cannot open " + util::path_utf8(tokenizer_json));
+  const std::uint64_t size = info.size;
   if (size > kMaxTokenizerBytes) {
     throw std::runtime_error("tokenizer: " + util::path_utf8(tokenizer_json) + " is " + std::to_string(size) +
                              " bytes, over the limit of " + std::to_string(kMaxTokenizerBytes));

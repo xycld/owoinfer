@@ -172,21 +172,19 @@ moss_dit::AttentionMode dit_attention(planner::AttentionMode a) { return static_
 // A file's size and modification time, for keys of state built from its contents: a file replaced under the same
 // path gets another stamp (empty when it cannot be read; the load that follows reports why).
 std::string file_stamp(const std::filesystem::path& p) {
-  std::error_code ec;
-  const std::uintmax_t size = std::filesystem::file_size(p, ec);
-  if (ec) return {};
-  const auto mtime = std::filesystem::last_write_time(p, ec);
-  if (ec) return {};
-  return std::to_string(size) + "@" + std::to_string(mtime.time_since_epoch().count());
+  const util::FileInfo f = util::file_info(p);
+  if (!f.regular()) return {};
+  return std::to_string(f.size) + "@" + std::to_string(f.mtime_ns);
 }
 
 // Bytes of a weight file, or of the *.safetensors files directly inside a directory.
 std::uint64_t weight_bytes(const std::filesystem::path& p) {
-  std::error_code ec;
-  if (std::filesystem::is_regular_file(p, ec)) return std::filesystem::file_size(p, ec);
+  const util::FileInfo info = util::file_info(p);
+  if (!info.directory()) return info.size;
   std::uint64_t total = 0;
+  std::error_code ec;
   for (const auto& e : std::filesystem::directory_iterator(p, ec)) {
-    if (e.is_regular_file(ec) && e.path().extension() == ".safetensors") total += e.file_size(ec);
+    if (e.path().extension() == ".safetensors") total += util::file_info(e.path()).size;
   }
   return total;
 }
@@ -262,9 +260,8 @@ DitFileInfo inspect_dit_file(const weights::SafetensorsFile& header,
 }
 
 DitFileInfo inspect_dit_file(const std::filesystem::path& file, const std::function<std::string()>& nvfp4_refusal) {
-  std::error_code ec;
-  if (!std::filesystem::is_regular_file(file, ec)) {
-    if (std::filesystem::exists(file, ec)) throw std::invalid_argument(util::path_utf8(file) + ": not a regular file");
+  if (const util::FileInfo info = util::file_info(file); !info.regular()) {
+    if (info.exists()) throw std::invalid_argument(util::path_utf8(file) + ": not a regular file");
     throw weights::IoError(util::path_utf8(file) + ": no such file");
   }
   // GGUF / pickle containers are named before the header is parsed as safetensors.
@@ -635,10 +632,7 @@ ReleaseReport Pipeline::release_device_memory(bool keep_host_copy, const std::at
     m.dit_host.reset();
     m.dit_host_src = nullptr;
     std::uint64_t bytes = 0;
-    for (const std::filesystem::path& f : copy_src->files) {
-      std::error_code ec;
-      bytes += std::filesystem::file_size(f, ec);
-    }
+    for (const std::filesystem::path& f : copy_src->files) bytes += util::file_info(f).size;
     if (const std::string why = m.host_copy_room(bytes); !why.empty()) {
       rep.note = "the DiT was not kept in RAM: " + why;
     } else {
@@ -717,7 +711,7 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     };
     const std::string key = util::path_utf8(util::path_key(req.control.adapter));
     if (!m.control_file || m.control_key != key) {
-      if (!std::filesystem::is_regular_file(req.control.adapter)) {
+      if (!util::file_info(req.control.adapter).regular()) {
         throw std::invalid_argument("control adapter not found: " + util::path_utf8(req.control.adapter));
       }
       const auto t0c = Clock::now();

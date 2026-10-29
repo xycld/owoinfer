@@ -186,12 +186,11 @@ pipeline::SessionOptions to_session_options(const mi_session_params& p, pipeline
   if (p.control_adapter != nullptr && *p.control_adapter != '\0') {
     o.control_adapter = util::path_from_utf8(p.control_adapter);
     util::check_user_path(o.control_adapter, "control_adapter");
-    std::error_code ec;
-    const fs::file_status st = fs::status(o.control_adapter, ec);
-    if (!fs::exists(st)) {
+    const util::FileInfo info = util::file_info(o.control_adapter);
+    if (!info.exists()) {
       throw std::invalid_argument(std::string("control_adapter: file not found: ") + p.control_adapter);
     }
-    if (!fs::is_regular_file(st)) {
+    if (!info.regular()) {
       throw std::invalid_argument(std::string("control_adapter: not a regular file: ") + p.control_adapter);
     }
   }

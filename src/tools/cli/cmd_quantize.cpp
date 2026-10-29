@@ -16,6 +16,7 @@
 #include "pipeline/nvfp4_calibration.h"
 #include "tools/cli/commands.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "weights/quant/quant_convert.h"
 
 namespace mi::cli {
@@ -45,14 +46,14 @@ constexpr const char* kUsage =
 // The bundle a diffusers input belongs to: the directory itself when it has a transformer/ subdirectory, else its
 // parent when the input is that transformer directory. Empty for a single file or anything else.
 std::filesystem::path bundle_of(const std::filesystem::path& input) {
+  if (!util::file_info(input).directory()) return {};
+  if (util::file_info(input / "transformer").directory()) return input;
   std::error_code ec;
-  if (!std::filesystem::is_directory(input, ec)) return {};
-  if (std::filesystem::is_directory(input / "transformer", ec)) return input;
   // "x/transformer/" and "." normalize to a path without a file name: drop the separator before taking the parent.
   std::filesystem::path dir = std::filesystem::absolute(input, ec).lexically_normal();
   if (!dir.has_filename()) dir = dir.parent_path();
   const std::filesystem::path parent = dir.parent_path();
-  if (std::filesystem::is_directory(parent / "transformer", ec) && std::filesystem::equivalent(parent / "transformer", input, ec)) {
+  if (const util::FileInfo t = util::file_info(parent / "transformer"); t.directory() && util::same_file(t, util::file_info(input))) {
     return parent;
   }
   return {};
@@ -175,10 +176,10 @@ int cmd_quantize(const std::vector<std::string>& args) {
         return 2;
       }
       // A single-file DiT is captured as it is; a diffusers input only with its own bundle's transformer.
-      std::error_code ec;
-      if (!std::filesystem::is_directory(input, ec)) {
+      if (!util::file_info(input).directory()) {
         co.dit_file = input;
-      } else if (bundle_of(input).empty() || !std::filesystem::equivalent(bundle_of(input), co.model, ec)) {
+      } else if (bundle_of(input).empty() ||
+                 !util::same_file(util::file_info(bundle_of(input)), util::file_info(co.model))) {
         std::cerr << "moss-infer quantize: for a diffusers input, --calib-model must be the input's own bundle\n";
         return 2;
       }

@@ -92,10 +92,9 @@ fs::path user_path(const char* utf8, const std::string& name) {
 // A UTF-8 path that must name an existing regular file.
 fs::path existing_file(const char* utf8, const std::string& name) {
   const fs::path path = user_path(utf8, name);
-  std::error_code ec;
-  const fs::file_status st = fs::status(path, ec);
-  if (!fs::exists(st)) throw std::invalid_argument(name + ": file not found: " + utf8);
-  if (!fs::is_regular_file(st)) throw std::invalid_argument(name + ": not a regular file: " + utf8);
+  const util::FileInfo info = util::file_info(path);
+  if (!info.exists()) throw std::invalid_argument(name + ": file not found: " + utf8);
+  if (!info.regular()) throw std::invalid_argument(name + ": not a regular file: " + utf8);
   return path;
 }
 
@@ -153,18 +152,17 @@ mi_block_path to_block_path(moss_dit::BlockPath path) {
 fs::path model_dir(const mi_engine_params& p) {
   if (p.model_path == nullptr || *p.model_path == '\0') throw std::invalid_argument("model_path is required.");
   const fs::path path = user_path(p.model_path, "model_path");
-  std::error_code ec;
-  const fs::file_status st = fs::status(path, ec);
-  if (p.model_format == MI_MODEL_FORMAT_COMFYUI || (p.model_format == MI_MODEL_FORMAT_AUTO && fs::is_regular_file(st))) {
+  const util::FileInfo info = util::file_info(path);
+  if (p.model_format == MI_MODEL_FORMAT_COMFYUI || (p.model_format == MI_MODEL_FORMAT_AUTO && info.regular())) {
     throw NotSupportedError("ComfyUI model files are not supported as model_path; pass a Hugging Face bundle directory "
                             "(component files go in dit_file, text_encoder_file and vae_file).");
   }
   if (p.model_format != MI_MODEL_FORMAT_AUTO && p.model_format != MI_MODEL_FORMAT_HF_BUNDLE) {
     unknown("model_format", static_cast<int>(p.model_format));
   }
-  if (!fs::is_directory(st)) throw std::invalid_argument("model bundle not found: " + std::string(p.model_path));
+  if (!info.directory()) throw std::invalid_argument("model bundle not found: " + std::string(p.model_path));
   for (const char* component : {"text_encoder", "tokenizer", "transformer", "vae"}) {
-    if (!fs::is_directory(path / component, ec)) {
+    if (!util::file_info(path / component).directory()) {
       throw ModelError("not a MOSS-Image bundle (no " + std::string(component) + "/ directory): " + std::string(p.model_path));
     }
   }
@@ -214,8 +212,7 @@ bool given(const char* utf8) { return utf8 != nullptr && *utf8 != '\0'; }
 // a path that is not a directory is an argument error.
 moss_dit::DistillBundle distill_bundle(const char* utf8, const std::string& name) {
   const fs::path dir = user_path(utf8, name);
-  std::error_code ec;
-  if (!fs::is_directory(dir, ec)) throw std::invalid_argument(name + ": not a directory: " + utf8);
+  if (!util::file_info(dir).directory()) throw std::invalid_argument(name + ": not a directory: " + utf8);
   try {
     return moss_dit::open_distill_bundle(dir);
   } catch (const moss_dit::DistillError& e) {
@@ -261,9 +258,8 @@ ImageInput check_image(const mi_image* px, const char* path, int channels, bool 
     in.pixels = px;
   } else if (given(path)) {
     in.file = existing_file(path, n + "_path");
-    std::error_code ec;
-    const std::uintmax_t size = fs::file_size(in.file, ec);
-    if (!ec && size > pipeline::kMaxImageFileBytes) {
+    const std::uint64_t size = util::file_info(in.file).size;
+    if (size > pipeline::kMaxImageFileBytes) {
       throw std::invalid_argument(n + "_path: the file is " + std::to_string(size) + " bytes; at most " +
                                   std::to_string(pipeline::kMaxImageFileBytes) + " are read.");
     }
@@ -627,8 +623,8 @@ pipeline::PipelineOptions to_options(const mi_engine_params& p) {
   if (given(p.distill_dir)) {
     const moss_dit::DistillBundle b = distill_bundle(p.distill_dir, "distill_dir");
     if (!b.time_embedding.empty()) {
-      std::error_code ec;
-      if (!o.time_embedding_file.empty() && !fs::equivalent(o.time_embedding_file, b.time_embedding, ec)) {
+      if (!o.time_embedding_file.empty() &&
+          !util::same_file(util::file_info(o.time_embedding_file), util::file_info(b.time_embedding))) {
         throw std::invalid_argument("time_embedding_file and distill_dir name different time embeddings (" +
                                     util::path_utf8(o.time_embedding_file) + ", " + util::path_utf8(b.time_embedding) +
                                     "); set one of them.");
@@ -828,17 +824,12 @@ namespace {
 
 // Bytes of a component's weights: its file, else the *.safetensors files in the bundle's folder (0 when unreadable).
 std::uint64_t weight_bytes(const fs::path& file, const fs::path& folder) {
-  std::error_code ec;
-  if (!file.empty()) {
-    const std::uintmax_t n = fs::file_size(file, ec);
-    return ec ? 0 : n;
-  }
+  if (!file.empty()) return util::file_info(file).size;
   std::uint64_t total = 0;
+  std::error_code ec;
+  if (!util::file_info(folder).directory()) return 0;
   for (fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
-    if (it->path().extension() != ".safetensors") continue;
-    std::error_code size_ec;
-    const std::uintmax_t n = it->file_size(size_ec);
-    if (!size_ec) total += n;
+    if (it->path().extension() == ".safetensors") total += util::file_info(it->path()).size;
   }
   return total;
 }
@@ -901,8 +892,7 @@ namespace {
 // A distill bundle's step embedder is the engine's (PipelineOptions): the request's bundle must use the same one.
 void check_distill_time_embedding(const fs::path& engine_te, const fs::path& distill_te) {
   if (distill_te.empty()) return;
-  std::error_code ec;
-  if (engine_te.empty() || !fs::equivalent(engine_te, distill_te, ec)) {
+  if (engine_te.empty() || !util::same_file(util::file_info(engine_te), util::file_info(distill_te))) {
     throw std::invalid_argument("distill_dir has a time embedding (" + util::path_utf8(distill_te) +
                                 ") that this engine does not use; set the bundle as mi_engine_params.distill_dir "
                                 "(or its file as time_embedding_file) when creating the engine.");

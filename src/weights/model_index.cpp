@@ -4,7 +4,6 @@
 #include <charconv>
 #include <chrono>
 #include <cstdio>
-#include <fstream>
 #include <iomanip>
 #include <map>
 #include <ostream>
@@ -14,9 +13,9 @@
 #include <unordered_map>
 
 #include "util/checked_math.h"
-#include "util/file_time.h"
 #include "util/json.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 #include "util/rename_replace.h"
 #include "util/replaceable_file.h"
 #include "util/xxh64.h"
@@ -44,9 +43,9 @@ bool ends_with(std::string_view s, std::string_view suffix) {
 
 // Reads a whole file, refusing one larger than max_bytes before allocating anything.
 std::string slurp(const fs::path& path, std::uintmax_t max_bytes) {
-  std::error_code ec;
-  const std::uintmax_t size = fs::file_size(path, ec);
-  if (ec) throw IndexError("cannot open " + path_utf8(path));
+  const util::FileInfo info = util::file_info(path);
+  if (!info.regular()) throw IndexError("cannot open " + path_utf8(path));
+  const std::uintmax_t size = info.size;
   if (size > max_bytes) {
     throw IndexError(path_utf8(path) + ": " + std::to_string(size) + " bytes exceeds the limit of " + std::to_string(max_bytes));
   }
@@ -75,7 +74,7 @@ json::Value parse_json_file(const fs::path& path, std::uintmax_t max_bytes, std:
 // registers them in index.files and returns all tensors with their file ids.
 std::vector<IndexedTensor> load_component_tensors(ModelIndex& index, Component comp) {
   const fs::path dir = index.bundle_dir / component_name(comp);
-  if (!fs::is_directory(dir)) throw IndexError("bundle is missing directory " + path_utf8(dir));
+  if (!util::file_info(dir).directory()) throw IndexError("bundle is missing directory " + path_utf8(dir));
 
   std::vector<std::string> shards, shard_indexes;
   for (const auto& e : fs::directory_iterator(dir)) {
@@ -114,7 +113,7 @@ std::vector<IndexedTensor> load_component_tensors(ModelIndex& index, Component c
     const fs::path path = dir / path_from_utf8(shard);
     SafetensorsFile file(path);
     auto id = static_cast<std::uint32_t>(index.files.size());
-    index.files.push_back({std::string(component_name(comp)) + "/" + shard, file.file_size(), util::file_mtime_ns(path)});
+    index.files.push_back({std::string(component_name(comp)) + "/" + shard, file.file_size(), util::file_info(path).mtime_ns});
     for (const TensorInfo& t : file.tensors()) {
       if (!weight_map.empty()) {
         auto it = weight_map.find(t.name);
@@ -510,10 +509,8 @@ void write_index(const ModelIndex& index, const fs::path& path) {
   fs::path tmp = path;
   tmp += ".tmp";
   {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    out << o.str();
-    out.flush();
-    if (!out) throw IndexError("cannot write " + path_utf8(tmp));
+    util::OutputFile out(tmp);
+    if (!out.write(o.str()) || !out.close()) throw IndexError("cannot write " + path_utf8(tmp));
   }
   std::error_code ec;
   util::rename_replace(tmp, path, ec);
@@ -557,13 +554,13 @@ ModelIndex load_index(const fs::path& path, const fs::path& bundle_dir, Componen
       }
       kept_id.push_back(static_cast<std::int64_t>(index.files.size()));
       const fs::path p = index.bundle_dir / path_from_utf8(file.path);
-      std::error_code ec;
+      const util::FileInfo info = util::file_info(p);
       // Gone: its component's weights are missing (rebuilding cannot help); a skipped component's are never looked at.
-      if (!fs::is_regular_file(p, ec)) {
+      if (!info.regular()) {
         const std::string folder = file.path.substr(0, file.path.find('/'));
         fail("missing weights for " + folder + " (" + file.path + "): add them or pass its component file");
       }
-      if (fs::file_size(p) != file.size || util::file_mtime_ns(p) != file.mtime_ns) {
+      if (info.size != file.size || info.mtime_ns != file.mtime_ns) {
         throw StaleIndexError(where + ": " + file.path + " changed since the index was built; rebuild with `moss-infer index`");
       }
       index.files.push_back(std::move(file));
