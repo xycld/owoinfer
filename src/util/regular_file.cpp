@@ -349,12 +349,16 @@ bool OutputFile::publish(const std::filesystem::path& target) {
     return SetFileInformationByHandle(static_cast<HANDLE>(handle_), cls, info, size) != 0;
   };
   bool renamed = false;
+  bool ex = true;  // FileRenameInfoEx, until the file system refuses it (FAT, exFAT)
   for (int attempt = 0; !renamed && attempt < 200; ++attempt) {
     if (attempt > 0) Sleep(1);
-    renamed = set_name(kFileRenameInfoEx, kReplaceIfExists | kPosixSemantics);
-    const DWORD error = renamed ? 0 : GetLastError();
-    if (!renamed && (error == ERROR_INVALID_PARAMETER || error == ERROR_NOT_SUPPORTED)) {
-      renamed = set_name(FileRenameInfo, kReplaceIfExists);  // no FileRenameInfoEx on this file system
+    renamed = ex ? set_name(kFileRenameInfoEx, kReplaceIfExists | kPosixSemantics)
+                 : set_name(FileRenameInfo, kReplaceIfExists);
+    DWORD error = renamed ? 0 : GetLastError();
+    if (!renamed && ex && (error == ERROR_INVALID_PARAMETER || error == ERROR_NOT_SUPPORTED)) {
+      ex = false;
+      renamed = set_name(FileRenameInfo, kReplaceIfExists);
+      error = renamed ? 0 : GetLastError();  // the retry below goes by the fallback's own error
     }
     if (!renamed && error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION) break;
   }
