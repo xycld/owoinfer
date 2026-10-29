@@ -8,7 +8,7 @@ The reference documents are:
 
 This page does not repeat them. It explains how the pieces fit together, and which choices the launcher has to make.
 
-Version 2.0.0 (ABI 1, server protocol 2). See [Versioning](#versioning) for what stays compatible, and [Migrating from 1.x](#migrating-from-1x) for what changed.
+Version 2.1.0 (ABI 1, server protocol 2). See [Versioning](#versioning) for what stays compatible, and [Migrating from 1.x](#migrating-from-1x) for what changed.
 
 MossInfer is a low-level engine: it runs what the caller asks for, refuses what the hardware or the files cannot run with the reason, and reports what ran. It does not choose for the caller. The launcher picks the tier, the memory mode and the budgets; [Performance](#performance) says what each costs and gives.
 
@@ -203,7 +203,7 @@ cmake --build --preset linux-cuda13 -j8
 CUDA_VISIBLE_DEVICES="" ctest --preset linux-cuda13 -L '^cpu$'
 cmake --install build-linux-cuda13                # -> build-linux-cuda13/install
 cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-cuda13/install-system-cuda
-(cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-2.0.0-linux-cu13-x86_64.{tar.gz,zip}
+(cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-2.1.0-linux-cu13-x86_64.{tar.gz,zip}
 ```
 
 - **glibc:** the archive needs the glibc of the machine that built it, or a newer one. Build on the oldest distribution you want to support. CI uses Ubuntu 22.04, which gives glibc 2.35. A build from a rolling distribution such as Arch will not start on Ubuntu LTS.
@@ -513,7 +513,7 @@ Attach it to bug reports, together with the server's stderr log and `hello`'s `p
 ## Versioning
 
 - **Version numbers.**
-  - `mi_version()` returns the release version (`2.0.0`).
+  - `mi_version()` returns the release version (`2.1.0`).
   - `mi_abi_version()` and `MI_ABI_VERSION` give the binary interface version (1).
   - The server's `hello` reports its `protocol_version` (2).
 - **Additive changes keep ABI 1:** new functions, new fields at the end of structs, new enum values, new optional server parameters and events.

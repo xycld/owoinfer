@@ -8,7 +8,7 @@
 ```
 moss-server                     # speak the protocol on stdin/stdout
 moss-server --parent-pid <pid>  # the same, and exit when process <pid> (the launcher) exits
-moss-server --version           # "moss-server 2.0.0 (protocol 2, ABI 1)"
+moss-server --version           # "moss-server 2.1.0 (protocol 2, ABI 1)"
 ```
 
 ### `--parent-pid`

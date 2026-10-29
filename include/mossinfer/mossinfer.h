@@ -73,7 +73,7 @@ extern "C" {
 /* ------------------------------------------------------------------------------------------------ version */
 
 #define MI_VERSION_MAJOR 2
-#define MI_VERSION_MINOR 0
+#define MI_VERSION_MINOR 1
 #define MI_VERSION_PATCH 0
 /* Incremented on every incompatible change of the binary interface (see the conventions above). */
 #define MI_ABI_VERSION 1
