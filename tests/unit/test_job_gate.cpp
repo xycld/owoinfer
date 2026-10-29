@@ -195,8 +195,10 @@ TEST(JobGate, CloseEngineWaitsForEveryWaiterBeforeTheFree) {
       EXPECT_FALSE(raw->end_run([] {}));  // the session's ending ended the run; or the gate closed
     });
     first.join();
-    g.reset();
+    // The second ender is joined before the free: one that had not entered the gate yet when close_engine returned
+    // would call into a freed gate (the caller's ordering rule, as for mi_engine_free).
     second.join();
+    g.reset();
   }
   JobGate g;
   open(g, false);
