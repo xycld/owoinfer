@@ -115,22 +115,27 @@ std::vector<ProgressSegment> generate_segments(const planner::ExecutionPlan& pla
   const LoadEstimates load = load_estimates(plan, hw, held, bytes, shape);
   const planner::TimeEstimate& t = plan.time;
   const int first = shape.hires ? shape.first_steps : shape.total_steps;
+  // Reference images: each pass's prefill (in denoise_s) is that pass's work before its first step.
+  const int passes = (first > 0 ? 1 : 0) + (shape.hires && shape.total_steps > first ? 1 : 0);
+  const double prefill = passes > 0 ? t.reference_prefill_s / passes : 0;
+  const double steps_s = t.denoise_s - t.reference_prefill_s;
   // The planner counts a hires fix's first-pass steps at the target's cost times their pixel share.
-  double first_price = shape.total_steps > 0 ? t.denoise_s / shape.total_steps : 0;
+  double first_price = shape.total_steps > 0 ? steps_s / shape.total_steps : 0;
   double second_price = first_price;
   if (shape.hires) {
     const double share = shape.first_pixel_share;
     const double target_steps = (shape.total_steps - first) + first * share;
-    second_price = target_steps > 0 ? t.denoise_s / target_steps : 0;
+    second_price = target_steps > 0 ? steps_s / target_steps : 0;
     first_price = second_price * share;
   }
   std::vector<ProgressSegment> s;
   s.push_back({MI_PHASE_TEXT_ENCODER, t.text_encoder_s + load.text_encoder});
   s.push_back({MI_PHASE_DIT_LOAD, dit_load_seconds(plan, held, load, shape) + (shape.encodes_image ? load.vae_encoder : 0)});
-  s.push_back({MI_PHASE_DENOISE, 0, first, first_price});
+  s.push_back({MI_PHASE_DENOISE, first > 0 ? prefill : 0, first, first_price});
   if (shape.hires) {
     s.push_back({MI_PHASE_DECODE, t.decode_s * shape.first_pixel_share + load.vae_decoder});
-    s.push_back({MI_PHASE_DENOISE, shape.encodes_image ? 0 : load.vae_encoder, shape.total_steps - first, second_price});
+    s.push_back({MI_PHASE_DENOISE, (shape.encodes_image ? 0 : load.vae_encoder) + (shape.total_steps > first ? prefill : 0),
+                 shape.total_steps - first, second_price});
     s.push_back({MI_PHASE_DECODE, t.decode_s});
   } else {
     s.push_back({MI_PHASE_DECODE, t.decode_s + load.vae_decoder});

@@ -553,6 +553,46 @@ pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embe
   }
   q.accel.step_cache_threshold = p.step_cache_threshold > 0 ? std::optional<double>(p.step_cache_threshold) : std::nullopt;
 
+  // Reference images (MI_CAP_REFERENCE_IMAGES): pixels (copied) or files (read as RGB), in order; their sizes and the
+  // token limit are pipeline::validate's. Not loaded (validate only): a file's size is unknown here, so a 16x16
+  // stand-in (the file's existence is checked).
+  if (p.reference_images_count > 0 && p.reference_images == nullptr) {
+    throw std::invalid_argument("reference_images: NULL array with a nonzero count.");
+  }
+  if (p.reference_images_count > static_cast<std::size_t>(pipeline::kMaxReferenceImages)) {
+    throw std::invalid_argument("reference_images: at most " + std::to_string(pipeline::kMaxReferenceImages) +
+                                " entries (got " + std::to_string(p.reference_images_count) + ").");
+  }
+  switch (p.lora_placement) {
+    case MI_LORA_PLACEMENT_DEFAULT: q.lora_placement = lora::Placement::kDefault; break;
+    case MI_LORA_PLACEMENT_MERGE: q.lora_placement = lora::Placement::kMerge; break;
+    case MI_LORA_PLACEMENT_SIDE_BRANCH: q.lora_placement = lora::Placement::kSideBranch; break;
+    default: unknown("lora_placement", static_cast<int>(p.lora_placement));
+  }
+  if (p.reference_max_edge != 0 && (p.reference_max_edge < 16 || p.reference_max_edge > 2048)) {
+    throw std::invalid_argument("reference_max_edge must be 0 (the default, 512) or 16 to 2048.");
+  }
+  q.references.max_edge = p.reference_max_edge != 0 ? p.reference_max_edge : 512;
+  for (std::size_t i = 0; i < p.reference_images_count; ++i) {
+    const mi_reference_image& r = p.reference_images[i];
+    const std::string name = "reference_images[" + std::to_string(i) + "]";
+    if (r._reserved0 != 0 || r._reserved1 != 0) throw std::invalid_argument(name + "._reserved0 / _reserved1 must be 0.");
+    if (r.image == nullptr && !given(r.image_path)) throw std::invalid_argument(name + " needs an image or an image_path.");
+    if (r.image != nullptr && r.image->channels != 1 && r.image->channels != 3 && r.image->channels != 4) {
+      throw std::invalid_argument(name + ".image.channels must be 1, 3 or 4, not " + std::to_string(r.image->channels) + ".");
+    }
+    const int channels = r.image != nullptr ? r.image->channels : 3;
+    const ImageInput in = check_image(r.image, r.image_path, channels, false, name + ".image");
+    if (load_images || in.pixels != nullptr) {
+      q.references.images.push_back(load_input(in, channels, false, name + ".image"));
+    } else {
+      pipeline::Image s;
+      s.width = s.height = 16;
+      s.pixels.assign(16 * 16 * 3, 0);
+      q.references.images.push_back(std::make_shared<const pipeline::Image>(std::move(s)));
+    }
+  }
+
   if (distill_dataspace && (init.given() || q.hires.enabled())) {
     throw std::invalid_argument("distill_dir selected the bundle's dataspace sampler, which cannot start from an image "
                                 "(init_image, hires_width / hires_height); set sampler to use another sampler.");
@@ -797,6 +837,8 @@ Generation to_generation(const pipeline::Request& q, pipeline::Result& r, bool i
   g.step_cache_diffs = a.step_cache_diffs;
   g.step_cache_threshold_source = a.step_cache_threshold_source;
   g.accel_warnings = r.accel_warnings;
+  g.references_json = pipeline::references_json(q, r);
+  g.reference_warnings = r.reference_warnings;
   return g;
 }
 
@@ -946,7 +988,8 @@ JobShape job_shape(const pipeline::Request& q) {
   }
   // The pipeline's img2img condition (an init image at strength 1 without a mask is not used), and control images.
   s.encodes_image = (q.init_image != nullptr && (q.denoise_strength < 1.0 || q.mask != nullptr)) ||
-                    (q.control.enabled() && !q.control.images.empty() && s.total_steps > 0);
+                    (q.control.enabled() && !q.control.images.empty() && s.total_steps > 0) ||
+                    (q.references.enabled() && s.total_steps > 0);  // reference images: encoded before the DiT load
   // A LoRA change may re-merge or reload the DiT: the progress prices a load whenever the stack differs.
   for (const lora::LoraSpec& l : q.loras) s.merge_key += util::path_utf8(l.path) + '\n' + std::to_string(l.strength) + '\n';
   if (q.control.enabled()) {

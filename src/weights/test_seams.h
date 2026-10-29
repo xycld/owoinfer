@@ -22,6 +22,12 @@ void cancel_after_first_host_chunk(std::atomic<bool>* flag);
 // Called after every chunk read_files_to_host reads: fires the seam above (one relaxed load when it is off).
 void after_host_chunk();
 
+// Sets `*flag` to true as the `nth` reference prefill from now starts (moss_dit::MossDit::prefill_references; 1 = the
+// next; once, the seam then disarms), so a test cancels inside a given pass's prefill. nullptr disarms.
+void cancel_at_reference_prefill(std::atomic<bool>* flag, int nth);
+// Called as every reference prefill starts: fires the seam above (one relaxed load when it is off).
+void before_reference_prefill();
+
 // page_cache_fraction's query: kAuto (cachestat, else the mincore sample), kMincore (the sample alone, as on kernels
 // without cachestat) or kNone (no query: unknown).
 enum class ResidencyQuery { kAuto, kMincore, kNone };

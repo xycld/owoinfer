@@ -459,6 +459,56 @@ TEST(LoraFormat, AlphaRuleSharedWithConverter) {
   EXPECT_THROW(quant::lora_metadata_alpha(md), quant::QuantError);
 }
 
+// moss-edit-lora (Moss-Image-Edit): bare .lora_A / .lora_B keys, each module's alpha from the adapter_config header
+// (here alpha != rank), q / k / v as separate modules of the fused qkv, and the file's format in its report.
+TEST(LoraFormat, MossEditLoraAdapterConfig) {
+  TempDir dir("lora_edit");
+  auto t = low_rank("layers.0.proj.q", ".lora_A", ".lora_B", kD, kD, 16, 1);
+  for (auto& x : low_rank("layers.0.proj.k", ".lora_A", ".lora_B", kD, kD, 16, 2)) t.push_back(x);
+  for (auto& x : low_rank("layers.0.proj.v", ".lora_A", ".lora_B", kD, kD, 16, 3)) t.push_back(x);
+  const std::string meta =
+      R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"format_version\": 1, \"modules\": {)"
+      R"(\"layers.0.proj.q\": {\"alpha\": 32.0, \"rank\": 16}, \"layers.0.proj.k\": {\"alpha\": 8, \"rank\": 16}}}"})";
+  write_st(dir.path() / "e.safetensors", t, meta);
+  const LoraStack s = open1(dir.path() / "e.safetensors");
+  EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.q").at(0)->alpha_scale, 2.0);
+  EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.k").at(0)->alpha_scale, 0.5);
+  EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.v").at(0)->alpha_scale, 1.0);  // no alpha: 1, with a warning
+  EXPECT_EQ(s.reports()[0].format, "moss-edit-lora");
+  EXPECT_TRUE(s.reports()[0].unknown.empty());
+  EXPECT_EQ(s.reports()[0].warnings,
+            std::vector<std::string>{"1 module without an alpha in adapter_config (moss-edit-lora), first: layers.0.proj.v"});
+  LoadOptions strict;
+  strict.strict = true;
+  EXPECT_THROW(open1(dir.path() / "e.safetensors", 1.0f, strict), LoraError);
+  EXPECT_NE(s.reports()[0].notes.back().find("adapter_config (moss-edit-lora) applied to 2 modules"), std::string::npos);
+  std::map<std::string, std::string> md{{"adapter_config", R"({"format": "other", "modules": {"q": {"alpha": 2}}})"}};
+  EXPECT_TRUE(quant::lora_adapter_config_alphas(md).empty());  // only the moss-edit-lora format's
+  EXPECT_EQ(quant::lora_adapter_config_format(md), "");
+  md["adapter_config"] = R"({"format": "moss-edit-lora", "modules": {"q": {"alpha": "x"}}})";
+  EXPECT_THROW(quant::lora_adapter_config_alphas(md), quant::QuantError);
+  md["adapter_config"] = R"({"format": "moss-edit-lora"})";
+  EXPECT_THROW(quant::lora_adapter_config_alphas(md), quant::QuantError);  // no modules object
+}
+
+// An ordinary LoRA whose adapter_config header is not a moss-edit-lora one (not JSON, not an object, another format, a
+// modules entry of the wrong shape) loads as in 2.0: no format, no alphas from it, no error.
+TEST(LoraFormat, ForeignAdapterConfigIgnored) {
+  TempDir dir("lora_junk_cfg");
+  const auto t = low_rank("diffusion_model.layers.0.proj.o", ".lora_down.weight", ".lora_up.weight", kD, kD, 4, 1);
+  for (const char* cfg : {R"(not json)", R"([1, 2])", R"(\"text\")", R"({\"format\": \"peft\", \"modules\": 3})",
+                          R"({\"r\": 4, \"lora_alpha\": \"x\"})"}) {
+    SCOPED_TRACE(cfg);
+    write_st(dir.path() / "k.safetensors", t, std::string(R"({"adapter_config":")") + cfg + "\"}");
+    const LoraStack s = open1(dir.path() / "k.safetensors");
+    EXPECT_DOUBLE_EQ(s.adapters_of("layers.0.proj.o").at(0)->alpha_scale, 1.0);
+    EXPECT_EQ(s.reports()[0].format, "");
+    EXPECT_TRUE(s.reports()[0].unknown.empty());
+    EXPECT_TRUE(s.reports()[0].warnings.empty());
+    EXPECT_TRUE(s.reports()[0].notes.empty());
+  }
+}
+
 // On an INT8 base every merged adapter of a block GEMM is reported as a warning; strict turns warnings into errors.
 TEST(LoraFormat, Int8MergeWarnings) {
   TempDir dir("lora_warn");
@@ -476,10 +526,104 @@ TEST(LoraFormat, Int8MergeWarnings) {
   LoadOptions opt;
   opt.int8_block_gemms = true;
   const LoraStack q = open1(dir.path() / "w.safetensors", 1.0f, opt);
-  ASSERT_EQ(q.reports()[0].warnings.size(), 1u);  // only the LoHa on layers.4.proj.o (side branch and text_embedder: none)
-  EXPECT_EQ(q.reports()[0].warnings[0], "layers.4.proj.o: loha adapter merged into INT8: adds requantization error");
+  // One warning per file: only the LoHa on layers.4.proj.o is merged into INT8 (side branch and text_embedder: none).
+  ASSERT_EQ(q.reports()[0].warnings.size(), 1u);
+  EXPECT_EQ(q.reports()[0].warnings[0], "1 adapter merged into INT8 (requantization error)");
   opt.strict = true;
   EXPECT_THROW(open1(dir.path() / "w.safetensors", 1.0f, opt), LoraError);
+}
+
+// lora_placement, per module from its base format: an ordinary LoRA stays on the side branch under default and merges
+// under merge (refused on a packed 4-bit module); a moss-edit-lora file too: the side branch everywhere by default,
+// merged under merge (on INT8 one warning per file, refused by strict naming side_branch); side_branch never merges.
+// side_branch; side_branch never merges. Merged edit block modules keep no pristine copy.
+TEST(LoraFormat, PlacementPerModule) {
+  TempDir dir("lora_place");
+  auto plain = low_rank("transformer.layers.0.proj.q", ".lora_A.weight", ".lora_B.weight", kD, kD, 4, 1);
+  for (auto& x : low_rank("transformer.layers.1.proj.o", ".lora_A.weight", ".lora_B.weight", kD, kD, 4, 2)) plain.push_back(x);
+  write_st(dir.path() / "plain.safetensors", plain);
+  const std::string edit_meta =
+      R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"modules\": {\"layers.0.proj.q\": {\"alpha\": 4}, )"
+      R"(\"layers.1.proj.o\": {\"alpha\": 4}, \"layers.2.proj.k\": {\"alpha\": 4}}}"})";
+  auto edit = low_rank("layers.0.proj.q", ".lora_A", ".lora_B", kD, kD, 4, 3);
+  for (auto& x : low_rank("layers.1.proj.o", ".lora_A", ".lora_B", kD, kD, 4, 4)) edit.push_back(x);
+  for (auto& x : low_rank("layers.2.proj.k", ".lora_A", ".lora_B", kD, kD, 4, 5)) edit.push_back(x);
+  write_st(dir.path() / "edit.safetensors", edit, edit_meta);
+  write_st(dir.path() / "edit8.safetensors", low_rank("layers.0.proj.q", ".lora_A", ".lora_B", kD, kD, 4, 3), edit_meta);
+  // Block 0 INT8, block 1 INT4, block 3 INT8 without ConvRot, the others bf16.
+  const auto base = [](std::string_view m) {
+    return m.starts_with("layers.0.")   ? mi::lora::BaseFormat::kInt8
+           : m.starts_with("layers.1.") ? mi::lora::BaseFormat::kInt4
+           : m.starts_with("layers.3.") ? mi::lora::BaseFormat::kInt8Plain
+                                        : mi::lora::BaseFormat::kBf16;
+  };
+  const auto open = [&](const char* file, mi::lora::Placement p, bool strict = false) {
+    LoadOptions o;
+    o.placement = p;
+    o.base_format = base;
+    o.strict = strict;
+    return open1(dir.path() / file, 1.0f, o);
+  };
+  using mi::lora::Placement;
+  const auto side = [](const LoraStack& s, const char* m) { return s.adapters_of(m).at(0)->side_branch; };
+  {
+    const LoraStack s = open("plain.safetensors", Placement::kDefault);
+    EXPECT_TRUE(side(s, "layers.0.proj.q"));
+    EXPECT_TRUE(side(s, "layers.1.proj.o"));
+    EXPECT_TRUE(s.reports()[0].warnings.empty());
+  }
+  // layers.1.proj.o is INT4, layers.3 INT8 without ConvRot: refused naming the module's own format.
+  const auto merge_error = [&](const char* file) {
+    try {
+      open(file, Placement::kMerge);
+    } catch (const LoraError& e) {
+      return std::string(e.what());
+    }
+    return std::string("no error");
+  };
+  EXPECT_NE(merge_error("plain.safetensors").find("module layers.1.proj.o is stored int4_convrot, which cannot take a merge"),
+            std::string::npos);
+  write_st(dir.path() / "plain8.safetensors", low_rank("transformer.layers.3.proj.v", ".lora_A.weight", ".lora_B.weight", kD, kD, 4, 6));
+  EXPECT_NE(merge_error("plain8.safetensors").find("module layers.3.proj.v is stored int8_plain (INT8 without ConvRot)"),
+            std::string::npos);
+  EXPECT_TRUE(side(open("plain8.safetensors", Placement::kDefault), "layers.3.proj.v"));
+  {
+    const LoraStack s = open("edit.safetensors", Placement::kDefault, true);  // strict: nothing lossy by default
+    EXPECT_TRUE(side(s, "layers.0.proj.q"));
+    EXPECT_TRUE(side(s, "layers.1.proj.o"));
+    EXPECT_TRUE(side(s, "layers.2.proj.k"));
+    EXPECT_TRUE(s.merge_modules().empty());
+    EXPECT_TRUE(s.reports()[0].warnings.empty());
+  }
+  {
+    // merge on a bf16 module: no warning, no pristine copy for an edit adapter's block module.
+    write_st(dir.path() / "edit16.safetensors", low_rank("layers.2.proj.k", ".lora_A", ".lora_B", kD, kD, 4, 5), edit_meta);
+    const LoraStack s = open("edit16.safetensors", Placement::kMerge, true);
+    EXPECT_FALSE(side(s, "layers.2.proj.k"));
+    EXPECT_FALSE(s.keeps_pristine("layers.2.proj.k"));
+    EXPECT_TRUE(s.reports()[0].warnings.empty());
+  }
+  {
+    const LoraStack s = open("edit8.safetensors", Placement::kMerge);
+    EXPECT_FALSE(side(s, "layers.0.proj.q"));
+    EXPECT_FALSE(s.keeps_pristine("layers.0.proj.q"));
+    EXPECT_EQ(s.reports()[0].warnings, std::vector<std::string>{"1 adapter merged into INT8 (requantization error)"});
+  }
+  try {
+    open("edit8.safetensors", Placement::kMerge, true);
+    ADD_FAILURE() << "strict accepted an INT8 merge";
+  } catch (const LoraError& e) {
+    EXPECT_NE(std::string(e.what()).find("lora_placement side_branch"), std::string::npos) << e.what();
+  }
+  {
+    const LoraStack s = open("edit.safetensors", Placement::kSideBranch, true);
+    EXPECT_TRUE(side(s, "layers.0.proj.q"));
+    EXPECT_TRUE(side(s, "layers.2.proj.k"));
+    EXPECT_TRUE(s.merge_modules().empty());
+  }
+  EXPECT_EQ(mi::lora::parse_placement("side_branch"), Placement::kSideBranch);
+  EXPECT_STREQ(mi::lora::placement_name(Placement::kDefault), "default");
+  EXPECT_THROW(mi::lora::parse_placement("auto"), std::invalid_argument);
 }
 
 // PristineWeights: a strength change re-merges from the kept base weights; strength 0 restores them bit for bit.

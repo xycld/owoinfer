@@ -232,29 +232,13 @@ class Planner {
   // One step: compute, plus the part of the streamed blocks' copy not hidden behind it (fills d's per-step fields).
   double step_seconds(DitPlan& d) const {
     const double image_tokens = static_cast<double>(r_.height / 16) * static_cast<double>(r_.width / 16);
-    const double dim = s_.dit_dim > 0 ? s_.dit_dim : 3072;
     double flops = 0;
     for (int row = 0; row < r_.rows_per_step; ++row) {
       // Row 1 is the negative prompt; rows 0 and 2 (SLG) the prompt.
       const std::size_t text_row = row == 1 && r_.text_lengths.size() > 1 ? 1 : 0;
       const double l = image_tokens + (r_.text_lengths.empty() ? 0.0 : static_cast<double>(r_.text_lengths[text_row]));
-      // GEMMs: 2 FLOPs per weight per token (bf16: 2 bytes per weight); attention: QK^T and PV, 2 * L^2 * dim each,
-      // per block. P6 paths in bf16-equivalent FLOPs: divided by their measured speedup.
-      const double f4 = s_.dit_precision == Precision::kInt4 ? std::clamp(s_.dit_int4_fraction, 0.0, 1.0) : 0.0;
-      const double fn = s_.dit_precision == Precision::kNvfp4 ? std::clamp(s_.dit_nvfp4_fraction, 0.0, 1.0) : 0.0;
-      const double f8 = std::clamp(s_.dit_int8_fraction, 0.0, 1.0 - f4 - fn);
-      const double gemm = s_.dit_precision != Precision::kBf16
-                              ? 2.0 * static_cast<double>(s_.dit_params) * l *
-                                    ((1.0 - f8 - f4 - fn) + f8 / kInt8GemmSpeedup +
-                                     f4 / (in_.caps.int4_mma_native ? kInt4GemmSpeedup : kInt4ViaInt8Speedup) +
-                                     fn / (kInt8GemmSpeedup * (in_.caps.nvfp4_native ? kNvfp4SpeedVsInt8 : 1.0)))
-                              : static_cast<double>(s_.dit_bytes) * l;
-      const double attention = 4.0 * l * l * dim * s_.dit_blocks;
-      const double attention_speedup = in_.attention == AttentionMode::kExact    ? 1.0
-                                       : in_.attention == AttentionMode::kQ8Fp8  ? kQ8Fp8AttentionSpeedup
-                                       : in_.attention == AttentionMode::kQ8Fp16 ? kQ8Fp16AttentionSpeedup
-                                                                                 : kQ8F32AccAttentionSpeedup;
-      flops += gemm + attention / attention_speedup;
+      // Reference keys (the edit layout): every query also attends to the R reference tokens.
+      flops += sequence_flops(l, l + static_cast<double>(r_.reference_tokens));
     }
     const double compute = flops / (tflops() * 1e12);
     d.compute_s = compute;
@@ -264,13 +248,51 @@ class Planner {
       d.hidden = 1.0;
       return compute;
     }
-    const double rate = d.source == DitSource::kHostPinned ? std::max(1e-3, hw_.h2d_gbps) : weight_rate_gbps(false, r_.dit_weights_cached);
-    const double transfer = static_cast<double>(d.stream_bytes) / (rate * 1e9);
-    const double overlap = dit_buffers(d) >= 3 ? kStreamOverlap : kStreamOverlapTwoBuffers;
-    const double exposed = std::max(0.0, transfer - compute) + (1.0 - overlap) * std::min(transfer, compute);
+    double transfer = 0;
+    const double exposed = exposed_transfer(d, compute, transfer);
     d.transfer_s = transfer;
     d.hidden = 1.0 - exposed / transfer;
     return compute + exposed;
+  }
+
+  // One sequence of l tokens attending to `keys` keys through every block, in bf16-equivalent FLOPs. GEMMs: 2 FLOPs per
+  // weight per token (bf16: 2 bytes per weight); attention: QK^T and PV, 2 * L * keys * dim each, per block. P6 paths:
+  // divided by their measured speedup.
+  double sequence_flops(double l, double keys) const {
+    const double dim = s_.dit_dim > 0 ? s_.dit_dim : 3072;
+    const double f4 = s_.dit_precision == Precision::kInt4 ? std::clamp(s_.dit_int4_fraction, 0.0, 1.0) : 0.0;
+    const double fn = s_.dit_precision == Precision::kNvfp4 ? std::clamp(s_.dit_nvfp4_fraction, 0.0, 1.0) : 0.0;
+    const double f8 = std::clamp(s_.dit_int8_fraction, 0.0, 1.0 - f4 - fn);
+    const double gemm = s_.dit_precision != Precision::kBf16
+                            ? 2.0 * static_cast<double>(s_.dit_params) * l *
+                                  ((1.0 - f8 - f4 - fn) + f8 / kInt8GemmSpeedup +
+                                   f4 / (in_.caps.int4_mma_native ? kInt4GemmSpeedup : kInt4ViaInt8Speedup) +
+                                   fn / (kInt8GemmSpeedup * (in_.caps.nvfp4_native ? kNvfp4SpeedVsInt8 : 1.0)))
+                            : static_cast<double>(s_.dit_bytes) * l;
+    const double attention = 4.0 * l * keys * dim * s_.dit_blocks;
+    const double attention_speedup = in_.attention == AttentionMode::kExact    ? 1.0
+                                     : in_.attention == AttentionMode::kQ8Fp8  ? kQ8Fp8AttentionSpeedup
+                                     : in_.attention == AttentionMode::kQ8Fp16 ? kQ8Fp16AttentionSpeedup
+                                                                               : kQ8F32AccAttentionSpeedup;
+    return gemm + attention / attention_speedup;
+  }
+
+  // The part of one pass over the streamed blocks' copies (`transfer` seconds, set) that `compute` seconds do not hide.
+  double exposed_transfer(const DitPlan& d, double compute, double& transfer) const {
+    const double rate = d.source == DitSource::kHostPinned ? std::max(1e-3, hw_.h2d_gbps) : weight_rate_gbps(false, r_.dit_weights_cached);
+    transfer = static_cast<double>(dit_streamed_bytes(d)) / (rate * 1e9);
+    const double overlap = dit_buffers(d) >= 3 ? kStreamOverlap : kStreamOverlapTwoBuffers;
+    return std::max(0.0, transfer - compute) + (1.0 - overlap) * std::min(transfer, compute);
+  }
+
+  // One reference prefill (R tokens through every block, attending to each other), plus its weight pass when blocks
+  // stream.
+  double prefill_seconds(const DitPlan& d) const {
+    const double r = static_cast<double>(r_.reference_tokens);
+    const double compute = sequence_flops(r, r) / (tflops() * 1e12);
+    if (dit_streamed_bytes(d) == 0) return compute;
+    double transfer = 0;
+    return compute + exposed_transfer(d, compute, transfer);
   }
 
   double decode_seconds(const VaePlan& v) const {
@@ -327,6 +349,10 @@ class Planner {
     c.time.text_encoder_s = te_seconds(c.te);
     c.time.dit_load_s = c.parks() ? static_cast<double>(s_.dit_bytes) / (reload_rate_gbps() * 1e9) : 0;
     c.time.denoise_s = step_seconds(c.dit) * r_.steps;
+    if (r_.reference_prefills > 0) {
+      c.time.reference_prefill_s = prefill_seconds(c.dit) * r_.reference_prefills;
+      c.time.denoise_s += c.time.reference_prefill_s;
+    }
     c.time.decode_s = decode_seconds(c.vae);
   }
 

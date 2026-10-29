@@ -116,6 +116,13 @@ inline constexpr Name<mi_step_cache> kStepCacheNames[] = {
     {"fbcache", MI_STEP_CACHE_FBCACHE},
 };
 
+// lora::placement_name()'s spellings.
+inline constexpr Name<mi_lora_placement> kLoraPlacementNames[] = {
+    {"default", MI_LORA_PLACEMENT_DEFAULT},
+    {"merge", MI_LORA_PLACEMENT_MERGE},
+    {"side_branch", MI_LORA_PLACEMENT_SIDE_BRANCH},
+};
+
 // A table's names, for hello's "values".
 template <class E, std::size_t N>
 constexpr std::array<std::string_view, N> names_of(const Name<E> (&table)[N]) {
@@ -138,6 +145,7 @@ inline constexpr auto kNoiseSources = names_of(kNoiseSourceNames);
 inline constexpr auto kResizes = names_of(kResizeNames);
 inline constexpr auto kMaskEncodings = names_of(kMaskEncodingNames);
 inline constexpr auto kStepCaches = names_of(kStepCacheNames);
+inline constexpr auto kLoraPlacements = names_of(kLoraPlacementNames);
 }  // namespace detail
 
 // The parameter each table validates, for hello's "values": load's (mode .. te_host_pin), then generate's and
@@ -160,6 +168,7 @@ inline constexpr ValueTable kValueTables[] = {
     {"resize", detail::kResizes},
     {"mask_encoding", detail::kMaskEncodings},
     {"step_cache", detail::kStepCaches},
+    {"lora_placement", detail::kLoraPlacements},
 };
 
 }  // namespace mi::server

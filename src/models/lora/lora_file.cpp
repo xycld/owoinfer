@@ -48,6 +48,8 @@ constexpr SuffixRule kSuffixes[] = {
     {".lora_up.weight", Part::kUp},
     {".lora_A.weight", Part::kDown},
     {".lora_B.weight", Part::kUp},
+    {".lora_A", Part::kDown},  // moss-edit-lora (Moss-Image-Edit): bare PEFT names, alphas in adapter_config
+    {".lora_B", Part::kUp},
     {".lora.down.weight", Part::kDown},
     {".lora.up.weight", Part::kUp},
     {".lora_linear_layer.down.weight", Part::kDown},
@@ -140,6 +142,22 @@ const char* block_gemm_name(BlockGemm g) {
   return "?";
 }
 
+const char* placement_name(Placement p) {
+  switch (p) {
+    case Placement::kDefault: return "default";
+    case Placement::kMerge: return "merge";
+    case Placement::kSideBranch: return "side_branch";
+  }
+  return "?";
+}
+
+Placement parse_placement(std::string_view name) {
+  for (const Placement p : {Placement::kDefault, Placement::kMerge, Placement::kSideBranch}) {
+    if (name == placement_name(p)) return p;
+  }
+  throw std::invalid_argument("lora_placement must be default, merge or side_branch, got \"" + std::string(name) + "\"");
+}
+
 const char* kind_name(AdapterKind k) {
   switch (k) {
     case AdapterKind::kLowRank: return "lora";
@@ -230,6 +248,18 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
     rep.file = util::path_utf8(spec.path.filename());
     const std::optional<double> meta_alpha = metadata_alpha(spec.path, f.st.metadata());
     int meta_alpha_used = 0;
+    std::map<std::string, double> config_alphas;  // moss-edit-lora: per module, by name as written
+    try {
+      config_alphas = quant::lora_adapter_config_alphas(f.st.metadata());
+      rep.format = quant::lora_adapter_config_format(f.st.metadata());
+    } catch (const quant::QuantError& e) {
+      throw FormatError(spec.path, "", e.what());
+    }
+    int config_alpha_used = 0;
+    int config_alpha_missing = 0;  // moss-edit-lora modules without an alpha (tensor or adapter_config entry)
+    std::string config_alpha_first_missing;
+    const bool edit = rep.format == "moss-edit-lora";
+    int int8_merges = 0;  // adapters merged into INT8 block GEMMs
 
     // Group tensors by (resolved) module name.
     std::map<std::string, ModuleParts> mods;   // canonical module or alias name -> parts
@@ -358,7 +388,18 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
         if (r > std::min(stored_rows, k)) throw FormatError(spec.path, down.name, "rank " + std::to_string(r) + " exceeds the module's dimensions");
         a.rank = divisor = r;
         a.parts = {down, up};
-        // Without an alpha tensor, diffusers' metadata alpha applies (PEFT: scaling = lora_alpha / r).
+        // Without an alpha tensor, a moss-edit-lora adapter_config's module alpha (by the name as written, else the
+        // module's: the converter's rule), else diffusers' metadata alpha (PEFT: scaling = lora_alpha / r).
+        if (!alpha) {
+          auto it = config_alphas.find(src);
+          if (it == config_alphas.end()) it = config_alphas.find(module);
+          if (it != config_alphas.end()) {
+            alpha = it->second;
+            ++config_alpha_used;
+          } else if (edit) {
+            if (config_alpha_missing++ == 0) config_alpha_first_missing = src;
+          }
+        }
         if (!alpha && meta_alpha) {
           alpha = *meta_alpha;
           ++meta_alpha_used;
@@ -439,10 +480,28 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
         t.module = name;
         t.n = tm->n;
         t.row0 = row0;
-        t.side_branch = t.kind == AdapterKind::kLowRank && tm->block >= 0 && !t.bias_diff;
-        if (!t.side_branch && tm->block >= 0 && options.int8_block_gemms) {
-          rep.warnings.push_back(name + ": " + kind_name(t.kind) + " adapter merged into INT8: adds requantization error");
+        // Placement (LoadOptions::placement): a low-rank block adapter goes to the side branch unless the placement
+        // merges it where its module's format allows.
+        const BaseFormat base = tm->block < 0             ? BaseFormat::kBf16
+                                : options.base_format     ? options.base_format(name)
+                                : options.int8_block_gemms ? BaseFormat::kInt8
+                                                          : BaseFormat::kBf16;
+        const bool branchable = t.kind == AdapterKind::kLowRank && tm->block >= 0 && !t.bias_diff;
+        t.side_branch = branchable;
+        if (branchable && options.placement == Placement::kMerge) {
+          if (base != BaseFormat::kBf16 && base != BaseFormat::kInt8) {
+            const char* stored = base == BaseFormat::kInt8Plain ? "int8_plain (INT8 without ConvRot)"
+                                 : base == BaseFormat::kInt4    ? "int4_convrot"
+                                                                : "nvfp4";
+            fail(util::path_utf8(spec.path) + ": lora_placement merge: module " + name + " is stored " + stored +
+                 ", which cannot take a merge (merges need bf16 or INT8 ConvRot; use lora_placement default or "
+                 "side_branch)");
+          }
+          t.side_branch = false;
         }
+        // A merged block module of an edit adapter keeps no pristine copy (every block linear: the whole DiT's size).
+        t.keep_pristine = !(edit && !t.side_branch && tm->block >= 0);
+        if (!t.side_branch && tm->block >= 0 && base == BaseFormat::kInt8) ++int8_merges;
         file_adapters.push_back(std::move(t));
       }
     }
@@ -453,6 +512,22 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
     if (options.strict && !rep.unknown.empty()) {
       fail(util::path_utf8(spec.path) + ": " + std::to_string(rep.unknown.size()) + " keys not applied, first: " + rep.unknown.front());
     }
+    // One warning per moss-edit-lora file for its modules without an alpha: the file declares them all, so one missing is
+    // likely a renamed key, read at a scale its training did not use.
+    if (config_alpha_missing > 0) {
+      rep.warnings.push_back(std::to_string(config_alpha_missing) + " module" + (config_alpha_missing == 1 ? "" : "s") +
+                             " without an alpha in adapter_config (moss-edit-lora), first: " + config_alpha_first_missing);
+    }
+    // One warning per file for its merges into INT8 block GEMMs (lossy: requantized).
+    if (int8_merges > 0) {
+      rep.warnings.push_back(std::to_string(int8_merges) + " adapter" + (int8_merges == 1 ? "" : "s") +
+                             " merged into INT8 (requantization error)");
+    }
+    if (options.strict && int8_merges > 0 && edit) {
+      fail(util::path_utf8(spec.path) + ": strict: " + std::to_string(int8_merges) +
+           " adapters would be merged into INT8 (requantization error); use lora_placement side_branch, or a DiT file "
+           "with the adapter baked in (moss-infer quantize --lora)");
+    }
     if (options.strict && !rep.warnings.empty()) {
       fail(util::path_utf8(spec.path) + ": " + std::to_string(rep.warnings.size()) + " warnings, first: " + rep.warnings.front());
     }
@@ -462,6 +537,10 @@ LoraStack::LoraStack(std::span<const LoraSpec> specs, const TargetModel& model, 
       std::snprintf(buf, sizeof buf, "%.9g", *meta_alpha);
       rep.notes.push_back(std::string("lora_alpha ") + buf + " from lora_adapter_metadata applied to " +
                           std::to_string(meta_alpha_used) + " modules without an alpha tensor");
+    }
+    if (config_alpha_used > 0) {
+      rep.notes.push_back("alphas from adapter_config (moss-edit-lora) applied to " + std::to_string(config_alpha_used) +
+                          " modules");
     }
     rep.adapters = static_cast<int>(file_adapters.size());
     for (const Adapter& a : file_adapters) {
@@ -489,6 +568,11 @@ std::vector<std::string> LoraStack::merge_modules() const {
     if (!a.side_branch) s.insert(a.module);
   }
   return {s.begin(), s.end()};
+}
+
+bool LoraStack::keeps_pristine(std::string_view module) const {
+  return std::none_of(adapters_.begin(), adapters_.end(),
+                      [&](const Adapter& a) { return !a.side_branch && !a.keep_pristine && a.module == module; });
 }
 
 bool LoraStack::has_merge(std::string_view module) const {

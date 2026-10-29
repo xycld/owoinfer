@@ -95,6 +95,9 @@ struct DenoiseStack {
   bool preview = false;
   bool from_image = false;
   bool crops = false;  // a component run with crop calls: the forward at crop_workspace_bound
+  // Reference images (0: none): their tokens and latents ([128, h, w] fp32 each, uploaded for the prefill).
+  std::int64_t ref_tokens = 0;
+  int ref_images = 0;
 };
 std::size_t denoise_stack_bytes(const DenoiseStack& d, moss_dit::BlockPath path, const moss_dit::ComputeConfig& config,
                                 const moss_dit::FusedRouteSnapshot& route);
@@ -1240,6 +1243,8 @@ struct Pipeline::Impl {
     int decode_height = 0, decode_width = 0;  // the largest decode (0: none)
     std::size_t denoise = 0;       // the denoise phase's stack: its passes, encodes and a hires fix's first decode
     std::size_t host_buffers = 0;  // the call's own host buffers
+    std::int64_t reference_tokens = 0;  // reference images (planner::RequestShape)
+    int reference_prefills = 0;
   };
   // The call's plan into r.plan (throws planner::BudgetError before any heavy work): planner::plan within the engine's
   // mode and budgets, without the VAE models an earlier call left resident when they alone make it infeasible

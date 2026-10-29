@@ -13,10 +13,12 @@
 #include <map>
 #include <random>
 #include <set>
+#include <span>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include "models/lora/lora.h"
 #include "test_util.h"
 #include "util/checked_math.h"
 #include "util/npy.h"
@@ -1057,6 +1059,93 @@ TEST(QuantConvert, LoraEdgeCasesAndCleanup) {
     const auto* l = m.find_linear("layers.0.proj.o");
     EXPECT_EQ(bytes_i8(mi::quant::read_tensor(m, l->weight)), q_ref);
     EXPECT_EQ(bytes_f32(mi::quant::read_tensor(m, *l->scale)), s_ref);
+  }
+  fs::remove(out);
+
+  // moss-edit-lora (Moss-Image-Edit): bare `<m>.lora_A / .lora_B` keys and the module's alpha from adapter_config
+  // (8 at rank 4: coefficient 2), the same bits as the runtime stack's rule.
+  write_st(dir.path() / "edit.safetensors", {make("layers.0.proj.o.lora_A", DType::kF32, {4, kD}, down),
+                                             make("layers.0.proj.o.lora_B", DType::kF32, {kD, 4}, up)},
+           R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"modules\": {\"layers.0.proj.o\": {\"alpha\": 8}}}"})");
+  opt.loras = {{dir.path() / "edit.safetensors", 1.0f}};
+  EXPECT_EQ(mi::quant::convert(dir.path(), out, opt).lora_modules, 1);
+  {
+    const auto m = mi::quant::open_quant_model(out);
+    std::vector<float> w = widen(d.w["layers.0.proj.o"]);
+    std::vector<double> acc(static_cast<std::size_t>(kD));
+    for (std::int64_t r = 0; r < kD; ++r) mi::quant::lora_merge_row(w.data() + r * kD, kD, up.data() + r * 4, down.data(), 4, 2.0f, acc.data());
+    std::vector<float> s_ref;
+    const auto q_ref = ref_quant(w, kD, kD, s_ref);
+    EXPECT_EQ(bytes_i8(mi::quant::read_tensor(m, m.find_linear("layers.0.proj.o")->weight)), q_ref);
+  }
+  fs::remove(out);
+
+  // Prefixed keys with alpha != rank (8 at rank 4): the adapter_config may name a module as written or without the
+  // prefix; the converter and the runtime stack find it either way, with the same coefficient (2) and so the same bits.
+  {
+    mi::lora::TargetModel tm;
+    tm.modules = {{"layers.0.proj.o", kD, kD, false, 0, mi::lora::BlockGemm::kO}};
+    tm.blocks = 1;
+    tm.dim = kD;
+    std::vector<float> w = widen(d.w["layers.0.proj.o"]);
+    std::vector<double> acc(static_cast<std::size_t>(kD));
+    for (std::int64_t r = 0; r < kD; ++r) mi::quant::lora_merge_row(w.data() + r * kD, kD, up.data() + r * 4, down.data(), 4, 2.0f, acc.data());
+    std::vector<float> s_ref;
+    const auto q_ref = ref_quant(w, kD, kD, s_ref);
+    for (const char* named : {"layers.0.proj.o", "transformer.layers.0.proj.o"}) {
+      SCOPED_TRACE(named);
+      write_st(dir.path() / "editp.safetensors", {make("transformer.layers.0.proj.o.lora_A", DType::kF32, {4, kD}, down),
+                                                  make("transformer.layers.0.proj.o.lora_B", DType::kF32, {kD, 4}, up)},
+               std::string(R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"modules\": {\")") + named +
+                   R"(\": {\"alpha\": 8, \"rank\": 4}}}"})");
+      const mi::lora::LoraSpec spec{dir.path() / "editp.safetensors", 1.0f};
+      const mi::lora::LoraStack s(std::span(&spec, 1), tm);
+      ASSERT_EQ(s.adapters().size(), 1u);
+      EXPECT_DOUBLE_EQ(s.adapters()[0].alpha_scale, 2.0);
+      EXPECT_EQ(s.coef(s.adapters()[0]), mi::quant::lora_coef(1.0f, 8.0, 4));
+      EXPECT_EQ(s.coef(s.adapters()[0]), 2.0f);
+      EXPECT_TRUE(s.reports()[0].warnings.empty());
+      opt.loras = {{dir.path() / "editp.safetensors", 1.0f}};
+      EXPECT_EQ(mi::quant::convert(dir.path(), out, opt).lora_modules, 1);
+      const auto m = mi::quant::open_quant_model(out);
+      EXPECT_EQ(bytes_i8(mi::quant::read_tensor(m, m.find_linear("layers.0.proj.o")->weight)), q_ref);
+      fs::remove(out);
+    }
+    // A moss-edit-lora module without an alpha: alpha / rank 1, with a warning from both.
+    write_st(dir.path() / "editn.safetensors", {make("layers.0.proj.o.lora_A", DType::kF32, {4, kD}, down),
+                                                make("layers.0.proj.o.lora_B", DType::kF32, {kD, 4}, up)},
+             R"({"adapter_config":"{\"format\": \"moss-edit-lora\", \"modules\": {\"layers.0.proj.q\": {\"alpha\": 8}}}"})");
+    const mi::lora::LoraSpec spec{dir.path() / "editn.safetensors", 1.0f};
+    const mi::lora::LoraStack s(std::span(&spec, 1), tm);
+    EXPECT_DOUBLE_EQ(s.adapters()[0].alpha_scale, 1.0);
+    EXPECT_EQ(s.reports()[0].warnings,
+              std::vector<std::string>{"1 module without an alpha in adapter_config (moss-edit-lora), first: layers.0.proj.o"});
+    std::vector<std::string> logged;
+    mi::quant::ConvertOptions logging = opt;
+    logging.loras = {{dir.path() / "editn.safetensors", 1.0f}};
+    logging.log = [&](std::string_view line) { logged.emplace_back(line); };
+    EXPECT_EQ(mi::quant::convert(dir.path(), out, logging).lora_modules, 1);
+    EXPECT_NE(std::find(logged.begin(), logged.end(),
+                        "warning: editn.safetensors: 1 module without an alpha in adapter_config (moss-edit-lora), first: "
+                        "layers.0.proj.o"),
+              logged.end());
+    fs::remove(out);
+  }
+
+  // An ordinary LoRA whose adapter_config is not a moss-edit-lora header (here not JSON) merges as in 2.0 (alpha / rank 1).
+  write_st(dir.path() / "junk.safetensors", {make("base_model.model.layers.0.proj.o.lora_A.weight", DType::kF32, {4, kD}, down),
+                                             make("base_model.model.layers.0.proj.o.lora_B.weight", DType::kF32, {kD, 4}, up)},
+           R"({"adapter_config":"not json {"})");
+  opt.loras = {{dir.path() / "junk.safetensors", 1.0f}};
+  EXPECT_EQ(mi::quant::convert(dir.path(), out, opt).lora_modules, 1);
+  {
+    const auto m = mi::quant::open_quant_model(out);
+    std::vector<float> w = widen(d.w["layers.0.proj.o"]);
+    std::vector<double> acc(static_cast<std::size_t>(kD));
+    for (std::int64_t r = 0; r < kD; ++r) mi::quant::lora_merge_row(w.data() + r * kD, kD, up.data() + r * 4, down.data(), 4, 1.0f, acc.data());
+    std::vector<float> s_ref;
+    const auto q_ref = ref_quant(w, kD, kD, s_ref);
+    EXPECT_EQ(bytes_i8(mi::quant::read_tensor(m, m.find_linear("layers.0.proj.o")->weight)), q_ref);
   }
   fs::remove(out);
 

@@ -199,7 +199,7 @@ TEST(ServerJson, HelloValuesAreTheTables) {
     ASSERT_EQ(listed.size(), std::size(table));
     for (std::size_t i = 0; i < listed.size(); ++i) EXPECT_EQ(listed[i], table[i].name);
   };
-  ASSERT_EQ(std::size(s::kValueTables), 13u);
+  ASSERT_EQ(std::size(s::kValueTables), 14u);
   for (const s::ValueTable& t : s::kValueTables) {
     SCOPED_TRACE(t.param);
     if (t.param == "mode") same(t.names, s::kModeNames);
@@ -215,6 +215,7 @@ TEST(ServerJson, HelloValuesAreTheTables) {
     else if (t.param == "resize") same(t.names, s::kResizeNames);
     else if (t.param == "mask_encoding") same(t.names, s::kMaskEncodingNames);
     else if (t.param == "step_cache") same(t.names, s::kStepCacheNames);
+    else if (t.param == "lora_placement") same(t.names, s::kLoraPlacementNames);
     else ADD_FAILURE() << "unexpected parameter";
   }
 }

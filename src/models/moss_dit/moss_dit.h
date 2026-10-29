@@ -220,6 +220,20 @@ struct InputExtension {
   Tensor extra;
 };
 
+// Reference images of the edit layout (Moss-Image-Edit, "index_timestep_zero_text_start"; ComfyUI PR #17296): the
+// reference latents attend only to each other at t = 0, so every block's keys and values for them depend on themselves
+// alone. MossDit::prefill_references computes them once per sampling pass; with set_references, each row's queries of
+// every following forward then attend to the row's own keys plus all reference keys.
+struct RefKv {
+  // CUDA bf16 [kLayers, R, 2 * kDim], contiguous: block b's reference token i holds [k | v], k after QK-norm and RoPE.
+  Tensor kv;
+  std::int64_t tokens() const { return kv.rank == 3 ? kv.dim(1) : 0; }
+};
+// The most reference tokens (Σ h * w over the reference latents) a prefill or a forward takes: the prefill is then one
+// run within kMaxRunRows.
+inline constexpr std::int64_t kMaxReferenceTokens = 16384;
+static_assert(kMaxReferenceTokens <= kMaxRunRows);
+
 // The video embedding of a forward (P:247-248): tokens = [latents | extra] flattened to bf16 [h*w, C_in] (each fp32
 // value rounded once: the reference's .to(bf16) of the concatenated latents), then out = tokens · weightᵀ + bias with
 // gemm (bf16 in, fp32 accumulation, bf16 out [h*w, kDim]). extra null (and weight [kDim, kLatentChannels]): the plain
@@ -305,6 +319,10 @@ class MossDit {
   // with): re-merges every merged module from the pristine weights kept at load, into the device weights and the
   // pinned host copies of streamed blocks. Synchronizes the device; call between forwards.
   void remerge_lora(const lora::LoraStack& stack);
+  // Whether remerge_lora / rebase_merges can change the merged adapters in place: false once a module was merged at load
+  // without a pristine copy (lora::Adapter::keep_pristine: a merged edit adapter's block modules); remerge_lora then
+  // throws std::logic_error and rebase_merges returns false (reload the model).
+  bool can_remerge() const { return !no_pristine_; }
   // Switches the merged adapters to those of `stack` (nullptr: none) without reloading: every module merged now is
   // merged again from its pristine copy (its pristine bits when `stack` does not merge it, the copy then dropped), and a
   // module `stack` merges that is not merged yet is kept and merged in place, the same bits as a load with `stack`.
@@ -332,6 +350,31 @@ class MossDit {
   // latent grid. The tokens of the concatenation fit the forward's existing activations (no extra workspace).
   void set_input_extension(const InputExtension* ext);
   const InputExtension* input_extension() const { return input_ext_; }
+
+  // Reference images (RefKv). The cache's bytes for R reference tokens: kLayers * R * 2 * kDim bf16.
+  static std::size_t reference_cache_bytes(std::int64_t ref_tokens);
+  // Stack bytes prefill_references needs for R reference tokens with block path `path`, compute config `config` and
+  // `route` (nullptr: a fresh snapshot), and on this model as it is set up now (with the streaming pass's block buffers).
+  static std::size_t prefill_workspace_bytes(std::int64_t ref_tokens, BlockPath path, const ComputeConfig& config,
+                                             const FusedRouteSnapshot* route);
+  std::size_t prefill_stack_bytes(std::int64_t ref_tokens) const;
+  // The reference prefill (ComfyUI MOSSImage.preprocess_refs): latents[i] CUDA fp32 [kLatentChannels, h_i, w_i]
+  // contiguous (the normalized latents the DiT embeds, as img2img's z0), concatenated into one sequence of
+  // R = Σ h_i * w_i tokens (1 <= R <= kMaxReferenceTokens) through the video embedder (an input extension's channels
+  // zero), with the t = 0 modulation and reference i's RoPE table (kernels::moss_rope_table_reference), through the
+  // block path the forwards run (LoRA side branches, attention mode, streaming alike); every block's k and v rows go
+  // to out.kv ([kLayers, R, 2 kDim]), and block kLayers - 1 ends after them. Throws std::invalid_argument for bad
+  // shapes (before any work), Cancelled like forward(), std::logic_error with a linear-input hook.
+  void prefill_references(std::span<const Tensor> latents, const RefKv& out, cudaStream_t stream);
+  // Every following forward attends to `refs` (nullptr: none, the forward bit-identical to never setting one): a row's
+  // queries see its own tokens and every reference key; the reference tokens themselves are not in the rows, and each
+  // block's run reads its cached keys and values through two slots of its qkv buffer (BlockRun::slot_rows). A forward
+  // with references takes one latent and at most 2 rows (std::invalid_argument otherwise), grows its stack by
+  // workspace_bytes(..., ref_tokens) and runs eagerly (no CUDA graphs). `refs` must outlive its use; set between
+  // forwards. Throws std::invalid_argument for a cache other than bf16 [kLayers, R, 2 kDim] with
+  // 1 <= R <= kMaxReferenceTokens.
+  void set_references(const RefKv* refs);
+  const RefKv* references() const { return refs_; }
 
   // Pins the fused route of every following forward (a request's snapshot, which sized its workspace); nullopt: each
   // forward takes its own snapshot (the default).
@@ -387,9 +430,11 @@ class MossDit {
   // at its start, so a poisoning in between makes it need the op-by-op size.
   static std::size_t workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
                                      BlockPath path = BlockPath::kFused);
-  // The same for compute config `config`, under `route` (nullptr: a fresh snapshot) as a pinned request route.
+  // The same for compute config `config`, under `route` (nullptr: a fresh snapshot) as a pinned request route, and with
+  // ref_tokens reference keys (set_references; 0: none).
   static std::size_t workspace_bytes(std::int64_t height, std::int64_t width, std::span<const std::int64_t> text_lengths,
-                                     BlockPath path, const ComputeConfig& config, const FusedRouteSnapshot* route);
+                                     BlockPath path, const ComputeConfig& config, const FusedRouteSnapshot* route,
+                                     std::int64_t ref_tokens = 0);
   // Stack bytes the next forward() over a latent grid of height x width and these rows' text lengths takes on this
   // model as it is set up now (block path, compute config with the active LoRA sites, pinned or fresh route, the
   // streaming pass's block buffers): what a caller compares with the stack it reserved before a forward at a size it
@@ -433,7 +478,6 @@ class MossDit {
   void linear(const Tensor& out, const Tensor& x, const Linear& l, cudaStream_t stream);
   void linear(const Tensor& out, const Tensor& x, const Tensor& w, cudaStream_t stream);
   void run_block(int bi, const Block& b, const Activations& a, const Run& run, cudaStream_t stream);
-
   runtime::DeviceArena& arena_;
   const quant::QuantIndex* quant_ = nullptr;
   ComputeConfig config_;
@@ -441,6 +485,7 @@ class MossDit {
   std::optional<FusedRouteSnapshot> request_route_;
   const lora::SideBranches* lora_ = nullptr;
   const InputExtension* input_ext_ = nullptr;
+  const RefKv* refs_ = nullptr;
   // Runtime-LoRA merges: the pristine weights of the merged modules and where each module's merged weights live.
   struct MergeTarget {
     Tensor w, bias, scale;  // bias / scale empty when absent / bf16
@@ -473,6 +518,7 @@ class MossDit {
   static void remerge_into(const lora::PristineWeights& pristine, const lora::LoraStack& stack, const std::string& module,
                            const MergeTarget& t, MergeStaging& staging);
   std::unique_ptr<lora::PristineWeights> pristine_;
+  bool no_pristine_ = false;  // some module merged at load without a pristine copy (can_remerge)
   std::vector<std::pair<std::string, MergeTarget>> merge_targets_;
   // rebase_merges' memo: the merged bits of the stack named memo_key_, by module.
   std::string memo_key_;

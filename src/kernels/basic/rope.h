@@ -36,6 +36,12 @@ inline constexpr int kQwenRopeDim = 64;
 // rows only (P:251): pass table.slice0(height*width, height*width + text_length) to moss_rope_apply.
 void moss_rope_table(const Tensor& out, int height, int width, int text_length, cudaStream_t stream);
 
+// The edit layout's reference tokens (Moss-Image-Edit _reference_inputs; ComfyUI MOSSImage.rope's ref_shapes): out is
+// bf16 [height*width, 128] for reference `index` (0-based) on a height x width latent grid, at coordinates
+// (r = index + 1, f = 0, centred h, w) with moss_rope_table's bands and arithmetic (the official fp32 bands, no NTK
+// scaling). Its own kernel: moss_rope_table is unchanged.
+void moss_rope_table_reference(const Tensor& out, int height, int width, int index, cudaStream_t stream);
+
 // MOSS _rotate (P:77-82): out = x*cos + cat(-x2, x1)*sin in bf16, pairing dims (i, i+64).
 // x and out: bf16 [..., L, heads, 128] (last dim contiguous); table: bf16 [L, 128]. out may alias x.
 void moss_rope_apply(const Tensor& x, const Tensor& table, const Tensor& out, cudaStream_t stream);

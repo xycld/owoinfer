@@ -133,7 +133,29 @@ struct BlockRun {
   std::int64_t t0 = 0, t1 = 0;
   Tensor cu_seqlens;
   int max_seqlen = 0;
+  // Reference keys (MossDit::set_references; slot_rows 0: none, and nothing below is read). The attention phase's qkv
+  // region of `big` is then [slot A (slot_rows) | the L tokens | slot B (slot_rows)] ([L + 2 slot_rows, 3 kDim]), the
+  // attn region after it; the slots' k and v columns hold the block's cached reference keys and values. Each sequence
+  // attends to its own keys plus a slot next to it: keys are rows [k0, k1) of that region with cu_seqlens_k (int32,
+  // as cu_seqlens), and max_seqlen covers the key lengths.
+  std::int64_t slot_rows = 0;
+  std::int64_t k0 = 0, k1 = 0;
+  Tensor cu_seqlens_k{};
+  // Reference prefill (MossDit::prefill_references; nullptr: none): after QK-norm and RoPE the run's k and v rows are
+  // copied to kv_tap as bf16 [t1 - t0, 2 kDim] (k | v per token, contiguous); tap_only: the block ends there.
+  void* kv_tap = nullptr;
+  bool tap_only = false;
 };
+
+// bf16 elements of `big` the attention phase of an l-token forward with reference slots of slot_rows rows uses (the
+// slotted qkv region, then attn): l * 4 kDim without slots.
+inline constexpr std::int64_t slotted_big(std::int64_t l, std::int64_t slot_rows) {
+  return (l + 2 * slot_rows) * 3 * 3072 + l * 3072;
+}
+
+// BlockRun::kv_tap's copy: columns [kDim, 3 kDim) (k | v) of every row of `qkv` (bf16 [rows, >= 3 kDim], row stride
+// qkv.stride[0]) into `tap` as bf16 [rows, 2 kDim], on `stream` (graph-capturable).
+void tap_reference_kv(const Tensor& qkv, void* tap, cudaStream_t stream);
 
 // The model's cuBLASLt handle and workspace: the QKV projection and the linears fused_route() runs op by op.
 struct QkvGemm {

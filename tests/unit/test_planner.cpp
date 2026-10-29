@@ -1379,3 +1379,25 @@ TEST(PlannerHostMemory, ReportsPrivateMemory) {
 }
 
 }  // namespace
+
+// Reference images: the extra keys every row attends to and one prefill per pass are priced in the denoise time; the
+// plan's memory comes from the workspaces (the pipeline's denoise stack), and without references the plan is unchanged.
+TEST(Planner, ReferenceTokensPriceAttentionAndPrefills) {
+  Scenario s;
+  s.size = 1024;
+  s.lengths = {282, 15};
+  const ExecutionPlan base = plan(s.inputs());
+  PlanInputs in = s.inputs();
+  in.request.reference_tokens = 0;
+  in.request.reference_prefills = 0;
+  EXPECT_EQ(plan(in).to_json(), base.to_json());
+  in.request.reference_tokens = 1024;
+  const ExecutionPlan attn = plan(in);
+  EXPECT_GT(attn.time.denoise_s, base.time.denoise_s);
+  in.request.reference_prefills = 2;
+  const ExecutionPlan both = plan(in);
+  EXPECT_GT(both.time.denoise_s, attn.time.denoise_s);
+  // A prefill is about one R-token forward: far below a 2-row step at 1024^2.
+  EXPECT_LT(both.time.denoise_s - attn.time.denoise_s, 2 * attn.time.denoise_s / 50);
+  EXPECT_EQ(both.arena_bytes, base.arena_bytes);
+}

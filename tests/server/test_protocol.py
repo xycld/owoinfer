@@ -267,10 +267,11 @@ class CpuProtocolTest(ProtocolTestBase):
                                                "image_input": True, "hires": True, "distill": True,
                                                "system_cuda": True, "control": True, "accel": True,
                                                "preload": True, "release": True, "certificate_dirs": False,
-                                               "te_host_pin": True, "progress_fraction": True, "inspect": True})
+                                               "te_host_pin": True, "progress_fraction": True, "inspect": True,
+                                               "references": True})
         self.assertEqual(set(res["values"]), {"mode", "block_path", "tier", "attention", "dit_direct_io", "te_host_pin",
                                               "sampler", "scheduler", "noise_layout", "noise_source", "resize",
-                                              "mask_encoding", "step_cache"})
+                                              "mask_encoding", "step_cache", "lora_placement"})
         self.assertEqual(res["values"]["tier"], ["reference", "high", "turbo"])  # exactly the accepted names
         self.assertEqual(res["values"]["mode"], ["min_memory", "balanced", "max_speed"])
         probe = res["probe"]
@@ -520,6 +521,29 @@ class CpuProtocolTest(ProtocolTestBase):
         open(os.path.join(self.tmp, "x.png"), "wb").write(b"not a png")
         for i, params in enumerate(ok):
             self.assertError(self.server.call("generate", params, id="ok%d" % i), "no_engine", "ok%d" % i)
+
+    def test_reference_params(self):
+        ref = os.path.join(self.tmp, "ref.png")
+        write_png(ref, 32, 16, lambda x, y: (x * 8, y * 8, 0))
+        missing = os.path.join(self.tmp, "missing_ref.png")
+        base = {"prompt": "make it red", "output": os.path.join(self.tmp, "x.png")}
+        bad = [
+            ({"references": ref}, '"references" must be an object'),
+            ({"references": {}}, '"references.images" is required'),
+            ({"references": {"images": []}}, '"references.images" must be a non-empty array'),
+            ({"references": {"images": [5]}}, '"references.images[0]" must be a non-empty string'),
+            ({"references": {"images": [ref], "max_edge": 8}}, '"references.max_edge" must be an integer from 16 to 2048'),
+            ({"references": {"images": [ref], "max_edge": 512.5}}, '"references.max_edge" must be an integer'),
+            ({"references": {"images": [ref], "size": 1}}, '"references" has an unknown member "size"'),
+            ({"references": {"images": [missing]}}, "references.images[0].path: file not found"),
+            ({"references": {"images": [ref] * 5}}, "references.images: at most 4 entries"),
+            ({"references": {"images": [ref]}, "slg_scale": 2}, "Reference images do not work with an SLG row"),
+        ]
+        for i, (params, text) in enumerate(bad):
+            r = self.server.call("generate", dict(base, **params), id=i)
+            self.assertError(r, "invalid_params", i)
+            self.assertIn(text, r["error"]["message"], params)
+            self.assertNotIn("reference_images", r["error"]["message"], params)
 
     def test_control_and_accelerator_params(self):
         adapter = os.path.join(self.tmp, "control.safetensors")

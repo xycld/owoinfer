@@ -36,6 +36,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -106,6 +107,9 @@ struct Adapter {
   std::int64_t rank = 0;      // kLowRank: r; kLoHa: r1; kLoKr: the scale divisor (0 = none); kFull: 0
   double alpha_scale = 1.0;   // alpha / rank (1 without alpha), in double as ComfyUI's Python float
   bool side_branch = false;   // applied by the side branch (else merged at load)
+  // Merged without a pristine copy of its module (a block module of a merged moss-edit-lora file: its strength or
+  // placement changes reload the model instead of re-merging).
+  bool keep_pristine = true;
   // kLowRank: {down [r, k], up [stored_rows, r]}
   // kLoHa:    {w1a [stored_rows, r1], w1b [r1, k], w2a [stored_rows, r2], w2b [r2, k]}
   // kLoKr:    w1 = {w1 [a, b]} or {w1a [a, r], w1b [r, b]}, then w2 = {w2 [c, d]} or {w2a [c, r'], w2b [r', d]},
@@ -126,6 +130,7 @@ struct LoraSpec {
 
 struct FileReport {
   std::string file;
+  std::string format;    // its adapter_config format ("moss-edit-lora": a Moss-Image-Edit adapter), "" for none
   int adapters = 0;      // after the fused-qkv split
   int side_branch = 0;   // of them on the side branch
   int merged = 0;        // of them merged at load
@@ -134,9 +139,29 @@ struct FileReport {
   std::vector<std::string> notes;     // how the file was read (e.g. the metadata alpha applied)
 };
 
+// Where low-rank adapters on the block GEMMs go (the request's lora_placement), a fixed rule per module, decided when
+// the stack is parsed:
+//   kDefault     every low-rank block adapter on the side branch, moss-edit-lora files (Moss-Image-Edit) included:
+//                strength changes are instant and loads fast (a DiT file with the adapter baked in, moss-infer
+//                quantize --lora, has no per-step cost)
+//   kMerge       every low-rank block adapter merged (no per-step cost, a slower load; an edit adapter's strength or
+//                placement change reloads the DiT); one on a module that cannot take a merge (INT8 without ConvRot,
+//                INT4, NVFP4) is a LoraError naming the module and its format
+//   kSideBranch  every low-rank block adapter on the side branch
+// Other adapters (LoHa / LoKr / full deltas, non-block modules) are merged whatever the placement.
+enum class Placement : std::uint8_t { kDefault, kMerge, kSideBranch };
+const char* placement_name(Placement p);  // "default", "merge", "side_branch"
+Placement parse_placement(std::string_view name);  // one of those; std::invalid_argument otherwise
+
+// How the base stores a block linear, one value per quant::QuantFormat (merges need kBf16 or kInt8, INT8 ConvRot).
+enum class BaseFormat : std::uint8_t { kBf16, kInt8, kInt8Plain, kInt4, kNvfp4 };
+
 struct LoadOptions {
   bool strict = false;            // throw LoraError instead of reporting unknown keys or warnings
   bool int8_block_gemms = false;  // the base stores the block GEMMs as INT8: merged adapters there are requantized
+  Placement placement = Placement::kDefault;
+  // Each block linear's stored format (empty: every block linear INT8 with int8_block_gemms, else bf16).
+  std::function<BaseFormat(std::string_view module)> base_format{};
 };
 
 class LoraStack {
@@ -163,6 +188,8 @@ class LoraStack {
   // Modules with adapters to merge at load (sorted, unique), and whether `module` has any.
   std::vector<std::string> merge_modules() const;
   bool has_merge(std::string_view module) const;
+  // Whether a merged `module` keeps a pristine copy (false when an adapter on it has Adapter::keep_pristine false).
+  bool keeps_pristine(std::string_view module) const;
   // Adapters on `module` in stack order (file order, then the file's own order).
   std::vector<const Adapter*> adapters_of(std::string_view module) const;
 

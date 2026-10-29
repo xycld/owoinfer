@@ -143,7 +143,7 @@ MI_LAYOUT(mi_progress, step_seconds, 24);
 MI_LAYOUT(mi_progress, elapsed_seconds, 32);  // the 1.0.0 layout ends here (40 bytes)
 MI_LAYOUT(mi_progress, fraction, 40);
 MI_LAYOUT(mi_progress, eta_seconds, 48);
-static_assert(sizeof(mi_gen_params) == 376);
+static_assert(sizeof(mi_gen_params) == 408);
 MI_LAYOUT(mi_gen_params, struct_size, 0);
 MI_LAYOUT(mi_gen_params, prompt, 8);
 MI_LAYOUT(mi_gen_params, negative_prompt, 16);
@@ -201,7 +201,18 @@ MI_LAYOUT(mi_gen_params, control_images_count, 344);
 MI_LAYOUT(mi_gen_params, cfg_truncation, 352);
 MI_LAYOUT(mi_gen_params, step_cache, 360);
 MI_LAYOUT(mi_gen_params, _reserved4, 364);
-MI_LAYOUT(mi_gen_params, step_cache_threshold, 368);
+MI_LAYOUT(mi_gen_params, step_cache_threshold, 368);  // the 2.0.0 layout ends here (376 bytes)
+MI_LAYOUT(mi_gen_params, reference_images, 376);
+MI_LAYOUT(mi_gen_params, reference_images_count, 384);
+MI_LAYOUT(mi_gen_params, reference_max_edge, 392);
+MI_LAYOUT(mi_gen_params, _reserved5, 396);
+MI_LAYOUT(mi_gen_params, lora_placement, 400);
+MI_LAYOUT(mi_gen_params, _reserved6, 404);
+static_assert(sizeof(mi_reference_image) == 24);  // array element: no struct_size, frozen
+MI_LAYOUT(mi_reference_image, image, 0);
+MI_LAYOUT(mi_reference_image, image_path, 8);
+MI_LAYOUT(mi_reference_image, _reserved0, 16);
+MI_LAYOUT(mi_reference_image, _reserved1, 20);
 static_assert(sizeof(mi_control_image) == 48);  // array element: no struct_size, frozen
 MI_LAYOUT(mi_control_image, kind, 0);
 MI_LAYOUT(mi_control_image, image, 8);
@@ -464,7 +475,8 @@ constexpr std::size_t kEngineParamsSizes[] = {offsetof(mi_engine_params, dit_fil
                                                offsetof(mi_engine_params, time_embedding_file),
                                                offsetof(mi_engine_params, certificate_dirs), sizeof(mi_engine_params)};
 constexpr std::size_t kGenParamsSizes[] = {offsetof(mi_gen_params, scheduler), offsetof(mi_gen_params, init_image),
-                                            offsetof(mi_gen_params, control_adapter), sizeof(mi_gen_params)};
+                                            offsetof(mi_gen_params, control_adapter), offsetof(mi_gen_params, reference_images),
+                                            sizeof(mi_gen_params)};
 // Output structs that grew: mi_timings (0.1.0: 104 bytes, 1.0.0: 128), mi_probe_info (0.2.0: 576 bytes).
 constexpr std::size_t kTimingsSizes[] = {offsetof(mi_timings, vae_encoder_load_s), offsetof(mi_timings, lora_load_s),
                                          sizeof(mi_timings)};
@@ -481,7 +493,7 @@ static_assert(kEngineParamsSizes[2] == 136 && kTimingsSizes[1] == 128 && kMemory
 static_assert(kEngineParamsSizes[0] == 80 && kGenParamsSizes[0] == 168 && kTimingsSizes[0] == 104, "the 0.1.0 layouts");
 static_assert(kProbeInfoSizes[0] == 576, "the 0.2.0 mi_probe_info");
 static_assert(kEngineParamsSizes[1] == 120 && kGenParamsSizes[1] == 240, "the first 0.2.0 layouts");
-static_assert(kGenParamsSizes[2] == 320, "the 1.0.0 mi_gen_params");
+static_assert(kGenParamsSizes[2] == 320 && kGenParamsSizes[3] == 376, "the 1.0.0 and 2.0.0 mi_gen_params");
 // The component structs (2.1): one size each so far.
 constexpr std::size_t kSessionParamsSize = sizeof(mi_session_params);
 constexpr std::size_t kTextParamsSize = sizeof(mi_text_params);
@@ -586,6 +598,8 @@ void check_reserved(const mi_gen_params& p) {
   check_reserved(p._reserved2, "mi_gen_params._reserved2");
   check_reserved(p._reserved3, "mi_gen_params._reserved3");
   check_reserved(p._reserved4, "mi_gen_params._reserved4");
+  check_reserved(p._reserved5, "mi_gen_params._reserved5");
+  check_reserved(p._reserved6, "mi_gen_params._reserved6");
 }
 
 // Versioned structs: `known` lists every size the struct has had (ABI 1: it only grows at the end).
@@ -717,6 +731,7 @@ const std::vector<std::string>* messages(const mi::api::Generation& g, mi_messag
     case MI_MESSAGE_CONTROL_WARNING: return &g.control_warnings;
     case MI_MESSAGE_CONTROL_NOTE: return &g.control_notes;
     case MI_MESSAGE_ACCEL_WARNING: return &g.accel_warnings;
+    case MI_MESSAGE_REFERENCE_WARNING: return &g.reference_warnings;
     case MI_MESSAGE_MAX_ENUM: break;
   }
   return nullptr;
@@ -834,7 +849,7 @@ uint32_t mi_capabilities(void) {
   return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS | MI_CAP_IMAGE_INPUT | MI_CAP_HIRES |
          MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL | MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE |
          MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT |
-         MI_CAP_COMPONENTS;  // MI_CAP_CERTIFICATE_DIRS: reserved since 2.0
+         MI_CAP_COMPONENTS | MI_CAP_REFERENCE_IMAGES;  // MI_CAP_CERTIFICATE_DIRS: reserved since 2.0
 }
 
 mi_status mi_probe(mi_probe_info* info) {
@@ -1195,6 +1210,7 @@ const char* mi_result_text(const mi_result* result, mi_result_text_kind kind) {
       case MI_TEXT_PRELOAD_NOTE: return g.preload_note.c_str();
       case MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE: return g.step_cache_threshold_source.c_str();
       case MI_TEXT_COMPONENT_NOTE: return g.component_note.c_str();
+      case MI_TEXT_REFERENCES: return g.references_json.c_str();
       case MI_TEXT_MAX_ENUM: break;
     }
     set_error("mi_result_text: unknown kind.");
@@ -1413,6 +1429,10 @@ mi_status mi_session_open(mi_engine* engine, const mi_session_params* params) {
       plan = read_input<mi_gen_params>(p.plan_request, kGenParamsSizes, gen_params_defaults,
                                        "mi_session_params.plan_request");
       check_reserved(plan);
+      if (plan.reference_images_count > 0) {
+        throw std::invalid_argument("mi_session_params.plan_request: reference images are mi_generate()'s only (not the "
+                                    "component API's).");
+      }
       p.plan_request = &plan;
     }
     engine->session.replace(

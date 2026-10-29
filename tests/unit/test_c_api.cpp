@@ -96,7 +96,8 @@ TEST(CApi, VersionAndAbi) {
   EXPECT_EQ(mi_capabilities(), MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS |
                                   MI_CAP_IMAGE_INPUT | MI_CAP_HIRES | MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL |
                                   MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE |
-                                  MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT | MI_CAP_COMPONENTS);
+                                  MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT | MI_CAP_COMPONENTS |
+                                  MI_CAP_REFERENCE_IMAGES);
   EXPECT_EQ(mi_capabilities() & MI_CAP_COMFYUI_MODELS, 0u);
   EXPECT_EQ(MI_CAP_PREVIEW | MI_CAP_COMFYUI_MODELS | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS, 0x3fu);
   EXPECT_EQ(MI_CAP_IMAGE_INPUT, 0x40u);
@@ -391,7 +392,7 @@ TEST(CApi, OldStructSizes) {
   for (const std::size_t bad : {kGen01 - 8, kGen01 + 8, sizeof g - 8}) {
     g.struct_size = bad;
     EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_ABI_MISMATCH) << bad;
-    EXPECT_NE(last_error().find("168, 240, 320 or 376"), std::string::npos) << last_error();
+    EXPECT_NE(last_error().find("168, 240, 320, 376 or 408"), std::string::npos) << last_error();
   }
 
   mi_engine_params e;
@@ -1775,6 +1776,103 @@ TEST(CApi, ImageResultFromAPipelineResult) {
 // Control adapters and the accelerators (MI_CAP_CONTROL, MI_CAP_ACCEL): mapped into pipeline::Request, every argument
 // checked without a GPU; validation neither copies nor decodes the control images. The adapter's format and kinds are
 // mi_generate()'s (the pipeline's), so a stand-in file passes here.
+// Reference images (MI_CAP_REFERENCE_IMAGES): pixels of 1, 3 or 4 channels, copied in order with the max edge (0: 512);
+// the refusals before anything runs.
+TEST(CApi, ReferenceImages) {
+  mi::testing::TempDir dir("c_api_references");
+  std::vector<std::uint8_t> rgba(40 * 24 * 4, 7), gray(16 * 16, 9), rgb(48 * 32 * 3, 5);
+  const std::string png = mi::util::path_utf8(dir.path() / "ref.png");
+  ASSERT_EQ(mi_write_png(png.c_str(), rgb.data(), 48, 32), MI_OK) << last_error();
+  const mi_image px[2] = {rgb_image(rgba, 40, 24, 4), rgb_image(gray, 16, 16, 1)};
+  mi_reference_image ims[3] = {};
+  ims[0].image = &px[0];
+  ims[1].image = &px[1];
+  ims[2].image_path = png.c_str();
+  mi_gen_params p = gen_defaults();
+  p.prompt = "make it red";
+  p.reference_images = ims;
+  p.reference_images_count = 3;
+  ASSERT_EQ(mi_gen_params_validate(&p), MI_OK) << last_error();
+  mi::pipeline::Request q = mi::api::to_request(p);
+  ASSERT_EQ(q.references.images.size(), 3u);
+  EXPECT_EQ(q.references.max_edge, 512);
+  EXPECT_EQ(q.references.images[0]->channels, 4);
+  EXPECT_EQ(q.references.images[1]->width, 16);
+  EXPECT_EQ(q.references.images[0]->pixels, rgba);
+  EXPECT_EQ(q.references.images[2]->width, 48);
+  EXPECT_EQ(q.references.images[2]->pixels, rgb);
+  p.reference_max_edge = 256;
+  EXPECT_EQ(mi::api::to_request(p).references.max_edge, 256);
+
+  const auto refused = [&](const char* what, auto&& change) {
+    mi_gen_params g = p;
+    change(g);
+    EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_INVALID_ARGUMENT) << what;
+    return last_error();
+  };
+  EXPECT_NE(refused("SLG row", [](mi_gen_params& g) { g.slg_scale = 2.0; }).find("SLG"), std::string::npos);
+  EXPECT_NE(refused("count", [](mi_gen_params& g) { g.reference_images_count = 5; }).find("at most 4"), std::string::npos);
+  EXPECT_NE(refused("NULL", [](mi_gen_params& g) { g.reference_images = nullptr; }).find("NULL array"), std::string::npos);
+  EXPECT_NE(refused("max edge", [](mi_gen_params& g) { g.reference_max_edge = 8; }).find("reference_max_edge"),
+            std::string::npos);
+  EXPECT_NE(refused("reserved", [](mi_gen_params& g) { g._reserved5 = 1; }).find("_reserved5"), std::string::npos);
+  mi_image two_px = px[1];
+  two_px.channels = 2;
+  mi_reference_image bad = {};
+  bad.image = &two_px;
+  const auto one = [&](mi_gen_params& g, const mi_reference_image& r) {
+    g.reference_images = &r;
+    g.reference_images_count = 1;
+  };
+  EXPECT_NE(refused("channels", [&](mi_gen_params& g) { one(g, bad); }).find("1, 3 or 4"), std::string::npos);
+  bad = ims[0];
+  bad.image_path = png.c_str();
+  EXPECT_NE(refused("both", [&](mi_gen_params& g) { one(g, bad); }).find("both set"), std::string::npos);
+  bad = {};
+  EXPECT_NE(refused("neither", [&](mi_gen_params& g) { one(g, bad); }).find("needs an image"), std::string::npos);
+  bad = ims[0];
+  bad._reserved1 = 1;
+  EXPECT_NE(refused("element reserved", [&](mi_gen_params& g) { one(g, bad); }).find("_reserved"), std::string::npos);
+  const std::string missing = mi::util::path_utf8(dir.path() / "missing.png");
+  bad = {};
+  bad.image_path = missing.c_str();
+  mi_gen_params gone = p;
+  one(gone, bad);
+  EXPECT_NE(mi_gen_params_validate(&gone), MI_OK);
+  EXPECT_NE(last_error().find("file not found"), std::string::npos) << last_error();
+  // Too many tokens: four 2048-edge references (4 x 16384).
+  std::vector<std::uint8_t> big(2048 * 2048 * 3, 1);
+  const mi_image big_px = rgb_image(big, 2048, 2048, 3);
+  mi_reference_image bigs[4] = {};
+  for (mi_reference_image& b : bigs) b.image = &big_px;
+  EXPECT_NE(refused("tokens", [&](mi_gen_params& g) {
+              g.reference_images = bigs;
+              g.reference_images_count = 4;
+              g.reference_max_edge = 2048;
+            }).find("tokens"),
+            std::string::npos);
+  // No sampling step (denoise strength 0, a hires pass of strength 0 too): the references would act on nothing.
+  const mi_image init = rgb_image(rgb, 48, 32, 3);
+  EXPECT_NE(refused("strength 0", [&](mi_gen_params& g) {
+              g.init_image = &init;
+              g.denoise_strength = 0.0;
+            }).find("Reference images need a sampling step; none runs at denoise strength 0 ("),
+            std::string::npos);
+  EXPECT_NE(refused("strength 0, hires 0", [&](mi_gen_params& g) {
+              g.init_image = &init;
+              g.denoise_strength = 0.0;
+              g.hires_width = g.hires_height = 512;
+              g.hires_strength = 0.0;
+            }).find("none runs at denoise strength 0 and hires strength 0 ("),
+            std::string::npos);
+  mi_gen_params hires_steps = p;
+  hires_steps.init_image = &init;
+  hires_steps.denoise_strength = 0.0;
+  hires_steps.hires_width = hires_steps.hires_height = 512;
+  hires_steps.hires_strength = 0.5;
+  EXPECT_EQ(mi_gen_params_validate(&hires_steps), MI_OK) << last_error();  // the hires pass samples
+}
+
 TEST(CApi, ControlAndAccelerators) {
   mi::testing::TempDir dir("c_api_control");
   const std::string adapter = mi::util::path_utf8(dir.path() / "control.safetensors");
@@ -2362,7 +2460,9 @@ TEST(CApi, DitLoadNotesAndDiffs) {
   EXPECT_STREQ(mi_result_text(res, MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE), "request");
   EXPECT_EQ(mi_result_text(res, MI_TEXT_MAX_ENUM), nullptr);
   EXPECT_STREQ(mi_result_text(res, MI_TEXT_COMPONENT_NOTE), "");  // a generation has no component note
-  EXPECT_EQ(mi_result_text(res, static_cast<mi_result_text_kind>(19)), nullptr);
+  EXPECT_STREQ(mi_result_text(res, MI_TEXT_REFERENCES), "");  // no reference images
+  EXPECT_EQ(mi_result_text(res, static_cast<mi_result_text_kind>(20)), nullptr);
+  EXPECT_EQ(mi_result_message_count(res, MI_MESSAGE_REFERENCE_WARNING), 0);
   ASSERT_EQ(mi_result_message_count(res, MI_MESSAGE_ACCEL_WARNING), 2);
   EXPECT_STREQ(mi_result_message(res, MI_MESSAGE_ACCEL_WARNING, 1), "step cache never engaged");
   EXPECT_EQ(mi_result_message(res, MI_MESSAGE_ACCEL_WARNING, 2), nullptr);
@@ -2413,6 +2513,39 @@ TEST(CApi, DitLoadNotesAndDiffs) {
     EXPECT_EQ(count, 0u);
     mi_result_free(res);
   }
+}
+
+// An edit adapter without reference images: MI_TEXT_REFERENCES is "" and the report has no "references" key (as the
+// header says: "" when no reference image ran); the warning is MI_MESSAGE_REFERENCE_WARNING's alone. With references
+// that ran, both carry the object and its warnings.
+TEST(CApi, ReferencesTextOnlyWhenTheyRan) {
+  mi::pipeline::Request q;
+  q.prompt = "a cat";
+  mi::pipeline::Result r;
+  r.reference_warnings = {"edit.safetensors is an edit adapter (moss-edit-lora) used without reference images"};
+  {
+    mi_result* res = mi::api::new_result(mi::api::to_generation(q, r, true));
+    EXPECT_STREQ(mi_result_text(res, MI_TEXT_REFERENCES), "");
+    ASSERT_EQ(mi_result_message_count(res, MI_MESSAGE_REFERENCE_WARNING), 1);
+    EXPECT_STREQ(mi_result_message(res, MI_MESSAGE_REFERENCE_WARNING, 0), r.reference_warnings[0].c_str());
+    mi_result_free(res);
+    const mi::json::Value rep = mi::json::parse("{" + mi::pipeline::report_fields(q, r, "", "") + "}");
+    EXPECT_EQ(rep.find("references"), nullptr);
+  }
+  r.references.count = 1;
+  r.references.sizes = {{384, 512}};
+  r.references.tokens = 768;
+  r.references.prefills = 1;
+  r.reference_warnings = {"reference images without a moss-edit-lora adapter"};
+  mi_result* res = mi::api::new_result(mi::api::to_generation(q, r, true));
+  const mi::json::Value refs = mi::json::parse(mi_result_text(res, MI_TEXT_REFERENCES));
+  ASSERT_NE(refs.find("count"), nullptr);
+  EXPECT_EQ(refs.find("count")->as_double(), 1);
+  ASSERT_NE(refs.find("warnings"), nullptr);
+  EXPECT_EQ(refs.find("warnings")->as_array().size(), 1u);
+  mi_result_free(res);
+  const mi::json::Value rep = mi::json::parse("{" + mi::pipeline::report_fields(q, r, "", "") + "}");
+  EXPECT_NE(rep.find("references"), nullptr);
 }
 
 // mi_engine_preload's request: the prompt may be NULL or blank (kept blank for Pipeline::preload), everything else is

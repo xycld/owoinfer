@@ -13,6 +13,8 @@ namespace {
 constexpr std::uint64_t kOff = std::numeric_limits<std::uint64_t>::max();
 std::atomic<std::uint64_t> g_pinned_left{kOff};  // bytes still allowed before the seam fails pinned allocations
 std::atomic<std::atomic<bool>*> g_chunk_cancel{nullptr};
+std::atomic<std::atomic<bool>*> g_prefill_cancel{nullptr};
+std::atomic<int> g_prefill_left{0};  // prefills to start before the seam fires (the last one fires it)
 std::atomic<ResidencyQuery> g_query{ResidencyQuery::kAuto};
 std::atomic<bool> g_any_model_shapes{false};
 
@@ -27,6 +29,17 @@ void cancel_after_first_host_chunk(std::atomic<bool>* flag) { g_chunk_cancel.sto
 void after_host_chunk() {
   if (g_chunk_cancel.load(std::memory_order_relaxed) == nullptr) return;  // the production path: one relaxed load
   if (std::atomic<bool>* flag = g_chunk_cancel.exchange(nullptr)) flag->store(true);
+}
+
+void cancel_at_reference_prefill(std::atomic<bool>* flag, int nth) {
+  g_prefill_left.store(nth);
+  g_prefill_cancel.store(flag);
+}
+
+void before_reference_prefill() {
+  if (g_prefill_cancel.load(std::memory_order_relaxed) == nullptr) return;  // the production path: one relaxed load
+  if (g_prefill_left.fetch_sub(1) > 1) return;
+  if (std::atomic<bool>* flag = g_prefill_cancel.exchange(nullptr)) flag->store(true);
 }
 
 void check_pinned_alloc(std::size_t bytes) {

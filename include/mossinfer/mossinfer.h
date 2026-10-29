@@ -151,6 +151,9 @@ MOSSINFER_API const char* mi_last_error_message(void);
 /* The component API ("components" below): mi_session_*, mi_encode_text(), mi_conditioning_*, mi_run_*,
  * mi_denoise_step(), mi_vae_*, the pure helpers and MI_TEXT_COMPONENT_NOTE. */
 #define MI_CAP_COMPONENTS 0x40000u
+/* Reference images of edit adapters (moss-edit-lora files such as Moss-Image-Edit): mi_gen_params.reference_images /
+ * reference_max_edge, MI_TEXT_REFERENCES and MI_MESSAGE_REFERENCE_WARNING. mi_generate() only (not the components). */
+#define MI_CAP_REFERENCE_IMAGES 0x80000u
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -428,6 +431,35 @@ typedef struct mi_image {
   int32_t _reserved0; /* must be 0 */
 } mi_image;
 
+/* Where the low-rank adapters of `loras` on the DiT's block GEMMs go (MI_CAP_REFERENCE_IMAGES), a fixed rule per
+ * module and base precision:
+ *   DEFAULT      every low-rank block adapter on the side branch, edit adapters (moss-edit-lora) included: strength
+ *                changes are instant, loads fast, the weights untouched (for INT8 with no per-step cost: a DiT file
+ *                with the adapter baked in, quantize --lora)
+ *   MERGE        every low-rank block adapter merged: no per-step cost (about 6.5 % faster per step than the side
+ *                branch on bf16 for the edit adapter), a load tens of seconds slower (INT8: requantized, one
+ *                MI_MESSAGE_LORA_WARNING per file, refused with lora_strict; an INT4 / NVFP4 module is MI_ERR_MODEL)
+ *   SIDE_BRANCH  every low-rank block adapter on the side branch
+ * Merging costs nothing per step but a load-time merge; an edit adapter's merged blocks keep no pristine copy, so its
+ * strength or placement changes reload the DiT. Merged blocks that stream need a pinned host copy: when the host
+ * budget cannot hold it the plan fails (MI_ERR_OUT_OF_MEMORY) and names the alternatives. */
+typedef enum mi_lora_placement {
+  MI_LORA_PLACEMENT_DEFAULT = 0,
+  MI_LORA_PLACEMENT_MERGE = 1,
+  MI_LORA_PLACEMENT_SIDE_BRANCH = 2,
+  MI_LORA_PLACEMENT_MAX_ENUM = 0x7fffffff
+} mi_lora_placement;
+
+/* One reference image of an edit adapter (MI_CAP_REFERENCE_IMAGES). A fixed 24-byte layout without struct_size. The
+ * image comes as pixels (1, 3 or 4 channels: converted like PIL convert("RGB"), alpha dropped) or as a PNG / JPEG file
+ * (read as RGB, EXIF orientation applied), exactly one of the two. */
+typedef struct mi_reference_image {
+  const mi_image* image;  /* NULL = use image_path */
+  const char* image_path; /* UTF-8; NULL or "" = use image */
+  int32_t _reserved0;     /* must be 0 */
+  int32_t _reserved1;     /* must be 0 */
+} mi_reference_image;
+
 /* One conditioning image of a control adapter (MI_CAP_CONTROL). A fixed 48-byte layout without struct_size. The image
  * comes as pixels or as a PNG / JPEG file, exactly one of the two, and is brought to each pass's size by
  * mi_gen_params.resize, like an init image. Pixels are read (copied) during mi_gen_params_validate() / mi_generate()
@@ -602,6 +634,18 @@ typedef struct mi_gen_params {
    * MI_TEXT_STEP_CACHE_THRESHOLD_SOURCE report what ran), else (0, 1]; larger is faster and further from the uncached
    * image. Ignored with the step cache off. */
   double step_cache_threshold;
+  /* Fields after the 376-byte layout (2.1). Reference images (MI_CAP_REFERENCE_IMAGES) for an edit adapter loaded in
+   * `loras` (a moss-edit-lora file, e.g. Moss-Image-Edit): in order, the source image first; at most 4, each fit
+   * within reference_max_edge (each side rounded to 16, never upscaled beyond that rounding) and VAE-encoded once.
+   * Every row (cond and uncond) then attends to the reference tokens, at most 16384 in all; skipped layers
+   * (uncond_skip_layers) skip the rows only. Refused with slg_scale > 0 (MI_ERR_INVALID_ARGUMENT). The array and its
+   * images are read during mi_gen_params_validate() / mi_generate() only. Default none. */
+  const mi_reference_image* reference_images;
+  size_t reference_images_count;
+  int32_t reference_max_edge;       /* 0 (default) = 512; else 16..2048, floored to a multiple of 16 */
+  int32_t _reserved5;               /* must be 0 */
+  mi_lora_placement lora_placement; /* default MI_LORA_PLACEMENT_DEFAULT */
+  int32_t _reserved6;               /* must be 0 */
 } mi_gen_params;
 
 /* Fills the first `struct_size` bytes of `params` with the defaults. struct_size is sizeof(mi_gen_params) of the
@@ -844,6 +888,9 @@ typedef enum mi_result_text_kind {
    * scheduler fields (the first differing index, both values), the calls whose sigma was off the schedule, and which
    * rows had foreign conditioning; "" when none applies (and for every other result). Facts only. */
   MI_TEXT_COMPONENT_NOTE = 18,
+  /* MI_CAP_REFERENCE_IMAGES: the report's "references" object as JSON (count, max_edge, sizes, tokens, cache_bytes,
+   * prefills, encode_schedule, warnings); "" when no reference image ran. */
+  MI_TEXT_REFERENCES = 19,
   MI_TEXT_MAX_ENUM = 0x7fffffff
 } mi_result_text_kind;
 /* Owned by the result; "" when empty (e.g. cancelled early). NULL for a NULL result or an unknown kind. */
@@ -963,6 +1010,8 @@ typedef enum mi_message_kind {
   /* MI_CAP_ACCEL: what the user should know about the accelerators for this model, e.g. a step-cache threshold that
    * moves the base model's composition, or a cache that never engaged. */
   MI_MESSAGE_ACCEL_WARNING = 4,
+  /* MI_CAP_REFERENCE_IMAGES: reference images without an edit adapter, or an edit adapter without them. */
+  MI_MESSAGE_REFERENCE_WARNING = 5,
   MI_MESSAGE_MAX_ENUM = 0x7fffffff
 } mi_message_kind;
 /* 0 for a NULL result or an unknown kind. */

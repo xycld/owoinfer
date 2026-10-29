@@ -50,6 +50,26 @@ __global__ void moss_table_kernel(bf16* out, RowMap rows, std::int64_t n, int he
   }
 }
 
+// Reference tokens of the edit layout (moss_rope_table_reference): coordinates (r = r_coord, f = 0, centred h, w), the
+// image rows' arithmetic and bands.
+__global__ void moss_ref_table_kernel(bf16* out, RowMap rows, std::int64_t n, int height, int width, float r_coord,
+                                      Freqs<16> bands) {
+  using namespace detail;
+  const float h_mid = static_cast<float>((height - 1) / 2.0);
+  const float w_mid = static_cast<float>((width - 1) / 2.0);
+  const int c = static_cast<int>(threadIdx.x);  // 0..127
+  for (std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * blockDim.y + threadIdx.y; r < n;
+       r += static_cast<std::int64_t>(gridDim.x) * blockDim.y) {
+    const int p = c & 63, axis = p >> 4, band = p & 15;
+    float coord = 0.0f;
+    if (axis == 0) coord = r_coord;
+    if (axis == 2) coord = __fsub_rn(static_cast<float>(r / width), h_mid);
+    if (axis == 3) coord = __fsub_rn(static_cast<float>(r % width), w_mid);
+    const float phase = mul(coord, bands.v[band]);
+    out[rows.offset(r) + c] = bf(c < 64 ? sinf(phase) : cosf(phase));
+  }
+}
+
 // Rotation of one (lo, hi) pair: lo' = lo*cos + (-hi)*sin, hi' = hi*cos + lo*sin, each product and the
 // sum rounded to bf16 (x * cos, cat(-x2, x1) * sin and their sum are three torch ops).
 __device__ __forceinline__ void rotate_pair(bf16* lo_out, bf16* hi_out, float lo, float hi, float co, float si) {
@@ -143,6 +163,19 @@ void moss_rope_table(const Tensor& out, int height, int width, int text_length, 
   }
   moss_table_kernel<<<blocks_for(n), dim3(kMossRopeDim, kRowsPerBlock), 0, stream>>>(
       out.ptr<bf16>(), detail::row_map(out), n, height, width, text_length, freqs_from_bits(kMossRopeBandBits));
+  MI_CUDA_CHECK_LAUNCH();
+}
+
+void moss_rope_table_reference(const Tensor& out, int height, int width, int index, cudaStream_t stream) {
+  constexpr const char* op = "moss_rope_table_reference";
+  detail::check_rows(op, "out", out, DType::kBF16, kMossRopeDim);
+  const std::int64_t n = static_cast<std::int64_t>(height) * width;
+  if (height < 1 || width < 1 || index < 0 || index >= (1 << 24) || out.rank != 2 || out.dim(0) != n) {
+    detail::fail(op, "expected out [" + std::to_string(n) + ", 128] and 0 <= index < 2^24, got " + out.describe());
+  }
+  moss_ref_table_kernel<<<blocks_for(n), dim3(kMossRopeDim, kRowsPerBlock), 0, stream>>>(
+      out.ptr<bf16>(), detail::row_map(out), n, height, width, static_cast<float>(index + 1),
+      freqs_from_bits(kMossRopeBandBits));
   MI_CUDA_CHECK_LAUNCH();
 }
 

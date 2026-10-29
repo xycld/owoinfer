@@ -218,6 +218,10 @@ struct RequestShape {
   // The VAE decoder already sits in the arena's persistent region from an earlier request: its bytes count in every
   // phase even when this request does not decode (only recreating the arena drops it).
   bool vae_resident = false;
+  // Reference images (the edit layout, moss_dit::RefKv; 0: none): their tokens, which every row's attention reads as
+  // extra keys, and the reference prefills the request runs (one per sampling pass), each R tokens through every block.
+  std::int64_t reference_tokens = 0;
+  int reference_prefills = 0;
 };
 
 // Whether a file-streamed text-encoder pass ran from the page cache, from its measurements (EncodeStats): `bytes`
@@ -351,6 +355,7 @@ struct TimeEstimate {
   double text_encoder_s = 0;
   double dit_load_s = 0;  // per-generation reloads (parking)
   double denoise_s = 0;
+  double reference_prefill_s = 0;  // of denoise_s: the reference prefills (RequestShape; not in the plan JSON)
   double decode_s = 0;
   double total_s() const { return text_encoder_s + dit_load_s + denoise_s + decode_s; }
 };

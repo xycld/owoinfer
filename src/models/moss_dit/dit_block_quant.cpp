@@ -165,7 +165,8 @@ std::int64_t nvfp4_big_cols(bool nvfp4_up_gate, bool bf16_ffn) {
 
 std::size_t nvfp4_sf_bytes(std::int64_t l) { return static_cast<std::size_t>(kn::sf_bytes(l, kF)); }
 
-std::size_t q8_attention_workspace_bytes(std::int64_t hw, std::span<const std::int64_t> text_lengths, AttentionMode mode) {
+std::size_t q8_attention_workspace_bytes(std::int64_t hw, std::span<const std::int64_t> text_lengths, AttentionMode mode,
+                                         std::int64_t ref_tokens) {
   if (mode == AttentionMode::kExact) return 0;
   const std::size_t n = text_lengths.size();
   if (n > 16) throw std::invalid_argument("mi::moss_dit::q8_attention_workspace_bytes: too many rows");
@@ -182,8 +183,8 @@ std::size_t q8_attention_workspace_bytes(std::int64_t hw, std::span<const std::i
       max_len = std::max(max_len, len);
       ++batch;
     }
-    bytes = std::max(bytes, attention_q8::attention_q8_workspace_bytes(q8_options(mode), total, total, batch,
-                                                                       static_cast<int>(max_len), kH, kH));
+    bytes = std::max(bytes, attention_q8::attention_q8_workspace_bytes(q8_options(mode), total, total + batch * ref_tokens,
+                                                                       batch, static_cast<int>(max_len + ref_tokens), kH, kH));
   }
   return bytes;
 }
@@ -257,9 +258,11 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   std::size_t attn_need = 0;
   if (attention != AttentionMode::kExact) {
     const int batch = static_cast<int>(run.cu_seqlens.numel()) - 1;
-    attn_need = attention_q8::attention_q8_workspace_bytes(q8_options(attention), m, m, batch, run.max_seqlen, kH, kH);
+    const std::int64_t keys = run.slot_rows == 0 ? m : run.k1 - run.k0;
+    attn_need = attention_q8::attention_q8_workspace_bytes(q8_options(attention), m, keys, batch, run.max_seqlen, kH, kH);
   }
-  if (qkv_gemm.gemm == nullptr || !a.big.is_contiguous() || a.big.numel() < l * big_cols || a.mod.numel() != 6 * kD ||
+  if (qkv_gemm.gemm == nullptr || !a.big.is_contiguous() ||
+      a.big.numel() < std::max(l * big_cols, slotted_big(l, run.slot_rows)) || a.mod.numel() != 6 * kD ||
       qa.scale.dtype != DType::kF32 || qa.scale.numel() < l || qa.attn_workspace_bytes < attn_need ||
       (attn_need > 0 && qa.attn_workspace == nullptr)) {
     throw std::invalid_argument("mi::moss_dit::run_block_quant: buffers do not match x " + a.x.describe() + ": big " +
@@ -272,8 +275,11 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   }
 
   const Tensor x = a.x.slice0(run.t0, run.t1), y = a.y.slice0(run.t0, run.t1);
-  const Tensor qkv = rows_of(a.big, 0, l, 3 * kD, run.t0, run.t1);
-  const Tensor attn = rows_of(a.big, l * 3 * kD, l, kD, run.t0, run.t1);
+  const std::int64_t slots = run.slot_rows;
+  const Tensor qkv = rows_of(a.big, slots * 3 * kD, l, 3 * kD, run.t0, run.t1);
+  const Tensor attn = rows_of(a.big, (l + 2 * slots) * 3 * kD, l, kD, run.t0, run.t1);
+  // The keys and values: the run's own rows, or with reference slots the run's key rows of the slotted region.
+  const Tensor kv = slots == 0 ? qkv : rows_of(a.big, 0, l + 2 * slots, 3 * kD, run.k0, run.k1);
   float* scale = static_cast<float*>(qa.scale.data) + run.t0;
   // Quantized [L, kD] GEMM inputs (INT8, or packed INT4 in the first half): the qkv input in the attention output's
   // columns (free until attention runs), the o-proj and ffn_up_gate inputs in y (free while their GEMMs run: the
@@ -412,13 +418,18 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     }
   }
   kernels::fused::qk_norm_rope_moss(qkv, static_cast<int>(kH), w.q_norm, w.k_norm, a.rope.slice0(run.t0, run.t1), stream);
+  if (run.kv_tap != nullptr) {
+    tap_reference_kv(qkv, run.kv_tap, stream);
+    if (run.tap_only) return;
+  }
+  const Tensor& cu_k = slots == 0 ? run.cu_seqlens : run.cu_seqlens_k;
   if (attention != AttentionMode::kExact) {
-    attention_q8::attention_q8(q8_options(attention), heads(qkv, 0), heads(qkv, kD), heads(qkv, 2 * kD), heads(attn, 0),
-                               run.cu_seqlens, run.cu_seqlens, run.max_seqlen, kScale, qa.attn_workspace,
-                               qa.attn_workspace_bytes, stream);
+    attention_q8::attention_q8(q8_options(attention), heads(qkv, 0), heads(kv, kD), heads(kv, 2 * kD), heads(attn, 0),
+                               run.cu_seqlens, cu_k, run.max_seqlen, kScale, qa.attn_workspace, qa.attn_workspace_bytes,
+                               stream);
   } else {
-    attention::flash_fwd(heads(qkv, 0), heads(qkv, kD), heads(qkv, 2 * kD), heads(attn, 0), run.cu_seqlens,
-                         run.cu_seqlens, run.max_seqlen, false, kScale, a.lse, a.lse_bytes, stream);
+    attention::flash_fwd(heads(qkv, 0), heads(kv, kD), heads(kv, 2 * kD), heads(attn, 0), run.cu_seqlens, cu_k,
+                         run.max_seqlen, false, kScale, a.lse, a.lse_bytes, stream);
   }
 
   // x += o(attn) * gate_a (P:142).
