@@ -66,17 +66,25 @@ struct DeviceCall {
   }
 };
 
-// A call that may load or drop models: the adapter's progress record goes cold (before, and after: a generate may
-// start between the two); model-file errors are ModelError (MI_ERR_MODEL), as for mi_generate().
+// A call that may load or drop models: once the gate admitted it, the adapter's progress record goes cold for the next
+// job; model-file errors are ModelError (MI_ERR_MODEL), as for mi_generate().
 template <class F>
 auto loading(PipelineAdapter& adapter, F&& call) {
-  adapter.models_changed();
   struct After {
     PipelineAdapter& a;
-    ~After() { a.models_changed(); }
+    bool admitted = true;
+    ~After() {
+      if (admitted) a.models_changed();
+    }
   } after{adapter};
   try {
     return call();
+  } catch (const runtime::JobGate::Busy&) {
+    after.admitted = false;
+    throw;
+  } catch (const runtime::JobGate::Refused&) {
+    after.admitted = false;
+    throw;
   } catch (const lora::LoraError& e) {
     throw ModelError(e.what());
   } catch (const control::ControlError& e) {
@@ -116,8 +124,8 @@ Tensor to_tensor(const mi_tensor& t, const char* what) {
     if (i >= t.rank && d != 0) {
       throw std::invalid_argument(n + ".shape[" + std::to_string(i) + "] must be 0 past the rank.");
     }
+    if (i < t.rank && d > (std::int64_t{1} << 40) / numel) throw std::invalid_argument(n + ": too many elements.");
     if (i < t.rank) numel *= d;
-    if (numel > (std::int64_t{1} << 40)) throw std::invalid_argument(n + ": too many elements.");
   }
   return Tensor::view(t.data, dtype, device, t.shape, t.rank);
 }
@@ -239,8 +247,11 @@ pipeline::RunSpec to_run_spec(const mi_run_params& p, const pipeline::SessionOpt
     throw std::invalid_argument("Denoise strength must be between 0 and 1.");
   }
   if (!std::isfinite(p.cfg) || p.cfg < 0) throw std::invalid_argument("CFG must be a finite number >= 0.");
-  if (!std::isfinite(p.step_cache_threshold) || p.step_cache_threshold < 0 || p.step_cache_threshold > 1) {
-    throw std::invalid_argument("step_cache_threshold must be in (0, 1] with the step cache on (0 when it is off).");
+  // The threshold is ignored with the step cache off; with it on, Session::validate requires (0, 1].
+  const bool step_cache_on = p.step_cache == MI_STEP_CACHE_FBCACHE;  // an unknown value: to_request names it
+  const double threshold = step_cache_on ? p.step_cache_threshold : 0.0;
+  if (step_cache_on && !(p.step_cache_threshold > 0 && p.step_cache_threshold <= 1)) {
+    throw std::invalid_argument("The step cache needs an explicit threshold in (0, 1] (step_cache_threshold).");
   }
 
   // The fields mi_gen_params shares, read and checked as mi_generate() reads them.
@@ -271,7 +282,7 @@ pipeline::RunSpec to_run_spec(const mi_run_params& p, const pipeline::SessionOpt
   g.resize = p.control_resize;
   g.cfg_truncation = p.cfg_truncation;
   g.step_cache = p.step_cache;
-  g.step_cache_threshold = p.step_cache_threshold;
+  g.step_cache_threshold = threshold;
   const pipeline::Request q = to_request(g, nullptr, true, false);
 
   s.width = q.width;
@@ -292,7 +303,7 @@ pipeline::RunSpec to_run_spec(const mi_run_params& p, const pipeline::SessionOpt
   s.control_images = q.control.images;
   s.control_resize = q.resize;
   s.step_cache = q.accel.step_cache;
-  s.step_cache_threshold = p.step_cache_threshold;
+  s.step_cache_threshold = threshold;
   pipeline::Session::validate(s, options);
   return s;
 }

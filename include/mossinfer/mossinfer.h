@@ -1068,11 +1068,12 @@ MOSSINFER_API void mi_file_report_free(mi_file_report* report);
  * Every session call is a job of the engine (one at a time, MI_ERR_BUSY otherwise; mi_cancel() stops it). Between
  * runs mi_generate(), mi_engine_preload() and mi_engine_release() work; while a run is open they (and mi_encode_text,
  * mi_vae_*, a second mi_run_begin) fail with MI_ERR_BUSY. mi_run_end(), mi_session_close() and mi_engine_free() never
- * fail for a call in flight on another thread: they cancel it (a step, or any session call for a close; a generation is
- * waited for, never cancelled), wait for it to return, then end. From the moment an ending starts, new calls on what it
- * ends fail with MI_ERR_INVALID_ARGUMENT ("the run is ending" / "the session is closing"). From a callback of the
- * running call, mi_run_end() and mi_session_close() return MI_ERR_BUSY and do nothing; mi_engine_free() stays
- * forbidden there.
+ * fail for a call in flight on another thread: they cancel it (a step, or any session call for a close; mi_run_end and
+ * mi_session_close wait for a generation without cancelling it, mi_engine_free cancels whatever runs), wait for it to
+ * return, then end. From the moment an ending starts, new calls on what it ends fail with MI_ERR_INVALID_ARGUMENT ("the
+ * run is ending" / "the session is closing"). From a callback of the engine's running job (any job), mi_run_end() and
+ * mi_session_close() return MI_ERR_BUSY and do nothing, even with nothing open; mi_engine_free() stays forbidden
+ * there.
  *
  * Runs use the engine's tier and attention (mi_engine_params; explicit since 2.0) and are planned as mi_generate()
  * plans the equivalent request, within the engine's mode and budgets. Every image-affecting parameter is explicit; a

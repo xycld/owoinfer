@@ -53,7 +53,9 @@ struct mi_engine {
   mutable std::condition_variable session_cv;
   std::unique_ptr<mi::api::ComponentSession> session;
   mutable int session_users = 0;
+  mutable int session_waiters = 0;  // calls waiting for a replacement to finish
   bool session_replacing = false;
+  bool freeing = false;  // mi_engine_free has begun: no new session opens
 };
 
 struct mi_result {
@@ -797,7 +799,12 @@ class SessionRef {
  public:
   explicit SessionRef(const mi_engine& e, bool required = true) : e_(e) {
     std::unique_lock<std::mutex> lock(e_.session_mu);
-    e_.session_cv.wait(lock, [&] { return !e_.session_replacing; });
+    if (e_.session_replacing) {
+      ++e_.session_waiters;  // counted while waiting: mi_engine_free waits for it to leave
+      e_.session_cv.wait(lock, [&] { return !e_.session_replacing; });
+      --e_.session_waiters;
+      e_.session_cv.notify_all();
+    }
     if (!e_.session) {
       if (required) throw mi::runtime::JobGate::Refused("no session is open");
       return;
@@ -969,18 +976,29 @@ mi_status mi_engine_create(const mi_engine_params* params, mi_engine** out_engin
 static_assert(std::is_nothrow_destructible_v<mi_engine>);
 void mi_engine_free(mi_engine* engine) {
   if (engine == nullptr) return;
+  const auto close_session = [&] {
+    try {
+      const SessionRef session(*engine, false);
+      if (session) session->close();
+    } catch (const mi::runtime::JobGate::Busy&) {
+      return false;  // from a callback of the running call
+    } catch (...) {
+      // A failure freeing the session's state: the engine is freed all the same.
+    }
+    return true;
+  };
+  if (!close_session()) return;
   try {
-    const SessionRef session(*engine, false);
-    if (session) session->close();
-  } catch (const mi::runtime::JobGate::Busy&) {
-    return;  // from a callback of the running call
-  } catch (...) {
-    // A failure freeing the session's state: the engine is freed all the same.
-  }
-  try {
+    {
+      const std::lock_guard<std::mutex> lock(engine->session_mu);
+      engine->freeing = true;
+    }
+    close_session();  // one a racing mi_session_open opened before the flag
     engine->gate.close_engine();
     std::unique_lock<std::mutex> lock(engine->session_mu);
-    engine->session_cv.wait(lock, [&] { return engine->session_users == 0 && !engine->session_replacing; });
+    engine->session_cv.wait(lock, [&] {
+      return engine->session_users == 0 && engine->session_waiters == 0 && !engine->session_replacing;
+    });
   } catch (...) {
     return;
   }
@@ -1441,6 +1459,7 @@ mi_status mi_session_open(mi_engine* engine, const mi_session_params* params) {
     }
     {
       std::unique_lock<std::mutex> lock(engine->session_mu);
+      if (engine->freeing) throw mi::runtime::JobGate::Refused("the engine is being freed");
       if (engine->session_replacing) throw mi::runtime::JobGate::Busy("a session is being opened on this engine");
       if (engine->gate.session_open()) throw mi::runtime::JobGate::Busy("a session is open on this engine");
       engine->session_replacing = true;

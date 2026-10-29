@@ -217,6 +217,11 @@ TEST(ComponentApi, TensorDescriptors) {
   bad = t;
   bad._reserved0 = 1;
   refused_tensor(bad, "out[1]._reserved0 must be 0");
+  bad = t;
+  bad.rank = 2;
+  bad.shape[0] = bad.shape[1] = std::int64_t{1} << 32;  // 2^64 elements: refused before the product overflows
+  bad.shape[2] = 0;
+  refused_tensor(bad, "out[1]: too many elements");
 }
 
 TEST(ComponentApi, ForeignConditioning) {
@@ -438,6 +443,9 @@ TEST(ComponentApi, RunSpecValidation) {
   refused(x, o, "The step cache needs an explicit threshold in (0, 1]");
   x.step_cache_threshold = 0.2;
   EXPECT_EQ(mi::api::to_run_spec(x, o).step_cache_threshold, 0.2);
+  x.step_cache = MI_STEP_CACHE_OFF;
+  x.step_cache_threshold = 2.0;  // ignored with the step cache off
+  EXPECT_EQ(mi::api::to_run_spec(x, o).step_cache_threshold, 0.0);
   const std::uint8_t px[16 * 16 * 3] = {};
   const mi_image img{px, 16, 16, 3, 0};
   const mi_control_image ci{"depth", &img, nullptr, 1.0, 0.0, 1.0};
