@@ -3,12 +3,10 @@
 #include "mossinfer/mossinfer.h"
 
 #include <algorithm>
-#include <condition_variable>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <new>
 #include <optional>
 #include <span>
@@ -33,6 +31,7 @@
 #include "runtime/device_arena.h"
 #include "runtime/exchange.h"
 #include "runtime/job_gate.h"
+#include "runtime/session_slot.h"
 #include "util/json.h"
 #include "util/path.h"
 #include "util/regular_file.h"
@@ -47,15 +46,8 @@ struct mi_engine {
   // through it.
   mi::runtime::JobGate gate;
   std::unique_ptr<mi::api::PipelineAdapter> adapter;
-  // The open session, or the last one (closed). mi_session_open replaces it only once no call holds it (SessionRef),
-  // so a call never reaches another session than the one it found; the gate refuses calls on a closed one.
-  mutable std::mutex session_mu;
-  mutable std::condition_variable session_cv;
-  std::unique_ptr<mi::api::ComponentSession> session;
-  mutable int session_users = 0;
-  mutable int session_waiters = 0;  // calls waiting for a replacement to finish
-  bool session_replacing = false;
-  bool freeing = false;  // mi_engine_free has begun: no new session opens
+  // The open session, or the last one (closed): runtime/session_slot.h. The gate refuses calls on a closed one.
+  mi::runtime::SessionSlot<mi::api::ComponentSession> session;
 };
 
 struct mi_result {
@@ -793,40 +785,8 @@ mi_step_params step_params_defaults(std::size_t /*size*/ = sizeof(mi_step_params
   return p;
 }
 
-// A call's hold on the engine's session object (mi_engine::session): it stays that object until the call returns.
-// Without one (no session was ever opened) `required` throws "no session is open"; otherwise it is empty.
-class SessionRef {
- public:
-  explicit SessionRef(const mi_engine& e, bool required = true) : e_(e) {
-    std::unique_lock<std::mutex> lock(e_.session_mu);
-    if (e_.session_replacing) {
-      ++e_.session_waiters;  // counted while waiting: mi_engine_free waits for it to leave
-      e_.session_cv.wait(lock, [&] { return !e_.session_replacing; });
-      --e_.session_waiters;
-      e_.session_cv.notify_all();
-    }
-    if (!e_.session) {
-      if (required) throw mi::runtime::JobGate::Refused("no session is open");
-      return;
-    }
-    s_ = e_.session.get();
-    ++e_.session_users;
-  }
-  ~SessionRef() {
-    if (s_ == nullptr) return;
-    const std::lock_guard<std::mutex> lock(e_.session_mu);
-    --e_.session_users;
-    e_.session_cv.notify_all();
-  }
-  SessionRef(const SessionRef&) = delete;
-  SessionRef& operator=(const SessionRef&) = delete;
-  explicit operator bool() const { return s_ != nullptr; }
-  mi::api::ComponentSession* operator->() const { return s_; }
-
- private:
-  const mi_engine& e_;
-  mi::api::ComponentSession* s_ = nullptr;
-};
+// A call's hold on the engine's session object: it stays that object until the call returns.
+using SessionRef = mi::runtime::SessionSlot<mi::api::ComponentSession>::Ref;
 
 }  // namespace
 
@@ -978,7 +938,7 @@ void mi_engine_free(mi_engine* engine) {
   if (engine == nullptr) return;
   const auto close_session = [&] {
     try {
-      const SessionRef session(*engine, false);
+      const SessionRef session(engine->session, false);
       if (session) session->close();
     } catch (const mi::runtime::JobGate::Busy&) {
       return false;  // from a callback of the running call
@@ -989,16 +949,10 @@ void mi_engine_free(mi_engine* engine) {
   };
   if (!close_session()) return;
   try {
-    {
-      const std::lock_guard<std::mutex> lock(engine->session_mu);
-      engine->freeing = true;
-    }
+    engine->session.begin_freeing();
     close_session();  // one a racing mi_session_open opened before the flag
     engine->gate.close_engine();
-    std::unique_lock<std::mutex> lock(engine->session_mu);
-    engine->session_cv.wait(lock, [&] {
-      return engine->session_users == 0 && engine->session_waiters == 0 && !engine->session_replacing;
-    });
+    engine->session.wait_idle();
   } catch (...) {
     return;
   }
@@ -1457,25 +1411,11 @@ mi_status mi_session_open(mi_engine* engine, const mi_session_params* params) {
       check_reserved(plan);
       p.plan_request = &plan;
     }
-    {
-      std::unique_lock<std::mutex> lock(engine->session_mu);
-      if (engine->freeing) throw mi::runtime::JobGate::Refused("the engine is being freed");
-      if (engine->session_replacing) throw mi::runtime::JobGate::Busy("a session is being opened on this engine");
-      if (engine->gate.session_open()) throw mi::runtime::JobGate::Busy("a session is open on this engine");
-      engine->session_replacing = true;
-      engine->session_cv.wait(lock, [&] { return engine->session_users == 0; });
-    }
-    struct Done {
-      mi_engine& e;
-      ~Done() {
-        const std::lock_guard<std::mutex> lock(e.session_mu);
-        e.session_replacing = false;
-        e.session_cv.notify_all();
-      }
-    } done{*engine};
-    // The closed session first: its destructor's close() must find nothing open.
-    engine->session.reset();
-    engine->session = std::make_unique<mi::api::ComponentSession>(*engine->adapter, engine->gate, p);
+    engine->session.replace(
+        [&] {
+          if (engine->gate.session_open()) throw mi::runtime::JobGate::Busy("a session is open on this engine");
+        },
+        [&] { return std::make_unique<mi::api::ComponentSession>(*engine->adapter, engine->gate, p); });
     return MI_OK;
   });
 }
@@ -1483,7 +1423,7 @@ mi_status mi_session_open(mi_engine* engine, const mi_session_params* params) {
 mi_status mi_session_close(mi_engine* engine) {
   return guarded([&] {
     require(engine, "engine");
-    const SessionRef session(*engine, false);
+    const SessionRef session(engine->session, false);
     if (session) session->close();
     return MI_OK;
   });
@@ -1505,7 +1445,7 @@ mi_status mi_encode_text(mi_engine* engine, const mi_text_params* params, mi_con
     require(out_conditionings, "out_conditionings");
     const mi_text_params p =
         read_input<mi_text_params>(params, std::span(&kTextParamsSize, 1), text_params_defaults, "mi_text_params");
-    const SessionRef session(*engine);
+    const SessionRef session(engine->session);
     const std::vector<std::shared_ptr<const mi::pipeline::Conditioning>> conds = session->encode_text(p);
     std::vector<std::unique_ptr<mi_conditioning>> out;
     for (const auto& c : conds) out.push_back(std::make_unique<mi_conditioning>(mi_conditioning{c}));
@@ -1586,7 +1526,7 @@ mi_status mi_run_begin(mi_engine* engine, const mi_run_params* params) {
     require(params, "params");
     const mi_run_params p =
         read_input<mi_run_params>(params, std::span(&kRunParamsSize, 1), run_params_defaults, "mi_run_params");
-    const SessionRef session(*engine);
+    const SessionRef session(engine->session);
     session->begin_run(p);
     return MI_OK;
   });
@@ -1597,7 +1537,7 @@ mi_status mi_run_query(const mi_engine* engine, mi_run_info* out) {
     require(engine, "engine");
     require(out, "out");
     check_size(out->struct_size, sizeof(mi_run_info), "mi_run_info");
-    const SessionRef session(*engine);
+    const SessionRef session(engine->session);
     write_output(out, session->run_info());
     return MI_OK;
   });
@@ -1612,7 +1552,7 @@ const float* mi_run_sigmas(const mi_engine* engine, size_t* count) {
   const float* out = nullptr;
   guarded([&] {
     require(engine, "engine");
-    const SessionRef session(*engine);
+    const SessionRef session(engine->session);
     const std::vector<float>& s = session->run_sigmas();
     out = s.data();
     *count = s.size();
@@ -1625,7 +1565,7 @@ mi_status mi_run_adopt_staging(mi_engine* engine, void* base, size_t bytes) {
   return guarded([&] {
     require(engine, "engine");
     require(base, "base");
-    const SessionRef session(*engine);
+    const SessionRef session(engine->session);
     session->adopt_staging(base, bytes);
     return MI_OK;
   });
@@ -1635,7 +1575,7 @@ mi_status mi_run_staging(mi_engine* engine, mi_tensor* x, mi_tensor* outs, size_
   return guarded([&] {
     require(engine, "engine");
     if (outs == nullptr && outs_count > 0) throw std::invalid_argument("outs: NULL array with a nonzero count.");
-    const SessionRef session(*engine);
+    const SessionRef session(engine->session);
     const mi::pipeline::StagingViews v = session->staging();
     if (x != nullptr) *x = mi::api::from_tensor(v.x);
     for (std::size_t k = 0; k < outs_count && k < static_cast<std::size_t>(v.outputs); ++k) {
@@ -1662,7 +1602,7 @@ mi_status mi_denoise_step(mi_engine* engine, const mi_step_params* params, mi_st
     if (out_info != nullptr) check_size(out_info->struct_size, sizeof(mi_step_info), "mi_step_info");
     const mi_step_params p =
         read_input<mi_step_params>(params, std::span(&kStepParamsSize, 1), step_params_defaults, "mi_step_params");
-    const SessionRef session(*engine);
+    const SessionRef session(engine->session);
     const mi_step_info info = session->step(p);
     if (out_info != nullptr) write_output(out_info, info);
     return MI_OK;
@@ -1673,7 +1613,7 @@ mi_status mi_run_end(mi_engine* engine, mi_result** out_result) {
   if (out_result != nullptr) *out_result = nullptr;
   return guarded([&] {
     require(engine, "engine");
-    const SessionRef session(*engine, false);
+    const SessionRef session(engine->session, false);
     if (!session) return MI_OK;
     std::optional<mi::api::Generation> g = session->end_run();
     if (g && out_result != nullptr) *out_result = mi::api::new_result(std::move(*g));
@@ -1686,7 +1626,7 @@ mi_status mi_vae_encode(mi_engine* engine, const mi_image* image, const mi_tenso
     require(engine, "engine");
     require(image, "image");
     require(out_latents, "out_latents");
-    const SessionRef session(*engine);
+    const SessionRef session(engine->session);
     session->vae_encode(*image, *out_latents);
     return MI_OK;
   });
@@ -1697,7 +1637,7 @@ mi_status mi_vae_decode(mi_engine* engine, const mi_tensor* latents, const mi_te
     require(engine, "engine");
     require(latents, "latents");
     require(out_rgb, "out_rgb");
-    const SessionRef session(*engine);
+    const SessionRef session(engine->session);
     session->vae_decode(*latents, *out_rgb);
     return MI_OK;
   });
