@@ -560,6 +560,48 @@ void check_int4_against_oracle(const Int4Data& d, const std::vector<int>& rows, 
 
 // The torch vectors: oracle == torch._int_mm + the CUDA-order dequant; every tile bit-exact; the agreement with
 // comfy-kitchen's eager int4_linear (bf16 integer matmul) reported and bounded.
+// The SiTU-GLU epilogue (shared with the INT8 GEMM) reads SiTU's two factors from tables over every bf16 input: as
+// GpuQuantKernels.Int8GemmSituGluEveryBf16Value, through the INT4 GEMM. acc = 1 in every column (x's first code 1 in
+// either nibble order: byte 0x01; every weight row's first two codes 1: byte 0x11), so the dequantized value of column
+// c is w_scale[c] (+ the zero bias: -0 arrives as +0). Against kernels::situ_glu, bit for bit.
+TEST(GpuQuant4Kernels, Int4GemmSituGluEveryBf16Value) {
+  constexpr std::int64_t F = 65536, n = 2 * F, k = 32;
+  std::vector<std::uint8_t> xh(k / 2, 0), wh(static_cast<std::size_t>(n * k / 2), 0);
+  xh[0] = 0x01;
+  for (std::int64_t i = 0; i < n; ++i) wh[static_cast<std::size_t>(i * k / 2)] = 0x11;
+  Buf<std::uint8_t> x(xh), w(wh);
+  Buf<float> xs(std::vector<float>{1.0f});
+  const std::uint16_t one = bf16_bits(1.0f);
+  for (int pass = 0; pass < 3; ++pass) {
+    std::vector<float> ws(static_cast<std::size_t>(n));
+    std::vector<std::uint16_t> y(static_cast<std::size_t>(n));
+    for (std::int64_t i = 0; i < F; ++i) {
+      const auto all = static_cast<std::uint16_t>(i), perm = static_cast<std::uint16_t>((i * 40503 + 12345) & 0xFFFF);
+      const std::uint16_t h = pass == 1 ? one : all, g = pass == 0 ? one : pass == 1 ? all : perm;
+      const auto at = static_cast<std::size_t>(i);
+      ws[at] = bf16_float(h);
+      ws[at + F] = bf16_float(g);
+      y[at] = bf16_bits(ws[at] + 0.0f);
+      y[at + F] = bf16_bits(ws[at + F] + 0.0f);
+    }
+    Buf<float> wsb(ws);
+    Buf<std::uint16_t> yb(y), got(static_cast<std::size_t>(F)), ref(static_cast<std::size_t>(F));
+    q4::Int4Operands o;
+    o.x_q = x.get();
+    o.ldx = k / 2;
+    o.x_scale = xs.get();
+    o.w = w.get();
+    o.w_scale = wsb.get();
+    o.m = 1;
+    o.n = n;
+    o.k = k;
+    q4::int4_gemm_situ_glu(o, as_bf16(got), F, nullptr);
+    mi::kernels::situ_glu(view_bf16(yb.get(), 1, n), view_bf16(ref.get(), 1, F), nullptr);
+    MI_CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(count_diff(got.download(), ref.download()), 0u) << "pass " << pass;
+  }
+}
+
 TEST(GpuQuant4Kernels, Int4GemmMatchesReference) {
   const auto xa = load("gemm_xq"), wa = load("gemm_wq");
   const std::int64_t m = xa.shape[0], kb = xa.shape[1], n = wa.shape[0], k = 2 * kb;

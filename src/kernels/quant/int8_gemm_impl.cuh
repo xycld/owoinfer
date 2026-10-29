@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 
 #include "core/cuda_check.h"
@@ -115,12 +116,13 @@ CUTLASS_HOST_DEVICE int up_gate_row(int n, int half) {
 // computation bit for bit, NaN and inf inputs included. The epilogue's transcendentals (two tanhf, an expf and an
 // IEEE division per output) otherwise serialize after the main loop: ~12 % of the GEMM's time on sm_89.
 struct SituFactorTables {
-  const std::uint16_t* gate = nullptr;    // [65536] bf16 bits of situ_gate_factor(g)
-  const std::uint16_t* hidden = nullptr;  // [65536] bf16 bits of situ_hidden_factor(h)
+  // No defaults; SituGluNode::to_underlying_arguments throws on a null table (an argument list that leaves them out).
+  const std::uint16_t* gate;    // [65536] bf16 bits of situ_gate_factor(g)
+  const std::uint16_t* hidden;  // [65536] bf16 bits of situ_hidden_factor(h)
 };
 
-// Fills the tables (static device memory of int8_gemm_situ.cu) on `stream` and returns them: before every launch of
-// a SituGlu epilogue (int8_gemm_situ_glu, quant4::int4_gemm_situ_glu).
+// The tables (static device memory of int8_gemm_situ.cu), filled on `stream` the first time per device (int8_gemm_situ.cu
+// says how): before every launch of a SituGlu epilogue (int8_gemm_situ_glu, quant4::int4_gemm_situ_glu).
 SituFactorTables situ_factor_tables(cudaStream_t stream);
 
 // A bf16-representable float's bits (exact: its low 16 bits are zero) and back.
@@ -138,7 +140,10 @@ struct SituGluNode {
   struct SharedStorage {};
 
   template <class ProblemShape>
-  static constexpr Params to_underlying_arguments(ProblemShape const&, Arguments const& args, void*) {
+  static Params to_underlying_arguments(ProblemShape const&, Arguments const& args, void*) {
+    if (args.gate == nullptr || args.hidden == nullptr) {
+      throw std::invalid_argument("mi::kernels::quant: the SiTU-GLU epilogue needs situ_factor_tables()");
+    }
     return args;
   }
   template <class ProblemShape>
