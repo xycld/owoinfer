@@ -324,20 +324,6 @@ struct NormVecs {
         shift(synth_vec(seed + 2, static_cast<std::size_t>(k), 0.0f, 1.0f)) {}
 };
 
-// A quantizer's optional bf16 copy (row stride ld) against the op-by-op tensor (contiguous [m, k]): equal bits, the
-// padding columns still 0x7FC1.
-void expect_copy(const std::vector<std::uint16_t>& want, const std::vector<std::uint16_t>& got, std::int64_t m,
-                 std::int64_t k, std::int64_t ld, const std::string& what) {
-  std::size_t bad = 0;
-  for (std::int64_t r = 0; r < m; ++r) {
-    for (std::int64_t c = 0; c < ld; ++c) {
-      const std::uint16_t g = got[static_cast<std::size_t>(r * ld + c)];
-      bad += c < k ? g != want[static_cast<std::size_t>(r * k + c)] : g != 0x7FC1;
-    }
-  }
-  EXPECT_EQ(bad, 0u) << what;
-}
-
 // qkv and ffn_up_gate sites: the fused norm + modulate + quantize against kernels::rms_norm_modulate_moss into bf16,
 // then the codec, at every row count class (the norm's reduce order depends on m: m = 1, 2, 7, 12 and >= 16 give 512,
 // 256, 128, 64 and 32 threads per row at k = 3072).
@@ -358,16 +344,8 @@ TEST(GpuNvfp4Quant, FusedNormMatchesOpByOp) {
     const Tensor xt = strided_bf16(xd.get(), m, k, ldx);
     mi::kernels::rms_norm_modulate_moss(xt, vec_bf16(v.weight.get(), k), vec_bf16(v.scale.get(), k),
                                         vec_bf16(v.shift.get(), k), view_bf16(y.get(), m, k), nullptr);
-    // The same call storing its bf16 norm output (row stride k + 8): y bit for bit, the padding untouched, the same codes.
-    const std::int64_t ldy = k + 8;
-    Buf<std::uint16_t> y2(std::vector<std::uint16_t>(static_cast<std::size_t>(m * ldy), 0x7FC1));
-    DevAct out2(m, k);
-    nv::rms_norm_modulate_quantize_nvfp4(as_bf16(xd), ldx, as_bf16(v.weight), as_bf16(v.scale), as_bf16(v.shift),
-                                         out2.act(), m, static_cast<int>(k), nullptr, as_bf16(y2), ldy);
     MI_CUDA_CHECK(cudaDeviceSynchronize());
     expect_same(download(out), codec(y.download(), m, k), "m " + std::to_string(m));
-    expect_same(download(out2), download(out), "with y, m " + std::to_string(m));
-    expect_copy(y.download(), y2.download(), m, k, ldy, "m " + std::to_string(m));
   }
 }
 
@@ -386,16 +364,8 @@ TEST(GpuNvfp4Quant, SituGluMatchesOpByOp) {
     nv::situ_glu_quantize_nvfp4(as_bf16(xd), c.ld, out.act(), c.m, static_cast<int>(c.f), nullptr);
     const Tensor xt = strided_bf16(xd.get(), c.m, 2 * c.f, c.ld);
     mi::kernels::situ_glu(xt, view_bf16(y.get(), c.m, c.f), nullptr);
-    // The same call storing its bf16 SiTU-GLU output (row stride F + 8): ffn bit for bit, the same codes.
-    const std::int64_t ldf = c.f + 8;
-    Buf<std::uint16_t> y2(std::vector<std::uint16_t>(static_cast<std::size_t>(c.m * ldf), 0x7FC1));
-    DevAct out2(c.m, c.f);
-    nv::situ_glu_quantize_nvfp4(as_bf16(xd), c.ld, out2.act(), c.m, static_cast<int>(c.f), nullptr, as_bf16(y2), ldf);
     MI_CUDA_CHECK(cudaDeviceSynchronize());
-    const std::string what = "m " + std::to_string(c.m) + " F " + std::to_string(c.f);
-    expect_same(download(out), codec(y.download(), c.m, c.f), what);
-    expect_same(download(out2), download(out), "with ffn, " + what);
-    expect_copy(y.download(), y2.download(), c.m, c.f, ldf, what);
+    expect_same(download(out), codec(y.download(), c.m, c.f), "m " + std::to_string(c.m) + " F " + std::to_string(c.f));
   }
 }
 
@@ -417,12 +387,6 @@ TEST(GpuNvfp4Quant, RejectsBadArguments) {
   a.scale = nullptr;
   bad([&] { nv::quantize_nvfp4(as_bf16(x), 32, a, 8, 32, nullptr); });
   bad([&] { nv::situ_glu_quantize_nvfp4(as_bf16(x), 32, out.act(), 8, 32, nullptr); });  // ld < 2F
-  bad([&] { nv::situ_glu_quantize_nvfp4(as_bf16(x), 64, out.act(), 8, 32, nullptr, as_bf16(x), 24); });  // ldf < F
-  bad([&] { nv::situ_glu_quantize_nvfp4(as_bf16(x), 64, out.act(), 8, 32, nullptr, as_bf16(x) + 1, 32); });  // misaligned
-  bad([&] {  // the norm output's row stride not a multiple of 8
-    nv::rms_norm_modulate_quantize_nvfp4(as_bf16(x), 256, as_bf16(x), as_bf16(x), as_bf16(x), out.act(), 8, 256, nullptr,
-                                         as_bf16(x), 260);
-  });
   bad([&] {
     nv::rms_norm_modulate_quantize_nvfp4(as_bf16(x), 256, nullptr, as_bf16(x), as_bf16(x), out.act(), 8, 256, nullptr);
   });

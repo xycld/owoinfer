@@ -99,22 +99,7 @@ struct QuantArgs {
   const __nv_bfloat16* mod_scale;
   const __nv_bfloat16* mod_shift;
   float factor;  // torch MeanOps factor: float(rows) / float(rows * k)
-  // kNorm / kSitu: optional copy of the bf16 tensor quantized (the norm or SiTU-GLU output), row stride ldy
-  __nv_bfloat16* y;
-  std::int64_t ldy;
 };
-
-// 16 floats that are bf16 values, stored as 16 contiguous bf16 (32 bytes, exact).
-__device__ __forceinline__ void store16(__nv_bfloat16* p, const float (&v)[16]) {
-#pragma unroll
-  for (int half = 0; half < 2; ++half) {
-    uint4 raw;
-    auto* b = reinterpret_cast<__nv_bfloat162*>(&raw);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) b[i] = __floats2bfloat162_rn(v[8 * half + 2 * i], v[8 * half + 2 * i + 1]);
-    reinterpret_cast<uint4*>(p)[half] = raw;
-  }
-}
 
 template <int kBlocksPerThread, Mode kMode, int kVT>
 __global__ void quantize_kernel(QuantArgs a) {
@@ -150,7 +135,6 @@ __global__ void quantize_kernel(QuantArgs a) {
       load16(xr + a.k + kb * kBlock, g);
 #pragma unroll
       for (int j = 0; j < 16; ++j) v[i][j] = rbf(situ_value(h[j], g[j]));  // kernels::situ_glu's bf16 output
-      if (a.y != nullptr) store16(a.y + row * a.ldy + kb * kBlock, v[i]);
     } else {
       load16(xr + kb * kBlock, v[i]);
     }
@@ -173,7 +157,6 @@ __global__ void quantize_kernel(QuantArgs a) {
       load16(a.mod_shift + kb * kBlock, sh);
 #pragma unroll
       for (int j = 0; j < 16; ++j) v[i][j] = kernels::detail::moss_modulate(v[i][j], r, w[j], sc[j], sh[j]);
-      if (a.y != nullptr) store16(a.y + row * a.ldy + kb * kBlock, v[i]);
     }
   }
 
@@ -297,25 +280,11 @@ void quantize_nvfp4(const __nv_bfloat16* x, std::int64_t ldx, const Nvfp4Act& ou
   launch<Mode::kPlain, 0>(a, stream);
 }
 
-namespace {
-// The optional bf16 copy of the quantized tensor: 16-byte aligned, row stride >= k and a multiple of 8.
-void check_copy(const char* op, __nv_bfloat16* y, std::int64_t ldy, int k, QuantArgs& a) {
-  if (y != nullptr && (!aligned16(y) || ldy < k || ldy % 8 != 0)) {
-    fail(op, "the bf16 copy must be 16-byte aligned with a row stride >= " + std::to_string(k) +
-                 " and a multiple of 8, got " + std::to_string(ldy));
-  }
-  a.y = y;
-  a.ldy = ldy;
-}
-}  // namespace
-
 void rms_norm_modulate_quantize_nvfp4(const __nv_bfloat16* x, std::int64_t ldx, const __nv_bfloat16* norm_weight,
                                       const __nv_bfloat16* mod_scale, const __nv_bfloat16* mod_shift,
-                                      const Nvfp4Act& out, std::int64_t m, int k, cudaStream_t stream,
-                                      __nv_bfloat16* y, std::int64_t ldy) {
+                                      const Nvfp4Act& out, std::int64_t m, int k, cudaStream_t stream) {
   constexpr const char* op = "nvfp4::rms_norm_modulate_quantize_nvfp4";
   QuantArgs a = check(op, x, ldx, k, out, m, k);
-  check_copy(op, y, ldy, k, a);
   if (norm_weight == nullptr || mod_scale == nullptr || mod_shift == nullptr || !aligned16(norm_weight) ||
       !aligned16(mod_scale) || !aligned16(mod_shift)) {
     fail(op, "norm_weight, mod_scale and mod_shift must be 16-byte aligned device vectors");
@@ -339,10 +308,8 @@ void rms_norm_modulate_quantize_nvfp4(const __nv_bfloat16* x, std::int64_t ldx, 
 }
 
 void situ_glu_quantize_nvfp4(const __nv_bfloat16* up_gate, std::int64_t ld, const Nvfp4Act& out, std::int64_t m,
-                             int f, cudaStream_t stream, __nv_bfloat16* ffn, std::int64_t ldf) {
-  constexpr const char* op = "nvfp4::situ_glu_quantize_nvfp4";
-  QuantArgs a = check(op, up_gate, ld, 2 * static_cast<std::int64_t>(f), out, m, f);
-  check_copy(op, ffn, ldf, f, a);
+                             int f, cudaStream_t stream) {
+  const QuantArgs a = check("nvfp4::situ_glu_quantize_nvfp4", up_gate, ld, 2 * static_cast<std::int64_t>(f), out, m, f);
   if (m == 0) return;
   launch<Mode::kSitu, 0>(a, stream);
 }
