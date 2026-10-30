@@ -1661,10 +1661,10 @@ TEST(PipelineEndToEnd, ReplacedComponentFilesLoadAnew) {
   mi::testing::TempDir scratch("pipe_replaced");
   const fs::path dit = scratch.path() / "dit.safetensors", te = scratch.path() / "te.safetensors",
                  vae = scratch.path() / "vae.safetensors", ctl = scratch.path() / "control.safetensors";
-  if (!clone_file(kInt8Dit, dit)) GTEST_SKIP() << "the test folder's file system cannot clone files";
-  ASSERT_TRUE(clone_file(te8, te));
-  ASSERT_TRUE(clone_file(small_vae, vae));
-  ASSERT_TRUE(clone_file(control, ctl));
+  // Each source may sit on another file system than the test folder: any copy that cannot be a clone skips.
+  if (!clone_file(kInt8Dit, dit) || !clone_file(te8, te) || !clone_file(small_vae, vae) || !clone_file(control, ctl)) {
+    GTEST_SKIP() << "the test folder's file system cannot clone these files";
+  }
 
   mi::pipeline::Request req;
   req.model = sft;

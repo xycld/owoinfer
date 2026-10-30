@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "models/moss_dit/nvfp4_support.h"
 #include "pipeline/gguf_dit.h"
 #include "pipeline/pipeline.h"
 #include "test_util.h"
@@ -177,6 +178,18 @@ const mi::json::Value& member(const mi::json::Value& v, const char* path) {
   return *at;
 }
 
+// Whether a folder made read-only refuses new files to this process (not as root, nor where the permission bits do not
+// bind, as on Windows): the read-only cases need it.
+bool refuses_writes(const fs::path& dir) {
+  const fs::path probe = dir / "write_probe";
+  std::FILE* f = std::fopen(mi::util::path_utf8(probe).c_str(), "wb");
+  if (f == nullptr) return true;
+  std::fclose(f);
+  std::error_code ec;
+  fs::remove(probe, ec);
+  return false;
+}
+
 // A JSON scalar as text, for comparing plan fields.
 std::string scalar(const mi::json::Value& v) {
   if (v.is_string()) return v.as_string();
@@ -313,8 +326,9 @@ TEST_F(GpuCheckAgreement, CheckAgreesWithTheRealCalls) {
          g.loras_count = 1;
        },
        false},
-      {"nvfp4 off an RTX 50", {nvfp4_}, [&](mi_engine_params& e, mi_gen_params&) { e.dit_file = nvfp4_.c_str(); e.tier = MI_TIER_TURBO; },
-       false},
+      // Refused off an RTX 50 (or without the NVFP4 kernels), accepted on one: both sides agree either way.
+      {"nvfp4 turbo", {nvfp4_}, [&](mi_engine_params& e, mi_gen_params&) { e.dit_file = nvfp4_.c_str(); e.tier = MI_TIER_TURBO; },
+       mi::moss_dit::nvfp4_unsupported_reason().empty()},
       {"gguf turbo", {gguf_},
        [&](mi_engine_params& e, mi_gen_params&) { e.dit_file = gguf_.c_str(); e.tier = MI_TIER_TURBO; },
        false},
@@ -452,15 +466,20 @@ TEST_F(GpuCheckAgreement, GgufBeforeAndAfterItsConversion) {
     const fs::path ro = dir.path() / "ro";
     fs::create_directories(ro);
     fs::permissions(ro, fs::perms::owner_read | fs::perms::owner_exec);
-    const std::string blocked = mi::util::path_utf8(ro / "cache");
-    mi_engine_params b = e;
-    b.cache_dir = blocked.c_str();
-    const Checked c = run_check(b, g);
-    const Real real = run_real(b, g);
-    fs::permissions(ro, fs::perms::owner_all);
-    EXPECT_EQ(real.status, MI_ERR_IO) << real.message;
-    EXPECT_EQ(c.info.status, real.status);
-    EXPECT_EQ(c.message, real.message);
+    if (refuses_writes(ro)) {
+      const std::string blocked = mi::util::path_utf8(ro / "cache");
+      mi_engine_params b = e;
+      b.cache_dir = blocked.c_str();
+      const Checked c = run_check(b, g);
+      const Real real = run_real(b, g);
+      fs::permissions(ro, fs::perms::owner_all);
+      EXPECT_EQ(real.status, MI_ERR_IO) << real.message;
+      EXPECT_EQ(c.info.status, real.status);
+      EXPECT_EQ(c.message, real.message);
+    } else {
+      fs::permissions(ro, fs::perms::owner_all);
+      std::printf("[gguf] the read-only cases are skipped: a read-only folder does not refuse this process's writes\n");
+    }
   }
 
   // The real calls convert; the check, now a cache hit, plans as they did.
@@ -496,6 +515,10 @@ TEST_F(GpuCheckAgreement, GgufBeforeAndAfterItsConversion) {
     if (entry.path().extension() == ".lock") fs::remove(entry.path());
   }
   fs::permissions(gguf_dir, fs::perms::owner_read | fs::perms::owner_exec);
+  if (!refuses_writes(gguf_dir)) {
+    fs::permissions(gguf_dir, fs::perms::owner_all);
+    return;  // as above: the read-only folder would not refuse the lock file
+  }
   const Real ro_real = run_real(e, g);
   const Checked ro_check = run_check(e, g);
   fs::permissions(gguf_dir, fs::perms::owner_all);

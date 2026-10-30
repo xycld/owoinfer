@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,10 @@ std::size_t free_device_bytes() {
 }
 
 // The INT4 Turbo DiT (2.8 GiB: quick to load on the dev box) with the SFT bundle, 256^2, 4 steps.
+// The pinned-copy tests need host room for the copies they plan: a container whose limit is mostly taken (its page cache
+// counted as used) plans no pinned copy, so the seams they exercise never fire.
+bool host_room_for_pinned_copies() { return mi::planner::host_available_bytes() >= (std::size_t{8} << 30); }
+
 bool have_int4() { return fs::is_regular_file(weights_root() / "sft" / "moss.mossidx") && fs::is_regular_file(kInt4); }
 PipelineOptions int4_options() {
   PipelineOptions o;
@@ -484,7 +489,9 @@ TEST(GpuPipelineRelease, CopyFailureCancelAndRefusalStillRelease) {
   }
   const mi::pipeline::ReleaseReport refused = pipe.release_device_memory(true);
   EXPECT_FALSE(refused.dit_host_copy);
-  EXPECT_NE(refused.note.find("host budget"), std::string::npos) << refused.note;
+  // The budget, or the RAM margin when it binds first (little host memory available): both are host-memory refusals.
+  EXPECT_TRUE(refused.note.find("host budget") != std::string::npos || refused.note.find("available") != std::string::npos)
+      << refused.note;
 }
 
 // A cancel that arrives while the DiT's files are being copied to RAM: the release still completes (the device memory
@@ -516,6 +523,7 @@ TEST(GpuPipelineRelease, CancelMidHostCopyKeepsNoCopyAndStillReleases) {
 // soft unload.
 TEST(GpuPipelinePinFallback, PinnedTextEncoderFallsBackToStreaming) {
   if (!have_int4() || !fs::is_regular_file(kW4a8Te)) GTEST_SKIP() << "SFT bundle, INT4 DiT or W4A8 text encoder not present";
+  if (!host_room_for_pinned_copies()) GTEST_SKIP() << "less than 8 GiB of host memory available: no pinned copy is planned";
   struct Clear {
     ~Clear() { mi::weights::testing::clear_fail_pinned_alloc(); }
   } clear;
@@ -631,6 +639,7 @@ TEST(GpuPipelineControlToggle, SwitchOnCostIsTimed) {
   if (!fs::is_regular_file(weights_root() / "sft" / "moss.mossidx") || !fs::is_regular_file(kControl)) {
     GTEST_SKIP() << "SFT bundle or control adapter not present";
   }
+  if (!host_room_for_pinned_copies()) GTEST_SKIP() << "less than 8 GiB of host memory available";
   auto depth = std::make_shared<mi::pipeline::Image>();
   depth->width = depth->height = 256;
   depth->channels = 1;
@@ -648,12 +657,14 @@ TEST(GpuPipelineControlToggle, SwitchOnCostIsTimed) {
     return t.total_s - (t.index_load_s + t.tokenize_s + t.plan_s + t.text_encode_s + t.dit_load_s + t.lora_load_s + t.lora_merge_s +
                         t.refine_s + t.denoise_s + t.vae_load_s + t.decode_s + t.vae_encoder_load_s + t.encode_s + t.image_ops_s);
   };
-  Pipeline pipe;
-  const Result p0 = pipe.generate(plain);
-  const Result c1 = pipe.generate(ctl);
-  const Result c2 = pipe.generate(ctl);
-  const Result p1 = pipe.generate(plain);
-  const Result c3 = pipe.generate(ctl);
+  // One pipeline at a time (each plans against the GPU memory the others leave): the toggles, a fresh pipeline, the cap.
+  std::optional<Pipeline> pipe(std::in_place);
+  const Result p0 = pipe->generate(plain);
+  const Result c1 = pipe->generate(ctl);
+  const Result c2 = pipe->generate(ctl);
+  const Result p1 = pipe->generate(plain);
+  const Result c3 = pipe->generate(ctl);
+  pipe.reset();
   EXPECT_EQ(c1.memory.dit_loads, 0);
   EXPECT_EQ(c3.memory.dit_loads, 0);
   EXPECT_LT(c3.timings.lora_merge_s, 0.5 * c1.timings.lora_merge_s) << "the kept merged bits, not a new merge";
@@ -668,8 +679,10 @@ TEST(GpuPipelineControlToggle, SwitchOnCostIsTimed) {
   for (const Result* r : {&p0, &c1, &c2, &p1, &c3}) EXPECT_LT(unaccounted(*r), 0.15) << "time outside every timing field";
   EXPECT_EQ(mismatches(p1.latents, p0.latents), 0u);
   EXPECT_EQ(mismatches(c2.latents, c1.latents), 0u);
-  Pipeline fresh;
-  EXPECT_EQ(mismatches(fresh.generate(ctl).latents, c1.latents), 0u) << "switched on in place vs a fresh pipeline";
+  {
+    Pipeline fresh;
+    EXPECT_EQ(mismatches(fresh.generate(ctl).latents, c1.latents), 0u) << "switched on in place vs a fresh pipeline";
+  }
   // Over the memo's cap (forced down to 1 MiB) nothing is kept: switching on again merges again, the same bits.
   mi::moss_dit::MossDit::set_merge_memo_cap_for_tests(std::size_t{1} << 20);
   struct Restore {
