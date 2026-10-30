@@ -6,7 +6,7 @@ Models: MOSS-Image Base and SFT only (`OpenMOSS-Team/MOSS-Image-Base`, `OpenMOSS
 
 Version 2.1.0. Supported: Linux x86-64 and Windows x64 (MSVC), each with a CUDA 12 and a CUDA 13 build, as a full package and a `-system-cuda` package. The full support matrix is in [docs/integration.md](docs/integration.md#support-status).
 
-The caller picks the quality tier: `reference` (bf16, exact), `high` (the loaded DiT's GEMMs with 8-bit attention) or `turbo` (a 4-bit DiT). An INT8 DiT with `high` is the everyday choice: 2.4 times the bf16 speed on an RTX 5090, in 40 % less VRAM ([performance](docs/integration.md#performance)). Upgrading from 1.x: [migration](docs/integration.md#migrating-from-1x).
+The caller picks the quality tier: `reference` (bf16, exact), `high` (the loaded DiT's GEMMs with 8-bit attention) or `turbo` (a 4-bit DiT). An INT8 DiT with `high` is the everyday choice: 2.5 times the bf16 speed on an RTX 5090, in 40 % less VRAM ([performance](docs/integration.md#performance)). Upgrading from 1.x: [migration](docs/integration.md#migrating-from-1x).
 
 ```sh
 moss-infer generate --model MOSS-Image/sft --dit moss_image_sft_int8_convrot.safetensors --tier high \

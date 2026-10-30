@@ -312,7 +312,7 @@ Files built only from the types the table reads load, whatever their mix: unslot
 
 ## Performance
 
-The launcher sets three things: the tier (with the DiT file it loads), the memory mode and, when it shares the GPU or the RAM, the budgets. The engine plans everything else within them. **For everyday use, load an INT8 DiT (`dit_file`) with tier `high`:** 2.4 times the speed of the bf16 Reference in 40 % less VRAM.
+The launcher sets three things: the tier (with the DiT file it loads), the memory mode and, when it shares the GPU or the RAM, the budgets. The engine plans everything else within them. **For everyday use, load an INT8 DiT (`dit_file`) with tier `high`:** 2.5 times the speed of the bf16 Reference in 40 % less VRAM.
 
 | Tier | Runs | Gives |
 |---|---|---|
@@ -325,10 +325,10 @@ RTX 5090, SFT, 1024², 50 steps, every model resident:
 | Configuration | Denoise step | Speed | VRAM peak |
 |---|---|---|---|
 | bf16 bundle, `reference` | 0.466 s | 1.0× | 11.7 GiB |
-| INT8 DiT, `high` (q8_fp8) | 0.192 s | 2.4× | 7.2 GiB |
+| INT8 DiT, `high` (q8_fp8) | 0.186 s | 2.5× | 7.2 GiB |
 | NVFP4 DiT, `turbo` (q8_fp8) | 0.143 s | 3.3× | 5.5 GiB |
 
-The gain holds at 2048²: INT8 `high` runs 1.18 s per step against 2.77 s for bf16. 8-bit attention runs at every size; `attention` picks another kernel (`exact`, or the fp32-accumulating variants) when the caller wants one.
+The gain holds at 2048²: INT8 `high` runs 1.12 s per step against 2.77 s for bf16. 8-bit attention runs at every size; `attention` picks another kernel (`exact`, or the fp32-accumulating variants) when the caller wants one.
 
 **Memory modes** trade host RAM for speed. `balanced` (the default) keeps the process near 8 GiB of private RAM, `min_memory` near 4 GiB (more streaming and parking, the lowest peaks), and `max_speed` uses what the machine has free (the text encoder held in RAM, pinned where there is room, and a larger embedding cache, so a new prompt starts sooner).
 
