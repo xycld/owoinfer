@@ -8,7 +8,7 @@
 ```
 moss-server                     # speak the protocol on stdin/stdout
 moss-server --parent-pid <pid>  # the same, and exit when process <pid> (the launcher) exits
-moss-server --version           # "moss-server 2.1.0 (protocol 2, ABI 1)"
+moss-server --version           # "moss-server 2.1.1 (protocol 2, ABI 1)"
 ```
 
 ### `--parent-pid`
@@ -183,7 +183,7 @@ Creates the engine. A loaded engine is released first, because two engines would
 
 `te_host_pin` takes the pipeline's spellings (`te_host_pin_name()`); `dit_direct_io` has the server's own.
 
-Since 2.x, `load` checks its parameters before it looks at the server's state: a malformed `load` is `invalid_params` even while a job runs (it was `busy` before).
+Since 2.1.0, `load` checks its parameters before it looks at the server's state: a malformed `load` is `invalid_params` even while a job runs (it was `busy` before).
 
 ### `generate`
 
