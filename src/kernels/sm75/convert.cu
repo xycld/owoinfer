@@ -62,7 +62,8 @@ int blocks_for(std::int64_t n) {
 void convert_3d_inplace(const Tensor& t, std::int64_t rows, std::int64_t heads, std::int64_t dim, bool to_f16,
                         cudaStream_t stream) {
   if (rows == 0 || heads == 0 || dim == 0) return;
-  if (rows > kMaxBlocks) return;  // the engine's varlen token counts stay far below 2^31 blocks; never reached
+  // One block per row on grid.x, whose limit is 2^31 - 1 (kMaxBlocks is the grid-stride cap of the flat kernels).
+  if (rows > 0x7fffffff) throw std::length_error("sm75::convert_3d_inplace: more rows than one grid dimension holds");
   auto* base = static_cast<char*>(t.data);
   for (std::int64_t h = 0; h < heads; ++h) {
     char* p = base + h * static_cast<std::int64_t>(t.stride[1]) * 2;

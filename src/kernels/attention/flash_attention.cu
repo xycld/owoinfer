@@ -153,16 +153,12 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
   int device = 0, smem_per_sm = 0, smem_per_block = 0;
   MI_CUDA_CHECK(cudaGetDevice(&device));
 #if MOSSINFER_HAVE_SM75
-  {
-    int major = 0;
-    MI_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
-    if (major < 8) {
-      // Turing: the vendored kernel's own sm_75 traits (fp16 MMA, no cp.async) run in the sm_75 kernel family;
-      // q/k/v/out are converted around the launch there.
-      kernels::sm75::flash_fwd(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen, causal, scale, workspace,
-                               workspace_bytes, stream);
-      return;
-    }
+  if (kernels::sm75::turing()) {
+    // Turing: the vendored kernel's own sm_75 traits (fp16 MMA, no cp.async) run in the sm_75 kernel family;
+    // q/k/v/out are converted around the launch there.
+    kernels::sm75::flash_fwd(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen, causal, scale, workspace,
+                             workspace_bytes, stream);
+    return;
   }
 #endif
   require_sm80(device);

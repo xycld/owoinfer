@@ -20,6 +20,7 @@
 #include "core/varlen.h"
 #include "kernels/gdn/checks.h"
 #include "kernels/gdn/gdn.h"
+#include "kernels/sm75/sm75.h"
 
 namespace mi::gdn {
 namespace {
@@ -462,7 +463,8 @@ void allow_dynamic_smem(Kernel kernel, int bytes) {
 // sm_75: the chunked kernel needs ~85 KiB of shared memory (PrepSmem), over Turing's 64 KiB per block. This per-token
 // recurrent form computes the same rule (the chunked algorithm is an algebraic rearrangement of it) with the 128 state
 // columns split across two launches of 64: every state column is independent, so the split is exact. 33 KiB of dynamic
-// shared memory, 64 threads per block.
+// shared memory, 64 threads per block. Built in an MOSSINFER_SM75 build only (the dispatch below).
+#if MOSSINFER_HAVE_SM75
 constexpr int kSm75Cols = 64;
 
 template <typename OutT>
@@ -531,6 +533,7 @@ __global__ void recurrent_sm75_kernel(const __nv_bfloat16* __restrict__ qkv, std
     for (int i = 0; i < kHeadDim; ++i) fs[i * kHeadDim + col] = s[i * kSm75Cols + c];
   }
 }
+#endif
 
 }  // namespace
 
@@ -559,11 +562,10 @@ void chunk_gated_delta_rule(const Tensor& qkv, const Tensor& g, const Tensor& be
   workspace_layout(tokens, workspace, &ws);
 
   // sm_75: the chunked kernels need ~85 KiB of shared memory, over Turing's 64 KiB per block. The recurrent form above
-  // computes the same rule with 33 KiB; its numerics are fp32 like the chunked path's.
-  int sm75_device = 0, sm75_major = 0;
-  MI_CUDA_CHECK(cudaGetDevice(&sm75_device));
-  MI_CUDA_CHECK(cudaDeviceGetAttribute(&sm75_major, cudaDevAttrComputeCapabilityMajor, sm75_device));
-  if (sm75_major < 8) {
+  // computes the same rule with 33 KiB; its numerics are fp32 like the chunked path's. Only an MOSSINFER_SM75 build
+  // checks (once per device, kernels::sm75::turing()); without it the probe never accepts a 7.x device.
+#if MOSSINFER_HAVE_SM75
+  if (kernels::sm75::turing()) {
     constexpr int kSm75Smem = (kHeadDim * kSm75Cols + 2 * kHeadDim + 4) * static_cast<int>(sizeof(float));
     const dim3 grid(kNumVHeads, num_seqs, kHeadDim / kSm75Cols);
     recurrent_sm75_kernel<__nv_bfloat16><<<grid, kSm75Cols, kSm75Smem, stream>>>(
@@ -572,6 +574,7 @@ void chunk_gated_delta_rule(const Tensor& qkv, const Tensor& g, const Tensor& be
     MI_CUDA_CHECK_LAUNCH();
     return;
   }
+#endif
 
   constexpr int kPrepSmem = sizeof(PrepSmem), kStateSmem = sizeof(StateSmem);
   allow_dynamic_smem(prep_kernel, kPrepSmem);

@@ -289,7 +289,7 @@ Limits, checked before any pixel is read: each side 1 to 16384, at most 64,000,0
 - `denoise_strength` unset with an init image is 0.75. An explicit 1 with an init image and no mask is txt2img: the image is not used, and `MI_TEXT_IMAGE_NOTE` says so. 0 runs no step: the result is the image's VAE round trip.
 - The steps that run: of a pass's N scheduled steps (after snapping), the first `int(N - N * strength)` are skipped. `mi_result_steps_scheduled()` and the progress callback's `total_steps` count the steps that run, both passes of a hires fix included.
 - The `DATASPACE` sampler cannot start from an image (img2img, inpainting, hires fix).
-- An `MOSSINFER_SM75` build has no VAE encoder kernel: img2img and inpainting are refused up front with `MI_ERR_NOT_SUPPORTED`, before anything is loaded or planned; txt2img and the hires fix still run. Runtime LoRAs and control adapters are refused the same way (their GEMM kernels are sm_80+) ([sm75.md](sm75.md#not-supported-on-sm75-yet)).
+- An `MOSSINFER_SM75` build has no VAE encoder kernel: img2img, inpainting, reference images and the hires fix are refused up front with `MI_ERR_NOT_SUPPORTED`, before anything is loaded or planned; txt2img still runs. Runtime LoRAs and control adapters are refused the same way (their GEMM kernels are sm_80+) ([sm75.md](sm75.md#not-supported-on-sm75-yet)).
 
 | `mi_mask_encoding` | Values |
 |---|---|

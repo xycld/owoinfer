@@ -939,11 +939,10 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     // the LoRA files too). The lossy accelerators are an explicit speed opt-in: the tier is resolved without them.
     const std::filesystem::path te_file = tes.model ? tes.path : std::filesystem::path();
     const auto supported = [](planner::AttentionMode mode) { return moss_dit::attention_supported(dit_attention(mode)); };
-    // sm_75 (and any device without an 8-bit attention kernel): the tier's default 8-bit attention does not exist, so
-    // the caller's unset attention resolves to exact instead of failing. On sm_80+ an 8-bit kernel always exists, so
-    // the fallback only ever runs on such devices.
-    const bool exact_when_no_q8 = !supported(planner::AttentionMode::kQ8Fp8) &&
-                                  !supported(planner::AttentionMode::kQ8Fp16);
+    // sm_75: no 8-bit attention kernel exists for Turing, so the caller's unset attention resolves to exact instead of
+    // failing. Keyed on the device, not on the kernels' availability: an sm_80+ build without them (MOSSINFER_ONLY)
+    // still refuses, as before.
+    const bool exact_when_no_q8 = kernels::sm75::turing();
     r.tier = planner::resolve_tier(m.options.tier, m.options.attention, src.precision, supported,
                                    tes.precision != qwen35_text::Precision::kBF16,
                                    src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available(),
@@ -1507,12 +1506,21 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   check_user_paths(m.options, req);
   validate(req);
   // Two features still need sm_80+ kernels and are refused here, before anything is planned, read or uploaded: the VAE
-  // encoder's convolutions (img2img and inpainting) and the LoRA GEMMs (runtime LoRAs, and control adapters, which carry
-  // a LoRA). The message names the reason and what does work, instead of failing at a missing kernel image mid-request.
+  // encoder's convolutions (img2img, inpainting, reference images, and the hires fix, whose second pass encodes the
+  // upscaled image) and the LoRA GEMMs (runtime LoRAs, and control adapters, which carry a LoRA). The message names the
+  // reason and what does work, instead of failing at a missing kernel image mid-request.
   if (kernels::sm75::turing()) {
     if (req.init_image != nullptr) {
       throw NotSupportedError("img2img and inpainting encode the input with the VAE encoder, which has no sm_75 kernel "
-                              "in this build; text-to-image works, and so does the hires fix (it only decodes)");
+                              "in this build; text-to-image works");
+    }
+    if (req.hires.enabled()) {
+      throw NotSupportedError("the hires fix encodes the upscaled image with the VAE encoder, which has no sm_75 kernel "
+                              "in this build; text-to-image without it works");
+    }
+    if (req.references.enabled()) {
+      throw NotSupportedError("reference images are encoded with the VAE encoder, which has no sm_75 kernel in this "
+                              "build; text-to-image without them works");
     }
     if (!req.loras.empty()) {
       throw NotSupportedError("runtime LoRAs need sm_80+ GEMM kernels; this sm_75 build cannot apply them");

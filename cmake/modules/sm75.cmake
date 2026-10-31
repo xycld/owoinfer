@@ -8,7 +8,7 @@
 #   - the probe accepts compute capability 7.5 (MOSSINFER_HAVE_SM75 on probe.cpp, and 75-real in its architecture list,
 #     cmake/modules/backend.cmake),
 #   - the portable SIMT translation units are also compiled for sm_75,
-#   - flash_attention.cu / gemm.cpp dispatch into the sm_75 kernels,
+#   - flash_attention.cu / gemm.cpp / chunk_rule.cu dispatch into the sm_75 kernels,
 #   - the sm75_check bring-up tool is built.
 # Tolerates the sources being filtered out by MOSSINFER_ONLY.
 set(_mi_sm75_sources ${MOSSINFER_SOURCES})
@@ -93,6 +93,7 @@ if(MOSSINFER_SM75 AND _mi_sm75_sources)
   set_property(SOURCE ${CMAKE_SOURCE_DIR}/src/backend/probe.cpp
                       ${CMAKE_SOURCE_DIR}/src/kernels/attention/flash_attention.cu
                       ${CMAKE_SOURCE_DIR}/src/kernels/basic/gemm.cpp
+                      ${CMAKE_SOURCE_DIR}/src/kernels/gdn/chunk_rule.cu
                APPEND PROPERTY COMPILE_DEFINITIONS MOSSINFER_HAVE_SM75=1)
   message(STATUS "SM75: compute capability 7.5 accepted")
 

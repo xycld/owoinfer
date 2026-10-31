@@ -1,5 +1,5 @@
-// src/kernels/sm75: the Turing kernel family's build presence and its dtype conversion (the only piece that runs on
-// any device, so this file also works as a smoke test that the sm_75 object library is linked in).
+// src/kernels/sm75: the Turing kernel family's build presence (any device, a smoke test that the sm_75 object library
+// is linked in) and its dtype conversion (built 75-real only, so it runs on a Turing device alone).
 #include <gtest/gtest.h>
 
 #include <cuda_bf16.h>
@@ -20,7 +20,7 @@ using mi::DType;
 using mi::Device;
 using mi::Tensor;
 
-float bf16_to_float(std::uint16_t bits) {
+[[maybe_unused]] float bf16_to_float(std::uint16_t bits) {
   const std::uint32_t u = static_cast<std::uint32_t>(bits) << 16;
   float f = 0;
   std::memcpy(&f, &u, sizeof f);
@@ -58,6 +58,13 @@ struct DeviceBf16 {
   }
 };
 
+[[maybe_unused]] std::uint16_t float_to_f16_bits(float f) {
+  const __half h = __float2half_rn(f);
+  std::uint16_t bits = 0;
+  std::memcpy(&bits, &h, sizeof bits);
+  return bits;
+}
+
 }  // namespace
 
 TEST(Sm75Build, KernelFamilyPresence) {
@@ -76,6 +83,7 @@ TEST(GpuSm75Convert, RoundTripIsExactInFp16Range) {
 #ifndef MOSSINFER_HAVE_SM75
   GTEST_SKIP() << "built without MOSSINFER_SM75";
 #else
+  if (!mi::kernels::sm75::turing()) GTEST_SKIP() << "the sm_75 kernels are built 75-real: needs a Turing device";
   // 65504 is the largest fp16 value but not representable in bf16 (it rounds to 65536, which overflows fp16 to inf):
   // values above fp16's range are the documented sm_75 numerics difference, not tested here.
   const std::vector<float> values = {0.f, 1.f, -1.f, 2.5f, -3.14159f, 123.456f, -1024.f, 32768.f, 1e-3f, -7e-2f};
@@ -98,6 +106,7 @@ TEST(GpuSm75Convert, StridedInPlaceConversionTouchesOnlyTheView) {
 #ifndef MOSSINFER_HAVE_SM75
   GTEST_SKIP() << "built without MOSSINFER_SM75";
 #else
+  if (!mi::kernels::sm75::turing()) GTEST_SKIP() << "the sm_75 kernels are built 75-real: needs a Turing device";
   constexpr int kRows = 3, kHeads = 2, kDim = 8, kHeadStride = 16;  // heads interleaved: [token][head][16]
   std::vector<float> storage(static_cast<std::size_t>(kRows) * kHeads * kHeadStride, -12345.f);
   DeviceBf16 buf(storage);
@@ -107,6 +116,19 @@ TEST(GpuSm75Convert, StridedInPlaceConversionTouchesOnlyTheView) {
   view.stride[2] = 1;
   const std::vector<std::uint16_t> before = buf.host();
   mi::kernels::sm75::convert_tensor_bf16_to_f16_inplace(view, kRows, kHeads, kDim, nullptr);
+  MI_CUDA_CHECK(cudaDeviceSynchronize());
+  // Converted: the view holds fp16 bits (a different pattern from bf16 for -12345), the padding is untouched.
+  const std::vector<std::uint16_t> mid = buf.host();
+  const std::uint16_t f16 = float_to_f16_bits(bf16_to_float(before[0]));
+  ASSERT_NE(f16, before[0]);
+  for (int r = 0; r < kRows; ++r) {
+    for (int h = 0; h < kHeads; ++h) {
+      for (int d = 0; d < kHeadStride; ++d) {
+        const std::size_t i = static_cast<std::size_t>(r) * kHeads * kHeadStride + h * kHeadStride + d;
+        EXPECT_EQ(mid[i], d < kDim ? f16 : before[i]) << "converted r " << r << " h " << h << " d " << d;
+      }
+    }
+  }
   mi::kernels::sm75::convert_tensor_f16_to_bf16_inplace(view, kRows, kHeads, kDim, nullptr);
   MI_CUDA_CHECK(cudaDeviceSynchronize());
   const std::vector<std::uint16_t> after = buf.host();

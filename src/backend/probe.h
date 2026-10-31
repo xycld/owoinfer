@@ -23,7 +23,7 @@ namespace mi::backend {
 #define MOSSINFER_HAVE_SM75 0
 #endif
 inline constexpr int kMinComputeMajor = MOSSINFER_HAVE_SM75 ? 7 : 8;
-inline constexpr int kMinComputeMinor = 0;
+inline constexpr int kMinComputeMinor = MOSSINFER_HAVE_SM75 ? 5 : 0;
 
 // Release flavours, named by the CUDA major version of the toolkit they are built with.
 enum class Flavour { kNone, kCuda12, kCuda13 };

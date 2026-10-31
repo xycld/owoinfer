@@ -48,7 +48,8 @@ __global__ void conv2d_f32_sm75(const float* __restrict__ x, const float* __rest
     for (int i = tid; i < kTK * 9 * kTC; i += kConvThreads) {
       const int cc = i % kTC, t = i / kTC, rs = t % 9, kk = t / 9;
       const int kch = kb * kTK + kk, gc = c0 + cc;
-      ws[i] = (kch < K && gc < C)
+      // The tile holds 9 taps; a 1x1 filter (R = 1) has one, and reading the other 8 would run past the end of w.
+      ws[i] = (kch < K && gc < C && rs < R * R)
                   ? w[(static_cast<std::int64_t>(kch) * R + rs / R) * R * C + (rs % R) * C + gc]
                   : 0.f;
     }
