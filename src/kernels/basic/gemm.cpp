@@ -201,8 +201,9 @@ struct Gemm::Impl {
       const float alpha = 1.0f, beta = 0.0f;
       MI_LT_CHECK(cublasLtMatmul(handle, plan.desc, &alpha, w.data, plan.a, x16, plan.b, &beta, dptr, plan.d, dptr,
                                  plan.d, &plan.algo, workspace, plan.workspace, stream));
-      kernels::sm75::convert_gemm_out_f16(static_cast<char*>(out.data) + r0 * ldo * 2, dptr, bias_ptr, bias_f32,
-                                          out_f32, rows, n, ldo, acc_ld, stream);
+      // The output row offset in bytes: f32 rows are 4 bytes per element (dptr above is acc16 for them).
+      kernels::sm75::convert_gemm_out_f16(static_cast<char*>(out.data) + r0 * ldo * (out_f32 ? 4 : 2), dptr, bias_ptr,
+                                          bias_f32, out_f32, rows, n, ldo, acc_ld, stream);
     }
   }
 };

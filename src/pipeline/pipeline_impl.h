@@ -218,6 +218,9 @@ inline void check_user_paths(const PipelineOptions& o, const Request& r) {
   for (const lora::LoraSpec& l : r.loras) util::check_user_path(l.path, "loras");
 }
 
+// On a Turing device: throws NotSupportedError for what still needs sm_80+ kernels (pipeline.cpp). No-op elsewhere.
+void refuse_unsupported_on_sm75(const Request& req);
+
 inline moss_dit::SkipSet skip_set(const std::vector<int>& layers) {
   moss_dit::SkipSet s;
   for (const int l : layers) s.set(static_cast<std::size_t>(l));
