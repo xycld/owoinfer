@@ -354,7 +354,12 @@ std::size_t MossDit::graph_bytes() const { return graphs_.size() * (graph_cache_
 void MossDit::set_block_path(BlockPath path) {
   path_ = path;
   graphs_.clear();
-  last_step_hash_ = 0;
+  recent_step_hashes_.clear();
+}
+
+void MossDit::set_graph_window(int forwards) {
+  graph_window_ = static_cast<std::size_t>(std::clamp(forwards, 1, kGraphCapacity / kLayers));
+  while (recent_step_hashes_.size() > graph_window_) recent_step_hashes_.erase(recent_step_hashes_.begin());
 }
 
 std::size_t MossDit::persistent_bytes(const weights::ModelIndex& index) { return persistent_bytes(index, Residency{}); }
@@ -1393,8 +1398,11 @@ void MossDit::forward(const Tensor& latents, float timestep, std::span<const Row
     if (qa.lora != nullptr) key.variant |= qa.lora->generation() << 8;
     key.route_generation = route.generation;
     const std::uint64_t h = key.hash();
-    use_graphs = h == last_step_hash_;
-    last_step_hash_ = h;
+    const auto seen = std::find(recent_step_hashes_.begin(), recent_step_hashes_.end(), h);
+    use_graphs = seen != recent_step_hashes_.end();
+    if (use_graphs) recent_step_hashes_.erase(seen);
+    recent_step_hashes_.push_back(h);
+    if (recent_step_hashes_.size() > graph_window_) recent_step_hashes_.erase(recent_step_hashes_.begin());
   }
 
   // Step caching (StepCacheHook): a reuse after block 0 ends the loop and the streaming pass there.

@@ -86,6 +86,18 @@ int latents_of(const RunSpec& spec) {
   return l;
 }
 
+// Joint tokens (h * w + text per row) of the run's largest forward: the largest latent's rows (a call runs one forward
+// per latent), or with `batched` (a streamed DiT's single forward over every latent) all of them.
+std::int64_t largest_forward_tokens(const RunSpec& spec, const Guidance& g, bool batched) {
+  const std::int64_t video = std::int64_t{spec.height / 16} * (spec.width / 16);
+  std::vector<std::int64_t> per_latent(static_cast<std::size_t>(std::max(latents_of(spec), 1)), 0);
+  for (const auto& [bit, k] : evaluated_rows(spec, g, false)) {
+    const RunRow& row = spec.rows[static_cast<std::size_t>(k)];
+    per_latent[static_cast<std::size_t>(batched ? 0 : row.latent)] += video + row.conditioning->length();
+  }
+  return *std::max_element(per_latent.begin(), per_latent.end());
+}
+
 Shape run_shape(const RunSpec& spec, const Guidance& g, int steps, bool latent0_only) {
   Shape sh;
   sh.height = spec.height;
@@ -174,6 +186,10 @@ struct Session::Run {
   bool schedule_matches = false;
   std::string schedule_note;
   int latents = 1;
+  // A latent batch on a streamed DiT: each call is one batched forward over every latent (the weights stream once per
+  // step); otherwise a call runs one forward per latent (Session::step).
+  bool batched = false;
+  std::uint64_t graph_replays_at_begin = 0;
   std::int64_t h = 0, w = 0;
   std::uint32_t row_bits = 0;  // the rows a call may evaluate
   int outputs = 0;
@@ -334,6 +350,7 @@ struct Session::State {
     m.dit->set_input_extension(nullptr);
     m.dit->set_step_cache(nullptr);
     m.dit->set_graphs_paused(false);
+    m.dit->set_graph_window(1);
   }
 
   // The most pinned host bytes the staging may hold: the host budget left when one is set. Without one, the bound is
@@ -454,13 +471,13 @@ void Session::validate(const RunSpec& spec, const SessionOptions& options) {
     throw std::invalid_argument("The schedule has no step left (denoise strength 0): the VAE round trip needs no run.");
   }
   if (!spec.sigmas.empty()) RunSchedule(spec.sigmas, spec.exact_sigma);  // its errors name the first bad value
-  std::int64_t tokens = 0;
-  const std::int64_t video = std::int64_t{spec.height / 16} * (spec.width / 16);
-  for (const std::int64_t s : run_shape(spec, g, 1, false).rows) tokens += video + s;
+  // A call runs one forward per latent, so the cap applies to each latent's rows (begin_run adds the batch's sum when a
+  // streamed DiT runs one batched forward).
+  const std::int64_t tokens = largest_forward_tokens(spec, g, false);
   if (tokens > kMaxCallTokens) {
-    throw std::invalid_argument("The run's largest call would carry " + std::to_string(tokens) + " tokens, more than the " +
-                                std::to_string(kMaxCallTokens) + " the DiT's fused path validated (MI_MAX_CALL_TOKENS): use " +
-                                "fewer rows or latents per run, or a smaller size.");
+    throw std::invalid_argument("The run's largest forward would carry " + std::to_string(tokens) + " tokens, more than " +
+                                "the " + std::to_string(kMaxCallTokens) + " the DiT's fused path validated " +
+                                "(MI_MAX_CALL_TOKENS): use fewer rows per latent, or a smaller size.");
   }
 }
 
@@ -637,6 +654,17 @@ void Session::begin_run(const RunSpec& spec) {
     throw std::invalid_argument("MI_RUN_CROPS's crop workspace would keep " + std::to_string(blocks) +
                                 " DiT blocks resident, fewer than the " + std::to_string(crop_ref) + " without it.");
   }
+  // A streamed DiT runs a latent batch as one batched forward (one pass of the weights per step), whose tokens are the
+  // batch's sum: the cap validate() applied per latent then applies to the sum.
+  R.batched = R.latents > 1 && m.dit_residency(r.plan.dit).streamed();
+  if (R.batched) {
+    const std::int64_t tokens = largest_forward_tokens(spec, g, true);
+    if (tokens > kMaxCallTokens) {
+      throw std::invalid_argument("The streamed DiT runs the latent batch as one forward of " + std::to_string(tokens) +
+                                  " tokens, more than the " + std::to_string(kMaxCallTokens) + " the DiT's fused path " +
+                                  "validated (MI_MAX_CALL_TOKENS): use fewer latents per run, or a smaller size.");
+    }
+  }
   s.apply_plan(models, planned, r);
   s.staging.ensure(R.layout.bytes, s.staging_budget());  // planned: before any load
   R.block = s.staging.block();
@@ -720,6 +748,8 @@ void Session::begin_run(const RunSpec& spec) {
   R.check = std::make_unique<runtime::DevicePointerCheck>(s.options.device);
   R.stepped.assign(static_cast<std::size_t>(n), 0);
   s.shape = sh;
+  m.dit->set_graph_window(R.batched ? 1 : R.latents);  // the latents' forwards cycle through up to L step shapes
+  R.graph_replays_at_begin = m.dit->graph_stats().replays;
   clear.keep = true;
   restore.keep = true;
   s.run = std::move(run);
@@ -926,7 +956,15 @@ StepReport Session::step(const StepArgs& a) {
     ++nf;
   }
   if (crop) {
-    const std::size_t need = m.dit->forward_stack_bytes(hc, wc, lengths);
+    // The largest forward the call runs: the batched one on a streamed DiT, else the largest latent's.
+    std::size_t need = 0;
+    for (int l = 0; l < (R.batched ? 1 : R.latents); ++l) {
+      std::vector<std::int64_t> ll;
+      for (int f = 0; f < nf; ++f) {
+        if (R.batched || frows[f].latent == l) ll.push_back(lengths[static_cast<std::size_t>(f)]);
+      }
+      if (!ll.empty()) need = std::max(need, m.dit->forward_stack_bytes(hc, wc, ll));
+    }
     if (need > m.arena->available()) {
       throw std::invalid_argument("The crop " + std::to_string(wc * 16) + "x" + std::to_string(hc * 16) + " needs " +
                                   std::to_string(need) + " bytes of forward workspace, more than the " +
@@ -986,22 +1024,24 @@ StepReport Session::step(const StepArgs& a) {
           R.ctl_dirty = false;
         }
         // A control window opened or closed: the DiT's input changed, so the next call runs in full (as mi_generate).
-        if (R.ctl_in->apply(first, pos.step, n, stream) > 0 && R.cache) R.cache->invalidate();
+        // The run's control latents feed latent 0 only (the others' are zeros): only its residuals are dropped.
+        if (R.ctl_in->apply(first, pos.step, n, stream) > 0 && R.cache) R.cache->invalidate(0);
         m.control_ext.extra = view(R.ctl_extra.data, R.h, R.w);
       }
     }
-    if (a.control_changed && R.cache) R.cache->invalidate();
+    if (a.control_changed && R.cache) R.cache->invalidate();  // the call's control may differ for any latent
     if (crop) {
       m.dit->set_step_cache(nullptr);  // crops bypass the step cache, its state untouched
       m.dit->set_graphs_paused(true);  // and CUDA graphs: one-off shapes run eagerly
     }
     // A call over several latents runs one forward per latent, its rows in row order: each latent gets its single-image
-    // forward (mi_generate's shapes, graphs and bits, a side branch's GEMM included), since on a power-capped GPU one
-    // batched forward costs more than the latents' forwards in turn (E45). Each forward makes its own step-cache
-    // decision, so a latent reuses exactly as its image alone.
+    // forward (mi_generate's shapes, graphs and bits, a side branch's GEMM included), since one batched forward over
+    // the latents took ~1.2 % more GPU time than their forwards in turn at the same clock (E45: a kernel / shape
+    // effect). Each forward makes its own step-cache decision, so a latent reuses exactly as its image alone. A
+    // streamed DiT keeps one batched forward, so its weights stream once per step (R.batched).
     bool several = false;
     for (int f = 1; f < nf; ++f) several = several || frows[f].latent != frows[0].latent;
-    if (!several) {
+    if (!several || R.batched) {
       m.dit->forward(xf, timestep, std::span<const moss_dit::Row>(frows, static_cast<std::size_t>(nf)),
                      std::span<const Tensor>(fouts, static_cast<std::size_t>(nf)), stream);
     } else {
@@ -1092,6 +1132,7 @@ RunResult Session::State::finish_run() {
   out.schedule_matches = R.schedule_matches;
   out.off_schedule_calls = R.schedule->off_schedule_calls();
   out.calls = R.schedule->calls();
+  if (m.dit) out.graph_replays = m.dit->graph_stats().replays - R.graph_replays_at_begin;
   for (std::size_t k = 0; k < R.spec.rows.size(); ++k) {
     if (!R.spec.rows[k].conditioning->engine_encoded) out.foreign_rows.push_back(static_cast<int>(k));
   }

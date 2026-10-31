@@ -15,7 +15,7 @@
 // para_attn/first_block_cache, "First Block Cache", 2024; the same method as ComfyUI-WaveSpeed's apply_first_block_cache),
 // on the MOSS DiT through moss_dit::StepCacheHook. Every DiT call runs block 0; its output residual r0 = x1 - x0 on the
 // video tokens of every row is compared with r0 of the last call that ran every block:
-//   diff = sum |r0 - r0_prev| / sum |r0_prev|   (summed over all rows of the call: the batched-CFG semantics)
+//   diff = sum |r0 - r0_prev| / sum |r0_prev|   (summed over all rows of the forward: the batched-CFG semantics)
 // diff < threshold reuses the cache: blocks 1..41 do not run (nor are streamed), and each row's video tokens become
 // x1 + R with R the row's residual of blocks 1..41 from that last full call (R = x_41 - x1). Otherwise every block runs
 // and r0_prev and R are refreshed. Residuals are bf16, as the reference keeps them in the model dtype. The comparison
@@ -23,8 +23,11 @@
 // text tensor, skip set and latent: cond, uncond, SLG, and per image of a latent batch) has its own residuals; a call
 // with a row the cache has not computed yet (the first call, the SLG row entering its window, a changed skip set) runs
 // every block, as does the call after invalidate() (the pipeline's: a control input's step window opened or closed);
-// a row absent from a call loses its residuals, so a row identity that comes back never gets a stale R. The decision
-// needs one device-to-host synchronization per call. Works with every block path (CUDA graphs: block 0 replays, the
+// a row absent from a call loses its residuals, so a row identity that comes back never gets a stale R. Each forward
+// decides for its own rows: a component run's latent batch runs one forward per latent (Session::step), so each latent
+// reuses as its image alone would, and a forward over one latent judges absences among that latent's rows only (a
+// batched forward over several latents, a streamed DiT's, judges every row). The decision needs one device-to-host
+// synchronization per forward. Works with every block path (CUDA graphs: block 0 replays, the
 // hook runs between graphs), streamed blocks (a reuse ends the streaming pass after block 0), LoRA side branches and
 // INT8/INT4 blocks: the hook only reads and writes the residual stream.
 // TeaCache (Liu et al. 2024, "Timestep Embedding Tells: It's Time to Cache for Video Diffusion Model") is not offered:
@@ -132,6 +135,9 @@ class FirstBlockCache final : public moss_dit::StepCacheHook {
   // Drops every row's residuals: the next call runs every block (the caller changed the DiT's inputs beyond the rows,
   // e.g. a control input switched on or off between steps, which block 0's relative change may not reveal).
   void invalidate();
+  // Drops the residuals of `latent`'s rows only (a latent batch whose input changed for that latent alone, e.g. a run's
+  // control window, which feeds latent 0): that latent's next forward runs every block.
+  void invalidate(int latent);
 
   int calls() const { return calls_; }
   int reused() const { return reused_; }

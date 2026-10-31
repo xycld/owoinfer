@@ -923,8 +923,9 @@ MOSSINFER_API mi_status mi_result_control(const mi_result* result, mi_control_in
 typedef struct mi_accel_info {
   size_t struct_size;
   int32_t cfg_truncated_steps; /* steps run without the negative branch (CFG truncation) */
-  int32_t dit_calls;           /* DiT calls with the step cache on */
-  int32_t cached_calls;        /* of them, calls that reused the cache (the blocks after block 0 skipped) */
+  /* DiT forwards with the step cache on (a component run's latent batch on a resident DiT: one per latent and call) */
+  int32_t dit_calls;
+  int32_t cached_calls;        /* of them, forwards that reused the cache (the blocks after block 0 skipped) */
   /* The request's settings activate a lossy accelerator (MI_TEXT_ACCELERATORS). It describes the requested, active
    * settings, not what ran: a run cancelled before sampling still reports 1. */
   int32_t lossy;
@@ -934,14 +935,14 @@ typedef struct mi_accel_info {
 } mi_accel_info;
 /* `out` has struct_size set by the caller: the current size or the 24-byte one. */
 MOSSINFER_API mi_status mi_result_accel(const mi_result* result, mi_accel_info* out);
-/* The 1-based steps (counting on across the passes of a hires fix) with a DiT call that reused the step cache, in
- * order; owned by the result. `count` (required) receives their number. NULL with *count 0 when there are none, and
- * for a NULL result or count (mi_last_error_message() then set). */
+/* The 1-based steps (counting on across the passes of a hires fix) with a DiT call that reused the step cache (a
+ * component run's latent batch: any latent's forward), in order; owned by the result. `count` (required) receives their
+ * number. NULL with *count 0 when there are none, and for a NULL result or count (mi_last_error_message() then set). */
 MOSSINFER_API const int32_t* mi_result_accel_cached_steps(const mi_result* result, size_t* count);
-/* The relative change of DiT block 0's output that the step cache measured at every DiT call with the cache on (both
- * passes of a hires fix), in order: what the threshold was compared against; NaN where a call had nothing to compare
- * with. Owned by the result; `count` (required) receives their number. NULL with *count 0 when there are none, and for a
- * NULL result or count (mi_last_error_message() then set). */
+/* The relative change of DiT block 0's output that the step cache measured at every DiT forward with the cache on (both
+ * passes of a hires fix; a latent batch's forwards in latent order), in order: what the threshold was compared against;
+ * NaN where a call had nothing to compare with. Owned by the result; `count` (required) receives their number. NULL
+ * with *count 0 when there are none, and for a NULL result or count (mi_last_error_message() then set). */
 MOSSINFER_API const double* mi_result_accel_step_cache_diffs(const mi_result* result, size_t* count);
 
 /* What the image input ran (MI_CAP_IMAGE_INPUT, MI_CAP_HIRES). */
@@ -1229,8 +1230,10 @@ MOSSINFER_API void mi_check_report_free(mi_check_report* report);
 #define MI_LATENT_CHANNELS 128
 #define MI_LATENT_SCALE 16
 #define MI_TEXT_DIM 4096
-/* The most tokens one call may carry, summed over its rows (h * w + prompt tokens each): the longest run the fused
- * block path's startup self-check validated. mi_run_begin() refuses a run whose rows exceed it. */
+/* The most tokens one forward may carry, summed over its rows (h * w + prompt tokens each): the longest run the fused
+ * block path's startup self-check validated. A call runs one forward per latent, so the cap applies to each latent's
+ * rows; on a streamed DiT a latent batch runs as one forward, and the cap applies to the batch's sum. mi_run_begin()
+ * refuses a run whose rows exceed it. */
 #define MI_MAX_CALL_TOKENS 61506
 #define MI_MAX_ROWS 8 /* rows per run and per call (the DiT's varlen limit), latents included */
 
@@ -1457,7 +1460,8 @@ typedef struct mi_step_params {
 
 /* mi_step_params.flags */
 /* The per-call control latent differs from the previous call's: the step cache is invalidated before this call (the
- * next reuse needs a full call), as mi_generate invalidates it when a control window opens or closes. */
+ * next reuse needs a full call), for every latent of a batch, as mi_generate invalidates it when a control window
+ * opens or closes. (The run's own control windows invalidate latent 0's residuals only: the latent they feed.) */
 #define MI_STEP_CONTROL_CHANGED 0x1u
 
 /* An output struct: struct_size set by the caller. */
@@ -1465,7 +1469,7 @@ typedef struct mi_step_info {
   size_t struct_size;
   int32_t step;        /* the step position used */
   uint32_t rows;       /* rows evaluated */
-  int32_t cached;      /* the step cache reused its residual (a batch: for at least one latent) */
+  int32_t cached;      /* the step cache reused its residual (a latent batch: for at least one latent) */
   int32_t on_schedule; /* sigma is sigmas[step], or sigmas[step + 1] with an explicit step (a corrector) */
   double seconds;      /* wall time of the call */
 } mi_step_info;
@@ -1499,12 +1503,12 @@ MOSSINFER_API mi_status mi_run_staging(mi_engine* engine, mi_tensor* x, mi_tenso
                                        mi_tensor* control);
 MOSSINFER_API mi_status mi_step_params_init(mi_step_params* params, size_t struct_size);
 /* One model evaluation of the call's rows at (x, sigma): one batched varlen forward over each latent's rows (rows of
- * different prompt lengths included), a batch's latents in turn; returns when the outputs are written (device mode:
- * also ordered into cuda_stream). Tensors: all device, or all host and exactly the staging views; x must not alias
- * an output; else MI_ERR_INVALID_ARGUMENT (the run usable). A job: MI_ERR_BUSY while one runs. mi_cancel() stops it
- * within one DiT block: MI_CANCELLED, outputs undefined, the run usable (step cache invalidated). On return, whatever
- * the status, the engine no longer reads x or control and no longer writes out[]. `out_info` (struct_size set by the
- * caller) may be NULL. */
+ * different prompt lengths included), a batch's latents in turn (on a streamed DiT, one forward over them all); returns
+ * when the outputs are written (device mode: also ordered into cuda_stream). Tensors: all device, or all host and
+ * exactly the staging views; x must not alias an output; else MI_ERR_INVALID_ARGUMENT (the run usable). A job:
+ * MI_ERR_BUSY while one runs. mi_cancel() stops it within one DiT block: MI_CANCELLED, outputs undefined, the run
+ * usable (step cache invalidated). On return, whatever the status, the engine no longer reads x or control and no
+ * longer writes out[]. `out_info` (struct_size set by the caller) may be NULL. */
 MOSSINFER_API mi_status mi_denoise_step(mi_engine* engine, const mi_step_params* params, mi_step_info* out_info);
 /* Ends the run, interrupt-safe: cancels a step running on another thread and waits for it (MI_ERR_BUSY, nothing done,
  * from a callback of the running call); also after a cancelled or failed step. Releases the run's stack, step cache

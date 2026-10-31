@@ -471,6 +471,40 @@ TEST(GpuAccel, FirstBlockCacheKeysRowsByLatent) {
   EXPECT_EQ(cache.diffs().back(), 0.0);
 }
 
+// A forward over several latents (a streamed DiT's batched forward) drops every absent row identity's residuals, also
+// another latent's; invalidate(latent) drops one latent's rows only (a run's control window, which feeds latent 0).
+TEST(GpuAccel, FirstBlockCacheMixedLatentsAndPerLatentInvalidation) {
+  const std::int64_t video = 8;
+  mi::runtime::DeviceArena arena(std::size_t{64} << 20);
+  mi::runtime::StackScope scope(arena);
+  const Tensor cond = arena.alloc_tensor(mi::DType::kBF16, {4, mi::moss_dit::kDim});
+  SkipSet skip5;
+  skip5.set(5);
+  const Row img0{cond, {}, 0}, img1{cond, {}, 1}, img1s{cond, skip5, 1};
+  accel::FirstBlockCache cache(arena, 2, 4, 3, 0.1);
+  FakeDit dit{arena, video, true};
+  const std::vector<float> r0 = {0.5f, -0.25f, 1.0f};
+  const std::vector<float> rest = {2.0f, 0.75f, -1.5f, 0.125f};
+  bool reused = true;
+  dit.run(cache, {img0, img1, img1s}, r0, rest, &reused);
+  EXPECT_FALSE(reused);
+  // Both latents without img1s: a mixed-latent forward judges every identity, so img1s loses its residuals.
+  dit.run(cache, {img0, img1}, r0, rest, &reused);
+  EXPECT_TRUE(reused);
+  dit.run(cache, {img0, img1, img1s}, r0, rest, &reused);
+  EXPECT_FALSE(reused) << "img1s kept residuals across a mixed-latent forward without it";
+  dit.run(cache, {img0, img1, img1s}, r0, rest, &reused);
+  EXPECT_TRUE(reused);
+  // Latent 1 invalidated: latent 0's rows still reuse, latent 1's run in full.
+  cache.invalidate(1);
+  dit.run(cache, {img0}, r0, rest, &reused);
+  EXPECT_TRUE(reused);
+  dit.run(cache, {img1, img1s}, r0, rest, &reused);
+  EXPECT_FALSE(reused);
+  dit.run(cache, {img1, img1s}, r0, rest, &reused);
+  EXPECT_TRUE(reused);
+}
+
 // ---- GPU: the real DiT ----
 
 // The step-cache seam as a deterministic cancel point: delegates to a FirstBlockCache and sets the cancel flag in

@@ -188,6 +188,7 @@ struct RunResult {
   std::int64_t off_schedule_calls = 0;
   std::int64_t calls = 0;
   std::vector<int> foreign_rows;  // rows whose conditioning was not engine-encoded
+  std::uint64_t graph_replays = 0;  // CUDA graph replays of the run's forwards (kFusedGraphs; tests)
   // How the sigmas differ from the engine's schedule for the scheduler fields, the off-schedule calls and the foreign
   // rows (MI_TEXT_COMPONENT_NOTE; "" when none applies).
   std::string note;

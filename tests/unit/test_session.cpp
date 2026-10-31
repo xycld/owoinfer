@@ -174,6 +174,9 @@ TEST(Session, TokenCap) {
   EXPECT_NO_THROW(Session::validate(s, options(4)));
   s.rows.push_back({cond(4096), {}, 0});
   refused(s, options(4), "81920 tokens, more than the 61506");
+  // The cap is per latent (one forward per latent): the same four rows over two latents carry 40960 each.
+  s.rows[2].latent = s.rows[3].latent = 1;
+  EXPECT_NO_THROW(Session::validate(s, options(4, 2)));
   // MOSS's largest call (cond, uncond, SLG) stays within the range at any valid size and text length: the self-check
   // validated exactly three rows of 4.2 MP and 4096 tokens.
   RunSpec m;
@@ -482,6 +485,86 @@ TEST_F(GpuSession, TableALatentsEqualGenerate) {
     std::vector<float> second(x.begin() + static_cast<std::ptrdiff_t>(n), x.end());
     EXPECT_EQ(differing(second, ref8.latents.data(), n), 0u) << "image 1 of the batch";
   }
+  EXPECT_TRUE(session.close());
+}
+
+// A latent batch whose latents' forwards differ in shape (prompts of different lengths) with the CUDA-graph block path:
+// the forwards alternate between two step shapes, and both replay their graphs (the DiT's graph window is the run's
+// latent count); each image still equals mi_generate's final latents.
+TEST_F(GpuSession, LatentForwardsOfDifferentShapesReplayGraphs) {
+  mi::pipeline::PipelineOptions po = pipeline_options();
+  po.block_path = mi::moss_dit::BlockPath::kFusedGraphs;
+  mi::pipeline::Pipeline pipe(po);
+  mi::runtime::JobGate gate;
+  mi::pipeline::Request qa = moss_request();
+  qa.decode = false;
+  qa.prompt = "an old lighthouse on a basalt cliff at golden hour, waves breaking into white spray, gulls circling";
+  mi::pipeline::Request qb = qa;
+  qb.prompt = "a red apple";
+  qb.seed = 8;
+  pipe.generate(qa);  // loads the models and fills the embedding cache
+  const mi::pipeline::Result ra = pipe.generate(qa), rb = pipe.generate(qb);
+  ASSERT_FALSE(ra.latents.empty());
+  SessionOptions so;
+  so.plan_request = qa;
+  so.max_rows = 4;
+  so.max_latents = 2;
+  Session session(pipe, gate, so);
+  const std::vector<std::string> prompts = {qa.prompt, qb.prompt, qa.negative_prompt};
+  const auto conds = session.encode_texts(prompts, qa.max_sequence_length);
+  ASSERT_NE(conds[0]->length(), conds[1]->length());
+  RunSpec spec;
+  spec.width = qa.width;
+  spec.height = qa.height;
+  spec.steps = qa.steps;
+  spec.rows = {{conds[0], {}, 0}, {conds[2], {22}, 0}, {conds[1], {}, 1}, {conds[2], {22}, 1}};
+  session.begin_run(spec);
+  const mi::pipeline::RunInfo info = session.run_info();
+  const mi::pipeline::StagingViews v = session.staging();
+  const std::vector<float> s = session.run_sigmas();
+  const std::size_t n = ra.latents.size();
+  const float g = static_cast<float>(qa.cfg);
+  std::vector<float> x;
+  for (const std::int64_t seed : {qa.seed, qb.seed}) {
+    const std::vector<float> nz =
+        mi::pipeline::initial_noise(qa.noise_layout, static_cast<std::uint64_t>(seed), 128, info.latent_height, info.latent_width);
+    for (const float e : nz) {
+      const float p = s[0] * e;
+      const float z = (1.0f - s[0]) * 0.0f;
+      x.push_back(p + z);
+    }
+  }
+  for (int i = 0; i < info.steps; ++i) {
+    const float si = s[static_cast<std::size_t>(i)], sn = s[static_cast<std::size_t>(i) + 1];
+    std::copy(x.begin(), x.end(), static_cast<float*>(v.x.data));
+    mi::pipeline::StepArgs a;
+    a.sigma = si;
+    a.x = v.x;
+    a.out = v.out;
+    session.step(a);
+    const float h = static_cast<float>(static_cast<double>(sn) - static_cast<double>(si));
+    for (std::size_t l = 0; l < 2; ++l) {
+      const auto* c = static_cast<const float*>(v.out[2 * l].data);
+      const auto* u = static_cast<const float*>(v.out[2 * l + 1].data);
+      for (std::size_t k = 0; k < n; ++k) {
+        const float d = c[k] - u[k];
+        const float t = g * d;
+        const float vel = u[k] + t;
+        const float m = h * vel;
+        x[l * n + k] = x[l * n + k] + m;
+      }
+    }
+  }
+  const std::optional<mi::pipeline::RunResult> done = session.end_run();
+  ASSERT_TRUE(done.has_value());
+  EXPECT_GT(done->graph_replays, 0u) << "the latents' alternating step shapes never replayed their graphs";
+  std::size_t da = 0, db = 0;
+  for (std::size_t k = 0; k < n; ++k) {
+    da += x[k] != ra.latents[k];
+    db += x[n + k] != rb.latents[k];
+  }
+  EXPECT_EQ(da, 0u) << "image 0 differs from mi_generate's final latents";
+  EXPECT_EQ(db, 0u) << "image 1 differs from mi_generate's final latents";
   EXPECT_TRUE(session.close());
 }
 

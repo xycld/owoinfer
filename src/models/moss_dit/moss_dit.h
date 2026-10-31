@@ -299,6 +299,11 @@ class MossDit {
   // While paused, kFusedGraphs forwards run eagerly and leave the cached graphs as they are (a component run's crop
   // calls: one-off shapes neither capture graphs nor evict the run's). Set between forwards.
   void set_graphs_paused(bool paused) { graphs_paused_ = paused; }
+  // How many forwards a step shape may lie back and still replay with kFusedGraphs: 1 (default) replays a shape only
+  // right after a forward of the same shape; a component run's latent batch, one forward per latent, cycles through up
+  // to L shapes (prompt lengths, rows). Clamped to the shapes the graph cache holds (kGraphCapacity / kLayers). Set
+  // between forwards.
+  void set_graph_window(int forwards);
   // Device memory the cached CUDA graphs hold outside the arena now (graph_cache_bytes()'s per-graph bound each).
   std::size_t graph_bytes() const;
 
@@ -554,7 +559,9 @@ class MossDit {
   std::size_t host_bytes_ = 0;
   BlockPath path_ = BlockPath::kFused;
   StepGraphs graphs_{kGraphCapacity};  // per-block graphs of a few step shapes
-  std::uint64_t last_step_hash_ = 0;  // step shape of the previous forward (graphs are captured once it repeats)
+  // Step shapes of the last graph_window_ forwards, oldest first, each once (graphs are captured once a shape recurs).
+  std::vector<std::uint64_t> recent_step_hashes_;
+  std::size_t graph_window_ = 1;
   bool graphs_paused_ = false;
 };
 

@@ -1094,7 +1094,8 @@ Vec concat(std::initializer_list<Vec> parts) {
 
 // Latent batches (design §5.2): L = 2 (4 rows) and L = 4 (8 rows), the host's CFG per latent, in host staging and in
 // device mode: each image's final latents equal its own single-image run (L = 1) bit for bit, and the first image is
-// mi_generate's RGB bytes. A batch over MI_MAX_CALL_TOKENS (L = 2 with CFG at 2048^2) is refused.
+// mi_generate's RGB bytes. The cap applies per latent (a call runs one forward per latent on a resident DiT): one latent
+// with four rows at 2048^2 is refused, naming MI_MAX_CALL_TOKENS.
 TEST_F(GpuComponentRuns, LatentBatchesEqualSingleImages) {
   ASSERT_EQ(open_session(engine_, 8, 4), MI_OK) << last_error();
   const char* prompts[] = {"a red apple on a wooden table, studio light", "a cat",
@@ -1134,7 +1135,7 @@ TEST_F(GpuComponentRuns, LatentBatchesEqualSingleImages) {
     }
   }
 
-  const std::vector<mi_run_row> rows = cfg_rows(conds, 2, 4);
+  const std::vector<mi_run_row> rows = {row(conds[0]), row(conds[1]), row(conds[2]), row(conds[3])};
   mi_run_params big = run_params(rows, MI_GUIDANCE_HOST, MI_STEP_OUTPUT_ROWS);
   big.width = big.height = 2048;
   EXPECT_EQ(mi_run_begin(engine_, &big), MI_ERR_INVALID_ARGUMENT);
@@ -1142,24 +1143,30 @@ TEST_F(GpuComponentRuns, LatentBatchesEqualSingleImages) {
 }
 
 // The batch's per-image bit identity on the other numerics of sm_89: the INT8 DiT with exact attention and the bf16 DiT
-// (tier reference): one L = 2 call (4 rows) at two sigmas equals the two images' L = 1 calls, output for output.
+// (tier reference), resident (one forward per latent) and streamed at an 8 GiB budget (one batched forward over both
+// latents, its report's DiT streamed): one L = 2 call (4 rows) at two sigmas equals the two images' L = 1 calls,
+// output for output.
 TEST_F(GpuComponentRuns, LatentBatchOtherNumerics) {
   release_shared();
   struct Config {
     fs::path dit;
     mi_tier tier;
     mi_attention attention;
+    std::uint64_t budget;
     const char* name;
   };
-  for (const Config& cfg : {Config{kInt8, MI_TIER_HIGH, MI_ATTENTION_EXACT, "INT8, exact attention"},
-                            Config{fs::path(), MI_TIER_REFERENCE, MI_ATTENTION_EXACT, "bf16, tier reference"}}) {
+  for (const Config& cfg : {Config{kInt8, MI_TIER_HIGH, MI_ATTENTION_EXACT, 0, "INT8, exact attention"},
+                            Config{fs::path(), MI_TIER_REFERENCE, MI_ATTENTION_EXACT, 0, "bf16, tier reference"},
+                            Config{fs::path(), MI_TIER_REFERENCE, MI_ATTENTION_EXACT, std::uint64_t{8} << 30,
+                                   "bf16, tier reference, streamed at 8 GiB"}}) {
     SCOPED_TRACE(cfg.name);
-    mi_engine* e = create(cfg.dit, cfg.tier, cfg.attention);
+    mi_engine* e = create(cfg.dit, cfg.tier, cfg.attention, cfg.budget);
     ASSERT_NE(e, nullptr);
     ASSERT_EQ(open_session(e, 4, 2), MI_OK) << last_error();
     {
       const Conds conds = encode(e, {"a red apple on a wooden table, studio light", "a cat", "blurry"});
       const Vec xa = noise(7), xb = noise(8);
+      std::string report;
       const auto calls = [&](const std::vector<mi_run_row>& rows, const Vec& x) {
         const mi_run_params rp = run_params(rows, MI_GUIDANCE_HOST, MI_STEP_OUTPUT_ROWS);
         std::vector<Vec> got;
@@ -1177,10 +1184,12 @@ TEST_F(GpuComponentRuns, LatentBatchOtherNumerics) {
             for (int k = 0; k < ex.info().outputs; ++k) got.push_back(ex.out(k));
           }
         }
-        end_run(e);
+        report = end_run(e);
         return got;
       };
       const std::vector<Vec> batch = calls(cfg_rows(conds, 2, 2), concat({xa, xb}));
+      const std::string residency = mi::json::parse(report).at("plan").at("dit").at("residency").as_string();
+      EXPECT_EQ(residency, cfg.budget > 0 ? "streamed" : "resident");
       const std::vector<Vec> a = calls({row(conds[0]), row(conds[2], kSkip22, 1)}, xa);
       const std::vector<Vec> b = calls({row(conds[1]), row(conds[2], kSkip22, 1)}, xb);
       ASSERT_EQ(batch.size(), 8u);
@@ -2467,18 +2476,19 @@ TEST_F(GpuComponentRuns, Dpm2AndUniPcHostLoops) {
   EXPECT_TRUE(finite(x));
 }
 
-// The step cache at L = 2 (design §7.2): residuals per latent, and two rows with the same text on different latents in
-// separate slots. Two identical images in one run reuse exactly as the image alone (the same cached calls, each image
-// its single run's bits); two different images swapped between the latents swap their outputs bit for bit with the
-// same cached calls (shared slots would hand one image's residual to the other).
+// The step cache at L = 2 (design §7.2): each latent runs its own forward with its own residuals and reuse decision, so
+// each image of the batch equals its own step-cached single run bit for bit, at a threshold where the two singles'
+// cached steps differ (the first of a list that does: where they differ depends on the GPU), and the batch's cached
+// steps (mi_step_info.cached: any latent) are the union of the singles'. Rows with the same text on different latents
+// keep separate slots.
 TEST_F(GpuComponentRuns, StepCacheAtTwoLatents) {
   ASSERT_EQ(open_session(engine_, 2, 2), MI_OK) << last_error();
-  const Conds conds = encode(engine_, {"a red apple on a wooden table, studio light"});
+  const Conds conds = encode(engine_, {"a red apple on a wooden table, studio light", "a cat"});
   const Vec a = noise(7), b = noise(8);
-  const auto run = [&](const std::vector<mi_run_row>& rows, const Vec& x0, std::vector<int>& cached) {
+  const auto run = [&](const std::vector<mi_run_row>& rows, const Vec& x0, double threshold, std::vector<int>& cached) {
     mi_run_params rp = run_params(rows, MI_GUIDANCE_HOST, MI_STEP_OUTPUT_ROWS, 8);
     rp.step_cache = MI_STEP_CACHE_FBCACHE;
-    rp.step_cache_threshold = 0.9;  // reuses whatever it may
+    rp.step_cache_threshold = threshold;
     EXPECT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
     const Vec s = run_sigmas(engine_);
     Vec x;
@@ -2499,21 +2509,42 @@ TEST_F(GpuComponentRuns, StepCacheAtTwoLatents) {
     end_run(engine_);
     return x;
   };
-  std::vector<int> cached_single, cached_same, cached_ab, cached_ba;
-  const Vec single = run({row(conds[0])}, a, cached_single);
-  EXPECT_FALSE(cached_single.empty()) << "the threshold reused nothing: the test shows nothing";
-  const std::vector<mi_run_row> two = {row(conds[0]), row(conds[0], nullptr, 0, 1)};
-  const Vec same = run(two, concat({a, a}), cached_same);
-  EXPECT_EQ(cached_same, cached_single);
-  EXPECT_EQ(differing(slice(same, 0), single), 0u) << "latent 0 differs from the image alone";
-  EXPECT_EQ(differing(slice(same, 1), single), 0u) << "latent 1 differs from the image alone";
-  const Vec ab = run(two, concat({a, b}), cached_ab);
-  const Vec ba = run(two, concat({b, a}), cached_ba);
-  EXPECT_FALSE(cached_ab.empty());
-  EXPECT_EQ(cached_ab, cached_ba);
-  EXPECT_GT(differing(slice(ab, 0), slice(ab, 1)), 0u);
-  EXPECT_EQ(differing(slice(ab, 0), slice(ba, 1)), 0u) << "image a depends on its latent slot";
-  EXPECT_EQ(differing(slice(ab, 1), slice(ba, 0)), 0u) << "image b depends on its latent slot";
+  double threshold = 0;
+  std::vector<int> cached_a, cached_b;
+  Vec single_a, single_b;
+  for (const double t : {0.25, 0.22, 0.28, 0.2, 0.33, 0.18, 0.36, 0.15, 0.4, 0.13, 0.45, 0.3}) {
+    cached_a.clear();
+    cached_b.clear();
+    single_a = run({row(conds[0])}, a, t, cached_a);
+    single_b = run({row(conds[1])}, b, t, cached_b);
+    const auto str = [](const std::vector<int>& v) {
+      std::string o;
+      for (const int k : v) o += std::to_string(k) + " ";
+      return o;
+    };
+    std::printf("[step cache] threshold %.2f: cached a {%s} b {%s}\n", t, str(cached_a).c_str(), str(cached_b).c_str());
+    if (cached_a != cached_b) {
+      threshold = t;
+      break;
+    }
+  }
+  ASSERT_GT(threshold, 0) << "no threshold gave the two images different cached steps: the test shows nothing";
+  SCOPED_TRACE("threshold " + std::to_string(threshold));
+  std::vector<int> cached_union = cached_a;
+  cached_union.insert(cached_union.end(), cached_b.begin(), cached_b.end());
+  std::sort(cached_union.begin(), cached_union.end());
+  cached_union.erase(std::unique(cached_union.begin(), cached_union.end()), cached_union.end());
+  std::vector<int> cached_ab;
+  const Vec ab = run({row(conds[0]), row(conds[1], nullptr, 0, 1)}, concat({a, b}), threshold, cached_ab);
+  EXPECT_EQ(differing(slice(ab, 0), single_a), 0u) << "image a differs from its step-cached single run";
+  EXPECT_EQ(differing(slice(ab, 1), single_b), 0u) << "image b differs from its step-cached single run";
+  EXPECT_EQ(cached_ab, cached_union) << "the batch's cached steps are not the union of the singles'";
+  // The same text on both latents: separate slots, each image its single run's bits and cached steps.
+  std::vector<int> cached_same;
+  const Vec same = run({row(conds[0]), row(conds[0], nullptr, 0, 1)}, concat({a, a}), threshold, cached_same);
+  EXPECT_EQ(cached_same, cached_a);
+  EXPECT_EQ(differing(slice(same, 0), single_a), 0u) << "latent 0 differs from the image alone";
+  EXPECT_EQ(differing(slice(same, 1), single_a), 0u) << "latent 1 differs from the image alone";
 }
 
 // Interrupts (design §7.2): a run abandoned between calls, a run whose step was cancelled mid-forward, and a run whose

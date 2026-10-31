@@ -513,18 +513,20 @@ TEST(ComponentApi, SessionOptions) {
 }
 
 TEST(ComponentApi, TokenCap) {
-  // 2048^2 with L = 2 and CFG: 4 rows of 16384 + text tokens each exceed MI_MAX_CALL_TOKENS.
+  // The cap applies per latent's rows (a call runs one forward per latent): at 2048^2, L = 2 with CFG carries 2 rows of
+  // 16384 + text tokens per latent and passes; the same 4 rows on one latent exceed MI_MAX_CALL_TOKENS. (A streamed
+  // DiT's batched forward over the sum is checked at mi_run_begin, after planning.)
   Cond a(50), b(10);
   const std::int32_t skip22[] = {22};
-  const mi_run_row rows[4] = {
+  mi_run_row rows[4] = {
       {a.c, nullptr, 0, 0, 0}, {b.c, skip22, 1, 0, 0}, {a.c, nullptr, 0, 1, 0}, {b.c, skip22, 1, 1, 0}};
   mi_run_params p = run_defaults();
   p.width = p.height = 2048;
   p.rows = rows;
   p.rows_count = 4;
-  refused(p, session_options(4, 2), "MI_MAX_CALL_TOKENS");
-  p.width = p.height = 1024;
   EXPECT_NO_THROW(mi::api::to_run_spec(p, session_options(4, 2)));
+  rows[2].latent = rows[3].latent = 0;
+  refused(p, session_options(4, 2), "MI_MAX_CALL_TOKENS");
 }
 
 TEST(ComponentApi, StepArgs) {
