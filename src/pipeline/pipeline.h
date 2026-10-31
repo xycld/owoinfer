@@ -42,6 +42,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -70,6 +71,13 @@ inline constexpr int kMaxSide = 4096;
 inline constexpr std::int64_t kMaxPixels = 4'200'000;
 // Upper bound for PipelineOptions sizes taken from user input (vram_option_bytes).
 inline constexpr std::size_t kMaxVramBytes = std::size_t{1024} << 30;
+
+// A feature this build or device does not implement (MI_ERR_NOT_SUPPORTED through the C API; the server reports it as
+// `not_supported`). Raised before any work is planned, e.g. for img2img and runtime LoRAs on an sm_75 build, whose VAE
+// encoder and LoRA GEMMs are still sm_80 kernels.
+struct NotSupportedError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
 // One generation, mirroring the assets' parameters.json (gradio_app.py GenerationConfig) plus engine choices.
 struct Request {

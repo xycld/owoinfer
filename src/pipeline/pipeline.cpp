@@ -1506,6 +1506,21 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   Impl& m = *impl_;
   check_user_paths(m.options, req);
   validate(req);
+  // Two features still need sm_80+ kernels and are refused here, before anything is planned, read or uploaded: the VAE
+  // encoder's convolutions (img2img and inpainting) and the LoRA GEMMs (runtime LoRAs, and control adapters, which carry
+  // a LoRA). The message names the reason and what does work, instead of failing at a missing kernel image mid-request.
+  if (kernels::sm75::turing()) {
+    if (req.init_image != nullptr) {
+      throw NotSupportedError("img2img and inpainting encode the input with the VAE encoder, which has no sm_75 kernel "
+                              "in this build; text-to-image works, and so does the hires fix (it only decodes)");
+    }
+    if (!req.loras.empty()) {
+      throw NotSupportedError("runtime LoRAs need sm_80+ GEMM kernels; this sm_75 build cannot apply them");
+    }
+    if (req.control.enabled()) {
+      throw NotSupportedError("control adapters are LoRAs and need sm_80+ GEMM kernels; this sm_75 build cannot run them");
+    }
+  }
   Result r;
   r.tier.tier = m.options.tier;  // what a run cancelled before the tier is resolved reports
   Timings& tm = r.timings;

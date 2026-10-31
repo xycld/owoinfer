@@ -565,6 +565,8 @@ mi_status guarded(F&& body) noexcept {
     return fail(MI_ERR_INVALID_ARGUMENT, e.what());
   } catch (const mi::api::NotSupportedError& e) {
     return fail(MI_ERR_NOT_SUPPORTED, e.what());
+  } catch (const mi::pipeline::NotSupportedError& e) {
+    return fail(MI_ERR_NOT_SUPPORTED, e.what());
   } catch (const mi::planner::BudgetError& e) {
     return fail(MI_ERR_OUT_OF_MEMORY, e.what());
   } catch (const mi::runtime::BudgetError& e) {
