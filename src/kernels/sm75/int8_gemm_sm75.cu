@@ -2,6 +2,9 @@
 // MMA and tiles that fit 64 KiB of shared memory.
 #include "kernels/sm75/int8_sm75.h"
 
+#include <atomic>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 
 #include "kernels/quant/int8_gemm_impl.cuh"
@@ -10,6 +13,62 @@ namespace mi::kernels::sm75 {
 namespace qd = quant::detail;
 
 namespace {
+
+// The SiTU factor tables of the Turing epilogue: the sm_80 tables (int8_gemm_situ.cu) are filled by a kernel built for
+// sm_80+ only, so the sm_75 path keeps its own 256 KiB copy, filled once per device by a kernel built for 75. The
+// factors are the same functions, so a lookup is bit-identical to the sm_80 table's value.
+constexpr int kBf16Values = 1 << 16;
+__device__ std::uint16_t g_situ_gate[kBf16Values];
+__device__ std::uint16_t g_situ_hidden[kBf16Values];
+
+__global__ void situ_tables_sm75_kernel() {
+  const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const float x = __uint_as_float(static_cast<std::uint32_t>(i) << 16);
+  g_situ_gate[i] = __bfloat16_as_ushort(__float2bfloat16_rn(qd::situ_gate_factor(x)));
+  g_situ_hidden[i] = __bfloat16_as_ushort(__float2bfloat16_rn(qd::situ_hidden_factor(x)));
+}
+
+// Fill once per device (see quant::detail::situ_factor_tables; the same lock and capture handling).
+qd::SituFactorTables situ_tables(cudaStream_t stream) {
+  constexpr int kMaxDevices = 64;
+  struct Device {
+    std::atomic<bool> filled{false};
+    std::atomic<const std::uint16_t*> gate{nullptr}, hidden{nullptr};
+  };
+  static Device devices[kMaxDevices];
+  static std::mutex fill_mutex;
+  int dev = 0;
+  MI_CUDA_CHECK(cudaGetDevice(&dev));
+  if (dev < 0 || dev >= kMaxDevices) throw std::runtime_error("mi::kernels::sm75: device ordinal out of range");
+  Device& d = devices[dev];
+  const auto fill = [&] {
+    constexpr int kThreads = 256;
+    situ_tables_sm75_kernel<<<kBf16Values / kThreads, kThreads, 0, stream>>>();
+    MI_CUDA_CHECK_LAUNCH();
+  };
+  if (!d.filled.load(std::memory_order_acquire)) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    MI_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+      fill();
+    } else {
+      const std::lock_guard<std::mutex> lock(fill_mutex);
+      if (!d.filled.load(std::memory_order_relaxed)) {
+        fill();
+        MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+        d.filled.store(true, std::memory_order_release);
+      }
+    }
+  }
+  if (d.gate.load(std::memory_order_acquire) == nullptr) {
+    void *gate = nullptr, *hidden = nullptr;
+    MI_CUDA_CHECK(cudaGetSymbolAddress(&gate, g_situ_gate));
+    MI_CUDA_CHECK(cudaGetSymbolAddress(&hidden, g_situ_hidden));
+    d.hidden.store(static_cast<const std::uint16_t*>(hidden), std::memory_order_release);
+    d.gate.store(static_cast<const std::uint16_t*>(gate), std::memory_order_release);
+  }
+  return {d.gate.load(std::memory_order_acquire), d.hidden.load(std::memory_order_acquire)};
+}
 
 using Sm75Tile = qd::TileCfg<64, 128, 64, 32, 64, 2>;  // threadblock 64x128, warp 32x64, K 64, 2 stages: 24 KiB
 using Sm75Instr = cutlass::gemm::GemmShape<8, 8, 16>;
@@ -58,7 +117,7 @@ void situ_glu(const qd::Problem& p, const quant::Int8Operands& a, __nv_bfloat16*
   auto* d = reinterpret_cast<std::uint8_t*>(out);
   const std::int64_t ldd = 2 * ldo;
   const typename N::SituGlu::Arguments cb{
-      {{}, {const_cast<float*>(a.x_scale), 0.f, {_1{}, _0{}, p.m}}, {a.w_scale}, {}},
+      {{}, {const_cast<float*>(a.x_scale), 0.f, {_1{}, _0{}, p.m}}, {a.w_scale}, situ_tables(stream)},
       {d, {ldd, _1{}, ldd * p.m}}};
   qd::launch<Gemm>("sm75::int8_gemm_situ_glu", p, a, cb, stream);
 }
