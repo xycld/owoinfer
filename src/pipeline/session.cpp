@@ -381,6 +381,7 @@ Session::Session(Pipeline& pipeline, JobGate& gate, SessionOptions options) {
   if (tok::python_strip(q.prompt).empty()) q.prompt = "preload";
   check_user_paths(pipeline.impl_->options, q);
   pipeline::validate(q);
+  refuse_unsupported_on_sm75(q);
   if (q.accel.step_cache_on() && !q.accel.step_cache_threshold) {
     throw std::invalid_argument("The step cache needs an explicit threshold in (0, 1] (step_cache_threshold).");
   }
@@ -463,7 +464,9 @@ void Session::validate(const RunSpec& spec, const SessionOptions& options) {
   }
   // The rules mi_generate's request shares (sizes, steps, schedule fields, CFG, SLG, control images, accelerators).
   const Guidance g = run_guidance(spec);
-  pipeline::validate(run_request(options, spec, g));
+  const Request run_q = run_request(options, spec, g);
+  pipeline::validate(run_q);
+  refuse_unsupported_on_sm75(run_q);
   if (spec.sigmas.empty() && !(std::isfinite(spec.denoise_strength) && spec.denoise_strength >= 0 && spec.denoise_strength <= 1)) {
     throw std::invalid_argument("Denoise strength must be between 0 and 1.");
   }

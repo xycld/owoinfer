@@ -289,12 +289,15 @@ struct Int8Gemm : cutlass::gemm::device::GemmUniversalBase<Kernel> {
 
 // The kernel: DefaultGemmWithVisitor (default_gemm_universal_with_visitor.h) with a B-operand permutation, without
 // the stream-K selection, in BandedSwizzle's tile order (GemmBase keeps CUTLASS's swizzle: only its Mma is used).
-template <class Tile, class Callbacks, class PermuteB = cutlass::layout::NoPermute>
+// ArchTag/InstrShape default to the sm_80 16x8x32 INT8 MMA; the sm_75 kernel family (src/kernels/sm75/int8_gemm_sm75.cu)
+// instantiates the same template with arch::Sm75 and the 8x8x16 MMA.
+template <class Tile, class Callbacks, class PermuteB = cutlass::layout::NoPermute,
+          class ArchTag = cutlass::arch::Sm80, class InstrShape = cutlass::gemm::GemmShape<16, 8, 32>>
 struct Int8Kernel {
   using GemmBase = typename cutlass::gemm::kernel::DefaultGemmUniversal<
       std::int8_t, RowMajor, cutlass::ComplexTransform::kNone, kAlignAB, std::int8_t, ColumnMajor,
       cutlass::ComplexTransform::kNone, kAlignAB, bf16, RowMajor, std::int32_t, cutlass::arch::OpClassTensorOp,
-      cutlass::arch::Sm80, typename Tile::Threadblock, typename Tile::Warp, InstructionShape,
+      ArchTag, typename Tile::Threadblock, typename Tile::Warp, InstrShape,
       cutlass::epilogue::thread::LinearCombination<bf16, kAlignC, std::int32_t, float>, Swizzle, Tile::stages,
       cutlass::arch::OpMultiplyAddSaturate, cutlass::gemm::SharedMemoryClearOption::kNone, false, false, false,
       cutlass::layout::NoPermute, cutlass::layout::NoPermute, PermuteB>::GemmKernel;

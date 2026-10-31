@@ -32,8 +32,8 @@ void extrapolate_latents(const Tensor& x, const Tensor& x_prev, float c, const T
 void unpack_int4(const void* in, std::int64_t ld_in, void* out, std::int64_t ld_out, std::int64_t rows, std::int64_t cols,
                  cudaStream_t stream);
 
-// out[r] = bf16(sum_c w[r, c] * x[c] + bias[r]) in fp32 (w bf16 [n, k] contiguous, widened; x, bias f32 device
-// arrays; out bf16 [n]): an fp32 nn.Linear on one row, rounded once. k % 8 == 0, w 16-byte aligned.
+// out[r] = bf16(sum_c w[r, c] * x[c] + bias[r]) in fp32 (w bf16, or fp16 on sm_75, [n, k] contiguous, widened; x, bias
+// f32 device arrays; out bf16 [n]): an fp32 nn.Linear on one row, rounded once. k % 8 == 0, w 16-byte aligned.
 void linear_fp32_row(const Tensor& w, const float* x, const float* bias, const Tensor& out, cudaStream_t stream);
 
 // Copies `bytes` (<= kMaxParamBytes) host bytes to dst through kernel arguments: no pinned staging,

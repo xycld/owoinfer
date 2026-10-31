@@ -1,5 +1,7 @@
 // int8_gemm_gated_residual (see quant.h).
 #include "kernels/quant/int8_gemm_impl.cuh"
+#include "kernels/sm75/int8_sm75.h"
+#include "kernels/sm75/sm75.h"
 
 namespace mi::kernels::quant {
 namespace detail {
@@ -36,6 +38,10 @@ void int8_gemm_gated_residual(const Int8Operands& op, const __nv_bfloat16* bias,
   detail::check_vector(name, "bias", bias, /*optional=*/true);
   detail::check_vector(name, "gate", gate, /*optional=*/false);
   if (p.m == 0) return;
+  if (kernels::sm75::turing()) {
+    kernels::sm75::int8_gemm_gated_residual(op, bias, gate, residual, ldr, stream);
+    return;
+  }
   detail::with_tile(detail::resolve_tile(tile, p), [&](auto cfg) {
     detail::gated_residual<decltype(cfg)>(p, op, bias, gate, residual, ldr, stream);
   });

@@ -5,6 +5,8 @@
 #include <string>
 
 #include "kernels/quant/int8_gemm_impl.cuh"
+#include "kernels/sm75/int8_sm75.h"
+#include "kernels/sm75/sm75.h"
 
 namespace mi::kernels::quant {
 namespace detail {
@@ -148,6 +150,10 @@ void int8_gemm(const Int8Operands& op, const __nv_bfloat16* bias, __nv_bfloat16*
   detail::check_output(name, "out", out, ldo, p.n);
   detail::check_vector(name, "bias", bias, /*optional=*/true);
   if (p.m == 0) return;
+  if (kernels::sm75::turing()) {  // Turing's 8x8x16 INT8 MMA (src/kernels/sm75/int8_gemm_sm75.cu)
+    kernels::sm75::int8_gemm(op, bias, out, ldo, stream);
+    return;
+  }
   detail::with_tile(detail::resolve_tile(tile, p),
                     [&](auto cfg) { detail::plain<decltype(cfg)>(p, op, bias, out, ldo, stream); });
 }

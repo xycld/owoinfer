@@ -1,6 +1,7 @@
 #include "models/moss_dit/dit_kernels.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstring>
 #include <stdexcept>
@@ -69,9 +70,13 @@ __global__ void unpack_int4_kernel(const std::uint8_t* in, std::int64_t ld_in, s
   out[r * ld_out + 2 * c + 1] = hi;
 }
 
-// One warp per output row; 8 bf16 weights per 16-byte load.
-__global__ void linear_fp32_row_kernel(const __nv_bfloat16* w, const float* x, const float* bias, __nv_bfloat16* out,
-                                       int n, int k) {
+__device__ __forceinline__ float widen(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float widen(__half v) { return __half2float(v); }
+
+// One warp per output row; 8 weights per 16-byte load. W is bf16, or fp16 on sm_75 (weights converted at load, exact
+// for in-range values).
+template <typename W>
+__global__ void linear_fp32_row_kernel(const W* w, const float* x, const float* bias, __nv_bfloat16* out, int n, int k) {
   const int row = static_cast<int>(blockIdx.x) * (blockDim.x / 32) + static_cast<int>(threadIdx.x) / 32;
   const int lane = static_cast<int>(threadIdx.x) % 32;
   if (row >= n) return;
@@ -79,8 +84,8 @@ __global__ void linear_fp32_row_kernel(const __nv_bfloat16* w, const float* x, c
   float acc = 0.0f;
   for (int i = lane; i < k / 8; i += 32) {
     const uint4 v = wr[i];
-    const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&v);
-    for (int j = 0; j < 8; ++j) acc = fmaf(__bfloat162float(h[j]), x[8 * i + j], acc);
+    const W* h = reinterpret_cast<const W*>(&v);
+    for (int j = 0; j < 8; ++j) acc = fmaf(widen(h[j]), x[8 * i + j], acc);
   }
   for (int o = 16; o > 0; o /= 2) acc += __shfl_xor_sync(0xffffffffu, acc, o);
   if (lane == 0) out[row] = __float2bfloat16_rn(acc + bias[row]);
@@ -194,15 +199,22 @@ void unpack_int4(const void* in, std::int64_t ld_in, void* out, std::int64_t ld_
 }
 
 void linear_fp32_row(const Tensor& w, const float* x, const float* bias, const Tensor& out, cudaStream_t stream) {
-  check(w.device == Device::kCUDA && w.dtype == DType::kBF16 && w.rank == 2 && w.is_contiguous() && w.dim(1) % 8 == 0 &&
+  check(w.device == Device::kCUDA && (w.dtype == DType::kBF16 || w.dtype == DType::kF16) && w.rank == 2 &&
+            w.is_contiguous() && w.dim(1) % 8 == 0 &&
             reinterpret_cast<std::uintptr_t>(w.data) % 16 == 0 && x != nullptr && bias != nullptr &&
             out.device == Device::kCUDA && out.dtype == DType::kBF16 && out.numel() == w.dim(0) && out.is_contiguous(),
-        "linear_fp32_row", "needs a contiguous 16-byte aligned CUDA bf16 w [n, k % 8 == 0] and a bf16 out [n]");
+        "linear_fp32_row", "needs a contiguous 16-byte aligned CUDA bf16/fp16 w [n, k % 8 == 0] and a bf16 out [n]");
   const auto n = static_cast<int>(w.dim(0));
   if (n == 0) return;
   constexpr int kWarps = 8;
-  linear_fp32_row_kernel<<<static_cast<unsigned>((n + kWarps - 1) / kWarps), 32 * kWarps, 0, stream>>>(
-      w.ptr<const __nv_bfloat16>(), x, bias, out.ptr<__nv_bfloat16>(), n, static_cast<int>(w.dim(1)));
+  const auto blocks = static_cast<unsigned>((n + kWarps - 1) / kWarps);
+  if (w.dtype == DType::kF16) {
+    linear_fp32_row_kernel<<<blocks, 32 * kWarps, 0, stream>>>(w.ptr<const __half>(), x, bias, out.ptr<__nv_bfloat16>(),
+                                                               n, static_cast<int>(w.dim(1)));
+  } else {
+    linear_fp32_row_kernel<<<blocks, 32 * kWarps, 0, stream>>>(w.ptr<const __nv_bfloat16>(), x, bias,
+                                                               out.ptr<__nv_bfloat16>(), n, static_cast<int>(w.dim(1)));
+  }
   MI_CUDA_CHECK_LAUNCH();
 }
 

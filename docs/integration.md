@@ -18,19 +18,19 @@ MossInfer is a low-level engine: it runs what the caller asks for, refuses what 
 
 | Area | What works |
 |---|---|
-| Platform | Linux x86-64 and Windows x64 (MSVC), each in a `cu12` and a `cu13` flavour, as a full package and a `-system-cuda` package. CI builds, packages and runs the CPU tests of all four flavours; GPU runs are verified on Linux `cu13`. |
-| GPUs | NVIDIA compute capability 8.x and 12.x: RTX 30xx, RTX 40xx, RTX 50xx, A100/A10/A40, L4/L40, RTX PRO Blackwell |
+| Platform | Linux x86-64 and Windows x64 (MSVC), each in a `cu12` and a `cu13` flavour, as a full package and a `-system-cuda` package. CI builds, packages and runs the CPU tests of all four standard flavours, plus the Windows CUDA 13 Turing build (`-sm75`); GPU runs are verified on Linux `cu13`. |
+| GPUs | NVIDIA compute capability 8.x and 12.x: RTX 30xx, RTX 40xx, RTX 50xx, A100/A10/A40, L4/L40, RTX PRO Blackwell. Compute capability 7.5 (Turing: RTX 20xx, T4, GTX 16xx) with a build configured `-DMOSSINFER_SM75=ON`: the bf16 GEMMs run as fp16 tensor-core GEMMs, INT8/INT4 ConvRot files run the INT8 GEMMs (INT4 through the INT8 unpack fallback), the exact attention and the VAE use the sm_75 kernels, and an unset attention resolves to `exact` (there is no 8-bit attention kernel on Turing). See [sm75.md](sm75.md). |
 | Models | MOSS-Image Base and SFT only: the official Hugging Face folders (bf16), read in place, and fine-tunes with the same architecture; other models are refused when they load. See [Supported models](#supported-models). |
 | Component model files | a single-file DiT, text encoder or VAE next to the bundle folder: ComfyUI and community files, INT8 ConvRot, INT4 ConvRot and NVFP4 DiT (NVFP4 on RTX 50 only), INT8 ConvRot and W4A8 text encoder (`dit_file`, `text_encoder_file`, `vae_file`); community GGUF DiTs (Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, BF16, F16), converted once into INT8 ConvRot or bf16 ([GGUF DiT files](#gguf-dit-files)) |
 | Generation | text-to-image with the official app's parameters: prompt, negative prompt, size, steps, CFG, shift, seed, skip layers, skip-layer guidance |
-| Quality tier | required, the caller's choice: `reference` (the DiT's bf16 GEMMs, exact attention), `high` (the loaded DiT's INT8 or bf16 GEMMs, 8-bit attention), `turbo` (a 4-bit DiT: INT4, or NVFP4 on an RTX 50, 8-bit attention); a tier the loaded files cannot run is refused with the reason, and the tier that ran is reported |
-| Image input | img2img (an init image and a denoise strength) and inpainting (a mask), with crop / fit / stretch resizing; pixels (library) or PNG / JPEG files (both surfaces) |
-| Hires fix | a second pass at a larger size from the first pass upscaled, with its own strength and steps |
+| Quality tier | required, the caller's choice: `reference` (the DiT's bf16 GEMMs, exact attention), `high` (the loaded DiT's INT8 or bf16 GEMMs, 8-bit attention), `turbo` (a 4-bit DiT: INT4, or NVFP4 on an RTX 50, 8-bit attention); a tier the loaded files cannot run is refused with the reason, and the tier that ran is reported. On an `MOSSINFER_SM75` build all three run; 8-bit attention becomes `exact` ([sm75.md](sm75.md#tiers-on-sm_75)) |
+| Image input | img2img (an init image and a denoise strength) and inpainting (a mask), with crop / fit / stretch resizing; pixels (library) or PNG / JPEG files (both surfaces). Needs the VAE encoder, so an `MOSSINFER_SM75` build refuses it with `not_supported` ([sm75.md](sm75.md#not-supported-on-sm75-yet)) |
+| Hires fix | a second pass at a larger size from the first pass upscaled, with its own strength and steps. Encodes the upscaled image, so an `MOSSINFER_SM75` build refuses it on Turing with `not_supported` ([sm75.md](sm75.md#not-supported-on-sm75-yet)) |
 | Distill bundles | few-step distilled checkpoints shipped as a bundle folder (time embedding, LoRA, data-space sampler parameters), applied per engine and per generation |
-| Control adapters | a control adapter file (a LoRA with a widened DiT input embedder, e.g. the MOSS-Image color / depth control) with one conditioning image per kind, each with a strength and a step window; pixels (library) or PNG / JPEG files (both surfaces). Opt-in. |
+| Control adapters | a control adapter file (a LoRA with a widened DiT input embedder, e.g. the MOSS-Image color / depth control) with one conditioning image per kind, each with a strength and a step window; pixels (library) or PNG / JPEG files (both surfaces). Opt-in. It is a LoRA, so an `MOSSINFER_SM75` build refuses it with `not_supported` |
 | Lossy accelerators | CFG truncation and a step cache (First-Block Cache), off by default. Opt-in: they change the image. |
-| Attention mode | exact (FlashAttention-2) or one of four 8-bit modes, as an override of the tier's default |
-| LoRAs | a list of files with strengths per generation, applied at run time: kohya, PEFT / diffusers, LyCORIS LoHa and LoKr, and full deltas; per-file reports and warnings |
+| Attention mode | exact (FlashAttention-2) or one of four 8-bit modes, as an override of the tier's default. An `-DMOSSINFER_SM75=ON` build has only `exact` (its own m16n8k8 kernel); the tier's 8-bit default resolves to `exact` with the reason saying so ([sm75.md](sm75.md#not-supported-on-sm75-yet)) |
+| LoRAs | a list of files with strengths per generation, applied at run time: kohya, PEFT / diffusers, LyCORIS LoHa and LoKr, and full deltas; per-file reports and warnings. Their GEMM kernels are sm_80+, so an `MOSSINFER_SM75` build refuses a request that carries LoRAs with `not_supported` |
 | Samplers and schedulers | 9 samplers (Euler, AB2, Euler ancestral, Heun, DPM++ 2M, DPM++ 2M SDE, ER-SDE, RES multistep, data-space), 7 schedulers, noise layout and source, eta, s_noise, flow multiplier |
 | Preview | a latent preview image during sampling, every N steps (library: a callback with RGB8; server: a PNG rewritten in place and a `preview` event) |
 | PNG metadata | the generation settings embedded in the PNG (`generation` record, schema `mossinfer.generation/1`, plus `parameters`), the prompts optional |
@@ -65,7 +65,7 @@ These are designed and partly built. The launcher can prepare for them now (see 
 
 | Area | Status |
 |---|---|
-| GPUs with compute capability below 8.0 (GTX 16xx, RTX 20xx and older) | not supported: the engine needs bf16 tensor cores |
+| GPUs with compute capability below 8.0 unless the build enables `MOSSINFER_SM75` (GTX 16xx, RTX 20xx and older) | not supported without that option: the engine needs bf16 tensor cores. With `-DMOSSINFER_SM75=ON` compute capability 7.5 runs (fp16 GEMMs + exact attention); older than 7.5 stays unsupported |
 | GPUs with compute capability 9.x, 10.x or 11.x (H100/H200, B200/GB200 and similar) | not supported: no kernels are built for them |
 | AMD, Intel and Apple GPUs; CPU-only machines; macOS | not supported |
 | 32-bit systems | not supported |
@@ -194,7 +194,7 @@ On top of that, the weights are read through the operating system's page cache. 
 
 ## Getting the binaries
 
-**From a release.** CI builds two archives per OS and flavour: `mossinfer-<version>-<os>-cu<12|13>-<arch>.zip` (the full package) and `mossinfer-<version>-<os>-cu<12|13>-<arch>-system-cuda.zip` (the same without cuBLASLt); Linux also gets `.tar.gz` of both. A GitHub release attaches the archives with one `SHA256SUMS` file. Release candidates (tags `vX.Y.Z-rcN`) are GitHub pre-releases; their archives and binaries carry the plain `X.Y.Z` version. See [Package contents](#package-contents).
+**From a release.** CI builds two archives per OS and flavour: `mossinfer-<version>-<os>-cu<12|13>-<arch>.zip` (the full package) and `mossinfer-<version>-<os>-cu<12|13>-<arch>-system-cuda.zip` (the same without cuBLASLt); Linux also gets `.tar.gz` of both. The Windows CUDA 13 SM75 preset additionally produces `mossinfer-<version>-windows-cu13-x86_64-sm75.zip`, a full package with Turing support. A GitHub release attaches the archives with one `SHA256SUMS` file. Release candidates (tags `vX.Y.Z-rcN`) are GitHub pre-releases; their archives and binaries carry the plain `X.Y.Z` version. See [Package contents](#package-contents).
 
 **From source** (Linux shown):
 
@@ -209,6 +209,7 @@ cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-
 ```
 
 - **glibc:** the archive needs the glibc of the machine that built it, or a newer one. Build on the oldest distribution you want to support. CI uses Ubuntu 22.04, which gives glibc 2.35. A build from a rolling distribution such as Arch will not start on Ubuntu LTS.
+- **Windows CUDA 13 with Turing:** from a Visual Studio x64 developer prompt, run `cmake --preset windows-msvc-cuda13-sm75`, `cmake --build --preset windows-msvc-cuda13-sm75`, `ctest --preset windows-msvc-cuda13-sm75`, then `cpack --config build-windows-msvc-cuda13-sm75/CPackConfig.cmake -B build-windows-msvc-cuda13-sm75`. This creates the full `-sm75.zip` package; the ordinary presets remain Ampere-and-newer. Any preset takes `-DMOSSINFER_SM75=ON`; what the build adds is in [sm75.md](sm75.md#build).
 - **Other presets:** `linux-cuda12`, `windows-msvc-cuda13` and `windows-msvc-cuda12`. The Windows presets run from a Visual Studio 2022 x64 developer prompt.
 
 ### Package contents
@@ -226,6 +227,7 @@ cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-
 
 **Two variants per flavour.**
 - **Full** (`mossinfer-…-cu13-x86_64.zip`): bundles cuBLASLt and the CUDA EULA. It runs on any machine with a suitable driver, and uses its own cuBLASLt by default (`auto`, see [CUDA libraries](#cuda-libraries)): results are reproducible across machines.
+- **SM75 full package** (`mossinfer-…-cu13-x86_64-sm75.zip`): the Windows CUDA 13 package built with `MOSSINFER_SM75=ON`; it includes bundled CUDA libraries and adds Turing support (compute capability 7.5). Keep this suffix when publishing assets so launchers can distinguish it from the standard package.
 - **System CUDA** (`mossinfer-…-cu13-x86_64-system-cuda.zip`): the same files without cuBLASLt and the EULA, several hundred MB smaller. It runs only where a compatible cuBLASLt is installed. It is made from the release presets, which link the CUDA runtime statically; a tree installed the same way from a build with a shared cudart (the dev preset) also needs a system cudart.
 - **Users with a CUDA toolkit** can use its cuBLASLt instead in two ways: download the smaller `-system-cuda` archive, or keep the full one and set `MOSSINFER_CUDA_LIBS=system`. A system copy of another cuBLASLt version can change result bits (see Reproducibility below).
 - **Which to offer:** the launcher decides from the probe. Run the probe of any installed copy with `MOSSINFER_CUDA_LIBS=system` (`hello`'s `probe.cublaslt`, or `mi_probe()`): when `source` is `"system"`, the machine has a compatible copy and the `-system-cuda` archive works there; otherwise offer the full one. A launcher that installs once for many machines ships the full archive.
@@ -330,6 +332,11 @@ RTX 5090, SFT, 1024², 50 steps, every model resident:
 
 The gain holds at 2048²: INT8 `high` runs 1.12 s per step against 2.77 s for bf16. 8-bit attention runs at every size; `attention` picks another kernel (`exact`, or the fp32-accumulating variants) when the caller wants one.
 
+An `-DMOSSINFER_SM75=ON` build on an RTX 2080 8 GiB (SFT, every model resident or streamed as planned) is slower but
+the same configuration ladder works: 0.80 s per 256² step for the bf16 bundle at `reference`, 0.19 s for an INT8 DiT at
+`high` (6.5 GiB peak), 0.22 s for an INT4 DiT at `turbo` (3.9 GiB peak); at 1024² the INT8 `high` runs 3.8 s per step and
+the VAE fp32 decode costs 10–12 s. Details in [sm75.md](sm75.md#performance).
+
 **Memory modes** trade host RAM for speed. `balanced` (the default) keeps the process near 8 GiB of private RAM, `min_memory` near 4 GiB (more streaming and parking, the lowest peaks), and `max_speed` uses what the machine has free (the text encoder held in RAM, pinned where there is room, and a larger embedding cache, so a new prompt starts sooner).
 
 **VRAM budgets.** A DiT that does not fit stays exact: its blocks stream to the GPU every step, from the page cache or a pinned copy in RAM, and each step pays the part of the copy not hidden behind compute. Streaming from disk instead of RAM costs several seconds per step, so leave RAM free for the page cache. An INT8 DiT moves half the bytes of the bf16 one: on 8 to 12 GiB cards it is also the fast choice. Leave `vram_budget_bytes` at 0 unless the GPU is shared; the engine plans against the memory that is actually free.
@@ -359,6 +366,13 @@ Decision procedure for the launcher:
    - `"cu12"`: the driver supports only CUDA 12. Install the `cu12` flavour, or ask the user to update the driver (580 or newer). The `cu13` server still lists the GPUs, each marked unsupported with the driver as the reason, and its `load` fails with `cuda`.
    - `""`: no usable GPU. Show `probe.message` (e.g. "no flavour recommended: no device has compute capability >= 8.0") and the per-device `unsupported_reason`.
 4. Use `devices[i].free_memory_bytes` for sizing hints in the UI. The engine checks memory again itself at generation time.
+
+**Turing machines.** The standard packages carry no `sm_75` kernel image, so their `hello` lists a compute capability
+7.5 device as unsupported (`"this build has no kernel image for compute capability 7.5"`). Install the `-sm75` package
+instead (the Windows CUDA 13 one today; any build configured `-DMOSSINFER_SM75=ON` carries it): its `hello` reports the
+device supported, while `recommended_flavour` stays `cu13` because that follows the driver, not the package. Branch on
+`devices[i].supported` and `unsupported_reason`, not on `recommended_flavour` alone, and prefer the `-sm75` asset when
+the only GPUs are 7.5. What such a build runs is in [sm75.md](sm75.md).
 
 ## Driving the sidecar
 

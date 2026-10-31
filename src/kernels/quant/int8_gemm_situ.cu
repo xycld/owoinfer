@@ -5,6 +5,8 @@
 #include <string>
 
 #include "kernels/quant/int8_gemm_impl.cuh"
+#include "kernels/sm75/int8_sm75.h"
+#include "kernels/sm75/sm75.h"
 
 namespace mi::kernels::quant {
 namespace detail {
@@ -102,6 +104,10 @@ void int8_gemm_situ_glu(const Int8Operands& op, __nv_bfloat16* out, std::int64_t
                                     std::to_string(ldo));
   }
   if (p.m == 0) return;
+  if (kernels::sm75::turing()) {
+    kernels::sm75::int8_gemm_situ_glu(op, out, ldo, stream);
+    return;
+  }
   detail::with_tile(detail::resolve_tile(tile, p),
                     [&](auto cfg) { detail::situ_glu<decltype(cfg)>(p, op, out, ldo, stream); });
 }

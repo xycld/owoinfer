@@ -8,6 +8,7 @@
 #include <string>
 
 #include "core/cuda_check.h"
+#include "kernels/sm75/sm75.h"
 #include "kernels/vae/vae_kernels.h"
 
 #include "cutlass/conv/conv2d_problem_size.h"
@@ -173,6 +174,7 @@ auto dispatch(const ConvShape& s, DType t, Fn&& fn) {
 
 std::size_t conv2d_workspace_bytes(const Tensor& x, const Tensor& w) {
   const ConvShape s = check_shapes(x, w);
+  if (x.dtype == DType::kF32 && kernels::sm75::fp16_weights()) return 0;  // the sm_75 fp32 kernel needs none
   return dispatch(s, x.dtype, [&]<typename Cfg>() { return workspace_for<Cfg>(s, x, w); });
 }
 
@@ -190,6 +192,11 @@ void conv2d(const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor* 
   check_out(y, "y");
   if (residual) check_out(*residual, "residual");
   if (y.data == x.data) throw std::invalid_argument("conv2d: y must not alias x");
+  if (kernels::sm75::fp16_weights()) {
+    if (x.dtype != DType::kF32) throw std::runtime_error("conv2d: the sm_75 path runs the VAE in fp32 (reference mode)");
+    kernels::sm75::vae_conv2d(x, w, bias, residual, y, stream);
+    return;
+  }
   dispatch(s, x.dtype, [&]<typename Cfg>() { run<Cfg>(s, x, w, bias, residual, y, workspace, workspace_bytes, stream); });
 }
 
@@ -227,6 +234,10 @@ void conv_weight_to_krsc(const Tensor& w_kcrs, const Tensor& w_krsc, cudaStream_
   if (w_krsc.dim(0) != k || w_krsc.dim(1) != r || w_krsc.dim(2) != s || w_krsc.dim(3) != c)
     throw std::invalid_argument("conv_weight_to_krsc: shape mismatch " + w_kcrs.describe() + " -> " + w_krsc.describe());
   const std::int64_t total = w_kcrs.numel();
+  if (kernels::sm75::fp16_weights()) {
+    kernels::sm75::vae_weight_to_krsc(w_kcrs, w_krsc, stream);
+    return;
+  }
   const int blocks = static_cast<int>(std::min<std::int64_t>((total + 255) / 256, 4096));
   if (total == 0) return;
   if (w_krsc.dtype == DType::kF32) {

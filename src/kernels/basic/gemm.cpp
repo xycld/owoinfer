@@ -9,6 +9,7 @@
 
 #include "core/cuda_check.h"
 #include "kernels/basic/detail.h"
+#include "kernels/sm75/sm75.h"
 
 namespace mi::kernels {
 namespace {
@@ -35,11 +36,18 @@ std::int64_t row_stride(const Tensor& t) {
   return m.nd == 1 ? m.stride[0] : 0;
 }
 
-cudaDataType_t cuda_type(DType t) { return t == DType::kF32 ? CUDA_R_32F : CUDA_R_16BF; }
+cudaDataType_t cuda_type(DType t) {
+  switch (t) {
+    case DType::kF32: return CUDA_R_32F;
+    case DType::kF16: return CUDA_R_16F;
+    default: return CUDA_R_16BF;
+  }
+}
 
 struct Key {
   std::int64_t m, n, k, ldx, ldw, ldo;
   int out_type, bias_type;  // bias_type -1: no bias
+  int ab_type;              // 0: bf16 operands (sm_80+), 1: fp16 operands (sm_75 path)
   std::size_t workspace;
   std::uint32_t align_x, align_w, align_out, align_bias;
   bool operator==(const Key&) const = default;
@@ -50,9 +58,9 @@ struct KeyHash {
     std::size_t h = 1469598103934665603ull;
     const auto mix = [&h](std::uint64_t v) { h = (h ^ v) * 1099511628211ull; };
     for (std::int64_t v : {key.m, key.n, key.k, key.ldx, key.ldw, key.ldo}) mix(static_cast<std::uint64_t>(v));
-    for (std::uint64_t v : {std::uint64_t(key.out_type + 8), std::uint64_t(key.bias_type + 8), std::uint64_t(key.workspace),
-                            std::uint64_t(key.align_x), std::uint64_t(key.align_w), std::uint64_t(key.align_out),
-                            std::uint64_t(key.align_bias)}) {
+    for (std::uint64_t v : {std::uint64_t(key.out_type + 8), std::uint64_t(key.bias_type + 8),
+                            std::uint64_t(key.ab_type), std::uint64_t(key.workspace), std::uint64_t(key.align_x),
+                            std::uint64_t(key.align_w), std::uint64_t(key.align_out), std::uint64_t(key.align_bias)}) {
       mix(v);
     }
     return h;
@@ -84,6 +92,22 @@ struct Gemm::Impl {
   cublasLtHandle_t handle = nullptr;
   mutable std::mutex mutex;
   std::unordered_map<Key, std::unique_ptr<Plan>, KeyHash> plans;
+  // sm_75: fp16 tensor cores with bf16 activations. x is converted to fp16 in a chunked scratch buffer, the weights
+  // are fp16 (converted once by the loader) and the GEMM writes fp16 (into the bf16 output buffer, or into `acc16`
+  // for an f32 output) which a second pass converts to the output dtype and adds the bias.
+  bool fp16 = false;
+  void* x16 = nullptr;
+  std::size_t x16_bytes = 0;
+  void* acc16 = nullptr;
+  std::size_t acc16_bytes = 0;
+
+  static void ensure_scratch(void*& p, std::size_t& cap, std::size_t need) {
+    if (cap >= need) return;
+    MI_CUDA_CHECK(cudaDeviceSynchronize());  // an earlier launch on another stream may still read it
+    if (p != nullptr) MI_CUDA_CHECK(cudaFree(p));
+    MI_CUDA_CHECK(cudaMalloc(&p, need));
+    cap = need;
+  }
 
   Plan& plan_for(const Key& key, const void* bias_ptr) {
     auto it = plans.find(key);
@@ -93,7 +117,7 @@ struct Gemm::Impl {
     const cublasOperation_t trans_a = CUBLAS_OP_T, trans_b = CUBLAS_OP_N;
     MI_LT_CHECK(cublasLtMatmulDescSetAttribute(plan->desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
     MI_LT_CHECK(cublasLtMatmulDescSetAttribute(plan->desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
-    if (key.bias_type >= 0) {
+    if (key.bias_type >= 0 && key.ab_type == 0) {
       const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
       const auto bias_type = static_cast<std::int32_t>(cuda_type(static_cast<DType>(key.bias_type)));
       MI_LT_CHECK(cublasLtMatmulDescSetAttribute(plan->desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
@@ -104,8 +128,9 @@ struct Gemm::Impl {
                                                  sizeof(bias_ptr)));
     }
     const auto u64 = [](std::int64_t v) { return static_cast<std::uint64_t>(v); };
-    MI_LT_CHECK(cublasLtMatrixLayoutCreate(&plan->a, CUDA_R_16BF, u64(key.k), u64(key.n), key.ldw));
-    MI_LT_CHECK(cublasLtMatrixLayoutCreate(&plan->b, CUDA_R_16BF, u64(key.k), u64(key.m), key.ldx));
+    const cudaDataType_t ab_type = key.ab_type ? CUDA_R_16F : CUDA_R_16BF;
+    MI_LT_CHECK(cublasLtMatrixLayoutCreate(&plan->a, ab_type, u64(key.k), u64(key.n), key.ldw));
+    MI_LT_CHECK(cublasLtMatrixLayoutCreate(&plan->b, ab_type, u64(key.k), u64(key.m), key.ldx));
     MI_LT_CHECK(cublasLtMatrixLayoutCreate(&plan->d, cuda_type(static_cast<DType>(key.out_type)), u64(key.n),
                                            u64(key.m), key.ldo));
 
@@ -141,12 +166,65 @@ struct Gemm::Impl {
     plan->workspace = result.workspaceSize;
     return *plans.emplace(key, std::move(plan)).first->second;
   }
+
+  // sm_75 path: x is bf16, the GEMM runs fp16 in / fp32 out on Turing's tensor cores, and the result is converted to
+  // the output dtype with the bias added in fp32. Row-chunked so the fp16 copies stay in a small scratch buffer.
+  void linear_f16(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias, void* workspace,
+                  std::size_t workspace_bytes, cudaStream_t stream) {
+    const std::int64_t m = detail::rows_of(x);
+    const std::int64_t k = x.dim(-1);
+    const std::int64_t n = w.dim(0);
+    const std::int64_t ldx = row_stride(x);
+    const std::int64_t ldo = row_stride(out);
+    const std::int64_t ldw = row_stride(w);
+    if (m == 0 || n == 0) return;
+    const bool out_f32 = out.dtype == DType::kF32;
+    constexpr std::size_t kScratchBytes = std::size_t{16} << 20;
+    const std::size_t per_row = static_cast<std::size_t>(std::max(n, k)) * 2;
+    std::int64_t chunk = static_cast<std::int64_t>(kScratchBytes / std::max<std::size_t>(1, per_row));
+    chunk = std::max<std::int64_t>(1, std::min(chunk, m));
+    ensure_scratch(x16, x16_bytes, static_cast<std::size_t>(chunk) * static_cast<std::size_t>(k) * 2);
+    if (out_f32) {
+      ensure_scratch(acc16, acc16_bytes, static_cast<std::size_t>(chunk) * static_cast<std::size_t>(n) * 2);
+    }
+    const void* bias_ptr = bias != nullptr ? bias->data : nullptr;
+    const bool bias_f32 = bias != nullptr && bias->dtype == DType::kF32;
+    for (std::int64_t r0 = 0; r0 < m; r0 += chunk) {
+      const std::int64_t rows = std::min(chunk, m - r0);
+      kernels::sm75::convert_rows_bf16_to_f16(x16, static_cast<const char*>(x.data) + r0 * ldx * 2, rows, k, ldx, k,
+                                              stream);
+      void* dptr = out_f32 ? acc16 : (static_cast<char*>(out.data) + r0 * ldo * 2);
+      const std::int64_t acc_ld = out_f32 ? n : ldo;
+      const Key key{rows, n, k, k, ldw, acc_ld, static_cast<int>(DType::kF16), -1, 1, workspace_bytes,
+                    alignment(x16), alignment(w.data), alignment(dptr), 0u};
+      Plan& plan = plan_for(key, nullptr);
+      const float alpha = 1.0f, beta = 0.0f;
+      MI_LT_CHECK(cublasLtMatmul(handle, plan.desc, &alpha, w.data, plan.a, x16, plan.b, &beta, dptr, plan.d, dptr,
+                                 plan.d, &plan.algo, workspace, plan.workspace, stream));
+      // The output row offset in bytes: f32 rows are 4 bytes per element (dptr above is acc16 for them).
+      kernels::sm75::convert_gemm_out_f16(static_cast<char*>(out.data) + r0 * ldo * (out_f32 ? 4 : 2), dptr, bias_ptr,
+                                          bias_f32, out_f32, rows, n, ldo, acc_ld, stream);
+    }
+  }
 };
 
-Gemm::Gemm() : impl_(std::make_unique<Impl>()) { MI_LT_CHECK(cublasLtCreate(&impl_->handle)); }
+Gemm::Gemm() : impl_(std::make_unique<Impl>()) {
+  MI_LT_CHECK(cublasLtCreate(&impl_->handle));
+#if MOSSINFER_HAVE_SM75
+  // Turing: no bf16 tensor cores, so bf16 linears run as fp16 with fp32 accumulation (see Impl::linear_f16).
+  int device = 0, major = 0;
+  if (cudaGetDevice(&device) == cudaSuccess &&
+      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess && major < 8) {
+    impl_->fp16 = true;
+  }
+  cudaGetLastError();  // the two queries above leave no error the caller should see
+#endif
+}
 
 Gemm::~Gemm() {
   impl_->plans.clear();
+  if (impl_->x16 != nullptr) cudaFree(impl_->x16);
+  if (impl_->acc16 != nullptr) cudaFree(impl_->acc16);
   if (impl_->handle != nullptr) cublasLtDestroy(impl_->handle);
 }
 
@@ -158,11 +236,13 @@ std::size_t Gemm::cached_plans() const {
 namespace {
 
 // Validates linear()'s operands and returns their plan key; m or n of 0 means there is nothing to compute.
-Key linear_key(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias, std::size_t workspace_bytes) {
+// fp16: the sm_75 path, where the weights are stored fp16 (converted once by the loader).
+Key linear_key(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias, std::size_t workspace_bytes,
+               bool fp16) {
   constexpr const char* op = "linear";
   detail::check_rows(op, "x", x, DType::kBF16);
   const std::int64_t k = x.dim(-1);
-  detail::check_rows(op, "w", w, DType::kBF16, k);
+  detail::check_rows(op, "w", w, fp16 ? DType::kF16 : DType::kBF16, k);
   if (w.rank != 2) detail::fail(op, "w must be [N, K], got " + w.describe());
   const std::int64_t n = w.dim(0);
   if (out.dtype != DType::kBF16 && out.dtype != DType::kF32) detail::fail(op, "out must be bf16 or f32, got " + out.describe());
@@ -182,7 +262,7 @@ Key linear_key(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor
     bias_type = static_cast<int>(bias->dtype);
   }
   const void* bias_ptr = bias != nullptr ? bias->data : nullptr;
-  return Key{m, n, k, ldx, ldw, ldo, static_cast<int>(out.dtype), bias_type, workspace_bytes,
+  return Key{m, n, k, ldx, ldw, ldo, static_cast<int>(out.dtype), bias_type, fp16 ? 1 : 0, workspace_bytes,
              alignment(x.data), alignment(w.data), alignment(out.data), bias_ptr ? alignment(bias_ptr) : 0u};
 }
 
@@ -205,7 +285,7 @@ std::string Gemm::AlgoConfig::describe() const {
 
 Gemm::AlgoConfig Gemm::algo_config(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias,
                                    std::size_t workspace_bytes) {
-  const Key key = linear_key(out, x, w, bias, workspace_bytes);
+  const Key key = linear_key(out, x, w, bias, workspace_bytes, impl_->fp16);
   if (key.m == 0 || key.n == 0) return {};
   std::lock_guard<std::mutex> lock(impl_->mutex);
   const Plan& plan = impl_->plan_for(key, bias != nullptr ? bias->data : nullptr);
@@ -225,11 +305,17 @@ Gemm::AlgoConfig Gemm::algo_config(const Tensor& out, const Tensor& x, const Ten
 
 void Gemm::linear(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias, void* workspace,
                   std::size_t workspace_bytes, cudaStream_t stream) {
-  const Key key = linear_key(out, x, w, bias, workspace_bytes);
+  const Key key = linear_key(out, x, w, bias, workspace_bytes, impl_->fp16);
   if (workspace_bytes > 0 && (workspace == nullptr || alignment(workspace) < 256)) {
     detail::fail("linear", "workspace must be 256-byte aligned");
   }
   if (key.m == 0 || key.n == 0) return;
+
+  if (impl_->fp16) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->linear_f16(out, x, w, bias, workspace, workspace_bytes, stream);
+    return;
+  }
 
   const void* bias_ptr = bias != nullptr ? bias->data : nullptr;
   std::lock_guard<std::mutex> lock(impl_->mutex);

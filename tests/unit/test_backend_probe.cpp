@@ -122,7 +122,13 @@ TEST(BackendProbe, DeviceVerdicts) {
 
   DeviceInfo turing = device(7, 5);
   mi::backend::evaluate_device(turing, 13040, 13040, kRelease);
-  EXPECT_NE(turing.reason.find("8.0"), std::string::npos) << turing.reason;
+  EXPECT_FALSE(turing.supported);
+  if (mi::backend::kMinComputeMajor >= 8) {
+    EXPECT_NE(turing.reason.find("8.0"), std::string::npos) << turing.reason;
+  } else {
+    // An sm_75 build accepts compute capability 7.5 in general; this list (the release archs) has no image for it.
+    EXPECT_NE(turing.reason.find("no kernel image for compute capability 7.5"), std::string::npos) << turing.reason;
+  }
   DeviceInfo old_driver = device(8, 9);
   mi::backend::evaluate_device(old_driver, 12090, 13040, kRelease);
   EXPECT_NE(old_driver.reason.find("580"), std::string::npos) << old_driver.reason;

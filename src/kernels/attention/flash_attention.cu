@@ -9,6 +9,7 @@
 #include "core/cuda_check.h"
 #include "core/varlen.h"
 #include "kernels/attention/flash_fwd_kernels.h"
+#include "kernels/sm75/sm75.h"
 
 namespace mi::attention {
 namespace {
@@ -48,7 +49,9 @@ int tile_smem_bytes(FlashTile t) {
 std::atomic<FlashTile> g_tile_override{FlashTile::kAuto};
 
 // The kernels use cp.async and bf16 mma, which need sm_80+; on older parts they would compile to empty
-// bodies (see MI_FLASH_PARAM_MODIFIER) and silently leave `out` unwritten. Checked once per device.
+// bodies (see MI_FLASH_PARAM_MODIFIER) and silently leave `out` unwritten. A build with the sm_75 kernel family
+// (MOSSINFER_SM75) dispatches compute capability 7.x to kernels::sm75::flash_fwd instead, so this check only runs on
+// the sm_80 path. Checked once per device.
 void require_sm80(int device) {
   static std::array<std::atomic<bool>, 64> ok{};
   if (device >= 0 && device < static_cast<int>(ok.size()) && ok[device].load()) return;
@@ -149,6 +152,15 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
   // difference.
   int device = 0, smem_per_sm = 0, smem_per_block = 0;
   MI_CUDA_CHECK(cudaGetDevice(&device));
+#if MOSSINFER_HAVE_SM75
+  if (kernels::sm75::turing()) {
+    // Turing: the sm_75 family's own exact attention (src/kernels/sm75/attention_sm75.cu, fp16 MMA; the vendored
+    // kernel's sm_75 traits are not used); q/k/v/out are converted around the launch there.
+    kernels::sm75::flash_fwd(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen, causal, scale, workspace,
+                             workspace_bytes, stream);
+    return;
+  }
+#endif
   require_sm80(device);
   MI_CUDA_CHECK(cudaDeviceGetAttribute(&smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device));
   MI_CUDA_CHECK(cudaDeviceGetAttribute(&smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));

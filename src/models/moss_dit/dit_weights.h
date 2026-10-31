@@ -209,6 +209,11 @@ class BlockWeights {
   bool resident(int block) const { return mask_.test(static_cast<std::size_t>(block)); }
   int streamed_blocks() const { return static_cast<int>(streamed_.size()); }
   std::size_t host_resident_bytes() const;  // pinned host copy held (kHostPinned)
+
+  // sm_75 (kernels::sm75::fp16_weights()): converts the resident blocks' bf16 linear weights to fp16 in place, so the
+  // fp16 GEMM path can consume them (the views are marked kF16). Streamed blocks are converted by Pass::acquire(),
+  // after each block's copy. No-op on sm_80+ devices and when the build has no sm_75 kernels.
+  void convert_weights_to_f16(cudaStream_t stream);
   void set_copy_hook(CopyHook hook) { hook_ = std::move(hook); }
 
   // Stats of the last finished forward() (synchronizes on its events the first time it is read) and the sum over

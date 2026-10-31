@@ -939,9 +939,14 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     // the LoRA files too). The lossy accelerators are an explicit speed opt-in: the tier is resolved without them.
     const std::filesystem::path te_file = tes.model ? tes.path : std::filesystem::path();
     const auto supported = [](planner::AttentionMode mode) { return moss_dit::attention_supported(dit_attention(mode)); };
+    // sm_75: no 8-bit attention kernel exists for Turing, so the caller's unset attention resolves to exact instead of
+    // failing. Keyed on the device, not on the kernels' availability: an sm_80+ build without them (MOSSINFER_ONLY)
+    // still refuses, as before.
+    const bool exact_when_no_q8 = kernels::sm75::turing();
     r.tier = planner::resolve_tier(m.options.tier, m.options.attention, src.precision, supported,
                                    tes.precision != qwen35_text::Precision::kBF16,
-                                   src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available());
+                                   src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available(),
+                                   exact_when_no_q8);
     if (lora_requested) r.tier.reason += "; runtime LoRAs active";
     if (req.accel.step_cache_on()) {
       // An unset threshold takes the model's default (0.02 on the base model, told apart by its DiT's input embedder:
@@ -1495,11 +1500,39 @@ void Pipeline::Impl::explain_control(const Request::Control& control, Result& r)
                         "): " + (inputs.empty() ? std::string("no images (zero control latents)") : inputs) + ".";
 }
 
+// Two features still need sm_80+ kernels and are refused on Turing before anything is planned, read or uploaded (by
+// Pipeline::run, and by a Session for its options and every run's spec): the VAE encoder's convolutions (img2img,
+// inpainting, reference images, and the hires fix, whose second pass encodes the upscaled image) and the LoRA GEMMs
+// (runtime LoRAs, and control adapters, which carry a LoRA). The message names the reason and what does work, instead
+// of failing at a missing kernel image mid-request.
+void detail::refuse_unsupported_on_sm75(const Request& req) {
+  if (!kernels::sm75::turing()) return;
+  if (req.init_image != nullptr) {
+    throw NotSupportedError("img2img and inpainting encode the input with the VAE encoder, which has no sm_75 kernel "
+                            "in this build; text-to-image works");
+  }
+  if (req.hires.enabled()) {
+    throw NotSupportedError("the hires fix encodes the upscaled image with the VAE encoder, which has no sm_75 kernel "
+                            "in this build; text-to-image without it works");
+  }
+  if (req.references.enabled()) {
+    throw NotSupportedError("reference images are encoded with the VAE encoder, which has no sm_75 kernel in this "
+                            "build; text-to-image without them works");
+  }
+  if (!req.loras.empty()) {
+    throw NotSupportedError("runtime LoRAs need sm_80+ GEMM kernels; this sm_75 build cannot apply them");
+  }
+  if (req.control.enabled()) {
+    throw NotSupportedError("control adapters are LoRAs and need sm_80+ GEMM kernels; this sm_75 build cannot run them");
+  }
+}
+
 // generate(), or with `preload` the same up to the plan and the arena, then the loads of the models the plan keeps.
 Result Pipeline::run(const Request& req, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
   check_user_paths(m.options, req);
   validate(req);
+  refuse_unsupported_on_sm75(req);
   Result r;
   r.tier.tier = m.options.tier;  // what a run cancelled before the tier is resolved reports
   Timings& tm = r.timings;

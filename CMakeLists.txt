@@ -28,6 +28,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(MOSSINFER_WERROR "Treat warnings as errors" ON)
 option(MOSSINFER_ASAN "Build host code with AddressSanitizer" OFF)
 option(MOSSINFER_TESTS "Build unit tests" ON)
+# Turing (compute capability 7.5): builds src/kernels/sm75 for sm_75 and accepts those devices (see
+# cmake/modules/sm75.cmake). Off: the engine is Ampere-or-newer only, exactly as before.
+option(MOSSINFER_SM75 "Build the sm_75 (Turing) kernels and accept compute capability 7.5" OFF)
 
 find_package(CUDAToolkit 12.4 REQUIRED)
 # sm_120 (Blackwell GeForce) needs CUDA 12.8.
@@ -178,8 +181,11 @@ if(MOSSINFER_TESTS)
     list(FILTER MOSSINFER_TEST_SOURCES EXCLUDE REGEX ".*/tests/unit/test_(c_api|c_api_check|c_api_inspect|component_api|component_gpu|progress_model)\\.cpp$")
   endif()
   add_executable(mossinfer_tests ${MOSSINFER_TEST_SOURCES})
-  # Their reference arithmetic is compared bit for bit with the NVFP4 recipes (MOSSINFER_STRICT_FP_SOURCES) and with
-  # the samplers' kernels (the component API's host loops, design §5.3).
+  if(MOSSINFER_SM75)
+    # probe.h's minimum compute capability (test_backend_probe) and the sm_75 kernel-family smoke test.
+    target_compile_definitions(mossinfer_tests PRIVATE MOSSINFER_HAVE_SM75=1)
+  endif()
+  # Its reference arithmetic is compared bit for bit with the NVFP4 recipes (MOSSINFER_STRICT_FP_SOURCES).
   set(_mi_strict_tests ${MOSSINFER_TEST_SOURCES})
   list(FILTER _mi_strict_tests INCLUDE REGEX ".*/tests/unit/test_(nvfp4_convert|component_gpu)\\.cpp$")
   if(_mi_strict_tests)

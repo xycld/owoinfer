@@ -23,6 +23,13 @@ trees, and the Python package.
    which MossInfer never enables.
 2. `flash.h`: `#include <ATen/cuda/CUDAGeneratorImpl.h>` became `#include "mi_torch_shim.h"`.
 3. `philox_unpack.cuh`: `#include <ATen/cuda/detail/UnpackRaw.cuh>` became `#include "mi_torch_shim.h"`.
+4. `flash_fwd_kernel.h`: the two `if (Is_dropout)` guards around `dropout.apply_dropout(...)` and the two
+   `if (Return_softmax)` guards around its `encode_dropout_in_sign_bit` call became `if constexpr`. With a runtime `if`,
+   the dropout code was instantiated even for `Is_dropout=false` / `Return_softmax=false`, and its
+   `static_assert(size<2>(tensor) % 2 == 0)` (dropout.h) holds for the sm_80 `m16n8k16` accumulator layout but not for
+   Turing's `m16n8k8` layout, so an sm_75 instantiation failed to compile. Both are template parameters, so `if constexpr`
+   skips the instantiation for every architecture and changes no generated code where they are false (the only mode
+   MossInfer builds).
 
 Nothing else changed: no kernel code was touched.
 

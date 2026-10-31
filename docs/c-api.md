@@ -147,10 +147,10 @@ The caller chooses the tier; the engine runs it or refuses it. The loaded weight
 |---|---|
 | `AUTO` (0) | reserved since 2.0: refused by `mi_engine_create()` (`MI_ERR_INVALID_ARGUMENT`, the message names the choices) |
 | `REFERENCE` (1) | the DiT's bf16 GEMMs with exact attention. Refused for a quantized DiT or text encoder file and for an 8-bit `attention`. |
-| `HIGH` (2) | the loaded DiT's GEMMs (INT8 or bf16) with 8-bit attention. Refused for a 4-bit DiT, and for a bf16 DiT with exact attention (that is `REFERENCE`). |
-| `TURBO` (3) | a 4-bit DiT file (`dit_file`: INT4 ConvRot, or NVFP4 on an RTX 50) with 8-bit attention. Refused for any other DiT. |
+| `HIGH` (2) | the loaded DiT's GEMMs (INT8 or bf16) with 8-bit attention, or exact attention where the build has no 8-bit kernel (sm_75). Refused for a 4-bit DiT, and for a bf16 DiT with exact attention (that is `REFERENCE`). |
+| `TURBO` (3) | a 4-bit DiT file (`dit_file`: INT4 ConvRot, or NVFP4 on an RTX 50) with 8-bit attention (exact where the build has no 8-bit kernel, e.g. sm_75). Refused for any other DiT. |
 
-`HIGH` and `TURBO` default to `Q8_FP8` where the GPU has FP8 tensor cores (compute capability 8.9 and later), else `Q8_FP16`; `attention` overrides it. Capability refusals stay: an NVFP4 DiT needs FP4 tensor cores (`MI_ERR_MODEL` on other GPUs), an 8-bit `attention` the GPU or build cannot run is refused, and so are `HIGH` and `TURBO` on a GPU or build without any 8-bit kernel unless `attention` is `EXACT` (never a silent fallback). `mi_result_tier()` and the report say what ran.
+`HIGH` and `TURBO` default to `Q8_FP8` where the GPU has FP8 tensor cores (compute capability 8.9 and later), else `Q8_FP16`; `attention` overrides it. Capability refusals stay: an NVFP4 DiT needs FP4 tensor cores (`MI_ERR_MODEL` on other GPUs), an 8-bit `attention` the GPU or build cannot run is refused, and so are `HIGH` and `TURBO` on a GPU or build without any 8-bit kernel unless `attention` is `EXACT` — except that an **unset** `attention` there resolves to `EXACT` (sm_75), and the tier result and the report say so. `mi_result_tier()` and the report say what ran.
 
 | `mi_attention` | Pipeline name |
 |---|---|
@@ -289,6 +289,7 @@ Limits, checked before any pixel is read: each side 1 to 16384, at most 64,000,0
 - `denoise_strength` unset with an init image is 0.75. An explicit 1 with an init image and no mask is txt2img: the image is not used, and `MI_TEXT_IMAGE_NOTE` says so. 0 runs no step: the result is the image's VAE round trip.
 - The steps that run: of a pass's N scheduled steps (after snapping), the first `int(N - N * strength)` are skipped. `mi_result_steps_scheduled()` and the progress callback's `total_steps` count the steps that run, both passes of a hires fix included.
 - The `DATASPACE` sampler cannot start from an image (img2img, inpainting, hires fix).
+- An `MOSSINFER_SM75` build has no VAE encoder kernel: img2img, inpainting, reference images and the hires fix are refused up front with `MI_ERR_NOT_SUPPORTED`, before anything is loaded or planned; txt2img still runs. Runtime LoRAs and control adapters are refused the same way (their GEMM kernels are sm_80+) ([sm75.md](sm75.md#not-supported-on-sm75-yet)).
 
 | `mi_mask_encoding` | Values |
 |---|---|

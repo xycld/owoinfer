@@ -22,6 +22,7 @@
 #include <string>
 
 #include "core/cuda_check.h"
+#include "kernels/sm75/sm75.h"
 #include "kernels/vae/attention.h"
 
 namespace mi::vae {
@@ -477,6 +478,12 @@ void attention_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
   require(q.dim(1) < (1ll << 31) && q.dim(0) <= 65535, "attention_fp32: L or B too large");
   const int len = static_cast<int>(q.dim(1));
   if (len == 0 || q.dim(0) == 0) return;
+  // sm_75: no TF32 tensor cores; the fp32 SIMT kernel is exact in fp32 (the reference precision) and the VAE's
+  // attention is a small part of a generation.
+  if (kernels::sm75::fp16_weights()) {
+    kernels::sm75::vae_attention_fp32(q, k, v, o, scale, stream);
+    return;
+  }
   AttnArgs a{q.ptr<float>(), k.ptr<float>(), v.ptr<float>(), o.ptr<float>(), q.stride[0], k.stride[0], v.stride[0],
              o.stride[0], q.stride[1], k.stride[1], v.stride[1], len, scale * 1.4426950408889634f};
   const dim3 grid(static_cast<unsigned>((len + kBr - 1) / kBr), static_cast<unsigned>(q.dim(0)));

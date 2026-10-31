@@ -382,11 +382,21 @@ int max_smem_per_block() {
   return v;
 }
 
+// Compute capability major of the current device: the four forced-tile tests below name sm_80 instantiations, which an
+// sm_75 build does not carry (its dispatcher runs the vendored kernel's own Turing traits instead).
+int compute_major() {
+  int device = 0, v = 0;
+  MI_CUDA_CHECK(cudaGetDevice(&device));
+  MI_CUDA_CHECK(cudaDeviceGetAttribute(&v, cudaDevAttrComputeCapabilityMajor, device));
+  return v;
+}
+
 // All four FA2 instantiations against the fp32 reference. The auto dispatcher picks only one of the
 // two tiles per head_dim on a given GPU; the override runs the other too. hdim256 128x64 needs 128 KiB
 // of shared memory per block: sm_89 allows 99 KiB, so there it must be rejected (and is only runnable on
 // sm_80/90-class parts), which this test asserts instead of skipping.
 void check_forced_tile(mi::attention::FlashTile tile, int need_smem, const Problem& p, std::uint64_t seed) {
+  if (compute_major() < 8) GTEST_SKIP() << "forced sm_80 tile instantiations are not built for sm_75";
   ResetOverrides reset;
   Buffers buf(p);
   buf.fill_random(p, seed);
@@ -417,6 +427,7 @@ TEST(GpuAttention, Hdim256Tile128x64) {
 }
 
 TEST(GpuAttention, ForcedTileMustMatchHeadDim) {
+  if (compute_major() < 8) GTEST_SKIP() << "forced sm_80 tile instantiations are not built for sm_75";
   ResetOverrides reset;
   const Problem p = make_problem(4, 4, 128, false, {16});
   Buffers buf(p);
