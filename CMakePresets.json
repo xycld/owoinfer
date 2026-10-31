@@ -88,6 +88,13 @@
       "cacheVariables": { "MOSSINFER_EXPECT_CUDA_MAJOR": "13" }
     },
     {
+      "name": "windows-msvc-cuda13-sm75",
+      "displayName": "Windows release, CUDA 13.x with Turing (sm_75)",
+      "inherits": "windows-msvc-cuda13",
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "cacheVariables": { "MOSSINFER_SM75": "ON" }
+    },
+    {
       "name": "windows-msvc-cuda12",
       "displayName": "Windows release, MSVC + CUDA 12.8+ (driver >= 527)",
       "inherits": [ "release-base", "windows" ],
@@ -100,6 +107,7 @@
     { "name": "linux-cuda13", "configurePreset": "linux-cuda13" },
     { "name": "linux-cuda12", "configurePreset": "linux-cuda12" },
     { "name": "windows-msvc-cuda13", "configurePreset": "windows-msvc-cuda13" },
+    { "name": "windows-msvc-cuda13-sm75", "configurePreset": "windows-msvc-cuda13-sm75" },
     { "name": "windows-msvc-cuda12", "configurePreset": "windows-msvc-cuda12" }
   ],
   "testPresets": [
@@ -121,6 +129,11 @@
     },
     { "name": "windows-msvc-cuda13", "inherits": "test-base", "configurePreset": "windows-msvc-cuda13" },
     {
+      "name": "windows-msvc-cuda13-sm75",
+      "inherits": "test-base",
+      "configurePreset": "windows-msvc-cuda13-sm75"
+    },
+    {
       "name": "windows-msvc-cuda12",
       "inherits": "test-base",
       "configurePreset": "windows-msvc-cuda12",
@@ -132,6 +145,7 @@
     { "name": "linux-cuda13", "configurePreset": "linux-cuda13" },
     { "name": "linux-cuda12", "configurePreset": "linux-cuda12" },
     { "name": "windows-msvc-cuda13", "configurePreset": "windows-msvc-cuda13" },
+    { "name": "windows-msvc-cuda13-sm75", "configurePreset": "windows-msvc-cuda13-sm75" },
     { "name": "windows-msvc-cuda12", "configurePreset": "windows-msvc-cuda12" }
   ]
 }

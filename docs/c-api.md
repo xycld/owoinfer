@@ -147,10 +147,10 @@ The caller chooses the tier; the engine runs it or refuses it. The loaded weight
 |---|---|
 | `AUTO` (0) | reserved since 2.0: refused by `mi_engine_create()` (`MI_ERR_INVALID_ARGUMENT`, the message names the choices) |
 | `REFERENCE` (1) | the DiT's bf16 GEMMs with exact attention. Refused for a quantized DiT or text encoder file and for an 8-bit `attention`. |
-| `HIGH` (2) | the loaded DiT's GEMMs (INT8 or bf16) with 8-bit attention. Refused for a 4-bit DiT, and for a bf16 DiT with exact attention (that is `REFERENCE`). |
-| `TURBO` (3) | a 4-bit DiT file (`dit_file`: INT4 ConvRot, or NVFP4 on an RTX 50) with 8-bit attention. Refused for any other DiT. |
+| `HIGH` (2) | the loaded DiT's GEMMs (INT8 or bf16) with 8-bit attention, or exact attention where the build has no 8-bit kernel (sm_75). Refused for a 4-bit DiT, and for a bf16 DiT with exact attention (that is `REFERENCE`). |
+| `TURBO` (3) | a 4-bit DiT file (`dit_file`: INT4 ConvRot, or NVFP4 on an RTX 50) with 8-bit attention (exact where the build has no 8-bit kernel, e.g. sm_75). Refused for any other DiT. |
 
-`HIGH` and `TURBO` default to `Q8_FP8` where the GPU has FP8 tensor cores (compute capability 8.9 and later), else `Q8_FP16`; `attention` overrides it. Capability refusals stay: an NVFP4 DiT needs FP4 tensor cores (`MI_ERR_MODEL` on other GPUs), an 8-bit `attention` the GPU or build cannot run is refused, and so are `HIGH` and `TURBO` on a GPU or build without any 8-bit kernel unless `attention` is `EXACT` (never a silent fallback). `mi_result_tier()` and the report say what ran.
+`HIGH` and `TURBO` default to `Q8_FP8` where the GPU has FP8 tensor cores (compute capability 8.9 and later), else `Q8_FP16`; `attention` overrides it. Capability refusals stay: an NVFP4 DiT needs FP4 tensor cores (`MI_ERR_MODEL` on other GPUs), an 8-bit `attention` the GPU or build cannot run is refused, and so are `HIGH` and `TURBO` on a GPU or build without any 8-bit kernel unless `attention` is `EXACT` — except that an **unset** `attention` there resolves to `EXACT` (sm_75), and the tier result and the report say so. `mi_result_tier()` and the report say what ran.
 
 | `mi_attention` | Pipeline name |
 |---|---|

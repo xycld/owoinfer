@@ -1,6 +1,7 @@
 # Tag vX.Y.Z (a release) or vX.Y.Z-rcN, N >= 1 (a release candidate, published as a pre-release that does not become
-# "latest"): build and check all four flavours (build.yml), then publish their archives (the full package and the
-# -system-cuda variant of each) and a SHA256SUMS file as a GitHub release. X.Y.Z must equal the MI_VERSION_* of
+# "latest"): build and check all four standard flavours and the Windows CUDA 13 SM75 flavour (build.yml), then publish
+# their archives (the full package and the -system-cuda variant of each) and a SHA256SUMS file as a GitHub release.
+# X.Y.Z must equal the MI_VERSION_* of
 # include/mossinfer/mossinfer.h and an rc must come before vX.Y.Z (.github/scripts/release_version.py), the tagged
 # commit must be on main with a successful ci run (.github/scripts/release_gate.sh), and the release must not exist
 # yet (a re-run of the same workflow run may finish a partial upload).
@@ -117,6 +118,9 @@ jobs:
           done
           echo "$n full archives, each with its -system-cuda variant, all version $ARCHIVE_VERSION"
           test "$n" -gt 0
+          sm75="mossinfer-$ARCHIVE_VERSION-windows-cu13-x86_64-sm75.zip"
+          test -f "$sm75" || { echo "missing SM75 package $sm75"; exit 1; }
+          test -f "${sm75%.zip}-system-cuda.zip" || { echo "missing SM75 system-CUDA package"; exit 1; }
       - name: SHA256SUMS
         shell: bash
         working-directory: dist

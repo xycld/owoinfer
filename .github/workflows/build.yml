@@ -1,7 +1,8 @@
-# Reusable build of the four release flavours (Linux/Windows x CUDA 12/13), called by ci.yml and release.yml.
-# Per flavour: configure + build with the CMakePresets.json release preset, CPU-only tests (hosted runners have no
-# GPU), install, AC1 (no torch/python) + exports + AC17 (size) + cuBLASLt-through-the-shim checks, the find_package
-# consumer, CPack archives, and the system-CUDA variant (the install without the `cuda` component: no cuBLASLt).
+# Reusable build of the four release flavours (Linux/Windows x CUDA 12/13) plus Windows CUDA 13 with SM75, called by
+# ci.yml and release.yml. Per flavour: configure + build with the CMakePresets.json release preset, CPU-only tests
+# (hosted runners have no GPU), install, AC1 (no torch/python) + exports + AC17 (size) + cuBLASLt-through-the-shim
+# checks, the find_package consumer, CPack archives, and the system-CUDA variant (the install without the `cuda`
+# component: no cuBLASLt).
 name: build
 
 on:
@@ -31,6 +32,10 @@ jobs:
         # Bump the 13.x entry to 13.4 once Jimver/cuda-toolkit lists it: the gate toolchain is 13.4.
         # bitexact_cu13 tests are GPU tests and do not run on hosted runners.
         cuda: ["12.8.1", "13.3.1"]
+        # An include entry whose os/cuda match a combination is merged into it (that is how the entries below set
+        # platform/flavour/nvcc); a new combination needs a value no combination has. The Turing flavour is that:
+        # sm75=true does not match any of the four standard jobs, so it adds a fifth one.
+        sm75: [false]
         include:
           - os: ubuntu-22.04
             platform: linux
@@ -71,6 +76,13 @@ jobs:
             sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand_dev", "thrust", "documentation"]'
           - os: windows-2022
             cuda: "13.3.1"
+            nvcc: "13.3.73"
+            sub-packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "curand_dev", "thrust", "documentation"]'
+          - os: windows-2022
+            platform: windows-msvc
+            cuda: "13.3.1"
+            sm75: true
+            flavour: cuda13-sm75
             nvcc: "13.3.73"
             sub-packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "curand_dev", "thrust", "documentation"]'
     env:
