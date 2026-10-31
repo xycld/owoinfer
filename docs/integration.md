@@ -19,7 +19,7 @@ MossInfer is a low-level engine: it runs what the caller asks for, refuses what 
 | Area | What works |
 |---|---|
 | Platform | Linux x86-64 and Windows x64 (MSVC), each in a `cu12` and a `cu13` flavour, as a full package and a `-system-cuda` package. CI builds, packages and runs the CPU tests of all four flavours; GPU runs are verified on Linux `cu13`. |
-| GPUs | NVIDIA compute capability 8.x and 12.x: RTX 30xx, RTX 40xx, RTX 50xx, A100/A10/A40, L4/L40, RTX PRO Blackwell |
+| GPUs | NVIDIA compute capability 8.x and 12.x: RTX 30xx, RTX 40xx, RTX 50xx, A100/A10/A40, L4/L40, RTX PRO Blackwell. Compute capability 7.5 (Turing: RTX 20xx, T4, GTX 16xx) with a build configured `-DMOSSINFER_SM75=ON`: the bf16 GEMMs run as fp16 tensor-core GEMMs, INT8/INT4 ConvRot files run the INT8 GEMMs (INT4 through the INT8 unpack fallback), the exact attention and the VAE use the sm_75 kernels, and an unset attention resolves to `exact` (there is no 8-bit attention kernel on Turing). |
 | Models | MOSS-Image Base and SFT only: the official Hugging Face folders (bf16), read in place, and fine-tunes with the same architecture; other models are refused when they load. See [Supported models](#supported-models). |
 | Component model files | a single-file DiT, text encoder or VAE next to the bundle folder: ComfyUI and community files, INT8 ConvRot, INT4 ConvRot and NVFP4 DiT (NVFP4 on RTX 50 only), INT8 ConvRot and W4A8 text encoder (`dit_file`, `text_encoder_file`, `vae_file`); community GGUF DiTs (Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, BF16, F16), converted once into INT8 ConvRot or bf16 ([GGUF DiT files](#gguf-dit-files)) |
 | Generation | text-to-image with the official app's parameters: prompt, negative prompt, size, steps, CFG, shift, seed, skip layers, skip-layer guidance |
@@ -65,7 +65,7 @@ These are designed and partly built. The launcher can prepare for them now (see 
 
 | Area | Status |
 |---|---|
-| GPUs with compute capability below 8.0 (GTX 16xx, RTX 20xx and older) | not supported: the engine needs bf16 tensor cores |
+| GPUs with compute capability below 8.0 unless the build enables `MOSSINFER_SM75` (GTX 16xx, RTX 20xx and older) | not supported without that option: the engine needs bf16 tensor cores. With `-DMOSSINFER_SM75=ON` compute capability 7.5 runs (fp16 GEMMs + exact attention); older than 7.5 stays unsupported |
 | GPUs with compute capability 9.x, 10.x or 11.x (H100/H200, B200/GB200 and similar) | not supported: no kernels are built for them |
 | AMD, Intel and Apple GPUs; CPU-only machines; macOS | not supported |
 | 32-bit systems | not supported |

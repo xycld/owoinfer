@@ -939,9 +939,15 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     // the LoRA files too). The lossy accelerators are an explicit speed opt-in: the tier is resolved without them.
     const std::filesystem::path te_file = tes.model ? tes.path : std::filesystem::path();
     const auto supported = [](planner::AttentionMode mode) { return moss_dit::attention_supported(dit_attention(mode)); };
+    // sm_75 (and any device without an 8-bit attention kernel): the tier's default 8-bit attention does not exist, so
+    // the caller's unset attention resolves to exact instead of failing. On sm_80+ an 8-bit kernel always exists, so
+    // the fallback only ever runs on such devices.
+    const bool exact_when_no_q8 = !supported(planner::AttentionMode::kQ8Fp8) &&
+                                  !supported(planner::AttentionMode::kQ8Fp16);
     r.tier = planner::resolve_tier(m.options.tier, m.options.attention, src.precision, supported,
                                    tes.precision != qwen35_text::Precision::kBF16,
-                                   src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available());
+                                   src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available(),
+                                   exact_when_no_q8);
     if (lora_requested) r.tier.reason += "; runtime LoRAs active";
     if (req.accel.step_cache_on()) {
       // An unset threshold takes the model's default (0.02 on the base model, told apart by its DiT's input embedder:

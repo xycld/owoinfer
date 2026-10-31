@@ -17,6 +17,7 @@
 #include "kernels/basic/elementwise.h"
 #include "kernels/basic/norm.h"
 #include "kernels/basic/rope.h"
+#include "kernels/sm75/sm75.h"
 #include "models/lora/lora_merge_device.h"
 #include "models/moss_dit/dit_kernels.h"
 #include "models/moss_dit/nvfp4_support.h"
@@ -811,6 +812,20 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
     // the scratch).
     if (!merge_on_device(*merges, module, t)) merge_on_host(module, t);
     merge_targets_.emplace_back(module, t);
+  }
+  // sm_75: every bf16 linear weight becomes fp16 in place (the fp16 GEMM path in kernels/basic/gemm.cpp). Streamed
+  // block buffers are converted by BlockWeights::Pass::acquire() after each copy. One-time cost at load, after the
+  // pre-merged adapters above so they still run their bf16 kernels.
+  if (kernels::sm75::fp16_weights()) {
+    for (Linear* l : {&video_embedder_, &time_in_, &time_out_, &block_modulation_, &head_modulation_, &text_proj_}) {
+      kernels::sm75::convert_weight_inplace(l->w, nullptr);
+    }
+    kernels::sm75::convert_weight_inplace(final_linear_, nullptr);
+    for (TextBlock& b : text_blocks_) {
+      for (Linear* l : {&b.qkv, &b.proj, &b.up_gate, &b.down}) kernels::sm75::convert_weight_inplace(l->w, nullptr);
+    }
+    blocks_->convert_weights_to_f16(nullptr);
+    MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
   }
   load_stats_.direct = readers.all_direct();
   for (cudaEvent_t& e : block_done_) MI_CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));

@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "core/cuda_check.h"
+#include "kernels/sm75/sm75.h"
 #include "models/control/control.h"
 #include "models/flux2_vae/flux2_vae.h"
 #include "models/flux2_vae/vae_file.h"
@@ -1008,9 +1009,15 @@ struct Pipeline::Impl {
     return *c;
   }
 
-  // The block path for this call: options.block_path unless the fused GEMMs failed their self-check.
+  // The block path for this call: options.block_path unless the fused GEMMs failed their self-check. sm_75 never runs
+  // the fused route: the fused bf16 CUTLASS GEMMs need sm_80 tensor cores (and the fp16 GEMM path takes fp16 weights),
+  // so the blocks run op by op there, said so instead of letting the self-check fail with a kernel-image error.
   moss_dit::BlockPath block_path(std::string& note) {
     if (options.block_path == moss_dit::BlockPath::kOpByOp) return options.block_path;
+    if (kernels::sm75::turing()) {
+      note = "sm_75: DiT blocks run op by op (the fused bf16 CUTLASS GEMMs need sm_80+ tensor cores)";
+      return moss_dit::BlockPath::kOpByOp;
+    }
     const moss_dit::FusedCheck c = check_fused();
     if (c.ok) return options.block_path;
     note = std::string("fused DiT blocks disabled, running op by op: ") + c.detail;

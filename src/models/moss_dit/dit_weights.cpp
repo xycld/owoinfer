@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "core/cuda_check.h"
+#include "kernels/sm75/sm75.h"
 #include "models/moss_dit/moss_dit.h"
 #include "weights/quant/nvfp4_codec.h"
 
@@ -456,6 +457,31 @@ BlockWeights::BlockWeights(const weights::ModelIndex& index, runtime::DeviceAren
 
 BlockWeights::~BlockWeights() { release(); }
 
+namespace {
+// sm_75: the bf16 linear weights of one block, converted to fp16 in place (the views are marked kF16). The quantized
+// linears (qkv8/... , qkv_nvfp4/...) are not bf16 and are left alone; the fused bf16 qkv view covers its parts.
+void convert_linear_to_f16(Tensor& t, cudaStream_t stream) {
+  if (t.data == nullptr) return;
+  kernels::sm75::convert_weight_storage_inplace(t, stream);
+}
+
+void convert_block_to_f16(BlockTensors& b, cudaStream_t stream) {
+  convert_linear_to_f16(b.qkv, stream);
+  convert_linear_to_f16(b.o, stream);
+  convert_linear_to_f16(b.up_gate, stream);
+  convert_linear_to_f16(b.down, stream);
+  for (Tensor& t : b.qkv_part) convert_linear_to_f16(t, stream);
+}
+}  // namespace
+
+void BlockWeights::convert_weights_to_f16(cudaStream_t stream) {
+  if (!kernels::sm75::fp16_weights()) return;
+  for (int i = 0; i < kNumBlocks; ++i) {
+    if (!resident(i)) continue;
+    convert_block_to_f16(resident_[static_cast<std::size_t>(i)], stream);
+  }
+}
+
 void BlockWeights::create_streaming_resources() {
   const auto n = static_cast<std::size_t>(reader_count(residency_));
   const std::size_t s = streamed_.size();
@@ -669,6 +695,9 @@ const BlockTensors& BlockWeights::Pass::acquire(int block) {
   w_.sync_->wait_enqueued(j + 1);
   for (const auto& r : w_.rd_) MI_CUDA_CHECK(cudaStreamWaitEvent(stream_, r->copy_done[b], 0));
   MI_CUDA_CHECK(cudaEventRecord(w_.wait_end_[static_cast<std::size_t>(j)], stream_));
+  // sm_75: the block's bf16 linear weights just landed; convert them to fp16 on the compute stream, before the block's
+  // kernels read them (the copy itself moves the stored bf16 bytes, so this runs for every refill).
+  if (kernels::sm75::fp16_weights()) convert_block_to_f16(views_[static_cast<std::size_t>(j)], stream_);
   return views_[static_cast<std::size_t>(j)];
 }
 

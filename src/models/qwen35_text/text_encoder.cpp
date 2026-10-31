@@ -21,6 +21,7 @@
 #include "kernels/basic/elementwise.h"
 #include "kernels/basic/gemm.h"
 #include "kernels/basic/norm.h"
+#include "kernels/sm75/sm75.h"
 #include "kernels/basic/rope.h"
 #include "kernels/gdn/gdn.h"
 #include "kernels/quant/quant.h"
@@ -738,6 +739,21 @@ void TextEncoder::Impl::reader_loop(std::size_t r, const std::vector<LayerPlan>&
   chunks = me.ring ? me.ring->stats().chunks - start.chunks : 0;
 }
 
+namespace {
+// sm_75: the layer's bf16 GEMM weights (the rank-2 tensors: q/k/v, o, mlp and GDN projections) are converted to fp16
+// in place, for the fp16 GEMM path in kernels/basic. Norms (rank 1), A_log/dt_bias (rank 1) and the conv1d kernel
+// (rank 3) stay bf16. Always converts: the streamed buffers are refilled with the stored bf16 bytes on every layer.
+void convert_linears_f16(weights::TensorMap& w, cudaStream_t stream) {
+  if (!kernels::sm75::fp16_weights()) return;
+  for (auto& entry : w) {
+    Tensor& t = entry.second;
+    if (t.rank == 2 && (t.dtype == DType::kBF16 || t.dtype == DType::kF16)) {
+      kernels::sm75::convert_weight_storage_inplace(t, stream);
+    }
+  }
+}
+}  // namespace
+
 // P2 path: load layer k, run it, synchronize, move on.
 void TextEncoder::Impl::run_layers_sync(const Batch& b, void* weight_buf, const Tensor& x, const Tensor& h,
                                         const Tensor& y, const EncodeOptions& options) {
@@ -750,6 +766,7 @@ void TextEncoder::Impl::run_layers_sync(const Batch& b, void* weight_buf, const 
     if (!aux.empty()) w.insert(aux[static_cast<std::size_t>(i)].begin(), aux[static_cast<std::size_t>(i)].end());
     stats.weight_load_s += seconds_since(t0);
     stats.layer_bytes[static_cast<std::size_t>(i)] = l.group->total_bytes;
+    convert_linears_f16(w, stream);
     t0 = Clock::now();
     run_layer(l, w, b, x, h, y);
     if (options.layer_hook) options.layer_hook(i, x, stream);
@@ -764,8 +781,7 @@ void TextEncoder::Impl::run_layers_sync(const Batch& b, void* weight_buf, const 
 void TextEncoder::Impl::run_layers_streaming(const std::vector<std::vector<std::int32_t>>& sequences, const Batch& b,
                                              const std::vector<void*>& bufs, const Tensor& x, const Tensor& h,
                                              const Tensor& y, const EncodeOptions& options) {
-  const std::vector<LayerPlan> plans = plan_layers(bufs);
-  const std::size_t nr = rd.size();
+  std::vector<LayerPlan> plans = plan_layers(bufs);  const std::size_t nr = rd.size();
   std::vector<std::vector<std::uint64_t>> layer_bytes(nr, std::vector<std::uint64_t>(kNumLayers, 0));
   std::vector<std::uint64_t> chunks(nr, 0);
   StreamSync sync(static_cast<int>(nr));
@@ -806,6 +822,7 @@ void TextEncoder::Impl::run_layers_streaming(const std::vector<std::vector<std::
       flush(stream);
       sync.wait_enqueued(k + 1);
       for (const Reader& r : rd) MI_CUDA_CHECK(cudaStreamWaitEvent(stream, r.copy_done[buf], 0));
+      convert_linears_f16(plans[static_cast<std::size_t>(k)].w, stream);
       MI_CUDA_CHECK(cudaEventRecord(timing[static_cast<std::size_t>(kEvLayerStart + k)], stream));
       run_layer(layers[static_cast<std::size_t>(k)], plans[static_cast<std::size_t>(k)].w, b, x, h, y);
       if (options.layer_hook) options.layer_hook(k, x, stream);

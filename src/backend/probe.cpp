@@ -133,6 +133,10 @@ void evaluate_device(DeviceInfo& dev, int driver_version, int build_cuda_version
   if (std::tie(dev.cc_major, dev.cc_minor) < std::tie(kMinComputeMajor, kMinComputeMinor)) {
     dev.reason = "compute capability " + cc_string(dev.cc_major, dev.cc_minor) + " is below the required " +
                  cc_string(kMinComputeMajor, kMinComputeMinor) + " (Ampere or newer)";
+#if MOSSINFER_HAVE_SM75
+    // The sm_80 path needs Ampere; this build's sm_75 kernel family reaches down to Turing.
+    dev.reason = "compute capability " + cc_string(dev.cc_major, dev.cc_minor) + " is below the required 7.5 (Turing)";
+#endif
     return;
   }
   const Flavour build = flavour_of_cuda_version(build_cuda_version);

@@ -13,6 +13,7 @@
 
 #include <mutex>
 #include <set>
+#include <type_traits>
 #include <utility>
 
 #include "core/cuda_check.h"
@@ -458,6 +459,79 @@ void allow_dynamic_smem(Kernel kernel, int bytes) {
   done.insert(key);
 }
 
+// sm_75: the chunked kernel needs ~85 KiB of shared memory (PrepSmem), over Turing's 64 KiB per block. This per-token
+// recurrent form computes the same rule (the chunked algorithm is an algebraic rearrangement of it) with the 128 state
+// columns split across two launches of 64: every state column is independent, so the split is exact. 33 KiB of dynamic
+// shared memory, 64 threads per block.
+constexpr int kSm75Cols = 64;
+
+template <typename OutT>
+__global__ void recurrent_sm75_kernel(const __nv_bfloat16* __restrict__ qkv, std::int64_t qkv_stride,
+                                      const float* __restrict__ g, const __nv_bfloat16* __restrict__ beta,
+                                      const int* __restrict__ cu, OutT* __restrict__ out,
+                                      float* __restrict__ final_state) {
+  extern __shared__ float smem_sm75[];
+  float* s = smem_sm75;                       // [kHeadDim][kSm75Cols], state column c
+  float* sq = s + kHeadDim * kSm75Cols;       // [kHeadDim]
+  float* sk = sq + kHeadDim;                  // [kHeadDim]
+  float* redq = sk + kHeadDim;                // [2]
+  float* redk = redq + 2;                     // [2]
+  const int h = blockIdx.x, kh = h / (kNumVHeads / kNumKHeads), seq = blockIdx.y;
+  const int c = threadIdx.x;  // 0..63
+  const int col = static_cast<int>(blockIdx.z) * kSm75Cols + c;
+  const int lane = c & 31, warp = c >> 5;
+  for (int i = 0; i < kHeadDim; ++i) s[i * kSm75Cols + c] = 0.f;
+  for (int t = cu[seq]; t < cu[seq + 1]; ++t) {
+    const __nv_bfloat16* row = qkv + t * qkv_stride;
+    const float q0 = bf(row[kh * kHeadDim + c]);
+    const float q1 = bf(row[kh * kHeadDim + kSm75Cols + c]);
+    const float k0 = bf(row[kKeyDim + kh * kHeadDim + c]);
+    const float k1 = bf(row[kKeyDim + kh * kHeadDim + kSm75Cols + c]);
+    float qq = q0 * q0 + q1 * q1, kk = k0 * k0 + k1 * k1;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      qq += __shfl_xor_sync(0xffffffffu, qq, off);
+      kk += __shfl_xor_sync(0xffffffffu, kk, off);
+    }
+    if (lane == 0) {
+      redq[warp] = qq;
+      redk[warp] = kk;
+    }
+    __syncthreads();
+    const float qs = redq[0] + redq[1], ks = redk[0] + redk[1];
+    sq[c] = q0 * rsqrtf(qs + kNormEps) / kSqrtHeadDim;
+    sq[kSm75Cols + c] = q1 * rsqrtf(qs + kNormEps) / kSqrtHeadDim;
+    sk[c] = k0 * rsqrtf(ks + kNormEps);
+    sk[kSm75Cols + c] = k1 * rsqrtf(ks + kNormEps);
+    const float v = bf(row[2 * kKeyDim + h * kHeadDim + col]);
+    __syncthreads();
+    const float decay = expf(g[t * kNumVHeads + h]), b = bf(beta[t * kNumVHeads + h]);
+    float kv = 0.f;
+    for (int i = 0; i < kHeadDim; ++i) {
+      const float sv = s[i * kSm75Cols + c] * decay;
+      s[i * kSm75Cols + c] = sv;
+      kv = fmaf(sv, sk[i], kv);
+    }
+    const float delta = (v - kv) * b;
+    float o = 0.f;
+    for (int i = 0; i < kHeadDim; ++i) {
+      const float sv = fmaf(sk[i], delta, s[i * kSm75Cols + c]);
+      s[i * kSm75Cols + c] = sv;
+      o = fmaf(sv, sq[i], o);
+    }
+    if constexpr (std::is_same_v<OutT, float>) {
+      out[(static_cast<std::int64_t>(t) * kNumVHeads + h) * kHeadDim + col] = o;
+    } else {
+      out[(static_cast<std::int64_t>(t) * kNumVHeads + h) * kHeadDim + col] = __float2bfloat16_rn(o);
+    }
+    __syncthreads();  // sq, sk and the reductions are rewritten by the next token
+  }
+  if (final_state != nullptr) {
+    float* fs = final_state + (static_cast<std::int64_t>(seq) * kNumVHeads + h) * kHeadDim * kHeadDim;
+    for (int i = 0; i < kHeadDim; ++i) fs[i * kHeadDim + col] = s[i * kSm75Cols + c];
+  }
+}
+
 }  // namespace
 
 std::size_t chunk_gated_delta_rule_workspace_bytes(std::int64_t total_tokens) {
@@ -483,6 +557,21 @@ void chunk_gated_delta_rule(const Tensor& qkv, const Tensor& g, const Tensor& be
   }
   Workspace ws{};
   workspace_layout(tokens, workspace, &ws);
+
+  // sm_75: the chunked kernels need ~85 KiB of shared memory, over Turing's 64 KiB per block. The recurrent form above
+  // computes the same rule with 33 KiB; its numerics are fp32 like the chunked path's.
+  int sm75_device = 0, sm75_major = 0;
+  MI_CUDA_CHECK(cudaGetDevice(&sm75_device));
+  MI_CUDA_CHECK(cudaDeviceGetAttribute(&sm75_major, cudaDevAttrComputeCapabilityMajor, sm75_device));
+  if (sm75_major < 8) {
+    constexpr int kSm75Smem = (kHeadDim * kSm75Cols + 2 * kHeadDim + 4) * static_cast<int>(sizeof(float));
+    const dim3 grid(kNumVHeads, num_seqs, kHeadDim / kSm75Cols);
+    recurrent_sm75_kernel<__nv_bfloat16><<<grid, kSm75Cols, kSm75Smem, stream>>>(
+        qkv.ptr<__nv_bfloat16>(), qkv.stride[0], g.ptr<float>(), beta.ptr<__nv_bfloat16>(), cu_seqlens.ptr<int>(),
+        out.ptr<__nv_bfloat16>(), final_state ? final_state->ptr<float>() : nullptr);
+    MI_CUDA_CHECK_LAUNCH();
+    return;
+  }
 
   constexpr int kPrepSmem = sizeof(PrepSmem), kStateSmem = sizeof(StateSmem);
   allow_dynamic_smem(prep_kernel, kPrepSmem);

@@ -1179,6 +1179,14 @@ TEST(Planner, TurboTier) {
   EXPECT_EQ(d.attention, AttentionMode::kQ8Fp8);
   EXPECT_EQ(d.reason, "Turbo tier: INT4 ConvRot GEMMs, q8_fp8 attention");
   EXPECT_THROW(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, no_q8), std::invalid_argument);  // no fallback
+  // sm_75: no 8-bit attention kernel exists, so an unset attention may resolve to exact (explicitly said so).
+  {
+    const TierDecision t = resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, no_q8, false, false, /*exact_when_no_q8=*/true);
+    EXPECT_EQ(t.attention, AttentionMode::kExact);
+    EXPECT_NE(t.reason.find("no 8-bit attention kernel"), std::string::npos) << t.reason;
+    const TierDecision h = resolve_tier(Tier::kHigh, O{}, Precision::kInt8, no_q8, false, false, /*exact_when_no_q8=*/true);
+    EXPECT_EQ(h.attention, AttentionMode::kExact);
+  }
   EXPECT_EQ(resolve_tier(Tier::kTurbo, O{AttentionMode::kExact}, Precision::kInt4, no_q8).attention, AttentionMode::kExact);
   EXPECT_EQ(resolve_tier(Tier::kTurbo, O{AttentionMode::kExact}, Precision::kInt4, all).attention, AttentionMode::kExact);
   EXPECT_EQ(resolve_tier(Tier::kTurbo, O{}, Precision::kInt4, all, true).tier, Tier::kTurbo);  // + quantized TE
