@@ -39,6 +39,7 @@ void int8_gemm_gated_residual(const Int8Operands& op, const __nv_bfloat16* bias,
   detail::check_vector(name, "gate", gate, /*optional=*/false);
   if (p.m == 0) return;
   if (kernels::sm75::turing()) {
+    detail::check_sm75_tile(name, tile);
     kernels::sm75::int8_gemm_gated_residual(op, bias, gate, residual, ldr, stream);
     return;
   }

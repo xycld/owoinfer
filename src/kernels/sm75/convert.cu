@@ -1,13 +1,14 @@
 // sm_75 dtype conversion kernels: every tensor-core operand in the engine is bf16, while Turing's tensor cores take
-// fp16. These kernels convert in place (the same 2-byte slot) or into a separate buffer; the attention wrapper relies
-// on the round trip being exact for in-range values (fp16 has more mantissa bits than bf16, so bf16 -> fp16 is lossless
-// and fp16 -> bf16 recovers the original value as long as it stayed in fp16's normal range).
+// fp16. bf16 -> fp16 is lossless for values in fp16's normal range (fp16 has more mantissa bits than bf16), and
+// fp16 -> bf16 recovers the original value. The weight conversions run in place (the same 2-byte slot); the GEMM's
+// activation rows are converted into its scratch with a per-row power-of-two scale that keeps them in range.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include <atomic>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 #include "core/cuda_check.h"
 #include "kernels/sm75/sm75.h"
@@ -17,65 +18,26 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr int kMaxBlocks = 65535;
+constexpr float kF16Max = 65504.f;
 
-__global__ void bf16_to_f16_flat(const __nv_bfloat16* __restrict__ src, __half* __restrict__ dst, std::int64_t n) {
+// In place when dst == src (no __restrict__): each element is read and written by the same thread.
+__global__ void bf16_to_f16_flat(const __nv_bfloat16* src, __half* dst, std::int64_t n) {
   const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
   for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) {
     dst[i] = __float2half_rn(__bfloat162float(src[i]));
   }
 }
 
-__global__ void f16_to_bf16_flat(const __half* __restrict__ src, __nv_bfloat16* __restrict__ dst, std::int64_t n) {
+__global__ void f16_to_bf16_flat(const __half* src, __nv_bfloat16* dst, std::int64_t n) {
   const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
   for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) {
     dst[i] = __float2bfloat16_rn(__half2float(src[i]));
   }
 }
 
-// One block per token row, `dim` contiguous elements per (token, head) run.
-__global__ void bf16_to_f16_row(const __nv_bfloat16* __restrict__ src, __half* __restrict__ dst, std::int64_t stride,
-                                std::int64_t dim) {
-  const __nv_bfloat16* s = src + static_cast<std::int64_t>(blockIdx.x) * stride;
-  __half* d = dst + static_cast<std::int64_t>(blockIdx.x) * stride;
-  for (std::int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
-    d[i] = __float2half_rn(__bfloat162float(s[i]));
-  }
-}
-
-__global__ void f16_to_bf16_row(const __half* __restrict__ src, __nv_bfloat16* __restrict__ dst, std::int64_t stride,
-                                std::int64_t dim) {
-  const __half* s = src + static_cast<std::int64_t>(blockIdx.x) * stride;
-  __nv_bfloat16* d = dst + static_cast<std::int64_t>(blockIdx.x) * stride;
-  for (std::int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
-    d[i] = __float2bfloat16_rn(__half2float(s[i]));
-  }
-}
-
 int blocks_for(std::int64_t n) {
   const std::int64_t blocks = (n + kThreads - 1) / kThreads;
   return static_cast<int>(blocks < kMaxBlocks ? (blocks > 0 ? blocks : 1) : kMaxBlocks);
-}
-
-// The attention tensors are [tokens, heads, dim] with a contiguous last dim, so every (token, head) pair is one run of
-// `dim` elements at token * stride[0] + head * stride[1]. q/k/v may be views of a fused QKV output (non-contiguous
-// heads), which the per-head loop handles.
-void convert_3d_inplace(const Tensor& t, std::int64_t rows, std::int64_t heads, std::int64_t dim, bool to_f16,
-                        cudaStream_t stream) {
-  if (rows == 0 || heads == 0 || dim == 0) return;
-  // One block per row on grid.x, whose limit is 2^31 - 1 (kMaxBlocks is the grid-stride cap of the flat kernels).
-  if (rows > 0x7fffffff) throw std::length_error("sm75::convert_3d_inplace: more rows than one grid dimension holds");
-  auto* base = static_cast<char*>(t.data);
-  for (std::int64_t h = 0; h < heads; ++h) {
-    char* p = base + h * static_cast<std::int64_t>(t.stride[1]) * 2;
-    if (to_f16) {
-      bf16_to_f16_row<<<static_cast<int>(rows), kThreads, 0, stream>>>(
-          reinterpret_cast<const __nv_bfloat16*>(p), reinterpret_cast<__half*>(p), t.stride[0], dim);
-    } else {
-      f16_to_bf16_row<<<static_cast<int>(rows), kThreads, 0, stream>>>(
-          reinterpret_cast<const __half*>(p), reinterpret_cast<__nv_bfloat16*>(p), t.stride[0], dim);
-    }
-  }
-  MI_CUDA_CHECK_LAUNCH();
 }
 
 }  // namespace
@@ -136,70 +98,82 @@ void convert_f16_to_bf16(void* dst, const void* src, std::int64_t n, cudaStream_
   MI_CUDA_CHECK_LAUNCH();
 }
 
-void convert_tensor_bf16_to_f16_inplace(const Tensor& t, std::int64_t rows, std::int64_t heads, std::int64_t dim,
-                                        cudaStream_t stream) {
-  convert_3d_inplace(t, rows, heads, dim, /*to_f16=*/true, stream);
-}
-
-void convert_tensor_f16_to_bf16_inplace(const Tensor& t, std::int64_t rows, std::int64_t heads, std::int64_t dim,
-                                        cudaStream_t stream) {
-  convert_3d_inplace(t, rows, heads, dim, /*to_f16=*/false, stream);
-}
-
 namespace {
 
-__global__ void bf16_to_f16_rows(const __nv_bfloat16* __restrict__ src, __half* __restrict__ dst, std::int64_t cols,
-                                 std::int64_t src_stride, std::int64_t dst_stride) {
+// One block per row: the row's largest magnitude, then the row converted with scale 2^-e, the smallest power of two
+// that brings it within fp16's range (1 for every row already in range, so those convert exactly as plain bf16 ->
+// fp16). Scaling by a power of two is exact, so a scaled row loses nothing but the low values it pushes below fp16's
+// normal range; inv_scale[row] = 2^e undoes it in the GEMM's output pass. A row holding inf is left unscaled (a NaN
+// is skipped by the max and carried through either way).
+__global__ void bf16_to_f16_rows_scaled(const __nv_bfloat16* __restrict__ src, __half* __restrict__ dst,
+                                        float* __restrict__ inv_scale, std::int64_t cols, std::int64_t src_stride,
+                                        std::int64_t dst_stride) {
+  __shared__ float warp_max[kThreads / 32];
+  __shared__ float row_scale;
   const __nv_bfloat16* s = src + static_cast<std::int64_t>(blockIdx.x) * src_stride;
   __half* d = dst + static_cast<std::int64_t>(blockIdx.x) * dst_stride;
-  for (std::int64_t i = threadIdx.x; i < cols; i += blockDim.x) {
-    d[i] = __float2half_rn(__bfloat162float(s[i]));
+  float amax = 0.f;
+  for (std::int64_t i = threadIdx.x; i < cols; i += blockDim.x) amax = fmaxf(amax, fabsf(__bfloat162float(s[i])));
+  for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+  if (threadIdx.x % 32 == 0) warp_max[threadIdx.x / 32] = amax;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float m = 0.f;
+    for (int w = 0; w < kThreads / 32; ++w) m = fmaxf(m, warp_max[w]);
+    int e = 0;
+    if (m > kF16Max && isfinite(m)) e = static_cast<int>(ceilf(log2f(m / kF16Max)));
+    while (e > 0 && ldexpf(m, -e) > kF16Max) ++e;  // log2f's rounding at an exact power of two
+    row_scale = ldexpf(1.f, -e);
+    inv_scale[blockIdx.x] = ldexpf(1.f, e);
   }
+  __syncthreads();
+  const float scale = row_scale;
+  for (std::int64_t i = threadIdx.x; i < cols; i += blockDim.x) d[i] = __float2half_rn(__bfloat162float(s[i]) * scale);
 }
 
-// out is bf16: `acc` may alias it (the GEMM writes fp16 into the output buffer, this pass converts in place).
-__global__ void gemm_out_f16_bf16(__half* __restrict__ acc, __nv_bfloat16* __restrict__ out,
-                                  const __nv_bfloat16* __restrict__ bias, std::int64_t cols, std::int64_t out_stride,
-                                  std::int64_t acc_stride) {
-  const __half* a = acc + static_cast<std::int64_t>(blockIdx.x) * acc_stride;
-  __nv_bfloat16* o = out + static_cast<std::int64_t>(blockIdx.x) * out_stride;
+// out[r][c] = out_type(acc[r][c] * inv_scale[r] + bias[c]): the fp32 add before the single final rounding.
+template <typename Out, typename Bias>
+__global__ void gemm_out_f32(const float* __restrict__ acc, const float* __restrict__ inv_scale, Out* __restrict__ out,
+                             const Bias* __restrict__ bias, std::int64_t cols, std::int64_t out_stride,
+                             std::int64_t acc_stride) {
+  const float* a = acc + static_cast<std::int64_t>(blockIdx.x) * acc_stride;
+  Out* o = out + static_cast<std::int64_t>(blockIdx.x) * out_stride;
+  const float sc = inv_scale[blockIdx.x];
   for (std::int64_t c = threadIdx.x; c < cols; c += blockDim.x) {
-    const float v = __half2float(a[c]) + (bias != nullptr ? __bfloat162float(bias[c]) : 0.f);
-    o[c] = __float2bfloat16_rn(v);
-  }
-}
-
-__global__ void gemm_out_f16_f32(const __half* __restrict__ acc, float* __restrict__ out, const float* __restrict__ bias,
-                                 std::int64_t cols, std::int64_t out_stride, std::int64_t acc_stride) {
-  const __half* a = acc + static_cast<std::int64_t>(blockIdx.x) * acc_stride;
-  float* o = out + static_cast<std::int64_t>(blockIdx.x) * out_stride;
-  for (std::int64_t c = threadIdx.x; c < cols; c += blockDim.x) {
-    o[c] = __half2float(a[c]) + (bias != nullptr ? bias[c] : 0.f);
+    float v = a[c] * sc;
+    if (bias != nullptr) v += static_cast<float>(bias[c]);
+    if constexpr (std::is_same_v<Out, float>) {
+      o[c] = v;
+    } else {
+      o[c] = __float2bfloat16_rn(v);
+    }
   }
 }
 
 }  // namespace
 
-void convert_rows_bf16_to_f16(void* dst, const void* src, std::int64_t rows, std::int64_t cols,
-                              std::int64_t src_stride, std::int64_t dst_stride, cudaStream_t stream) {
+void convert_rows_bf16_to_f16_scaled(void* dst, float* inv_scale, const void* src, std::int64_t rows,
+                                     std::int64_t cols, std::int64_t src_stride, std::int64_t dst_stride,
+                                     cudaStream_t stream) {
   if (rows <= 0 || cols <= 0) return;
-  bf16_to_f16_rows<<<static_cast<int>(rows), kThreads, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(src), static_cast<__half*>(dst), cols, src_stride, dst_stride);
+  bf16_to_f16_rows_scaled<<<static_cast<int>(rows), kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(src), static_cast<__half*>(dst), inv_scale, cols, src_stride, dst_stride);
   MI_CUDA_CHECK_LAUNCH();
 }
 
-void convert_gemm_out_f16(void* out, const void* acc, const void* bias, bool bias_f32, bool out_f32,
+void convert_gemm_out_f32(void* out, bool out_f32, const float* acc, const float* inv_scale, const void* bias,
                           std::int64_t rows, std::int64_t cols, std::int64_t out_stride, std::int64_t acc_stride,
                           cudaStream_t stream) {
   if (rows <= 0 || cols <= 0) return;
+  const auto grid = static_cast<int>(rows);
   if (out_f32) {
-    gemm_out_f16_f32<<<static_cast<int>(rows), kThreads, 0, stream>>>(
-        static_cast<const __half*>(acc), static_cast<float*>(out), static_cast<const float*>(bias_f32 ? bias : nullptr),
-        cols, out_stride, acc_stride);
+    gemm_out_f32<float, float><<<grid, kThreads, 0, stream>>>(acc, inv_scale, static_cast<float*>(out),
+                                                              static_cast<const float*>(bias), cols, out_stride,
+                                                              acc_stride);
   } else {
-    gemm_out_f16_bf16<<<static_cast<int>(rows), kThreads, 0, stream>>>(
-        static_cast<__half*>(const_cast<void*>(acc)), static_cast<__nv_bfloat16*>(out),
-        static_cast<const __nv_bfloat16*>(bias), cols, out_stride, acc_stride);
+    gemm_out_f32<__nv_bfloat16, __nv_bfloat16><<<grid, kThreads, 0, stream>>>(
+        acc, inv_scale, static_cast<__nv_bfloat16*>(out), static_cast<const __nv_bfloat16*>(bias), cols, out_stride,
+        acc_stride);
   }
   MI_CUDA_CHECK_LAUNCH();
 }

@@ -8,11 +8,12 @@
 // scores in the m16n8k8 accumulator layout, row max/sum reduced across the four lanes of a row group, and the P·V
 // product reusing the normalized scores directly as the A operand (the m16n8k8 accumulator layout of Q·Kᵀ is exactly
 // the A-operand layout of P·V for the next MMA). GQA maps query head h to KV head h / (heads / kv_heads); sequences are
-// varlen through cu_seqlens.
+// varlen through cu_seqlens. The causal mask is aligned bottom-right (key <= query + len_k - len_q), as
+// FlashAttention-2's; a row that sees no key gets a zero output and an +inf log-sum-exp, as FA2's.
 //
-// Precision: the engine's tensors are bf16 and sm_75's MMA is fp16. bf16 -> fp16 is exact for values in fp16's normal
-// range and fp16 -> bf16 recovers the original value, so q/k/v are converted in place before the launch and restored
-// after it; `out` is written as fp16 by the kernel and converted to bf16 in place.
+// Precision: the engine's tensors are bf16 and sm_75's MMA is fp16. q/k/v are read as bf16 and converted to fp16 as
+// they are staged into shared memory (exact for values in fp16's normal range); the caller's tensors are never
+// written. `out` is rounded once, fp32 -> bf16, as FA2's.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -52,6 +53,17 @@ __device__ __forceinline__ std::uint32_t pack_half2(float lo, float hi) {
   return c.u;
 }
 
+__device__ __forceinline__ std::uint32_t pack_bf162(float lo, float hi) {
+  union {
+    __nv_bfloat162 h;
+    std::uint32_t u;
+  } c;
+  c.h = __floats2bfloat162_rn(lo, hi);
+  return c.u;
+}
+
+__device__ __forceinline__ __half to_half(__nv_bfloat16 v) { return __float2half_rn(__bfloat162float(v)); }
+
 __device__ __forceinline__ std::uint32_t load_u32(const void* p) {
   return *static_cast<const std::uint32_t*>(p);
 }
@@ -61,10 +73,10 @@ __device__ __forceinline__ void store_u32(void* p, std::uint32_t v) {
 }
 
 struct Params {
-  const __half* q = nullptr;
-  const __half* k = nullptr;
-  const __half* v = nullptr;
-  __half* o = nullptr;
+  const __nv_bfloat16* q = nullptr;
+  const __nv_bfloat16* k = nullptr;
+  const __nv_bfloat16* v = nullptr;
+  __nv_bfloat16* o = nullptr;
   float* lse = nullptr;
   std::int64_t q_row = 0, q_head = 0;
   std::int64_t k_row = 0, k_head = 0;
@@ -101,6 +113,7 @@ __global__ void attention_kernel_sm75(const Params p) {
   if (row_base >= len_q) return;
   const int rows = min(kBM, len_q - row_base);
   const int kv_head = head / (p.heads / p.kv_heads);
+  const int causal_shift = len_k - len_q;  // bottom-right: query row i sees keys 0 .. i + causal_shift
   const int tid = threadIdx.x;
   const int lane = tid % 32;
   const int warp = tid / 32;
@@ -110,7 +123,7 @@ __global__ void attention_kernel_sm75(const Params p) {
   // Q tile into shared memory (rows past this sequence's end are zero).
   for (int idx = tid; idx < kBM * D; idx += kThreads) {
     const int r = idx / D, d = idx % D;
-    qs[r * kQStride + d] = (r < rows) ? p.q[(q_start + row_base + r) * p.q_row + head * p.q_head + d]
+    qs[r * kQStride + d] = (r < rows) ? to_half(p.q[(q_start + row_base + r) * p.q_row + head * p.q_head + d])
                                       : __float2half_rn(0.f);
   }
   __syncthreads();
@@ -133,7 +146,7 @@ __global__ void attention_kernel_sm75(const Params p) {
   float m0 = -1e30f, m1 = -1e30f;  // running row max for r0 / r1
   float l0 = 0.f, l1 = 0.f;        // running row sum
 
-  const int key_tiles = p.causal ? min((len_k + BN - 1) / BN, (row_base + rows + BN - 1) / BN)
+  const int key_tiles = p.causal ? min((len_k + BN - 1) / BN, max(0, (row_base + rows + causal_shift + BN - 1) / BN))
                                  : (len_k + BN - 1) / BN;
   for (int tile = 0; tile < key_tiles; ++tile) {
     const int j0 = tile * BN;
@@ -142,8 +155,10 @@ __global__ void attention_kernel_sm75(const Params p) {
       const int j = idx / D, d = idx % D;
       const int token = j0 + j;
       const bool valid = token < len_k;
-      ks[j * kQStride + d] = valid ? p.k[(k_start + token) * p.k_row + kv_head * p.k_head + d] : __float2half_rn(0.f);
-      vt[d * kVStride + j] = valid ? p.v[(k_start + token) * p.v_row + kv_head * p.v_head + d] : __float2half_rn(0.f);
+      ks[j * kQStride + d] =
+          valid ? to_half(p.k[(k_start + token) * p.k_row + kv_head * p.k_head + d]) : __float2half_rn(0.f);
+      vt[d * kVStride + j] =
+          valid ? to_half(p.v[(k_start + token) * p.v_row + kv_head * p.v_head + d]) : __float2half_rn(0.f);
     }
     __syncthreads();
 
@@ -170,7 +185,7 @@ __global__ void attention_kernel_sm75(const Params p) {
       for (int e = 0; e < 4; ++e) {
         const int key = key0 + (e & 1);
         const int row_q = (e < 2) ? row_q0 : row_q1;
-        const bool valid = key < len_k && (!p.causal || key <= row_q);
+        const bool valid = key < len_k && (!p.causal || key <= row_q + causal_shift);
         s[t][e] = valid ? s[t][e] * p.scale : -1e30f;
       }
       tile_max0 = fmaxf(tile_max0, fmaxf(s[t][0], s[t][1]));
@@ -186,14 +201,16 @@ __global__ void attention_kernel_sm75(const Params p) {
     const float alpha0 = (m0 <= -1e29f) ? 0.f : exp2f((m0 - m_new0) * kLog2e);
     const float alpha1 = (m1 <= -1e29f) ? 0.f : exp2f((m1 - m_new1) * kLog2e);
 
-    // P = exp(S - m_new) as fp16, and the running sum.
+    // P = exp(S - m_new) as fp16, and the running sum. A masked score is 0 even while its row has seen no key yet
+    // (m_new still the -1e30 sentinel, where exp(S - m_new) would be 1).
     float tile_sum0 = 0.f, tile_sum1 = 0.f;
+    const auto prob = [](float sv, float mv) { return sv <= -1e29f ? 0.f : exp2f((sv - mv) * kLog2e); };
 #pragma unroll
     for (int t = 0; t < kSubtiles; ++t) {
-      const float p0 = exp2f((s[t][0] - m_new0) * kLog2e);
-      const float p1 = exp2f((s[t][1] - m_new0) * kLog2e);
-      const float p2 = exp2f((s[t][2] - m_new1) * kLog2e);
-      const float p3 = exp2f((s[t][3] - m_new1) * kLog2e);
+      const float p0 = prob(s[t][0], m_new0);
+      const float p1 = prob(s[t][1], m_new0);
+      const float p2 = prob(s[t][2], m_new1);
+      const float p3 = prob(s[t][3], m_new1);
       tile_sum0 += p0 + p1;
       tile_sum1 += p2 + p3;
       s[t][0] = p0;
@@ -231,26 +248,27 @@ __global__ void attention_kernel_sm75(const Params p) {
     __syncthreads();
   }
 
-  // Normalize, then out (fp16) and the log-sum-exp workspace (fp32 [heads, total_q], unpadded).
+  // Normalize, then out (bf16) and the log-sum-exp workspace (fp32 [heads, total_q], unpadded; +inf for a row that saw
+  // no key, as FA2's).
   const float inv0 = l0 > 0.f ? 1.f / l0 : 0.f;
   const float inv1 = l1 > 0.f ? 1.f / l1 : 0.f;
   if (r0 < rows) {
 #pragma unroll
     for (int i = 0; i < kDimChunks; ++i) {
       store_u32(&p.o[(q_start + row_base + r0) * p.o_row + head * p.o_head + i * 8 + tig * 2],
-                pack_half2(o[i][0] * inv0, o[i][1] * inv0));
+                pack_bf162(o[i][0] * inv0, o[i][1] * inv0));
     }
     if (tig == 0 && p.lse != nullptr) p.lse[static_cast<std::int64_t>(head) * p.total_q + q_start + row_base + r0] =
-        m0 + logf(l0);
+        l0 > 0.f ? m0 + logf(l0) : INFINITY;
   }
   if (r1 < rows) {
 #pragma unroll
     for (int i = 0; i < kDimChunks; ++i) {
       store_u32(&p.o[(q_start + row_base + r1) * p.o_row + head * p.o_head + i * 8 + tig * 2],
-                pack_half2(o[i][2] * inv1, o[i][3] * inv1));
+                pack_bf162(o[i][2] * inv1, o[i][3] * inv1));
     }
     if (tig == 0 && p.lse != nullptr) p.lse[static_cast<std::int64_t>(head) * p.total_q + q_start + row_base + r1] =
-        m1 + logf(l1);
+        l1 > 0.f ? m1 + logf(l1) : INFINITY;
   }
 }
 
@@ -292,15 +310,11 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
     throw std::invalid_argument("sm75::flash_fwd: workspace too small for the log-sum-exp");
   }
 
-  convert_tensor_bf16_to_f16_inplace(q, total_q, heads, head_dim, stream);
-  convert_tensor_bf16_to_f16_inplace(k, k.dim(0), kv_heads, head_dim, stream);
-  convert_tensor_bf16_to_f16_inplace(v, v.dim(0), kv_heads, head_dim, stream);
-
   Params p;
-  p.q = static_cast<const __half*>(q.data);
-  p.k = static_cast<const __half*>(k.data);
-  p.v = static_cast<const __half*>(v.data);
-  p.o = static_cast<__half*>(out.data);
+  p.q = static_cast<const __nv_bfloat16*>(q.data);
+  p.k = static_cast<const __nv_bfloat16*>(k.data);
+  p.v = static_cast<const __nv_bfloat16*>(v.data);
+  p.o = static_cast<__nv_bfloat16*>(out.data);
   p.lse = static_cast<float*>(workspace);
   p.q_row = q.stride[0];
   p.q_head = q.stride[1];
@@ -324,11 +338,6 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
   } else {
     launch<256, 16>(p, max_seqlen, batch, stream);
   }
-
-  convert_tensor_f16_to_bf16_inplace(out, out.dim(0), out.dim(1), out.dim(2), stream);
-  convert_tensor_f16_to_bf16_inplace(q, total_q, heads, head_dim, stream);
-  convert_tensor_f16_to_bf16_inplace(k, k.dim(0), kv_heads, head_dim, stream);
-  convert_tensor_f16_to_bf16_inplace(v, v.dim(0), kv_heads, head_dim, stream);
 }
 
 }  // namespace mi::kernels::sm75

@@ -105,6 +105,7 @@ void int8_gemm_situ_glu(const Int8Operands& op, __nv_bfloat16* out, std::int64_t
   }
   if (p.m == 0) return;
   if (kernels::sm75::turing()) {
+    detail::check_sm75_tile(name, tile);
     kernels::sm75::int8_gemm_situ_glu(op, out, ldo, stream);
     return;
   }

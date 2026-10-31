@@ -92,22 +92,8 @@ struct Gemm::Impl {
   cublasLtHandle_t handle = nullptr;
   mutable std::mutex mutex;
   std::unordered_map<Key, std::unique_ptr<Plan>, KeyHash> plans;
-  // sm_75: fp16 tensor cores with bf16 activations. x is converted to fp16 in a chunked scratch buffer, the weights
-  // are fp16 (converted once by the loader) and the GEMM writes fp16 (into the bf16 output buffer, or into `acc16`
-  // for an f32 output) which a second pass converts to the output dtype and adds the bias.
+  // sm_75: fp16 tensor cores with bf16 activations (linear_f16). The weights are fp16 (converted once by the loader).
   bool fp16 = false;
-  void* x16 = nullptr;
-  std::size_t x16_bytes = 0;
-  void* acc16 = nullptr;
-  std::size_t acc16_bytes = 0;
-
-  static void ensure_scratch(void*& p, std::size_t& cap, std::size_t need) {
-    if (cap >= need) return;
-    MI_CUDA_CHECK(cudaDeviceSynchronize());  // an earlier launch on another stream may still read it
-    if (p != nullptr) MI_CUDA_CHECK(cudaFree(p));
-    MI_CUDA_CHECK(cudaMalloc(&p, need));
-    cap = need;
-  }
 
   Plan& plan_for(const Key& key, const void* bias_ptr) {
     auto it = plans.find(key);
@@ -167,8 +153,11 @@ struct Gemm::Impl {
     return *plans.emplace(key, std::move(plan)).first->second;
   }
 
-  // sm_75 path: x is bf16, the GEMM runs fp16 in / fp32 out on Turing's tensor cores, and the result is converted to
-  // the output dtype with the bias added in fp32. Row-chunked so the fp16 copies stay in a small scratch buffer.
+  // sm_75 path: x is bf16, the GEMM runs fp16 in / fp32 out on Turing's tensor cores, and a second pass converts the
+  // result to the output dtype with the bias added in fp32 (one rounding, as the sm_80 path's BIAS epilogue). x's rows
+  // are converted to fp16 with a per-row power-of-two scale (1 for rows in fp16's range), undone in that pass. The
+  // fp16 rows, the scales and the fp32 result live in the caller's workspace, after the share cuBLASLt gets: row
+  // chunks of what fits, so the GEMM needs no memory of its own and each stream's workspace keeps its calls apart.
   void linear_f16(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias, void* workspace,
                   std::size_t workspace_bytes, cudaStream_t stream) {
     const std::int64_t m = detail::rows_of(x);
@@ -179,31 +168,45 @@ struct Gemm::Impl {
     const std::int64_t ldw = row_stride(w);
     if (m == 0 || n == 0) return;
     const bool out_f32 = out.dtype == DType::kF32;
-    constexpr std::size_t kScratchBytes = std::size_t{16} << 20;
-    const std::size_t per_row = static_cast<std::size_t>(std::max(n, k)) * 2;
-    std::int64_t chunk = static_cast<std::int64_t>(kScratchBytes / std::max<std::size_t>(1, per_row));
-    chunk = std::max<std::int64_t>(1, std::min(chunk, m));
-    ensure_scratch(x16, x16_bytes, static_cast<std::size_t>(chunk) * static_cast<std::size_t>(k) * 2);
-    if (out_f32) {
-      ensure_scratch(acc16, acc16_bytes, static_cast<std::size_t>(chunk) * static_cast<std::size_t>(n) * 2);
+    constexpr std::size_t kAlign = 256;
+    const auto align_up = [](std::size_t v) { return (v + kAlign - 1) / kAlign * kAlign; };
+    const std::size_t lt_bytes = workspace_bytes / 8 / kAlign * kAlign;
+    const std::size_t per_row = static_cast<std::size_t>(k) * 2 + static_cast<std::size_t>(n) * 4 + sizeof(float);
+    const std::size_t scratch = workspace_bytes - lt_bytes;
+    const std::size_t slack = 3 * kAlign;
+    if (scratch < slack + per_row) {
+      detail::fail("linear", "the sm_75 path needs a workspace (Gemm::kWorkspaceBytes) for its fp16/fp32 rows, got " +
+                                 std::to_string(workspace_bytes) + " bytes");
     }
+    // Equal chunks in whole 128-row tiles (no short tail that rereads the weight for a few rows) when the scratch
+    // holds at least one such tile.
+    std::int64_t chunk = static_cast<std::int64_t>((scratch - slack) / per_row);
+    constexpr std::int64_t kTileRows = 128;
+    if (chunk < m) {
+      if (chunk >= kTileRows) chunk = chunk / kTileRows * kTileRows;
+      const std::int64_t pieces = (m + chunk - 1) / chunk;
+      const std::int64_t even = (m + pieces - 1) / pieces;
+      chunk = std::min(chunk, chunk >= kTileRows ? (even + kTileRows - 1) / kTileRows * kTileRows : even);
+    }
+    chunk = std::min(chunk, m);
+    char* const base = static_cast<char*>(workspace) + lt_bytes;
+    void* const x16 = base;
+    auto* const acc = reinterpret_cast<float*>(base + align_up(static_cast<std::size_t>(chunk) * k * 2));
+    auto* const inv_scale = acc + align_up(static_cast<std::size_t>(chunk) * n * 4) / sizeof(float);
     const void* bias_ptr = bias != nullptr ? bias->data : nullptr;
-    const bool bias_f32 = bias != nullptr && bias->dtype == DType::kF32;
+    const std::size_t out_elem = out_f32 ? 4 : 2;
     for (std::int64_t r0 = 0; r0 < m; r0 += chunk) {
       const std::int64_t rows = std::min(chunk, m - r0);
-      kernels::sm75::convert_rows_bf16_to_f16(x16, static_cast<const char*>(x.data) + r0 * ldx * 2, rows, k, ldx, k,
-                                              stream);
-      void* dptr = out_f32 ? acc16 : (static_cast<char*>(out.data) + r0 * ldo * 2);
-      const std::int64_t acc_ld = out_f32 ? n : ldo;
-      const Key key{rows, n, k, k, ldw, acc_ld, static_cast<int>(DType::kF16), -1, 1, workspace_bytes,
-                    alignment(x16), alignment(w.data), alignment(dptr), 0u};
+      kernels::sm75::convert_rows_bf16_to_f16_scaled(x16, inv_scale, static_cast<const char*>(x.data) + r0 * ldx * 2,
+                                                     rows, k, ldx, k, stream);
+      const Key key{rows, n, k, k, ldw, n, static_cast<int>(DType::kF32), -1, 1, lt_bytes,
+                    alignment(x16), alignment(w.data), alignment(acc), 0u};
       Plan& plan = plan_for(key, nullptr);
       const float alpha = 1.0f, beta = 0.0f;
-      MI_LT_CHECK(cublasLtMatmul(handle, plan.desc, &alpha, w.data, plan.a, x16, plan.b, &beta, dptr, plan.d, dptr,
+      MI_LT_CHECK(cublasLtMatmul(handle, plan.desc, &alpha, w.data, plan.a, x16, plan.b, &beta, acc, plan.d, acc,
                                  plan.d, &plan.algo, workspace, plan.workspace, stream));
-      // The output row offset in bytes: f32 rows are 4 bytes per element (dptr above is acc16 for them).
-      kernels::sm75::convert_gemm_out_f16(static_cast<char*>(out.data) + r0 * ldo * (out_f32 ? 4 : 2), dptr, bias_ptr,
-                                          bias_f32, out_f32, rows, n, ldo, acc_ld, stream);
+      kernels::sm75::convert_gemm_out_f32(static_cast<char*>(out.data) + r0 * ldo * static_cast<std::int64_t>(out_elem),
+                                          out_f32, acc, inv_scale, bias_ptr, rows, n, ldo, n, stream);
     }
   }
 };
@@ -223,8 +226,6 @@ Gemm::Gemm() : impl_(std::make_unique<Impl>()) {
 
 Gemm::~Gemm() {
   impl_->plans.clear();
-  if (impl_->x16 != nullptr) cudaFree(impl_->x16);
-  if (impl_->acc16 != nullptr) cudaFree(impl_->acc16);
   if (impl_->handle != nullptr) cublasLtDestroy(impl_->handle);
 }
 

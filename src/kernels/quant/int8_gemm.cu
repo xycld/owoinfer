@@ -92,6 +92,12 @@ Int8Tile resolve_tile(Int8Tile tile, const Problem& p) {
   return tile;
 }
 
+void check_sm75_tile(const char* op, Int8Tile tile) {
+  if (tile != Int8Tile::kAuto) {
+    fail(op, std::string("a forced tile (") + int8_tile_name(tile) + ") names an sm_80 kernel; sm_75 runs one tile");
+  }
+}
+
 void check_status(cutlass::Status status, const char* op, const char* stage) {
   if (status != cutlass::Status::kSuccess) {
     throw CudaError(std::string("mi::kernels::") + op + ": CUTLASS " + stage + " failed: " +
@@ -151,6 +157,7 @@ void int8_gemm(const Int8Operands& op, const __nv_bfloat16* bias, __nv_bfloat16*
   detail::check_vector(name, "bias", bias, /*optional=*/true);
   if (p.m == 0) return;
   if (kernels::sm75::turing()) {  // Turing's 8x8x16 INT8 MMA (src/kernels/sm75/int8_gemm_sm75.cu)
+    detail::check_sm75_tile(name, tile);
     kernels::sm75::int8_gemm(op, bias, out, ldo, stream);
     return;
   }
