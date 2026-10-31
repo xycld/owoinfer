@@ -995,8 +995,31 @@ StepReport Session::step(const StepArgs& a) {
       m.dit->set_step_cache(nullptr);  // crops bypass the step cache, its state untouched
       m.dit->set_graphs_paused(true);  // and CUDA graphs: one-off shapes run eagerly
     }
-    m.dit->forward(xf, timestep, std::span<const moss_dit::Row>(frows, static_cast<std::size_t>(nf)),
-                   std::span<const Tensor>(fouts, static_cast<std::size_t>(nf)), stream);
+    // A call over several latents runs one forward per latent, its rows in row order: each latent gets its single-image
+    // forward (mi_generate's shapes, graphs and bits, a side branch's GEMM included), since on a power-capped GPU one
+    // batched forward costs more than the latents' forwards in turn (E45). Each forward makes its own step-cache
+    // decision, so a latent reuses exactly as its image alone.
+    bool several = false;
+    for (int f = 1; f < nf; ++f) several = several || frows[f].latent != frows[0].latent;
+    if (!several) {
+      m.dit->forward(xf, timestep, std::span<const moss_dit::Row>(frows, static_cast<std::size_t>(nf)),
+                     std::span<const Tensor>(fouts, static_cast<std::size_t>(nf)), stream);
+    } else {
+      for (int l = 0; l < R.latents; ++l) {
+        moss_dit::Row lrows[kMaxSessionRows];
+        Tensor louts[kMaxSessionRows];
+        int nl = 0;
+        for (int f = 0; f < nf; ++f) {
+          if (frows[f].latent != l) continue;
+          lrows[nl] = frows[f];
+          louts[nl] = fouts[f];
+          ++nl;
+        }
+        if (nl == 0) continue;
+        m.dit->forward(xf, timestep, std::span<const moss_dit::Row>(lrows, static_cast<std::size_t>(nl)),
+                       std::span<const Tensor>(louts, static_cast<std::size_t>(nl)), stream);
+      }
+    }
     if (guided) {
       const Prediction space = spec.output == StepOutput::kGuidedVelocity ? Prediction::kVelocity : Prediction::kDenoised;
       const Tensor out0 = device ? a.out[0] : R.guided;

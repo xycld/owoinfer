@@ -1465,7 +1465,7 @@ typedef struct mi_step_info {
   size_t struct_size;
   int32_t step;        /* the step position used */
   uint32_t rows;       /* rows evaluated */
-  int32_t cached;      /* the step cache reused its residual */
+  int32_t cached;      /* the step cache reused its residual (a batch: for at least one latent) */
   int32_t on_schedule; /* sigma is sigmas[step], or sigmas[step + 1] with an explicit step (a corrector) */
   double seconds;      /* wall time of the call */
 } mi_step_info;
@@ -1498,12 +1498,13 @@ MOSSINFER_API mi_status mi_run_adopt_staging(mi_engine* engine, void* base, size
 MOSSINFER_API mi_status mi_run_staging(mi_engine* engine, mi_tensor* x, mi_tensor* outs, size_t outs_count,
                                        mi_tensor* control);
 MOSSINFER_API mi_status mi_step_params_init(mi_step_params* params, size_t struct_size);
-/* One model evaluation of the call's rows at (x, sigma) in one batched varlen forward (rows of different prompt
- * lengths included); returns when the outputs are written (device mode: also ordered into cuda_stream). Tensors: all
- * device, or all host and exactly the staging views; x must not alias an output; else MI_ERR_INVALID_ARGUMENT (the run
- * usable). A job: MI_ERR_BUSY while one runs. mi_cancel() stops it within one DiT block: MI_CANCELLED, outputs
- * undefined, the run usable (step cache invalidated). On return, whatever the status, the engine no longer reads x or
- * control and no longer writes out[]. `out_info` (struct_size set by the caller) may be NULL. */
+/* One model evaluation of the call's rows at (x, sigma): one batched varlen forward over each latent's rows (rows of
+ * different prompt lengths included), a batch's latents in turn; returns when the outputs are written (device mode:
+ * also ordered into cuda_stream). Tensors: all device, or all host and exactly the staging views; x must not alias
+ * an output; else MI_ERR_INVALID_ARGUMENT (the run usable). A job: MI_ERR_BUSY while one runs. mi_cancel() stops it
+ * within one DiT block: MI_CANCELLED, outputs undefined, the run usable (step cache invalidated). On return, whatever
+ * the status, the engine no longer reads x or control and no longer writes out[]. `out_info` (struct_size set by the
+ * caller) may be NULL. */
 MOSSINFER_API mi_status mi_denoise_step(mi_engine* engine, const mi_step_params* params, mi_step_info* out_info);
 /* Ends the run, interrupt-safe: cancels a step running on another thread and waits for it (MI_ERR_BUSY, nothing done,
  * from a callback of the running call); also after a cancelled or failed step. Releases the run's stack, step cache

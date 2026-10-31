@@ -1198,6 +1198,43 @@ TEST_F(GpuComponentRuns, LatentBatchOtherNumerics) {
   }
 }
 
+// Latent batches with a side-branch LoRA: a call runs one forward per latent, so a row's side-branch GEMM sees its
+// single-image call's tokens even when the latents' prompts differ in length. An L = 2 run (4 rows, the host's CFG)
+// equals each image's own run bit for bit, in host staging and device mode.
+TEST_F(GpuComponentRuns, LatentBatchWithASideBranchLoraEqualsSingleImages) {
+  const fs::path file = "/workspace/Models/community/axiomofmind/Moss-image-beauty-lora/pytorch_lora_weights.safetensors";
+  if (!fs::is_regular_file(file)) GTEST_SKIP() << "LoRA file not present";
+  const std::string path = file.string();
+  const mi_lora lora{path.c_str(), 0.8};
+  ASSERT_EQ(open_session(engine_, 4, 2), MI_OK) << last_error();
+  const char* prompts[] = {kPrompt, "an old lighthouse on a cliff at dusk, oil painting, heavy brush strokes"};
+  const std::int64_t seeds[] = {7, 8};
+  const Conds conds = encode(engine_, {prompts[0], prompts[1], "blurry"});
+  const auto run = [&](const std::vector<mi_run_row>& rows, const Vec& x0, Mode mode) {
+    mi_run_params rp = run_params(rows, MI_GUIDANCE_HOST, MI_STEP_OUTPUT_ROWS);
+    rp.loras = &lora;
+    rp.loras_count = 1;
+    EXPECT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
+    const Vec s = run_sigmas(engine_);
+    Vec x;
+    {
+      Exchange ex(engine_, mode);
+      x = sample(MI_SAMPLER_EULER, true, s.data(), s.size(), start_latents(x0, s[0]), host_cfg(ex, 3.0));
+    }
+    end_run(engine_);
+    return x;
+  };
+  std::vector<Vec> single(2);
+  for (std::size_t l = 0; l < 2; ++l) single[l] = run({row(conds[l]), row(conds[2], kSkip22, 1)}, noise(seeds[l]), Mode::kHost);
+  for (const Mode mode : {Mode::kHost, Mode::kStream}) {
+    SCOPED_TRACE(mode_name(mode));
+    const Vec x = run(cfg_rows(conds, 2, 2), concat({noise(seeds[0]), noise(seeds[1])}), mode);
+    for (std::size_t l = 0; l < 2; ++l) {
+      EXPECT_EQ(differing(slice(x, l), single[l]), 0u) << "latent " << l << " differs from its single-image run";
+    }
+  }
+}
+
 // The residency rules at mi_run_begin (design §5.4), on engines whose budget makes the DiT stream at 1024^2:
 // - a latent batch never streams more DiT bytes per step than its latent-0 rows alone: L = 4 with two rows each is
 //   refused at 4.5 GiB (INT8), naming both byte counts, while latent 0's rows alone begin;
@@ -1627,9 +1664,8 @@ TEST_F(GpuComponentRuns, ControlPerCallRecipeEqualsGenerate) {
 // the same as explicit zeros; a nonzero control differs), the run-level call again (the run's control rewritten after
 // the crop overwrote it), a per-call control equal to the run's state (the same output) and the run's again; a control
 // tensor of the wrong channel count is refused. Then per-latent control at L = 2: each image's output with its own
-// control latent equals its single-image call. That part runs the adapter's LoRA at strength 0: with a LoRA active, a
-// row's bits depend on the other rows of its call (the side branch's down projection is one cuBLASLt GEMM over the
-// call's tokens), so batch and mask identity hold without LoRAs only (LoraRunEqualsGenerate covers LoRA parity).
+// control latent equals its single-image call, with the adapter's LoRA part at strength 0 and at 1: each latent runs
+// its own forward, so its side branch sees its single-image call's tokens (LoraRunEqualsGenerate covers LoRA parity).
 TEST_F(GpuComponentRuns, ControlSourcesCropsAndLatentBatches) {
   if (!fs::is_regular_file(kControl)) GTEST_SKIP() << "control adapter not present";
   const ControlInputs in;
@@ -1706,9 +1742,10 @@ TEST_F(GpuComponentRuns, ControlSourcesCropsAndLatentBatches) {
   }();
   const Vec none(static_cast<std::size_t>(2 * kGroup), 0.0f);
   const Vec xb = noise(6);
+  double lora_strength = 0.0;
   const auto one_call = [&](const std::vector<mi_run_row>& rows, const Vec& xx, const Vec* control) {
     mi_run_params rp = run_params(rows, MI_GUIDANCE_HOST, MI_STEP_OUTPUT_ROWS);
-    rp.control_lora_strength = 0.0;
+    rp.control_lora_strength = lora_strength;
     EXPECT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
     const Vec s = run_sigmas(engine_);
     std::vector<Vec> outs;
@@ -1724,13 +1761,17 @@ TEST_F(GpuComponentRuns, ControlSourcesCropsAndLatentBatches) {
     return outs;
   };
   const Vec batch_control = concat({both, none});
-  const std::vector<Vec> batch = one_call({row(conds[0], nullptr, 0, 0), row(conds[2], nullptr, 0, 1)},
-                                          concat({x, xb}), &batch_control);
-  const std::vector<Vec> a = one_call({row(conds[0])}, x, &both);
-  const std::vector<Vec> b = one_call({row(conds[2])}, xb, nullptr);
-  ASSERT_EQ(batch.size(), 2u);
-  EXPECT_EQ(differing(batch[0], a[0]), 0u) << "latent 0 with its control";
-  EXPECT_EQ(differing(batch[1], b[0]), 0u) << "latent 1 with zeros";
+  for (const double strength : {0.0, 1.0}) {
+    SCOPED_TRACE("control LoRA strength " + std::to_string(strength));
+    lora_strength = strength;
+    const std::vector<Vec> batch = one_call({row(conds[0], nullptr, 0, 0), row(conds[2], nullptr, 0, 1)},
+                                            concat({x, xb}), &batch_control);
+    const std::vector<Vec> a = one_call({row(conds[0])}, x, &both);
+    const std::vector<Vec> b = one_call({row(conds[2])}, xb, nullptr);
+    ASSERT_EQ(batch.size(), 2u);
+    EXPECT_EQ(differing(batch[0], a[0]), 0u) << "latent 0 with its control";
+    EXPECT_EQ(differing(batch[1], b[0]), 0u) << "latent 1 with zeros";
+  }
 }
 
 // A runtime LoRA (design §7.2, "windows and adapters"): a MOSS run with a LoRA, sampled by the host, gives mi_generate's

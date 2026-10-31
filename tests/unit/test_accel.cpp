@@ -457,9 +457,11 @@ TEST(GpuAccel, FirstBlockCacheKeysRowsByLatent) {
     const float big_r = from_bf16(to_bf16(from_bf16(full[n + i]) - x1));  // image 1's R from the full call
     ASSERT_EQ(alone[i], to_bf16(x1 + big_r)) << i;
   }
-  // Image 0 was absent: it lost its residuals, so a call with both runs in full; then both reuse in either order.
+  // Image 0 was absent from a forward over image 1 alone: a forward judges only its own latents' rows (a latent batch
+  // runs one forward per latent), so image 0 keeps its residuals and calls with both reuse in either order.
   dit.run(cache, {img1, img0}, r0, rest, &reused);
-  EXPECT_FALSE(reused);
+  EXPECT_TRUE(reused);
+  EXPECT_EQ(cache.diffs().back(), 0.0);
   dit.run(cache, {img0, img1}, r0, rest, &reused);
   EXPECT_TRUE(reused);
   EXPECT_EQ(cache.diffs().back(), 0.0);

@@ -173,9 +173,12 @@ void FirstBlockCache::before_blocks(const Tensor& x, std::span<const moss_dit::R
   current_.clear();
   for (const moss_dit::Row& row : rows) current_.push_back(&slot_of(row));
   // A row identity absent from this call (e.g. the SLG row outside its window) loses its residuals: when it comes back,
-  // its first call runs in full instead of reusing an R older than the other rows'.
+  // its first call runs in full instead of reusing an R older than the other rows'. A latent batch runs one forward per
+  // latent (Session::step), so only the identities of this forward's latents are judged here.
   for (Slot& s : slots_) {
-    if (std::find(current_.begin(), current_.end(), &s) == current_.end()) s.valid = false;
+    const bool latent_here =
+        std::any_of(rows.begin(), rows.end(), [&](const moss_dit::Row& row) { return row.latent == s.latent; });
+    if (latent_here && std::find(current_.begin(), current_.end(), &s) == current_.end()) s.valid = false;
   }
   for (std::size_t r = 0; r < rows.size(); ++r) {
     MI_CUDA_CHECK(cudaMemcpyAsync(current_[r]->scratch, row_video(x, offsets, r), video_bytes(video_),
