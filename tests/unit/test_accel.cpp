@@ -505,6 +505,30 @@ TEST(GpuAccel, FirstBlockCacheMixedLatentsAndPerLatentInvalidation) {
   EXPECT_TRUE(reused);
 }
 
+// set_per_latent(false) (a streamed DiT's batched calls decide jointly): a forward over latent 1 alone drops latent 0's
+// residuals too, so the next joint forward runs in full instead of mixing residuals of different ages.
+TEST(GpuAccel, FirstBlockCacheBatchedModeJudgesEveryRow) {
+  const std::int64_t video = 8;
+  mi::runtime::DeviceArena arena(std::size_t{64} << 20);
+  mi::runtime::StackScope scope(arena);
+  const Tensor cond = arena.alloc_tensor(mi::DType::kBF16, {4, mi::moss_dit::kDim});
+  const Row img0{cond, {}, 0}, img1{cond, {}, 1};
+  accel::FirstBlockCache cache(arena, 2, 4, 2, 0.1);
+  cache.set_per_latent(false);
+  FakeDit dit{arena, video, true};
+  const std::vector<float> r0 = {0.5f, -0.25f, 1.0f};
+  const std::vector<float> rest = {2.0f, 0.75f, -1.5f, 0.125f};
+  bool reused = true;
+  dit.run(cache, {img0, img1}, r0, rest, &reused);
+  EXPECT_FALSE(reused);
+  dit.run(cache, {img0, img1}, r0, rest, &reused);
+  EXPECT_TRUE(reused);
+  dit.run(cache, {img1}, r0, rest, &reused);
+  EXPECT_TRUE(reused);
+  dit.run(cache, {img0, img1}, r0, rest, &reused);
+  EXPECT_FALSE(reused) << "img0 kept residuals across a forward without it in batched mode";
+}
+
 // ---- GPU: the real DiT ----
 
 // The step-cache seam as a deterministic cancel point: delegates to a FirstBlockCache and sets the cancel flag in

@@ -138,6 +138,10 @@ class FirstBlockCache final : public moss_dit::StepCacheHook {
   // Drops the residuals of `latent`'s rows only (a latent batch whose input changed for that latent alone, e.g. a run's
   // control window, which feeds latent 0): that latent's next forward runs every block.
   void invalidate(int latent);
+  // Per-latent forwards (default): a forward over one latent judges absences among that latent's rows only. Off (one
+  // batched forward per call over every latent, a streamed DiT's), every forward judges every row identity, so a
+  // joint decision never mixes residuals of different ages.
+  void set_per_latent(bool on) { per_latent_ = on; }
 
   int calls() const { return calls_; }
   int reused() const { return reused_; }
@@ -163,6 +167,7 @@ class FirstBlockCache final : public moss_dit::StepCacheHook {
 
   std::int64_t video_ = 0;  // h * w
   double threshold_ = 0;
+  bool per_latent_ = true;
   std::vector<Slot> slots_;
   std::vector<Slot*> current_;  // the slot of each row of the running call
   double* partials_ = nullptr;  // device, rows * kDiffBlocks * 2

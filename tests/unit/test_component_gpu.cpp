@@ -1675,6 +1675,7 @@ TEST_F(GpuComponentRuns, ControlPerCallRecipeEqualsGenerate) {
 // tensor of the wrong channel count is refused. Then per-latent control at L = 2: each image's output with its own
 // control latent equals its single-image call, with the adapter's LoRA part at strength 0 and at 1: each latent runs
 // its own forward, so its side branch sees its single-image call's tokens (LoraRunEqualsGenerate covers LoRA parity).
+// Last, run-level control windows at L = 2 with the step cache: latent 1 equals its no-control single run.
 TEST_F(GpuComponentRuns, ControlSourcesCropsAndLatentBatches) {
   if (!fs::is_regular_file(kControl)) GTEST_SKIP() << "control adapter not present";
   const ControlInputs in;
@@ -1781,6 +1782,40 @@ TEST_F(GpuComponentRuns, ControlSourcesCropsAndLatentBatches) {
     EXPECT_EQ(differing(batch[0], a[0]), 0u) << "latent 0 with its control";
     EXPECT_EQ(differing(batch[1], b[0]), 0u) << "latent 1 with zeros";
   }
+
+  // Run-level control windows at L = 2 with the step cache: the run's control latents feed latent 0 only, so a window
+  // flip drops latent 0's residuals alone, and latent 1 equals its no-control single run bit for bit (it reuses where
+  // that run does, also across latent 0's flips).
+  const auto cached_run = [&](const std::vector<mi_run_row>& rows, const Vec& x0, bool images, std::vector<int>& cached) {
+    mi_run_params rp = run_params(rows, MI_GUIDANCE_HOST, MI_STEP_OUTPUT_ROWS, 8);
+    if (images) ctl.apply(rp);
+    rp.step_cache = MI_STEP_CACHE_FBCACHE;
+    rp.step_cache_threshold = 0.9;  // reuses whatever it may: only invalidations force full calls
+    EXPECT_EQ(mi_run_begin(engine_, &rp), MI_OK) << last_error();
+    const Vec s = run_sigmas(engine_);
+    Vec xr;
+    {
+      Exchange ex(engine_, Mode::kHost);
+      int step = 0;
+      const Model m = [&](const Vec& xx, float sigma, int, Vec& pred) {
+        Call c;
+        c.sigma = sigma;
+        ASSERT_EQ(ex.call(c, xx), MI_OK) << last_error();
+        if (ex.last().cached) cached.push_back(step);
+        ++step;
+        pred.clear();
+        for (int k = 0; k < ex.info().outputs; ++k) pred.insert(pred.end(), ex.out(k).begin(), ex.out(k).end());
+      };
+      xr = sample(MI_SAMPLER_EULER, true, s.data(), s.size(), start_latents(x0, s[0]), m);
+    }
+    end_run(engine_);
+    return xr;
+  };
+  std::vector<int> cached_single, cached_batch;
+  const Vec single = cached_run({row(conds[2])}, xb, false, cached_single);
+  EXPECT_FALSE(cached_single.empty()) << "the threshold reused nothing: the test shows nothing";
+  const Vec windows = cached_run({row(conds[0]), row(conds[2], nullptr, 0, 1)}, concat({x, xb}), true, cached_batch);
+  EXPECT_EQ(differing(slice(windows, 1), single), 0u) << "latent 1 differs from its no-control single run";
 }
 
 // A runtime LoRA (design §7.2, "windows and adapters"): a MOSS run with a LoRA, sampled by the host, gives mi_generate's
@@ -2512,6 +2547,7 @@ TEST_F(GpuComponentRuns, StepCacheAtTwoLatents) {
   double threshold = 0;
   std::vector<int> cached_a, cached_b;
   Vec single_a, single_b;
+  std::string searched;  // the search's cached steps, shown only when no threshold is found
   for (const double t : {0.25, 0.22, 0.28, 0.2, 0.33, 0.18, 0.36, 0.15, 0.4, 0.13, 0.45, 0.3}) {
     cached_a.clear();
     cached_b.clear();
@@ -2522,13 +2558,13 @@ TEST_F(GpuComponentRuns, StepCacheAtTwoLatents) {
       for (const int k : v) o += std::to_string(k) + " ";
       return o;
     };
-    std::printf("[step cache] threshold %.2f: cached a {%s} b {%s}\n", t, str(cached_a).c_str(), str(cached_b).c_str());
+    searched += "threshold " + std::to_string(t) + ": a {" + str(cached_a) + "} b {" + str(cached_b) + "}\n";
     if (cached_a != cached_b) {
       threshold = t;
       break;
     }
   }
-  ASSERT_GT(threshold, 0) << "no threshold gave the two images different cached steps: the test shows nothing";
+  ASSERT_GT(threshold, 0) << "no threshold gave the two images different cached steps: the test shows nothing\n" << searched;
   SCOPED_TRACE("threshold " + std::to_string(threshold));
   std::vector<int> cached_union = cached_a;
   cached_union.insert(cached_union.end(), cached_b.begin(), cached_b.end());
@@ -2539,6 +2575,13 @@ TEST_F(GpuComponentRuns, StepCacheAtTwoLatents) {
   EXPECT_EQ(differing(slice(ab, 0), single_a), 0u) << "image a differs from its step-cached single run";
   EXPECT_EQ(differing(slice(ab, 1), single_b), 0u) << "image b differs from its step-cached single run";
   EXPECT_EQ(cached_ab, cached_union) << "the batch's cached steps are not the union of the singles'";
+  // The images swapped between the latents swap their outputs bit for bit, with the same cached steps (shared slots
+  // would hand one image's residual to the other).
+  std::vector<int> cached_ba;
+  const Vec ba = run({row(conds[1]), row(conds[0], nullptr, 0, 1)}, concat({b, a}), threshold, cached_ba);
+  EXPECT_EQ(cached_ba, cached_ab);
+  EXPECT_EQ(differing(slice(ab, 0), slice(ba, 1)), 0u) << "image a depends on its latent slot";
+  EXPECT_EQ(differing(slice(ab, 1), slice(ba, 0)), 0u) << "image b depends on its latent slot";
   // The same text on both latents: separate slots, each image its single run's bits and cached steps.
   std::vector<int> cached_same;
   const Vec same = run({row(conds[0]), row(conds[0], nullptr, 0, 1)}, concat({a, a}), threshold, cached_same);

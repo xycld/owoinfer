@@ -358,6 +358,7 @@ void MossDit::set_block_path(BlockPath path) {
 }
 
 void MossDit::set_graph_window(int forwards) {
+  // At the clamp (L = 4, four shapes) the window fills the graph cache exactly, so its LRU may evict and recapture.
   graph_window_ = static_cast<std::size_t>(std::clamp(forwards, 1, kGraphCapacity / kLayers));
   while (recent_step_hashes_.size() > graph_window_) recent_step_hashes_.erase(recent_step_hashes_.begin());
 }

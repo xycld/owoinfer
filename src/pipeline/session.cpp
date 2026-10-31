@@ -733,6 +733,7 @@ void Session::begin_run(const RunSpec& spec) {
   }
   if (spec.step_cache != accel::StepCacheKind::kOff) {
     R.cache.emplace(arena, R.h, R.w, static_cast<int>(sh.rows.size()), r.accel.step_cache_threshold);
+    R.cache->set_per_latent(!R.batched);  // a streamed batch decides jointly: every forward judges every row
     m.dit->set_step_cache(&*R.cache);
   } else {
     m.dit->set_step_cache(nullptr);
