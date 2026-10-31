@@ -344,6 +344,9 @@ void check_output(const char* op, const char* name, const void* p, std::int64_t 
 void check_vector(const char* op, const char* name, const void* p, bool optional);
 
 Int8Tile resolve_tile(Int8Tile tile, const Problem& p);
+// sm_75 runs one tile (src/kernels/sm75/int8_gemm_sm75.cu, 64x128x64): a forced tile names an sm_80 instantiation and
+// is refused rather than ignored.
+void check_sm75_tile(const char* op, Int8Tile tile);
 
 void check_status(cutlass::Status status, const char* op, const char* stage);
 

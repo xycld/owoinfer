@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 #include "core/cuda_check.h"
 #include "kernels/sm75/sm75.h"
@@ -171,6 +172,8 @@ void vae_weight_to_krsc(const Tensor& w_kcrs, const Tensor& w_krsc, cudaStream_t
   const int blocks = static_cast<int>(std::min<std::int64_t>((total + 255) / 256, 4096));
   if (w_krsc.dtype == DType::kF32) {
     kcrs_to_krsc_sm75<float><<<blocks, 256, 0, stream>>>(w_kcrs.ptr<float>(), w_krsc.ptr<float>(), k, c, rs);
+  } else if (w_krsc.dtype != DType::kBF16) {
+    throw std::invalid_argument("sm75::vae_weight_to_krsc: destination must be f32 or bf16");
   } else {
     kcrs_to_krsc_sm75<__nv_bfloat16><<<blocks, 256, 0, stream>>>(w_kcrs.ptr<float>(), w_krsc.ptr<__nv_bfloat16>(), k,
                                                                  c, rs);

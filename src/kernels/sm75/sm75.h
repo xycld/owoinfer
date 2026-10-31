@@ -7,8 +7,10 @@
 // that dispatches into it lives in the sm_80 translation units and is arch-independent.
 //
 // Numerics: sm_75 has fp16 tensor cores but no bf16 ones, so every tensor-core operand is converted bf16 -> fp16 at
-// the boundary (lossless for |x| in fp16's normal range; values outside it saturate/round, which the engine reports
-// as the sm_75 numerics). Accumulation stays fp32 where the sm_80 kernel had fp32 accumulation.
+// the boundary (lossless for |x| in fp16's normal range). GEMM activations get a per-row power-of-two scale that keeps
+// rows above 65504 in range; weights and attention operands above it would become inf, values below about 6e-5 lose
+// precision (fp16 subnormals). Accumulation stays fp32 where the sm_80 kernel had fp32 accumulation, and outputs are
+// rounded once, from fp32.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -46,22 +48,17 @@ void convert_weight_storage_inplace(Tensor& w, cudaStream_t stream);
 void convert_bf16_to_f16(void* dst, const void* src, std::int64_t n, cudaStream_t stream);
 void convert_f16_to_bf16(void* dst, const void* src, std::int64_t n, cudaStream_t stream);
 
-// bf16 -> fp16 over a 3-D tensor [rows, heads, dim] with free row/head strides, in place: every element is replaced by
-// its fp16 bit pattern in the same 2-byte slot. Used by the sm_75 attention, which needs fp16 operands and restores
-// bf16 after the launch so callers that reuse q/k/v are unaffected.
-void convert_tensor_bf16_to_f16_inplace(const Tensor& t, std::int64_t rows, std::int64_t heads, std::int64_t dim,
-                                        cudaStream_t stream);
-void convert_tensor_f16_to_bf16_inplace(const Tensor& t, std::int64_t rows, std::int64_t heads, std::int64_t dim,
-                                        cudaStream_t stream);
+// GEMM input rows: bf16 [rows, cols] (src_stride elements) -> fp16 `dst` (dst_stride), each row multiplied by the
+// power of two that brings its largest magnitude within fp16's range (1 for in-range rows); inv_scale[r] (fp32,
+// device) receives the inverse.
+void convert_rows_bf16_to_f16_scaled(void* dst, float* inv_scale, const void* src, std::int64_t rows,
+                                     std::int64_t cols, std::int64_t src_stride, std::int64_t dst_stride,
+                                     cudaStream_t stream);
 
-// bf16 [rows, cols] (free row strides) -> fp16, into `dst` (dst_stride elements) or in place when dst == src.
-void convert_rows_bf16_to_f16(void* dst, const void* src, std::int64_t rows, std::int64_t cols,
-                              std::int64_t src_stride, std::int64_t dst_stride, cudaStream_t stream);
-
-// GEMM output conversion: `acc` is fp16 [rows, cols] (acc_stride elements; may alias `out` when `out` is bf16),
-// `bias` is nullptr or fp32/bf16 [cols] (bias_f32 selects), `out` is bf16 or f32 [rows, cols] (out_stride).
-// out[r][c] = out_type(float(acc[r][c]) + (bias ? bias[c] : 0)), the fp32 add before the final rounding.
-void convert_gemm_out_f16(void* out, const void* acc, const void* bias, bool bias_f32, bool out_f32,
+// GEMM output pass: `acc` is fp32 [rows, cols] (acc_stride), `out` bf16 or f32 (out_f32) [rows, cols] (out_stride),
+// `bias` nullptr or [cols] of the output dtype. out[r][c] = out_type(acc[r][c] * inv_scale[r] + bias[c]), the fp32 add
+// before the single final rounding (as the sm_80 path's cuBLASLt BIAS epilogue).
+void convert_gemm_out_f32(void* out, bool out_f32, const float* acc, const float* inv_scale, const void* bias,
                           std::int64_t rows, std::int64_t cols, std::int64_t out_stride, std::int64_t acc_stride,
                           cudaStream_t stream);
 
@@ -78,10 +75,9 @@ void vae_attention_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const
 void vae_weight_to_krsc(const Tensor& w_kcrs, const Tensor& w_krsc, cudaStream_t stream);
 
 // Exact (non-approximate) attention, the sm_75 counterpart of attention::flash_fwd for the same arguments and
-// supported configurations (head_dim 128 non-causal for the DiT, head_dim 256 causal for the text encoder). q, k, v
-// and out are bf16; they are converted to fp16 in place around the launch and restored to bf16 (the values are
-// recoverable exactly for in-range inputs: fp16 has more mantissa bits than bf16). The kernel itself is the vendored
-// FlashAttention-2 with its own sm_75 traits (fp16 m16n8k8 MMA, no cp.async).
+// supported configurations (head_dim 128 non-causal for the DiT, head_dim 256 causal for the text encoder, whose
+// causal mask is aligned bottom-right as FlashAttention-2's). q, k, v and out are bf16 and never modified but `out`:
+// the kernel converts q/k/v to fp16 as it stages them and writes `out` from fp32 (attention_sm75.cu, fp16 m16n8k8 MMA).
 void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out, const Tensor& cu_seqlens_q,
                const Tensor& cu_seqlens_k, int max_seqlen, bool causal, float scale, void* workspace,
                std::size_t workspace_bytes, cudaStream_t stream);

@@ -383,7 +383,7 @@ int max_smem_per_block() {
 }
 
 // Compute capability major of the current device: the four forced-tile tests below name sm_80 instantiations, which an
-// sm_75 build does not carry (its dispatcher runs the vendored kernel's own Turing traits instead).
+// sm_75 device does not run (its dispatcher runs src/kernels/sm75/attention_sm75.cu instead).
 int compute_major() {
   int device = 0, v = 0;
   MI_CUDA_CHECK(cudaGetDevice(&device));

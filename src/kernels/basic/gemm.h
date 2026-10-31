@@ -31,7 +31,9 @@ class Gemm {
   // x: bf16, rows of K with a contiguous last dim whose leading dims flatten to one row stride (M rows).
   // w: bf16 [N, K], contiguous rows. bias: nullptr or [N] of the output dtype (cuBLASLt has no bf16 bias
   // with f32 output; widen it with kernels::cast).
-  // out: bf16 or f32 [..., N], M rows with one row stride. workspace: 256-byte aligned, or null with 0 bytes.
+  // out: bf16 or f32 [..., N], M rows with one row stride. workspace: 256-byte aligned, or null with 0 bytes. On sm_75
+  // (w fp16, kernels/sm75) the workspace also holds the fp16 input rows and the fp32 result, so it is required there
+  // (Gemm::kWorkspaceBytes) and must not be shared by calls in flight on other streams.
   // Thread-safe; launches on `stream` only.
   void linear(const Tensor& out, const Tensor& x, const Tensor& w, const Tensor* bias, void* workspace,
               std::size_t workspace_bytes, cudaStream_t stream);

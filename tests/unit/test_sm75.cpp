@@ -100,48 +100,47 @@ TEST(GpuSm75Convert, RoundTripIsExactInFp16Range) {
 #endif
 }
 
-// The attention tensors are [tokens, heads, dim] views with free row/head strides: the in-place conversion must touch
-// exactly the view's elements and no neighbour.
-TEST(GpuSm75Convert, StridedInPlaceConversionTouchesOnlyTheView) {
+// GEMM input rows: an in-range row converts exactly with scale 1; a row above fp16's range is scaled by the power of
+// two that brings it in range, and inv_scale undoes it exactly (bf16 values times a power of two stay representable).
+TEST(GpuSm75Convert, GemmRowsScaleOnlyOutOfRangeRows) {
 #ifndef MOSSINFER_HAVE_SM75
   GTEST_SKIP() << "built without MOSSINFER_SM75";
 #else
   if (!mi::kernels::sm75::turing()) GTEST_SKIP() << "the sm_75 kernels are built 75-real: needs a Turing device";
-  constexpr int kRows = 3, kHeads = 2, kDim = 8, kHeadStride = 16;  // heads interleaved: [token][head][16]
-  std::vector<float> storage(static_cast<std::size_t>(kRows) * kHeads * kHeadStride, -12345.f);
-  DeviceBf16 buf(storage);
-  Tensor view = Tensor::view(buf.data, DType::kBF16, Device::kCUDA, {kRows, kHeads, kDim});
-  view.stride[0] = kHeads * kHeadStride;
-  view.stride[1] = kHeadStride;
-  view.stride[2] = 1;
-  const std::vector<std::uint16_t> before = buf.host();
-  mi::kernels::sm75::convert_tensor_bf16_to_f16_inplace(view, kRows, kHeads, kDim, nullptr);
-  MI_CUDA_CHECK(cudaDeviceSynchronize());
-  // Converted: the view holds fp16 bits (a different pattern from bf16 for -12345), the padding is untouched.
-  const std::vector<std::uint16_t> mid = buf.host();
-  const std::uint16_t f16 = float_to_f16_bits(bf16_to_float(before[0]));
-  ASSERT_NE(f16, before[0]);
+  constexpr int kRows = 3, kCols = 8, kSrcStride = 12;
+  const std::vector<float> rows[kRows] = {{1.f, -2.5f, 3.f, 0.f, 1e-3f, -7e-2f, 123.f, 32768.f},
+                                          {1e5f, -2.5f, 3.f, 0.f, 1e-2f, -7e-2f, 123.f, 65536.f},
+                                          {3e38f, 1.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}};
+  std::vector<float> src(static_cast<std::size_t>(kRows) * kSrcStride, 0.f);
   for (int r = 0; r < kRows; ++r) {
-    for (int h = 0; h < kHeads; ++h) {
-      for (int d = 0; d < kHeadStride; ++d) {
-        const std::size_t i = static_cast<std::size_t>(r) * kHeads * kHeadStride + h * kHeadStride + d;
-        EXPECT_EQ(mid[i], d < kDim ? f16 : before[i]) << "converted r " << r << " h " << h << " d " << d;
-      }
+    for (int c = 0; c < kCols; ++c) {
+      src[static_cast<std::size_t>(r) * kSrcStride + c] = rows[r][static_cast<std::size_t>(c)];
     }
   }
-  mi::kernels::sm75::convert_tensor_f16_to_bf16_inplace(view, kRows, kHeads, kDim, nullptr);
+  DeviceBf16 in(src);
+  void* dst = nullptr;
+  float* inv = nullptr;
+  MI_CUDA_CHECK(cudaMalloc(&dst, kRows * kCols * 2));
+  MI_CUDA_CHECK(cudaMalloc(&inv, kRows * sizeof(float)));
+  mi::kernels::sm75::convert_rows_bf16_to_f16_scaled(dst, inv, in.data, kRows, kCols, kSrcStride, kCols, nullptr);
   MI_CUDA_CHECK(cudaDeviceSynchronize());
-  const std::vector<std::uint16_t> after = buf.host();
+  std::vector<std::uint16_t> got(kRows * kCols);
+  std::vector<float> inv_host(kRows);
+  MI_CUDA_CHECK(cudaMemcpy(got.data(), dst, got.size() * 2, cudaMemcpyDeviceToHost));
+  MI_CUDA_CHECK(cudaMemcpy(inv_host.data(), inv, inv_host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+  cudaFree(dst);
+  cudaFree(inv);
+  EXPECT_EQ(inv_host[0], 1.f);
+  EXPECT_EQ(inv_host[1], 2.f);  // max 1e5 (bf16 99840): 99840 / 2 fits, 99840 does not
+  EXPECT_GT(inv_host[2], 1e33f);
   for (int r = 0; r < kRows; ++r) {
-    for (int h = 0; h < kHeads; ++h) {
-      for (int d = 0; d < kDim; ++d) {
-        const std::size_t i = static_cast<std::size_t>(r) * kHeads * kHeadStride + h * kHeadStride + d;
-        EXPECT_EQ(after[i], before[i]) << "r " << r << " h " << h << " d " << d;
-      }
-      for (int d = kDim; d < kHeadStride; ++d) {
-        const std::size_t i = static_cast<std::size_t>(r) * kHeads * kHeadStride + h * kHeadStride + d;
-        EXPECT_EQ(after[i], before[i]) << "padding r " << r << " h " << h << " d " << d;
-      }
+    for (int c = 0; c < kCols; ++c) {
+      const float bf = bf16_to_float(float_to_bf16_bits(rows[r][static_cast<std::size_t>(c)]));
+      __half_raw raw;
+      raw.x = got[static_cast<std::size_t>(r) * kCols + c];
+      const float back = __half2float(__half(raw)) * inv_host[r];
+      // Row 2's 1.0 times 2^-112 is below fp16's range: the documented loss of a scaled row's low values.
+      EXPECT_EQ(back, r == 2 && c == 1 ? 0.f : bf) << "row " << r << " col " << c;
     }
   }
 #endif

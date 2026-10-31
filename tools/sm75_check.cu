@@ -3,7 +3,9 @@
 //
 // Usage: sm75_check [attn128|attn256|convert|all]
 //   attn128  varlen non-causal attention, head_dim 128 (the DiT's joint attention shape), GQA 2:1
-//   attn256  varlen causal attention, head_dim 256 (the text encoder's full-attention shape), GQA 4:1
+//   attn256  varlen causal attention, head_dim 256 (the text encoder's full-attention shape), GQA 4:1, and causal
+//            with key lengths unlike the query lengths (bottom-right alignment)
+//   gemm     the fp16 linear: bf16 and f32 out, a row above fp16's range, several row chunks
 //   convert  bf16 <-> fp16 round trip on device
 // The engine's own GPU tests compile their reference kernels for the build's CUDA architectures (sm_80+), so the
 // unit-test binary cannot exercise sm_75 kernels on a Turing device; this tool builds its own reference in host code.
@@ -90,10 +92,12 @@ class DevBuf {
   void* p_ = nullptr;
 };
 
-// Host reference: one (row, head) at a time, fp32 scores/softmax/PV, bf16 inputs as the device sees them.
+// Host reference: one (row, head) at a time, fp32 scores/softmax/PV, bf16 inputs as the device sees them. Causal is
+// aligned bottom-right (FlashAttention-2): query i of a sequence sees keys 0 .. i + len_k - len_q; none: a zero row.
 std::vector<float> reference_attention(const std::vector<std::uint16_t>& q, const std::vector<std::uint16_t>& k,
                                        const std::vector<std::uint16_t>& v, const std::vector<int>& cu_q,
-                                       int heads, int kv_heads, int dim, bool causal, float scale) {
+                                       const std::vector<int>& cu_k, int heads, int kv_heads, int dim, bool causal,
+                                       float scale) {
   const int batch = static_cast<int>(cu_q.size()) - 1;
   const int total_q = cu_q.back();
   std::vector<float> out(static_cast<std::size_t>(total_q) * heads * dim, 0.f);
@@ -101,14 +105,16 @@ std::vector<float> reference_attention(const std::vector<std::uint16_t>& q, cons
   std::vector<float> scores;
   for (int b = 0; b < batch; ++b) {
     const int q0 = cu_q[b], q1 = cu_q[b + 1];
+    const int k0 = cu_k[b], len_k = cu_k[b + 1] - k0;
     for (int h = 0; h < heads; ++h) {
       const int kh = h / group;
       for (int i = q0; i < q1; ++i) {
-        const int n = causal ? (i - q0 + 1) : (q1 - q0);
+        const int n = causal ? std::clamp(i - q0 + 1 + len_k - (q1 - q0), 0, len_k) : len_k;
+        if (n == 0) continue;
         scores.assign(static_cast<std::size_t>(n), 0.f);
         float max_s = -INFINITY;
         for (int j = 0; j < n; ++j) {
-          const int row = q0 + j;
+          const int row = k0 + j;
           float s = 0.f;
           for (int d = 0; d < dim; ++d) {
             s += bf16_to_float(q[(static_cast<std::size_t>(i) * heads + h) * dim + d]) *
@@ -126,7 +132,7 @@ std::vector<float> reference_attention(const std::vector<std::uint16_t>& q, cons
         std::size_t base = (static_cast<std::size_t>(i) * heads + h) * dim;
         for (int j = 0; j < n; ++j) {
           const float p = scores[static_cast<std::size_t>(j)] / sum;
-          const int row = q0 + j;
+          const int row = k0 + j;
           for (int d = 0; d < dim; ++d) {
             out[base + d] += p * bf16_to_float(v[(static_cast<std::size_t>(row) * kv_heads + kh) * dim + d]);
           }
@@ -137,28 +143,36 @@ std::vector<float> reference_attention(const std::vector<std::uint16_t>& q, cons
   return out;
 }
 
+// k_lengths: the keys' per-sequence lengths (empty: the queries' own).
 int run_attention(const char* name, int heads, int kv_heads, int dim, bool causal, const std::vector<int>& lengths,
-                  std::uint64_t seed, bool dump = false) {
+                  std::uint64_t seed, bool dump = false, const std::vector<int>& k_lengths = {}) {
   const int batch = static_cast<int>(lengths.size());
-  std::vector<int> cu(static_cast<std::size_t>(batch) + 1, 0);
-  for (int b = 0; b < batch; ++b) cu[static_cast<std::size_t>(b) + 1] = cu[static_cast<std::size_t>(b)] + lengths[static_cast<std::size_t>(b)];
+  const std::vector<int>& kl = k_lengths.empty() ? lengths : k_lengths;
+  std::vector<int> cu(static_cast<std::size_t>(batch) + 1, 0), cu_k(cu);
+  for (int b = 0; b < batch; ++b) {
+    cu[static_cast<std::size_t>(b) + 1] = cu[static_cast<std::size_t>(b)] + lengths[static_cast<std::size_t>(b)];
+    cu_k[static_cast<std::size_t>(b) + 1] = cu_k[static_cast<std::size_t>(b)] + kl[static_cast<std::size_t>(b)];
+  }
   const int total_q = cu.back();
+  const int total_k = cu_k.back();
   const int max_len = *std::max_element(lengths.begin(), lengths.end());
   const float scale = 1.f / std::sqrt(static_cast<float>(dim));
 
   const auto q = normal(static_cast<std::size_t>(total_q) * heads * dim, seed, 1.f);
-  const auto k = normal(static_cast<std::size_t>(total_q) * kv_heads * dim, seed + 1, 1.f);
-  const auto v = normal(static_cast<std::size_t>(total_q) * kv_heads * dim, seed + 2, 1.f);
+  const auto k = normal(static_cast<std::size_t>(total_k) * kv_heads * dim, seed + 1, 1.f);
+  const auto v = normal(static_cast<std::size_t>(total_k) * kv_heads * dim, seed + 2, 1.f);
   std::vector<std::uint16_t> qb(q.size()), kb(k.size()), vb(v.size());
   for (std::size_t i = 0; i < q.size(); ++i) qb[i] = float_to_bf16_bits(q[i]);
   for (std::size_t i = 0; i < k.size(); ++i) kb[i] = float_to_bf16_bits(k[i]);
   for (std::size_t i = 0; i < v.size(); ++i) vb[i] = float_to_bf16_bits(v[i]);
 
-  DevBuf dq(qb.size() * 2), dk(kb.size() * 2), dv(vb.size() * 2), dout(qb.size() * 2), dcu(cu.size() * sizeof(int));
+  DevBuf dq(qb.size() * 2), dk(kb.size() * 2), dv(vb.size() * 2), dout(qb.size() * 2), dcu(cu.size() * sizeof(int)),
+      dcu_k(cu_k.size() * sizeof(int));
   dq.upload(qb);
   dk.upload(kb);
   dv.upload(vb);
   dcu.upload(cu);
+  dcu_k.upload(cu_k);
   MI_CUDA_CHECK(cudaMemset(dout.get(), 0, qb.size() * 2));
   std::vector<float> lse(static_cast<std::size_t>(total_q) * heads, 0.f);
   DevBuf dls(lse.size() * sizeof(float));
@@ -168,22 +182,26 @@ int run_attention(const char* name, int heads, int kv_heads, int dim, bool causa
     return Tensor::view(p, dt, Device::kCUDA, shape);
   };
   const Tensor tq = t(dq.get(), DType::kBF16, {total_q, heads, dim});
-  const Tensor tk = t(dk.get(), DType::kBF16, {total_q, kv_heads, dim});
-  const Tensor tv = t(dv.get(), DType::kBF16, {total_q, kv_heads, dim});
+  const Tensor tk = t(dk.get(), DType::kBF16, {total_k, kv_heads, dim});
+  const Tensor tv = t(dv.get(), DType::kBF16, {total_k, kv_heads, dim});
   const Tensor to = t(dout.get(), DType::kBF16, {total_q, heads, dim});
   const Tensor tcu = t(dcu.get(), DType::kI32, {batch + 1});
+  const Tensor tcu_k = t(dcu_k.get(), DType::kI32, {batch + 1});
   const std::size_t ws_bytes = mi::attention::flash_fwd_workspace_bytes(total_q, heads);
   MI_CUDA_CHECK(cudaGetLastError());
   std::printf("  launch: tokens %d heads %d kv %d dim %d causal %d maxlen %d ws %zu\n", total_q, heads, kv_heads, dim,
               causal ? 1 : 0, max_len, ws_bytes);
   std::fflush(stdout);
-  mi::attention::flash_fwd(tq, tk, tv, to, tcu, tcu, max_len, causal, scale, dls.get(), ws_bytes, nullptr);
+  mi::attention::flash_fwd(tq, tk, tv, to, tcu, tcu_k, max_len, causal, scale, dls.get(), ws_bytes, nullptr);
   MI_CUDA_CHECK(cudaDeviceSynchronize());
+  // The inputs are read only: q/k/v hold their bf16 bits after the call.
+  const bool inputs_kept = dq.download<std::uint16_t>(qb.size()) == qb && dk.download<std::uint16_t>(kb.size()) == kb &&
+                           dv.download<std::uint16_t>(vb.size()) == vb;
   std::printf("  kernel done\n");
   std::fflush(stdout);
 
   const auto got = dout.download<std::uint16_t>(qb.size());
-  const auto want = reference_attention(qb, kb, vb, cu, heads, kv_heads, dim, causal, scale);
+  const auto want = reference_attention(qb, kb, vb, cu, cu_k, heads, kv_heads, dim, causal, scale);
   double dot = 0, ng = 0, nw = 0;
   float max_abs = 0.f;
   for (std::size_t i = 0; i < want.size(); ++i) {
@@ -194,8 +212,9 @@ int run_attention(const char* name, int heads, int kv_heads, int dim, bool causa
     max_abs = std::max(max_abs, std::fabs(g - want[i]));
   }
   const double cosine = dot / std::sqrt(ng * nw);
-  std::printf("%-8s tokens %5d heads %2d kv %2d dim %3d causal %d: cosine %.9f max|diff| %.3g\n", name, total_q, heads,
-              kv_heads, dim, causal ? 1 : 0, cosine, max_abs);
+  std::printf("%-8s tokens %5d keys %5d heads %2d kv %2d dim %3d causal %d: cosine %.9f max|diff| %.3g inputs %s\n",
+              name, total_q, total_k, heads, kv_heads, dim, causal ? 1 : 0, cosine, max_abs,
+              inputs_kept ? "kept" : "MODIFIED");
   if (dump) {
     for (std::size_t i = 0; i < std::min<std::size_t>(want.size(), 12); ++i) {
       std::printf("   [%zu] got %.6f want %.6f (q %.6f)\n", i, bf16_to_float(got[i]), want[i], q[i]);
@@ -203,7 +222,7 @@ int run_attention(const char* name, int heads, int kv_heads, int dim, bool causa
     // Diagnostic: is the mismatch a different softmax temperature?
     const float log2e = 1.4426950408889634f;
     for (float f : {1.f, log2e, 1.f / log2e, 2.f, 0.5f, 1.f / std::sqrt(static_cast<float>(dim))}) {
-      const auto alt = reference_attention(qb, kb, vb, cu, heads, kv_heads, dim, causal, scale * f);
+      const auto alt = reference_attention(qb, kb, vb, cu, cu_k, heads, kv_heads, dim, causal, scale * f);
       double d2 = 0, g2 = 0, w2 = 0;
       for (std::size_t i = 0; i < alt.size(); ++i) {
         const float g = bf16_to_float(got[i]);
@@ -215,7 +234,7 @@ int run_attention(const char* name, int heads, int kv_heads, int dim, bool causa
     }
   }
   MI_CUDA_CHECK(cudaGetLastError());
-  return cosine >= 0.9999 ? 0 : 1;
+  return cosine >= 0.9999 && inputs_kept ? 0 : 1;
 }
 
 int run_convert() {
@@ -234,11 +253,17 @@ int run_convert() {
   return bad == 0 ? 0 : 1;
 }
 
-// The sm_75 GEMM (cuBLASLt fp16 in / fp32 accumulate, bf16 activation input): bf16 x, fp16 weights, bf16 out with a
-// bias added in fp32. Cross-checked against a host accumulation of the stored operand values.
-int run_gemm(int M, int N, int K) {
+// The sm_75 GEMM (cuBLASLt fp16 in / fp32 out, bf16 activation input): bf16 x, fp16 weights, bf16 or f32 out with a
+// bias of the output dtype added in fp32. Cross-checked against a host accumulation of the stored operand values.
+// big_row >= 0 scales that row of x far above fp16's range (the per-row power-of-two scale); a small ws_bytes makes
+// the GEMM run several row chunks (the workspace holds its fp16 rows and fp32 result).
+int run_gemm(int M, int N, int K, bool out_f32 = false, int big_row = -1,
+             std::size_t ws_bytes = std::size_t{32} << 20) {
   mi::backend::load_cublaslt();
-  const auto xv = normal(static_cast<std::size_t>(M) * K, 51, 1.f);
+  auto xv = normal(static_cast<std::size_t>(M) * K, 51, 1.f);
+  if (big_row >= 0) {
+    for (int d = 0; d < K; ++d) xv[static_cast<std::size_t>(big_row) * K + d] *= 3e5f;
+  }
   const auto wv = normal(static_cast<std::size_t>(N) * K, 52, 0.05f);
   const auto bv = normal(static_cast<std::size_t>(N), 53, 0.01f);
   std::vector<std::uint16_t> xb(xv.size()), wb(wv.size()), bb(bv.size());
@@ -248,25 +273,41 @@ int run_gemm(int M, int N, int K) {
     std::memcpy(&wb[i], &h, sizeof h);
   }
   for (std::size_t i = 0; i < bv.size(); ++i) bb[i] = float_to_bf16_bits(bv[i]);
+  std::vector<float> bf(bv.size());
+  for (std::size_t i = 0; i < bv.size(); ++i) bf[i] = bf16_to_float(bb[i]);  // the same bias values for an f32 out
 
-  DevBuf dx(xb.size() * 2), dw(wb.size() * 2), db(bb.size() * 2), dout(static_cast<std::size_t>(M) * N * 2);
-  DevBuf dws(std::size_t{32} << 20);
+  const std::size_t out_elem = out_f32 ? 4 : 2;
+  DevBuf dx(xb.size() * 2), dw(wb.size() * 2), db(bb.size() * out_elem);
+  DevBuf dout(static_cast<std::size_t>(M) * N * out_elem);
+  DevBuf dws(ws_bytes);
   dx.upload(xb);
   dw.upload(wb);
-  db.upload(bb);
-  MI_CUDA_CHECK(cudaMemset(dout.get(), 0, static_cast<std::size_t>(M) * N * 2));
+  if (out_f32) {
+    db.upload(bf);
+  } else {
+    db.upload(bb);
+  }
+  MI_CUDA_CHECK(cudaMemset(dout.get(), 0, static_cast<std::size_t>(M) * N * out_elem));
 
+  const DType out_type = out_f32 ? DType::kF32 : DType::kBF16;
   const Tensor tx = Tensor::view(dx.get(), DType::kBF16, Device::kCUDA, {M, K});
   const Tensor tw = Tensor::view(dw.get(), DType::kF16, Device::kCUDA, {N, K});
-  const Tensor tb = Tensor::view(db.get(), DType::kBF16, Device::kCUDA, {N});
-  const Tensor to = Tensor::view(dout.get(), DType::kBF16, Device::kCUDA, {M, N});
+  const Tensor tb = Tensor::view(db.get(), out_type, Device::kCUDA, {N});
+  const Tensor to = Tensor::view(dout.get(), out_type, Device::kCUDA, {M, N});
   mi::kernels::Gemm gemm;
-  gemm.linear(to, tx, tw, &tb, dws.get(), std::size_t{32} << 20, nullptr);
+  gemm.linear(to, tx, tw, &tb, dws.get(), ws_bytes, nullptr);
   MI_CUDA_CHECK(cudaDeviceSynchronize());
-  const auto got = dout.download<std::uint16_t>(static_cast<std::size_t>(M) * N);
+  std::vector<float> got(static_cast<std::size_t>(M) * N);
+  if (out_f32) {
+    got = dout.download<float>(got.size());
+  } else {
+    const auto bits = dout.download<std::uint16_t>(got.size());
+    for (std::size_t i = 0; i < got.size(); ++i) got[i] = bf16_to_float(bits[i]);
+  }
 
   double dot = 0, ng = 0, nw = 0;
   float max_abs = 0.f, max_rel = 0.f;
+  bool finite = true;
   for (int r = 0; r < M; ++r) {
     for (int c = 0; c < N; ++c) {
       double acc = 0;
@@ -278,8 +319,9 @@ int run_gemm(int M, int N, int K) {
         }();
         acc += static_cast<double>(bf16_to_float(xb[static_cast<std::size_t>(r) * K + d])) * w;
       }
-      const float want = static_cast<float>(acc) + bf16_to_float(bb[static_cast<std::size_t>(c)]);
-      const float g = bf16_to_float(got[static_cast<std::size_t>(r) * N + c]);
+      const float want = static_cast<float>(acc) + bf[static_cast<std::size_t>(c)];
+      const float g = got[static_cast<std::size_t>(r) * N + c];
+      finite = finite && std::isfinite(g);
       dot += static_cast<double>(g) * want;
       ng += static_cast<double>(g) * g;
       nw += static_cast<double>(want) * want;
@@ -288,8 +330,9 @@ int run_gemm(int M, int N, int K) {
     }
   }
   const double cosine = dot / std::sqrt(ng * nw);
-  std::printf("gemm     M %d N %d K %d: cosine %.9f max|diff| %.3g max|rel| %.3g\n", M, N, K, cosine, max_abs, max_rel);
-  return cosine >= 0.9999 && max_rel < 0.01 ? 0 : 1;
+  std::printf("gemm     M %d N %d K %d out %s big row %d ws %zu: cosine %.9f max|diff| %.3g max|rel| %.3g%s\n", M, N, K,
+              out_f32 ? "f32" : "bf16", big_row, ws_bytes, cosine, max_abs, max_rel, finite ? "" : " NON-FINITE");
+  return finite && cosine >= 0.9999 && max_rel < 0.01 ? 0 : 1;
 }
 
 // VAE sm_75 conv2d: NHWC fp32 with KRSC filters, bias + residual, against a host reference.
@@ -485,6 +528,11 @@ int main(int argc, char** argv) {
     if (what == "gemm" || what == "all") {
       failures += run_gemm(64, 128, 256);
       failures += run_gemm(3, 8, 32);  // a tail case: m not a multiple of anything
+      failures += run_gemm(64, 128, 256, /*out_f32=*/true);
+      failures += run_gemm(64, 128, 256, false, /*big_row=*/5);  // a row above fp16's range (scaled, not inf)
+      // Several row chunks (1 MiB workspace: 357 rows of N 512 / K 256 each), f32 and bf16 out.
+      failures += run_gemm(1000, 512, 256, /*out_f32=*/true, 999, std::size_t{1} << 20);
+      failures += run_gemm(1000, 512, 256, false, 7, std::size_t{1} << 20);
     }
     if (what == "vae") {
       failures += run_vae_conv_case(1, 6, 6, 8, 8, 3, 61);
@@ -512,6 +560,10 @@ int main(int argc, char** argv) {
     if (what == "attn256" || what == "all") {
       failures += run_attention("attn256", 4, 1, 256, true, {32, 100}, 13);
       failures += run_attention("attn256", 4, 1, 256, true, {256}, 14);
+      // Causal with more keys than queries (bottom-right: the last query sees every key) and fewer (the first queries
+      // see none: zero rows).
+      failures += run_attention("attn256", 4, 1, 256, true, {40, 64}, 15, false, {100, 64});
+      failures += run_attention("attn256", 4, 1, 256, true, {100}, 16, false, {30});
     }
     if (what == "big") {
       // Engine-shaped cases: 24 heads at head_dim 128 (the DiT's joint attention) and the text encoder's 16/4 GQA at
