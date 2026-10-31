@@ -8,7 +8,7 @@ The reference documents are:
 
 This page does not repeat them. It explains how the pieces fit together, and which choices the launcher has to make.
 
-Version 2.1.0 (ABI 1, server protocol 2). See [Versioning](#versioning) for what stays compatible, and [Migrating from 1.x](#migrating-from-1x) for what changed.
+Version 2.1.1 (ABI 1, server protocol 2). See [Versioning](#versioning) for what stays compatible, and [Migrating from 1.x](#migrating-from-1x) for what changed.
 
 MossInfer is a low-level engine: it runs what the caller asks for, refuses what the hardware or the files cannot run with the reason, and reports what ran. It does not choose for the caller. The launcher picks the tier, the memory mode and the budgets; [Performance](#performance) says what each costs and gives.
 
@@ -205,7 +205,7 @@ cmake --build --preset linux-cuda13 -j8
 CUDA_VISIBLE_DEVICES="" ctest --preset linux-cuda13 -L '^cpu$'
 cmake --install build-linux-cuda13                # -> build-linux-cuda13/install
 cmake --install build-linux-cuda13 --component Unspecified --prefix build-linux-cuda13/install-system-cuda
-(cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-2.1.0-linux-cu13-x86_64.{tar.gz,zip}
+(cd build-linux-cuda13 && cpack --config CPackConfig.cmake)   # -> mossinfer-2.1.1-linux-cu13-x86_64.{tar.gz,zip}
 ```
 
 - **glibc:** the archive needs the glibc of the machine that built it, or a newer one. Build on the oldest distribution you want to support. CI uses Ubuntu 22.04, which gives glibc 2.35. A build from a rolling distribution such as Arch will not start on Ubuntu LTS.
@@ -332,10 +332,10 @@ RTX 5090, SFT, 1024², 50 steps, every model resident:
 
 The gain holds at 2048²: INT8 `high` runs 1.12 s per step against 2.77 s for bf16. 8-bit attention runs at every size; `attention` picks another kernel (`exact`, or the fp32-accumulating variants) when the caller wants one.
 
-An `-DMOSSINFER_SM75=ON` build on an RTX 2080 8 GiB (SFT, every model resident or streamed as planned) is slower but
-the same configuration ladder works: 0.80 s per 256² step for the bf16 bundle at `reference`, 0.19 s for an INT8 DiT at
-`high` (6.5 GiB peak), 0.22 s for an INT4 DiT at `turbo` (3.9 GiB peak); at 1024² the INT8 `high` runs 3.8 s per step and
-the VAE fp32 decode costs 10–12 s. Details in [sm75.md](sm75.md#performance).
+An `-DMOSSINFER_SM75=ON` build on an RTX 2080 Ti 11 GiB (SFT) is slower but the same configuration ladder works: 0.175 s
+per 256² step for the bf16 bundle at `reference`, 0.091 s for an INT8 DiT at `high` (6.3 GiB peak), 0.103 s for an INT4 DiT
+at `turbo` (4.1 GiB peak); at 1024² the INT8 `high` runs 2.58 s per step and the VAE fp32 decode costs about 11 s. Details
+in [sm75.md](sm75.md#performance).
 
 **Memory modes** trade host RAM for speed. `balanced` (the default) keeps the process near 8 GiB of private RAM, `min_memory` near 4 GiB (more streaming and parking, the lowest peaks), and `max_speed` uses what the machine has free (the text encoder held in RAM, pinned where there is room, and a larger embedding cache, so a new prompt starts sooner).
 
@@ -551,7 +551,7 @@ Attach it to bug reports, together with the server's stderr log and `hello`'s `p
 ## Versioning
 
 - **Version numbers.**
-  - `mi_version()` returns the release version (`2.1.0`).
+  - `mi_version()` returns the release version (`2.1.1`).
   - `mi_abi_version()` and `MI_ABI_VERSION` give the binary interface version (1).
   - The server's `hello` reports its `protocol_version` (2).
 - **Additive changes keep ABI 1:** new functions, new fields at the end of structs, new enum values, new optional server parameters and events.
