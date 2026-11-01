@@ -1,7 +1,7 @@
-// sm_75 bring-up harness: runs the Turing kernel family on the current device and checks it against a host
-// reference. Built only with MOSSINFER_SM75 (cmake/modules/sm75.cmake), as a development tool, not installed shipped.
+// sm_7x bring-up harness: runs the compatibility kernels on the current device against a host reference.
+// Built as sm75_check with MOSSINFER_SM75, or sm70_check with MOSSINFER_SM70; a development tool, not installed.
 //
-// Usage: sm75_check [attn128|attn256|convert|all]
+// Usage: sm75_check / sm70_check [attn128|attn256|convert|gemm|int8|vae|big|all]
 //   attn128  varlen non-causal attention, head_dim 128 (the DiT's joint attention shape), GQA 2:1
 //   attn256  varlen causal attention, head_dim 256 (the text encoder's full-attention shape), GQA 4:1, and causal
 //            with key lengths unlike the query lengths (bottom-right alignment)
@@ -97,10 +97,11 @@ class DevBuf {
 std::vector<float> reference_attention(const std::vector<std::uint16_t>& q, const std::vector<std::uint16_t>& k,
                                        const std::vector<std::uint16_t>& v, const std::vector<int>& cu_q,
                                        const std::vector<int>& cu_k, int heads, int kv_heads, int dim, bool causal,
-                                       float scale) {
+                                       float scale, std::vector<float>* lse = nullptr) {
   const int batch = static_cast<int>(cu_q.size()) - 1;
   const int total_q = cu_q.back();
   std::vector<float> out(static_cast<std::size_t>(total_q) * heads * dim, 0.f);
+  if (lse) lse->assign(static_cast<std::size_t>(total_q) * heads, INFINITY);
   const int group = heads / kv_heads;
   std::vector<float> scores;
   for (int b = 0; b < batch; ++b) {
@@ -129,6 +130,7 @@ std::vector<float> reference_attention(const std::vector<std::uint16_t>& q, cons
           scores[static_cast<std::size_t>(j)] = std::exp(scores[static_cast<std::size_t>(j)] - max_s);
           sum += scores[static_cast<std::size_t>(j)];
         }
+        if (lse) (*lse)[static_cast<std::size_t>(h) * total_q + i] = max_s + std::log(sum);
         std::size_t base = (static_cast<std::size_t>(i) * heads + h) * dim;
         for (int j = 0; j < n; ++j) {
           const float p = scores[static_cast<std::size_t>(j)] / sum;
@@ -201,7 +203,15 @@ int run_attention(const char* name, int heads, int kv_heads, int dim, bool causa
   std::fflush(stdout);
 
   const auto got = dout.download<std::uint16_t>(qb.size());
-  const auto want = reference_attention(qb, kb, vb, cu, cu_k, heads, kv_heads, dim, causal, scale);
+  std::vector<float> expected_lse;
+  const auto want = reference_attention(qb, kb, vb, cu, cu_k, heads, kv_heads, dim, causal, scale, &expected_lse);
+  const auto actual_lse = dls.download<float>(lse.size());
+  bool lse_ok = true;
+  for (std::size_t i = 0; i < lse.size(); ++i) {
+    if (std::isinf(expected_lse[i])) lse_ok &= actual_lse[i] == INFINITY;
+    else lse_ok &= std::fabs(actual_lse[i] - expected_lse[i]) <= 2e-4f;
+  }
+  std::printf("  log-sum-exp: %s\n", lse_ok ? "OK" : "MISMATCH");
   double dot = 0, ng = 0, nw = 0;
   float max_abs = 0.f;
   for (std::size_t i = 0; i < want.size(); ++i) {
@@ -234,7 +244,7 @@ int run_attention(const char* name, int heads, int kv_heads, int dim, bool causa
     }
   }
   MI_CUDA_CHECK(cudaGetLastError());
-  return cosine >= 0.9999 && inputs_kept ? 0 : 1;
+  return cosine >= 0.9999 && inputs_kept && lse_ok ? 0 : 1;
 }
 
 int run_convert() {
@@ -534,14 +544,14 @@ int main(int argc, char** argv) {
       failures += run_gemm(1000, 512, 256, /*out_f32=*/true, 999, std::size_t{1} << 20);
       failures += run_gemm(1000, 512, 256, false, 7, std::size_t{1} << 20);
     }
-    if (what == "vae") {
+    if (what == "vae" || what == "all") {
       failures += run_vae_conv_case(1, 6, 6, 8, 8, 3, 61);
       failures += run_vae_conv_case(1, 8, 8, 96, 96, 3, 65);   // decoder widths: several channel chunks and K blocks
       failures += run_vae_conv_case(1, 5, 7, 96, 3, 1, 69);    // conv_out: 1x1, K = 3
       failures += run_vae_conv_case(1, 4, 4, 32, 96, 1, 73);   // 1x1 shortcut
       failures += run_vae_attn();
     }
-    if (what == "int8") {
+    if (what == "int8" || what == "all") {
       failures += run_int8_gemm(64, 128, 256);
       failures += run_int8_gemm(3, 8, 64);   // tiny M: one tile row
       failures += run_int8_gemm(257, 384, 1024);

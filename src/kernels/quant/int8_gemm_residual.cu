@@ -2,6 +2,7 @@
 #include "kernels/quant/int8_gemm_impl.cuh"
 #include "kernels/sm75/int8_sm75.h"
 #include "kernels/sm75/sm75.h"
+#include "kernels/sm70/sm70.h"
 
 namespace mi::kernels::quant {
 namespace detail {
@@ -38,6 +39,13 @@ void int8_gemm_gated_residual(const Int8Operands& op, const __nv_bfloat16* bias,
   detail::check_vector(name, "bias", bias, /*optional=*/true);
   detail::check_vector(name, "gate", gate, /*optional=*/false);
   if (p.m == 0) return;
+#if MOSSINFER_HAVE_SM70
+  if (kernels::sm70::volta()) {
+    detail::check_sm75_tile(name, tile);
+    kernels::sm70::int8_gemm_gated_residual(op, bias, gate, residual, ldr, stream);
+    return;
+  }
+#endif
   if (kernels::sm75::turing()) {
     detail::check_sm75_tile(name, tile);
     kernels::sm75::int8_gemm_gated_residual(op, bias, gate, residual, ldr, stream);

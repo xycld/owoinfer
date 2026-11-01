@@ -134,10 +134,15 @@ void evaluate_device(DeviceInfo& dev, int driver_version, int build_cuda_version
     // The sm_80 path needs Ampere; a build with the sm_75 kernel family reaches down to Turing.
     dev.reason = "compute capability " + cc_string(dev.cc_major, dev.cc_minor) + " is below the required " +
                  cc_string(kMinComputeMajor, kMinComputeMinor) +
-                 (MOSSINFER_HAVE_SM75 ? " (Turing or newer)" : " (Ampere or newer)");
+                 (MOSSINFER_HAVE_SM70 ? " (Volta or newer)" :
+                  MOSSINFER_HAVE_SM75 ? " (Turing or newer)" : " (Ampere or newer)");
     return;
   }
   const Flavour build = flavour_of_cuda_version(build_cuda_version);
+  if (dev.cc_major == 7 && dev.cc_minor < 5 && build_cuda_version >= 13000) {
+    dev.reason = "Volta needs a CUDA 12 build; CUDA 13 removed its compilation and library support";
+    return;
+  }
   const int min_driver = build == Flavour::kNone ? build_cuda_version / 1000 * 1000 : min_driver_version(build);
   if (driver_version < min_driver) {
     dev.reason = driver_version == 0 ? std::string("no NVIDIA driver is loaded")
@@ -165,6 +170,7 @@ void recommend(ProbeResult& r, const std::vector<CudaArch>& archs) {
   auto append = [&r](const std::string& s) { r.reason += (r.reason.empty() ? "" : "; ") + s; };
   bool any_capable = false;
   bool any_image = false;
+  bool any_cuda13_image = false;
   std::string no_image;  // "sm_90, sm_100" of capable devices without a kernel image
   for (const DeviceInfo& d : r.devices) {
     if (std::tie(d.cc_major, d.cc_minor) < std::tie(kMinComputeMajor, kMinComputeMinor)) continue;
@@ -173,6 +179,7 @@ void recommend(ProbeResult& r, const std::vector<CudaArch>& archs) {
     // driver is new enough for its own toolkit.
     if (compatible_image(archs, d.cc_major, d.cc_minor, true)) {
       any_image = true;
+      if (d.cc_major > 7 || (d.cc_major == 7 && d.cc_minor >= 5)) any_cuda13_image = true;
     } else {
       no_image += (no_image.empty() ? "sm_" : ", sm_") + std::to_string(d.cc_major) + std::to_string(d.cc_minor);
     }
@@ -191,7 +198,8 @@ void recommend(ProbeResult& r, const std::vector<CudaArch>& archs) {
            build_architectures_string() + ")");
     return;
   }
-  const Flavour f = flavour_for_driver(r.driver_version);
+  Flavour f = flavour_for_driver(r.driver_version);
+  if (f == Flavour::kCuda13 && !any_cuda13_image) f = Flavour::kCuda12;
   if (f == Flavour::kNone) {
     append(r.driver_version == 0 ? std::string("no flavour recommended: no NVIDIA driver is loaded")
                                  : "no flavour recommended: the driver supports CUDA " +

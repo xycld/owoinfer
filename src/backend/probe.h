@@ -18,12 +18,15 @@ namespace mi::backend {
 
 // Minimum compute capability this build can run. Every sm_80 kernel needs bf16 tensor cores and cp.async; a build
 // with the sm_75 (Turing) kernel family (MOSSINFER_SM75, cmake/modules/sm75.cmake) also runs compute capability 7.5,
-// through the fp16/INT8 fallbacks in src/kernels/sm75.
+// through the fp16/INT8 fallbacks in src/kernels/sm75. MOSSINFER_SM70 adds the Volta kernels for 7.0 with CUDA 12.
 #ifndef MOSSINFER_HAVE_SM75
 #define MOSSINFER_HAVE_SM75 0
 #endif
-inline constexpr int kMinComputeMajor = MOSSINFER_HAVE_SM75 ? 7 : 8;
-inline constexpr int kMinComputeMinor = MOSSINFER_HAVE_SM75 ? 5 : 0;
+#ifndef MOSSINFER_HAVE_SM70
+#define MOSSINFER_HAVE_SM70 0
+#endif
+inline constexpr int kMinComputeMajor = (MOSSINFER_HAVE_SM70 || MOSSINFER_HAVE_SM75) ? 7 : 8;
+inline constexpr int kMinComputeMinor = MOSSINFER_HAVE_SM70 ? 0 : (MOSSINFER_HAVE_SM75 ? 5 : 0);
 
 // Release flavours, named by the CUDA major version of the toolkit they are built with.
 enum class Flavour { kNone, kCuda12, kCuda13 };

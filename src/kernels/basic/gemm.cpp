@@ -213,7 +213,7 @@ struct Gemm::Impl {
 
 Gemm::Gemm() : impl_(std::make_unique<Impl>()) {
   MI_LT_CHECK(cublasLtCreate(&impl_->handle));
-#if MOSSINFER_HAVE_SM75
+#if MOSSINFER_HAVE_SM75 || MOSSINFER_HAVE_SM70
   // Turing: no bf16 tensor cores, so bf16 linears run as fp16 with fp32 accumulation (see Impl::linear_f16).
   int device = 0, major = 0;
   if (cudaGetDevice(&device) == cudaSuccess &&

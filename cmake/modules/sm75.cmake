@@ -19,22 +19,40 @@ if(_mi_sm75_sources)
   set_property(TARGET mossinfer_core PROPERTY SOURCES ${_mi_core_sources})
   unset(_mi_core_sources)
 
-  add_library(mossinfer_sm75 OBJECT ${_mi_sm75_sources})
-  set_target_properties(mossinfer_sm75 PROPERTIES
-    CUDA_ARCHITECTURES 75-real
-    POSITION_INDEPENDENT_CODE ON
-    CUDA_SEPARABLE_COMPILATION OFF)
-  target_include_directories(mossinfer_sm75 PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
-  target_include_directories(mossinfer_sm75 SYSTEM PRIVATE
-    ${CMAKE_SOURCE_DIR}/third_party/flash-attention/csrc/flash_attn/src
-    ${CMAKE_SOURCE_DIR}/third_party/cutlass/include
-    ${CMAKE_SOURCE_DIR}/third_party/cutlass/tools/util/include)
-  target_compile_options(mossinfer_sm75 PRIVATE --expt-relaxed-constexpr -lineinfo ${MOSSINFER_CUDA_HOST_WARN})
-  target_sources(mossinfer_core PRIVATE $<TARGET_OBJECTS:mossinfer_sm75>)
-  message(STATUS "SM75: Turing kernel family built (${_mi_sm75_sources})")
+  set(_mi_sm75_present TRUE)
+  if(MOSSINFER_SM70)
+    # Conversion and VAE decode are SIMT; share their source with Volta without compiling Turing MMA for sm_70.
+    set(_mi_sm7x_sources ${_mi_sm75_sources})
+    list(FILTER _mi_sm7x_sources INCLUDE REGEX "/(convert|vae_sm75)\\.cu$")
+    if(_mi_sm7x_sources)
+      list(REMOVE_ITEM _mi_sm75_sources ${_mi_sm7x_sources})
+      add_library(mossinfer_sm7x OBJECT ${_mi_sm7x_sources})
+      set_target_properties(mossinfer_sm7x PROPERTIES CUDA_ARCHITECTURES "70-real;75-real"
+                            POSITION_INDEPENDENT_CODE ON CUDA_SEPARABLE_COMPILATION OFF)
+      target_include_directories(mossinfer_sm7x PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+      target_compile_options(mossinfer_sm7x PRIVATE --expt-relaxed-constexpr -lineinfo ${MOSSINFER_CUDA_HOST_WARN})
+      target_sources(mossinfer_core PRIVATE $<TARGET_OBJECTS:mossinfer_sm7x>)
+    endif()
+    unset(_mi_sm7x_sources)
+  endif()
+  if(_mi_sm75_sources)
+    add_library(mossinfer_sm75 OBJECT ${_mi_sm75_sources})
+    set_target_properties(mossinfer_sm75 PROPERTIES
+      CUDA_ARCHITECTURES 75-real
+      POSITION_INDEPENDENT_CODE ON
+      CUDA_SEPARABLE_COMPILATION OFF)
+    target_include_directories(mossinfer_sm75 PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(mossinfer_sm75 SYSTEM PRIVATE
+      ${CMAKE_SOURCE_DIR}/third_party/flash-attention/csrc/flash_attn/src
+      ${CMAKE_SOURCE_DIR}/third_party/cutlass/include
+      ${CMAKE_SOURCE_DIR}/third_party/cutlass/tools/util/include)
+    target_compile_options(mossinfer_sm75 PRIVATE --expt-relaxed-constexpr -lineinfo ${MOSSINFER_CUDA_HOST_WARN})
+    target_sources(mossinfer_core PRIVATE $<TARGET_OBJECTS:mossinfer_sm75>)
+    message(STATUS "SM75: Turing kernel family built (${_mi_sm75_sources})")
+  endif()
 endif()
 
-if(MOSSINFER_SM75 AND _mi_sm75_sources)
+if((MOSSINFER_SM75 OR MOSSINFER_SM70) AND _mi_sm75_present)
   # Portable kernels: pure SIMT translation units (no cp.async, no tensor-core asm, no CUTLASS), which run unchanged on
   # Turing but were only compiled for the core's sm_80+ list. They are built for sm_75 too, in their own OBJECT library
   # (the core keeps its list, so the mixed-precision kernels around them never see --arch=sm_75).
@@ -71,6 +89,9 @@ if(MOSSINFER_SM75 AND _mi_sm75_sources)
     set_property(TARGET mossinfer_core PROPERTY SOURCES ${_mi_core_sources})
     unset(_mi_core_sources)
     set(_mi_portable_archs 75 ${CMAKE_CUDA_ARCHITECTURES})
+    if(MOSSINFER_SM70)
+      list(PREPEND _mi_portable_archs 70-real)
+    endif()
     list(REMOVE_DUPLICATES _mi_portable_archs)
     add_library(mossinfer_sm75_portable OBJECT ${_mi_portable_present})
     set_target_properties(mossinfer_sm75_portable PROPERTIES
@@ -90,16 +111,18 @@ if(MOSSINFER_SM75 AND _mi_sm75_sources)
   # src/backend/probe.h: the minimum compute capability and the architecture list this build accepts. Defined on the
   # sources that read it rather than on the whole target, so a build without MOSSINFER_SM75 keeps its old objects and
   # adding the option only recompiles the dispatchers.
-  set_property(SOURCE ${CMAKE_SOURCE_DIR}/src/backend/probe.cpp
+  if(MOSSINFER_SM75 OR MOSSINFER_SM70)
+    set_property(SOURCE ${CMAKE_SOURCE_DIR}/src/backend/probe.cpp
                       ${CMAKE_SOURCE_DIR}/src/kernels/attention/flash_attention.cu
                       ${CMAKE_SOURCE_DIR}/src/kernels/basic/gemm.cpp
                       ${CMAKE_SOURCE_DIR}/src/kernels/gdn/chunk_rule.cu
                APPEND PROPERTY COMPILE_DEFINITIONS MOSSINFER_HAVE_SM75=1)
-  message(STATUS "SM75: compute capability 7.5 accepted")
+    message(STATUS "SM75: compute capability 7.5 accepted")
+  endif()
 
   # Bring-up harness (not installed): the engine's GPU tests compile their reference kernels for the build's CUDA
   # architectures, so a Turing device cannot run them; this tool builds its own host reference.
-  if(EXISTS ${CMAKE_SOURCE_DIR}/tools/sm75_check.cu)
+  if(MOSSINFER_SM75 AND EXISTS ${CMAKE_SOURCE_DIR}/tools/sm75_check.cu)
     add_executable(sm75_check ${CMAKE_SOURCE_DIR}/tools/sm75_check.cu)
     set_target_properties(sm75_check PROPERTIES CUDA_ARCHITECTURES 75)
     target_include_directories(sm75_check PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
@@ -108,3 +131,4 @@ if(MOSSINFER_SM75 AND _mi_sm75_sources)
   endif()
 endif()
 unset(_mi_sm75_sources)
+unset(_mi_sm75_present)
