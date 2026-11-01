@@ -13,6 +13,20 @@ moss-infer generate --model MOSS-Image/sft --dit moss_image_sft_int8_convrot.saf
   --prompt "a red apple on a wooden table" -o apple.png
 ```
 
+Speed against GPU memory on an RTX 5090 at 50 steps, where down and to the left is better. owoinfer is this engine. Memory is the whole-process peak, which for ComfyUI includes models it keeps cached while memory is free. The official pipeline runs use the base model and the other runs use SFT, and samplers differ between implementations. At 2048×2048 the official pipeline runs out of memory in the VAE decode.
+
+![Step time against peak GPU memory at 1024×1024 for owoinfer, ComfyUI and official PyTorch](assets/comparison_1024x1024.png)
+
+![Step time against peak GPU memory at 2048×2048 for owoinfer, ComfyUI and official PyTorch](assets/comparison_2048x2048.png)
+
+The same peaks on their own. The official PyTorch runs use bf16 only, and ComfyUI's peak is not a minimum requirement.
+
+![Peak GPU memory at 1024×1024 and 2048×2048 for owoinfer, ComfyUI and official PyTorch](assets/comparison_peak_vram.png)
+
+Lowest VRAM against normal use at 1024×1024. `min_memory` streams the DiT and costs about 3 % per step here. The owoinfer runs use a 4096-token prompt and the official pipeline runs use a 282-token prompt.
+
+![Step time against peak GPU memory at 1024×1024 in low-VRAM and normal modes for owoinfer and official PyTorch](assets/comparison_1024x1024_low_vram.png)
+
 - [docs/integration.md](docs/integration.md): building the engine into an application. Start here.
 - [docs/sm75.md](docs/sm75.md): Turing (compute capability 7.5) support: build and package, what runs, measured speed on an RTX 2080 Ti, limitations.
 - [docs/c-api.md](docs/c-api.md): the C library, `include/mossinfer/mossinfer.h`.
