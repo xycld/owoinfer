@@ -72,7 +72,8 @@ qd::SituFactorTables situ_tables(cudaStream_t stream) {
 // The main loop uses CUTLASS's Volta shared-memory swizzle and pipelined register loads. Global iterators still
 // read INT8; MmaPipelined's NumericArrayConverter stages exact fp16 integers. Fold every 1024 products into int32:
 // each fp32 partial is bounded by 2^24, preserving integer sums even with cancellation at the maximum supported K.
-using Sm70Tile = qd::TileCfg<64, 128, 32, 32, 64, 2>;
+using Sm70SmallTile = qd::TileCfg<64, 128, 32, 32, 64, 2>;
+using Sm70LargeTile = qd::TileCfg<128, 128, 32, 32, 64, 2>;
 using Sm70Instr = cutlass::gemm::GemmShape<8, 8, 4>;
 
 template <class Base>
@@ -115,10 +116,10 @@ using qd::mul;
 using qd::rbf;
 using qd::dequant;
 
-template <Epilogue E>
+template <Epilogue E, typename Tile>
 struct Kernel {
   using Core = cutlass::gemm::threadblock::DefaultMmaCore<
-      Sm70Tile::Threadblock, Sm70Tile::Warp, Sm70Instr, cutlass::half_t, qd::RowMajor,
+      typename Tile::Threadblock, typename Tile::Warp, Sm70Instr, cutlass::half_t, qd::RowMajor,
       cutlass::half_t, qd::ColumnMajor, float, qd::RowMajor, cutlass::arch::OpClassTensorOp, 2>;
   using IteratorA = cutlass::transform::threadblock::PredicatedTileIterator<
       cutlass::MatrixShape<Core::Shape::kM, Core::Shape::kK>, std::int8_t, qd::RowMajor, 1,
@@ -130,20 +131,22 @@ struct Kernel {
   using Mma = ExactMma<cutlass::gemm::threadblock::MmaPipelined<
       typename Core::Shape, IteratorA, typename Core::SmemIteratorA, IteratorB, typename Core::SmemIteratorB,
       float, qd::RowMajor, typename Core::MmaPolicy>>;
+  union SharedStorage {
+    typename Mma::SharedStorage mainloop;
+    float result[Tile::Threadblock::kM * Tile::Threadblock::kN];
+  };
 };
 
-template <Epilogue E>
-__global__ void int8_kernel(quant::Int8Operands p, typename Kernel<E>::IteratorA::Params pa,
-                             typename Kernel<E>::IteratorB::Params pb, const __nv_bfloat16* bias,
+template <Epilogue E, typename Tile>
+__global__ void int8_kernel(quant::Int8Operands p, typename Kernel<E, Tile>::IteratorA::Params pa,
+                             typename Kernel<E, Tile>::IteratorB::Params pb, const __nv_bfloat16* bias,
                              const __nv_bfloat16* gate, __nv_bfloat16* out, std::int64_t ldo,
                              qd::SituFactorTables tables) {
-  using K = Kernel<E>;
-  constexpr int BM = Sm70Tile::Threadblock::kM, BN = Sm70Tile::Threadblock::kN;
-  constexpr int kThreads = (BM / Sm70Tile::Warp::kM) * (BN / Sm70Tile::Warp::kN) * 32;
-  __shared__ union Storage {
-    typename K::Mma::SharedStorage mainloop;
-    float result[BM * BN];
-  } storage;
+  using K = Kernel<E, Tile>;
+  constexpr int BM = Tile::Threadblock::kM, BN = Tile::Threadblock::kN;
+  constexpr int kThreads = (BM / Tile::Warp::kM) * (BN / Tile::Warp::kN) * 32;
+  extern __shared__ __align__(16) char buffer[];
+  auto& storage = *reinterpret_cast<typename K::SharedStorage*>(buffer);
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
   const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
   typename K::IteratorA a(pa, const_cast<std::int8_t*>(p.x_q), {int(p.m), int(p.k)}, tid, {m0, 0});
@@ -151,11 +154,11 @@ __global__ void int8_kernel(quant::Int8Operands p, typename Kernel<E>::IteratorA
   typename K::Mma mma(storage.mainloop, tid, warp, lane);
   typename K::Mma::FragmentC accum, zero;
   zero.clear();
-  mma((p.k + Sm70Tile::Threadblock::kK - 1) / Sm70Tile::Threadblock::kK, accum, a, b, zero);
+  mma((p.k + Tile::Threadblock::kK - 1) / Tile::Threadblock::kK, accum, a, b, zero);
   __syncthreads();
   using IteratorC = typename K::Core::MmaTensorOp::IteratorC;
   IteratorC c({storage.result, qd::RowMajor(BN)}, lane);
-  c.add_tile_offset({warp % (BM / Sm70Tile::Warp::kM), warp / (BM / Sm70Tile::Warp::kM)});
+  c.add_tile_offset({warp % (BM / Tile::Warp::kM), warp / (BM / Tile::Warp::kM)});
   c.store(accum);
   __syncthreads();
   const float* result = storage.result;
@@ -183,18 +186,29 @@ __global__ void int8_kernel(quant::Int8Operands p, typename Kernel<E>::IteratorA
   }
 }
 
+template <Epilogue E, typename Tile>
+void launch_tile(const quant::Int8Operands& p, const __nv_bfloat16* bias, const __nv_bfloat16* gate,
+             __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream) {
+  constexpr int kBM = Tile::Threadblock::kM, kBN = Tile::Threadblock::kN;
+  constexpr int kThreads = (kBM / Tile::Warp::kM) * (kBN / Tile::Warp::kN) * 32;
+  const dim3 grid(static_cast<unsigned>((p.m + kBM - 1) / kBM), static_cast<unsigned>((p.n + kBN - 1) / kBN));
+  const typename Kernel<E, Tile>::IteratorA::Params pa{qd::RowMajor(p.ldx)};
+  const typename Kernel<E, Tile>::IteratorB::Params pb{qd::ColumnMajor(p.k)};
+  qd::SituFactorTables tables{};
+  if constexpr (E == Epilogue::kSitu) tables = situ_tables(stream);
+  constexpr int bytes = sizeof(typename Kernel<E, Tile>::SharedStorage);
+  auto kernel = &int8_kernel<E, Tile>;
+  if constexpr (bytes > 48 * 1024) MI_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+  kernel<<<grid, kThreads, bytes, stream>>>(p, pa, pb, bias, gate, out, ldo, tables);
+  MI_CUDA_CHECK_LAUNCH();
+}
+
 template <Epilogue E>
 void launch(const quant::Int8Operands& p, const __nv_bfloat16* bias, const __nv_bfloat16* gate,
              __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream) {
-  constexpr int kBM = Sm70Tile::Threadblock::kM, kBN = Sm70Tile::Threadblock::kN;
-  constexpr int kThreads = (kBM / Sm70Tile::Warp::kM) * (kBN / Sm70Tile::Warp::kN) * 32;
-  const dim3 grid(static_cast<unsigned>((p.m + kBM - 1) / kBM), static_cast<unsigned>((p.n + kBN - 1) / kBN));
-  const typename Kernel<E>::IteratorA::Params pa{qd::RowMajor(p.ldx)};
-  const typename Kernel<E>::IteratorB::Params pb{qd::ColumnMajor(p.k)};
-  qd::SituFactorTables tables{};
-  if constexpr (E == Epilogue::kSitu) tables = situ_tables(stream);
-  int8_kernel<E><<<grid, kThreads, 0, stream>>>(p, pa, pb, bias, gate, out, ldo, tables);
-  MI_CUDA_CHECK_LAUNCH();
+  // More rows reuse each weight tile during DiT prefill; short text/boundary shapes retain the smaller tile.
+  if (p.m >= 1024) launch_tile<E, Sm70LargeTile>(p, bias, gate, out, ldo, stream);
+  else launch_tile<E, Sm70SmallTile>(p, bias, gate, out, ldo, stream);
 }
 
 }  // namespace

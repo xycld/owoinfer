@@ -4,7 +4,10 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <array>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -12,6 +15,9 @@
 #include "core/cuda_check.h"
 #include "kernels/basic/elementwise.h"
 #include "kernels/sm70/sm70.h"
+#include "kernels/sm70/vae_sm70.h"
+#include "kernels/sm75/sm75.h"
+#include "kernels/vae/vae_kernels.h"
 
 namespace {
 
@@ -160,9 +166,138 @@ TEST(GpuSm70, Int8EpiloguesAndStrides) {
   check_gemm(3, 8, 16, false);
   check_gemm(67, 136, 1040, false);
   check_gemm(129, 256, 4096, false);
+  check_gemm(1025, 136, 1040, false);
 }
 
 TEST(GpuSm70, Int8ExactLargeCancellation) {
   if (!mi::kernels::sm70::volta()) GTEST_SKIP() << "needs MOSSINFER_SM70 and a Volta device";
   check_gemm(3, 16, 131056, true);
 }
+
+#if MOSSINFER_HAVE_SM70
+TEST(GpuSm70, VaeConvolutionFp32AndResidualAlias) {
+  if (!mi::kernels::sm70::volta()) GTEST_SKIP() << "needs MOSSINFER_SM70 and a Volta device";
+  // Spatial/channel tails, both decoder widths, 1x1/3x3, padding, batch and in-place residual epilogues.
+  for (const auto& shape : {std::array{2, 7, 9, 4, 3, 3}, std::array{1, 13, 11, 12, 65, 1},
+                            std::array{1, 9, 17, 128, 128, 3}, std::array{1, 5, 7, 384, 96, 3},
+                            std::array{1, 5, 7, 512, 256, 3}}) {
+    const auto [n, h, width, c, k, r] = shape;
+    SCOPED_TRACE(::testing::Message() << "C=" << c << " K=" << k << " R=" << r);
+    std::uint32_t rng = 42;
+    const auto values = [&](std::size_t count) {
+      std::vector<float> v(count);
+      for (float& f : v) {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        f = static_cast<float>(static_cast<int>(rng % 2001) - 1000) / 4096.f;
+      }
+      return v;
+    };
+    const auto hx = values(static_cast<std::size_t>(n) * h * width * c), hw = values(static_cast<std::size_t>(k) * r * r * c);
+    const auto hb = values(static_cast<std::size_t>(k)), hr = values(static_cast<std::size_t>(n) * h * width * k);
+    Buffer<float> dx(hx), dw(hw), db(hb), out(hr);
+    const Tensor x = Tensor::view(dx.get(), DType::kF32, Device::kCUDA, {n, h, width, c});
+    const Tensor w = Tensor::view(dw.get(), DType::kF32, Device::kCUDA, {k, r, r, c});
+    const Tensor bias = Tensor::view(db.get(), DType::kF32, Device::kCUDA, {k});
+    const Tensor y = Tensor::view(out.get(), DType::kF32, Device::kCUDA, {n, h, width, k});
+    EXPECT_EQ(mi::vae::conv2d_workspace_bytes(x, w), 0u);
+    for (bool residual : {false, true}) {
+      MI_CUDA_CHECK(cudaMemcpy(out.get(), hr.data(), hr.size() * sizeof(float), cudaMemcpyHostToDevice));
+      cudaStream_t stream = nullptr;
+      cudaGraph_t graph = nullptr;
+      cudaGraphExec_t exec = nullptr;
+      MI_CUDA_CHECK(cudaStreamCreate(&stream));
+      MI_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+      mi::vae::conv2d(x, w, bias, residual ? &y : nullptr, y, nullptr, 0, stream);
+      MI_CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+      MI_CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+      MI_CUDA_CHECK(cudaGraphLaunch(exec, stream));
+      MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+      cudaGraphExecDestroy(exec);
+      cudaGraphDestroy(graph);
+      cudaStreamDestroy(stream);
+      const auto actual = out.host();
+      double max_error = 0.;
+      for (int batch = 0; batch < n; ++batch) for (int oh = 0; oh < h; ++oh) for (int ow = 0; ow < width; ++ow) {
+        for (int oc = 0; oc < k; ++oc) {
+          double sum = 0.;
+          for (int rh = 0; rh < r; ++rh) for (int rw = 0; rw < r; ++rw) {
+            const int ih = oh + rh - r / 2, iw = ow + rw - r / 2;
+            if (ih < 0 || ih >= h || iw < 0 || iw >= width) continue;
+            for (int ic = 0; ic < c; ++ic)
+              sum += static_cast<double>(hx[static_cast<std::size_t>(((batch * h + ih) * width + iw) * c + ic)]) *
+                     hw[static_cast<std::size_t>(((oc * r + rh) * r + rw) * c + ic)];
+          }
+          const auto i = static_cast<std::size_t>(((batch * h + oh) * width + ow) * k + oc);
+          const float expected = (static_cast<float>(sum) + hb[static_cast<std::size_t>(oc)]) + (residual ? hr[i] : 0.f);
+          ASSERT_TRUE(std::isfinite(actual[i]));
+          max_error = std::max(max_error, std::abs(static_cast<double>(actual[i]) - expected));
+        }
+      }
+      EXPECT_LE(max_error, 3e-5);
+    }
+    EXPECT_EQ(dx.host(), hx);
+    EXPECT_EQ(dw.host(), hw);
+  }
+}
+
+TEST(GpuSm70, VaeAttentionFp32SlabsAndStrides) {
+  if (!mi::kernels::sm70::volta()) GTEST_SKIP() << "needs MOSSINFER_SM70 and a Volta device";
+  struct Handle {
+    cublasLtHandle_t lt = nullptr;
+    ~Handle() { if (lt) cublasLtDestroy(lt); }
+  } handle;
+  ASSERT_EQ(cublasLtCreate(&handle.lt), CUBLAS_STATUS_SUCCESS);
+  for (const auto& [length, dim] : {std::pair{1, 384}, std::pair{67, 512}, std::pair{2053, 384}}) {
+    constexpr int batch = 2;
+    const int stride = 3 * dim + 4;
+    std::vector<float> values(static_cast<std::size_t>(batch) * length * stride);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      values[i] = std::sin(static_cast<float>(i % 997) * 0.137f) * 0.7f;
+    }
+    Buffer<float> qkv(values), out(std::vector<float>(static_cast<std::size_t>(batch) * length * dim, -123.f));
+    Buffer<float> reference(std::vector<float>(static_cast<std::size_t>(batch) * length * dim));
+    const auto view = [&](int offset) {
+      Tensor t = Tensor::view(qkv.get() + offset, DType::kF32, Device::kCUDA, {batch, length, dim});
+      t.stride[1] = stride;
+      t.stride[0] = static_cast<std::int64_t>(length) * stride;
+      return t;
+    };
+    const Tensor q = view(0), k = view(dim), v = view(2 * dim);
+    const Tensor o = Tensor::view(out.get(), DType::kF32, Device::kCUDA, {batch, length, dim});
+    const Tensor ref = Tensor::view(reference.get(), DType::kF32, Device::kCUDA, {batch, length, dim});
+    const std::size_t bytes = mi::kernels::sm70::vae_attention_workspace_bytes(length);
+    Buffer<float> allocation(std::vector<float>(bytes / sizeof(float) + 4));
+    float* scratch = allocation.get() + 4;  // preserve mid_attention's 16-byte alignment contract
+    const float scale = 1.f / std::sqrt(static_cast<float>(dim));
+    mi::kernels::sm75::vae_attention_fp32(q, k, v, ref, scale, nullptr);
+    mi::kernels::sm70::vae_attention_fp32(handle.lt, q, k, v, o, scale, scratch, bytes, nullptr);
+    // The warmed cuBLASLt plans and caller-owned slab also work on a captured, non-default stream.
+    cudaStream_t stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    MI_CUDA_CHECK(cudaStreamCreate(&stream));
+    MI_CUDA_CHECK(cudaDeviceSynchronize());
+    MI_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    mi::kernels::sm70::vae_attention_fp32(handle.lt, q, k, v, o, scale, scratch, bytes, stream);
+    MI_CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    MI_CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    for (int i = 0; i < 2; ++i) MI_CUDA_CHECK(cudaGraphLaunch(exec, stream));
+    MI_CUDA_CHECK(cudaStreamSynchronize(stream));
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    const auto actual = out.host(), expected = reference.host();
+    float max_error = 0.f;
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+      ASSERT_TRUE(std::isfinite(actual[i]));
+      max_error = std::max(max_error, std::fabs(actual[i] - expected[i]));
+    }
+    EXPECT_LE(max_error, 2e-5f) << "L=" << length << " D=" << dim;
+    EXPECT_EQ(qkv.host(), values);
+    EXPECT_THROW(mi::kernels::sm70::vae_attention_fp32(handle.lt, q, k, v, o, scale, scratch, bytes - 1, nullptr),
+                 std::invalid_argument);
+  }
+}
+#endif

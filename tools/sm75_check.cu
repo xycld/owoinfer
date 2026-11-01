@@ -29,6 +29,7 @@
 #include "kernels/basic/gemm.h"
 #include "kernels/quant/quant.h"
 #include "kernels/sm75/sm75.h"
+#include "kernels/vae/vae_kernels.h"
 
 namespace {
 
@@ -362,7 +363,7 @@ int run_vae_conv_case(int N, int H, int W, int C, int K, int R, std::uint64_t se
   const Tensor tb = Tensor::view(db.get(), DType::kF32, Device::kCUDA, {K});
   const Tensor tr = Tensor::view(dr.get(), DType::kF32, Device::kCUDA, {N, H, W, K});
   const Tensor ty = Tensor::view(dy.get(), DType::kF32, Device::kCUDA, {N, H, W, K});
-  mi::kernels::sm75::vae_conv2d(tx, tw, tb, &tr, ty, nullptr);
+  mi::vae::conv2d(tx, tw, tb, &tr, ty, nullptr, 0, nullptr);
   MI_CUDA_CHECK(cudaDeviceSynchronize());
   const auto got = dy.download<float>(rv.size());
   const int pad = (R - 1) / 2;
@@ -578,6 +579,7 @@ int main(int argc, char** argv) {
     if (what == "big") {
       // Engine-shaped cases: 24 heads at head_dim 128 (the DiT's joint attention) and the text encoder's 16/4 GQA at
       // head_dim 256. The host reference is O(L^2 D), so these stay at a few hundred tokens.
+      failures += run_attention("dit1025", 4, 2, 128, false, {1025, 193, 1}, 47);
       failures += run_attention("dit512", 24, 24, 128, false, {512, 512}, 41);
       failures += run_attention("te282", 16, 4, 256, true, {282}, 42);
       failures += run_attention("dit76", 24, 24, 128, false, {76, 200, 1}, 43);

@@ -18,6 +18,8 @@ if(_mi_sm70_sources)
     set_property(SOURCE ${CMAKE_SOURCE_DIR}/src/backend/probe.cpp
                         ${CMAKE_SOURCE_DIR}/src/kernels/sm70/sm70.cpp
                         ${CMAKE_SOURCE_DIR}/src/kernels/attention/flash_attention.cu
+                        ${CMAKE_SOURCE_DIR}/src/kernels/vae/attention.cu
+                        ${CMAKE_SOURCE_DIR}/src/kernels/vae/conv2d.cu
                         ${CMAKE_SOURCE_DIR}/src/kernels/basic/gemm.cpp
                         ${CMAKE_SOURCE_DIR}/src/kernels/gdn/chunk_rule.cu
                         ${CMAKE_SOURCE_DIR}/src/kernels/quant/int8_gemm.cu

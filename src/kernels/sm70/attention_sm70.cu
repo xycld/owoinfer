@@ -35,9 +35,9 @@ struct Params {
   bool causal = false;
 };
 
-template <int D, int BN>
-__global__ void attention_kernel(const Params p) {
-  constexpr int kBM = D == 128 ? 128 : 64, kThreads = kBM * 2;
+template <int D, int BN, int kBM>
+__global__ __launch_bounds__(kBM * 2) void attention_kernel(const Params p) {
+  constexpr int kThreads = kBM * 2;
   constexpr int kQStride = D + 8, kVStride = BN + 8;
   using Acc = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
   using A = wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>;
@@ -173,12 +173,12 @@ __global__ void attention_kernel(const Params p) {
   }
 }
 
-template <int D, int BN>
+template <int D, int BN, int kBM>
 void launch(const Params& p, int max_seqlen, int batch, cudaStream_t stream) {
-  constexpr int kBM = D == 128 ? 128 : 64, kThreads = kBM * 2;
+  constexpr int kThreads = kBM * 2;
   constexpr int bytes = ((kBM + BN) * (D + 8) + (D + kBM) * (BN + 8)) * sizeof(__half);
   static_assert(bytes <= 96 * 1024);
-  auto kernel = &attention_kernel<D, BN>;
+  auto kernel = &attention_kernel<D, BN, kBM>;
   if constexpr (bytes > 48 * 1024) MI_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
   const dim3 grid(static_cast<unsigned>((max_seqlen + kBM - 1) / kBM), static_cast<unsigned>(batch),
                   static_cast<unsigned>(p.heads));
@@ -232,9 +232,10 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
   const int batch = static_cast<int>(cu_seqlens_q.dim(0) - 1);
 
   if (head_dim == 128) {
-    launch<128, 32>(p, max_seqlen, batch, stream);
+    if (max_seqlen >= 1024) launch<128, 32, 192>(p, max_seqlen, batch, stream);
+    else launch<128, 32, 128>(p, max_seqlen, batch, stream);
   } else {
-    launch<256, 32>(p, max_seqlen, batch, stream);
+    launch<256, 32, 64>(p, max_seqlen, batch, stream);
   }
 }
 

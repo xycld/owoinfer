@@ -9,13 +9,14 @@
 
 #include "core/cuda_check.h"
 #include "kernels/sm75/sm75.h"
+#include "kernels/sm70/sm70.h"
+#include "kernels/sm70/vae_sm70.h"
+#include "kernels/vae/conv2d_epilogue.cuh"
 #include "kernels/vae/vae_kernels.h"
 
 #include "cutlass/conv/conv2d_problem_size.h"
 #include "cutlass/conv/device/implicit_gemm_convolution.h"
 #include "cutlass/conv/kernel/default_conv2d_fprop_with_broadcast.h"
-#include "cutlass/epilogue/thread/activation.h"
-#include "cutlass/epilogue/thread/linear_combination_bias_elementwise.h"
 #include "cutlass/gemm/threadblock/threadblock_swizzle.h"
 
 namespace mi::vae {
@@ -23,42 +24,7 @@ namespace {
 
 using cutlass::gemm::GemmShape;
 
-// Z = (acc + bias) + residual, the reference's rounding order (cuDNN adds the bias, then ResnetBlock2D adds
-// input_tensor). CUTLASS's LinearCombinationBiasElementwise evaluates (acc + residual) + bias; this subclass
-// only replaces the with-source operator. beta = 1 with a residual, else 0 (the epilogue then skips reading the
-// source tensor and the base's no-source path computes acc + bias). Bias stays fp32 in every mode. The alpha/beta
-// copies here ignore the base's set_k_partition, so this epilogue requires split-K = 1 (problem() fixes that).
-template <typename T, int kAlignOut>
-class BiasThenResidual
-    : public cutlass::epilogue::thread::LinearCombinationBiasElementwise<
-          T, float, float, T, T, kAlignOut, cutlass::epilogue::thread::Identity<float>, cutlass::plus<float>,
-          /*StoreT=*/false, /*ElementVector=*/float> {
- public:
-  using Base = cutlass::epilogue::thread::LinearCombinationBiasElementwise<
-      T, float, float, T, T, kAlignOut, cutlass::epilogue::thread::Identity<float>, cutlass::plus<float>, false, float>;
-  using typename Base::FragmentAccumulator;
-  using typename Base::FragmentC;
-  using typename Base::FragmentCompute;
-  using typename Base::FragmentT;
-  using typename Base::FragmentZ;
-  using typename Base::Params;
-  using Base::operator();
-
-  CUTLASS_HOST_DEVICE explicit BiasThenResidual(Params const& p) : Base(p), alpha_(p.alpha), beta_(p.beta) {}
-
-  CUTLASS_HOST_DEVICE void operator()(FragmentZ& frag_z, FragmentT&, FragmentAccumulator const& ab, FragmentC const& frag_c,
-                                      FragmentCompute const& v) const {
-    const FragmentCompute acc = cutlass::NumericArrayConverter<float, float, kAlignOut>()(ab);
-    const FragmentCompute res = cutlass::NumericArrayConverter<float, T, kAlignOut>()(frag_c);
-    FragmentCompute z;
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < kAlignOut; ++i) z[i] = (alpha_ * acc[i] + v[i]) + beta_ * res[i];
-    frag_z = cutlass::NumericArrayConverter<T, float, kAlignOut>()(z);
-  }
-
- private:
-  float alpha_, beta_;
-};
+using detail::BiasThenResidual;
 
 template <typename T, typename TileShape, typename WarpShape, typename InstShape, int kStages, int kAlignOut>
 struct ConvConfig {
@@ -194,6 +160,12 @@ void conv2d(const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor* 
   if (y.data == x.data) throw std::invalid_argument("conv2d: y must not alias x");
   if (kernels::sm75::fp16_weights()) {
     if (x.dtype != DType::kF32) throw std::runtime_error("conv2d: the sm_75 path runs the VAE in fp32 (reference mode)");
+#if MOSSINFER_HAVE_SM70
+    if (kernels::sm70::volta()) {
+      kernels::sm70::vae_conv2d(x, w, bias, residual, y, stream);
+      return;
+    }
+#endif
     kernels::sm75::vae_conv2d(x, w, bias, residual, y, stream);
     return;
   }
