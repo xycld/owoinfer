@@ -1,4 +1,5 @@
-// out[rows,d] = bf16(bf16(bf16(bf16(rms_norm(x)) * w) * bf16(1 + scale)) + shift); w, scale, shift: [d]. x and out are
+// out[rows,d] = bf16(bf16(bf16(bf16(rms_norm(x)) * w) * bf16(1 + scale)) + shift); w, scale, shift: [d]. With a null scale
+// address, out = bf16(bf16(rms_norm(x)) * w). x and out are
 // bf16 with strides that are multiples of 4, and d is a multiple of 4. One row per workgroup. The fp32 mean of squares is
 // summed in the order of torch's reduce kernel: 32 lanes of 4 running values, then a halving tree.
 #version 460
@@ -55,6 +56,10 @@ void main() {
   for (uint g = t; g < groups; g += 32u) {
     precise const vec4 normed = f4(X.d[g]) * r;
     precise const vec4 y = rbf4(normed) * f4(W.d[g]);
+    if (pc.scale == 0ul) {  // rms_norm_moss alone, as the text refiner's norms
+      O.d[g] = bf4(y);
+      continue;
+    }
     precise const vec4 one_plus = 1.0 + f4(S.d[g]);
     precise const vec4 scaled = rbf4(y) * rbf4(one_plus);
     precise const vec4 shifted = rbf4(scaled) + f4(H.d[g]);

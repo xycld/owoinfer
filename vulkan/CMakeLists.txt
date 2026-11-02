@@ -31,11 +31,11 @@ endfunction()
 _mi_add_shader(gemm_coop vulkan1.3)
 _mi_add_shader(gemm_bf16_coop vulkan1.3)
 _mi_add_shader(attention_coop vulkan1.3)
-foreach(shader IN ITEMS gemm_plain norm_modulate qk_norm_rope attention_plain)
+foreach(shader IN ITEMS gemm_plain norm_modulate qk_norm_rope attention_plain elementwise)
   _mi_add_shader(${shader} vulkan1.2)
 endforeach()
 
-add_library(mossinfer_vulkan STATIC runtime.cpp gemm.cpp block.cpp safetensors.cpp ${_spirv_files})
+add_library(mossinfer_vulkan STATIC runtime.cpp gemm.cpp block.cpp dit.cpp safetensors.cpp ${_spirv_files})
 target_include_directories(mossinfer_vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${_spirv_dir})
 target_link_libraries(mossinfer_vulkan PUBLIC Vulkan::Vulkan)
 
@@ -44,9 +44,14 @@ target_link_libraries(vulkan_check PRIVATE mossinfer_vulkan)
 
 # The host replays the block is checked against must round where the kernels do: no contraction.
 add_executable(vulkan_block_check tools/vulkan_block_check.cpp)
-target_compile_options(vulkan_block_check PRIVATE -ffp-contract=off)
+target_compile_options(vulkan_block_check PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/fp:precise,-ffp-contract=off>)
 target_link_libraries(vulkan_block_check PRIVATE mossinfer_vulkan)
 
 # One real block against the engine's captured output.
 add_executable(vulkan_block_real tools/vulkan_block_real.cpp)
 target_link_libraries(vulkan_block_real PRIVATE mossinfer_vulkan)
+
+# The DiT's sampling loop from a golden case; CFG and Euler on the host round like the engine's kernels: no contraction.
+add_executable(vulkan_dit_run tools/vulkan_dit_run.cpp)
+target_compile_options(vulkan_dit_run PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/fp:precise,-ffp-contract=off>)
+target_link_libraries(vulkan_dit_run PRIVATE mossinfer_vulkan)

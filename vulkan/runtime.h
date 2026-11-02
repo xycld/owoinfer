@@ -115,4 +115,9 @@ class Pipeline {
 // Makes earlier compute writes visible to later compute and transfer work. A queue wait only reaches the host.
 void compute_barrier(VkCommandBuffer cb);
 
+// Records a device copy of `bytes` from src at src_offset to dst at dst_offset, after earlier compute and transfer writes
+// and before later compute work.
+void record_copy(VkCommandBuffer cb, const Buffer& src, VkDeviceSize src_offset, const Buffer& dst, VkDeviceSize dst_offset,
+                 VkDeviceSize bytes);
+
 }  // namespace mi::vk

@@ -418,4 +418,24 @@ void compute_barrier(VkCommandBuffer cb) {
                        0, nullptr);
 }
 
+void record_copy(VkCommandBuffer cb, const Buffer& src, VkDeviceSize src_offset, const Buffer& dst, VkDeviceSize dst_offset,
+                 VkDeviceSize bytes) {
+  if (src_offset > src.bytes() || bytes > src.bytes() - src_offset || dst_offset > dst.bytes() ||
+      bytes > dst.bytes() - dst_offset) {
+    throw std::runtime_error("record_copy past the end of a buffer");
+  }
+  VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  before.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+  const VkBufferCopy copy{src_offset, dst_offset, bytes};
+  vkCmdCopyBuffer(cb, src.handle(), dst.handle(), 1, &copy);
+  VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &after, 0, nullptr,
+                       0, nullptr);
+}
+
 }  // namespace mi::vk

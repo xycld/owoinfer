@@ -7,6 +7,8 @@
 //   1: out is bf16
 //   2: out[m,n] += bf16(bf16(ab) * gate[n]), gated residual, bf16 in place
 //   3: out[m,n] = situ(bf16(A * B[n]), bf16(A * B[N + n])), SiTU-GLU over the stored [hidden | gate] weight, bf16
+//   4: out[m,n] = bf16(ab + bias[n]), nn.Linear with a bias (bias in `gate`), bf16
+//   5: out[m,n] += bf16(ab + bias[n]), the same then a residual add, bf16 in place
 #version 460
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
@@ -77,7 +79,15 @@ void main() {
     precise const vec4 gated = rbf4(acc) * gate;
     precise const vec4 sum = f4(out_w.d[0]) + rbf4(gated);
     out_w.d[0] = bf4(sum);
-  } else {
+  } else if (MODE == 3) {
     out_w.d[0] = bf4(situ(rbf4(acc), rbf4(acc_gate)));
+  } else {
+    precise const vec4 biased = acc + f4(Words(pc.gate + uint64_t(n) * 2ul).d[0]);
+    if (MODE == 4) {
+      out_w.d[0] = bf4(biased);
+    } else {
+      precise const vec4 sum = f4(out_w.d[0]) + rbf4(biased);
+      out_w.d[0] = bf4(sum);
+    }
   }
 }

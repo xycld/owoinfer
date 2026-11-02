@@ -240,6 +240,31 @@ bool check_norms(Device& device, const BlockKernels& kernels) {
     kernels.record_norm_modulate(cb, x->address(), d, w->address(), scale->address(), shift->address(), out->address(), d, rows, d);
   });
   bool ok = report("rms_norm_modulate", read(*out, x_h.size()), ref, {3.0, 1.0});
+  for (int r = 0; r < rows; ++r) {
+    const bits* row = x_h.data() + static_cast<std::ptrdiff_t>(r) * d;
+    const float rs = host_rsqrt_of_mean(row, d, factor);
+    for (int c = 0; c < d; ++c) {
+      ref[static_cast<std::size_t>(r) * d + c] = host_rbf(host_rbf(from_bf16(row[c]) * rs) * from_bf16(w_h[static_cast<std::size_t>(c)]));
+    }
+  }
+  device.run([&](VkCommandBuffer cb) { kernels.record_norm(cb, x->address(), d, w->address(), out->address(), d, rows, d); });
+  ok = report("rms_norm", read(*out, x_h.size()), ref, {3.0, 1.0}) && ok;
+
+  {
+    constexpr std::uint32_t n = 4 * 1001;
+    const auto a_h = synth_bf16(19, n, 2), b_h = synth_bf16(20, n, 3);
+    auto a = device_buffer(device, a_h), b = device_buffer(device, b_h), o = device_buffer(device, std::vector<bits>(n));
+    std::vector<double> silu_ref(n), situ_ref(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+      const float v = from_bf16(a_h[i]);
+      silu_ref[i] = v / (1.0f + std::exp(-v));
+      situ_ref[i] = host_situ(v, from_bf16(b_h[i]));
+    }
+    device.run([&](VkCommandBuffer cb) { kernels.record_silu(cb, a->address(), o->address(), n); });
+    ok = report("silu", read(*o, n), silu_ref, {1.0, 1.0}) && ok;
+    device.run([&](VkCommandBuffer cb) { kernels.record_situ(cb, a->address(), b->address(), o->address(), n); });
+    ok = report("situ", read(*o, n), situ_ref, {1.5, 1.0}) && ok;
+  }
 
   constexpr int tokens = 37, ld = 3 * kDiTDim;
   const auto qkv_h = synth_bf16(15, static_cast<std::size_t>(tokens) * ld, 0), q_h = synth_bf16(16, kDiTHeadDim, 0),
@@ -291,6 +316,25 @@ bool check_gemms(Device& device, const BlockKernels& kernels, int m, int n, int 
     kernels.record_gemm_gated_residual(cb, out->address(), n, x->address(), ld, w->address(), k, gate->address(), m, n, k);
   });
   ok = report("gemm_gated_residual", read(*out, plain.size()), gated, {1.0, 1.0}) && ok;
+  std::vector<double> biased(plain.size()), biased_res(plain.size());
+  for (int r = 0; r < m; ++r) {
+    for (int c = 0; c < n; ++c) {
+      const std::size_t i = static_cast<std::size_t>(r) * n + c;
+      const float bias = from_bf16(gate_h[static_cast<std::size_t>(c)]);
+      biased[i] = plain[i] + bias;
+      biased_res[i] = from_bf16(res_h[i]) + host_rbf(static_cast<float>(plain[i]) + bias);
+    }
+  }
+  device.run([&](VkCommandBuffer cb) {
+    kernels.record_gemm_bias(cb, out->address(), n, x->address(), ld, w->address(), k, gate->address(), m, n, k);
+  });
+  ok = report("gemm_bias", read(*out, plain.size()), biased, {1.0, 1.0 / 64.0}) && ok;
+  out->upload(res_h.data(), res_h.size() * 2);
+  device.run([&](VkCommandBuffer cb) {
+    kernels.record_gemm_bias_residual(cb, out->address(), n, x->address(), ld, w->address(), k, gate->address(), m, n, k);
+  });
+  // Two roundings: bf16(ab + bias) can land one ULP of its own off when ab differs in the last bits, then the sum rounds.
+  ok = report("gemm_bias_residual", read(*out, plain.size()), biased_res, {1.5, 1.0}) && ok;
   auto ffn = device_buffer(device, std::vector<bits>(static_cast<std::size_t>(m) * f));
   device.run([&](VkCommandBuffer cb) { kernels.record_gemm_situ_glu(cb, ffn->address(), f, x->address(), ld, w->address(), k, m, f, k); });
   return report("gemm_situ_glu", read(*ffn, situ.size()), situ, {1.5, 1.0}) && ok;

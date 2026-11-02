@@ -5,6 +5,8 @@
 //   1: out is bf16
 //   2: out[m,n] += bf16(bf16(ab) * gate[n]), gated residual, bf16 in place
 //   3: out[m,n] = situ(bf16(A * B[n]), bf16(A * B[N + n])), SiTU-GLU over the stored [hidden | gate] weight, bf16
+//   4: out[m,n] = bf16(ab + bias[n]), nn.Linear with a bias (bias in `gate`), bf16
+//   5: out[m,n] += bf16(ab + bias[n]), the same then a residual add, bf16 in place
 //
 // One workgroup per 128x128 tile of the product: 256 invocations, 8 full subgroups of 32, which the pipeline must require.
 // Subgroup s owns rows 32 (s % 4) .. +32 and the columns 32 (s / 4) .. +32 of each half of the tile, so in MODE 3, where the
@@ -166,10 +168,21 @@ void main() {
           precise const vec4 gated_lo = rbf4(lo) * f4(g.xy), gated_hi = rbf4(hi) * f4(g.zw);
           precise const vec4 sum_lo = f4(old.xy) + rbf4(gated_lo), sum_hi = f4(old.zw) + rbf4(gated_hi);
           target.d[0] = uvec4(bf4(sum_lo), bf4(sum_hi));
-        } else {
+        } else if (MODE == 3) {
           const vec4 g_lo = staged(base1, frow, fcol / 4u), g_hi = staged(base1, frow, fcol / 4u + 1u);
           Vec4s(pc.out_ + at * 2ul).d[0] =
               uvec4(bf4(situ(rbf4(lo), rbf4(g_lo))), bf4(situ(rbf4(hi), rbf4(g_hi))));
+        } else {
+          const uvec4 bias = Vec4s(pc.gate + uint64_t(n) * 2ul).d[0];
+          precise const vec4 biased_lo = lo + f4(bias.xy), biased_hi = hi + f4(bias.zw);
+          Vec4s target = Vec4s(pc.out_ + at * 2ul);
+          if (MODE == 4) {
+            target.d[0] = uvec4(bf4(biased_lo), bf4(biased_hi));
+          } else {
+            const uvec4 old = target.d[0];
+            precise const vec4 sum_lo = f4(old.xy) + rbf4(biased_lo), sum_hi = f4(old.zw) + rbf4(biased_hi);
+            target.d[0] = uvec4(bf4(sum_lo), bf4(sum_hi));
+          }
         }
       }
       sync_subgroup();

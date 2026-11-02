@@ -57,6 +57,20 @@ class BlockKernels {
   void record_gemm_situ_glu(VkCommandBuffer cb, VkDeviceAddress out, std::uint32_t ldo, VkDeviceAddress x,
                             std::uint32_t ldx, VkDeviceAddress w_up_gate, std::uint32_t ldw, std::uint32_t m,
                             std::uint32_t f, std::uint32_t k) const;
+  // out = bf16(x W^T + bias), and residual += bf16(x W^T + bias): nn.Linear with a bias, alone or before a residual add.
+  void record_gemm_bias(VkCommandBuffer cb, VkDeviceAddress out, std::uint32_t ldo, VkDeviceAddress x, std::uint32_t ldx,
+                        VkDeviceAddress w, std::uint32_t ldw, VkDeviceAddress bias, std::uint32_t m, std::uint32_t n,
+                        std::uint32_t k) const;
+  void record_gemm_bias_residual(VkCommandBuffer cb, VkDeviceAddress residual, std::uint32_t ldr, VkDeviceAddress x,
+                                 std::uint32_t ldx, VkDeviceAddress w, std::uint32_t ldw, VkDeviceAddress bias,
+                                 std::uint32_t m, std::uint32_t n, std::uint32_t k) const;
+  // out = bf16(bf16(rms_norm(x)) * weight), without modulation.
+  void record_norm(VkCommandBuffer cb, VkDeviceAddress x, std::uint32_t ldx, VkDeviceAddress weight, VkDeviceAddress out,
+                   std::uint32_t ldo, std::uint32_t rows, std::uint32_t d) const;
+  // Contiguous bf16 vectors of n elements, n a multiple of 4: out = silu(a); out = situ(hidden, gate).
+  void record_silu(VkCommandBuffer cb, VkDeviceAddress a, VkDeviceAddress out, std::uint32_t n) const;
+  void record_situ(VkCommandBuffer cb, VkDeviceAddress hidden, VkDeviceAddress gate, VkDeviceAddress out,
+                   std::uint32_t n) const;
   void record_qk_norm_rope(VkCommandBuffer cb, VkDeviceAddress qkv, std::uint32_t ld, std::uint32_t tokens,
                            std::uint32_t heads, VkDeviceAddress q_norm, VkDeviceAddress k_norm, VkDeviceAddress table,
                            std::uint32_t table_ld) const;
@@ -64,7 +78,8 @@ class BlockKernels {
 
  private:
   BlockPath path_;
-  std::unique_ptr<Pipeline> gemm_bf16_, gemm_gated_, gemm_situ_, norm_modulate_, qk_norm_rope_, attention_;
+  std::unique_ptr<Pipeline> gemm_bf16_, gemm_gated_, gemm_situ_, gemm_bias_, gemm_bias_residual_, norm_modulate_,
+      qk_norm_rope_, attention_, silu_, situ_;
 };
 
 struct BlockWeights {

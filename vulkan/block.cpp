@@ -19,6 +19,9 @@ const std::uint32_t kNormSpirv[] = {
 const std::uint32_t kQkSpirv[] = {
 #include "qk_norm_rope.spv.inc"
 };
+const std::uint32_t kElementwiseSpirv[] = {
+#include "elementwise.spv.inc"
+};
 const std::uint32_t kAttentionSpirv[] = {
 #include "attention_plain.spv.inc"
 };
@@ -53,7 +56,12 @@ struct CoopAttentionPush {
 };
 constexpr std::uint32_t kCoopAttentionRows = 64;
 
-enum GemmMode : std::uint32_t { kF32 = 0, kBF16 = 1, kGated = 2, kSitu = 3 };
+enum GemmMode : std::uint32_t { kF32 = 0, kBF16 = 1, kGated = 2, kSitu = 3, kBias = 4, kBiasResidual = 5 };
+
+struct ElementwisePush {
+  std::uint64_t a, b, out;
+  std::uint32_t n;
+};
 
 constexpr std::uint32_t kCoopSubgroup = 32;
 constexpr std::uint32_t kCoopTileRows = 128, kCoopTileCols = 128;
@@ -105,6 +113,12 @@ BlockKernels::BlockKernels(Device& device, BlockPath path) : path_(path) {
   gemm_bf16_ = gemm_pipeline(device, path, kBF16);
   gemm_gated_ = gemm_pipeline(device, path, kGated);
   gemm_situ_ = gemm_pipeline(device, path, kSitu);
+  gemm_bias_ = gemm_pipeline(device, path, kBias);
+  gemm_bias_residual_ = gemm_pipeline(device, path, kBiasResidual);
+  silu_ = std::make_unique<Pipeline>(device, kElementwiseSpirv, sizeof(kElementwiseSpirv), sizeof(ElementwisePush), 0,
+                                     std::vector<std::uint32_t>{0u});
+  situ_ = std::make_unique<Pipeline>(device, kElementwiseSpirv, sizeof(kElementwiseSpirv), sizeof(ElementwisePush), 0,
+                                     std::vector<std::uint32_t>{1u});
   norm_modulate_ = std::make_unique<Pipeline>(device, kNormSpirv, sizeof(kNormSpirv), sizeof(NormPush));
   qk_norm_rope_ = std::make_unique<Pipeline>(device, kQkSpirv, sizeof(kQkSpirv), sizeof(QkPush));
   if (path == BlockPath::kCoop) {
@@ -146,6 +160,42 @@ void BlockKernels::record_gemm_situ_glu(VkCommandBuffer cb, VkDeviceAddress out,
                                         std::uint32_t ldx, VkDeviceAddress w_up_gate, std::uint32_t ldw, std::uint32_t m,
                                         std::uint32_t f, std::uint32_t k) const {
   dispatch_gemm(*gemm_situ_, path_, kSitu, cb, GemmPush{x, w_up_gate, out, 0, m, f, k, ldx, ldw, ldo});
+}
+
+void BlockKernels::record_gemm_bias(VkCommandBuffer cb, VkDeviceAddress out, std::uint32_t ldo, VkDeviceAddress x,
+                                    std::uint32_t ldx, VkDeviceAddress w, std::uint32_t ldw, VkDeviceAddress bias,
+                                    std::uint32_t m, std::uint32_t n, std::uint32_t k) const {
+  dispatch_gemm(*gemm_bias_, path_, kBias, cb, GemmPush{x, w, out, bias, m, n, k, ldx, ldw, ldo});
+}
+
+void BlockKernels::record_gemm_bias_residual(VkCommandBuffer cb, VkDeviceAddress residual, std::uint32_t ldr,
+                                             VkDeviceAddress x, std::uint32_t ldx, VkDeviceAddress w, std::uint32_t ldw,
+                                             VkDeviceAddress bias, std::uint32_t m, std::uint32_t n,
+                                             std::uint32_t k) const {
+  dispatch_gemm(*gemm_bias_residual_, path_, kBiasResidual, cb, GemmPush{x, w, residual, bias, m, n, k, ldx, ldw, ldr});
+}
+
+void BlockKernels::record_norm(VkCommandBuffer cb, VkDeviceAddress x, std::uint32_t ldx, VkDeviceAddress weight,
+                               VkDeviceAddress out, std::uint32_t ldo, std::uint32_t rows, std::uint32_t d) const {
+  record_norm_modulate(cb, x, ldx, weight, 0, 0, out, ldo, rows, d);
+}
+
+namespace {
+void dispatch_elementwise(const Pipeline& p, VkCommandBuffer cb, const ElementwisePush& push) {
+  require(push.n % 4 == 0, "elementwise: n must be a multiple of 4");
+  if (push.n == 0) return;
+  p.dispatch(cb, &push, (push.n / 4 + 63) / 64, 1);
+  compute_barrier(cb);
+}
+}  // namespace
+
+void BlockKernels::record_silu(VkCommandBuffer cb, VkDeviceAddress a, VkDeviceAddress out, std::uint32_t n) const {
+  dispatch_elementwise(*silu_, cb, ElementwisePush{a, 0, out, n});
+}
+
+void BlockKernels::record_situ(VkCommandBuffer cb, VkDeviceAddress hidden, VkDeviceAddress gate, VkDeviceAddress out,
+                               std::uint32_t n) const {
+  dispatch_elementwise(*situ_, cb, ElementwisePush{hidden, gate, out, n});
 }
 
 void BlockKernels::record_qk_norm_rope(VkCommandBuffer cb, VkDeviceAddress qkv, std::uint32_t ld, std::uint32_t tokens,
