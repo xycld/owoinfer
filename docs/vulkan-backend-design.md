@@ -71,13 +71,14 @@ This keeps `main` shippable at every step and gives measurable checkpoints befor
 ## Module layout and build
 
 ```
-cmake/modules/vulkan.cmake        option MOSSINFER_VULKAN, find Vulkan (loader + headers), shader compilation
-src/runtime/vulkan/               device, queues, allocator, staging ring, pipeline cache, descriptor/BDA helpers
-src/kernels/vulkan/               GEMM, attention, norm, rope, gdn, vae, quantized formats (C++ dispatch)
-shaders/vulkan/                   *.comp GLSL sources; compiled to SPIR-V at build time by glslc
-tests/vulkan/                     kernel parity tests, end-to-end image tests
-tools/vulkan_check.cpp            bring-up tool (like tools/sm75_check.cu): device report, GEMM/attention/VAE checks
+vulkan/runtime.*        device, capabilities, buffers, pipelines, barriers
+vulkan/gemm.*           GEMM paths, then the other kernels beside it
+vulkan/shaders/         *.comp GLSL sources, compiled to SPIR-V at build time and embedded
+vulkan/tools/           vulkan_check (device list, checks, timing), probe.py
 ```
+
+It stays outside `src/` while it is standalone, because the engine's build globs that directory. Integration moves it behind
+`MOSSINFER_VULKAN`.
 
 - **Shaders**: GLSL 4.60 + `GL_KHR_cooperative_matrix` + `GL_EXT_shader_16bit_storage`/`8bit_storage` +
   `GL_EXT_shader_explicit_arithmetic_types_*` + `GL_KHR_shader_subgroup_*`, compiled by `glslc` to SPIR-V at build time
@@ -205,8 +206,8 @@ of A. N is a multiple of 64 in every engine GEMM.
 
 | Milestone | Deliverable | Acceptance | Estimate |
 |---|---|---|---|
-| **V0** | Probe tool + GEMM microbenchmark (`tools/vulkan_gemm`); done for the GEMM | GEMM correct and measured at the engine's shapes against cuBLASLt | done |
-| **V1** | Vulkan runtime (device, allocator, commands, pipeline cache) + f16 GEMM, shared-memory tiles and a plain compute path | GEMM cosine ≥ 0.9999 at engine shapes, on a device without cooperative matrices too | 1–2 weeks |
+| **V0** | Probe tool + GEMM microbenchmark; done | GEMM correct and measured at the engine's shapes against cuBLASLt | done |
+| **V1** | Vulkan runtime + f16 GEMM with shared-memory tiles and a plain compute path; done, except the suballocator and pipeline cache, which wait until the block runner needs them | Checks at engine shapes on a device without the fast path too | done |
 | **V2** | Attention + norm/RoPE/SiTU kernels; DiT block runner on real weights | Block output matches CUDA block (cosine ≥ 0.999) | 1–2 weeks |
 | **V3** | Text encoder (GEMM, RMSNorm, RoPE, causal attention, GDN) and VAE decoder | Encode/decode parity; first full Vulkan image | 2–3 weeks |
 | **V4** | Pipeline integration (runtime abstraction, planner, streaming, CLI/server) | `moss-infer --backend vulkan` and `moss-server` produce images on the 2080 | 2–4 weeks |

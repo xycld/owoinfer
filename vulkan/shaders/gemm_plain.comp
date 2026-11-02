@@ -1,0 +1,47 @@
+// C[M,N] = A[M,K] * B[N,K]^T without cooperative matrices, for any device with buffer device addresses and 64-bit
+// integers: 16-bit inputs (f16, or bf16 when INPUT_BF16 is set), f32 accumulate, f32 output. A and B are row-major with
+// strides lda and ldb, both multiples of 4; C has stride ldc. M and N are free, K is a multiple of 4.
+//
+// Inputs are read as 32-bit words, so the shader needs neither 16-bit storage nor 16-bit arithmetic, and it does not
+// depend on the subgroup size. Each invocation computes one output element of an 8x8 tile.
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const bool INPUT_BF16 = false;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uvec2 d[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32 { float d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t a;
+  uint64_t b;
+  uint64_t c;
+  uint M;
+  uint N;
+  uint K;
+  uint lda;
+  uint ldb;
+  uint ldc;
+} pc;
+
+const uint TILE = 8u;
+
+vec4 decode(uvec2 words) {
+  if (INPUT_BF16) {
+    return uintBitsToFloat(uvec4(words.x << 16, words.x & 0xffff0000u, words.y << 16, words.y & 0xffff0000u));
+  }
+  return vec4(unpackHalf2x16(words.x), unpackHalf2x16(words.y));
+}
+
+void main() {
+  const uint m = gl_WorkGroupID.y * TILE + gl_LocalInvocationIndex / TILE;
+  const uint n = gl_WorkGroupID.x * TILE + gl_LocalInvocationIndex % TILE;
+  if (m >= pc.M || n >= pc.N) return;
+  Words A = Words(pc.a + (uint64_t(m) * pc.lda) * 2ul);
+  Words B = Words(pc.b + (uint64_t(n) * pc.ldb) * 2ul);
+  float sum = 0.0;
+  for (uint i = 0u; i < pc.K / 4u; ++i) sum += dot(decode(A.d[i]), decode(B.d[i]));
+  F32(pc.c + (uint64_t(m) * pc.ldc + n) * 4ul).d[0] = sum;
+}

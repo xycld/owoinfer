@@ -130,26 +130,16 @@ attention remains the bottleneck. It is the closest prior art to what MossInfer 
 
 ## Performance model
 
-Measured on an RTX 4090 Laptop, same GPU and session, with the fragment-from-global-memory kernel in `tools/vulkan_gemm`:
-
-| Shape (M x N x K) | Vulkan | cuBLASLt (f16, f32 compute) | Ratio |
-|---|---:|---:|---:|
-| 8222 x 9216 x 3072 (DiT QKV) | 20.1 TFLOPS | 52.6 | 38 % |
-| 8222 x 3072 x 3072 (DiT projection) | 31.1 | 57.4 | 54 % |
-| 8222 x 16384 x 3072 (DiT up/gate) | 19.7 | 45.5 | 43 % |
-| 8222 x 3072 x 8192 (DiT down) | 13.5 | 70.1 | 19 % |
-| 282 x 12288 x 4096 (text encoder) | 25.0 | 59.5 | 42 % |
-| 282 x 4096 x 12288 (text encoder) | 12.7 | 52.2 | 24 % |
-
-The large-K shapes suffer most, which fits the kernel's strided global loads. These are NVIDIA numbers: they show the
-kernel works and where it loses time, not how a fallback device will perform. CUDA stays the path wherever it runs.
+Measured on an RTX 4090 Laptop against cuBLASLt on the same GPU. See [`vulkan/README.md`](../vulkan/README.md) for the table:
+the cooperative-matrix GEMM reaches 35-58 % of cuBLASLt at the engine's shapes, and the plain compute path 1-1.6 TFLOPS.
+These are NVIDIA numbers: they show the kernels work and where they lose time, not how a fallback device will perform.
 
 For scale, `docs/sm75.md` measures CUDA on an RTX 2080 Ti at 256x256: 0.175 s per step in `reference`, 0.091 s in `high`
 (INT8) and 0.103 s in `turbo` (INT4).
 
 The critical unknowns to measure in a prototype (M0):
 
-1. Cooperative-matrix GEMM throughput at the engine's shapes: measured above, without shared-memory tiles.
+1. Cooperative-matrix GEMM throughput at the engine's shapes: measured above.
 2. Dispatch overhead per kernel (engine runs ~20–40 dispatches per block; command-buffer batching must keep the CPU
    cost per step below the GPU cost).
 3. Attention throughput (fp16 QK^T + softmax + PV, 4096-token joint attention at 1024²).
