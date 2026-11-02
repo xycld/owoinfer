@@ -63,7 +63,8 @@ constexpr const char* kUsage =
     "`moss-infer check` takes the same options (-o optional): it checks them and plans the request as generate would,\n"
     "without loading weights or writing anything, and prints the verdict as JSON (exit 0 accepted, 1 refused).\n"
     "--backend vulkan (builds with -DMOSSINFER_VULKAN=ON) runs on Vulkan instead of CUDA, for GPUs the CUDA engine does\n"
-    "not support: txt2img with the bf16 model files and the official sampler and schedule only, much slower than CUDA.\n"
+    "not support: txt2img at --tier reference with the bf16 model files and the official sampler and schedule only, much\n"
+    "slower than CUDA.\n"
     "--vulkan-device picks a device (default: the first usable one, discrete first); --vulkan-kernels picks the bf16\n"
     "cooperative-matrix kernels or the plain ones (default: coop where the device has them). Both are reported.\n"
     "Flags override values read from --params. At least one of -o / --latent-out is required;\n"
@@ -614,12 +615,17 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
     // CUDA-only settings are refused rather than ignored.
     for (const char* f : {"--mode", "--vram-budget", "--vram-reserve", "--host-ram-budget", "--cache-dir", "--then-prompt",
                           "--direct-io", "--buffered-io", "--te-host-pin", "--cert-dir", "--dit-blocks", "--dit", "--te",
-                          "--vae", "--preview", "--tier", "--attention", "--json-report", "--time-embedding", "--distill",
+                          "--vae", "--preview", "--attention", "--json-report", "--time-embedding", "--distill",
                           "--lora-placement"}) {
       if (given(f)) {
         std::cerr << "moss-infer generate: " << f << " is not supported with --backend vulkan\n";
         return 2;
       }
+    }
+    // The backend runs the bf16 model files exactly as the reference tier does; the lossy tiers need the CUDA kernels.
+    if (options.tier != planner::Tier::kReference) {
+      std::cerr << "moss-infer generate: --backend vulkan runs --tier reference only\n";
+      return 2;
     }
     try {
       vulkan.out_png = out_png;
