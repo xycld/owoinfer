@@ -37,6 +37,9 @@ endforeach()
 
 add_library(mossinfer_vulkan STATIC vk_api.cpp runtime.cpp gemm.cpp block.cpp dit.cpp safetensors.cpp ${_spirv_files})
 target_include_directories(mossinfer_vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${_spirv_dir})
+# Hidden symbols: vk_api.cpp defines data objects named like the Vulkan entry points, which a shared library must not
+# export (they would interpose with a loader in the same process).
+set_target_properties(mossinfer_vulkan PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
 # Headers only: vk_api.cpp opens the loader at run time, so nothing links against it.
 find_package(Threads REQUIRED)
 target_link_libraries(mossinfer_vulkan PUBLIC Vulkan::Headers Threads::Threads ${CMAKE_DL_LIBS})

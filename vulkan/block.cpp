@@ -1,5 +1,6 @@
 #include "block.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -180,7 +181,8 @@ namespace {
 void dispatch_elementwise(const Pipeline& p, VkCommandBuffer cb, const ElementwisePush& push) {
   require(push.n % 4 == 0, "elementwise: n must be a multiple of 4");
   if (push.n == 0) return;
-  p.dispatch(cb, &push, (push.n / 4 + 63) / 64, 1);
+  const std::uint32_t groups = (push.n / 4 + 63) / 64, x = std::min<std::uint32_t>(groups, 65535);
+  p.dispatch(cb, &push, x, (groups + x - 1) / x);
   compute_barrier(cb);
 }
 }  // namespace

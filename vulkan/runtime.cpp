@@ -85,6 +85,14 @@ std::string why_no_coop_base(VkPhysicalDevice physical, const VkPhysicalDevicePr
            std::to_string(p13.maxSubgroupSize) + ")";
   }
   if (p13.maxComputeWorkgroupSubgroups < kCoopSubgroupsPerWorkgroup) return "needs 8 subgroups per workgroup";
+  VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+  VkPhysicalDeviceProperties2 sp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
+  vkGetPhysicalDeviceProperties2(physical, &sp);
+  constexpr VkSubgroupFeatureFlags kNeeded =
+      VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
+  if ((subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0 || (subgroup.supportedOperations & kNeeded) != kNeeded) {
+    return "no compute subgroup vote and shuffle operations";
+  }
   return {};
 }
 
@@ -155,6 +163,16 @@ DeviceInfo describe(VkInstance instance, VkPhysicalDevice physical, std::uint32_
   info.device_id = properties.deviceID;
   info.discrete = properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
   info.caps.shared_memory_bytes = properties.limits.maxComputeSharedMemorySize;
+  {
+    VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+    if (properties.apiVersion >= VK_API_VERSION_1_3) p11.pNext = &p13;
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p11};
+    if (properties.apiVersion >= VK_API_VERSION_1_2) vkGetPhysicalDeviceProperties2(physical, &p2);
+    info.caps.max_allocation_bytes = p11.maxMemoryAllocationSize;
+    // Before Vulkan 1.3 the limit is not reported; the allocation limit bounds a buffer here anyway.
+    info.caps.max_buffer_bytes = properties.apiVersion >= VK_API_VERSION_1_3 ? p13.maxBufferSize : p11.maxMemoryAllocationSize;
+  }
   if (properties.apiVersion < VK_API_VERSION_1_2) {
     info.unusable_reason = "needs Vulkan 1.2";
     return info;
@@ -180,8 +198,14 @@ std::vector<DeviceInfo> list_devices() {
 }
 
 Device::Device(int index) {
+  if (index < -1) throw std::runtime_error("Vulkan device index " + std::to_string(index) + " is negative");
   instance_ = create_instance();
   const std::vector<VkPhysicalDevice> devices = physical_devices(instance_);
+  if (index >= 0 && static_cast<std::size_t>(index) >= devices.size()) {
+    const std::size_t count = devices.size();
+    vkDestroyInstance(instance_, nullptr);
+    throw std::runtime_error("no Vulkan device " + std::to_string(index) + ": there are " + std::to_string(count));
+  }
   bool chosen = false;
   for (std::uint32_t i = 0; i < devices.size(); ++i) {
     DeviceInfo candidate = describe(instance_, devices[i], i);
@@ -333,9 +357,14 @@ void Device::run(const std::function<void(VkCommandBuffer)>& record) {
   check(vkAllocateCommandBuffers(device_, &allocate, &cb), "vkAllocateCommandBuffers");
   VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  check(vkBeginCommandBuffer(cb, &begin), "vkBeginCommandBuffer");
-  record(cb);
-  check(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
+  try {
+    check(vkBeginCommandBuffer(cb, &begin), "vkBeginCommandBuffer");
+    record(cb);
+    check(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
+  } catch (...) {
+    vkFreeCommandBuffers(device_, pool_, 1, &cb);  // an op's argument check threw while recording
+    throw;
+  }
   VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   submit.commandBufferCount = 1;
   submit.pCommandBuffers = &cb;
@@ -360,6 +389,13 @@ void Device::run(const std::function<void(VkCommandBuffer)>& record) {
 }
 
 Buffer::Buffer(Device& device, VkDeviceSize bytes, Kind kind, bool transfer) : device_(device), bytes_(bytes) {
+  const Capabilities& caps = device.info().caps;
+  if ((caps.max_buffer_bytes != 0 && bytes > caps.max_buffer_bytes) ||
+      (caps.max_allocation_bytes != 0 && bytes > caps.max_allocation_bytes)) {
+    throw std::runtime_error("a buffer of " + std::to_string(bytes >> 20) + " MiB exceeds " + device.info().name +
+                             "'s largest buffer or allocation (" +
+                             std::to_string(std::min(caps.max_buffer_bytes, caps.max_allocation_bytes) >> 20) + " MiB)");
+  }
   const bool on_device = kind == Kind::kDevice;
   VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   info.size = bytes;

@@ -188,6 +188,8 @@ void main() {
     smem[sp + frow * P_ROW + half_ * 2u] = uvec4(p_bits[0], p_bits[1], p_bits[2], p_bits[3]);
     smem[sp + frow * P_ROW + half_ * 2u + 1u] = uvec4(p_bits[4], p_bits[5], p_bits[6], p_bits[7]);
 
+    // Every lane has read S from the staging before the rescale overwrites it.
+    sync_subgroup();
     // acc_o *= rescale, through the staging two fragments at a time, when some row's maximum grew.
     if (subgroupAny(rescale != 1.0)) {
       [[unroll]] for (uint pair = 0u; pair < 4u; ++pair) {

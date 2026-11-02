@@ -12,6 +12,7 @@
 // submit runs long enough to trip a display driver's watchdog.
 #pragma once
 
+#include <filesystem>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -65,8 +66,8 @@ class TextEncoder {
  public:
   // `dir`: the text_encoder directory, with model.safetensors.index.json and its shards. The default path is the
   // cooperative-matrix one where the device has bf16 fragments.
-  TextEncoder(Device& device, const std::string& dir);
-  TextEncoder(Device& device, const std::string& dir, BlockPath path, TextEncoderOptions options = {});
+  TextEncoder(Device& device, const std::filesystem::path& dir);
+  TextEncoder(Device& device, const std::filesystem::path& dir, BlockPath path, TextEncoderOptions options = {});
   ~TextEncoder();
   TextEncoder(const TextEncoder&) = delete;
   TextEncoder& operator=(const TextEncoder&) = delete;

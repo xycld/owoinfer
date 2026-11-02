@@ -22,12 +22,12 @@ struct TensorInfo {
 
 class File {
  public:
-  explicit File(const std::string& path);
+  explicit File(const std::filesystem::path& path);  // opened by its wide name on Windows
   ~File();
   File(const File&) = delete;
   File& operator=(const File&) = delete;
 
-  const std::string& path() const { return path_; }
+  const std::string& path() const { return path_; }  // UTF-8, for messages
   const std::vector<TensorInfo>& tensors() const { return tensors_; }
   const TensorInfo* find(const std::string& name) const;  // null if absent
   const TensorInfo& at(const std::string& name) const;    // throws if absent
@@ -46,7 +46,7 @@ class File {
 };
 
 // model.safetensors.index.json's weight_map: tensor name -> shard file name (relative to the index's directory).
-std::map<std::string, std::string> read_index(const std::string& path);
+std::map<std::string, std::string> read_index(const std::filesystem::path& path);
 
 // The tensors of one file, or of every shard of a model directory, by name.
 class Index {

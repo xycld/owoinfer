@@ -47,7 +47,7 @@ void check_supported(const pipeline::Request& req) {
 
 bool vulkan_backend_built() { return true; }
 
-std::vector<float> run_vulkan_generate(const pipeline::Request& req, const VulkanRun& run) {
+void run_vulkan_generate(const pipeline::Request& req, const VulkanRun& run) {
   check_supported(req);
   if (!run.kernels.empty() && run.kernels != "coop" && run.kernels != "plain") {
     throw std::invalid_argument("--vulkan-kernels takes coop or plain");
@@ -105,7 +105,14 @@ std::vector<float> run_vulkan_generate(const pipeline::Request& req, const Vulka
     };
   }
 
-  const vk::GenerateResult r = vk::generate(device, path, g);
+  g.decode = !run.out_png.empty();
+  g.on_latents = run.on_latents;
+  vk::GenerateResult r;
+  try {
+    r = vk::generate(device, path, g);
+  } catch (const std::invalid_argument& e) {
+    throw std::runtime_error(e.what());  // an internal check, not a usage error: the request was checked above
+  }
   if (!run.out_png.empty()) {
     std::vector<pipeline::PngText> text;
     if (req.save_metadata) {
@@ -133,14 +140,13 @@ std::vector<float> run_vulkan_generate(const pipeline::Request& req, const Vulka
                  static_cast<unsigned long long>(seed), r.text_encoder_s, r.dit_load_s, r.denoise_s,
                  r.denoise_s / static_cast<double>(g.timesteps.size()), r.vae_s);
   }
-  return r.latents;
 }
 
 #else
 
 bool vulkan_backend_built() { return false; }
 
-std::vector<float> run_vulkan_generate(const pipeline::Request& req, const VulkanRun&) {
+void run_vulkan_generate(const pipeline::Request& req, const VulkanRun&) {
   check_supported(req);
   throw std::runtime_error("this build has no Vulkan backend (configure with -DMOSSINFER_VULKAN=ON)");
 }

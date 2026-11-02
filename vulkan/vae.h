@@ -21,6 +21,7 @@
 // that runs in bands of output rows, each its own submit), so no single submit runs long on a slow GPU.
 #pragma once
 
+#include <filesystem>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -115,8 +116,8 @@ class VaeDecoder {
   // Loads the decoder ("decoder.*", "post_quant_conv.*") and the latent statistics ("bn.running_mean", "bn.running_var")
   // from a FLUX.2 VAE safetensors file in diffusers' naming, fp32 or bf16. The widths come from the weights' shapes
   // (decoder_block_out_channels c, 2c, 4c, 4c).
-  VaeDecoder(Device& device, const std::string& safetensors_path);
-  VaeDecoder(Device& device, const std::string& safetensors_path, VaePath path);
+  VaeDecoder(Device& device, const std::filesystem::path& safetensors_path);
+  VaeDecoder(Device& device, const std::filesystem::path& safetensors_path, VaePath path);
   ~VaeDecoder();
   VaeDecoder(const VaeDecoder&) = delete;
   VaeDecoder& operator=(const VaeDecoder&) = delete;
@@ -126,6 +127,8 @@ class VaeDecoder {
   std::uint64_t weight_bytes() const;
   // Device bytes decode() allocates for an h x w latent grid.
   std::uint64_t workspace_bytes(std::uint32_t h, std::uint32_t w) const;
+  // The largest single buffer of that workspace (each ping-pong region).
+  std::uint64_t largest_buffer_bytes(std::uint32_t h, std::uint32_t w) const;
   void set_max_macs_per_submit(std::uint64_t macs) { max_macs_ = macs; }
   // Every op in its own submit, timed (VaeDecodeStats::profile): slower, for finding where time goes.
   void set_profile(bool on) { profile_ = on; }

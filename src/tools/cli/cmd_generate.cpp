@@ -630,8 +630,12 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
     try {
       vulkan.out_png = out_png;
       vulkan.quiet = quiet;
-      const std::vector<float> latents = run_vulkan_generate(req, vulkan);
-      if (!out_latent.empty()) write_npy_f32(out_latent, latents, {moss_dit::kLatentChannels, req.height / 16, req.width / 16});
+      if (!out_latent.empty()) {
+        vulkan.on_latents = [&](const std::vector<float>& latents) {
+          write_npy_f32(out_latent, latents, {moss_dit::kLatentChannels, req.height / 16, req.width / 16});
+        };
+      }
+      run_vulkan_generate(req, vulkan);
     } catch (const std::invalid_argument& e) {
       std::cerr << "moss-infer generate: " << e.what() << "\n";
       return 2;

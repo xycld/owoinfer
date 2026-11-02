@@ -25,6 +25,8 @@ struct Capabilities {
   std::string coop_bf16_reason;
   std::uint32_t shared_memory_bytes = 0;
   std::uint32_t min_subgroup = 0, max_subgroup = 0;
+  // The largest single buffer and allocation the device takes (maxBufferSize on Vulkan 1.3, maxMemoryAllocationSize).
+  std::uint64_t max_buffer_bytes = 0, max_allocation_bytes = 0;
 };
 
 struct DeviceInfo {

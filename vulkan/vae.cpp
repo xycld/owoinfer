@@ -385,15 +385,15 @@ void relocate(Resnet& r, VkDeviceAddress base) {
 
 }  // namespace
 
-VaeDecoder::VaeDecoder(Device& device, const std::string& path)
+VaeDecoder::VaeDecoder(Device& device, const std::filesystem::path& path)
     : VaeDecoder(device, path, device.info().caps.coop_bf16 ? VaePath::kCoop : VaePath::kPlain) {}
 
-VaeDecoder::VaeDecoder(Device& device, const std::string& path, VaePath vae_path)
+VaeDecoder::VaeDecoder(Device& device, const std::filesystem::path& path, VaePath vae_path)
     : device_(device), kernels_(std::make_unique<VaeKernels>(device, vae_path)), weights_(std::make_unique<Weights>()) {
   st::File file(path);
   const st::TensorInfo* conv_in = file.find("decoder.conv_in.weight");
   if (conv_in == nullptr || conv_in->shape.size() != 4 || conv_in->shape[0] % 4 != 0 || conv_in->shape[1] != 32) {
-    throw std::runtime_error("vulkan vae: " + path + " has no FLUX.2 decoder.conv_in.weight [4c, 32, 3, 3]");
+    throw std::runtime_error("vulkan vae: " + file.path() + " has no FLUX.2 decoder.conv_in.weight [4c, 32, 3, 3]");
   }
   base_ = static_cast<int>(conv_in->shape[0] / 4);
   require(base_ % 32 == 0, "decoder widths must be multiples of 32");
@@ -688,6 +688,10 @@ class Run {
 
 std::uint64_t VaeDecoder::workspace_bytes(std::uint32_t h, std::uint32_t w) const {
   return layout(static_cast<std::uint32_t>(base_), h, w, max_macs_).total();
+}
+
+std::uint64_t VaeDecoder::largest_buffer_bytes(std::uint32_t h, std::uint32_t w) const {
+  return layout(static_cast<std::uint32_t>(base_), h, w, max_macs_).region;
 }
 
 VaeDecodeStats VaeDecoder::decode(const float* latents, std::uint32_t h, std::uint32_t w, std::vector<std::uint8_t>& rgb,

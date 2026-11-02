@@ -211,6 +211,11 @@ std::uint64_t dtype_bytes(const std::string& dtype) {
 std::mutex g_read_mutex;  // _lseeki64 + _read share the descriptor's position
 #endif
 
+std::string utf8(const std::filesystem::path& p) {
+  const std::u8string u = p.u8string();
+  return std::string(u.begin(), u.end());
+}
+
 void read_at(int fd, void* dst, std::uint64_t offset, std::uint64_t bytes, const std::string& path) {
   auto* out = static_cast<char*>(dst);
   while (bytes > 0) {
@@ -240,11 +245,12 @@ void close_fd(int fd) {
 
 }  // namespace
 
-File::File(const std::string& path) : path_(path) {
+File::File(const std::filesystem::path& file) : path_(utf8(file)) {
+  const std::string& path = path_;
 #ifdef _WIN32
-  fd_ = _open(path.c_str(), _O_RDONLY | _O_BINARY);
+  fd_ = _wopen(file.c_str(), _O_RDONLY | _O_BINARY);
 #else
-  fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  fd_ = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
 #endif
   if (fd_ < 0) fail("cannot open " + path);
   try {
@@ -309,8 +315,9 @@ void File::read(const TensorInfo& t, void* dst, std::uint64_t rel, std::uint64_t
   read_at(fd_, dst, t.offset + rel, bytes, path_);
 }
 
-std::map<std::string, std::string> read_index(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
+std::map<std::string, std::string> read_index(const std::filesystem::path& file) {
+  const std::string path = utf8(file);
+  std::ifstream in(file, std::ios::binary);
   if (!in) fail("cannot open " + path);
   std::ostringstream ss;
   ss << in.rdbuf();
@@ -348,11 +355,11 @@ std::vector<float> File::read_f32(const std::string& name) const {
 
 Index::Index(const std::filesystem::path& path) {
   const auto add = [&](const std::filesystem::path& file) {
-    files_.push_back(std::make_unique<File>(file.string()));
+    files_.push_back(std::make_unique<File>(file));
     const File& f = *files_.back();
     for (const TensorInfo& t : f.tensors()) {
       if (!tensors_.emplace(t.name, std::make_pair(&f, &t)).second) {
-        throw std::runtime_error("safetensors: " + t.name + " appears in more than one file under " + path.string());
+        throw std::runtime_error("safetensors: " + t.name + " appears in more than one file under " + utf8(path));
       }
     }
   };
@@ -362,20 +369,20 @@ Index::Index(const std::filesystem::path& path) {
   }
   std::vector<std::filesystem::path> indexes, files;
   for (const auto& entry : std::filesystem::directory_iterator(path)) {
-    const std::string name = entry.path().filename().string();
+    const std::string name = utf8(entry.path().filename());
     if (name.ends_with(".safetensors.index.json")) indexes.push_back(entry.path());
     else if (name.ends_with(".safetensors")) files.push_back(entry.path());
   }
-  if (indexes.size() > 1) throw std::runtime_error("safetensors: " + path.string() + " holds more than one index file");
+  if (indexes.size() > 1) throw std::runtime_error("safetensors: " + utf8(path) + " holds more than one index file");
   if (indexes.empty()) {
     if (files.size() != 1) {
-      throw std::runtime_error("safetensors: " + path.string() + " holds no index file and not exactly one .safetensors file");
+      throw std::runtime_error("safetensors: " + utf8(path) + " holds no index file and not exactly one .safetensors file");
     }
     add(files.front());
     return;
   }
   std::map<std::string, bool> shards;
-  const std::map<std::string, std::string> weight_map = read_index(indexes.front().string());
+  const std::map<std::string, std::string> weight_map = read_index(indexes.front());
   for (const auto& [name, shard] : weight_map) shards[shard] = true;
   for (const auto& [shard, unused] : shards) add(path / shard);
   for (const auto& [name, shard] : weight_map) {

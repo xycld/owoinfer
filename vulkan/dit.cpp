@@ -169,9 +169,14 @@ Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::pat
 }
 
 Dit::~Dit() {
-  // Copies still in flight read host buffers this destructor frees.
+  // Copies still in flight read host buffers this destructor frees. A lost device fails the wait; nothing is in flight
+  // then.
   for (Slot& s : slot_state_) {
-    if (s.ticket != 0) device_.host_wait(s.ticket);
+    if (s.ticket == 0) continue;
+    try {
+      device_.host_wait(s.ticket);
+    } catch (const std::exception&) {
+    }
   }
 }
 
@@ -394,6 +399,27 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
   });
 
   for (int l = 0; l < kDiTLayers; ++l) {
+    Slot* slot = nullptr;
+    int prefetch_after = -1;
+    if (host_blocks_[static_cast<std::size_t>(l)] != nullptr) {
+      // This block's copy (issued while the previous streamed block ran, or now), waited for on the device by its first
+      // op. The next streamed block's copy goes into the other slot now, on the transfer queue while this block computes;
+      // when it shares this slot (an odd number of streamed blocks wraps around to the first), only after this block.
+      const double t0 = now_ms();
+      issue_copy(l);
+      slot = &slot_state_[slot_of_[static_cast<std::size_t>(l)]];
+      if (!slot->gpu_waited) {
+        device_.gpu_wait(slot->ticket);
+        slot->gpu_waited = true;
+      }
+      prefetch_after = next_streamed(l);
+      if (prefetch_after == l) prefetch_after = -1;
+      if (prefetch_after >= 0 && slot_of_[static_cast<std::size_t>(prefetch_after)] != slot_of_[static_cast<std::size_t>(l)]) {
+        issue_copy(prefetch_after);
+        prefetch_after = -1;
+      }
+      copy_ms += now_ms() - t0;
+    }
     // Each maximal run of consecutive rows that executes block l is one varlen batch over its contiguous tokens.
     for (std::size_t r0 = 0; r0 < rows.size();) {
       if (rows[r0].skip.test(static_cast<std::size_t>(l))) {
@@ -409,32 +435,18 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
       const BlockBuffers b{at(x, off[r0] * kDim * kBf16), y_->address(), qkv_->address(), attn_->address(), ffn_->address(),
                            at(rope, off[r0] * kHead * kBf16), mod_->address(), cu,
                            static_cast<std::uint32_t>(off[r1] - off[r0])};
-      Slot* slot = nullptr;
-      if (host_blocks_[static_cast<std::size_t>(l)] != nullptr) {
-        // This block's copy (issued while the previous streamed block ran, or now), then the next one's into the other
-        // slot, which runs on the transfer queue while this block computes.
-        const double t0 = now_ms();
-        issue_copy(l);
-        slot = &slot_state_[slot_of_[static_cast<std::size_t>(l)]];
-        if (!slot->gpu_waited) {
-          device_.gpu_wait(slot->ticket);
-          slot->gpu_waited = true;
-        }
-        const int next = next_streamed(l);
-        if (next != l) issue_copy(next);
-        copy_ms += now_ms() - t0;
-      }
       for (int op = 0; op < kBlockOps; ++op) {
         const double t0 = now_ms();
         run_block_op(op, blocks_[static_cast<std::size_t>(l)], b);
         op_ms_[static_cast<std::size_t>(op)] += now_ms() - t0;
       }
-      if (slot != nullptr && slot->ticket != 0) {
-        device_.host_wait(slot->ticket);  // completed: the block's first op waited for it on the device
-        slot->ticket = 0;
-      }
       r0 = r1;
     }
+    if (slot != nullptr && slot->ticket != 0) {
+      device_.host_wait(slot->ticket);  // every run of this block has completed (Device::run waits)
+      slot->ticket = 0;
+    }
+    if (prefetch_after >= 0) issue_copy(prefetch_after);  // this block's slot is free now
   }
 
   // Head (P:256-259): final norm with the head modulation (shift = head[0], scale = head[1]), linear, transpose.

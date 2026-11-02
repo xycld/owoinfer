@@ -178,13 +178,13 @@ struct TextEncoder::Impl {
   std::uint64_t layer_bytes = 0;
   TextEncoderStats stats;
 
-  Impl(Device& d, const std::string& dir, BlockPath p, TextEncoderOptions o)
+  Impl(Device& d, const std::filesystem::path& dir, BlockPath p, TextEncoderOptions o)
       : device(d), path(p), options(o), gemm(d, p), te(d) {
-    const std::map<std::string, std::string> index = st::read_index(dir + "/model.safetensors.index.json");
+    const std::map<std::string, std::string> index = st::read_index(dir / "model.safetensors.index.json");
     for (const auto& [name, shard] : index) {
       if (name.rfind("language_model.", 0) != 0) continue;
       auto& file = files[shard];
-      if (!file) file = std::make_unique<st::File>(dir + "/" + shard);
+      if (!file) file = std::make_unique<st::File>(dir / shard);
       tensors[name] = {file.get(), &file->at(name)};
     }
     const auto& e = lookup("language_model.embed_tokens.weight", {kTeVocab, kTeHidden});
@@ -290,10 +290,10 @@ struct TextEncoder::Impl {
   }
 };
 
-TextEncoder::TextEncoder(Device& device, const std::string& dir)
+TextEncoder::TextEncoder(Device& device, const std::filesystem::path& dir)
     : TextEncoder(device, dir, device.info().caps.coop_bf16 ? BlockPath::kCoop : BlockPath::kPlain) {}
 
-TextEncoder::TextEncoder(Device& device, const std::string& dir, BlockPath path, TextEncoderOptions options)
+TextEncoder::TextEncoder(Device& device, const std::filesystem::path& dir, BlockPath path, TextEncoderOptions options)
     : impl_(std::make_unique<Impl>(device, dir, path, options)) {}
 
 TextEncoder::~TextEncoder() = default;

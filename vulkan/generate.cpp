@@ -1,7 +1,9 @@
 #include "generate.h"
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 
 #include "text_encoder.h"
@@ -34,12 +36,35 @@ GenerateResult generate(Device& device, BlockPath path, const GenerateRequest& r
   out.width = r.width;
   out.height = r.height;
 
+  // The VAE first (about 0.1 GiB of weights, kept through the run), so a decode the device cannot hold fails before the
+  // text encoder and the steps run rather than after them.
+  std::optional<VaeDecoder> vae;
+  if (r.decode) {
+    vae.emplace(device, r.model_dir / "vae" / "diffusion_pytorch_model.safetensors",
+                path == BlockPath::kCoop ? VaePath::kCoop : VaePath::kPlain);
+  }
+  if (r.decode) {
+    const Capabilities& caps = device.info().caps;
+    const std::uint64_t need = vae->workspace_bytes(lh, lw), largest = vae->largest_buffer_bytes(lh, lw);
+    const std::uint64_t limit = std::min(caps.max_buffer_bytes, caps.max_allocation_bytes);
+    if (limit != 0 && largest > limit) {
+      throw std::runtime_error("the VAE decode at " + std::to_string(r.width) + "x" + std::to_string(r.height) + " needs a " +
+                               std::to_string(largest >> 20) + " MiB buffer; " + device.info().name + " takes at most " +
+                               std::to_string(limit >> 20) + " MiB");
+    }
+    if (need > device.free_device_memory()) {
+      throw std::runtime_error("the VAE decode at " + std::to_string(r.width) + "x" + std::to_string(r.height) + " needs " +
+                               std::to_string(need >> 20) + " MiB of device memory; " + device.info().name + " has " +
+                               std::to_string(device.free_device_memory() >> 20) + " MiB free");
+    }
+  }
+
   // Text encoder: streamed layer by layer, freed before the DiT loads.
   std::vector<std::vector<std::uint16_t>> embeds;
   {
     double t0 = now_s();
     report("text encoder", 0, 1);
-    TextEncoder encoder(device, (r.model_dir / "text_encoder").string(), path);
+    TextEncoder encoder(device, r.model_dir / "text_encoder", path);
     std::vector<std::vector<std::int32_t>> sequences{r.cond_ids};
     if (cfg) sequences.push_back(r.uncond_ids);
     embeds = encoder.encode(sequences);
@@ -95,13 +120,12 @@ GenerateResult generate(Device& device, BlockPath path, const GenerateRequest& r
     out.latents = std::move(latents);
   }
 
-  // VAE decode.
-  {
+  // VAE decode, after handing the final latents to the caller (a failed decode keeps them).
+  if (r.on_latents) r.on_latents(out.latents);
+  if (r.decode) {
     const double t0 = now_s();
     report("vae", 0, 1);
-    VaeDecoder vae(device, (r.model_dir / "vae" / "diffusion_pytorch_model.safetensors").string(),
-                   path == BlockPath::kCoop ? VaePath::kCoop : VaePath::kPlain);
-    vae.decode(out.latents.data(), lh, lw, out.rgb);
+    vae->decode(out.latents.data(), lh, lw, out.rgb);
     out.vae_s = now_s() - t0;
     report("vae", 1, 1);
   }

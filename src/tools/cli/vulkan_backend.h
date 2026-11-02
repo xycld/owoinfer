@@ -4,6 +4,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -14,16 +15,17 @@ namespace mi::cli {
 struct VulkanRun {
   int device = -1;      // -1: the first usable device, a discrete one first
   std::string kernels;  // "coop", "plain", or empty: coop where the device has bf16 cooperative matrices
-  std::filesystem::path out_png;  // empty: no image written (the decode still runs)
+  std::filesystem::path out_png;  // empty: no decode
   bool quiet = false;
+  // Called with the final latents, f32 [128, height / 16, width / 16], before the decode.
+  std::function<void(const std::vector<float>&)> on_latents;
 };
 
 // Whether this build has the Vulkan backend (MOSSINFER_VULKAN).
 bool vulkan_backend_built();
 
 // Runs txt2img for `req` (already validated) on Vulkan and writes the PNG. Throws std::invalid_argument for a request the
-// backend does not support (it names the option), std::runtime_error for a device or model failure. Returns the final
-// latents, f32 [128, height / 16, width / 16].
-std::vector<float> run_vulkan_generate(const pipeline::Request& req, const VulkanRun& run);
+// backend does not support (it names the option), std::runtime_error for anything else.
+void run_vulkan_generate(const pipeline::Request& req, const VulkanRun& run);
 
 }  // namespace mi::cli
