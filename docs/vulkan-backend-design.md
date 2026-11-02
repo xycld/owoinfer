@@ -208,7 +208,7 @@ of A. N is a multiple of 64 in every engine GEMM.
 |---|---|---|---|
 | **V0** | Probe tool + GEMM microbenchmark; done | GEMM correct and measured at the engine's shapes against cuBLASLt | done |
 | **V1** | Vulkan runtime + f16 GEMM with shared-memory tiles and a plain compute path; done, except the suballocator and pipeline cache, which wait until the block runner needs them | Checks at engine shapes on a device without the fast path too | done |
-| **V2** | Attention + norm/RoPE/SiTU kernels; DiT block runner on real weights | Block output matches CUDA block (cosine ≥ 0.999) | 1–2 weeks |
+| **V2** | Attention + norm/RoPE/SiTU kernels; DiT block runner on real weights; done on the plain compute path | Block output matches the engine's block (cosine ≥ 0.999) | done |
 | **V3** | Text encoder (GEMM, RMSNorm, RoPE, causal attention, GDN) and VAE decoder | Encode/decode parity; first full Vulkan image | 2–3 weeks |
 | **V4** | Pipeline integration (runtime abstraction, planner, streaming, CLI/server) | `moss-infer --backend vulkan` and `moss-server` produce images on the 2080 | 2–4 weeks |
 | **V5** | Quantized paths (INT8/INT4), packaging, CI, docs | `high`/`turbo` tiers on Vulkan; `-vulkan` package; tests in CI | 1–2 weeks |

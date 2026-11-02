@@ -44,3 +44,7 @@ target_link_libraries(vulkan_check PRIVATE mossinfer_vulkan)
 add_executable(vulkan_block_check tools/vulkan_block_check.cpp)
 target_compile_options(vulkan_block_check PRIVATE -ffp-contract=off)
 target_link_libraries(vulkan_block_check PRIVATE mossinfer_vulkan)
+
+# One real block against the engine's captured output.
+add_executable(vulkan_block_real tools/vulkan_block_real.cpp)
+target_link_libraries(vulkan_block_real PRIVATE mossinfer_vulkan)

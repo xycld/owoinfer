@@ -4,7 +4,7 @@ The fallback for hardware the engine does not otherwise support. CUDA stays the 
 standalone project for now: it links no engine code and nothing here affects the engine's build. Design and research:
 [design](../docs/vulkan-backend-design.md), [research](../docs/vulkan-backend-research.md).
 
-What exists is the device runtime and the GEMM. It cannot generate images yet.
+What exists is the device runtime, the GEMM and one DiT block's kernels. It cannot generate images yet: the text encoder, the VAE, the DiT's outer layers and the pipeline are still to come.
 
 ## Build and check
 
@@ -49,6 +49,25 @@ TFLOPS on an RTX 4090 Laptop, driver 615.78, with cuBLASLt (f16 inputs, f32 comp
 Checks pass on that GPU on both paths, and through the plain path on llvmpipe (Mesa's CPU driver, 8-wide subgroups, 32 KiB of
 shared memory), with core validation clean.
 
+## DiT block
+
+`block.h` is the plain compute path of one bf16 DiT block: RMSNorm with modulation, the GEMMs with their gated residual and SiTU-GLU epilogues, QK norm with RoPE, and varlen attention with an online softmax. It has the engine's rounding points and needs no cooperative matrices, 16-bit support or particular subgroup size.
+
+```sh
+build-vulkan/vulkan_block_check            # each kernel against a host replay of its op order, then one block
+build-vulkan/vulkan_block_real DIR         # real blocks against the engine's output, from files captured from its forward
+```
+
+On real weights and activations at the 1024x1024 golden case, against the engine:
+
+| Block | Same bits | p99 scaled ULPs | Max scaled ULPs | Cosine |
+|---:|---:|---:|---:|---:|
+| 1 | 83.98 % | 0.06 | 2.00 | 0.999999977 |
+| 22 | 72.36 % | 0.25 | 4.00 | 0.999999867 |
+| 41 | 69.23 % | 1.00 | 96.00 | 0.999997331 |
+
+Bits differ because fp32 scalar and tensor-core accumulation are not bit-compatible. Known-answer checks pass on an RTX 4090 Laptop and on llvmpipe. One block of 8484 tokens takes about 2 s on that GPU through this path, against 31 ms for the engine, so about 86 s per CFG step at 1024x1024.
+
 ## Numerics
 
 The cooperative-matrix path rounds like the tensor cores: its error matches cuBLASLt on the same data up to K = 1040 and is
@@ -61,7 +80,10 @@ bias.
 |---|---|
 | `runtime.h`, `runtime.cpp` | device selection, capabilities, buffers, pipelines, barriers |
 | `gemm.h`, `gemm.cpp` | path selection, argument checks, dispatch |
+| `block.h`, `block.cpp` | one DiT block's plain compute kernels |
 | `half.h` | host fp16 and bf16 conversions |
 | `shaders/` | compute shaders |
-| `tools/vulkan_check.cpp` | device list, checks, timing |
+| `tools/vulkan_check.cpp` | device list, GEMM checks, timing |
+| `tools/vulkan_block_check.cpp` | the block's kernels against host replays, one block's timing |
+| `tools/vulkan_block_real.cpp` | real blocks against the engine's captured output |
 | `tools/probe.py` | a device's cooperative-matrix shapes and heaps, using only the Vulkan loader (no headers) |
