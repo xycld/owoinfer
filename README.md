@@ -2,7 +2,7 @@
 
 A native C++/CUDA inference engine for the MOSS-Image text-to-image model (5B DiT, Qwen3.5 text encoder, FLUX.2 VAE), with no PyTorch or Python at run time. It plans memory against the GPU it finds and streams the model when it does not fit.
 
-Models: MOSS-Image Base and SFT, in the official folders and common community formats; other models are refused ([supported models](#supported-models)).
+The primary target is the official MOSS-Image Base and SFT models on RTX 30 series and newer GPUs, with an INT8 DiT recommended for everyday use. Other community file formats and older GPUs (Turing, Volta) are supported as secondary targets; other models are refused ([supported models](#supported-models)).
 
 Version 2.1.2. Supported: Linux x86-64 and Windows x64 (MSVC), each with a CUDA 12 and a CUDA 13 build, as a full package and a `-system-cuda` package. Turing (compute capability 7.5, e.g. RTX 2080) is supported by builds configured with `-DMOSSINFER_SM75=ON` (the `windows-msvc-cuda13-sm75` preset packages it): fp16 tensor-core GEMMs replace the bf16 ones, INT8 and INT4 ConvRot files run the INT8 GEMMs, the exact attention and the VAE run sm_75 kernels, all three quality tiers work, and an unset attention resolves to `exact`. See [docs/sm75.md](docs/sm75.md) for what runs, the measured speed on an RTX 2080 Ti and the remaining gaps. Volta (Tesla V100, sm_70) is supported by the CUDA 12 `linux-cuda12-sm70` preset; see [docs/sm70.md](docs/sm70.md) for its kernels, validation and performance. The full support matrix is in [docs/integration.md](docs/integration.md#support-status).
 
@@ -46,10 +46,13 @@ The other presets are `linux-cuda12`, `linux-cuda12-sm70`, `windows-msvc-cuda13`
 
 The engine runs one architecture, MOSS-Image: the 5B DiT, the Qwen3.5-9B text encoder and the FLUX.2 VAE. It identifies a model from its configs and safetensors headers, and refuses anything else with a message naming what it found.
 
+**Primary.** `OpenMOSS-Team/MOSS-Image-Base` and `OpenMOSS-Team/MOSS-Image-SFT` (or the ModelScope copies), and fine-tunes with the same architecture, in bf16 or with an INT8 ConvRot DiT (tier `high`, the everyday choice).
+
+**Secondary.** These also load, on top of the primary models:
+
 | Component | What loads |
 |---|---|
-| Model folder | `OpenMOSS-Team/MOSS-Image-Base` and `OpenMOSS-Team/MOSS-Image-SFT` (or the ModelScope copies), and fine-tunes with the same architecture |
-| DiT file | INT8 ConvRot (tier `high`), INT4 ConvRot (tier `turbo`), NVFP4 (tier `turbo`, RTX 50 only); GGUF Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, BF16 and F16, converted once on first load |
+| DiT file | INT4 ConvRot (tier `turbo`), NVFP4 (tier `turbo`, RTX 50 only); GGUF Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, BF16 and F16, converted once on first load |
 | Text encoder file | INT8 ConvRot, W4A8 GPTQ |
 | VAE file | FLUX.2 VAE, full or small |
 | LoRAs and adapters | PEFT, kohya and LyCORIS LoHa LoRAs, distill LoRAs and bundles, the colour and depth control adapter. Runtime LoRAs and control adapters need Ampere or newer |
