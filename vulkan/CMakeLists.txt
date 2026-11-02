@@ -54,7 +54,7 @@ target_link_libraries(vulkan_block_real PRIVATE mossinfer_vulkan)
 # The FLUX.2 VAE decoder (vae.h): its cooperative-matrix kernel needs Vulkan 1.3, the rest loads on Vulkan 1.2.
 set(_spirv_block ${_spirv_files})
 _mi_add_shader(vae_conv_coop vulkan1.3)
-foreach(shader IN ITEMS vae_conv_plain vae_gn_stats vae_gn_finalize vae_gn_apply vae_softmax vae_transpose
+foreach(shader IN ITEMS vae_conv_plain vae_conv_narrow vae_gn_stats vae_gn_finalize vae_gn_apply vae_softmax vae_transpose
                         vae_latent_unpack vae_rgb8)
   _mi_add_shader(${shader} vulkan1.2)
 endforeach()

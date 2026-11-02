@@ -20,6 +20,9 @@ const std::uint32_t kConvCoopSpirv[] = {
 const std::uint32_t kConvPlainSpirv[] = {
 #include "vae_conv_plain.spv.inc"
 };
+const std::uint32_t kConvNarrowSpirv[] = {
+#include "vae_conv_narrow.spv.inc"
+};
 const std::uint32_t kGnStatsSpirv[] = {
 #include "vae_gn_stats.spv.inc"
 };
@@ -122,7 +125,7 @@ VaeKernels::VaeKernels(Device& device, VaePath path) : device_(device), path_(pa
 VaeKernels::~VaeKernels() = default;
 
 // Coop: outputs at least 64 wide run on bf16 fragments; narrower ones (post_quant_conv's 32, conv_out's 3) on the plain
-// kernel, whose operands then get the same rounding.
+// kernels, whose operands then get the same rounding. Outputs at most 4 wide take the narrow kernel on either path.
 const Pipeline& VaeKernels::conv_pipeline(const ConvArgs& a, VaePrecision precision, std::uint32_t& tile_rows,
                                           std::uint32_t& tile_cols) const {
   const std::uint32_t taps = a.taps, up = a.upsample ? 1 : 0;
@@ -145,14 +148,26 @@ const Pipeline& VaeKernels::conv_pipeline(const ConvArgs& a, VaePrecision precis
     return *p;
   }
   const std::uint32_t tf32 = precision == VaePrecision::kTf32 ? 1 : 0;
-  const std::uint32_t tm = a.n <= 16 ? 8 : 4, tn = a.n <= 16 ? 1 : 4;
-  tile_rows = 16 * tm;
+  if (a.n <= 4) {
+    tile_rows = 256;
+    tile_cols = 4;
+    const std::vector<std::uint32_t> key = {2, taps, up, tf32};
+    auto& p = conv_[key];
+    if (!p) {
+      p = std::make_unique<Pipeline>(device_, kConvNarrowSpirv, sizeof(kConvNarrowSpirv), sizeof(ConvPush), 0,
+                                     std::vector<std::uint32_t>{taps, up, tf32});
+    }
+    return *p;
+  }
+  // The decoder's widths are multiples of 96: tiles 96 wide, others 64.
+  const std::uint32_t tn = a.n % 96 == 0 ? 6 : 4;
+  tile_rows = 128;
   tile_cols = 16 * tn;
-  const std::vector<std::uint32_t> key = {1, taps, up, tf32, tm, tn};
+  const std::vector<std::uint32_t> key = {1, taps, up, tf32, tn};
   auto& p = conv_[key];
   if (!p) {
     p = std::make_unique<Pipeline>(device_, kConvPlainSpirv, sizeof(kConvPlainSpirv), sizeof(ConvPush), 0,
-                                   std::vector<std::uint32_t>{taps, up, tf32, tm, tn});
+                                   std::vector<std::uint32_t>{taps, up, tf32, tn});
   }
   return *p;
 }
@@ -478,11 +493,26 @@ Layout layout(std::uint32_t c, std::uint32_t h, std::uint32_t w, std::uint64_t m
 }
 
 // Groups recorded ops into submits of at most `budget` multiply-adds (elementwise ops count kElementCost per element).
+// With a profile, every op is its own submit and its wall time is added to the profile under the op's name.
 class Submitter {
  public:
   static constexpr std::uint64_t kElementCost = 32;
-  Submitter(Device& device, std::uint64_t budget) : device_(device), budget_(budget) {}
-  void add(std::uint64_t cost, std::function<void(VkCommandBuffer)> op) {
+  Submitter(Device& device, std::uint64_t budget, std::vector<std::pair<std::string, double>>* profile)
+      : device_(device), budget_(budget), profile_(profile) {}
+  void add(const std::string& name, std::uint64_t cost, std::function<void(VkCommandBuffer)> op) {
+    if (profile_ != nullptr) {
+      const auto t0 = std::chrono::steady_clock::now();
+      device_.run(op);
+      ++submits_;
+      const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      auto it = std::find_if(profile_->begin(), profile_->end(), [&](const auto& e) { return e.first == name; });
+      if (it == profile_->end()) {
+        profile_->emplace_back(name, s);
+      } else {
+        it->second += s;
+      }
+      return;
+    }
     if (!ops_.empty() && cost_ + cost > budget_) flush();
     ops_.push_back(std::move(op));
     cost_ += cost;
@@ -501,10 +531,13 @@ class Submitter {
  private:
   Device& device_;
   std::uint64_t budget_;
+  std::vector<std::pair<std::string, double>>* profile_;
   std::vector<std::function<void(VkCommandBuffer)>> ops_;
   std::uint64_t cost_ = 0;
   int submits_ = 0;
 };
+
+std::string dims(std::uint32_t h, std::uint32_t w) { return " @" + std::to_string(h) + "x" + std::to_string(w); }
 
 class Run {
  public:
@@ -512,15 +545,17 @@ class Run {
       : k_(k), s_(s), max_macs_(max_macs), part_(part), stats_(stats) {}
 
   // A convolution or GEMM in bands of output rows, each at most max_macs multiply-adds (at least one row tile).
-  void gemm(ConvArgs a, VaePrecision precision) {
+  void gemm(const std::string& name, ConvArgs a, VaePrecision precision) {
     const std::uint64_t per_row = static_cast<std::uint64_t>(a.n) * a.k;
-    const std::uint64_t rows = std::max<std::uint64_t>(VaeKernels::kRowAlign, max_macs_ / per_row / VaeKernels::kRowAlign *
-                                                                                 VaeKernels::kRowAlign);
+    // 65535 row tiles of 128 is what one dispatch addresses.
+    const std::uint64_t rows = std::min<std::uint64_t>(
+        65535ull * VaeKernels::kRowAlign,
+        std::max<std::uint64_t>(VaeKernels::kRowAlign, max_macs_ / per_row / VaeKernels::kRowAlign * VaeKernels::kRowAlign));
     const std::uint32_t end = a.m;
     for (std::uint64_t m0 = a.m0; m0 < end; m0 += rows) {
       a.m0 = static_cast<std::uint32_t>(m0);
       a.m = static_cast<std::uint32_t>(std::min<std::uint64_t>(end, m0 + rows));
-      s_.add((a.m - a.m0) * per_row, [this, a, precision](VkCommandBuffer cb) { k_.record_conv(cb, a, precision); });
+      s_.add(name, (a.m - a.m0) * per_row, [this, a, precision](VkCommandBuffer cb) { k_.record_conv(cb, a, precision); });
     }
   }
   void conv(const Conv& cv, VkDeviceAddress x, std::uint32_t h, std::uint32_t w, VkDeviceAddress y,
@@ -542,12 +577,15 @@ class Run {
     a.w = w;
     a.c = cv.c;
     a.b_bf16 = cv.bf16;
-    gemm(a, VaePrecision::kTf32);
+    const std::string name = "conv " + std::to_string(cv.r) + "x" + std::to_string(cv.r) + " " + std::to_string(cv.c) + "->" +
+                             std::to_string(cv.k) + (upsample ? " upsampled" : "") + dims(h, w);
+    gemm(name, a, VaePrecision::kTf32);
   }
   void norm(const Norm& n, VkDeviceAddress x, std::uint32_t pixels, VkDeviceAddress y, bool silu) {
     const std::uint64_t cost = static_cast<std::uint64_t>(pixels) * n.c * Submitter::kElementCost;
-    s_.add(cost, [this, x, pixels, c = n.c](VkCommandBuffer cb) { k_.record_gn_stats(cb, x, pixels, c, part_, stats_, kResnetEps); });
-    s_.add(cost, [this, n, x, y, pixels, silu](VkCommandBuffer cb) {
+    const std::string shape = " " + std::to_string(n.c) + " ch, " + std::to_string(pixels) + " px";
+    s_.add("group_norm stats" + shape, cost, [this, x, pixels, c = n.c](VkCommandBuffer cb) { k_.record_gn_stats(cb, x, pixels, c, part_, stats_, kResnetEps); });
+    s_.add(std::string(silu ? "group_norm+silu apply" : "group_norm apply") + shape, cost, [this, n, x, y, pixels, silu](VkCommandBuffer cb) {
       k_.record_gn_apply(cb, x, y, pixels, n.c, stats_, n.gamma, n.beta, silu);
     });
   }
@@ -588,8 +626,8 @@ class Run {
     p.ldb = mid;
     p.ldo = 3 * mid;
     p.b_bf16 = w.qkv.bf16;
-    gemm(p, VaePrecision::kFp32);
-    s_.add(static_cast<std::uint64_t>(l_tokens) * mid * Submitter::kElementCost, [this, qkv, vt, l_tokens, mid](VkCommandBuffer cb) {
+    gemm("attention qkv", p, VaePrecision::kFp32);
+    s_.add("attention transpose V", static_cast<std::uint64_t>(l_tokens) * mid * Submitter::kElementCost, [this, qkv, vt, l_tokens, mid](VkCommandBuffer cb) {
       k_.record_transpose(cb, qkv + 2ull * mid * 4, vt, l_tokens, mid, 3 * mid, l_tokens);
     });
     // SDPA's scale as the engine forms it: 1 / sqrt(E) in fp32.
@@ -607,8 +645,8 @@ class Run {
       s.lda = 3 * mid;
       s.ldb = 3 * mid;
       s.ldo = l_tokens;
-      gemm(s, VaePrecision::kSplit16);
-      s_.add(static_cast<std::uint64_t>(rows) * l_tokens * Submitter::kElementCost,
+      gemm("attention scores", s, VaePrecision::kSplit16);
+      s_.add("attention softmax", static_cast<std::uint64_t>(rows) * l_tokens * Submitter::kElementCost,
              [this, scores, rows, l_tokens, scale](VkCommandBuffer cb) { k_.record_softmax(cb, scores, rows, l_tokens, l_tokens, scale); });
       ConvArgs pv;
       pv.a = scores;
@@ -620,7 +658,7 @@ class Run {
       pv.lda = l_tokens;
       pv.ldb = l_tokens;
       pv.ldo = mid;
-      gemm(pv, VaePrecision::kSplit16);
+      gemm("attention P V", pv, VaePrecision::kSplit16);
     }
     // Reference order: round(to_out(o) + bias), then + residual.
     ConvArgs out;
@@ -636,7 +674,7 @@ class Run {
     out.ldb = mid;
     out.ldo = mid;
     out.b_bf16 = w.attn_out.bf16;
-    gemm(out, VaePrecision::kFp32);
+    gemm("attention out", out, VaePrecision::kFp32);
   }
 
  private:
@@ -666,13 +704,14 @@ VaeDecodeStats VaeDecoder::decode(const float* latents, std::uint32_t h, std::ui
   const std::uint64_t half = l.region / 2;
   const Weights& wt = *weights_;
 
-  Submitter sub(device_, max_macs_);
+  VaeDecodeStats st;
+  Submitter sub(device_, max_macs_, profile_ ? &st.profile : nullptr);
   Run run(*kernels_, sub, max_macs_, part, stats);
   VkDeviceAddress p = r0.address(), q = r1.address();
 
   // Head at H/8: unpack, post_quant_conv, conv_in, mid resnet 0, mid attention.
   const VkDeviceAddress unpacked = q, pq = q + half;
-  sub.add(128ull * h * w * Submitter::kElementCost, [&, unpacked](VkCommandBuffer cb) {
+  sub.add("latent unpack", 128ull * h * w * Submitter::kElementCost, [&, unpacked](VkCommandBuffer cb) {
     kernels_->record_latent_unpack(cb, z.address(), wt.bn_scale, wt.bn_mean, unpacked, h, w);
   });
   run.conv(wt.post_quant, unpacked, hh, ww, pq);
@@ -702,7 +741,7 @@ VaeDecodeStats VaeDecoder::decode(const float* latents, std::uint32_t h, std::ui
   run.norm(wt.norm_out, p, ch * cw, p, true);
   run.conv(wt.conv_out, p, ch, cw, q);
   const std::uint32_t n = H * W * 3;
-  sub.add(static_cast<std::uint64_t>(n) * Submitter::kElementCost,
+  sub.add("rgb8", static_cast<std::uint64_t>(n) * Submitter::kElementCost,
           [&, q, n](VkCommandBuffer cb) { kernels_->record_rgb8(cb, q, out.address(), n); });
   sub.flush();
 
@@ -717,7 +756,6 @@ VaeDecodeStats VaeDecoder::decode(const float* latents, std::uint32_t h, std::ui
     image->resize(n);
     (q == r0.address() ? r0 : r1).download(image->data(), static_cast<std::uint64_t>(n) * 4);
   }
-  VaeDecodeStats st;
   st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   st.device_bytes = l.total();
   st.submits = sub.submits();

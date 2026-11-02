@@ -25,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "runtime.h"
@@ -105,6 +106,8 @@ struct VaeDecodeStats {
   double seconds = 0;              // decode() wall time, uploads and downloads included
   std::uint64_t device_bytes = 0;  // device memory decode() allocated (weights not included)
   int submits = 0;
+  // With set_profile(true): wall seconds per op kind (one submit per op), in order of first use.
+  std::vector<std::pair<std::string, double>> profile;
 };
 
 class VaeDecoder {
@@ -124,6 +127,8 @@ class VaeDecoder {
   // Device bytes decode() allocates for an h x w latent grid.
   std::uint64_t workspace_bytes(std::uint32_t h, std::uint32_t w) const;
   void set_max_macs_per_submit(std::uint64_t macs) { max_macs_ = macs; }
+  // Every op in its own submit, timed (VaeDecodeStats::profile): slower, for finding where time goes.
+  void set_profile(bool on) { profile_ = on; }
 
   // latents: fp32 NCHW [128, h, w], the pipeline's final latents. rgb: resized to 16h x 16w x 3. image: when not null, the
   // decoder's fp32 output [16h, 16w, 3] before the clamp.
@@ -138,6 +143,7 @@ class VaeDecoder {
   std::unique_ptr<Weights> weights_;
   int base_ = 0;
   std::uint64_t max_macs_ = 8ull << 30;
+  bool profile_ = false;
 };
 
 }  // namespace mi::vk

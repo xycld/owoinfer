@@ -6,8 +6,9 @@
 // for an H x W output (UPSAMPLE: read through a nearest 2x upsample of an H/2 x W/2 input), TAPS 0 a row-major A with
 // stride lda; B is row-major [N, K]. K, C, lda and ldb are multiples of 4. M and N are free.
 //
-// 256 invocations as 16 x 16; a workgroup computes a tile of 16 TM rows x 16 TN columns, invocation (x, y) the rows
-// y + 16 i and columns x + 16 j. K walks in steps of 16 through shared memory, the next step loading into registers.
+// 256 invocations as 16 x 16; a workgroup computes a tile of 128 rows x 16 TN columns (TN 4 or 6), invocation (x, y) the
+// rows 8 y .. +8 and columns TN x .. +TN, reading them from shared memory as vectors. K walks in steps of 16 through
+// shared memory; the next step's global loads are issued before the current step's products.
 #version 460
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_GOOGLE_include_directive : require
@@ -17,8 +18,7 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(constant_id = 0) const uint TAPS = 9;
 layout(constant_id = 1) const bool UPSAMPLE = false;
 layout(constant_id = 2) const bool TF32 = true;
-layout(constant_id = 3) const uint TM = 4;  // 1..8
-layout(constant_id = 4) const uint TN = 4;  // 1..4
+layout(constant_id = 3) const uint TN = 6;  // 4 or 6
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer Vec4s { vec4 d[]; };
 
@@ -40,12 +40,14 @@ layout(push_constant) uniform PC {
   uint m0;
 } pc;
 
-const uint BM = 16u * TM;
+const uint TM = 8u;
+const uint BM = 128u;
 const uint BN = 16u * TN;
 const uint BK = 16u;
-// [k][row], rows padded by 4 so the transposed stores of 4 k values spread over banks.
-shared float As[BK * (BM + 4u)];
-shared float Bs[BK * (BN + 4u)];
+const uint LDA_S = BM + 4u;  // floats per k row of the A tile: a multiple of 4, rows offset by 4 banks
+const uint LDB_S = BN + 2u;  // a multiple of 2
+shared vec4 As[BK * LDA_S / 4u];
+shared vec2 Bs[BK * LDB_S / 2u];
 
 float tf32(float v) {
   const uint u = floatBitsToUint(v);
@@ -82,8 +84,20 @@ vec4 load_b(uint n, uint k) {
   return round4(Vec4s(pc.b + (uint64_t(n) * pc.ldb + k) * 4ul).d[0]);
 }
 
-// Chunks of 4 k values: BM * 4 of A (invocation i takes chunks i and i + 256) and BN * 4 <= 256 of B per step.
-const uint A_CHUNKS = (BM * 4u + 255u) / 256u;
+// Chunks of 4 k values of one row: BM * 4 = 512 of A, BN * 4 <= 384 of B; invocation t takes chunks t and t + 256.
+const uint B_CHUNKS = BN * 4u;
+
+void store_a(uint chunk, vec4 v) {
+  const uint row = chunk / 4u, kk = (chunk % 4u) * 4u;
+  // As holds vec4s of 4 consecutive rows: scalar writes go through the vec4's components.
+  const uint at = row / 4u, lane = row % 4u;
+  [[unroll]] for (uint j = 0u; j < 4u; ++j) As[(kk + j) * (LDA_S / 4u) + at][lane] = v[j];
+}
+void store_b(uint chunk, vec4 v) {
+  const uint row = chunk / 4u, kk = (chunk % 4u) * 4u;
+  const uint at = row / 2u, lane = row % 2u;
+  [[unroll]] for (uint j = 0u; j < 4u; ++j) Bs[(kk + j) * (LDB_S / 2u) + at][lane] = v[j];
+}
 
 void main() {
   const uint t = gl_LocalInvocationIndex;
@@ -91,56 +105,53 @@ void main() {
   const uint m_base = pc.m0 + gl_WorkGroupID.y * BM;
   const uint n_base = gl_WorkGroupID.x * BN;
 
-  float acc[8][4];
-  [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-    [[unroll]] for (uint j = 0u; j < 4u; ++j) acc[i][j] = 0.0;
+  float acc[TM][6];
+  [[unroll]] for (uint i = 0u; i < TM; ++i) {
+    [[unroll]] for (uint j = 0u; j < 6u; ++j) acc[i][j] = 0.0;
   }
 
-  vec4 ra[2], rb[1];
+  vec4 ra0, ra1, rb0, rb1;
   const uint steps = (pc.K + BK - 1u) / BK;
+  ra0 = load_a(m_base + t / 4u, (t % 4u) * 4u);
+  ra1 = load_a(m_base + (t + 256u) / 4u, (t % 4u) * 4u);
+  rb0 = load_b(n_base + t / 4u, (t % 4u) * 4u);
+  rb1 = t + 256u < B_CHUNKS ? load_b(n_base + (t + 256u) / 4u, (t % 4u) * 4u) : vec4(0.0);
   for (uint step = 0u; step < steps; ++step) {
-    const uint k0 = step * BK;
-    [[unroll]] for (uint q = 0u; q < 2u; ++q) {
-      const uint chunk = t + q * 256u;
-      if (q < A_CHUNKS && chunk < BM * 4u) ra[q] = load_a(m_base + chunk / 4u, k0 + (chunk % 4u) * 4u);
-    }
-    if (t < BN * 4u) rb[0] = load_b(n_base + t / 4u, k0 + (t % 4u) * 4u);
     barrier();  // the previous step's reads of As and Bs are done
-    [[unroll]] for (uint q = 0u; q < 2u; ++q) {
-      const uint chunk = t + q * 256u;
-      if (q < A_CHUNKS && chunk < BM * 4u) {
-        const uint row = chunk / 4u, kk = (chunk % 4u) * 4u;
-        As[(kk + 0u) * (BM + 4u) + row] = ra[q].x;
-        As[(kk + 1u) * (BM + 4u) + row] = ra[q].y;
-        As[(kk + 2u) * (BM + 4u) + row] = ra[q].z;
-        As[(kk + 3u) * (BM + 4u) + row] = ra[q].w;
-      }
-    }
-    if (t < BN * 4u) {
-      const uint row = t / 4u, kk = (t % 4u) * 4u;
-      Bs[(kk + 0u) * (BN + 4u) + row] = rb[0].x;
-      Bs[(kk + 1u) * (BN + 4u) + row] = rb[0].y;
-      Bs[(kk + 2u) * (BN + 4u) + row] = rb[0].z;
-      Bs[(kk + 3u) * (BN + 4u) + row] = rb[0].w;
-    }
+    store_a(t, ra0);
+    store_a(t + 256u, ra1);
+    if (t < B_CHUNKS) store_b(t, rb0);
+    if (t + 256u < B_CHUNKS) store_b(t + 256u, rb1);
     barrier();
-    for (uint k = 0u; k < BK; ++k) {
-      float av[8], bv[4];
-      [[unroll]] for (uint i = 0u; i < 8u; ++i) av[i] = i < TM ? As[k * (BM + 4u) + ty + 16u * i] : 0.0;
-      [[unroll]] for (uint j = 0u; j < 4u; ++j) bv[j] = j < TN ? Bs[k * (BN + 4u) + tx + 16u * j] : 0.0;
-      [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-          if (i < TM && j < TN) acc[i][j] += av[i] * bv[j];
+    if (step + 1u < steps) {
+      const uint k = (step + 1u) * BK + (t % 4u) * 4u;
+      ra0 = load_a(m_base + t / 4u, k);
+      ra1 = load_a(m_base + (t + 256u) / 4u, k);
+      if (t < B_CHUNKS) rb0 = load_b(n_base + t / 4u, k);
+      if (t + 256u < B_CHUNKS) rb1 = load_b(n_base + (t + 256u) / 4u, k);
+    }
+    [[unroll]] for (uint k = 0u; k < BK; ++k) {
+      const vec4 a0 = As[k * (LDA_S / 4u) + ty * 2u], a1 = As[k * (LDA_S / 4u) + ty * 2u + 1u];
+      const float av[8] = float[8](a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w);
+      float bv[6];
+      [[unroll]] for (uint q = 0u; q < 3u; ++q) {
+        const vec2 b = q < TN / 2u ? Bs[k * (LDB_S / 2u) + tx * (TN / 2u) + q] : vec2(0.0);
+        bv[2u * q] = b.x;
+        bv[2u * q + 1u] = b.y;
+      }
+      [[unroll]] for (uint i = 0u; i < TM; ++i) {
+        [[unroll]] for (uint j = 0u; j < 6u; ++j) {
+          if (j < TN) acc[i][j] += av[i] * bv[j];
         }
       }
     }
   }
 
-  [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-    const uint m = m_base + ty + 16u * i;
-    if (i >= TM || m >= pc.M) continue;
-    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-      const uint n = n_base + tx + 16u * j;
+  [[unroll]] for (uint i = 0u; i < TM; ++i) {
+    const uint m = m_base + ty * TM + i;
+    if (m >= pc.M) continue;
+    [[unroll]] for (uint j = 0u; j < 6u; ++j) {
+      const uint n = n_base + tx * TN + j;
       if (j >= TN || n >= pc.N) continue;
       const uint64_t at = uint64_t(m) * pc.ldo + n;
       precise float y = acc[i][j];

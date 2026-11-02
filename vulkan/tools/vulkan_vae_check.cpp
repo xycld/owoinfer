@@ -4,7 +4,7 @@
 // size an fp32 sum can be wrong by, whatever its order) and an elementwise op's is a fraction of the replay's rms.
 // Exit status: 0 everything passed, 1 a check failed, 2 bad usage.
 // Usage: vulkan_vae_check [--device N] [--path coop|plain] [--kat-only | --no-kat | --bench] [--vae FILE] [--latent NPY]
-//                         [--golden PNG] [--out PNG] [--crop H,W] [--iters N] [--max-macs N]
+//                         [--golden PNG] [--out PNG] [--crop H,W] [--iters N] [--max-macs N] [--profile]
 #include <zlib.h>
 
 #include <algorithm>
@@ -238,7 +238,7 @@ bool report(const char* name, const std::vector<float>& got, const std::vector<d
     worst = std::max(worst, std::abs(static_cast<double>(got[i]) - ref[i]) / (std::abs(ref[i]) + floor[i]));
   }
   const bool ok = nans == 0 && worst <= limit.max_err;
-  std::printf("  %-34s %s  %zu values, %.2f %% same as the fp32-rounded replay, worst scaled error %.3g (limit %.3g: %s), %zu NaN\n",
+  std::printf("  %-40s %s  %zu values, %.2f %% same as the fp32-rounded replay, worst scaled error %.3g (limit %.3g: %s), %zu NaN\n",
               name, ok ? "ok    " : "FAILED", got.size(), 100.0 * static_cast<double>(same) / static_cast<double>(got.size()),
               worst, limit.max_err, limit.why, nans);
   return ok;
@@ -365,7 +365,7 @@ bool check_conv(Device& device, const VaeKernels& k, const ConvCase& cc) {
                                                   : Limit{4e-5, "16-bit operand pieces + fp32 accumulation"};
   bool ok = report(cc.name, got, want, fl, limit);
   if (clobbered != 0) {
-    std::printf("  %-34s FAILED  %zu values outside the output columns were written\n", cc.name, clobbered);
+    std::printf("  %-40s FAILED  %zu values outside the output columns were written\n", cc.name, clobbered);
     ok = false;
   }
   return ok;
@@ -378,6 +378,8 @@ bool check_convs(Device& device, const VaeKernels& k) {
       {"conv3x3 tf32 upsample, fp32 B", 9, true, 14, 18, 48, 0, 0, 0, 136, 432, 140, true, false, false, VaePrecision::kTf32, 0},
       {"conv1x1 tf32", 1, false, 11, 13, 40, 0, 0, 0, 72, 40, 76, true, false, true, VaePrecision::kTf32, 0},
       {"conv3x3 tf32 narrow (n = 3)", 9, false, 9, 30, 24, 0, 0, 0, 3, 216, 4, true, false, true, VaePrecision::kTf32, 0},
+      {"conv3x3 tf32 narrow, c = 96 (n = 3)", 9, false, 5, 7, 96, 0, 0, 0, 3, 864, 3, true, true, true, VaePrecision::kTf32, 0},
+      {"gemm fp32 narrow, k > 512 (n = 4)", 0, false, 0, 0, 0, 300, 1100, 1104, 4, 1100, 4, true, false, false, VaePrecision::kFp32, 0},
       {"conv1x1 tf32 narrow (n = 32)", 1, false, 10, 15, 32, 0, 0, 0, 32, 32, 32, true, false, true, VaePrecision::kTf32, 0},
       {"gemm fp32 bf16 B bias+residual", 0, false, 0, 0, 0, 150, 100, 104, 136, 100, 140, true, true, true, VaePrecision::kFp32, 0},
       {"gemm fp32, fp32 B", 0, false, 0, 0, 0, 77, 64, 64, 384, 68, 388, false, false, false, VaePrecision::kFp32, 0},
@@ -489,7 +491,7 @@ bool check_exact(Device& device, const VaeKernels& k) {
         bad += std::bit_cast<std::uint32_t>(got[static_cast<std::size_t>(i) * ld_out + j]) != std::bit_cast<std::uint32_t>(want);
       }
     }
-    std::printf("  %-34s %s  %zu of %zu values differ\n", "transpose", bad == 0 ? "ok    " : "FAILED", bad, got.size());
+    std::printf("  %-40s %s  %zu of %zu values differ\n", "transpose", bad == 0 ? "ok    " : "FAILED", bad, got.size());
     ok = ok && bad == 0;
   }
   {
@@ -514,7 +516,7 @@ bool check_exact(Device& device, const VaeKernels& k) {
         }
       }
     }
-    std::printf("  %-34s %s  %zu of %zu values differ\n", "latent unpack", bad == 0 ? "ok    " : "FAILED", bad, got.size());
+    std::printf("  %-40s %s  %zu of %zu values differ\n", "latent unpack", bad == 0 ? "ok    " : "FAILED", bad, got.size());
     ok = ok && bad == 0;
   }
   {
@@ -538,7 +540,7 @@ bool check_exact(Device& device, const VaeKernels& k) {
       }
       bad += got[i] != want;
     }
-    std::printf("  %-34s %s  %zu of %zu bytes differ\n", "rgb8", bad == 0 ? "ok    " : "FAILED", bad, got.size());
+    std::printf("  %-40s %s  %zu of %zu bytes differ\n", "rgb8", bad == 0 ? "ok    " : "FAILED", bad, got.size());
     ok = ok && bad == 0;
   }
   return ok;
@@ -618,7 +620,7 @@ void run_bench(Device& device, const VaeKernels& k) {
 struct Options {
   int device = -1;
   std::string path;
-  bool kat = true, decode = true, bench = false;
+  bool kat = true, decode = true, bench = false, profile = false;
   std::string vae = "/workspace/Models/MOSS-Image/base/vae/diffusion_pytorch_model.safetensors";
   std::string latent = "/workspace/Projects/MossInfer/tests/golden/g_fridge_1024/final_latent.npy";
   std::string golden = "/workspace/Projects/MossInfer/tests/golden/g_fridge_1024/image.png";
@@ -651,6 +653,7 @@ bool run_decode(Device& device, const Options& o, VaePath path) {
   }
   VaeDecoder decoder(device, o.vae, path);
   if (o.max_macs != 0) decoder.set_max_macs_per_submit(o.max_macs);
+  decoder.set_profile(o.profile);
   std::printf("\ndecode %ux%u (latents %ux%u, decoder c = %d, path %s): weights %.1f MB, decode allocates %.3f GiB\n", 16 * w,
               16 * h, h, w, decoder.base_channels(), vae_path_name(path), static_cast<double>(decoder.weight_bytes()) / 1e6,
               static_cast<double>(decoder.workspace_bytes(h, w)) / (1024.0 * 1024.0 * 1024.0));
@@ -662,6 +665,12 @@ bool run_decode(Device& device, const Options& o, VaePath path) {
     st = decoder.decode(latent.data(), h, w, rgb, i == 0 ? &image : nullptr);
     times.push_back(st.seconds);
     std::printf("  run %d: %.3f s (%d submits)%s\n", i, st.seconds, st.submits, i == 0 ? ", pipelines created" : "");
+  }
+  if (o.profile) {
+    double total = 0.0;
+    for (const auto& [name, s] : st.profile) total += s;
+    std::printf("  profile of the last run (one submit per op, %.3f s in submits):\n", total);
+    for (const auto& [name, s] : st.profile) std::printf("    %-48s %9.2f ms %5.1f %%\n", name.c_str(), s * 1e3, 100.0 * s / total);
   }
   std::size_t nans = 0;
   for (const float v : image) nans += std::isnan(v);
@@ -716,6 +725,8 @@ int main(int argc, char** argv) {
       } else if (arg == "--bench") {
         o.bench = true;
         o.decode = false;
+      } else if (arg == "--profile") {
+        o.profile = true;
       } else if (arg == "--no-kat") {
         o.kat = false;
       } else if (arg == "--vae") {
@@ -740,7 +751,7 @@ int main(int argc, char** argv) {
       }
     } catch (const std::exception& e) {
       std::printf("%s\nusage: %s [--device N] [--path coop|plain] [--kat-only | --no-kat | --bench] [--vae FILE] [--latent NPY]\n"
-                  "       [--golden PNG] [--out PNG] [--crop H,W] [--iters N] [--max-macs N]\n",
+                  "       [--golden PNG] [--out PNG] [--crop H,W] [--iters N] [--max-macs N] [--profile]\n",
                   e.what(), argv[0]);
       return 2;
     }

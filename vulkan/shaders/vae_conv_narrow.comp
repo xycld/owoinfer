@@ -1,0 +1,113 @@
+// A convolution or GEMM with at most 4 output columns (conv_out's 3), without cooperative matrices or 16-bit types:
+//   out[m, n] = (sum_k A[m, k] * B[n, k] + bias[n]) + residual[m, n]      (each + rounded separately), n < N <= 4
+// with fp32 accumulators, K ascending, and operands rounded to TF32 first with TF32. A and B are addressed as in
+// vae_conv_plain.comp; K and C are multiples of 4. One invocation per output row: per tap it reads the input pixel's
+// channels as vec4s and the 4 columns of B for the same k from shared memory, where B is staged transposed ([k] -> vec4 of
+// the 4 columns) in chunks of up to 512 channels. Workgroup y takes rows m0 + 256 y ..
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint TAPS = 9;
+layout(constant_id = 1) const bool UPSAMPLE = false;
+layout(constant_id = 2) const bool TF32 = true;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Vec4s { vec4 d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t a;
+  uint64_t b;
+  uint64_t out_;
+  uint64_t bias;
+  uint64_t residual;
+  uint M;
+  uint N;
+  uint K;
+  uint lda;
+  uint ldb;
+  uint ldo;
+  uint H;
+  uint W;
+  uint C;
+  uint m0;
+} pc;
+
+const uint KC = 512u;
+shared vec4 Bs[KC];
+
+float tf32(float v) {
+  const uint u = floatBitsToUint(v);
+  if ((u & 0x7f800000u) == 0x7f800000u) return v;
+  return uintBitsToFloat((u + 0x1000u) & 0xffffe000u);
+}
+vec4 round4(vec4 v) { return TF32 ? vec4(tf32(v.x), tf32(v.y), tf32(v.z), tf32(v.w)) : v; }
+
+// The address of A[m, tap, 0] (TAPS 0: the row m), or false in the zero padding.
+bool row_base(uint m, uint tap, out uint64_t at) {
+  if (TAPS == 0u) {
+    at = pc.a + uint64_t(m) * pc.lda * 4ul;
+    return true;
+  }
+  if (TAPS == 1u) {
+    at = pc.a + uint64_t(m) * pc.C * 4ul;
+    return true;
+  }
+  const uint oy = m / pc.W, ox = m - oy * pc.W;
+  const int iy = int(oy) + int(tap / 3u) - 1, ix = int(ox) + int(tap % 3u) - 1;
+  if (iy < 0 || ix < 0 || iy >= int(pc.H) || ix >= int(pc.W)) return false;
+  if (UPSAMPLE) {
+    at = pc.a + (uint64_t(uint(iy) >> 1) * (pc.W >> 1) + (uint(ix) >> 1)) * pc.C * 4ul;
+  } else {
+    at = pc.a + (uint64_t(iy) * pc.W + uint(ix)) * pc.C * 4ul;
+  }
+  return true;
+}
+
+void main() {
+  const uint t = gl_LocalInvocationIndex;
+  const uint m = pc.m0 + gl_WorkGroupID.y * 256u + t;
+  const bool row_ok = m < pc.M;
+  // K = taps * cols: a convolution's taps of C channels, or one "tap" of K columns for a GEMM.
+  const uint taps = TAPS == 0u ? 1u : TAPS, cols = TAPS == 0u ? pc.K : pc.C;
+  vec4 acc = vec4(0.0);
+  for (uint tap = 0u; tap < taps; ++tap) {
+    uint64_t base = 0ul;
+    const bool inside = row_ok && row_base(m, tap, base);
+    for (uint c0 = 0u; c0 < cols; c0 += KC) {
+      const uint kn = min(KC, cols - c0);
+      barrier();  // the previous chunk's reads are done
+      for (uint i = t; i < kn; i += 256u) {
+        const uint k = tap * cols + c0 + i;
+        vec4 col = vec4(0.0);
+        [[unroll]] for (uint n = 0u; n < 4u; ++n) {
+          if (n < pc.N) {
+            const float v = Floats(pc.b + (uint64_t(n) * pc.ldb + k) * 4ul).d[0];
+            col[n] = TF32 ? tf32(v) : v;
+          }
+        }
+        Bs[i] = col;
+      }
+      barrier();
+      if (inside) {
+        for (uint i = 0u; i < kn; i += 4u) {
+          const vec4 a = round4(Vec4s(base + uint64_t(c0 + i) * 4ul).d[0]);
+          acc += a.x * Bs[i];
+          acc += a.y * Bs[i + 1u];
+          acc += a.z * Bs[i + 2u];
+          acc += a.w * Bs[i + 3u];
+        }
+      }
+    }
+  }
+  if (!row_ok) return;
+  [[unroll]] for (uint n = 0u; n < 4u; ++n) {
+    if (n >= pc.N) continue;
+    const uint64_t at = uint64_t(m) * pc.ldo + n;
+    precise float y = acc[n];
+    if (pc.bias != 0ul) y = y + Floats(pc.bias).d[n];
+    if (pc.residual != 0ul) y = y + Floats(pc.residual + at * 4ul).d[0];
+    Floats(pc.out_ + at * 4ul).d[0] = y;
+  }
+}
