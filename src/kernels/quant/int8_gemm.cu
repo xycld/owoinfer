@@ -7,6 +7,7 @@
 #include "kernels/quant/int8_gemm_impl.cuh"
 #include "kernels/sm75/int8_sm75.h"
 #include "kernels/sm75/sm75.h"
+#include "kernels/sm70/sm70.h"
 
 namespace mi::kernels::quant {
 namespace detail {
@@ -94,7 +95,7 @@ Int8Tile resolve_tile(Int8Tile tile, const Problem& p) {
 
 void check_sm75_tile(const char* op, Int8Tile tile) {
   if (tile != Int8Tile::kAuto) {
-    fail(op, std::string("a forced tile (") + int8_tile_name(tile) + ") names an sm_80 kernel; sm_75 runs one tile");
+    fail(op, std::string("a forced tile (") + int8_tile_name(tile) + ") names an sm_80 kernel; sm_7x selects its own tiles");
   }
 }
 
@@ -156,6 +157,13 @@ void int8_gemm(const Int8Operands& op, const __nv_bfloat16* bias, __nv_bfloat16*
   detail::check_output(name, "out", out, ldo, p.n);
   detail::check_vector(name, "bias", bias, /*optional=*/true);
   if (p.m == 0) return;
+#if MOSSINFER_HAVE_SM70
+  if (kernels::sm70::volta()) {
+    detail::check_sm75_tile(name, tile);
+    kernels::sm70::int8_gemm(op, bias, out, ldo, stream);
+    return;
+  }
+#endif
   if (kernels::sm75::turing()) {  // Turing's 8x8x16 INT8 MMA (src/kernels/sm75/int8_gemm_sm75.cu)
     detail::check_sm75_tile(name, tile);
     kernels::sm75::int8_gemm(op, bias, out, ldo, stream);

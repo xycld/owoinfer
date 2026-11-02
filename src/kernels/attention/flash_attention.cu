@@ -10,6 +10,7 @@
 #include "core/varlen.h"
 #include "kernels/attention/flash_fwd_kernels.h"
 #include "kernels/sm75/sm75.h"
+#include "kernels/sm70/sm70.h"
 
 namespace mi::attention {
 namespace {
@@ -152,6 +153,13 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
   // difference.
   int device = 0, smem_per_sm = 0, smem_per_block = 0;
   MI_CUDA_CHECK(cudaGetDevice(&device));
+#if MOSSINFER_HAVE_SM70
+  if (kernels::sm70::volta()) {
+    kernels::sm70::flash_fwd(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen, causal, scale, workspace,
+                            workspace_bytes, stream);
+    return;
+  }
+#endif
 #if MOSSINFER_HAVE_SM75
   if (kernels::sm75::turing()) {
     // Turing: the sm_75 family's own exact attention (src/kernels/sm75/attention_sm75.cu, fp16 MMA; the vendored

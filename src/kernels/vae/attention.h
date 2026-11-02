@@ -1,6 +1,7 @@
 // VAE mid-block attention (fp32, single head) for both FLUX.2 widths: head dim D = 384 (the small decoder) and
-// D = 512 (the full decoder and the encoder). One kernel, templated on D (attention.cu); the D = 384 instance is the
-// original kernel bit for bit.
+// D = 512 (the full decoder and the encoder). The sm_80+ kernel is templated on D (attention.cu); its D = 384
+// instance is the original kernel bit for bit. Volta mid_attention uses bounded FP32 score slabs in caller scratch;
+// the standalone no-workspace API keeps the compatibility kernel.
 //
 // The types and functions are declared in kernels/vae/vae_kernels.h together with the other VAE ops (their
 // comments there predate D = 512); this header is the attention API's home and states the head-dim contract:

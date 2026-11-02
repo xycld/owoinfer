@@ -218,8 +218,8 @@ inline void check_user_paths(const PipelineOptions& o, const Request& r) {
   for (const lora::LoraSpec& l : r.loras) util::check_user_path(l.path, "loras");
 }
 
-// On a Turing device: throws NotSupportedError for what still needs sm_80+ kernels (pipeline.cpp). No-op elsewhere.
-void refuse_unsupported_on_sm75(const Request& req);
+// On a Volta or Turing device: throws NotSupportedError for what still needs sm_80+ kernels (pipeline.cpp). No-op elsewhere.
+void refuse_unsupported_on_sm7x(const Request& req);
 
 inline moss_dit::SkipSet skip_set(const std::vector<int>& layers) {
   moss_dit::SkipSet s;
@@ -1018,7 +1018,7 @@ struct Pipeline::Impl {
   moss_dit::BlockPath block_path(std::string& note) {
     if (options.block_path == moss_dit::BlockPath::kOpByOp) return options.block_path;
     if (kernels::sm75::turing()) {
-      note = "sm_75: DiT blocks run op by op (the fused bf16 CUTLASS GEMMs need sm_80+ tensor cores)";
+      note = "sm_7x: DiT blocks run op by op (the fused bf16 CUTLASS GEMMs need sm_80+ tensor cores)";
       return moss_dit::BlockPath::kOpByOp;
     }
     const moss_dit::FusedCheck c = check_fused();

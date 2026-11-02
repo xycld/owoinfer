@@ -23,6 +23,8 @@
 
 #include "core/cuda_check.h"
 #include "kernels/sm75/sm75.h"
+#include "kernels/sm70/sm70.h"
+#include "kernels/sm70/vae_sm70.h"
 #include "kernels/vae/attention.h"
 
 namespace mi::vae {
@@ -450,6 +452,11 @@ MidLayout mid_layout(const Tensor& x) {
   l.gn = l.qkv + align_up(tokens * 3 * d * sizeof(float));
   l.lt = l.gn + align_up(group_norm_workspace_bytes(x, kGroupNormGroups));
   l.total = l.lt + kLtWorkspace;
+#if MOSSINFER_HAVE_SM70
+  if (kernels::sm70::volta()) {
+    l.total = std::max(l.total, l.gn + kernels::sm70::vae_attention_workspace_bytes(x.dim(1) * x.dim(2)));
+  }
+#endif
   return l;
 }
 
@@ -541,7 +548,15 @@ void mid_attention(cublasLtHandle_t lt, const Tensor& x, const MidAttentionWeigh
   // SDPA's default scale is 1/sqrt(E) formed in double and rounded to fp32. This fp32 expression gives the same float
   // for E = 512 (0x3d3504f3) but 1 ulp less for E = 384 (0x3d5105eb vs 0x3d5105ec); kept, the small decoder's outputs
   // are pinned to it (the attention is fp32-accurate, not bit-identical to SDPA, either way).
-  attention_fp32(qkv_view(0), qkv_view(1), qkv_view(2), o, 1.0f / std::sqrt(static_cast<float>(dim)), precision, stream);
+#if MOSSINFER_HAVE_SM70
+  if (kernels::sm70::volta()) {
+    kernels::sm70::vae_attention_fp32(lt, qkv_view(0), qkv_view(1), qkv_view(2), o,
+                                      1.0f / std::sqrt(static_cast<float>(dim)), ws + l.gn, l.total - l.gn, stream);
+  } else
+#endif
+  {
+    attention_fp32(qkv_view(0), qkv_view(1), qkv_view(2), o, 1.0f / std::sqrt(static_cast<float>(dim)), precision, stream);
+  }
   if (!residual) {
     linear(lt, xn, dim, w.wo.ptr<float>(), w.bo.ptr<float>(), nullptr, 0, y.ptr<float>(), dim, tokens, dim, dim, fast_linears,
            ws + l.lt, kLtWorkspace, stream);

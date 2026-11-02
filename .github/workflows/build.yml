@@ -1,5 +1,5 @@
-# Reusable build of the four release flavours (Linux/Windows x CUDA 12/13) plus Windows CUDA 13 with SM75, called by
-# ci.yml and release.yml. Per flavour: configure + build with the CMakePresets.json release preset, CPU-only tests
+# Reusable build of the four release flavours (Linux/Windows x CUDA 12/13), Windows CUDA 13 with SM75 and Linux
+# CUDA 12 with SM70, called by ci.yml and release.yml. Per flavour: configure + build with the CMakePresets.json release preset, CPU-only tests
 # (hosted runners have no GPU), install, AC1 (no torch/python) + exports + AC17 (size) + cuBLASLt-through-the-shim
 # checks, the find_package consumer, CPack archives, and the system-CUDA variant (the install without the `cuda`
 # component: no cuBLASLt).
@@ -33,9 +33,9 @@ jobs:
         # bitexact_cu13 tests are GPU tests and do not run on hosted runners.
         cuda: ["12.8.1", "13.3.1"]
         # An include entry whose os/cuda match a combination is merged into it (that is how the entries below set
-        # platform/flavour/nvcc); a new combination needs a value no combination has. The Turing flavour is that:
-        # sm75=true does not match any of the four standard jobs, so it adds a fifth one.
+        # platform/flavour/nvcc); separate SM75/SM70 values add compatibility builds to the four standard jobs.
         sm75: [false]
+        sm70: [false]
         include:
           - os: ubuntu-22.04
             platform: linux
@@ -85,6 +85,17 @@ jobs:
             flavour: cuda13-sm75
             nvcc: "13.3.73"
             sub-packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "curand_dev", "thrust", "documentation"]'
+          - os: ubuntu-22.04
+            platform: linux
+            cuda: "12.8.1"
+            sm70: true
+            flavour: cuda12-sm70
+            nvcc: "12.8.93"
+            apt: >-
+              cuda-nvcc-12-8=12.8.93-1 cuda-nvvm-12-8=12.8.93-1 cuda-crt-12-8=12.8.93-1
+              cuda-cudart-12-8=12.8.90-1 cuda-cudart-dev-12-8=12.8.90-1 cuda-cccl-12-8=12.8.90-1
+              cuda-documentation-12-8=12.8.90-1 libcurand-12-8=10.3.9.90-1 libcurand-dev-12-8=10.3.9.90-1
+              libcublas-12-8=12.8.4.1-1 libcublas-dev-12-8=12.8.4.1-1
     env:
       preset: ${{ matrix.platform }}-${{ matrix.flavour }}
       SCCACHE_GHA_ENABLED: "true"

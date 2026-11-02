@@ -31,6 +31,10 @@ option(MOSSINFER_TESTS "Build unit tests" ON)
 # Turing (compute capability 7.5): builds src/kernels/sm75 for sm_75 and accepts those devices (see
 # cmake/modules/sm75.cmake). Off: the engine is Ampere-or-newer only, exactly as before.
 option(MOSSINFER_SM75 "Build the sm_75 (Turing) kernels and accept compute capability 7.5" OFF)
+option(MOSSINFER_SM70 "Build the sm_70 (Volta) kernels and accept compute capability 7.0 (CUDA 12 only)" OFF)
+if(MOSSINFER_SM70 AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+  message(FATAL_ERROR "MOSSINFER_SM70 needs CUDA 12.x: CUDA 13 removed Volta compilation and library support")
+endif()
 
 find_package(CUDAToolkit 12.4 REQUIRED)
 # sm_120 (Blackwell GeForce) needs CUDA 12.8.
@@ -181,7 +185,10 @@ if(MOSSINFER_TESTS)
     list(FILTER MOSSINFER_TEST_SOURCES EXCLUDE REGEX ".*/tests/unit/test_(c_api|c_api_check|c_api_inspect|component_api|component_gpu|progress_model)\\.cpp$")
   endif()
   add_executable(mossinfer_tests ${MOSSINFER_TEST_SOURCES})
-  if(MOSSINFER_SM75)
+  if(MOSSINFER_SM70)
+    target_compile_definitions(mossinfer_tests PRIVATE MOSSINFER_HAVE_SM70=1)
+  endif()
+  if(MOSSINFER_SM75 OR MOSSINFER_SM70)
     # probe.h's minimum compute capability (test_backend_probe) and the sm_75 kernel-family smoke test.
     target_compile_definitions(mossinfer_tests PRIVATE MOSSINFER_HAVE_SM75=1)
   endif()

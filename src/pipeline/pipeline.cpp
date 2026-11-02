@@ -1505,25 +1505,25 @@ void Pipeline::Impl::explain_control(const Request::Control& control, Result& r)
 // inpainting, reference images, and the hires fix, whose second pass encodes the upscaled image) and the LoRA GEMMs
 // (runtime LoRAs, and control adapters, which carry a LoRA). The message names the reason and what does work, instead
 // of failing at a missing kernel image mid-request.
-void detail::refuse_unsupported_on_sm75(const Request& req) {
+void detail::refuse_unsupported_on_sm7x(const Request& req) {
   if (!kernels::sm75::turing()) return;
   if (req.init_image != nullptr) {
-    throw NotSupportedError("img2img and inpainting encode the input with the VAE encoder, which has no sm_75 kernel "
+    throw NotSupportedError("img2img and inpainting encode the input with the VAE encoder, which has no sm_7x kernel "
                             "in this build; text-to-image works");
   }
   if (req.hires.enabled()) {
-    throw NotSupportedError("the hires fix encodes the upscaled image with the VAE encoder, which has no sm_75 kernel "
+    throw NotSupportedError("the hires fix encodes the upscaled image with the VAE encoder, which has no sm_7x kernel "
                             "in this build; text-to-image without it works");
   }
   if (req.references.enabled()) {
-    throw NotSupportedError("reference images are encoded with the VAE encoder, which has no sm_75 kernel in this "
+    throw NotSupportedError("reference images are encoded with the VAE encoder, which has no sm_7x kernel in this "
                             "build; text-to-image without them works");
   }
   if (!req.loras.empty()) {
-    throw NotSupportedError("runtime LoRAs need sm_80+ GEMM kernels; this sm_75 build cannot apply them");
+    throw NotSupportedError("runtime LoRAs need sm_80+ GEMM kernels; this sm_7x build cannot apply them");
   }
   if (req.control.enabled()) {
-    throw NotSupportedError("control adapters are LoRAs and need sm_80+ GEMM kernels; this sm_75 build cannot run them");
+    throw NotSupportedError("control adapters are LoRAs and need sm_80+ GEMM kernels; this sm_7x build cannot run them");
   }
 }
 
@@ -1532,7 +1532,7 @@ Result Pipeline::run(const Request& req, const GenerateControl& control, bool pr
   Impl& m = *impl_;
   check_user_paths(m.options, req);
   validate(req);
-  refuse_unsupported_on_sm75(req);
+  refuse_unsupported_on_sm7x(req);
   Result r;
   r.tier.tier = m.options.tier;  // what a run cancelled before the tier is resolved reports
   Timings& tm = r.timings;

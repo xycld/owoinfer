@@ -82,6 +82,12 @@
       "cacheVariables": { "MOSSINFER_EXPECT_CUDA_MAJOR": "12" }
     },
     {
+      "name": "linux-cuda12-sm70",
+      "displayName": "Linux release, CUDA 12.8+ with Volta (sm_70)",
+      "inherits": "linux-cuda12",
+      "cacheVariables": { "MOSSINFER_SM70": "ON" }
+    },
+    {
       "name": "windows-msvc-cuda13",
       "displayName": "Windows release, MSVC + CUDA 13.x (driver >= 580)",
       "inherits": [ "release-base", "windows" ],
@@ -106,6 +112,7 @@
     { "name": "dev-sccache", "configurePreset": "dev-sccache" },
     { "name": "linux-cuda13", "configurePreset": "linux-cuda13" },
     { "name": "linux-cuda12", "configurePreset": "linux-cuda12" },
+    { "name": "linux-cuda12-sm70", "configurePreset": "linux-cuda12-sm70" },
     { "name": "windows-msvc-cuda13", "configurePreset": "windows-msvc-cuda13" },
     { "name": "windows-msvc-cuda13-sm75", "configurePreset": "windows-msvc-cuda13-sm75" },
     { "name": "windows-msvc-cuda12", "configurePreset": "windows-msvc-cuda12" }
@@ -127,6 +134,11 @@
       "description": "bitexact_cu13 tests compare against CUDA 13.4 libdevice and are excluded.",
       "filter": { "exclude": { "label": "bitexact_cu13" } }
     },
+    {
+      "name": "linux-cuda12-sm70",
+      "inherits": "linux-cuda12",
+      "configurePreset": "linux-cuda12-sm70"
+    },
     { "name": "windows-msvc-cuda13", "inherits": "test-base", "configurePreset": "windows-msvc-cuda13" },
     {
       "name": "windows-msvc-cuda13-sm75",
@@ -144,6 +156,7 @@
   "packagePresets": [
     { "name": "linux-cuda13", "configurePreset": "linux-cuda13" },
     { "name": "linux-cuda12", "configurePreset": "linux-cuda12" },
+    { "name": "linux-cuda12-sm70", "configurePreset": "linux-cuda12-sm70" },
     { "name": "windows-msvc-cuda13", "configurePreset": "windows-msvc-cuda13" },
     { "name": "windows-msvc-cuda13-sm75", "configurePreset": "windows-msvc-cuda13-sm75" },
     { "name": "windows-msvc-cuda12", "configurePreset": "windows-msvc-cuda12" }

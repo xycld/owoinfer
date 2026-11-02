@@ -1,7 +1,8 @@
 # src/backend: the probe reports which compute capabilities this build has kernel images for, so it is told the
 # CUDA architecture list of mossinfer_core (commas: a semicolon would split the definition). This file only.
 # The sm_75 kernels are their own OBJECT library (cmake/modules/sm75.cmake) outside the core's list, so a build with
-# MOSSINFER_SM75 appends 75-real here: probe.h's minimum capability follows the same option.
+# MOSSINFER_SM75 appends 75-real here: probe.h's minimum capability follows the same option. MOSSINFER_SM70 appends
+# 70-real, whose SASS also counts for 7.5 (compatible_image in probe.cpp).
 # No-op when MOSSINFER_ONLY filtered the probe out.
 set(_mi_backend_probe ${CMAKE_SOURCE_DIR}/src/backend/probe.cpp)
 if(_mi_backend_probe IN_LIST MOSSINFER_SOURCES)
@@ -12,6 +13,9 @@ if(_mi_backend_probe IN_LIST MOSSINFER_SOURCES)
   string(JOIN "," _mi_arch_string ${_mi_core_archs})
   if(MOSSINFER_SM75)
     string(APPEND _mi_arch_string ",75-real")
+  endif()
+  if(MOSSINFER_SM70)
+    string(APPEND _mi_arch_string ",70-real")
   endif()
   set_property(SOURCE ${_mi_backend_probe} APPEND PROPERTY COMPILE_DEFINITIONS
     "MOSSINFER_CUDA_ARCHITECTURES=\"${_mi_arch_string}\"")

@@ -121,6 +121,9 @@ jobs:
           sm75="mossinfer-$ARCHIVE_VERSION-windows-cu13-x86_64-sm75.zip"
           test -f "$sm75" || { echo "missing SM75 package $sm75"; exit 1; }
           test -f "${sm75%.zip}-system-cuda.zip" || { echo "missing SM75 system-CUDA package"; exit 1; }
+          sm70="mossinfer-$ARCHIVE_VERSION-linux-cu12-x86_64-sm70.zip"
+          test -f "$sm70" || { echo "missing SM70 package $sm70"; exit 1; }
+          test -f "${sm70%.zip}-system-cuda.zip" || { echo "missing SM70 system-CUDA package"; exit 1; }
       - name: SHA256SUMS
         shell: bash
         working-directory: dist

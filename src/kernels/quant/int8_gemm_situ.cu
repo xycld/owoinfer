@@ -7,6 +7,7 @@
 #include "kernels/quant/int8_gemm_impl.cuh"
 #include "kernels/sm75/int8_sm75.h"
 #include "kernels/sm75/sm75.h"
+#include "kernels/sm70/sm70.h"
 
 namespace mi::kernels::quant {
 namespace detail {
@@ -104,6 +105,13 @@ void int8_gemm_situ_glu(const Int8Operands& op, __nv_bfloat16* out, std::int64_t
                                     std::to_string(ldo));
   }
   if (p.m == 0) return;
+#if MOSSINFER_HAVE_SM70
+  if (kernels::sm70::volta()) {
+    detail::check_sm75_tile(name, tile);
+    kernels::sm70::int8_gemm_situ_glu(op, out, ldo, stream);
+    return;
+  }
+#endif
   if (kernels::sm75::turing()) {
     detail::check_sm75_tile(name, tile);
     kernels::sm75::int8_gemm_situ_glu(op, out, ldo, stream);

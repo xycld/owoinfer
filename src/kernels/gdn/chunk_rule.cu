@@ -21,6 +21,7 @@
 #include "kernels/gdn/checks.h"
 #include "kernels/gdn/gdn.h"
 #include "kernels/sm75/sm75.h"
+#include "kernels/sm70/sm70.h"
 
 namespace mi::gdn {
 namespace {
@@ -565,7 +566,11 @@ void chunk_gated_delta_rule(const Tensor& qkv, const Tensor& g, const Tensor& be
   // computes the same rule with 33 KiB; its numerics are fp32 like the chunked path's. Only an MOSSINFER_SM75 build
   // checks (once per device, kernels::sm75::turing()); without it the probe never accepts a 7.x device.
 #if MOSSINFER_HAVE_SM75
-  if (kernels::sm75::turing()) {
+  if (kernels::sm75::turing()
+#if MOSSINFER_HAVE_SM70
+      && !kernels::sm70::volta()  // Volta's 96 KiB fits the faster chunked rule.
+#endif
+  ) {
     constexpr int kSm75Smem = (kHeadDim * kSm75Cols + 2 * kHeadDim + 4) * static_cast<int>(sizeof(float));
     const dim3 grid(kNumVHeads, num_seqs, kHeadDim / kSm75Cols);
     recurrent_sm75_kernel<__nv_bfloat16><<<grid, kSm75Cols, kSm75Smem, stream>>>(

@@ -59,6 +59,7 @@ inline constexpr float kBatchNormEps = 1e-4f; // vae.config.batch_norm_eps
 // may alias residual. Alignment: x, w 16 bytes; bias 32 bytes; y, residual 16 bytes (4 bytes when K < 64).
 // The fp32 path rounds operands to nearest TF32 and accumulates in the same order as cuDNN's TF32 kernels
 // (bit-identical to torch 2.14 / cuDNN 9.24 on the decoder's K >= 64 convs; conv_out differs by ~2e-6 rel).
+// The sm_7x compatibility paths keep fp32 operands/accumulation; Volta uses a SIMT implicit GEMM with no workspace.
 std::size_t conv2d_workspace_bytes(const Tensor& x, const Tensor& w);
 void conv2d(const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor* residual, const Tensor& y,
             void* workspace, std::size_t workspace_bytes, cudaStream_t stream);
