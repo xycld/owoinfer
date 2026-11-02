@@ -28,6 +28,8 @@ void check(VkResult result, const char* what) {
 }
 
 VkInstance create_instance() {
+  std::string error;
+  if (!load_vulkan(&error)) throw std::runtime_error(error);
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
   app.pApplicationName = "mossinfer";
   app.apiVersion = VK_API_VERSION_1_3;

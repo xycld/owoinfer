@@ -5,7 +5,7 @@
 //     once; the rows' joint sequences [video_r | text_r] are concatenated, so each linear runs once over all rows and
 //     attention is one varlen call per run of rows. A block that some rows skip runs on the other rows' token ranges only.
 // Each op follows the reference's order and bf16/fp32 rounding, as the engine's CUDA forward (src/models/moss_dit).
-// Work is submitted op by op, so no single submit runs long on a slow device.
+// Work is submitted op by op, and an op over many tokens in parts (DitOptions::submit_gflop).
 #pragma once
 
 #include <bitset>
@@ -31,6 +31,10 @@ struct DitOptions {
   // host-coherent) and are copied into one device slot right before they run, so a device with too little memory for
   // the 9.5 GiB of weights still runs the DiT, at the cost of moving those blocks over the bus every step.
   std::uint64_t device_budget = 0;
+  // Estimated work per submit, in GFLOP; 0 picks the path's default (200 cooperative matrix, 20 plain). A block op
+  // larger than that runs in token ranges (attention in query ranges), each its own submit, so no submit runs long
+  // enough to trip a display driver's watchdog (Windows' TDR, 2 s by default) on a slow device.
+  double submit_gflop = 0;
 };
 
 class Dit {
@@ -68,12 +72,14 @@ class Dit {
 
  private:
   Buffer& scratch(std::unique_ptr<Buffer>& slot, VkDeviceSize bytes);
+  void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b);
   void time_modulation(float timestep);
 
   Device& device_;
   const BlockKernels& kernels_;
   std::uint64_t weight_bytes_ = 0, host_weight_bytes_ = 0;
   int resident_blocks_ = 0;
+  double max_gflop_ = 0;
   std::vector<const Buffer*> host_blocks_;  // per block: its host copy when streamed, else null
   std::unique_ptr<Buffer> slot_;           // the device slot streamed blocks run from
   int streamed_layer_ = -1;                // the block the slot holds

@@ -2,7 +2,7 @@
 // embedded in the binary. Failures throw std::runtime_error.
 #pragma once
 
-#include <vulkan/vulkan.h>
+#include "vk_api.h"
 
 #include <cstddef>
 #include <cstdint>

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <string>
 
@@ -64,6 +65,7 @@ std::vector<std::uint16_t> rope_table(std::uint32_t height, std::uint32_t width,
 
 Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::path& transformer_dir, const DitOptions& options)
     : device_(device), kernels_(kernels) {
+  max_gflop_ = options.submit_gflop > 0 ? options.submit_gflop : kernels.path() == BlockPath::kCoop ? 200.0 : 20.0;
   const st::Index index(transformer_dir);
   std::vector<std::byte> host;
   // Places tensors in one new buffer, each at a 256-byte aligned offset, and uploads them (or, for a host buffer, reads
@@ -164,6 +166,50 @@ Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::pat
 
 Dit::~Dit() = default;
 
+void Dit::run_block_op(int op, const BlockWeights& w, const BlockBuffers& b) {
+  // Multiply-adds per token, x2 for FLOP; attention's per query token over its sequence's keys.
+  static constexpr double kFlopPerToken[kBlockOps] = {0, 2.0 * kDim * kQkv, 0, 0, 2.0 * kDim * kDim, 0,
+                                                      2.0 * kDim * 2 * kFfn, 2.0 * kFfn * kDim};
+  const double limit = max_gflop_ * 1e9;
+  if (op == 3) {
+    // Attention splits along each sequence's queries: every query row reads all of its sequence's keys.
+    for (std::size_t s = 0; s + 1 < b.cu_seqlens.size(); ++s) {
+      const auto start = static_cast<std::uint32_t>(b.cu_seqlens[s]), len = static_cast<std::uint32_t>(b.cu_seqlens[s + 1]) - start;
+      const double per_query = 4.0 * len * kDim;
+      std::uint32_t chunk = len;
+      if (limit > 0 && per_query * len > limit) chunk = std::max<std::uint32_t>(64, static_cast<std::uint32_t>(limit / per_query) / 64 * 64);
+      for (std::uint32_t q0 = 0; q0 < len; q0 += chunk) {
+        const std::uint32_t n = std::min(chunk, len - q0);
+        const VkDeviceAddress base = b.qkv + VkDeviceAddress{start} * kQkv * kBf16;
+        const VkDeviceAddress q = base + VkDeviceAddress{q0} * kQkv * kBf16;
+        const AttentionArgs args{q, base + kDim * kBf16, base + 2 * kDim * kBf16, b.attn + (VkDeviceAddress{start} + q0) * kDim * kBf16,
+                                 kQkv, kQkv, kQkv, kDim, kHead, kHead, kHead, kHead, {0, static_cast<std::int32_t>(n)},
+                                 {0, static_cast<std::int32_t>(len)}, kDiTHeads,
+                                 static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHead)))};
+        device_.run([&](VkCommandBuffer cb) { kernels_.record_attention(cb, args); });
+      }
+    }
+    return;
+  }
+  // Row-local ops split along the tokens, in multiples of the GEMM tiles' 128 rows.
+  std::uint32_t chunk = b.tokens;
+  if (limit > 0 && kFlopPerToken[op] * b.tokens > limit) {
+    chunk = std::max<std::uint32_t>(128, static_cast<std::uint32_t>(limit / kFlopPerToken[op]) / 128 * 128);
+  }
+  for (std::uint32_t t0 = 0; t0 < b.tokens; t0 += chunk) {
+    BlockBuffers part = b;
+    const VkDeviceAddress t = t0;
+    part.x += t * kDim * kBf16;
+    part.y += t * kDim * kBf16;
+    part.qkv += t * kQkv * kBf16;
+    part.attn += t * kDim * kBf16;
+    part.ffn += t * kFfn * kBf16;
+    part.rope += t * kHead * kBf16;
+    part.tokens = std::min(chunk, b.tokens - t0);
+    device_.run([&](VkCommandBuffer cb) { record_block_op(kernels_, cb, op, w, part); });
+  }
+}
+
 std::uint64_t Dit::activation_bytes(std::uint64_t tokens, std::uint64_t hw) {
   // forward(): x, y and attn [tokens, 3072]; qkv [tokens, 9216]; ffn [tokens, 8192]; rope [tokens, 128]; the video tokens
   // and the head's projection [hw, 128]; the modulation and time scratch. encode_text() reuses them for a prompt no longer
@@ -197,31 +243,47 @@ std::unique_ptr<Buffer> Dit::encode_text(const std::vector<std::uint16_t>& embed
   rope.upload(table.data(), table.size() * kBf16);
   auto out = std::make_unique<Buffer>(device_, s * kDim * kBf16);
   const VkDeviceAddress x = out->address();
-  const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHead)));
-  const std::vector<std::int32_t> cu = {0, static_cast<std::int32_t>(length)};
+  const VkDeviceAddress ya = y.address(), qa = qkv.address(), aa = attn.address(), ua = up.address(), ga = gate.address(),
+                        fa = ffn.address(), ea = e.address();
+  // Each linear in token ranges of at most max_gflop_ (see run_block_op); norms and elementwise ops run whole.
+  const auto rows = [&](double flop_per_token, const std::function<void(VkCommandBuffer, VkDeviceAddress, std::uint32_t)>& op) {
+    const double limit = max_gflop_ * 1e9;
+    std::uint32_t chunk = length;
+    if (limit > 0 && flop_per_token * length > limit) {
+      chunk = std::max<std::uint32_t>(128, static_cast<std::uint32_t>(limit / flop_per_token) / 128 * 128);
+    }
+    for (std::uint32_t t0 = 0; t0 < length; t0 += chunk) {
+      device_.run([&](VkCommandBuffer cb) { op(cb, t0, std::min(chunk, length - t0)); });
+    }
+  };
+  const auto off = [](VkDeviceAddress base, std::uint64_t t, std::uint64_t width) { return base + t * width * kBf16; };
 
-  device_.run([&](VkCommandBuffer cb) {
-    kernels_.record_gemm_bias(cb, x, kDim, e.address(), kDiTTextDim, g_.text_w, kDiTTextDim, g_.text_b, length, kDim,
-                              kDiTTextDim);
+  rows(2.0 * kDiTTextDim * kDim, [&](VkCommandBuffer cb, VkDeviceAddress t, std::uint32_t n) {
+    kernels_.record_gemm_bias(cb, off(x, t, kDim), kDim, off(ea, t, kDiTTextDim), kDiTTextDim, g_.text_w, kDiTTextDim, g_.text_b,
+                              n, kDim, kDiTTextDim);
   });
   for (const TextWeights& b : text_blocks_) {
-    device_.run([&](VkCommandBuffer cb) {
-      kernels_.record_norm(cb, x, kDim, b.norm1, y.address(), kDim, length, kDim);
-      kernels_.record_gemm_bias(cb, qkv.address(), kQkv, y.address(), kDim, b.qkv_w, kDim, b.qkv_b, length, kQkv, kDim);
-      kernels_.record_qk_norm_rope(cb, qkv.address(), kQkv, length, kDiTHeads, b.q_norm, b.k_norm, rope.address(), kHead);
+    device_.run([&](VkCommandBuffer cb) { kernels_.record_norm(cb, x, kDim, b.norm1, ya, kDim, length, kDim); });
+    rows(2.0 * kDim * kQkv, [&](VkCommandBuffer cb, VkDeviceAddress t, std::uint32_t n) {
+      kernels_.record_gemm_bias(cb, off(qa, t, kQkv), kQkv, off(ya, t, kDim), kDim, b.qkv_w, kDim, b.qkv_b, n, kQkv, kDim);
     });
     device_.run([&](VkCommandBuffer cb) {
-      const VkDeviceAddress k = at(qkv, kDim * kBf16), v = at(qkv, 2 * kDim * kBf16);
-      kernels_.record_attention(cb, AttentionArgs{qkv.address(), k, v, attn.address(), kQkv, kQkv, kQkv, kDim, kHead, kHead,
-                                                  kHead, kHead, cu, cu, kDiTHeads, scale});
-      kernels_.record_gemm_bias_residual(cb, x, kDim, attn.address(), kDim, b.proj_w, kDim, b.proj_b, length, kDim, kDim);
-      kernels_.record_norm(cb, x, kDim, b.norm2, y.address(), kDim, length, kDim);
+      kernels_.record_qk_norm_rope(cb, qa, kQkv, length, kDiTHeads, b.q_norm, b.k_norm, rope.address(), kHead);
     });
-    device_.run([&](VkCommandBuffer cb) {
-      kernels_.record_gemm_bias(cb, up.address(), kFfn, y.address(), kDim, b.up_w, kDim, b.up_b, length, kFfn, kDim);
-      kernels_.record_gemm_bias(cb, gate.address(), kFfn, y.address(), kDim, b.gate_w, kDim, b.gate_b, length, kFfn, kDim);
-      kernels_.record_situ(cb, up.address(), gate.address(), ffn.address(), length * kFfn);
-      kernels_.record_gemm_bias_residual(cb, x, kDim, ffn.address(), kFfn, b.down_w, kFfn, b.down_b, length, kDim, kFfn);
+    run_block_op(3, BlockWeights{}, BlockBuffers{0, 0, qa, aa, 0, 0, 0, {0, static_cast<std::int32_t>(length)}, length});
+    rows(2.0 * kDim * kDim, [&](VkCommandBuffer cb, VkDeviceAddress t, std::uint32_t n) {
+      kernels_.record_gemm_bias_residual(cb, off(x, t, kDim), kDim, off(aa, t, kDim), kDim, b.proj_w, kDim, b.proj_b, n, kDim,
+                                         kDim);
+    });
+    device_.run([&](VkCommandBuffer cb) { kernels_.record_norm(cb, x, kDim, b.norm2, ya, kDim, length, kDim); });
+    rows(4.0 * kDim * kFfn, [&](VkCommandBuffer cb, VkDeviceAddress t, std::uint32_t n) {
+      kernels_.record_gemm_bias(cb, off(ua, t, kFfn), kFfn, off(ya, t, kDim), kDim, b.up_w, kDim, b.up_b, n, kFfn, kDim);
+      kernels_.record_gemm_bias(cb, off(ga, t, kFfn), kFfn, off(ya, t, kDim), kDim, b.gate_w, kDim, b.gate_b, n, kFfn, kDim);
+    });
+    device_.run([&](VkCommandBuffer cb) { kernels_.record_situ(cb, ua, ga, fa, length * kFfn); });
+    rows(2.0 * kFfn * kDim, [&](VkCommandBuffer cb, VkDeviceAddress t, std::uint32_t n) {
+      kernels_.record_gemm_bias_residual(cb, off(x, t, kDim), kDim, off(fa, t, kFfn), kFfn, b.down_w, kFfn, b.down_b, n, kDim,
+                                         kFfn);
     });
   }
   return out;
@@ -323,7 +385,7 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
       }
       for (int op = 0; op < kBlockOps; ++op) {
         const double t0 = now_ms();
-        device_.run([&](VkCommandBuffer cb) { record_block_op(kernels_, cb, op, blocks_[static_cast<std::size_t>(l)], b); });
+        run_block_op(op, blocks_[static_cast<std::size_t>(l)], b);
         op_ms_[static_cast<std::size_t>(op)] += now_ms() - t0;
       }
       r0 = r1;

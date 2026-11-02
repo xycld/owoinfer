@@ -9,7 +9,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)  # the CPU reference is unusably slow unoptimized
 endif()
 
-find_package(Vulkan REQUIRED)
+find_package(Vulkan REQUIRED COMPONENTS glslc)
 find_program(GLSL_COMPILER NAMES glslc HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin" REQUIRED)
 
 # Shaders become SPIR-V word lists compiled into the binary, so nothing beyond it ships.
@@ -35,9 +35,10 @@ foreach(shader IN ITEMS gemm_plain norm_modulate qk_norm_rope attention_plain el
   _mi_add_shader(${shader} vulkan1.2)
 endforeach()
 
-add_library(mossinfer_vulkan STATIC runtime.cpp gemm.cpp block.cpp dit.cpp safetensors.cpp ${_spirv_files})
+add_library(mossinfer_vulkan STATIC vk_api.cpp runtime.cpp gemm.cpp block.cpp dit.cpp safetensors.cpp ${_spirv_files})
 target_include_directories(mossinfer_vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${_spirv_dir})
-target_link_libraries(mossinfer_vulkan PUBLIC Vulkan::Vulkan)
+# Headers only: vk_api.cpp opens the loader at run time, so nothing links against it.
+target_link_libraries(mossinfer_vulkan PUBLIC Vulkan::Headers ${CMAKE_DL_LIBS})
 
 # Built into the engine (cmake/modules/vulkan.cmake), the tools are off unless asked for.
 if(NOT DEFINED MOSSINFER_VULKAN_TOOLS)
