@@ -245,12 +245,6 @@ bool report(const char* name, const std::vector<float>& got, const std::vector<d
   return ok;
 }
 
-double rms(const std::vector<double>& v) {
-  double s = 0.0;
-  for (const double x : v) s += x * x;
-  return std::sqrt(s / static_cast<double>(std::max<std::size_t>(v.size(), 1)));
-}
-
 struct ConvCase {
   const char* name;
   std::uint32_t taps;  // 0 GEMM, 1, 9
