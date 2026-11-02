@@ -50,3 +50,29 @@ target_link_libraries(vulkan_block_check PRIVATE mossinfer_vulkan)
 # One real block against the engine's captured output.
 add_executable(vulkan_block_real tools/vulkan_block_real.cpp)
 target_link_libraries(vulkan_block_real PRIVATE mossinfer_vulkan)
+
+# The Qwen3.5 text encoder (text_encoder.h): its own kernels on top of the DiT block's GEMMs, and a safetensors reader for
+# streaming its weights.
+set(_te_spirv_files "")
+foreach(shader IN ITEMS te_rms_norm te_conv_silu te_gates te_gdn_qk te_gdn_chunk te_gdn_solve te_gdn_state te_attention
+                        te_gate_mul)
+  set(_source ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.comp)
+  set(_output ${_spirv_dir}/${shader}.spv.inc)
+  add_custom_command(
+    OUTPUT ${_output}
+    COMMAND ${GLSL_COMPILER} --target-env=vulkan1.2 -fshader-stage=comp -O -mfmt=num
+            -I${CMAKE_CURRENT_SOURCE_DIR}/shaders ${_source} -o ${_output}
+    DEPENDS ${_source} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.glsl ${CMAKE_CURRENT_SOURCE_DIR}/shaders/te_common.glsl
+    COMMENT "glslc ${shader}.comp")
+  list(APPEND _te_spirv_files ${_output})
+endforeach()
+target_sources(mossinfer_vulkan PRIVATE te_kernels.cpp text_encoder.cpp safetensors.cpp ${_te_spirv_files})
+
+# The text encoder's kernels against host replays of their op order; the replays must round where the kernels do.
+add_executable(vulkan_te_kernel_check tools/vulkan_te_kernel_check.cpp)
+target_compile_options(vulkan_te_kernel_check PRIVATE -ffp-contract=off)
+target_link_libraries(vulkan_te_kernel_check PRIVATE mossinfer_vulkan)
+
+# The whole text encoder against the official pipeline's golden hidden states.
+add_executable(vulkan_te_check tools/vulkan_te_check.cpp)
+target_link_libraries(vulkan_te_check PRIVATE mossinfer_vulkan)

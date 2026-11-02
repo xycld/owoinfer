@@ -1,0 +1,134 @@
+// Causal scaled-dot-product attention over one sequence for the text encoder's full-attention layers: head_dim 256, query
+// head h reading key/value head h / group, bf16 in and out, fp32 online softmax, any device. One query row of one head per
+// workgroup of 32 lanes; row i attends to keys 0 .. i, in steps of 32 walked from the last down to the first, as
+// FlashAttention's reverse iteration:
+//   S = q * K_step^T                     (lane c: key c of the step, dims ascending, each product and sum rounded)
+//   max, row_sum and acc_o rescaled to the new maximum
+//   P = bf16(exp2(S * log2_scale - max * log2_scale)), row_sum += P before rounding
+//   acc_o += P * V_step                  (lane l: dims 4l .. 4l + 3 and 128 + 4l .. 128 + 4l + 3)
+// and out = bf16(acc_o / row_sum). Rows q_first .. q_first + gl_NumWorkGroups.y - 1 of the sequence.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "te_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t q;
+  uint64_t k;
+  uint64_t v;
+  uint64_t o;
+  uint ldq;
+  uint ldk;
+  uint ldv;
+  uint ldo;
+  uint hsq;
+  uint hsk;
+  uint hsv;
+  uint hso;
+  uint q_first;  // within the sequence; q, k, v and o point at its first row
+  uint group;    // query heads per key/value head
+  float log2_scale;
+} pc;
+
+const uint STEP = 32u;
+
+shared vec4 q_shared[64];
+shared float s_shared[STEP];
+shared float w_shared[STEP];
+shared float p_shared[STEP];
+shared float max_scaled_shared;
+shared float rescale_shared;
+shared float inv_sum_shared;
+
+void main() {
+  const uint lane = gl_LocalInvocationIndex;
+  const uint head = gl_WorkGroupID.x, kv_head = head / pc.group;
+  const uint row = pc.q_first + gl_WorkGroupID.y;
+  const uint seqlen_k = row + 1u;
+
+  Words qrow = Words(pc.q + (uint64_t(row) * pc.ldq + uint64_t(head) * pc.hsq) * 2ul);
+  q_shared[lane] = f4(qrow.d[lane]);
+  q_shared[lane + 32u] = f4(qrow.d[lane + 32u]);
+  barrier();
+
+  const uint64_t k_head = pc.k + uint64_t(kv_head) * pc.hsk * 2ul;
+  const uint64_t v_head = pc.v + uint64_t(kv_head) * pc.hsv * 2ul;
+  const uint64_t ldk_bytes = uint64_t(pc.ldk) * 2ul, ldv_bytes = uint64_t(pc.ldv) * 2ul;
+
+  precise vec4 acc_lo = vec4(0.0), acc_hi = vec4(0.0);
+  float row_max = 0.0, row_sum = 0.0;  // lane 0's
+  const uint steps = (seqlen_k + STEP - 1u) / STEP;
+  for (uint step_plus_1 = steps; step_plus_1 > 0u; --step_plus_1) {
+    const uint step_index = step_plus_1 - 1u;
+    const bool first = step_plus_1 == steps;
+    const uint n0 = step_index * STEP;
+    const uint cols = min(STEP, seqlen_k - n0);
+
+    if (lane < cols) {
+      Words key = Words(k_head + uint64_t(n0 + lane) * ldk_bytes);
+      precise float s = 0.0;
+      for (uint g = 0u; g < 64u; ++g) {
+        const vec4 q4 = q_shared[g];
+        const vec4 k4 = f4(key.d[g]);
+        s = s + q4.x * k4.x;
+        s = s + q4.y * k4.y;
+        s = s + q4.z * k4.z;
+        s = s + q4.w * k4.w;
+      }
+      s_shared[lane] = s;
+    }
+    barrier();
+
+    if (lane == 0u) {
+      const float prev = row_max;
+      float cur = first ? s_shared[0] : max(prev, s_shared[0]);
+      for (uint c = 1u; c < cols; ++c) cur = max(cur, s_shared[c]);
+      row_max = cur;
+      if (first) {
+        rescale_shared = 1.0;
+        row_sum = 0.0;
+      } else {
+        precise const float diff = (prev - cur) * pc.log2_scale;
+        const float rescale = exp2(diff);
+        rescale_shared = rescale;
+        precise const float scaled = row_sum * rescale;
+        row_sum = scaled;
+      }
+      precise const float max_scaled = cur * pc.log2_scale;
+      max_scaled_shared = max_scaled;
+    }
+    barrier();
+
+    float w = 0.0;
+    if (lane < cols) w = exp2(fma(s_shared[lane], pc.log2_scale, -max_scaled_shared));
+    w_shared[lane] = w;
+    p_shared[lane] = uintBitsToFloat(bf(w) << 16);
+    if (!first) {
+      precise const vec4 lo = acc_lo * rescale_shared, hi = acc_hi * rescale_shared;
+      acc_lo = lo;
+      acc_hi = hi;
+    }
+    barrier();
+
+    if (lane == 0u) {
+      precise float sum = row_sum;
+      for (uint c = 0u; c < cols; ++c) sum = sum + w_shared[c];
+      row_sum = sum;
+    }
+    for (uint c = 0u; c < cols; ++c) {
+      Words val = Words(v_head + uint64_t(n0 + c) * ldv_bytes);
+      const float p = p_shared[c];
+      acc_lo = acc_lo + p * f4(val.d[lane]);
+      acc_hi = acc_hi + p * f4(val.d[lane + 32u]);
+    }
+    barrier();
+  }
+
+  if (lane == 0u) inv_sum_shared = (row_sum == 0.0 || isnan(row_sum)) ? 1.0 : 1.0 / row_sum;
+  barrier();
+  precise const vec4 lo = acc_lo * inv_sum_shared, hi = acc_hi * inv_sum_shared;
+  Words out_row = Words(pc.o + (uint64_t(row) * pc.ldo + uint64_t(head) * pc.hso) * 2ul);
+  out_row.d[lane] = bf4(lo);
+  out_row.d[lane + 32u] = bf4(hi);
+}

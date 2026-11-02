@@ -1,0 +1,110 @@
+// The inter-chunk scan of the chunked gated delta rule for one sequence, value head h and 16 value columns vc0 .. +16,
+// sequential over the chunks, as the engine's state kernel with S [128][16] the state slice (zero at the start):
+//   v_new = u - w S
+//   o     = (q exp(gcum)) S + attn v_new                    -> out bf16 [tokens][32][128]
+//   S     = S exp(gcum[n - 1]) + (k exp(gcum[n - 1] - gcum))^T v_new
+// Products are fused multiply-adds: over d ascending for w S and q S, then on over j ascending for attn v_new starting from
+// q S, over j ascending for the update, and S exp(...) + update as one more. Workgroup (slice, h): invocation
+// (rg, cp) = (i / 8, i % 8) owns columns 2 cp and 2 cp + 1 of rows rg + 16 r (r < 4) of the chunk and of state rows
+// rg + 16 r (r < 8).
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#include "te_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t qn;
+  uint64_t kn;
+  uint64_t gcum;
+  uint64_t eg;
+  uint64_t el;
+  uint64_t attn;
+  uint64_t u;
+  uint64_t w;
+  uint64_t out_;
+  uint tokens;
+  uint row0;
+  uint len;
+} pc;
+
+const uint C = 64u;
+const uint BV = 16u;
+
+shared vec2 s_state[128 * (BV / 2u)];
+shared vec2 s_vn[C * (BV / 2u)];
+
+void main() {
+  const uint tid = gl_LocalInvocationIndex;
+  const uint h = gl_WorkGroupID.y, kh = h / 2u;
+  const uint cp = tid % 8u, rg = tid / 8u;
+  const uint vc = gl_WorkGroupID.x * BV + 2u * cp;
+  const uint64_t ht = uint64_t(h) * pc.tokens, kt = uint64_t(kh) * pc.tokens;
+
+  [[unroll]] for (uint r = 0u; r < 8u; ++r) s_state[(rg + 16u * r) * 8u + cp] = vec2(0.0);
+  barrier();
+
+  for (uint c0 = 0u; c0 < pc.len; c0 += C) {
+    const uint t0 = pc.row0 + c0;
+    const uint n = min(C, pc.len - c0);
+
+    // w S and q S for rows rg + 16 r.
+    precise vec2 pw[4], pq[4];
+    [[unroll]] for (uint r = 0u; r < 4u; ++r) {
+      pw[r] = vec2(0.0);
+      pq[r] = vec2(0.0);
+      const uint i = rg + 16u * r;
+      if (i < n) {
+        Floats W = Floats(pc.w + ((ht + t0 + i) * 128ul) * 4ul);
+        Floats Q = Floats(pc.qn + ((kt + t0 + i) * 128ul) * 4ul);
+        const float eg = f32_at(pc.eg, ht + t0 + i);
+        precise vec2 accw = vec2(0.0), accq = vec2(0.0);
+        for (uint d = 0u; d < 128u; ++d) {
+          const vec2 s = s_state[d * 8u + cp];
+          precise const float qd = Q.d[d] * eg;
+          accw = fma(vec2(W.d[d]), s, accw);
+          accq = fma(vec2(qd), s, accq);
+        }
+        pw[r] = accw;
+        pq[r] = accq;
+      }
+    }
+    [[unroll]] for (uint r = 0u; r < 4u; ++r) {
+      const uint i = rg + 16u * r;
+      vec2 vn = vec2(0.0);
+      if (i < n) {
+        Floats U = Floats(pc.u + ((ht + t0 + i) * 128ul + vc) * 4ul);
+        precise const vec2 diff = vec2(U.d[0], U.d[1]) - pw[r];
+        vn = diff;
+      }
+      s_vn[i * 8u + cp] = vn;
+    }
+    barrier();
+
+    // o = q S + attn v_new.
+    [[unroll]] for (uint r = 0u; r < 4u; ++r) {
+      const uint i = rg + 16u * r;
+      if (i >= n) continue;
+      Floats A = Floats(pc.attn + ((ht + t0 + i) * C) * 4ul);
+      precise vec2 o = pq[r];
+      for (uint j = 0u; j <= i; ++j) o = fma(vec2(A.d[j]), s_vn[j * 8u + cp], o);
+      Uints(pc.out_ + ((uint64_t(t0 + i) * 32ul + h) * 128ul + vc) * 2ul).d[0] = bf2(o);
+    }
+
+    // S = S exp(gcum[n - 1]) + kd^T v_new, kd = k exp(gcum[n - 1] - gcum).
+    const float cd = exp_f(f32_at(pc.gcum, ht + t0 + n - 1u));
+    [[unroll]] for (uint r = 0u; r < 8u; ++r) {
+      const uint d = rg + 16u * r;
+      precise vec2 upd = vec2(0.0);
+      for (uint j = 0u; j < n; ++j) {
+        precise const float kd = f32_at(pc.kn, (kt + t0 + j) * 128ul + d) * f32_at(pc.el, ht + t0 + j);
+        upd = fma(vec2(kd), s_vn[j * 8u + cp], upd);
+      }
+      const uint at = d * 8u + cp;
+      precise const vec2 next = fma(s_state[at], vec2(cd), upd);
+      s_state[at] = next;
+    }
+    barrier();
+  }
+}

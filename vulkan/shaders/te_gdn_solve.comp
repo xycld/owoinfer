@@ -1,0 +1,62 @@
+// The UT transform of one chunk of one sequence and value head h, as the engine's prep kernel: forward substitution
+// x_i = b_i - sum_{j<i} a[i][j] x_j (fused multiply-adds, j ascending) of the unit lower triangular system from
+// te_gdn_chunk, for 256 right-hand sides in blocks of 64:
+//   blocks 0, 1: b = bf16 v * beta               -> u [32][tokens][128]
+//   blocks 2, 3: b = (k * beta) * exp(gcum)      -> w [32][tokens][128]
+// with v the value head h of the conv output (column 4096 + 128 h) and k of key head h / 2. Workgroup (4 chunk + block, h):
+// invocation l solves column l of its block; its solution so far lives in column l of shared memory, which only it uses.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "te_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t qkv;   // conv output, bf16 rows of stride ldqkv
+  uint64_t kn;
+  uint64_t beta;
+  uint64_t eg;
+  uint64_t a;
+  uint64_t u;
+  uint64_t w;
+  uint ldqkv;
+  uint tokens;
+  uint row0;
+  uint len;
+} pc;
+
+const uint C = 64u;
+const uint VALUE_COL = 4096u;
+
+shared float xs[C * C];
+
+void main() {
+  const uint lane = gl_LocalInvocationIndex;
+  const uint h = gl_WorkGroupID.y, kh = h / 2u;
+  const uint block = gl_WorkGroupID.x % 4u;
+  const bool is_u = block < 2u;
+  const uint col = (block & 1u) * C + lane;
+  const uint c0 = (gl_WorkGroupID.x / 4u) * C;
+  const uint t0 = pc.row0 + c0;
+  const uint n = min(C, pc.len - c0);
+
+  for (uint i = 0u; i < n; ++i) {
+    const uint t = t0 + i;
+    const float beta = bf16_at(pc.beta, uint64_t(t) * 32ul + h);
+    float b;
+    if (is_u) {
+      precise const float v = bf16_at(pc.qkv + uint64_t(t) * pc.ldqkv * 2ul, VALUE_COL + h * 128u + col) * beta;
+      b = v;
+    } else {
+      const float k = f32_at(pc.kn, (uint64_t(kh) * pc.tokens + t) * 128ul + col);
+      precise const float kb = (k * beta) * f32_at(pc.eg, uint64_t(h) * pc.tokens + t);
+      b = kb;
+    }
+    Floats A = Floats(pc.a + ((uint64_t(h) * pc.tokens + t) * C) * 4ul);
+    precise float acc = b;
+    for (uint j = 0u; j < i; ++j) acc = fma(-A.d[j], xs[j * C + lane], acc);
+    xs[i * C + lane] = acc;
+  }
+  const uint64_t x = is_u ? pc.u : pc.w;
+  for (uint i = 0u; i < n; ++i) f32_store(x, (uint64_t(h) * pc.tokens + t0 + i) * 128ul + col, xs[i * C + lane]);
+}
