@@ -43,18 +43,13 @@ struct QkPush {
   std::uint32_t ld, table_ld, heads;
   float factor;
 };
-struct AttentionPush {
-  std::uint64_t q, k, v, o;
-  std::uint32_t ldq, ldk, ldv, ldo, hsq, hsk, hsv, hso, q_row0, k_row0, seqlen_k;
-  float log2_scale;
-};
 
-struct CoopAttentionPush {
+struct AttentionPush {  // attention_coop.comp and attention_plain.comp
   std::uint64_t q, k, v, o;
   std::uint32_t ldq, ldk, ldv, ldo, hsq, hsk, hsv, hso, q_row0, k_row0, seqlen_q, seqlen_k;
   float log2_scale;
 };
-constexpr std::uint32_t kCoopAttentionRows = 64;
+constexpr std::uint32_t kCoopAttentionRows = 64, kPlainAttentionRows = 32;
 
 enum GemmMode : std::uint32_t { kF32 = 0, kBF16 = 1, kGated = 2, kSitu = 3, kBias = 4, kBiasResidual = 5 };
 
@@ -124,7 +119,7 @@ BlockKernels::BlockKernels(Device& device, BlockPath path) : path_(path) {
   qk_norm_rope_ = std::make_unique<Pipeline>(device, kQkSpirv, sizeof(kQkSpirv), sizeof(QkPush));
   if (path == BlockPath::kCoop) {
     attention_ = std::make_unique<Pipeline>(device, kAttentionCoopSpirv, sizeof(kAttentionCoopSpirv),
-                                            sizeof(CoopAttentionPush), kCoopSubgroup);
+                                            sizeof(AttentionPush), kCoopSubgroup);
   } else {
     attention_ = std::make_unique<Pipeline>(device, kAttentionSpirv, sizeof(kAttentionSpirv), sizeof(AttentionPush));
   }
@@ -225,19 +220,11 @@ void BlockKernels::record_attention(VkCommandBuffer cb, const AttentionArgs& a) 
     const std::int32_t seqlen_q = a.cu_q[b + 1] - a.cu_q[b], seqlen_k = a.cu_k[b + 1] - a.cu_k[b];
     if (seqlen_q <= 0) continue;
     require(seqlen_k > 0, "attention: a sequence with queries has no keys");
-    if (path_ == BlockPath::kCoop) {
-      const CoopAttentionPush push{a.q, a.k, a.v, a.o, a.ldq, a.ldk, a.ldv, a.ldo, a.hsq, a.hsk, a.hsv, a.hso,
-                                   static_cast<std::uint32_t>(a.cu_q[b]), static_cast<std::uint32_t>(a.cu_k[b]),
-                                   static_cast<std::uint32_t>(seqlen_q), static_cast<std::uint32_t>(seqlen_k), log2_scale};
-      attention_->dispatch(cb, &push, a.heads,
-                           (static_cast<std::uint32_t>(seqlen_q) + kCoopAttentionRows - 1) / kCoopAttentionRows);
-      continue;
-    }
-    const AttentionPush push{a.q,   a.k,   a.v,   a.o,   a.ldq,
-                             a.ldk, a.ldv, a.ldo, a.hsq, a.hsk,
-                             a.hsv, a.hso, static_cast<std::uint32_t>(a.cu_q[b]), static_cast<std::uint32_t>(a.cu_k[b]),
-                             static_cast<std::uint32_t>(seqlen_k), log2_scale};
-    attention_->dispatch(cb, &push, a.heads, static_cast<std::uint32_t>(seqlen_q));
+    const AttentionPush push{a.q, a.k, a.v, a.o, a.ldq, a.ldk, a.ldv, a.ldo, a.hsq, a.hsk, a.hsv, a.hso,
+                             static_cast<std::uint32_t>(a.cu_q[b]), static_cast<std::uint32_t>(a.cu_k[b]),
+                             static_cast<std::uint32_t>(seqlen_q), static_cast<std::uint32_t>(seqlen_k), log2_scale};
+    const std::uint32_t rows = path_ == BlockPath::kCoop ? kCoopAttentionRows : kPlainAttentionRows;
+    attention_->dispatch(cb, &push, a.heads, (static_cast<std::uint32_t>(seqlen_q) + rows - 1) / rows);
   }
   compute_barrier(cb);
 }
