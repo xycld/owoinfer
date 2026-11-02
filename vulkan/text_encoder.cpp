@@ -1,6 +1,7 @@
 #include "text_encoder.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -248,6 +249,41 @@ struct TextEncoder::Impl {
   }
 
   std::vector<std::vector<std::uint16_t>> encode(const std::vector<std::vector<std::int32_t>>& seqs, const TeLayerHook& hook);
+
+  // A layer's tensors into `dst` at their offsets, in chunks of 16 MiB that `reader_threads` threads take in turn: several
+  // reads in flight are what a cold NVMe drive needs to reach its speed.
+  void read_layer(const LayerPlan& l, std::byte* dst) const {
+    constexpr std::uint64_t kChunk = std::uint64_t{16} << 20;
+    struct Chunk {
+      const Piece* piece;
+      std::uint64_t rel, bytes;
+    };
+    std::vector<Chunk> chunks;
+    for (const Piece& p : l.pieces) {
+      for (std::uint64_t rel = 0; rel < p.tensor->bytes; rel += kChunk) chunks.push_back({&p, rel, std::min(kChunk, p.tensor->bytes - rel)});
+    }
+    std::atomic<std::size_t> next{0};
+    std::vector<std::exception_ptr> errors(static_cast<std::size_t>(std::max(1, options.reader_threads)));
+    const auto work = [&](std::size_t t) {
+      try {
+        for (std::size_t i = next++; i < chunks.size(); i = next++) {
+          const Chunk& c = chunks[i];
+          c.piece->file->read(*c.piece->tensor, dst + c.piece->offset + c.rel, c.rel, c.bytes);
+        }
+      } catch (...) {
+        errors[t] = std::current_exception();
+        next = chunks.size();
+      }
+    };
+    {
+      std::vector<std::jthread> helpers;
+      for (std::size_t t = 1; t < errors.size(); ++t) helpers.emplace_back(work, t);
+      work(0);
+    }
+    for (const auto& e : errors) {
+      if (e) std::rethrow_exception(e);
+    }
+  }
 };
 
 TextEncoder::TextEncoder(Device& device, const std::string& dir)
@@ -291,12 +327,14 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
   const std::uint64_t scratch_bytes = std::max({gs.end, as.end, ms.end});
   const std::uint64_t act_bytes = std::uint64_t{T} * kTeHidden * 2;
 
-  Buffer weights(device, layer_bytes);
+  // Layer k runs from weights[k % 2] while layer k + 1 is copied into the other.
+  std::unique_ptr<Buffer> weights[2] = {std::make_unique<Buffer>(device, layer_bytes, Buffer::Kind::kDevice, true),
+                                        std::make_unique<Buffer>(device, layer_bytes, Buffer::Kind::kDevice, true)};
   Buffer x(device, act_bytes), h(device, act_bytes), scratch(device, scratch_bytes);
   Buffer rope(device, std::uint64_t{max_len} * kRopeDim * 2), small(device, 3 * kTeHidden * 2);
-  stats.device_bytes = weights.bytes() + x.bytes() + h.bytes() + scratch.bytes() + rope.bytes() + small.bytes();
-  std::unique_ptr<Buffer> staging[2] = {std::make_unique<Buffer>(device, layer_bytes, Buffer::Kind::kStaging),
-                                        std::make_unique<Buffer>(device, layer_bytes, Buffer::Kind::kStaging)};
+  stats.device_bytes = 2 * layer_bytes + x.bytes() + h.bytes() + scratch.bytes() + rope.bytes() + small.bytes();
+  std::unique_ptr<Buffer> staging[2] = {std::make_unique<Buffer>(device, layer_bytes, Buffer::Kind::kStaging, true),
+                                        std::make_unique<Buffer>(device, layer_bytes, Buffer::Kind::kStaging, true)};
   stats.staging_bytes = 2 * layer_bytes;
 
   // Small constants: the final norm weight and a vector of ones (the gate that makes the gated-residual GEMM a plain
@@ -323,8 +361,7 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
           handoff.busy[s] = true;
         }
         const auto t0 = Clock::now();
-        auto* dst = static_cast<std::byte*>(staging[s]->mapped());
-        for (const Piece& piece : layers[static_cast<std::size_t>(k)].pieces) piece.file->read(*piece.tensor, dst + piece.offset);
+        read_layer(layers[static_cast<std::size_t>(k)], static_cast<std::byte*>(staging[s]->mapped()));
         read_s += seconds_since(t0);
         std::lock_guard<std::mutex> lock(handoff.mu);
         handoff.busy[s] = false;
@@ -348,6 +385,7 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
   };
 
   std::vector<std::vector<std::uint16_t>> result;
+  std::vector<std::uint64_t> in_flight;  // copies into the buffers above, which must finish before the buffers go
   try {
     // Embedding rows of the ids, gathered on the host.
     {
@@ -364,7 +402,7 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
     }
 
     Submitter sub(device, budget(), options.profile, stats);
-    const VkDeviceAddress xa = x.address(), ha = h.address(), sa = scratch.address(), wa = weights.address();
+    const VkDeviceAddress xa = x.address(), ha = h.address(), sa = scratch.address();
     const auto bf = [](VkDeviceAddress base, std::uint64_t elements) { return base + elements * 2; };
 
     // GEMMs split along M so that each piece fits the submit budget; rows of the output do not depend on the split.
@@ -412,33 +450,45 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
       });
     };
 
+    const auto wait_staged = [&](int j) {
+      const auto t0 = Clock::now();
+      std::unique_lock<std::mutex> lock(handoff.mu);
+      handoff.cv.wait(lock, [&] { return handoff.error != nullptr || handoff.filled[j % 2] == j; });
+      if (handoff.error) std::rethrow_exception(handoff.error);
+      stats.read_wait_s += seconds_since(t0);
+    };
+    const auto release_staged = [&](int j) {
+      std::lock_guard<std::mutex> lock(handoff.mu);
+      handoff.filled[j % 2] = -1;
+      handoff.cv.notify_all();
+    };
+    // Layer j's staging -> device copy, on the transfer queue where there is one.
+    const auto copy = [&](int j) {
+      in_flight.push_back(device.copy_async(*staging[j % 2], 0, *weights[j % 2], 0, layers[static_cast<std::size_t>(j)].bytes));
+      return in_flight.back();
+    };
+    // Blocks until layer j's copy is done, then hands its staging slot back to the reader.
+    const auto copied = [&](int j, std::uint64_t ticket) {
+      const auto t0 = Clock::now();
+      device.host_wait(ticket);
+      in_flight.erase(std::find(in_flight.begin(), in_flight.end(), ticket));
+      stats.upload_s += seconds_since(t0);
+      release_staged(j);
+    };
+    std::uint64_t tickets[kTeLayers] = {};
+    wait_staged(0);
+    tickets[0] = copy(0);
+    copied(0, tickets[0]);
+
     for (int k = 0; k < kTeLayers; ++k) {
       const LayerPlan& l = layers[static_cast<std::size_t>(k)];
-      const int s = k % 2;
-      {
-        const auto t0 = Clock::now();
-        std::unique_lock<std::mutex> lock(handoff.mu);
-        handoff.cv.wait(lock, [&] { return handoff.error != nullptr || handoff.filled[s] == k; });
-        if (handoff.error) std::rethrow_exception(handoff.error);
-        stats.read_wait_s += seconds_since(t0);
+      device.gpu_wait(tickets[k]);  // the layer's first submit waits for its weights
+      // The next layer's copy runs while this layer computes.
+      if (k + 1 < kTeLayers) {
+        wait_staged(k + 1);
+        tickets[k + 1] = copy(k + 1);
       }
-      {
-        const auto t0 = Clock::now();
-        device.run([&](VkCommandBuffer cb) {
-          const VkBufferCopy region{0, 0, l.bytes};
-          vkCmdCopyBuffer(cb, staging[s]->handle(), weights.handle(), 1, &region);
-          VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-          barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-          barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-          vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0,
-                               nullptr, 0, nullptr);
-        });
-        stats.upload_s += seconds_since(t0);
-        ++stats.submits;
-        std::lock_guard<std::mutex> lock(handoff.mu);
-        handoff.filled[s] = -1;
-        handoff.cv.notify_all();
-      }
+      const VkDeviceAddress wa = weights[k % 2]->address();
       const auto W = [&](std::uint64_t offset) { return wa + offset; };
 
       hidden_norm(W(l.in_norm), ha);
@@ -547,6 +597,7 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
       });
       linear_residual("gemm down+residual", act, kTeIntermediate, W(l.down), kTeIntermediate);
       sub.flush();
+      if (k + 1 < kTeLayers) copied(k + 1, tickets[k + 1]);
       if (hook) hook(k, x, T);
     }
     stop_reader();
@@ -560,6 +611,12 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
     }
   } catch (...) {
     stop_reader();
+    for (const std::uint64_t ticket : in_flight) {
+      try {
+        device.host_wait(ticket);
+      } catch (...) {  // already failing; the device is likely lost
+      }
+    }
     throw;
   }
   stats.read_s = read_s;

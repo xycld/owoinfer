@@ -6,8 +6,8 @@
 // All sequences go through each layer together, packed along the rows: GEMMs and elementwise ops see every token at once
 // (their outputs do not depend on the row count here), norms, the conv, the gated delta rule and attention run per sequence.
 // Weights stream from the safetensors files: the embedding rows of the given ids are gathered on the host, a reader thread
-// reads layer k + 1 into one of two host staging buffers while layer k runs, and each layer is copied into one device
-// buffer before it runs. Work goes to the device in submits of a bounded size (TextEncoderOptions::submit_gflop), so no
+// reads layer k + 2 into one of two host staging buffers while layer k runs, and layer k + 1 is copied from staging into
+// one of two device buffers meanwhile, on the device's transfer queue where it has one (Device::copy_async). Work goes to the device in submits of a bounded size (TextEncoderOptions::submit_gflop), so no
 // submit runs long enough to trip a display driver's watchdog.
 #pragma once
 
@@ -35,6 +35,8 @@ struct TextEncoderOptions {
   // Estimated work per submit, in GFLOP; 0 picks the path's default (20 plain, 200 cooperative matrix). A GEMM larger than
   // this is split along its rows.
   double submit_gflop = 0;
+  // Threads reading layer weights from the files.
+  int reader_threads = 4;
   // Submit every op on its own and time it into TextEncoderStats::op_seconds (slower; for finding costs).
   bool profile = false;
 };
@@ -46,7 +48,7 @@ struct TextEncoderStats {
   double embed_s = 0;       // embedding rows read and uploaded
   double read_s = 0;        // the reader thread reading layer weights from the files
   double read_wait_s = 0;   // waiting for the reader
-  double upload_s = 0;      // staging -> device copies
+  double upload_s = 0;      // waiting for staging -> device copies (the part not hidden behind compute)
   double compute_s = 0;     // the layers' and the final norm's submits
   int submits = 0;
   std::uint64_t device_bytes = 0;  // device memory the encoder held at the peak of the call (its buffers)

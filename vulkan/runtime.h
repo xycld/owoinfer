@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,19 @@ class Device {
   // Records into one command buffer, submits it and waits.
   void run(const std::function<void(VkCommandBuffer)>& record);
 
+  // Asynchronous buffer copies on a transfer-only queue (a DMA engine) where the device has one, else on the compute
+  // queue. Buffers they read or write must be created with `transfer` set. copy_async returns at once with a ticket;
+  // gpu_wait(ticket) makes the next run() wait on the device for that copy, which makes its writes visible to the run
+  // (once per ticket); host_wait(ticket) blocks until the copy has completed, after which its source may be reused. The
+  // two may come in either order; a ticket is released once both happened (or with the device).
+  bool has_transfer_queue() const { return transfer_queue_ != VK_NULL_HANDLE; }
+  std::uint64_t copy_async(const Buffer& src, VkDeviceSize src_offset, const Buffer& dst, VkDeviceSize dst_offset,
+                           VkDeviceSize bytes);
+  void gpu_wait(std::uint64_t ticket);
+  void host_wait(std::uint64_t ticket);
+  std::uint32_t queue_family() const { return family_; }
+  std::uint32_t transfer_family() const { return transfer_family_; }
+
   VkDevice handle() const { return device_; }
   std::uint32_t find_memory_type(std::uint32_t type_bits, VkMemoryPropertyFlags flags) const;
 
@@ -64,13 +78,28 @@ class Device {
   VkCommandPool pool_ = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memory_{};
   DeviceInfo info_;
+  std::uint32_t family_ = 0, transfer_family_ = 0;
+  VkQueue transfer_queue_ = VK_NULL_HANDLE;
+  VkCommandPool transfer_pool_ = VK_NULL_HANDLE;
+  struct Copy {
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkSemaphore done = VK_NULL_HANDLE;
+    bool host_done = false;  // host_wait returned
+    bool run_done = false;   // a run() waited for it on the device
+  };
+  void release_if_done(std::uint64_t ticket);
+  std::map<std::uint64_t, Copy> copies_;
+  std::uint64_t next_ticket_ = 1;
+  std::vector<std::uint64_t> run_waits_;  // tickets the next run() waits for
 };
 
 // A device-local storage buffer with a device address, or a host-visible staging buffer.
 class Buffer {
  public:
   enum class Kind { kDevice, kStaging };
-  Buffer(Device& device, VkDeviceSize bytes, Kind kind = Kind::kDevice);
+  // `transfer`: also used by Device::copy_async (shared with the transfer queue's family).
+  Buffer(Device& device, VkDeviceSize bytes, Kind kind = Kind::kDevice, bool transfer = false);
   ~Buffer();
   Buffer(const Buffer&) = delete;
   Buffer& operator=(const Buffer&) = delete;
