@@ -1,0 +1,84 @@
+// C[M,N] = A[M,K] * B[K,N] with A row-major (stride lda) and B column-major (stride ldb == K), i.e. B[k,n] lives at
+// n*ldb + k: exactly the engine's [N,K] weight layout, so the GEMM consumes weights as stored (no transpose).
+//
+// One workgroup per 64x64 output tile, 128 threads (4 subgroups of 32). Each subgroup owns a 32x32 quarter, computed as
+// four 16x16x16 cooperative-matrix operations (f16 inputs, f32 accumulate) per K step. Output tiles are walked in bands
+// of BAND N-tiles (the same idea as the engine's BandedSwizzle for INT8 GEMMs): a band of weight tiles stays in L2
+// while every M tile streams past it.
+//
+// The fragments load straight from global memory in this version. That is the correctness baseline; the shared-memory
+// staged version (vectorised coalesced copies, double buffering) is the next step and is expected to be 3-4x faster.
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer F16Buf { float16_t d[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32Buf { float d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t a;
+  uint64_t b;
+  uint64_t c;
+  uint M;
+  uint N;
+  uint K;
+  uint lda;
+  uint ldb;
+  uint ldc;
+} pc;
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BAND = 8u;
+
+void main() {
+  F16Buf A = F16Buf(pc.a);
+  F16Buf B = F16Buf(pc.b);
+  F32Buf C = F32Buf(pc.c);
+
+  const uint num_m = (pc.M + BM - 1u) / BM;
+  const uint num_n = (pc.N + BN - 1u) / BN;
+  const uint id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  const uint per_band = num_m * BAND;
+  const uint band = id / per_band;
+  const uint pos = id - band * per_band;
+  const uint width = min(BAND, num_n - band * BAND);
+  const uint m_tile = pos / width;
+  const uint n_tile = band * BAND + (pos - m_tile * width);
+
+  const uint warp = gl_SubgroupID;
+  const uint m0 = m_tile * BM + (warp >> 1) * 32u;
+  const uint n0 = n_tile * BN + (warp & 1u) * 32u;
+
+  coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa0, fa1;
+  coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb0, fb1;
+  coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00, acc01, acc10, acc11;
+  const float zero = 0.0;
+  acc00 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zero);
+  acc01 = acc00;
+  acc10 = acc00;
+  acc11 = acc00;
+
+  for (uint k = 0u; k < pc.K; k += 16u) {
+    coopMatLoad(fa0, A.d, m0 * pc.lda + k, pc.lda, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(fa1, A.d, (m0 + 16u) * pc.lda + k, pc.lda, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(fb0, B.d, n0 * pc.ldb + k, pc.ldb, gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatLoad(fb1, B.d, (n0 + 16u) * pc.ldb + k, pc.ldb, gl_CooperativeMatrixLayoutColumnMajor);
+    acc00 = coopMatMulAdd(fa0, fb0, acc00);
+    acc01 = coopMatMulAdd(fa0, fb1, acc01);
+    acc10 = coopMatMulAdd(fa1, fb0, acc10);
+    acc11 = coopMatMulAdd(fa1, fb1, acc11);
+  }
+
+  coopMatStore(acc00, C.d, m0 * pc.ldc + n0, pc.ldc, gl_CooperativeMatrixLayoutRowMajor);
+  coopMatStore(acc01, C.d, m0 * pc.ldc + n0 + 16u, pc.ldc, gl_CooperativeMatrixLayoutRowMajor);
+  coopMatStore(acc10, C.d, (m0 + 16u) * pc.ldc + n0, pc.ldc, gl_CooperativeMatrixLayoutRowMajor);
+  coopMatStore(acc11, C.d, (m0 + 16u) * pc.ldc + n0 + 16u, pc.ldc, gl_CooperativeMatrixLayoutRowMajor);
+}
