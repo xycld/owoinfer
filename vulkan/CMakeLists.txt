@@ -35,7 +35,7 @@ foreach(shader IN ITEMS gemm_plain norm_modulate qk_norm_rope attention_plain)
   _mi_add_shader(${shader} vulkan1.2)
 endforeach()
 
-add_library(mossinfer_vulkan STATIC runtime.cpp gemm.cpp block.cpp ${_spirv_files})
+add_library(mossinfer_vulkan STATIC runtime.cpp gemm.cpp block.cpp safetensors.cpp ${_spirv_files})
 target_include_directories(mossinfer_vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${_spirv_dir})
 target_link_libraries(mossinfer_vulkan PUBLIC Vulkan::Vulkan)
 

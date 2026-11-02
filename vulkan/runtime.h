@@ -80,8 +80,9 @@ class Buffer {
   VkDeviceSize bytes() const { return bytes_; }
   void* mapped() const { return mapped_; }
 
-  void upload(const void* data, VkDeviceSize bytes);
-  void download(void* data, VkDeviceSize bytes);
+  // Copies through a staging buffer and waits; `offset` is in bytes from the start of this buffer.
+  void upload(const void* data, VkDeviceSize bytes, VkDeviceSize offset = 0);
+  void download(void* data, VkDeviceSize bytes, VkDeviceSize offset = 0);
 
  private:
   Device& device_;

@@ -323,11 +323,12 @@ Buffer::~Buffer() {
   vkFreeMemory(device_.handle(), memory_, nullptr);
 }
 
-void Buffer::upload(const void* data, VkDeviceSize bytes) {
+void Buffer::upload(const void* data, VkDeviceSize bytes, VkDeviceSize offset) {
+  if (offset > bytes_ || bytes > bytes_ - offset) throw std::runtime_error("Buffer::upload past the end of the buffer");
   Buffer staging(device_, bytes, Kind::kStaging);
   std::memcpy(staging.mapped(), data, static_cast<std::size_t>(bytes));
   device_.run([&](VkCommandBuffer cb) {
-    const VkBufferCopy copy{0, 0, bytes};
+    const VkBufferCopy copy{0, offset, bytes};
     vkCmdCopyBuffer(cb, staging.handle(), buffer_, 1, &copy);
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -337,10 +338,11 @@ void Buffer::upload(const void* data, VkDeviceSize bytes) {
   });
 }
 
-void Buffer::download(void* data, VkDeviceSize bytes) {
+void Buffer::download(void* data, VkDeviceSize bytes, VkDeviceSize offset) {
+  if (offset > bytes_ || bytes > bytes_ - offset) throw std::runtime_error("Buffer::download past the end of the buffer");
   Buffer staging(device_, bytes, Kind::kStaging);
   device_.run([&](VkCommandBuffer cb) {
-    const VkBufferCopy copy{0, 0, bytes};
+    const VkBufferCopy copy{offset, 0, bytes};
     vkCmdCopyBuffer(cb, buffer_, staging.handle(), 1, &copy);
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
