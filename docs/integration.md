@@ -18,7 +18,7 @@ MossInfer is a low-level engine: it runs what the caller asks for, refuses what 
 
 | Area | What works |
 |---|---|
-| Platform | Linux x86-64 and Windows x64 (MSVC), each in a `cu12` and a `cu13` flavour, as a full package and a `-system-cuda` package. CI builds, packages and runs the CPU tests of all four standard flavours, plus the Windows CUDA 13 Turing build (`-sm75`) and Linux CUDA 12 Volta build (`-sm70`); GPU runs are verified on Linux `cu13`. |
+| Platform | Linux x86-64 and Windows x64 (MSVC), each in a `cu12` and a `cu13` flavour, as a full package and a `-system-cuda` package. CI builds, packages and runs the CPU tests of all four standard flavours, plus the Windows CUDA 13 Turing build (`-sm75`) and Linux CUDA 12 Volta build (`-sm70`); GPU runs are verified on Linux `cu13`, and on Linux `cu12` for Volta. |
 | GPUs | NVIDIA compute capability 8.x and 12.x: RTX 30xx, RTX 40xx, RTX 50xx, A100/A10/A40, L4/L40, RTX PRO Blackwell. Compute capability 7.5 (Turing: RTX 20xx, T4, GTX 16xx) with a build configured `-DMOSSINFER_SM75=ON`: the bf16 GEMMs run as fp16 tensor-core GEMMs, INT8/INT4 ConvRot files run the INT8 GEMMs (INT4 through the INT8 unpack fallback), the exact attention and the VAE use the sm_75 kernels, and an unset attention resolves to `exact` (there is no 8-bit attention kernel on Turing). See [sm75.md](sm75.md). Compute capability 7.0 (Volta, Tesla V100) with CUDA 12 and `-DMOSSINFER_SM70=ON`: dedicated fp16 tensor-core attention and exact INT8 GEMMs, sharing the Turing layer’s conversion and VAE paths. See [sm70.md](sm70.md). |
 | Models | MOSS-Image Base and SFT only: the official Hugging Face folders (bf16), read in place, and fine-tunes with the same architecture; other models are refused when they load. See [Supported models](#supported-models). |
 | Component model files | a single-file DiT, text encoder or VAE next to the bundle folder: ComfyUI and community files, INT8 ConvRot, INT4 ConvRot and NVFP4 DiT (NVFP4 on RTX 50 only), INT8 ConvRot and W4A8 text encoder (`dit_file`, `text_encoder_file`, `vae_file`); community GGUF DiTs (Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, BF16, F16), converted once into INT8 ConvRot or bf16 ([GGUF DiT files](#gguf-dit-files)) |
@@ -372,7 +372,8 @@ Decision procedure for the launcher:
 
 **Turing machines.** The standard packages carry no `sm_75` kernel image, so their `hello` lists a compute capability
 7.5 device as unsupported (`"this build has no kernel image for compute capability 7.5"`). Install the `-sm75` package
-instead (the Windows CUDA 13 one today; any build configured `-DMOSSINFER_SM75=ON` carries it): its `hello` reports the
+instead (the Windows CUDA 13 one today; any build configured `-DMOSSINFER_SM75=ON` carries it, and so does the Linux
+`-sm70` package): its `hello` reports the
 device supported, while `recommended_flavour` stays `cu13` because that follows the driver, not the package. Branch on
 `devices[i].supported` and `unsupported_reason`, not on `recommended_flavour` alone, and prefer the `-sm75` asset when
 the only GPUs are 7.5. What such a build runs is in [sm75.md](sm75.md).

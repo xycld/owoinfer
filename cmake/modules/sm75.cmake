@@ -10,6 +10,7 @@
 #   - the portable SIMT translation units are also compiled for sm_75,
 #   - flash_attention.cu / gemm.cpp / chunk_rule.cu dispatch into the sm_75 kernels,
 #   - the sm75_check bring-up tool is built.
+# MOSSINFER_SM70 (cmake/modules/sm70.cmake) turns on the same paths, and also builds convert and vae_sm75 for sm_70.
 # Tolerates the sources being filtered out by MOSSINFER_ONLY.
 set(_mi_sm75_sources ${MOSSINFER_SOURCES})
 list(FILTER _mi_sm75_sources INCLUDE REGEX ".*/src/kernels/sm75/[^/]*\\.cu$")
@@ -111,14 +112,12 @@ if((MOSSINFER_SM75 OR MOSSINFER_SM70) AND _mi_sm75_present)
   # src/backend/probe.h: the minimum compute capability and the architecture list this build accepts. Defined on the
   # sources that read it rather than on the whole target, so a build without MOSSINFER_SM75 keeps its old objects and
   # adding the option only recompiles the dispatchers.
-  if(MOSSINFER_SM75 OR MOSSINFER_SM70)
-    set_property(SOURCE ${CMAKE_SOURCE_DIR}/src/backend/probe.cpp
+  set_property(SOURCE ${CMAKE_SOURCE_DIR}/src/backend/probe.cpp
                       ${CMAKE_SOURCE_DIR}/src/kernels/attention/flash_attention.cu
                       ${CMAKE_SOURCE_DIR}/src/kernels/basic/gemm.cpp
                       ${CMAKE_SOURCE_DIR}/src/kernels/gdn/chunk_rule.cu
                APPEND PROPERTY COMPILE_DEFINITIONS MOSSINFER_HAVE_SM75=1)
-    message(STATUS "SM75: compute capability 7.5 accepted")
-  endif()
+  message(STATUS "SM75: compute capability 7.5 accepted")
 
   # Bring-up harness (not installed): the engine's GPU tests compile their reference kernels for the build's CUDA
   # architectures, so a Turing device cannot run them; this tool builds its own host reference.
