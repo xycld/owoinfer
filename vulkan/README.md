@@ -87,3 +87,37 @@ bias.
 | `tools/vulkan_block_check.cpp` | the block's kernels against host replays, one block's timing |
 | `tools/vulkan_block_real.cpp` | real blocks against the engine's captured output |
 | `tools/probe.py` | a device's cooperative-matrix shapes and heaps, using only the Vulkan loader (no headers) |
+
+## Text encoder
+
+`text_encoder.h` runs the Qwen3.5 text encoder (`Qwen3_5Model(input_ids).last_hidden_state`, bf16 [S, 4096] per prompt)
+for several prompts at once. Its GEMMs are `BlockKernels`' on either path. Its own kernels (`te_kernels.h`) need no
+cooperative matrices, 16-bit arithmetic or particular subgroup size, so both paths share them: the Qwen RMSNorms (with
+torch's reduction order for the row count, and RoPE fused into the q/k norm), conv1d with SiLU, the GatedDeltaNet gates,
+the engine's chunked gated delta rule in fp32 (four kernels, each within 32 KiB of shared memory), causal grouped-query
+attention at head_dim 256, and the gated products. Weights stream from the safetensors files: four threads read layer
+k + 2 into host staging while layer k runs and layer k + 1 is copied to the device on the transfer queue
+(`Device::copy_async`). The embedding table stays on the host. Device memory is two layer buffers (833 MiB) plus about
+130 KiB per token.
+
+```sh
+build-vulkan/vulkan_te_kernel_check                       # each kernel against a host replay of its op order
+build-vulkan/vulkan_te_check --golden tests/golden        # the encoder against the official pipeline's hidden states
+build-vulkan/vulkan_te_check --golden tests/golden --case g_long4096_1024 --profile
+```
+
+Against the goldens of the official PyTorch pipeline on an RTX 4090 Laptop, last_hidden_state, with torch's own
+deviation from the same goldens when one of its kernels changes (the worse of SDPA math and cuBLASLt,
+`tests/data/qwen35_text/noise_floor.json`):
+
+| Prompt | Tokens | Cosine, coop | Cosine, plain | Cosine, torch | Mean row rel. L2, coop | plain | torch |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| g_fridge cond | 62 | 0.9998972 | 0.9998746 | 0.9998949 | 1.29e-2 | 1.32e-2 | 1.29e-2 |
+| g_fridge uncond | 10 | 0.9998012 | 0.9997889 | 0.9998333 | 1.84e-2 | 1.90e-2 | 1.60e-2 |
+| g_short cond | 29 | 0.9998692 | 0.9998715 | 0.9999026 | 1.47e-2 | 1.50e-2 | 1.33e-2 |
+| g_layout cond | 172 | 0.9998756 | 0.9998911 | 0.9998857 | 1.45e-2 | 1.38e-2 | 1.44e-2 |
+| g_layout uncond | 16 | 0.9998486 | 0.9998133 | 0.9998634 | 1.64e-2 | 1.81e-2 | 1.52e-2 |
+| g_long4096 cond | 4096 | 0.9985798 | | 0.9992133 | 2.19e-2 | | 1.89e-2 |
+
+Differences grow over the 32 layers until they reach torch's own sensitivity to a kernel change; after the first layer
+they are at the level of one bf16 rounding (layer 0, row relative L2 at most 7.1e-3 on both paths).
