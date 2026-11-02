@@ -1,6 +1,5 @@
-// Minimal safetensors reader for the Vulkan backend: a file's header, and one tensor's bytes on demand. A sharded model is
-// a set of files named by its model.safetensors.index.json (or diffusion_pytorch_model.safetensors.index.json).
-// Reads with std::ifstream, so it is the same on every platform. Failures throw std::runtime_error.
+// A minimal safetensors reader: the header of one file, tensor bytes read with pread, and the shard map of a
+// model.safetensors.index.json. Failures throw std::runtime_error.
 #pragma once
 
 #include <cstddef>
@@ -14,32 +13,53 @@
 namespace mi::vk::st {
 
 struct TensorInfo {
-  std::string dtype;  // as the header spells it: "BF16", "F32", "F16", "I64", ...
+  std::string name;
+  std::string dtype;  // as stored, e.g. "BF16", "F32"
   std::vector<std::int64_t> shape;
-  std::uint64_t offset = 0;  // from the start of the file
+  std::uint64_t offset = 0;  // of the first byte, from the start of the file
   std::uint64_t bytes = 0;
-  std::filesystem::path file;
 };
 
-// The tensors of one file, or of every shard of a model directory.
+class File {
+ public:
+  explicit File(const std::string& path);
+  ~File();
+  File(const File&) = delete;
+  File& operator=(const File&) = delete;
+
+  const std::string& path() const { return path_; }
+  const std::vector<TensorInfo>& tensors() const { return tensors_; }
+  const TensorInfo* find(const std::string& name) const;  // null if absent
+  const TensorInfo& at(const std::string& name) const;    // throws if absent
+
+  // `bytes` bytes of tensor `t` from byte `rel` of it into `dst`.
+  void read(const TensorInfo& t, void* dst, std::uint64_t rel, std::uint64_t bytes) const;
+  void read(const TensorInfo& t, void* dst) const { read(t, dst, 0, t.bytes); }
+
+ private:
+  std::string path_;
+  int fd_ = -1;
+  std::vector<TensorInfo> tensors_;
+  std::map<std::string, std::size_t> by_name_;
+};
+
+// model.safetensors.index.json's weight_map: tensor name -> shard file name (relative to the index's directory).
+std::map<std::string, std::string> read_index(const std::string& path);
+
+// The tensors of one file, or of every shard of a model directory, by name.
 class Index {
  public:
   // A .safetensors file, or a directory holding one *.safetensors.index.json (its shards) or exactly one .safetensors.
   explicit Index(const std::filesystem::path& path);
 
-  const std::map<std::string, TensorInfo>& tensors() const { return tensors_; }
   bool has(const std::string& name) const { return tensors_.count(name) != 0; }
-  // Throws if the tensor is missing.
-  const TensorInfo& at(const std::string& name) const;
-
-  // Reads a tensor's bytes, or throws.
-  std::vector<std::byte> read(const std::string& name) const;
-  // Reads into caller memory of exactly info.bytes.
+  const TensorInfo& at(const std::string& name) const;  // throws if absent
+  // Reads a whole tensor into caller memory of exactly its size, or throws.
   void read_into(const std::string& name, void* out, std::uint64_t bytes) const;
 
  private:
-  void add_file(const std::filesystem::path& file);
-  std::map<std::string, TensorInfo> tensors_;
+  std::vector<std::unique_ptr<File>> files_;
+  std::map<std::string, std::pair<const File*, const TensorInfo*>> tensors_;
 };
 
 }  // namespace mi::vk::st

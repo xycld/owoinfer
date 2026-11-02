@@ -1,20 +1,31 @@
 #include "safetensors.h"
 
+#include <fcntl.h>
+
 #include <cstring>
 #include <fstream>
-#include <set>
+#include <sstream>
 #include <stdexcept>
+
+#ifdef _WIN32
+#include <io.h>
+
+#include <mutex>
+#else
+#include <unistd.h>
+#endif
 
 namespace mi::vk::st {
 namespace {
 
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("safetensors: " + what); }
 
-// Just enough JSON for safetensors headers and index files: objects, arrays, strings without \u escapes beyond ASCII
-// passthrough, integers, true/false/null.
+// The JSON subset safetensors headers and index files use: objects, arrays, strings, numbers, true/false/null.
 struct Json {
   enum class Kind { kNull, kBool, kNumber, kString, kArray, kObject } kind = Kind::kNull;
-  std::string text;  // string value, or the number's spelling
+  double number = 0;
+  std::int64_t integer = 0;  // exact for integral numbers
+  std::string text;
   std::vector<Json> items;
   std::vector<std::pair<std::string, Json>> members;
 
@@ -30,19 +41,19 @@ class Parser {
  public:
   explicit Parser(const std::string& s) : s_(s) {}
 
-  Json parse() {
-    Json j = value();
-    space();
-    if (i_ != s_.size()) fail("trailing characters in JSON");
-    return j;
+  Json parse_document() {
+    Json v = value();
+    skip();
+    if (i_ != s_.size()) fail("trailing bytes after the JSON value");
+    return v;
   }
 
  private:
-  void space() {
+  void skip() {
     while (i_ < s_.size() && (s_[i_] == ' ' || s_[i_] == '\n' || s_[i_] == '\r' || s_[i_] == '\t')) ++i_;
   }
   char peek() {
-    space();
+    skip();
     if (i_ >= s_.size()) fail("unexpected end of JSON");
     return s_[i_];
   }
@@ -50,213 +61,321 @@ class Parser {
     if (peek() != c) fail(std::string("expected '") + c + "' in JSON");
     ++i_;
   }
-  std::string string() {
-    expect('"');
-    std::string out;
-    while (true) {
-      if (i_ >= s_.size()) fail("unterminated JSON string");
-      const char c = s_[i_++];
-      if (c == '"') return out;
-      if (c != '\\') {
-        out += c;
-        continue;
-      }
-      if (i_ >= s_.size()) fail("unterminated JSON escape");
-      const char e = s_[i_++];
-      switch (e) {
-        case 'n': out += '\n'; break;
-        case 't': out += '\t'; break;
-        case 'r': out += '\r'; break;
-        case 'b': out += '\b'; break;
-        case 'f': out += '\f'; break;
-        case 'u': {
-          if (i_ + 4 > s_.size()) fail("short \\u escape");
-          const unsigned code = static_cast<unsigned>(std::stoul(s_.substr(i_, 4), nullptr, 16));
-          i_ += 4;
-          // Names and dtypes are ASCII; anything else only has to survive as some bytes.
-          if (code < 0x80) out += static_cast<char>(code);
-          else out += '?';
-          break;
-        }
-        default: out += e;
-      }
-    }
-  }
+
   Json value() {
-    Json j;
     const char c = peek();
-    if (c == '{') {
-      ++i_;
-      j.kind = Json::Kind::kObject;
-      if (peek() == '}') {
-        ++i_;
-        return j;
-      }
-      while (true) {
-        std::string key = string();
-        expect(':');
-        j.members.emplace_back(std::move(key), value());
-        if (peek() == ',') {
-          ++i_;
-          continue;
-        }
-        expect('}');
-        return j;
-      }
-    }
-    if (c == '[') {
-      ++i_;
-      j.kind = Json::Kind::kArray;
-      if (peek() == ']') {
-        ++i_;
-        return j;
-      }
-      while (true) {
-        j.items.push_back(value());
-        if (peek() == ',') {
-          ++i_;
-          continue;
-        }
-        expect(']');
-        return j;
-      }
-    }
+    if (c == '{') return object();
+    if (c == '[') return array();
     if (c == '"') {
-      j.kind = Json::Kind::kString;
-      j.text = string();
-      return j;
+      Json v;
+      v.kind = Json::Kind::kString;
+      v.text = string();
+      return v;
     }
     if (s_.compare(i_, 4, "true") == 0 || s_.compare(i_, 5, "false") == 0) {
-      j.kind = Json::Kind::kBool;
-      j.text = s_[i_] == 't' ? "true" : "false";
-      i_ += j.text.size();
-      return j;
+      Json v;
+      v.kind = Json::Kind::kBool;
+      v.integer = s_[i_] == 't';
+      i_ += s_[i_] == 't' ? 4 : 5;
+      return v;
     }
     if (s_.compare(i_, 4, "null") == 0) {
       i_ += 4;
-      return j;
+      return {};
     }
+    return number();
+  }
+
+  Json object() {
+    Json v;
+    v.kind = Json::Kind::kObject;
+    expect('{');
+    if (peek() == '}') {
+      ++i_;
+      return v;
+    }
+    for (;;) {
+      std::string key = (peek(), string());
+      expect(':');
+      v.members.emplace_back(std::move(key), value());
+      if (peek() == ',') {
+        ++i_;
+        continue;
+      }
+      expect('}');
+      return v;
+    }
+  }
+
+  Json array() {
+    Json v;
+    v.kind = Json::Kind::kArray;
+    expect('[');
+    if (peek() == ']') {
+      ++i_;
+      return v;
+    }
+    for (;;) {
+      v.items.push_back(value());
+      if (peek() == ',') {
+        ++i_;
+        continue;
+      }
+      expect(']');
+      return v;
+    }
+  }
+
+  std::string string() {
+    expect('"');
+    std::string out;
+    while (i_ < s_.size() && s_[i_] != '"') {
+      char c = s_[i_++];
+      if (c == '\\') {
+        if (i_ >= s_.size()) break;
+        const char e = s_[i_++];
+        switch (e) {
+          case 'n':
+            c = '\n';
+            break;
+          case 't':
+            c = '\t';
+            break;
+          case 'r':
+            c = '\r';
+            break;
+          case 'b':
+            c = '\b';
+            break;
+          case 'f':
+            c = '\f';
+            break;
+          case 'u': {
+            // Names here are ASCII; other code points are kept as UTF-8 of the BMP value.
+            if (i_ + 4 > s_.size()) fail("bad \\u escape");
+            const unsigned cp = static_cast<unsigned>(std::stoul(s_.substr(i_, 4), nullptr, 16));
+            i_ += 4;
+            if (cp < 0x80) {
+              out += static_cast<char>(cp);
+            } else if (cp < 0x800) {
+              out += static_cast<char>(0xC0 | (cp >> 6));
+              out += static_cast<char>(0x80 | (cp & 0x3F));
+            } else {
+              out += static_cast<char>(0xE0 | (cp >> 12));
+              out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+              out += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+            continue;
+          }
+          default:
+            c = e;
+            break;
+        }
+      }
+      out += c;
+    }
+    if (i_ >= s_.size()) fail("unterminated JSON string");
+    ++i_;
+    return out;
+  }
+
+  Json number() {
     const std::size_t start = i_;
-    while (i_ < s_.size() && (std::strchr("+-0123456789.eE", s_[i_]) != nullptr)) ++i_;
-    if (start == i_) fail("bad JSON value");
-    j.kind = Json::Kind::kNumber;
-    j.text = s_.substr(start, i_ - start);
-    return j;
+    bool integral = true;
+    while (i_ < s_.size() && (std::strchr("+-0123456789.eE", s_[i_]) != nullptr)) {
+      if (s_[i_] == '.' || s_[i_] == 'e' || s_[i_] == 'E') integral = false;
+      ++i_;
+    }
+    if (start == i_) fail("unexpected character in JSON");
+    Json v;
+    v.kind = Json::Kind::kNumber;
+    const std::string text = s_.substr(start, i_ - start);
+    v.number = std::stod(text);
+    v.integer = integral ? std::stoll(text) : static_cast<std::int64_t>(v.number);
+    return v;
   }
 
   const std::string& s_;
   std::size_t i_ = 0;
 };
 
-std::string read_text(const std::filesystem::path& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) fail("cannot open " + path.string());
-  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-}
-
-std::uint64_t to_u64(const Json& j) {
-  if (j.kind != Json::Kind::kNumber) fail("expected a number");
-  return std::stoull(j.text);
-}
-
-std::size_t dtype_bytes(const std::string& dtype) {
-  if (dtype == "F64" || dtype == "I64" || dtype == "U64") return 8;
+std::uint64_t dtype_bytes(const std::string& dtype) {
+  if (dtype == "BF16" || dtype == "F16" || dtype == "I16" || dtype == "U16") return 2;
   if (dtype == "F32" || dtype == "I32" || dtype == "U32") return 4;
-  if (dtype == "F16" || dtype == "BF16" || dtype == "I16" || dtype == "U16") return 2;
+  if (dtype == "F64" || dtype == "I64" || dtype == "U64") return 8;
   if (dtype == "I8" || dtype == "U8" || dtype == "BOOL" || dtype == "F8_E4M3" || dtype == "F8_E5M2") return 1;
-  fail("unknown dtype " + dtype);
+  return 0;
+}
+
+#ifdef _WIN32
+std::mutex g_read_mutex;  // _lseeki64 + _read share the descriptor's position
+#endif
+
+void read_at(int fd, void* dst, std::uint64_t offset, std::uint64_t bytes, const std::string& path) {
+  auto* out = static_cast<char*>(dst);
+  while (bytes > 0) {
+    const std::uint64_t want = bytes < (std::uint64_t{1} << 30) ? bytes : (std::uint64_t{1} << 30);
+#ifdef _WIN32
+    std::lock_guard<std::mutex> lock(g_read_mutex);
+    if (_lseeki64(fd, static_cast<__int64>(offset), SEEK_SET) < 0) fail("seek failed in " + path);
+    const int got = _read(fd, out, static_cast<unsigned>(want));
+#else
+    const ssize_t got = ::pread(fd, out, static_cast<std::size_t>(want), static_cast<off_t>(offset));
+#endif
+    if (got <= 0) fail("read failed or hit the end of " + path);
+    out += got;
+    offset += static_cast<std::uint64_t>(got);
+    bytes -= static_cast<std::uint64_t>(got);
+  }
+}
+
+void close_fd(int fd) {
+  if (fd < 0) return;
+#ifdef _WIN32
+  _close(fd);
+#else
+  ::close(fd);
+#endif
 }
 
 }  // namespace
 
+File::File(const std::string& path) : path_(path) {
+#ifdef _WIN32
+  fd_ = _open(path.c_str(), _O_RDONLY | _O_BINARY);
+#else
+  fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+#endif
+  if (fd_ < 0) fail("cannot open " + path);
+  try {
+    std::uint64_t header_bytes = 0;
+    unsigned char le[8];
+    read_at(fd_, le, 0, 8, path);
+    for (int i = 7; i >= 0; --i) header_bytes = (header_bytes << 8) | le[i];
+    if (header_bytes == 0 || header_bytes > (std::uint64_t{100} << 20)) fail("implausible header size in " + path);
+    std::string header(static_cast<std::size_t>(header_bytes), '\0');
+    read_at(fd_, header.data(), 8, header_bytes, path);
+    const Json root = Parser(header).parse_document();
+    if (root.kind != Json::Kind::kObject) fail("header of " + path + " is not an object");
+    const std::uint64_t data_start = 8 + header_bytes;
+    for (const auto& [name, v] : root.members) {
+      if (name == "__metadata__") continue;
+      const Json* dtype = v.find("dtype");
+      const Json* shape = v.find("shape");
+      const Json* offsets = v.find("data_offsets");
+      if (dtype == nullptr || shape == nullptr || offsets == nullptr || dtype->kind != Json::Kind::kString ||
+          shape->kind != Json::Kind::kArray || offsets->kind != Json::Kind::kArray || offsets->items.size() != 2) {
+        fail("malformed entry " + name + " in " + path);
+      }
+      TensorInfo t;
+      t.name = name;
+      t.dtype = dtype->text;
+      std::uint64_t numel = 1;
+      for (const Json& d : shape->items) {
+        if (d.kind != Json::Kind::kNumber || d.integer < 0) fail("bad shape of " + name);
+        t.shape.push_back(d.integer);
+        numel *= static_cast<std::uint64_t>(d.integer);
+      }
+      const std::int64_t begin = offsets->items[0].integer, end = offsets->items[1].integer;
+      if (begin < 0 || end < begin) fail("bad data_offsets of " + name);
+      t.offset = data_start + static_cast<std::uint64_t>(begin);
+      t.bytes = static_cast<std::uint64_t>(end - begin);
+      const std::uint64_t item = dtype_bytes(t.dtype);
+      if (item != 0 && numel * item != t.bytes) fail("size of " + name + " does not match its dtype and shape");
+      by_name_[t.name] = tensors_.size();
+      tensors_.push_back(std::move(t));
+    }
+  } catch (...) {
+    close_fd(fd_);  // the destructor does not run for a constructor that throws
+    throw;
+  }
+}
+
+File::~File() { close_fd(fd_); }
+
+const TensorInfo* File::find(const std::string& name) const {
+  const auto it = by_name_.find(name);
+  return it == by_name_.end() ? nullptr : &tensors_[it->second];
+}
+
+const TensorInfo& File::at(const std::string& name) const {
+  const TensorInfo* t = find(name);
+  if (t == nullptr) fail(path_ + " has no tensor " + name);
+  return *t;
+}
+
+void File::read(const TensorInfo& t, void* dst, std::uint64_t rel, std::uint64_t bytes) const {
+  if (rel > t.bytes || bytes > t.bytes - rel) fail("read past the end of tensor " + t.name);
+  read_at(fd_, dst, t.offset + rel, bytes, path_);
+}
+
+std::map<std::string, std::string> read_index(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) fail("cannot open " + path);
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  const std::string text = ss.str();
+  const Json root = Parser(text).parse_document();
+  const Json* map = root.find("weight_map");
+  if (map == nullptr || map->kind != Json::Kind::kObject) fail(path + " has no weight_map object");
+  std::map<std::string, std::string> out;
+  for (const auto& [name, file] : map->members) {
+    if (file.kind != Json::Kind::kString) fail("weight_map entry " + name + " is not a string");
+    out[name] = file.text;
+  }
+  return out;
+}
+
 Index::Index(const std::filesystem::path& path) {
+  const auto add = [&](const std::filesystem::path& file) {
+    files_.push_back(std::make_unique<File>(file.string()));
+    const File& f = *files_.back();
+    for (const TensorInfo& t : f.tensors()) {
+      if (!tensors_.emplace(t.name, std::make_pair(&f, &t)).second) {
+        throw std::runtime_error("safetensors: " + t.name + " appears in more than one file under " + path.string());
+      }
+    }
+  };
   if (!std::filesystem::is_directory(path)) {
-    add_file(path);
+    add(path);
     return;
   }
   std::vector<std::filesystem::path> indexes, files;
   for (const auto& entry : std::filesystem::directory_iterator(path)) {
     const std::string name = entry.path().filename().string();
-    if (name.size() > 22 && name.ends_with(".safetensors.index.json")) indexes.push_back(entry.path());
+    if (name.ends_with(".safetensors.index.json")) indexes.push_back(entry.path());
     else if (name.ends_with(".safetensors")) files.push_back(entry.path());
   }
-  if (indexes.size() > 1) fail(path.string() + " holds more than one index file");
+  if (indexes.size() > 1) throw std::runtime_error("safetensors: " + path.string() + " holds more than one index file");
   if (indexes.empty()) {
-    if (files.size() != 1) fail(path.string() + " holds no index file and not exactly one .safetensors file");
-    add_file(files.front());
+    if (files.size() != 1) {
+      throw std::runtime_error("safetensors: " + path.string() + " holds no index file and not exactly one .safetensors file");
+    }
+    add(files.front());
     return;
   }
-  const Json index = Parser(read_text(indexes.front())).parse();
-  const Json* map = index.find("weight_map");
-  if (map == nullptr || map->kind != Json::Kind::kObject) fail(indexes.front().string() + " has no weight_map");
-  std::set<std::string> shards;
-  for (const auto& [name, file] : map->members) shards.insert(file.text);
-  for (const std::string& shard : shards) add_file(path / shard);
-  for (const auto& [name, file] : map->members) {
-    if (!has(name)) fail(name + " is in the index but in no shard");
-  }
-}
-
-void Index::add_file(const std::filesystem::path& file) {
-  std::ifstream in(file, std::ios::binary);
-  if (!in) fail("cannot open " + file.string());
-  std::uint64_t header_bytes = 0;
-  unsigned char size[8];
-  if (!in.read(reinterpret_cast<char*>(size), 8)) fail(file.string() + " is too short");
-  for (int i = 7; i >= 0; --i) header_bytes = (header_bytes << 8) | size[i];
-  if (header_bytes > (std::uint64_t{100} << 20)) fail(file.string() + " has an implausible header size");
-  std::string header(header_bytes, '\0');
-  if (!in.read(header.data(), static_cast<std::streamsize>(header_bytes))) fail(file.string() + " has a short header");
-  const std::uint64_t data_start = 8 + header_bytes;
-  const std::uint64_t file_bytes = std::filesystem::file_size(file);
-
-  const Json root = Parser(header).parse();
-  if (root.kind != Json::Kind::kObject) fail(file.string() + ": the header is not an object");
-  for (const auto& [name, t] : root.members) {
-    if (name == "__metadata__") continue;
-    const Json* dtype = t.find("dtype");
-    const Json* shape = t.find("shape");
-    const Json* offsets = t.find("data_offsets");
-    if (dtype == nullptr || shape == nullptr || offsets == nullptr || offsets->items.size() != 2) {
-      fail(file.string() + ": malformed entry " + name);
-    }
-    TensorInfo info;
-    info.dtype = dtype->text;
-    std::uint64_t count = 1;
-    for (const Json& d : shape->items) {
-      info.shape.push_back(static_cast<std::int64_t>(to_u64(d)));
-      count *= to_u64(d);
-    }
-    const std::uint64_t begin = to_u64(offsets->items[0]), end = to_u64(offsets->items[1]);
-    if (end < begin || end - begin != count * dtype_bytes(info.dtype) || data_start + end > file_bytes) {
-      fail(file.string() + ": bad extent for " + name);
-    }
-    info.offset = data_start + begin;
-    info.bytes = end - begin;
-    info.file = file;
-    if (!tensors_.emplace(name, std::move(info)).second) fail(name + " appears twice");
+  std::map<std::string, bool> shards;
+  const std::map<std::string, std::string> weight_map = read_index(indexes.front().string());
+  for (const auto& [name, shard] : weight_map) shards[shard] = true;
+  for (const auto& [shard, unused] : shards) add(path / shard);
+  for (const auto& [name, shard] : weight_map) {
+    if (!has(name)) throw std::runtime_error("safetensors: " + name + " is in the index but in no shard");
   }
 }
 
 const TensorInfo& Index::at(const std::string& name) const {
   const auto it = tensors_.find(name);
-  if (it == tensors_.end()) fail("no tensor " + name);
-  return it->second;
-}
-
-std::vector<std::byte> Index::read(const std::string& name) const {
-  std::vector<std::byte> out(at(name).bytes);
-  read_into(name, out.data(), out.size());
-  return out;
+  if (it == tensors_.end()) throw std::runtime_error("safetensors: no tensor " + name);
+  return *it->second.second;
 }
 
 void Index::read_into(const std::string& name, void* out, std::uint64_t bytes) const {
-  const TensorInfo& info = at(name);
-  if (bytes != info.bytes) fail(name + ": read of " + std::to_string(bytes) + " bytes, tensor has " + std::to_string(info.bytes));
-  std::ifstream in(info.file, std::ios::binary);
-  if (!in) fail("cannot open " + info.file.string());
-  in.seekg(static_cast<std::streamoff>(info.offset));
-  if (!in.read(static_cast<char*>(out), static_cast<std::streamsize>(bytes))) fail("short read of " + name);
+  const TensorInfo& t = at(name);
+  if (bytes != t.bytes) {
+    throw std::runtime_error("safetensors: read of " + std::to_string(bytes) + " bytes of " + name + ", which has " +
+                             std::to_string(t.bytes));
+  }
+  tensors_.at(name).first->read(t, out);
 }
 
 }  // namespace mi::vk::st

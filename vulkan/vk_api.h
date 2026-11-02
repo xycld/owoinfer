@@ -54,7 +54,12 @@
   X(vkCmdDispatch)                             \
   X(vkCmdPipelineBarrier)                      \
   X(vkCmdCopyBuffer)                           \
-  X(vkCmdFillBuffer)
+  X(vkCmdFillBuffer)                           \
+  X(vkCreateFence)                             \
+  X(vkDestroyFence)                            \
+  X(vkWaitForFences)                           \
+  X(vkCreateSemaphore)                         \
+  X(vkDestroySemaphore)
 
 #define MI_VK_DECLARE(name) extern PFN_##name name;
 MI_VK_FUNCTIONS(MI_VK_DECLARE)

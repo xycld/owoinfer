@@ -210,6 +210,14 @@ Device::Device(int index) {
     if ((queue_families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) family = i;
   }
   if (family == families) throw std::runtime_error("no compute queue on " + info_.name);
+  // A family with transfer and neither graphics nor compute is a copy engine that runs beside compute work.
+  std::uint32_t transfer = families;
+  for (std::uint32_t i = 0; i < families && transfer == families; ++i) {
+    const VkQueueFlags flags = queue_families[i].queueFlags;
+    if ((flags & VK_QUEUE_TRANSFER_BIT) != 0 && (flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == 0) transfer = i;
+  }
+  family_ = family;
+  transfer_family_ = transfer == families ? family : transfer;
 
   // Only what the shaders declare, so a shader that needs more fails at pipeline creation instead of working by luck.
   VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
@@ -252,14 +260,18 @@ Device::Device(int index) {
   }
 
   const float priority = 1.0f;
-  VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-  queue_info.queueFamilyIndex = family;
-  queue_info.queueCount = 1;
-  queue_info.pQueuePriorities = &priority;
+  VkDeviceQueueCreateInfo queue_infos[2] = {{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO},
+                                             {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+  for (VkDeviceQueueCreateInfo& q : queue_infos) {
+    q.queueCount = 1;
+    q.pQueuePriorities = &priority;
+  }
+  queue_infos[0].queueFamilyIndex = family;
+  queue_infos[1].queueFamilyIndex = transfer_family_;
   VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   device_info.pNext = &features;
-  device_info.queueCreateInfoCount = 1;
-  device_info.pQueueCreateInfos = &queue_info;
+  device_info.queueCreateInfoCount = transfer_family_ != family ? 2 : 1;
+  device_info.pQueueCreateInfos = queue_infos;
   device_info.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
   device_info.ppEnabledExtensionNames = extensions.data();
   check(vkCreateDevice(physical_, &device_info, nullptr, &device_), "vkCreateDevice");
@@ -268,9 +280,21 @@ Device::Device(int index) {
   VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   pool_info.queueFamilyIndex = family;
   check(vkCreateCommandPool(device_, &pool_info, nullptr, &pool_), "vkCreateCommandPool");
+  if (transfer_family_ != family) {
+    vkGetDeviceQueue(device_, transfer_family_, 0, &transfer_queue_);
+    pool_info.queueFamilyIndex = transfer_family_;
+    check(vkCreateCommandPool(device_, &pool_info, nullptr, &transfer_pool_), "vkCreateCommandPool");
+  }
 }
 
 Device::~Device() {
+  if (transfer_queue_ != VK_NULL_HANDLE) vkQueueWaitIdle(transfer_queue_);
+  if (queue_ != VK_NULL_HANDLE) vkQueueWaitIdle(queue_);
+  for (auto& [ticket, c] : copies_) {
+    if (c.fence != VK_NULL_HANDLE) vkDestroyFence(device_, c.fence, nullptr);
+    vkDestroySemaphore(device_, c.done, nullptr);
+  }
+  if (transfer_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, transfer_pool_, nullptr);
   if (pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, pool_, nullptr);
   if (device_ != VK_NULL_HANDLE) vkDestroyDevice(device_, nullptr);
   if (instance_ != VK_NULL_HANDLE) vkDestroyInstance(instance_, nullptr);
@@ -315,20 +339,39 @@ void Device::run(const std::function<void(VkCommandBuffer)>& record) {
   VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   submit.commandBufferCount = 1;
   submit.pCommandBuffers = &cb;
+  std::vector<VkSemaphore> waits;
+  for (const std::uint64_t ticket : run_waits_) waits.push_back(copies_.at(ticket).done);
+  const std::vector<VkPipelineStageFlags> wait_stages(waits.size(),
+                                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+  submit.waitSemaphoreCount = static_cast<std::uint32_t>(waits.size());
+  submit.pWaitSemaphores = waits.data();
+  submit.pWaitDstStageMask = wait_stages.data();
   const VkResult submitted = vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
+  const std::vector<std::uint64_t> waited_for = submitted == VK_SUCCESS ? std::move(run_waits_) : std::vector<std::uint64_t>{};
+  if (submitted == VK_SUCCESS) run_waits_.clear();
   const VkResult waited = submitted == VK_SUCCESS ? vkQueueWaitIdle(queue_) : submitted;
   vkFreeCommandBuffers(device_, pool_, 1, &cb);
   check(submitted, "vkQueueSubmit");
   check(waited, "vkQueueWaitIdle");
+  for (const std::uint64_t ticket : waited_for) {
+    copies_.at(ticket).run_done = true;
+    release_if_done(ticket);
+  }
 }
 
-Buffer::Buffer(Device& device, VkDeviceSize bytes, Kind kind) : device_(device), bytes_(bytes) {
+Buffer::Buffer(Device& device, VkDeviceSize bytes, Kind kind, bool transfer) : device_(device), bytes_(bytes) {
   const bool on_device = kind == Kind::kDevice;
   VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   info.size = bytes;
   info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   if (on_device) info.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  const std::uint32_t families[2] = {device_.queue_family(), device_.transfer_family()};
+  if (transfer && families[0] != families[1]) {
+    info.sharingMode = VK_SHARING_MODE_CONCURRENT;  // no ownership transfers between the two queues
+    info.queueFamilyIndexCount = 2;
+    info.pQueueFamilyIndices = families;
+  }
   check(vkCreateBuffer(device_.handle(), &info, nullptr, &buffer_), "vkCreateBuffer");
 
   VkMemoryRequirements requirements{};
@@ -479,6 +522,72 @@ void Pipeline::dispatch(VkCommandBuffer cb, const void* push, std::uint32_t x, s
   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
   vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes_, push);
   vkCmdDispatch(cb, x, y, 1);
+}
+
+std::uint64_t Device::copy_async(const Buffer& src, VkDeviceSize src_offset, const Buffer& dst, VkDeviceSize dst_offset,
+                                 VkDeviceSize bytes) {
+  if (src_offset > src.bytes() || bytes > src.bytes() - src_offset || dst_offset > dst.bytes() ||
+      bytes > dst.bytes() - dst_offset) {
+    throw std::runtime_error("copy_async past the end of a buffer");
+  }
+  const bool own_queue = transfer_queue_ != VK_NULL_HANDLE;
+  Copy c;
+  VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  allocate.commandPool = own_queue ? transfer_pool_ : pool_;
+  allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  allocate.commandBufferCount = 1;
+  check(vkAllocateCommandBuffers(device_, &allocate, &c.cb), "vkAllocateCommandBuffers");
+  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  check(vkBeginCommandBuffer(c.cb, &begin), "vkBeginCommandBuffer");
+  const VkBufferCopy region{src_offset, dst_offset, bytes};
+  vkCmdCopyBuffer(c.cb, src.handle(), dst.handle(), 1, &region);
+  check(vkEndCommandBuffer(c.cb), "vkEndCommandBuffer");
+  const VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  check(vkCreateFence(device_, &fence_info, nullptr, &c.fence), "vkCreateFence");
+  const VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  check(vkCreateSemaphore(device_, &semaphore_info, nullptr, &c.done), "vkCreateSemaphore");
+  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &c.cb;
+  submit.signalSemaphoreCount = 1;
+  submit.pSignalSemaphores = &c.done;
+  // On the compute queue, earlier runs completed before this was called; a run's own waits order nothing here.
+  check(vkQueueSubmit(own_queue ? transfer_queue_ : queue_, 1, &submit, c.fence), "vkQueueSubmit");
+  const std::uint64_t ticket = next_ticket_++;
+  copies_[ticket] = c;
+  return ticket;
+}
+
+void Device::gpu_wait(std::uint64_t ticket) {
+  const auto it = copies_.find(ticket);
+  if (it == copies_.end() || it->second.run_done ||
+      std::find(run_waits_.begin(), run_waits_.end(), ticket) != run_waits_.end()) {
+    throw std::runtime_error("gpu_wait on an unknown copy or one already waited for");
+  }
+  run_waits_.push_back(ticket);
+}
+
+void Device::host_wait(std::uint64_t ticket) {
+  const auto it = copies_.find(ticket);
+  if (it == copies_.end() || it->second.host_done) throw std::runtime_error("host_wait on an unknown copy");
+  Copy& c = it->second;
+  check(vkWaitForFences(device_, 1, &c.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+  vkFreeCommandBuffers(device_, transfer_queue_ != VK_NULL_HANDLE ? transfer_pool_ : pool_, 1, &c.cb);
+  vkDestroyFence(device_, c.fence, nullptr);
+  c.cb = VK_NULL_HANDLE;
+  c.fence = VK_NULL_HANDLE;
+  c.host_done = true;
+  release_if_done(ticket);
+}
+
+// The semaphore lives until the copy completed on the host's side and a run waited for it: a binary semaphore is
+// destroyed only when no signal or wait on it is pending.
+void Device::release_if_done(std::uint64_t ticket) {
+  const auto it = copies_.find(ticket);
+  if (it == copies_.end() || !it->second.host_done || !it->second.run_done) return;
+  vkDestroySemaphore(device_, it->second.done, nullptr);
+  copies_.erase(it);
 }
 
 void compute_barrier(VkCommandBuffer cb) {

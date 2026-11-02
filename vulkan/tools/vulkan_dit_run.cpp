@@ -32,7 +32,7 @@ std::uint16_t to_bf16(float v) {
   return static_cast<std::uint16_t>((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
-std::vector<float> load_f32(const fs::path& p) { return npy::load(p).as<float>("<f4"); }
+std::vector<float> load_f32(const fs::path& p) { return npy::load(p).to_vector<float>(); }
 
 struct Compare {
   double cosine, max_abs, rms_ref, rms_diff;
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
     const npy::Array noise = npy::load(dir / "initial_noise.npy");
     if (noise.shape.size() != 4 || noise.shape[1] != kDiTLatentChannels) throw std::runtime_error("unexpected noise shape");
     const auto height = static_cast<std::uint32_t>(noise.shape[2]), width = static_cast<std::uint32_t>(noise.shape[3]);
-    std::vector<float> latents = noise.as<float>("<f4");
+    std::vector<float> latents = noise.to_vector<float>();
     const std::vector<float> sigmas = load_f32(dir / "sigmas.npy"), timesteps = load_f32(dir / "timesteps.npy");
     const int total_steps = static_cast<int>(timesteps.size());
     if (steps < 0 || steps > total_steps) steps = total_steps;
@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
     std::vector<Dit::Row> rows;
     for (const char* which : {"cond", "uncond"}) {
       const npy::Array te = npy::load(golden / (name + "." + which + ".te_last_hidden.npy"));
-      const std::vector<float> values = te.as<float>("<f4");
+      const std::vector<float> values = te.to_vector<float>();
       std::vector<std::uint16_t> bits(values.size());
       for (std::size_t i = 0; i < values.size(); ++i) bits[i] = to_bf16(values[i]);  // exact: the encoder's bf16 output
       const auto length = static_cast<std::uint32_t>(te.shape[0]);

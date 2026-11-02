@@ -38,7 +38,24 @@ endforeach()
 add_library(mossinfer_vulkan STATIC vk_api.cpp runtime.cpp gemm.cpp block.cpp dit.cpp safetensors.cpp ${_spirv_files})
 target_include_directories(mossinfer_vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${_spirv_dir})
 # Headers only: vk_api.cpp opens the loader at run time, so nothing links against it.
-target_link_libraries(mossinfer_vulkan PUBLIC Vulkan::Headers ${CMAKE_DL_LIBS})
+find_package(Threads REQUIRED)
+target_link_libraries(mossinfer_vulkan PUBLIC Vulkan::Headers Threads::Threads ${CMAKE_DL_LIBS})
+
+# The Qwen3.5 text encoder (text_encoder.h): its own kernels on top of the DiT block's GEMMs.
+set(_te_spirv_files "")
+foreach(shader IN ITEMS te_rms_norm te_conv_silu te_gates te_gdn_qk te_gdn_chunk te_gdn_solve te_gdn_state te_attention
+                        te_gate_mul)
+  set(_source ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.comp)
+  set(_output ${_spirv_dir}/${shader}.spv.inc)
+  add_custom_command(
+    OUTPUT ${_output}
+    COMMAND ${GLSL_COMPILER} --target-env=vulkan1.2 -fshader-stage=comp -O -mfmt=num
+            -I${CMAKE_CURRENT_SOURCE_DIR}/shaders ${_source} -o ${_output}
+    DEPENDS ${_source} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.glsl ${CMAKE_CURRENT_SOURCE_DIR}/shaders/te_common.glsl
+    COMMENT "glslc ${shader}.comp")
+  list(APPEND _te_spirv_files ${_output})
+endforeach()
+target_sources(mossinfer_vulkan PRIVATE te_kernels.cpp text_encoder.cpp ${_te_spirv_files})
 
 # Built into the engine (cmake/modules/vulkan.cmake), the tools are off unless asked for.
 if(NOT DEFINED MOSSINFER_VULKAN_TOOLS)
@@ -64,3 +81,12 @@ target_link_libraries(vulkan_block_real PRIVATE mossinfer_vulkan)
 add_executable(vulkan_dit_run tools/vulkan_dit_run.cpp)
 target_compile_options(vulkan_dit_run PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/fp:precise,-ffp-contract=off>)
 target_link_libraries(vulkan_dit_run PRIVATE mossinfer_vulkan)
+
+# The text encoder's kernels against host replays of their op order; the replays must round where the kernels do.
+add_executable(vulkan_te_kernel_check tools/vulkan_te_kernel_check.cpp)
+target_compile_options(vulkan_te_kernel_check PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/fp:precise,-ffp-contract=off>)
+target_link_libraries(vulkan_te_kernel_check PRIVATE mossinfer_vulkan)
+
+# The whole text encoder against the official pipeline's golden hidden states.
+add_executable(vulkan_te_check tools/vulkan_te_check.cpp)
+target_link_libraries(vulkan_te_check PRIVATE mossinfer_vulkan)

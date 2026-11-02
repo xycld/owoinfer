@@ -1,0 +1,55 @@
+// GatedDeltaNet's gates, as gdn::gates: beta = bf16(sigmoid(b)), g = -exp(A_log) * softplus(a + dt_bias) in fp32 (softplus
+// threshold 20). ba: bf16 rows [b(32) | a(32)] with stride ldba; a_log, dt_bias: bf16 [32]; g: f32 [tokens, 32]; beta: bf16
+// [tokens, 32]. Invocation i handles heads 2 (i % 16) and 2 (i % 16) + 1 of token i / 16.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "te_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t ba;
+  uint64_t a_log;
+  uint64_t dt_bias;
+  uint64_t g;
+  uint64_t beta;
+  uint ldba;
+  uint tokens;
+} pc;
+
+// log(1 + y) for y >= 0. Vulkan's log has only an absolute error bound (2^-21) on [0.5, 2], so below y = 1 this sums
+// 2 atanh(s) = 2 (s + s^3 / 3 + ... + s^17 / 17), s = y / (2 + y) <= 1/3, whose dropped terms are below 2^-27 of it.
+float log1p_f(float y) {
+  if (y > 1.0) return log(1.0 + y);
+  precise const float s = y / (2.0 + y);
+  precise const float s2 = s * s;
+  precise float p = 1.0 / 17.0;
+  p = p * s2 + 1.0 / 15.0;
+  p = p * s2 + 1.0 / 13.0;
+  p = p * s2 + 1.0 / 11.0;
+  p = p * s2 + 1.0 / 9.0;
+  p = p * s2 + 1.0 / 7.0;
+  p = p * s2 + 1.0 / 5.0;
+  p = p * s2 + 1.0 / 3.0;
+  p = p * s2 + 1.0;
+  precise const float r = 2.0 * s * p;
+  return r;
+}
+
+float softplus_f(float x) { return x > 20.0 ? x : log1p_f(exp_f(x)); }
+
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.tokens * 16u) return;
+  const uint64_t t = i / 16u;
+  const uint pair = i % 16u;
+  Uints row = Uints(pc.ba + t * pc.ldba * 2ul);
+  const vec2 b = f2(row.d[pair]), a = f2(row.d[16u + pair]);
+  const vec2 a_log = f2(Uints(pc.a_log).d[pair]), dt = f2(Uints(pc.dt_bias).d[pair]);
+  Uints(pc.beta + (t * 32ul + 2ul * pair) * 2ul).d[0] = bf2(vec2(sigmoid_f(b.x), sigmoid_f(b.y)));
+  precise const vec2 x = a + dt;
+  precise const vec2 g = -vec2(exp_f(a_log.x), exp_f(a_log.y)) * vec2(softplus_f(x.x), softplus_f(x.y));
+  Floats G = Floats(pc.g + (t * 32ul + 2ul * pair) * 4ul);
+  G.d[0] = g.x;
+  G.d[1] = g.y;
+}

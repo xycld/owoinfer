@@ -1,0 +1,116 @@
+// The intra-chunk part of the chunked gated delta rule (chunk 64) for one chunk of one sequence and one value head h, as
+// the engine's prep kernel:
+//   gcum = cumsum(g) over the chunk, eg = exp(gcum), el = exp(gcum[n - 1] - gcum)
+//   a[i][j]    = (k_i . k_j) * beta_i * exp(gcum_i - gcum_j) for j < i, else 0     (the UT system's strict lower part)
+//   attn[i][j] = (q_i . k_j) * exp(gcum_i - gcum_j) for j <= i, else 0
+// with q and k of key head h / 2 from te_gdn_qk, dot products as fused multiply-adds over d ascending, and rows past the
+// sequence zero. Writes gcum, eg, el [32][tokens] and a, attn [32][tokens][64] for the chunk's rows. Workgroup (chunk, h):
+// invocation (ty, tx) = (i / 16, i % 16) owns rows ty + 16 r and columns tx + 16 c, r and c < 4.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#include "te_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t qn;
+  uint64_t kn;
+  uint64_t g;
+  uint64_t beta;
+  uint64_t gcum;
+  uint64_t eg;
+  uint64_t el;
+  uint64_t a;
+  uint64_t attn;
+  uint tokens;
+  uint row0;  // the sequence's first token
+  uint len;
+} pc;
+
+const uint C = 64u;
+
+shared float gc[C];
+shared float bt[C];
+
+vec4 row4(uint64_t base, uint kh, uint t, uint d4) {
+  return Vec4f(base + ((uint64_t(kh) * pc.tokens + t) * 128ul) * 4ul).d[d4];
+}
+
+void main() {
+  const uint tid = gl_LocalInvocationIndex;
+  const uint h = gl_WorkGroupID.y, kh = h / 2u;
+  const uint c0 = gl_WorkGroupID.x * C;
+  const uint t0 = pc.row0 + c0;
+  const uint n = min(C, pc.len - c0);
+
+  if (tid < C) {
+    const bool valid = tid < n;
+    bt[tid] = valid ? bf16_at(pc.beta, uint64_t(t0 + tid) * 32ul + h) : 0.0;
+    gc[tid] = valid ? Floats(pc.g).d[(t0 + tid) * 32u + h] : 0.0;  // the padding's decay is 0 in log space
+  }
+  barrier();
+  if (tid == 0u) {
+    precise float acc = 0.0;
+    for (uint i = 0u; i < C; ++i) {
+      acc = acc + gc[i];
+      gc[i] = acc;
+    }
+  }
+  barrier();
+  if (tid < n) {
+    const uint64_t at = uint64_t(h) * pc.tokens + t0 + tid;
+    precise const float tail = gc[n - 1u] - gc[tid];
+    f32_store(pc.gcum, at, gc[tid]);
+    f32_store(pc.eg, at, exp_f(gc[tid]));
+    f32_store(pc.el, at, exp_f(tail));
+  }
+
+  const uint ty = tid / 16u, tx = tid % 16u;
+  precise float kk[4][4], qk[4][4];
+  [[unroll]] for (uint r = 0u; r < 4u; ++r) {
+    [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+      kk[r][c] = 0.0;
+      qk[r][c] = 0.0;
+    }
+  }
+  for (uint d4 = 0u; d4 < 32u; ++d4) {
+    vec4 qi[4], ki[4], kj[4];
+    [[unroll]] for (uint r = 0u; r < 4u; ++r) {
+      const uint i = ty + 16u * r, j = tx + 16u * r;
+      qi[r] = i < n ? row4(pc.qn, kh, t0 + i, d4) : vec4(0.0);
+      ki[r] = i < n ? row4(pc.kn, kh, t0 + i, d4) : vec4(0.0);
+      kj[r] = j < n ? row4(pc.kn, kh, t0 + j, d4) : vec4(0.0);
+    }
+    [[unroll]] for (uint r = 0u; r < 4u; ++r) {
+      [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+        float s = kk[r][c], p = qk[r][c];
+        s = fma(ki[r].x, kj[c].x, s);
+        s = fma(ki[r].y, kj[c].y, s);
+        s = fma(ki[r].z, kj[c].z, s);
+        s = fma(ki[r].w, kj[c].w, s);
+        p = fma(qi[r].x, kj[c].x, p);
+        p = fma(qi[r].y, kj[c].y, p);
+        p = fma(qi[r].z, kj[c].z, p);
+        p = fma(qi[r].w, kj[c].w, p);
+        kk[r][c] = s;
+        qk[r][c] = p;
+      }
+    }
+  }
+
+  [[unroll]] for (uint r = 0u; r < 4u; ++r) {
+    const uint i = ty + 16u * r;
+    if (i >= n) continue;
+    const uint64_t row = (uint64_t(h) * pc.tokens + t0 + i) * C;
+    [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+      const uint j = tx + 16u * c;
+      precise const float diff = gc[i] - gc[j];
+      const float decay = j <= i ? exp_f(diff) : 0.0;
+      precise const float lower = (kk[r][c] * bt[i]) * decay;
+      precise const float masked = qk[r][c] * decay;
+      f32_store(pc.a, row + j, j < i ? lower : 0.0);
+      f32_store(pc.attn, row + j, masked);
+    }
+  }
+}
