@@ -4,7 +4,7 @@
 // size an fp32 sum can be wrong by, whatever its order) and an elementwise op's is a fraction of the replay's rms.
 // Exit status: 0 everything passed, 1 a check failed, 2 bad usage.
 // Usage: vulkan_vae_check [--device N] [--path coop|plain] [--kat-only | --no-kat | --bench] [--vae FILE] [--latent NPY]
-//                         [--golden PNG] [--out PNG] [--crop H,W] [--iters N] [--max-macs N] [--profile]
+//                         [--golden PNG] [--out PNG] [--crop H,W] [--iters N] [--max-macs N] [--profile] [--calibrate]
 #include <zlib.h>
 
 #include <algorithm>
@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "block.h"
 #include "runtime.h"
 #include "vae.h"
 
@@ -242,12 +243,6 @@ bool report(const char* name, const std::vector<float>& got, const std::vector<d
               name, ok ? "ok    " : "FAILED", got.size(), 100.0 * static_cast<double>(same) / static_cast<double>(got.size()),
               worst, limit.max_err, limit.why, nans);
   return ok;
-}
-
-double rms(const std::vector<double>& v) {
-  double s = 0.0;
-  for (const double x : v) s += x * x;
-  return std::sqrt(s / static_cast<double>(std::max<std::size_t>(v.size(), 1)));
 }
 
 struct ConvCase {
@@ -615,12 +610,31 @@ void run_bench(Device& device, const VaeKernels& k) {
   }
 }
 
+// The DiT block's bf16 GEMM at 8222 x 3072 x 3072 (README: 33.1 TFLOPS on the coop path, 1.62 on the plain path, on an
+// idle RTX 4090 Laptop), timed next to a decode: when another process shares the GPU, its rate shows how much.
+double calibration_tflops(Device& device) {
+  const BlockKernels block(device);
+  constexpr std::uint32_t m = 8222, n = 3072, k = 3072;
+  Buffer a(device, 2ull * m * k), b(device, 2ull * n * k), c(device, 2ull * m * n);
+  device.run([&](VkCommandBuffer cb) {
+    vkCmdFillBuffer(cb, a.handle(), 0, VK_WHOLE_SIZE, 0x3c003c00u);
+    vkCmdFillBuffer(cb, b.handle(), 0, VK_WHOLE_SIZE, 0x3c003c00u);
+  });
+  double best = 1e30;
+  for (int it = 0; it < 3; ++it) {
+    const double t0 = now_s();
+    device.run([&](VkCommandBuffer cb) { block.record_gemm(cb, c.address(), n, a.address(), k, b.address(), k, m, n, k); });
+    best = std::min(best, now_s() - t0);
+  }
+  return 2.0 * m * n * k / best / 1e12;
+}
+
 // ---- Real decode ------------------------------------------------------------------------------------------------------
 
 struct Options {
   int device = -1;
   std::string path;
-  bool kat = true, decode = true, bench = false, profile = false;
+  bool kat = true, decode = true, bench = false, profile = false, calibrate = false;
   std::string vae = "/workspace/Models/MOSS-Image/base/vae/diffusion_pytorch_model.safetensors";
   std::string latent = "/workspace/Projects/MossInfer/tests/golden/g_fridge_1024/final_latent.npy";
   std::string golden = "/workspace/Projects/MossInfer/tests/golden/g_fridge_1024/image.png";
@@ -657,6 +671,10 @@ bool run_decode(Device& device, const Options& o, VaePath path) {
   std::printf("\ndecode %ux%u (latents %ux%u, decoder c = %d, path %s): weights %.1f MB, decode allocates %.3f GiB\n", 16 * w,
               16 * h, h, w, decoder.base_channels(), vae_path_name(path), static_cast<double>(decoder.weight_bytes()) / 1e6,
               static_cast<double>(decoder.workspace_bytes(h, w)) / (1024.0 * 1024.0 * 1024.0));
+  if (o.calibrate) {
+    std::printf("  calibration before: the block's GEMM 8222x3072x3072 at %.2f TFLOPS (%s path)\n", calibration_tflops(device),
+                device.info().caps.coop_bf16 ? "coop" : "plain");
+  }
   std::vector<std::uint8_t> rgb;
   std::vector<float> image;
   std::vector<double> times;
@@ -666,6 +684,7 @@ bool run_decode(Device& device, const Options& o, VaePath path) {
     times.push_back(st.seconds);
     std::printf("  run %d: %.3f s (%d submits)%s\n", i, st.seconds, st.submits, i == 0 ? ", pipelines created" : "");
   }
+  if (o.calibrate) std::printf("  calibration after: %.2f TFLOPS\n", calibration_tflops(device));
   if (o.profile) {
     double total = 0.0;
     for (const auto& [name, s] : st.profile) total += s;
@@ -725,6 +744,8 @@ int main(int argc, char** argv) {
       } else if (arg == "--bench") {
         o.bench = true;
         o.decode = false;
+      } else if (arg == "--calibrate") {
+        o.calibrate = true;
       } else if (arg == "--profile") {
         o.profile = true;
       } else if (arg == "--no-kat") {
@@ -751,7 +772,7 @@ int main(int argc, char** argv) {
       }
     } catch (const std::exception& e) {
       std::printf("%s\nusage: %s [--device N] [--path coop|plain] [--kat-only | --no-kat | --bench] [--vae FILE] [--latent NPY]\n"
-                  "       [--golden PNG] [--out PNG] [--crop H,W] [--iters N] [--max-macs N] [--profile]\n",
+                  "       [--golden PNG] [--out PNG] [--crop H,W] [--iters N] [--max-macs N] [--profile] [--calibrate]\n",
                   e.what(), argv[0]);
       return 2;
     }
