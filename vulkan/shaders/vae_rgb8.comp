@@ -1,0 +1,38 @@
+// The decoder output [n] fp32 (NHWC RGB) to RGB8 as the pipeline does: .clamp(-1, 1), then VaeImageProcessor.postprocess:
+// (x * 0.5 + 0.5).clamp(0, 1), numpy's (x * 255).round() (half to even) and .astype(uint8); NaN becomes 0. Each
+// invocation writes one 32-bit word of 4 bytes; bytes past n in the last word are written as 0.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Uints { uint d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t x;
+  uint64_t rgb;
+  uint n;
+} pc;
+
+uint to_u8(float v) {
+  if (isnan(v)) return 0u;
+  v = clamp(v, -1.0, 1.0);
+  precise const float half_ = v * 0.5;
+  precise const float shifted = half_ + 0.5;
+  v = clamp(shifted, 0.0, 1.0);
+  precise const float scaled = v * 255.0;
+  return uint(roundEven(scaled));
+}
+
+void main() {
+  const uint word = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationIndex;
+  const uint i0 = word * 4u;
+  if (i0 >= pc.n) return;
+  Floats X = Floats(pc.x);
+  uint packed = 0u;
+  for (uint j = 0u; j < 4u; ++j) {
+    if (i0 + j < pc.n) packed |= to_u8(X.d[i0 + j]) << (8u * j);
+  }
+  Uints(pc.rgb).d[word] = packed;
+}

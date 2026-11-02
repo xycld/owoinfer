@@ -35,6 +35,8 @@ class File {
   // `bytes` bytes of tensor `t` from byte `rel` of it into `dst`.
   void read(const TensorInfo& t, void* dst, std::uint64_t rel, std::uint64_t bytes) const;
   void read(const TensorInfo& t, void* dst) const { read(t, dst, 0, t.bytes); }
+  // A whole F32 or BF16 tensor as fp32 values (bf16 widened exactly), or throws.
+  std::vector<float> read_f32(const std::string& name) const;
 
  private:
   std::string path_;

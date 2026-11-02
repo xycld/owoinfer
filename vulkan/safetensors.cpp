@@ -326,6 +326,26 @@ std::map<std::string, std::string> read_index(const std::string& path) {
   return out;
 }
 
+std::vector<float> File::read_f32(const std::string& name) const {
+  const TensorInfo& t = at(name);
+  if (t.dtype == "F32") {
+    std::vector<float> out(static_cast<std::size_t>(t.bytes / 4));
+    read(t, out.data());
+    return out;
+  }
+  if (t.dtype == "BF16") {
+    std::vector<std::uint16_t> raw(static_cast<std::size_t>(t.bytes / 2));
+    read(t, raw.data());
+    std::vector<float> out(raw.size());
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+      const std::uint32_t bits = static_cast<std::uint32_t>(raw[i]) << 16;
+      std::memcpy(&out[i], &bits, 4);
+    }
+    return out;
+  }
+  throw std::runtime_error("safetensors " + path_ + ": tensor '" + name + "' is " + t.dtype + ", not F32 or BF16");
+}
+
 Index::Index(const std::filesystem::path& path) {
   const auto add = [&](const std::filesystem::path& file) {
     files_.push_back(std::make_unique<File>(file.string()));

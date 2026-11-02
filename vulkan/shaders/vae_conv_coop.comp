@@ -1,0 +1,265 @@
+// The VAE's convolutions and fp32 GEMMs on bf16 cooperative matrices with fp32 accumulators:
+//   out[m, n] = (sum_k A[m, k] * B[n, k] + bias[n]) + residual[m, n]      (each + rounded separately, as the reference)
+// with fp32 A and B in memory. Each operand is split on load into A_TERMS (B_TERMS) bf16 pieces whose sum is the operand
+// (or its TF32 rounding), and the products of pieces i, j with i + j < max(A_TERMS, B_TERMS) are accumulated:
+//   TF32 with A_TERMS 2, B_TERMS 1: cuDNN's TF32 convolution for weights that are bf16 values (the MOSS bundle's are). A is
+//     rounded to TF32 (half away from zero, as cvt.rna), whose 11 significant bits are exactly hi + lo in bf16, so every
+//     product is the exact product of the TF32 operands; only the fp32 accumulation order differs from cuDNN's.
+//   no TF32, A_TERMS 3, B_TERMS 1: an fp32 GEMM with exact products for bf16-valued weights (fp32 = 3 bf16 pieces).
+//   no TF32, A_TERMS 2, B_TERMS 2: 16 significant bits per operand, for attention scores and P V.
+// TAPS selects A: 9 is a 3x3 convolution with zero padding 1 and 1 a 1x1 convolution over an NHWC input of C channels, for
+// an H x W output whose pixels are the rows m (UPSAMPLE: the input is H/2 x W/2 and read through a nearest 2x upsample);
+// 0 is a row-major A with row stride lda. B is row-major [N, K] (a convolution's weights in KRSC order, K = TAPS C).
+// C is a multiple of 8; K, lda, ldb and ldo are multiples of 4. M and N are free.
+//
+// A workgroup computes rows m0 + 128 y .. +128 of the output and 32 FN columns from 32 FN x: 256 invocations, 8 full
+// subgroups of 32, which the pipeline must require. Subgroup s owns rows 32 (s % 4) .. +32 and columns 16 FN (s / 4) ..
+// +16 FN. K walks in steps of 16 through two shared-memory stages; the next step loads into registers while the current
+// one multiplies. Staged rows are 32 bytes (16 bf16), so a 16 x 16 fragment is one contiguous 512-byte block.
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint TAPS = 9;
+layout(constant_id = 1) const bool UPSAMPLE = false;
+layout(constant_id = 2) const uint A_TERMS = 2;  // 1..3
+layout(constant_id = 3) const uint B_TERMS = 1;  // 1..3
+layout(constant_id = 4) const bool TF32 = true;
+layout(constant_id = 5) const uint FN = 4;  // 1..4
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Vec4s { uvec4 d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t a;
+  uint64_t b;
+  uint64_t out_;
+  uint64_t bias;      // 0: none
+  uint64_t residual;  // 0: none; [M, N] with stride ldo, may be out_
+  uint M;             // rows end (exclusive)
+  uint N;
+  uint K;
+  uint lda;
+  uint ldb;
+  uint ldo;
+  uint H;
+  uint W;
+  uint C;
+  uint m0;  // first row
+} pc;
+
+const uint BM = 128u;
+const uint BN = 32u * FN;
+const uint BK = 16u;
+const uint TERMS = A_TERMS > B_TERMS ? A_TERMS : B_TERMS;
+// uvec4 per stage: A pieces of BM rows, then B pieces of BN rows, 2 uvec4 per row.
+const uint A_PIECE = BM * 2u;
+const uint B_PIECE = BN * 2u;
+const uint STAGE = A_TERMS * A_PIECE + B_TERMS * B_PIECE;
+const uint STAGING = 64u;  // uvec4 per 16x16 fp32 fragment in the epilogue: 8 subgroups need 512, below any STAGE
+
+shared uvec4 smem[2u * STAGE];
+
+#define FRAG_A coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define FRAG_B coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+// Round half away from zero to 10 mantissa bits; infinities and NaNs pass.
+float tf32(float v) {
+  const uint u = floatBitsToUint(v);
+  if ((u & 0x7f800000u) == 0x7f800000u) return v;
+  return uintBitsToFloat((u + 0x1000u) & 0xffffe000u);
+}
+
+// 8 fp32 values -> TERMS pieces of 8 bf16 (round to nearest even each; the remainders are exact in fp32).
+void split8(vec4 lo, vec4 hi, bool round_tf32, uint terms, out uvec4 piece[3]) {
+  vec4 r0 = lo, r1 = hi;
+  if (round_tf32) {
+    r0 = vec4(tf32(r0.x), tf32(r0.y), tf32(r0.z), tf32(r0.w));
+    r1 = vec4(tf32(r1.x), tf32(r1.y), tf32(r1.z), tf32(r1.w));
+  }
+  [[unroll]] for (uint t = 0u; t < 3u; ++t) {
+    piece[t] = uvec4(0u);
+    if (t < terms) {
+      const uvec2 p0 = bf4(r0), p1 = bf4(r1);
+      piece[t] = uvec4(p0, p1);
+      precise const vec4 n0 = r0 - f4(p0), n1 = r1 - f4(p1);
+      r0 = n0;
+      r1 = n1;
+    }
+  }
+}
+
+// The 8 values of A at row m, columns k .. k + 7; zero outside the tensor or the padding.
+void load_a(uint m, uint k, out vec4 lo, out vec4 hi) {
+  lo = vec4(0.0);
+  hi = vec4(0.0);
+  if (m >= pc.M || k >= pc.K) return;
+  uint64_t at;
+  if (TAPS == 0u) {
+    at = uint64_t(m) * pc.lda + k;
+  } else {
+    const uint tap = k / pc.C, c = k - tap * pc.C;
+    const uint oy = m / pc.W, ox = m - oy * pc.W;
+    if (TAPS == 1u) {
+      at = uint64_t(m) * pc.C + c;
+    } else {
+      const int iy = int(oy) + int(tap / 3u) - 1, ix = int(ox) + int(tap % 3u) - 1;
+      if (iy < 0 || ix < 0 || iy >= int(pc.H) || ix >= int(pc.W)) return;
+      if (UPSAMPLE) {
+        at = (uint64_t(uint(iy) >> 1) * (pc.W >> 1) + (uint(ix) >> 1)) * pc.C + c;
+      } else {
+        at = (uint64_t(iy) * pc.W + uint(ix)) * pc.C + c;
+      }
+    }
+  }
+  Vec4s p = Vec4s(pc.a + at * 4ul);
+  lo = uintBitsToFloat(p.d[0]);
+  if (k + 4u < pc.K) hi = uintBitsToFloat(p.d[1]);  // K is a multiple of 4: the chunk's second half may lie past it
+}
+
+void load_b(uint n, uint k, out vec4 lo, out vec4 hi) {
+  lo = vec4(0.0);
+  hi = vec4(0.0);
+  if (n >= pc.N || k >= pc.K) return;
+  Vec4s p = Vec4s(pc.b + (uint64_t(n) * pc.ldb + k) * 4ul);
+  lo = uintBitsToFloat(p.d[0]);
+  if (k + 4u < pc.K) hi = uintBitsToFloat(p.d[1]);
+}
+
+// Invocation i loads 8 values (columns 8 (i % 2) ..) of tile row i / 2 of A and, while i / 2 < BN, of B.
+struct Regs {
+  vec4 a_lo, a_hi, b_lo, b_hi;
+};
+
+void load_step(uint m_base, uint n_base, uint k0, out Regs r) {
+  const uint i = gl_LocalInvocationIndex;
+  const uint row = i / 2u, k = k0 + (i % 2u) * 8u;
+  load_a(m_base + row, k, r.a_lo, r.a_hi);
+  r.b_lo = vec4(0.0);
+  r.b_hi = vec4(0.0);
+  if (row < BN) load_b(n_base + row, k, r.b_lo, r.b_hi);
+}
+
+void store_step(uint stage, const Regs r) {
+  const uint i = gl_LocalInvocationIndex;
+  const uint row = i / 2u, half_ = i % 2u;
+  const uint base = stage * STAGE;
+  uvec4 piece[3];
+  split8(r.a_lo, r.a_hi, TF32, A_TERMS, piece);
+  [[unroll]] for (uint t = 0u; t < 3u; ++t) {
+    if (t < A_TERMS) smem[base + t * A_PIECE + row * 2u + half_] = piece[t];
+  }
+  if (row < BN) {
+    split8(r.b_lo, r.b_hi, TF32, B_TERMS, piece);
+    [[unroll]] for (uint t = 0u; t < 3u; ++t) {
+      if (t < B_TERMS) smem[base + A_TERMS * A_PIECE + t * B_PIECE + row * 2u + half_] = piece[t];
+    }
+  }
+}
+
+void sync_subgroup() {
+  subgroupMemoryBarrierShared();
+  subgroupBarrier();
+}
+
+void main() {
+  const uint m_base = pc.m0 + gl_WorkGroupID.y * BM;
+  const uint n_base = gl_WorkGroupID.x * BN;
+  const uint sg = gl_SubgroupID;
+  const uint row0 = (sg % 4u) * 32u;
+  const uint col0 = (sg / 4u) * 16u * FN;
+
+  ACC acc[2][4];
+  [[unroll]] for (uint r = 0u; r < 2u; ++r) {
+    [[unroll]] for (uint c = 0u; c < 4u; ++c) acc[r][c] = ACC(0.0);
+  }
+
+  const uint steps = (pc.K + BK - 1u) / BK;
+  Regs regs;
+  load_step(m_base, n_base, 0u, regs);
+  store_step(0u, regs);
+  barrier();
+  for (uint step = 0u; step < steps; ++step) {
+    const bool more = step + 1u < steps;
+    if (more) load_step(m_base, n_base, (step + 1u) * BK, regs);
+    const uint a_base = (step & 1u) * STAGE, b_base = a_base + A_TERMS * A_PIECE;
+    FRAG_A fa[2][3];
+    FRAG_B fb[4][3];
+    [[unroll]] for (uint r = 0u; r < 2u; ++r) {
+      [[unroll]] for (uint t = 0u; t < 3u; ++t) {
+        if (t < A_TERMS) {
+          coopMatLoad(fa[r][t], smem, a_base + t * A_PIECE + (row0 + r * 16u) * 2u, 2u, gl_CooperativeMatrixLayoutRowMajor);
+        }
+      }
+    }
+    [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+      [[unroll]] for (uint t = 0u; t < 3u; ++t) {
+        if (c < FN && t < B_TERMS) {
+          coopMatLoad(fb[c][t], smem, b_base + t * B_PIECE + (col0 + c * 16u) * 2u, 2u,
+                      gl_CooperativeMatrixLayoutColumnMajor);
+        }
+      }
+    }
+    // Smallest products first.
+    [[unroll]] for (int s = 4; s >= 0; --s) {
+      [[unroll]] for (uint i = 0u; i < 3u; ++i) {
+        [[unroll]] for (uint j = 0u; j < 3u; ++j) {
+          if (int(i + j) == s && i < A_TERMS && j < B_TERMS && i + j < TERMS) {
+            [[unroll]] for (uint r = 0u; r < 2u; ++r) {
+              [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+                if (c < FN) acc[r][c] = coopMatMulAdd(fa[r][i], fb[c][j], acc[r][c]);
+              }
+            }
+          }
+        }
+      }
+    }
+    if (more) store_step((step + 1u) & 1u, regs);
+    barrier();
+  }
+
+  // Epilogue: each 16x16 fragment goes through the subgroup's staging, then lane l writes 8 outputs of row l / 2.
+  const uint staging = sg * STAGING;
+  const uint lane = gl_SubgroupInvocationID;
+  const uint frow = lane / 2u, fcol = (lane % 2u) * 8u;
+  [[unroll]] for (uint r = 0u; r < 2u; ++r) {
+    const uint m = m_base + row0 + r * 16u + frow;
+    [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+      if (c >= FN) continue;
+      coopMatStore(acc[r][c], smem, staging, 4u, gl_CooperativeMatrixLayoutRowMajor);
+      sync_subgroup();
+      const uint n = n_base + col0 + c * 16u + fcol;
+      if (m < pc.M && n < pc.N) {
+        float v[8];
+        const vec4 lo = uintBitsToFloat(smem[staging + frow * 4u + fcol / 4u]);
+        const vec4 hi = uintBitsToFloat(smem[staging + frow * 4u + fcol / 4u + 1u]);
+        v[0] = lo.x; v[1] = lo.y; v[2] = lo.z; v[3] = lo.w;
+        v[4] = hi.x; v[5] = hi.y; v[6] = hi.z; v[7] = hi.w;
+        const uint64_t at = uint64_t(m) * pc.ldo + n;
+        [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+          if (n + j < pc.N) {
+            precise float y = v[j];
+            if (pc.bias != 0ul) y = y + Floats(pc.bias).d[n + j];
+            if (pc.residual != 0ul) y = y + Floats(pc.residual + (at + j) * 4ul).d[0];
+            v[j] = y;
+          }
+        }
+        if (n + 8u <= pc.N) {
+          Vec4s(pc.out_ + at * 4ul).d[0] = floatBitsToUint(vec4(v[0], v[1], v[2], v[3]));
+          Vec4s(pc.out_ + at * 4ul + 16ul).d[0] = floatBitsToUint(vec4(v[4], v[5], v[6], v[7]));
+        } else {
+          [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+            if (n + j < pc.N) Floats(pc.out_ + (at + j) * 4ul).d[0] = v[j];
+          }
+        }
+      }
+      sync_subgroup();
+    }
+  }
+}

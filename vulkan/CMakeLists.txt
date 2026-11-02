@@ -57,6 +57,19 @@ foreach(shader IN ITEMS te_rms_norm te_conv_silu te_gates te_gdn_qk te_gdn_chunk
 endforeach()
 target_sources(mossinfer_vulkan PRIVATE te_kernels.cpp text_encoder.cpp ${_te_spirv_files})
 
+# The FLUX.2 VAE decoder (vae.h): its cooperative-matrix kernel needs Vulkan 1.3, the rest loads on Vulkan 1.2.
+set(_spirv_block ${_spirv_files})
+_mi_add_shader(vae_conv_coop vulkan1.3)
+foreach(shader IN ITEMS vae_conv_plain vae_conv_narrow vae_gn_stats vae_gn_finalize vae_gn_apply vae_softmax vae_transpose
+                        vae_latent_unpack vae_rgb8)
+  _mi_add_shader(${shader} vulkan1.2)
+endforeach()
+set(_spirv_vae ${_spirv_files})
+list(REMOVE_ITEM _spirv_vae ${_spirv_block})
+target_sources(mossinfer_vulkan PRIVATE vae.cpp generate.cpp ${_spirv_vae})
+# generate.cpp's CFG and Euler step round like the engine's kernels: no contraction.
+set_source_files_properties(generate.cpp PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/fp:precise,-ffp-contract=off>")
+
 # Built into the engine (cmake/modules/vulkan.cmake), the tools are off unless asked for.
 if(NOT DEFINED MOSSINFER_VULKAN_TOOLS)
   set(MOSSINFER_VULKAN_TOOLS ON)
@@ -90,3 +103,9 @@ target_link_libraries(vulkan_te_kernel_check PRIVATE mossinfer_vulkan)
 # The whole text encoder against the official pipeline's golden hidden states.
 add_executable(vulkan_te_check tools/vulkan_te_check.cpp)
 target_link_libraries(vulkan_te_check PRIVATE mossinfer_vulkan)
+
+# Kernels against host replays, then the real decoder against the reference pipeline's PNG (zlib reads and writes PNGs).
+find_package(ZLIB REQUIRED)
+add_executable(vulkan_vae_check tools/vulkan_vae_check.cpp)
+target_compile_options(vulkan_vae_check PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/fp:precise,-ffp-contract=off>)
+target_link_libraries(vulkan_vae_check PRIVATE mossinfer_vulkan ZLIB::ZLIB)
