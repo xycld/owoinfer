@@ -1,4 +1,4 @@
-"""Lists a Vulkan device's cooperative-matrix shapes and memory heaps, using only vulkan-1.dll.
+"""Lists a Vulkan device's cooperative-matrix shapes and memory heaps, using only the Vulkan loader.
 
 The C++ tool needs Vulkan headers and an import library; this script needs neither (ctypes only), so it works on a
 machine with just the GPU driver installed. It is how the capability table in docs/vulkan-backend-research.md was
@@ -13,7 +13,6 @@ VK_SUCCESS = 0
 VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
 VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
 VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR = 1000506001
-VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_NV = 1000249001
 
 COMPONENT = {
     0: "f16", 1: "f32", 2: "f64", 3: "s8", 4: "s16", 5: "s32", 6: "s64",
@@ -64,10 +63,7 @@ class VkPhysicalDeviceMemoryProperties(C.Structure):
 
 
 def main():
-    try:
-        vk = C.WinDLL("vulkan-1.dll")
-    except OSError:
-        vk = C.CDLL("libvulkan.so.1")
+    vk = C.WinDLL("vulkan-1.dll") if sys.platform == "win32" else C.CDLL("libvulkan.so.1")
     vk.vkGetInstanceProcAddr.restype = C.c_void_p
     vk.vkGetInstanceProcAddr.argtypes = [C.c_void_p, C.c_char_p]
     gipa = vk.vkGetInstanceProcAddr
@@ -98,36 +94,22 @@ def main():
     for index in range(count.value):
         device = devices[index]
         print(f"\ndevice {index}:")
-        # The KHR query is authoritative on current drivers; the NV one is only a fallback for older ones (its enums
-        # are narrower, so its properties are not decoded here).
-        khr_shapes = 0
-        for name, s_type in (("vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR",
-                              VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR),
-                             ("vkGetPhysicalDeviceCooperativeMatrixPropertiesNV",
-                              VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_NV)):
-            if name.endswith("NV") and khr_shapes:
-                continue
-            query = proc(instance, name, C.c_int32,
-                         [C.c_void_p, C.POINTER(C.c_uint32), C.POINTER(VkCooperativeMatrixProperties)])
-            if query is None:
-                continue
-            n = C.c_uint32(0)
-            result = query(device, C.byref(n), None)
-            if result != VK_SUCCESS or n.value == 0:
-                continue
+        query = proc(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR", C.c_int32,
+                     [C.c_void_p, C.POINTER(C.c_uint32), C.POINTER(VkCooperativeMatrixProperties)])
+        n = C.c_uint32(0)
+        if query is None or query(device, C.byref(n), None) != VK_SUCCESS or n.value == 0:
+            print("  no VK_KHR_cooperative_matrix shapes")
+        else:
             shapes = (VkCooperativeMatrixProperties * n.value)()
             for shape in shapes:
-                shape.sType = s_type
-            if query(device, C.byref(n), shapes) != VK_SUCCESS:
-                continue
-            if name.endswith("KHR"):
-                khr_shapes = n.value
-            print(f"  {name}: {n.value} shapes")
-            for shape in shapes[:n.value]:
-                print(f"    {shape.MSize}x{shape.NSize}x{shape.KSize} "
-                      f"A={COMPONENT.get(shape.AType, shape.AType)} B={COMPONENT.get(shape.BType, shape.BType)} "
-                      f"C={COMPONENT.get(shape.CType, shape.CType)} R={COMPONENT.get(shape.ResultType, shape.ResultType)} "
-                      f"sat={shape.saturatingAccumulation} scope={SCOPE.get(shape.scope, shape.scope)}")
+                shape.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR
+            if query(device, C.byref(n), shapes) == VK_SUCCESS:
+                print(f"  cooperative matrix: {n.value} shapes")
+                for shape in shapes[:n.value]:
+                    print(f"    {shape.MSize}x{shape.NSize}x{shape.KSize} "
+                          f"A={COMPONENT.get(shape.AType, shape.AType)} B={COMPONENT.get(shape.BType, shape.BType)} "
+                          f"C={COMPONENT.get(shape.CType, shape.CType)} R={COMPONENT.get(shape.ResultType, shape.ResultType)} "
+                          f"sat={shape.saturatingAccumulation} scope={SCOPE.get(shape.scope, shape.scope)}")
         if get_memory is not None:
             memory = VkPhysicalDeviceMemoryProperties()
             get_memory(device, C.byref(memory))

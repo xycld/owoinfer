@@ -1,7 +1,9 @@
 // C[M,N] = A[M,K] * B[K,N] with A row-major (stride lda) and B column-major (stride ldb == K), i.e. B[k,n] lives at
 // n*ldb + k: exactly the engine's [N,K] weight layout, so the GEMM consumes weights as stored (no transpose).
 //
-// One workgroup per 64x64 output tile, 128 threads (4 subgroups of 32). Each subgroup owns a 32x32 quarter, computed as
+// One workgroup per 64x64 output tile, 128 threads: exactly 4 full subgroups of 32, which the pipeline must require
+// (VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT and requiredSubgroupSize). Whole tiles always run, so A and
+// C need M rounded up to 64 rows, and N must be a multiple of 64. Each subgroup owns a 32x32 quarter, computed as
 // four 16x16x16 cooperative-matrix operations (f16 inputs, f32 accumulate) per K step. Output tiles are walked in bands
 // of BAND N-tiles (the same idea as the engine's BandedSwizzle for INT8 GEMMs): a band of weight tiles stays in L2
 // while every M tile streams past it.

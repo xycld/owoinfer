@@ -5,14 +5,15 @@ Status: proposal; nothing in this document is implemented yet.
 
 ## Scope and goal
 
-Add a **Vulkan compute backend** that can run the whole MossInfer pipeline on a non-CUDA GPU (or on NVIDIA without the
-CUDA toolkit), at a usable fraction of the CUDA speed, without regressing the CUDA path.
+Add a **Vulkan compute backend** as the fallback for hardware the engine does not otherwise support, able to run the
+MossInfer pipeline there without regressing the CUDA path. CUDA stays the path on every GPU it supports.
 
 Requirements:
 
 - Same model files (official bf16 bundle, ComfyUI INT8/INT4 ConvRot files) and the same public API/CLI/server surface.
 - CPU side identical: tokenizer, samplers, PNG, planner, reports.
-- The backend is selected at run time (or at build time) and the probe reports which one ran.
+- The backend for a device follows one fixed rule, never a measurement: CUDA where the engine supports the device, Vulkan
+  otherwise. A caller can name a backend explicitly, and the probe and the report always say which one ran.
 - Correctness first: every kernel validated against the CUDA implementation on the same weights; end-to-end images
   compared statistically (Vulkan numerics differ in accumulation order, like sm_75 does today).
 
@@ -27,7 +28,7 @@ The engine is not CUDA-abstracted today:
   arenas (`runtime/DeviceArena`).
 - `Planner`/`pipeline` call `cudaMemGetInfo`-based free-memory helpers, `cudaEvent`s and cuBLASLt handles, and the
   model code calls kernel functions directly (`kernels::Gemm::linear`, `moss_dit::MossDit`, ...).
-- ~120 CUDA translation units implement the kernels (GEMM, attention, norm, RoPE, GDN, VAE, quantized formats).
+- About 70 CUDA translation units implement the kernels (GEMM, attention, norm, RoPE, GDN, VAE, quantized formats).
 
 A Vulkan backend therefore needs two layers: a **device runtime** (buffers, queues, commands, events, memory budget) and
 a **kernel set** behind the same call shapes the model code uses.
@@ -36,7 +37,7 @@ a **kernel set** behind the same call shapes the model code uses.
 
 | Option | What it means | Cost | Risk |
 |---|---|---|---|
-| **A. Backend abstraction inside the engine** | Introduce `mi::runtime::Backend` (device/buffer/stream/event) and `mi::kernels::Backend` (GEMM, attention, norm, ...) interfaces; CUDA and Vulkan implement them; model/pipeline code talks to the interfaces. | High upfront refactor (~120 TUs touched), but one pipeline for both. | Refactor stalls the CUDA path; hard to land incrementally. |
+| **A. Backend abstraction inside the engine** | Introduce `mi::runtime::Backend` (device/buffer/stream/event) and `mi::kernels::Backend` (GEMM, attention, norm, ...) interfaces; CUDA and Vulkan implement them; model/pipeline code talks to the interfaces. | High upfront refactor (about 70 kernel files and their callers), but one pipeline for both. | Refactor stalls the CUDA path; hard to land incrementally. |
 | **B. Separate Vulkan runner first** | A standalone `moss-vulkan` executable (or tool) that loads the same bundle and runs the pipeline with Vulkan kernels; the engine stays untouched. Merge later through A. | Medium; no risk to CUDA; proves kernels and performance with real weights. | Duplicated pipeline logic until merged; second code path to maintain. |
 | **C. CUDA shim over Vulkan** | Implement the CUDA runtime API subset (`cudaMalloc`, `cudaStream_t`, `cuBLASLt` calls) on top of Vulkan so the engine compiles unchanged. | Tempting but the semantics (streams/events, cuBLASLt descriptors, error model) do not map cleanly; CUTLASS kernels are SASS, not SPIR-V, so "compile the same kernels" is impossible. | Dead end for the kernel layer. |
 
@@ -108,7 +109,7 @@ tools/vulkan_check.cpp            bring-up tool (like tools/sm75_check.cu): devi
   `free_budget_bytes = heap_budget - heap_usage - reserve` to the planner, the same contract `cudaMemGetInfo` provides.
 - Weight streaming: the engine's DiT block streaming (5.16 GB INT8 at 256², 9.6 GB bf16) becomes: host-side ring buffer →
   transfer queue → device-local block buffers, with timeline semaphores per block and a per-step upload budget. The
-  planner's existing `HiddenFraction` model (copy hidden behind compute) applies unchanged.
+  planner's existing estimate of copies hidden behind compute applies unchanged.
 
 ### Dispatch and command recording
 
@@ -123,10 +124,10 @@ tools/vulkan_check.cpp            bring-up tool (like tools/sm75_check.cu): devi
 
 Legend: CM = cooperative matrix, SIMT = plain compute shader.
 
-| Stage | Operation | Shapes (DiT 3072, FFN 12288, VAE 96–384) | Vulkan kernel |
+| Stage | Operation | Shapes (DiT 3072, its FFN 8192; text encoder 4096, its FFN 12288; VAE 96–384) | Vulkan kernel |
 |---|---|---|---|
 | DiT block | modulation/norm | [tokens, 3072] | SIMT, vectorized f16 |
-| DiT block | QKV / out / FFN up / FFN down / final | 3072×3072, 3072×12288, 12288×3072 | CM f16 16×16×16, f32 acc; epilogues in shader (bias, gated residual) |
+| DiT block | QKV / out / FFN up-gate / FFN down / final (N×K, M = tokens) | 9216×3072, 3072×3072, 16384×3072, 3072×8192 | CM f16 16×16×16, f32 acc; epilogues in shader (bias, gated residual) |
 | DiT block | joint attention | tokens 4096 (1024²), heads 24, head_dim 128, non-causal varlen | tiled FA: CM QK^T, f32 softmax, SIMT PV or CM PV |
 | DiT block | RoPE, SiTU-GLU, residual | elementwise | SIMT |
 | Text encoder | RMSNorm, linear, RoPE, causal attention, GDN recurrence | hidden 4096, 32 layers | GEMM CM; attention CM/SIMT; GDN SIMT scan |
@@ -134,13 +135,22 @@ Legend: CM = cooperative matrix, SIMT = plain compute shader.
 | INT8 path | ConvRot GEMM + dequant | same GEMM shapes | CM s8 16×16×32, s32 acc, dequant epilogue |
 | INT4 path | unpack to INT8 then GEMM | same | SIMT unpack + INT8 CM |
 
+### Devices
+
+Tile sizes come from the device's limits, not from this document: Vulkan only guarantees 16 KiB of shared memory, and
+subgroup sizes differ (the tiles below need 32). A device without a usable cooperative-matrix shape runs a plain compute
+GEMM, slower but correct; that path is what makes the backend a fallback rather than a second fast path.
+
 ### GEMM tiling (48 KiB shared memory, f16, f32 accumulate)
+
+M is free: whole tiles always run, A and C are allocated with M rounded up to 64 rows, and row m of C depends only on row m
+of A. N is a multiple of 64 in every engine GEMM.
 
 - Workgroup 64×64 output tile, 4 warps (2×2), each warp computes 32×32 via four 16×16×16 cooperative-matrix ops.
 - K step 32: A tile 64×32 f16 = 4 KiB, B tile 32×64 f16 = 4 KiB; 3-stage pipeline = 24 KiB, leaves room for epilogue
   staging and the bias/gate vectors.
 - Registers: 32×32 f32 accumulator per warp = 1024 floats = 32 per thread, plus A/B fragments; well within a 255-register
-  budget at 256 threads/workgroup.
+  budget at 128 threads/workgroup.
 - Split-K for skinny GEMMs (e.g., final layer, modulation) or when M is small (prompt tokens); the engine's CUDA GEMM
   already chunks rows, so the Vulkan dispatcher can reuse that policy.
 - Epilogues are fused in the shader: bias add, `ffn_down` residual add, gated residual (multiply by gate), SiTU-GLU
@@ -148,13 +158,14 @@ Legend: CM = cooperative matrix, SIMT = plain compute shader.
 
 ### Attention kernel
 
-- One workgroup per (block of 64 queries, head, sequence chunk): 4 warps, BM=64, BN=64, head_dim 128 (DiT) or 256
-  (Qwen).
+- One workgroup per (block of queries, head, sequence chunk). Staged f16 tiles must fit 48 KiB, Q + K + V + P:
+  head_dim 128 (DiT) with 64 queries and 32 keys is 16 + 8 + 8 + 4 = 36 KiB; head_dim 256 (Qwen) with 32 queries and
+  16 keys is 16 + 8 + 8 + 1 = 33 KiB.
 - QK^T on cooperative matrix (f16 inputs, f32 accumulate), softmax in SIMT f32 with the same online algorithm as the
   CUDA sm_75 kernel (`src/kernels/sm75/attention_sm75.cu`), PV on cooperative matrix or SIMT.
 - Varlen/GQA: per-sequence offsets and head mapping in push constants; the DiT joint attention is non-causal over
   [text + image] tokens, Qwen is causal.
-- 4096-token attention at 1024² needs 64×64 tiles × 64 query blocks × 24 heads; the same tiling as the CUDA kernel.
+- 4096-token attention at 1024² walks those tiles over 64 query blocks and 24 heads.
 
 ### Quantization formats
 
@@ -168,12 +179,12 @@ Legend: CM = cooperative matrix, SIMT = plain compute shader.
 ## Integration with the engine
 
 - **Probe**: `src/backend/probe.*` gains a Vulkan path when built with `MOSSINFER_VULKAN`: enumerate physical devices,
-  report name/vendor/heap/coopmat shapes, recommend `vulkan` when no CUDA device is usable (or when `--backend vulkan`).
+  report name/vendor/heap/coopmat shapes and, per device, the backend that the fixed rule above gives it.
 - **Planner**: the cost model's rates (`bf16_tflops`, PCIe rate) are learned per backend and per device; the tier rules
   are backend-neutral (reference/high/turbo), except that on Vulkan the 8-bit attention modes may not exist.
 - **Tier/attention**: Vulkan on Turing-class hardware resolves an unset attention to `exact` (same rule as sm_75); on
   devices with f16 cooperative matrix a `q8_fp16` port can come later.
-- **CLI/server**: `--backend cuda|vulkan|auto`; the report gains `quality.backend = "vulkan"` and the device string;
+- **CLI/server**: `--backend cuda|vulkan` overrides the rule; the report gains `quality.backend = "vulkan"` and the device string;
   `moss-server` passes it through `load`'s new optional `backend` parameter (protocol addition).
 - **Packaging**: a `-vulkan` package flavour (loader + shaders embedded); the CUDA package stays the default.
 
@@ -194,8 +205,8 @@ Legend: CM = cooperative matrix, SIMT = plain compute shader.
 
 | Milestone | Deliverable | Acceptance | Estimate |
 |---|---|---|---|
-| **V0** | Probe tool + microbenchmarks (GEMM, bandwidth, dispatch overhead, attention) | Numbers for all five unknowns in the research doc; go/no-go | 2–3 days |
-| **V1** | Vulkan runtime (device, allocator, commands, pipeline cache) + f16 GEMM validated vs CPU/CUDA | GEMM cosine ≥ 0.9999 at engine shapes; ≥ 40 % of cuBLAS | 1–2 weeks |
+| **V0** | Probe tool + GEMM microbenchmark (`tools/vulkan_gemm`); done for the GEMM | GEMM correct and measured at the engine's shapes against cuBLASLt | done |
+| **V1** | Vulkan runtime (device, allocator, commands, pipeline cache) + f16 GEMM, shared-memory tiles and a plain compute path | GEMM cosine ≥ 0.9999 at engine shapes, on a device without cooperative matrices too | 1–2 weeks |
 | **V2** | Attention + norm/RoPE/SiTU kernels; DiT block runner on real weights | Block output matches CUDA block (cosine ≥ 0.999) | 1–2 weeks |
 | **V3** | Text encoder (GEMM, RMSNorm, RoPE, causal attention, GDN) and VAE decoder | Encode/decode parity; first full Vulkan image | 2–3 weeks |
 | **V4** | Pipeline integration (runtime abstraction, planner, streaming, CLI/server) | `moss-infer --backend vulkan` and `moss-server` produce images on the 2080 | 2–4 weeks |
@@ -209,14 +220,13 @@ the VAE convolutions are the least predictable parts.
 - **Scope explosion.** B-first keeps the engine shippable; V4 (refactor) is gated on V2/V3 parity.
 - **Vendor differences.** Cooperative matrix shapes and shared-memory limits vary; the kernel set is selected from a
   capability table (NVIDIA first, AMD/Intel fallbacks second).
-- **Performance shortfall.** If V0 shows < 40 % of cuBLAS on the 2080, the Vulkan backend is positioned as a
-  portability backend (AMD/Intel), not a replacement on NVIDIA.
+- **Performance.** As a fallback it never replaces CUDA, so its speed gate is whether a generation is usable on the
+  fallback device. That can only be measured on one.
 - **Maintenance.** Two kernel sets are expensive; the shared parity tests and the runtime abstraction are the
   mitigation. If the backend cannot be maintained, V1–V3 remain a standalone tool.
 
 ## Decisions requested
 
-1. Confirm the target: portability first (AMD/Intel) or NVIDIA parity first?
-2. Approve the two-phase plan (standalone runner, then runtime abstraction) or prefer a full abstraction up front?
-3. Choose the first device matrix for validation (2080 only, or also an AMD/Intel card).
-4. Decide whether the Vulkan path ships as a separate package flavour or inside the default package (loader dependency).
+1. Decided: Vulkan is the fallback for hardware the engine does not otherwise support.
+2. Choose the first fallback devices for validation.
+3. Decide whether the Vulkan path ships as a separate package flavour or inside the default package (loader dependency).

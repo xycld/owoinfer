@@ -5,6 +5,9 @@ project(mossinfer_vulkan_gemm LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release)  # the CPU reference is unusably slow unoptimized
+endif()
 
 # Prefer the Vulkan SDK's CMake package; fall back to explicit paths for machines without the SDK (the loader's import
 # library can be generated from vulkan-1.dll, see README.md).
@@ -28,17 +31,17 @@ if(NOT GLSL_COMPILER)
   message(FATAL_ERROR "glslc not found: it ships with the Vulkan SDK")
 endif()
 
-set(GERM_SPV ${CMAKE_CURRENT_BINARY_DIR}/gemm_f16.spv)
+set(GEMM_SPV ${CMAKE_CURRENT_BINARY_DIR}/gemm_f16.spv)
 add_custom_command(
-  OUTPUT ${GERM_SPV}
+  OUTPUT ${GEMM_SPV}
   COMMAND ${GLSL_COMPILER} --target-env=vulkan1.3 -fshader-stage=comp -O ${CMAKE_CURRENT_SOURCE_DIR}/gemm_f16.comp
-          -o ${GERM_SPV}
+          -o ${GEMM_SPV}
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/gemm_f16.comp
   COMMENT "glslc gemm_f16.comp")
-add_custom_target(gemm_spv ALL DEPENDS ${GERM_SPV})
+add_custom_target(gemm_spv ALL DEPENDS ${GEMM_SPV})
 
 add_executable(vulkan_gemm main.cpp)
 target_include_directories(vulkan_gemm PRIVATE ${VULKAN_INCLUDE})
 target_link_libraries(vulkan_gemm PRIVATE ${VULKAN_TARGET})
-target_compile_definitions(vulkan_gemm PRIVATE "DEFAULT_SPV_PATH=\"${GERM_SPV}\"")
+target_compile_definitions(vulkan_gemm PRIVATE "DEFAULT_SPV_PATH=\"${GEMM_SPV}\"")
 add_dependencies(vulkan_gemm gemm_spv)

@@ -4,9 +4,11 @@
 //
 // Kernel contract: C[M,N] = A[M,K] * B[K,N] with A row-major (stride K) and B column-major (stride K), i.e. B[k,n] lives
 // at n*K + k, which is exactly the engine's [N,K] weight layout. That lets the GEMM consume weights as stored, with no
-// transposes. M and N must be multiples of 64 (the tool checks).
+// transposes. N must be a multiple of 64 and K of 16. M is free: the kernel always runs whole 64-row tiles, so A and C
+// must be allocated with M rounded up to 64 rows. Row m of C depends only on row m of A, so the padding rows never reach
+// the first M rows (the check fills them with NaN to show it).
 //
-// Usage: vulkan_gemm [--spv <gemm_f16.spv>] [--bench M N K iters]... [--no-check]
+// Usage: vulkan_gemm [--spv <gemm_f16.spv>] [--device N] [--bench M N K iters]... [--no-check]
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
@@ -29,6 +31,7 @@
 namespace {
 
 constexpr uint32_t kTile = 64;  // BM == BN, one workgroup per tile
+constexpr uint32_t kSubgroupSize = 32;  // gemm_f16.comp divides its 128 invocations into four subgroups of this size
 
 [[noreturn]] void Fail(const char* what, VkResult r) {
   std::printf("%s failed: VkResult %d\n", what, static_cast<int>(r));
@@ -40,45 +43,37 @@ void Check(VkResult r, const char* what) {
 }
 
 float HalfToFloat(uint16_t h) {
-  const uint32_t sign = static_cast<uint32_t>(h >> 15) << 31;
   const uint32_t exp = (h >> 10) & 0x1f;
   const uint32_t mant = h & 0x3ff;
-  uint32_t bits = 0;
-  if (exp == 0) {
-    if (mant == 0) {
-      bits = sign;
-    } else {
-      uint32_t e = 127 - 15 + 1;
-      uint32_t m = mant;
-      while ((m & 0x400) == 0) {
-        m <<= 1;
-        --e;
-      }
-      bits = sign | ((e - 1) << 23) | ((m & 0x3ff) << 13);
-    }
-  } else if (exp == 31) {
-    bits = sign | 0x7f800000u | (mant << 13);
-  } else {
-    bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-  }
   float f = 0.0f;
-  std::memcpy(&f, &bits, 4);
-  return f;
+  if (exp == 0) {
+    f = std::ldexp(static_cast<float>(mant), -24);  // zero or subnormal: mant * 2^-24, exact in fp32
+  } else {
+    const uint32_t bits = exp == 31 ? 0x7f800000u | (mant << 13) : ((exp + 127 - 15) << 23) | (mant << 13);
+    std::memcpy(&f, &bits, 4);
+  }
+  return (h & 0x8000u) != 0 ? -f : f;
 }
 
+// Rounds to nearest, ties to even, like the hardware conversion.
 uint16_t FloatToHalf(float f) {
   uint32_t x = 0;
   std::memcpy(&x, &f, 4);
-  const uint32_t sign = (x >> 16) & 0x8000u;
-  const int32_t exp = static_cast<int32_t>((x >> 23) & 0xff) - 127 + 15;
-  uint32_t mant = x & 0x7fffffu;
-  if (exp <= 0) {
-    if (exp < -10) return static_cast<uint16_t>(sign);
-    mant = (mant | 0x800000u) >> (1 - exp);
-    return static_cast<uint16_t>(sign | ((mant + 0x1000u) >> 13));
-  }
-  if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
-  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | ((mant + 0x1000u) >> 13));
+  const auto sign = static_cast<uint16_t>((x >> 16) & 0x8000u);
+  const uint32_t magnitude = x & 0x7fffffffu;
+  if (magnitude > 0x7f800000u) return static_cast<uint16_t>(sign | 0x7e00u);  // NaN
+  const int32_t exp = static_cast<int32_t>(magnitude >> 23) - 127 + 15;
+  if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);  // overflow and infinity
+  if (exp < -10) return sign;                                   // below half of the smallest subnormal
+  const uint32_t mant = magnitude & 0x7fffffu;
+  const uint32_t significand = exp > 0 ? mant : mant | 0x800000u;
+  const int shift = exp > 0 ? 13 : 14 - exp;
+  uint32_t rounded = significand >> shift;
+  const uint32_t rest = significand & ((1u << shift) - 1u);
+  const uint32_t half = 1u << (shift - 1);
+  if (rest > half || (rest == half && (rounded & 1u) != 0)) ++rounded;
+  // An addition, not an OR: rounding can carry out of the mantissa into the exponent.
+  return static_cast<uint16_t>(sign | ((exp > 0 ? static_cast<uint32_t>(exp) << 10 : 0u) + rounded));
 }
 
 struct Buffer {
@@ -168,6 +163,16 @@ void Submit(Device& d, const std::function<void(VkCommandBuffer)>& record) {
   vkFreeCommandBuffers(d.device, d.pool, 1, &command_buffer);
 }
 
+// A global memory barrier. vkQueueWaitIdle only makes writes available to the host: work in a later submit still needs
+// one of these to see them.
+void Barrier(VkCommandBuffer cb, VkPipelineStageFlags src_stage, VkAccessFlags src_access,
+             VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
+  VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  barrier.srcAccessMask = src_access;
+  barrier.dstAccessMask = dst_access;
+  vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
 void Upload(Device& d, Buffer& dst, const void* data, VkDeviceSize size) {
   Buffer staging = CreateBuffer(d, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false);
@@ -175,6 +180,8 @@ void Upload(Device& d, Buffer& dst, const void* data, VkDeviceSize size) {
   Submit(d, [&](VkCommandBuffer cb) {
     VkBufferCopy copy{0, 0, size};
     vkCmdCopyBuffer(cb, staging.buffer, dst.buffer, 1, &copy);
+    Barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT);
   });
   DestroyBuffer(d, staging);
 }
@@ -185,6 +192,8 @@ void Download(Device& d, Buffer& src, void* data, VkDeviceSize size) {
   Submit(d, [&](VkCommandBuffer cb) {
     VkBufferCopy copy{0, 0, size};
     vkCmdCopyBuffer(cb, src.buffer, staging.buffer, 1, &copy);
+    Barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            VK_ACCESS_HOST_READ_BIT);
   });
   std::memcpy(data, staging.mapped, static_cast<size_t>(size));
   DestroyBuffer(d, staging);
@@ -224,16 +233,22 @@ const char* ComponentName(int type) {
     default: return "?";
   }
 }
-void PrintCooperativeMatrixShapes(Device& d) {
+std::vector<VkCooperativeMatrixPropertiesKHR> CooperativeMatrixShapes(VkInstance instance, VkPhysicalDevice physical) {
   auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
-      vkGetInstanceProcAddr(d.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
-  if (query == nullptr) return;
+      vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+  if (query == nullptr) return {};
   uint32_t count = 0;
-  if (query(d.physical, &count, nullptr) != VK_SUCCESS || count == 0) return;
+  if (query(physical, &count, nullptr) != VK_SUCCESS || count == 0) return {};
   std::vector<VkCooperativeMatrixPropertiesKHR> shapes(count);
   for (auto& s : shapes) s.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
-  if (query(d.physical, &count, shapes.data()) != VK_SUCCESS) return;
-  std::printf("cooperative matrix shapes (%u):\n", count);
+  if (query(physical, &count, shapes.data()) != VK_SUCCESS) return {};
+  shapes.resize(count);
+  return shapes;
+}
+
+void PrintCooperativeMatrixShapes(Device& d) {
+  const auto shapes = CooperativeMatrixShapes(d.instance, d.physical);
+  std::printf("cooperative matrix shapes (%zu):\n", shapes.size());
   for (const auto& s : shapes) {
     std::printf("  %ux%ux%u A=%s B=%s C=%s R=%s sat=%u\n", s.MSize, s.NSize, s.KSize,
                 ComponentName(static_cast<int>(s.AType)), ComponentName(static_cast<int>(s.BType)),
@@ -242,7 +257,62 @@ void PrintCooperativeMatrixShapes(Device& d) {
   }
 }
 
-Device OpenDevice() {
+// Why the kernel cannot run on this device; empty when it can.
+std::string WhyUnsupported(VkInstance instance, VkPhysicalDevice physical) {
+  VkPhysicalDeviceVulkan13Properties properties13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+  VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+  vkGetPhysicalDeviceProperties(physical, &properties.properties);
+  if (properties.properties.apiVersion < VK_API_VERSION_1_3) return "needs Vulkan 1.3";
+  properties.pNext = &properties13;
+  vkGetPhysicalDeviceProperties2(physical, &properties);
+
+  uint32_t count = 0;
+  vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
+  std::vector<VkExtensionProperties> extensions(count);
+  vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, extensions.data());
+  const bool has_extension = std::any_of(extensions.begin(), extensions.end(), [](const VkExtensionProperties& e) {
+    return std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0;
+  });
+  if (!has_extension) return "no VK_KHR_cooperative_matrix";
+
+  VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+  VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+  VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+  VkPhysicalDeviceVulkan11Features v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+  VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  features.pNext = &v11;
+  v11.pNext = &v12;
+  v12.pNext = &v13;
+  v13.pNext = &coop;
+  vkGetPhysicalDeviceFeatures2(physical, &features);
+  if (coop.cooperativeMatrix == 0) return "the cooperativeMatrix feature is off";
+  if (features.features.shaderInt64 == 0) return "no shaderInt64";
+  if (v11.storageBuffer16BitAccess == 0) return "no storageBuffer16BitAccess";
+  if (v12.shaderFloat16 == 0) return "no shaderFloat16";
+  if (v12.bufferDeviceAddress == 0) return "no bufferDeviceAddress";
+  if (v12.vulkanMemoryModel == 0) return "no vulkanMemoryModel";
+  if (v13.subgroupSizeControl == 0 || v13.computeFullSubgroups == 0) return "no subgroup size control";
+
+  if (properties13.minSubgroupSize > kSubgroupSize || properties13.maxSubgroupSize < kSubgroupSize ||
+      (properties13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
+    return "cannot fix the compute subgroup size at " + std::to_string(kSubgroupSize) + " (device range " +
+           std::to_string(properties13.minSubgroupSize) + "-" + std::to_string(properties13.maxSubgroupSize) + ")";
+  }
+  if (properties13.maxComputeWorkgroupSubgroups < 4) return "needs 4 subgroups per workgroup";
+
+  const auto shapes = CooperativeMatrixShapes(instance, physical);
+  const bool has_shape = std::any_of(shapes.begin(), shapes.end(), [](const VkCooperativeMatrixPropertiesKHR& s) {
+    return s.MSize == 16 && s.NSize == 16 && s.KSize == 16 && s.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+           s.BType == VK_COMPONENT_TYPE_FLOAT16_KHR && s.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+           s.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.saturatingAccumulation == VK_FALSE &&
+           s.scope == VK_SCOPE_SUBGROUP_KHR;
+  });
+  if (!has_shape) return "no 16x16x16 f16 x f16 -> f32 cooperative matrix in subgroup scope";
+  return {};
+}
+
+// device_index < 0: the first device that can run the kernel.
+Device OpenDevice(int device_index) {
   Device d;
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
   app.pApplicationName = "mossinfer-vulkan-gemm";
@@ -253,13 +323,28 @@ Device OpenDevice() {
 
   uint32_t count = 0;
   Check(vkEnumeratePhysicalDevices(d.instance, &count, nullptr), "vkEnumeratePhysicalDevices");
-  if (count == 0) {
-    std::printf("no Vulkan physical device\n");
-    std::exit(1);
-  }
   std::vector<VkPhysicalDevice> devices(count);
   Check(vkEnumeratePhysicalDevices(d.instance, &count, devices.data()), "vkEnumeratePhysicalDevices");
-  d.physical = devices[0];
+  bool chosen = false;
+  for (uint32_t i = 0; i < count; ++i) {
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(devices[i], &properties);
+    const std::string why = WhyUnsupported(d.instance, devices[i]);
+    std::printf("device %u: %s: %s\n", i, properties.deviceName, why.empty() ? "usable" : why.c_str());
+    const bool wanted = device_index < 0 ? why.empty() && !chosen : static_cast<uint32_t>(device_index) == i;
+    if (wanted) {
+      if (!why.empty()) {
+        std::printf("device %u cannot run this kernel\n", i);
+        std::exit(1);
+      }
+      d.physical = devices[i];
+      chosen = true;
+    }
+  }
+  if (!chosen) {
+    std::printf("no usable Vulkan device\n");
+    std::exit(1);
+  }
   vkGetPhysicalDeviceProperties(d.physical, &d.properties);
   vkGetPhysicalDeviceMemoryProperties(d.physical, &d.memory);
 
@@ -280,40 +365,29 @@ Device OpenDevice() {
     std::exit(1);
   }
 
-  VkPhysicalDeviceShaderFloat16Int8Features float16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
-  VkPhysicalDevice16BitStorageFeatures storage16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
-  VkPhysicalDevice8BitStorageFeatures storage8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES};
-  VkPhysicalDeviceBufferDeviceAddressFeatures address{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
-  VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
-  VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-  features.pNext = &float16;
-  float16.pNext = &storage16;
-  storage16.pNext = &storage8;
-  storage8.pNext = &address;
-  address.pNext = &coop;
-  vkGetPhysicalDeviceFeatures2(d.physical, &features);
-
-  std::printf("device: %s (Vulkan %u.%u.%u)\n", d.properties.deviceName,
-              VK_API_VERSION_MAJOR(d.properties.apiVersion), VK_API_VERSION_MINOR(d.properties.apiVersion),
-              VK_API_VERSION_PATCH(d.properties.apiVersion));
-  std::printf("features: shaderFloat16=%u storage16=%u storage8=%u bda=%u coopmat=%u\n", float16.shaderFloat16,
-              storage16.storageBuffer16BitAccess, storage8.storageBuffer8BitAccess, address.bufferDeviceAddress,
-              coop.cooperativeMatrix);
-  if (float16.shaderFloat16 == 0 || storage16.storageBuffer16BitAccess == 0 || address.bufferDeviceAddress == 0 ||
-      coop.cooperativeMatrix == 0) {
-    std::printf("the device lacks a feature the kernel needs\n");
-    std::exit(1);
-  }
-  float16.shaderFloat16 = VK_TRUE;
-  float16.shaderInt8 = VK_TRUE;
-  storage16.storageBuffer16BitAccess = VK_TRUE;
-  storage16.uniformAndStorageBuffer16BitAccess = VK_TRUE;
-  storage8.storageBuffer8BitAccess = VK_TRUE;
-  address.bufferDeviceAddress = VK_TRUE;
+  // Exactly what gemm_f16.spv declares (spirv-dis lists its capabilities), so a missing one fails at vkCreateDevice.
+  VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
   coop.cooperativeMatrix = VK_TRUE;
+  VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+  v13.pNext = &coop;
+  v13.subgroupSizeControl = VK_TRUE;
+  v13.computeFullSubgroups = VK_TRUE;
+  VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+  v12.pNext = &v13;
+  v12.shaderFloat16 = VK_TRUE;
+  v12.bufferDeviceAddress = VK_TRUE;
+  v12.vulkanMemoryModel = VK_TRUE;
+  VkPhysicalDeviceVulkan11Features v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+  v11.pNext = &v12;
+  v11.storageBuffer16BitAccess = VK_TRUE;
+  VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  features.pNext = &v11;
+  features.features.shaderInt64 = VK_TRUE;
 
-  const char* extensions[] = {"VK_KHR_cooperative_matrix"};
+  std::printf("using: %s (Vulkan %u.%u.%u)\n", d.properties.deviceName, VK_API_VERSION_MAJOR(d.properties.apiVersion),
+              VK_API_VERSION_MINOR(d.properties.apiVersion), VK_API_VERSION_PATCH(d.properties.apiVersion));
+
+  const char* extensions[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
   const float priority = 1.0f;
   VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
   queue_info.queueFamilyIndex = d.queue_family;
@@ -334,20 +408,27 @@ Device OpenDevice() {
   return d;
 }
 
-// One GEMM run: fills A and B with deterministic data, optionally checks a 64x64 case against a CPU reference,
-// then times `iterations` dispatches.
-void RunGemm(Device& d, VkPipeline pipeline, VkPipelineLayout layout, uint32_t M, uint32_t N, uint32_t K,
-             int iterations, bool check) {
-  const VkDeviceSize a_bytes = static_cast<VkDeviceSize>(M) * K * 2;
-  const VkDeviceSize b_bytes = static_cast<VkDeviceSize>(N) * K * 2;
-  const VkDeviceSize c_bytes = static_cast<VkDeviceSize>(M) * N * 4;
+// The CPU reference is O(M*N*K), so only shapes up to this many multiply-adds are checked.
+constexpr uint64_t kMaxCheckedMultiplyAdds = 1ull << 31;
 
-  std::vector<uint16_t> a(static_cast<size_t>(M) * K);
+// One GEMM run: fills A and B with deterministic data, times `iterations` dispatches, then checks shapes small enough
+// for the CPU reference.
+double RunGemm(Device& d, VkPipeline pipeline, VkPipelineLayout layout, uint32_t M, uint32_t N, uint32_t K,
+             int iterations, bool check) {
+  const uint32_t rows = (M + kTile - 1) / kTile * kTile;  // the kernel runs whole tiles
+  const bool checked = check && static_cast<uint64_t>(M) * N * K <= kMaxCheckedMultiplyAdds;
+  const VkDeviceSize a_bytes = static_cast<VkDeviceSize>(rows) * K * 2;
+  const VkDeviceSize b_bytes = static_cast<VkDeviceSize>(N) * K * 2;
+  const VkDeviceSize c_bytes = static_cast<VkDeviceSize>(rows) * N * 4;
+
+  std::vector<uint16_t> a(static_cast<size_t>(rows) * K);
   std::vector<uint16_t> b(static_cast<size_t>(N) * K);
   std::mt19937 rng(1234);
   std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
   for (auto& v : a) v = FloatToHalf(dist(rng));
   for (auto& v : b) v = FloatToHalf(dist(rng));
+  // NaN in the padding rows: any leak into the first M rows of C fails the check.
+  if (checked) std::fill(a.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(M) * K), a.end(), uint16_t{0x7e00});
 
   Buffer buffer_a = CreateBuffer(d, a_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
@@ -375,7 +456,12 @@ void RunGemm(Device& d, VkPipeline pipeline, VkPipelineLayout layout, uint32_t M
   const auto record = [&](VkCommandBuffer cb) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    for (int i = 0; i < iterations; ++i) vkCmdDispatch(cb, N / kTile, M / kTile, 1);
+    for (int i = 0; i < iterations; ++i) {
+      vkCmdDispatch(cb, N / kTile, rows / kTile, 1);
+      Barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    }
   };
 
   Submit(d, record);  // warm-up (compiles or loads the pipeline cache)
@@ -384,9 +470,9 @@ void RunGemm(Device& d, VkPipeline pipeline, VkPipelineLayout layout, uint32_t M
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() / static_cast<double>(iterations);
 
-  // The CPU reference is O(M*N*K); only small shapes can afford it.
-  if (check && static_cast<uint64_t>(M) * N * K <= (1ull << 26)) {
-    std::vector<float> c(static_cast<size_t>(M) * N);
+  double max_error = -1.0;
+  if (checked) {
+    std::vector<float> c(static_cast<size_t>(rows) * N);
     Download(d, buffer_c, c.data(), c_bytes);
     double max_abs = 0.0;
     for (uint32_t m = 0; m < M; ++m) {
@@ -396,9 +482,11 @@ void RunGemm(Device& d, VkPipeline pipeline, VkPipelineLayout layout, uint32_t M
           reference += static_cast<double>(HalfToFloat(a[static_cast<size_t>(m) * K + k])) *
                        static_cast<double>(HalfToFloat(b[static_cast<size_t>(n) * K + k]));
         }
-        max_abs = std::max(max_abs, std::fabs(static_cast<double>(c[static_cast<size_t>(m) * N + n]) - reference));
+        const double error = std::fabs(static_cast<double>(c[static_cast<size_t>(m) * N + n]) - reference);
+        max_abs = std::isnan(error) ? INFINITY : std::max(max_abs, error);
       }
     }
+    max_error = max_abs;
     std::printf("check %ux%ux%u: max|C - CPU| = %.6g\n", M, N, K, max_abs);
   }
 
@@ -408,6 +496,7 @@ void RunGemm(Device& d, VkPipeline pipeline, VkPipelineLayout layout, uint32_t M
   DestroyBuffer(d, buffer_a);
   DestroyBuffer(d, buffer_b);
   DestroyBuffer(d, buffer_c);
+  return max_error;
 }
 
 }  // namespace
@@ -415,6 +504,7 @@ void RunGemm(Device& d, VkPipeline pipeline, VkPipelineLayout layout, uint32_t M
 int main(int argc, char** argv) {
   std::string spv = DEFAULT_SPV_PATH;
   bool check = true;
+  int device_index = -1;
   struct Shape {
     uint32_t M, N, K;
     int iterations;
@@ -424,6 +514,8 @@ int main(int argc, char** argv) {
     const std::string arg = argv[i];
     if (arg == "--spv" && i + 1 < argc) {
       spv = argv[++i];
+    } else if (arg == "--device" && i + 1 < argc) {
+      device_index = std::atoi(argv[++i]);
     } else if (arg == "--no-check") {
       check = false;
     } else if (arg == "--bench" && i + 4 < argc) {
@@ -434,22 +526,25 @@ int main(int argc, char** argv) {
       s.iterations = std::atoi(argv[++i]);
       shapes.push_back(s);
     } else {
-      std::printf("usage: %s [--spv <gemm_f16.spv>] [--no-check] [--bench M N K iters]...\n", argv[0]);
+      std::printf("usage: %s [--spv <gemm_f16.spv>] [--device N] [--no-check] [--bench M N K iters]...\n", argv[0]);
       return 2;
     }
   }
   if (shapes.empty()) {
-    shapes = {{64, 64, 64, 1}, {512, 512, 512, 20}, {3072, 3072, 3072, 10}, {3072, 12288, 3072, 5},
-              {3072, 3072, 12288, 5}};
+    // Checked: one tile, a partial last band, several bands, and row tails. Then the engine's real shapes at 1024x1024
+    // with CFG: the DiT's QKV, projection, up/gate and down GEMMs, and the text encoder's GatedDeltaNet projections.
+    shapes = {{64, 64, 64, 1},       {128, 640, 64, 1},     {256, 1024, 64, 1},    {94, 640, 64, 1},
+              {1030, 9216, 64, 1},   {512, 512, 512, 20},   {8222, 9216, 3072, 5}, {8222, 3072, 3072, 5},
+              {8222, 16384, 3072, 3}, {8222, 3072, 8192, 3}, {282, 12288, 4096, 10}, {282, 4096, 12288, 10}};
   }
   for (const Shape& s : shapes) {
-    if (s.M % kTile != 0 || s.N % kTile != 0 || s.K % 16 != 0) {
-      std::printf("shapes must be multiples of %u (M, N) and 16 (K): %ux%ux%u\n", kTile, s.M, s.N, s.K);
+    if (s.M == 0 || s.N == 0 || s.K == 0 || s.iterations <= 0 || s.N % kTile != 0 || s.K % 16 != 0) {
+      std::printf("N must be a multiple of %u and K of 16, and all must be positive: %ux%ux%u\n", kTile, s.M, s.N, s.K);
       return 2;
     }
   }
 
-  Device d = OpenDevice();
+  Device d = OpenDevice(device_index);
   PrintCooperativeMatrixShapes(d);
 
   const std::vector<uint32_t> spirv = ReadFile(spv);
@@ -470,7 +565,13 @@ int main(int argc, char** argv) {
   Check(vkCreatePipelineLayout(d.device, &layout_info, nullptr, &layout), "vkCreatePipelineLayout");
 
   VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  // The kernel's tile split assumes exactly four full subgroups of 32. Without this a driver may pick another size.
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size{
+      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+  subgroup_size.requiredSubgroupSize = kSubgroupSize;
   pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  pipeline_info.stage.pNext = &subgroup_size;
+  pipeline_info.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
   pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
   pipeline_info.stage.module = module;
   pipeline_info.stage.pName = "main";
@@ -479,7 +580,16 @@ int main(int argc, char** argv) {
   Check(vkCreateComputePipelines(d.device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline),
         "vkCreateComputePipelines");
 
-  for (const Shape& s : shapes) RunGemm(d, pipeline, layout, s.M, s.N, s.K, s.iterations, check);
+  // Inputs are fp16 and the accumulator is fp32 (no fp64 reference is exact), so this bounds rounding, not bits.
+  constexpr double kMaxError = 1e-2;
+  bool failed = false;
+  for (const Shape& s : shapes) {
+    const double error = RunGemm(d, pipeline, layout, s.M, s.N, s.K, s.iterations, check);
+    if (error > kMaxError) {
+      std::printf("FAILED: %ux%ux%u: error %.6g is above %g\n", s.M, s.N, s.K, error, kMaxError);
+      failed = true;
+    }
+  }
 
   vkDestroyPipeline(d.device, pipeline, nullptr);
   vkDestroyPipelineLayout(d.device, layout, nullptr);
@@ -487,5 +597,5 @@ int main(int argc, char** argv) {
   vkDestroyCommandPool(d.device, d.pool, nullptr);
   vkDestroyDevice(d.device, nullptr);
   vkDestroyInstance(d.instance, nullptr);
-  return 0;
+  return failed ? 1 : 0;
 }

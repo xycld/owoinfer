@@ -7,17 +7,15 @@ Vulkan compute backend.
 ## Why a Vulkan backend
 
 MossInfer is CUDA-only: the pipeline calls cuBLASLt, CUTLASS kernels and CUDA kernels directly, and the probe refuses any
-GPU whose compute capability is below 8.0 (7.5 with `MOSSINFER_SM75`). That confines the engine to NVIDIA on Windows and
-Linux, with the CUDA toolkit's driver and memory-management model.
+GPU whose compute capability is below 8.0 (7.5 with `MOSSINFER_SM75`, 7.0 with `MOSSINFER_SM70`). That confines the engine
+to NVIDIA on Windows and Linux. The Vulkan backend is the fallback for the hardware that leaves out; CUDA stays the path
+on every GPU it supports.
 
 A Vulkan compute backend would give:
 
-- **Other GPUs.** AMD (RDNA2/3/4), Intel (Arc/Xe), and NVIDIA on systems where the CUDA toolkit is not desirable. The
-  engine's model code is portable C++/CUDA; only the kernels and the device runtime are CUDA-specific.
-- **One packaging story** for Windows and Linux without the CUDA runtime dependency, and a path to Steam Deck (RADV)
-  and other low-power devices.
-- **An escape hatch from CUDA's memory model.** Vulkan exposes `VK_EXT_memory_budget`, explicit heaps and suballocation,
-  which fits the engine's planner/streaming design; CUDA's `cudaMemGetInfo` is coarser.
+- **Other GPUs.** AMD, Intel and older NVIDIA cards. The engine's model code is portable; only the kernels and the device
+  runtime are CUDA-specific.
+- **No CUDA runtime dependency** in the fallback package.
 
 The cost is a second implementation of every tensor-core kernel, plus a device/memory/command abstraction the engine
 does not have today (see the design document).
@@ -35,7 +33,7 @@ and one physical device.
 | `maxComputeSharedMemorySize` | 48 KiB | 64 KiB is a CUDA opt-in only; Vulkan tiles must fit 48 KiB (Turing's hardware limit is 64 KiB but Vulkan caps at 48 KiB here). |
 | `maxComputeWorkGroupInvocations` | 1024 | Up to 32 warps per workgroup. |
 | `subgroupSize` | 32 | Cooperative-matrix `gl_ScopeSubgroup` = one warp. |
-| `maxStorageBufferRange` | 2^32-1 bytes | 4 GiB per buffer; weights are 75 MB at most per tensor, so a small number of big buffers is fine. |
+| `maxStorageBufferRange` | 2^32-1 bytes | 4 GiB per buffer; the largest DiT weight is 96 MiB as f16 (up/gate), so a small number of big buffers is fine. |
 | Device-local heap | 7989 MiB | The engine's planner sees the same ~8 GiB. A second device-local heap of 214 MiB exists; host-visible heap is 16 GiB. |
 
 ### Extensions a compute backend needs (all present)
@@ -132,28 +130,26 @@ attention remains the bottleneck. It is the closest prior art to what MossInfer 
 
 ## Performance model
 
-Measured CUDA numbers on this machine (RTX 2080 8 GiB, SFT bundle), from `docs/sm75.md`:
+Measured on an RTX 4090 Laptop, same GPU and session, with the fragment-from-global-memory kernel in `tools/vulkan_gemm`:
 
-| Tier | 256×256 step | Compute per step (approx.) |
-|---|---|---|
-| reference (bf16→fp16 GEMMs) | 0.80 s | 42 blocks × ~0.015 s + text encoder ~3 s per prompt |
-| high (INT8 DiT) | 0.19 s | 42 blocks × ~0.004 s |
-| turbo (INT4 via INT8) | 0.22 s | unpack overhead + INT8 |
+| Shape (M x N x K) | Vulkan | cuBLASLt (f16, f32 compute) | Ratio |
+|---|---:|---:|---:|
+| 8222 x 9216 x 3072 (DiT QKV) | 20.1 TFLOPS | 52.6 | 38 % |
+| 8222 x 3072 x 3072 (DiT projection) | 31.1 | 57.4 | 54 % |
+| 8222 x 16384 x 3072 (DiT up/gate) | 19.7 | 45.5 | 43 % |
+| 8222 x 3072 x 8192 (DiT down) | 13.5 | 70.1 | 19 % |
+| 282 x 12288 x 4096 (text encoder) | 25.0 | 59.5 | 42 % |
+| 282 x 4096 x 12288 (text encoder) | 12.7 | 52.2 | 24 % |
 
-Turing's fp16 tensor-core peak on the 2080 is roughly 50–60 TFLOPS (NVIDIA's figures for the card are in that range,
-depending on fp16 vs fp32 accumulate); cuBLASLt reaches a large fraction of it on the GEMM shapes of this model
-(3072×12288×3072 etc.). A Vulkan cooperative-matrix GEMM with 16×16×16 f16×f16→f32 tiles can use
-the same instruction; the realistic outcome is **50–80 % of cuBLAS** for large GEMMs, dropping for small ones (the DiT's
-per-block GEMMs are 3072-wide, large enough; the modulation/norm kernels are bandwidth-bound and vendor-independent).
+The large-K shapes suffer most, which fits the kernel's strided global loads. These are NVIDIA numbers: they show the
+kernel works and where it loses time, not how a fallback device will perform. CUDA stays the path wherever it runs.
 
-What that means per step at 256² (INT8 high, 0.19 s): a Vulkan backend at 60 % of the CUDA GEMM throughput would be
-~0.30 s/step; the planner's cost model would then choose the Vulkan tier/streaming plan accordingly. The VAE decode is
-fp32/conv-heavy and would be the second-largest cost; Vulkan convolution on Turing has no tensor-core help for fp32, so
-it stays bandwidth-bound (same as the CUDA fp32 VAE path).
+For scale, `docs/sm75.md` measures CUDA on an RTX 2080 Ti at 256x256: 0.175 s per step in `reference`, 0.091 s in `high`
+(INT8) and 0.103 s in `turbo` (INT4).
 
 The critical unknowns to measure in a prototype (M0):
 
-1. Cooperative-matrix GEMM throughput at the engine's shapes (f16, f32 accumulate, 48 KiB tiles).
+1. Cooperative-matrix GEMM throughput at the engine's shapes: measured above, without shared-memory tiles.
 2. Dispatch overhead per kernel (engine runs ~20–40 dispatches per block; command-buffer batching must keep the CPU
    cost per step below the GPU cost).
 3. Attention throughput (fp16 QK^T + softmax + PV, 4096-token joint attention at 1024²).
@@ -169,7 +165,7 @@ The critical unknowns to measure in a prototype (M0):
 - **Compute:** f16 inputs with f32 accumulate via cooperative matrix (matching cuBLASLt's `CUBLAS_COMPUTE_32F` use in the
   engine's fp16 path); INT8 weights use s32 accumulate (exact, same result as CUTLASS on CUDA); the VAE decoder stays
   fp32 (SIMT), since Vulkan exposes no fp32 tensor core.
-- **No FP8 on Turing** (`VK_KHR_shader_fp8` is not exposed), so the engine's `q8_fp8` attention path cannot be ported
+- **No FP8 on Turing** (`VK_EXT_shader_float8` is not exposed), so the engine's `q8_fp8` attention path cannot be ported
   to this GPU; `q8_fp16` would be the 8-bit attention variant on Vulkan, and `exact` remains the default on sm_75-class
   hardware.
 - **Denormals:** f16 cooperative matrix on NVIDIA flushes subnormal inputs/outputs? The CUDA sm_75 port relies on fp16
@@ -180,7 +176,7 @@ The critical unknowns to measure in a prototype (M0):
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Cooperative matrix on AMD/Intel differs (16×16×16 only, no int8) | Kernels must specialize per vendor; Vulkan backend becomes NVIDIA-first | Query properties at startup and select kernels; scalar/DP4A fallbacks |
+| Cooperative-matrix shapes, subgroup sizes and shared memory differ per device, or there is no cooperative matrix at all | The fast kernel cannot run everywhere | Query properties at startup and select kernels; a plain compute path is required, not optional |
 | Shader compilation time and driver bugs | Cold start and hangs | Precompile SPIR-V at build time, ship pipeline cache, validation layers in CI |
 | 48 KiB shared memory | Smaller tiles than CUDA, lower GEMM efficiency | 3-stage 64×64×32 f16 tiles; split-K for skinny shapes |
 | Dispatch overhead (CPU-bound at small sizes) | Step time worse than CUDA | Batch dispatches into one command buffer; reuse command buffers; push constants + BDA |
@@ -191,9 +187,9 @@ The critical unknowns to measure in a prototype (M0):
 
 ## Open questions for the design phase
 
-1. Is the target "NVIDIA parity plus AMD/Intel support", or "works on anything"? That decides how many fallbacks the
-   kernel layer needs.
+1. Decided: Vulkan is the fallback for hardware the engine does not otherwise support. It therefore needs a path for devices
+   without cooperative matrices, not only the fast one.
 2. Should the Vulkan path reuse the engine's existing planner/streaming code through a device abstraction, or start as a
    separate `moss-vulkan` runner and merge later? (The design document recommends the latter first.)
 3. Which attention variant is acceptable on Vulkan: `exact` only (like sm_75), or a `q8_fp16` port?
-4. Is a WebGPU/wgpu fallback worth a third backend, or is Vulkan enough for the non-NVIDIA target?
+4. Which fallback devices are the first validation targets? No non-NVIDIA device has run any of this.
