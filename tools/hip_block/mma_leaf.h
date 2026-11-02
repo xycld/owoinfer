@@ -9,7 +9,7 @@
 //
 // Every call is collective: all 32 threads of the wave make it, with the same (thread-independent) arguments and under
 // the same control flow. p may point to global or __shared__ memory. A caller reading what store_acc wrote to
-// __shared__ memory from another thread must __syncthreads() first.
+// __shared__ memory from another thread must call barrier() first.
 // The kernels depend on lockstep: they reuse a __shared__ buffer (the zero-padded fragments, s_mem, o_mem) right after a
 // collective read of it, with a barrier before the next write's readers but none between the read and that write. That
 // is safe only because the 32 threads are one wave, or one warp that has not diverged at that point. A workgroup of
@@ -37,6 +37,17 @@ inline constexpr const char* kName = "rocWMMA v_wmma_f32_16x16x16_bf16";
 using FragA = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, rocwmma::bfloat16_t, rocwmma::row_major>;
 using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, rocwmma::bfloat16_t, rocwmma::col_major>;
 using FragAcc = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;
+
+// One wave per workgroup, so the lanes are in lockstep: a barrier only has to order this wave's own __shared__ accesses.
+// __syncthreads would add a cache invalidate at every call, throwing away the operands in the wave's L0.
+__device__ __forceinline__ void barrier() { __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront"); }
+// barrier() between this wave's writes of a zero-padded tail copy and the fragment load of it. That load can be a FLAT
+// load: the copy and the operand it stands in for merge into one generic pointer. Nothing documented orders a FLAT read of
+// __shared__ memory after the wave's DS writes, and barrier() emits no wait, so this one waits for the DS writes too.
+__device__ __forceinline__ void pad_barrier() {
+  barrier();
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+}
 
 __device__ __forceinline__ void clear(FragAcc& c) { rocwmma::fill_fragment(c, 0.0f); }
 __device__ __forceinline__ void load_a(FragA& a, const std::uint16_t* p, int ld) {
@@ -79,6 +90,9 @@ struct FragB {
 struct FragAcc {
   float v[8];
 };
+
+__device__ __forceinline__ void barrier() { __syncthreads(); }
+__device__ __forceinline__ void pad_barrier() { barrier(); }
 
 __device__ __forceinline__ void clear(FragAcc& c) {
   HIP_BLOCK_UNROLL

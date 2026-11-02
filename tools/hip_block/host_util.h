@@ -209,6 +209,78 @@ std::array<T, kHeadDim> replay_attention_row(const bf16_bits* q, const bf16_bits
   return acc;
 }
 
+// The first line of a dump's manifest.txt and of each block's meta.txt (hip_block_verify --real --dump, hip_block_replay).
+// Format 1 had neither file's header, nor a manifest, nor the scalar leaf's per-op figures.
+inline constexpr const char* kDumpFormat = "hip_block dump format 2";
+
+// One op's output against a reference, both [rows, row_len] bf16 bits, over the first `cols` columns of each row (for
+// qk_norm_rope: q and k, without the v it leaves alone). same: % of values with equal bits, NaN on both sides counting as
+// equal. p99, p99.9: percentiles of the ULP distance. scaled: the largest error in ULPs of max(|ref|, the compared values'
+// rms), Inf when one side is infinite and the other not. min_row_same: the lowest same % of one token row, which sees a
+// whole row gone wrong when it is too few values for same and p99.9 (a row of 8484 is 0.012 %).
+struct Agreement {
+  double same = 0.0, scaled = 0.0, min_row_same = 100.0;
+  std::int32_t p99 = 0, p999 = 0;
+  std::size_t nan_mismatch = 0;
+};
+inline Agreement agreement(const std::vector<bf16_bits>& ref, const std::vector<bf16_bits>& got, std::size_t row_len, std::size_t cols) {
+  if (ref.empty() || ref.size() != got.size() || row_len == 0 || ref.size() % row_len != 0 || cols == 0 || cols > row_len) {
+    throw std::runtime_error("agreement: sizes do not match");
+  }
+  const auto is_nan = [](bf16_bits b) { return (b & 0x7fffu) > 0x7f80u; };
+  const auto ordered = [](bf16_bits b) { return (b & 0x8000u) != 0 ? -static_cast<std::int32_t>(b & 0x7fffu) : static_cast<std::int32_t>(b); };
+  const std::size_t rows = ref.size() / row_len, n = rows * cols;
+  double sq = 0.0;
+  std::size_t finite = 0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t c = 0; c < cols; ++c) {
+      const bf16_bits b = ref[r * row_len + c];
+      const double v = from_bf16(b);
+      if (!is_nan(b) && std::isfinite(v)) {
+        sq += v * v;
+        ++finite;
+      }
+    }
+  }
+  const double rms = std::sqrt(sq / static_cast<double>(std::max<std::size_t>(finite, 1)));
+  Agreement a;
+  std::vector<std::int32_t> ulps;
+  ulps.reserve(n);
+  std::size_t same = 0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    std::size_t row_same = 0;
+    for (std::size_t c = 0; c < cols; ++c) {
+      const bf16_bits rb = ref[r * row_len + c], gb = got[r * row_len + c];
+      const bool rn = is_nan(rb), gn = is_nan(gb);
+      if (rn || gn) {
+        a.nan_mismatch += rn != gn;
+        row_same += rn == gn;
+        ulps.push_back(0);
+        continue;
+      }
+      const std::int32_t d = std::abs(ordered(rb) - ordered(gb));
+      ulps.push_back(d);
+      row_same += d == 0;
+      const double x = from_bf16(rb), y = from_bf16(gb);
+      if (!std::isfinite(x) || !std::isfinite(y)) {
+        if (x != y) a.scaled = INFINITY;
+        continue;
+      }
+      int e = 0;
+      (void)std::frexp(std::max(std::abs(x), rms), &e);
+      a.scaled = std::max(a.scaled, std::abs(x - y) / std::ldexp(1.0, e - 8));
+    }
+    same += row_same;
+    a.min_row_same = std::min(a.min_row_same, 100.0 * static_cast<double>(row_same) / static_cast<double>(cols));
+  }
+  std::sort(ulps.begin(), ulps.end());
+  const auto pct = [&](double p) { return ulps[std::min(ulps.size() - 1, static_cast<std::size_t>(p / 100.0 * static_cast<double>(ulps.size())))]; };
+  a.same = 100.0 * static_cast<double>(same) / static_cast<double>(n);
+  a.p99 = pct(99);
+  a.p999 = pct(99.9);
+  return a;
+}
+
 // One block's synthetic weights and activations, device side, in the layouts of hip_block.h. Magnitudes keep
 // activations near 1 through the block, which makes softmax weights spread (S * scale has a standard deviation near 1).
 struct BlockInputs {
@@ -239,9 +311,34 @@ struct BlockInputs {
   }
 };
 
+// A block's GEMM weights in pack_fragments' layout.
+struct PackedWeights {
+  DevBuffer<bf16_bits> qkv, o, up_gate, down;
+  PackedWeights(const BlockWeights& w, hipStream_t stream) {
+    const auto pack = [&](DevBuffer<bf16_bits>& to, const bf16_bits* from, std::int64_t n, int k) {
+      to = DevBuffer<bf16_bits>(static_cast<std::size_t>(n) * k);
+      pack_fragments(to.get(), from, k, n, n, k, stream);
+    };
+    pack(qkv, w.qkv, 3 * kDim, kDim);
+    pack(o, w.o, kDim, kDim);
+    pack(up_gate, w.up_gate, 2 * kFfnDim, kDim);
+    pack(down, w.down, kDim, kFfnDim);
+    check(hipStreamSynchronize(stream), "hipStreamSynchronize");
+  }
+  BlockWeights apply(BlockWeights w) const {
+    w.qkv_packed = qkv.get();
+    w.o_packed = o.get();
+    w.up_gate_packed = up_gate.get();
+    w.down_packed = down.get();
+    return w;
+  }
+};
+
 // One run's work buffers.
 struct BlockActivations {
-  DevBuffer<bf16_bits> x, y, qkv, attn, ffn;
+  static constexpr int kMaxRows = 8;
+  static constexpr bf16_bits kPoison = 0x7fc0;  // a NaN
+  DevBuffer<bf16_bits> x, y, qkv, attn, ffn, pack, pack_attn;
   explicit BlockActivations(std::int64_t tokens) {
     const auto n = static_cast<std::size_t>(tokens);
     x = DevBuffer<bf16_bits>(n * kDim);
@@ -249,10 +346,24 @@ struct BlockActivations {
     qkv = DevBuffer<bf16_bits>(n * 3 * kDim);
     attn = DevBuffer<bf16_bits>(n * kDim);
     ffn = DevBuffer<bf16_bits>(n * kFfnDim);
+    pack = DevBuffer<bf16_bits>(static_cast<std::size_t>((tokens + kPackRowsMultiple - 1) / kPackRowsMultiple * kPackRowsMultiple) * kFfnDim);
+    pack_attn = DevBuffer<bf16_bits>((n + std::size_t{kAttentionStepN} * kMaxRows) * 3 * kDim);
+  }
+  // NaN in every buffer the ops write, after `stream`'s work. x is left alone: it is the residual stream, which the caller
+  // sets. A test that poisons before an op or a block, then sets that op's inputs, sees a value no op wrote as a NaN, not
+  // as what an earlier run (the engine's outputs, the other path's) left there.
+  void poison(hipStream_t stream) {
+    check(hipStreamSynchronize(stream), "hipStreamSynchronize");
+    DevBuffer<bf16_bits>* const outputs[] = {&y, &qkv, &attn, &ffn, &pack, &pack_attn};
+    std::size_t largest = 0;
+    for (const DevBuffer<bf16_bits>* b : outputs) largest = std::max(largest, b->size());
+    const std::vector<bf16_bits> nan(largest, kPoison);
+    for (DevBuffer<bf16_bits>* b : outputs) check(hipMemcpy(b->get(), nan.data(), b->size() * sizeof(bf16_bits), hipMemcpyHostToDevice), "hipMemcpy");
   }
   BlockBuffers buffers(const bf16_bits* rope, const bf16_bits* mod, const std::int32_t* cu_seqlens, int batch, int max_seqlen,
                        int tokens) const {
-    return {x.get(), y.get(), qkv.get(), attn.get(), ffn.get(), rope, mod, cu_seqlens, batch, max_seqlen, tokens};
+    if (batch > kMaxRows) throw std::runtime_error("BlockActivations: too many rows");
+    return {x.get(), y.get(), qkv.get(), attn.get(), ffn.get(), rope, mod, cu_seqlens, batch, max_seqlen, tokens, pack.get(), pack_attn.get()};
   }
 };
 

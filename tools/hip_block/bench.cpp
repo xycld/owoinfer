@@ -134,7 +134,7 @@ bool known_answer_norms(hipStream_t stream) {
 
 // M, N, K with tails on every axis: the padded fragment paths and the tile walk.
 bool known_answer_gemms(hipStream_t stream) {
-  constexpr int m = 37, n = 104, k = 40, f = 24, ld = 3 * k;
+  constexpr int m = 37, n = 104, k = 40, f = 40, ld = 3 * k;  // f: more than one SiTU tile, with a tail
   const std::vector<bf16_bits> x_h = synth_bf16(21, static_cast<std::size_t>(m) * ld, 0);
   const std::vector<bf16_bits> w_h = synth_bf16(22, static_cast<std::size_t>(n) * k, -2);
   const std::vector<bf16_bits> gate_h = synth_bf16(23, n, -2);
@@ -246,10 +246,11 @@ int run(const std::vector<int>& rows, int iters) {
   }
   const int tokens = cu_h.back();
   const BlockInputs in(tokens);
-  const BlockActivations act(tokens);
+  BlockActivations act(tokens);
   DevBuffer<std::int32_t> cu(cu_h.size());
   cu.upload(cu_h);
-  const BlockWeights w = in.weights();
+  const PackedWeights packed_weights(in.weights(), stream);
+  const BlockWeights w = packed_weights.apply(in.weights());
   const BlockBuffers b = act.buffers(in.rope.get(), in.mod.get(), cu.get(), static_cast<int>(rows.size()), max_seqlen, tokens);
   const auto x_bytes = static_cast<std::size_t>(tokens) * kDim * sizeof(bf16_bits);
   const auto reset_x = [&] {
@@ -257,6 +258,9 @@ int run(const std::vector<int>& rows, int iters) {
     check(hipStreamSynchronize(stream), "hipStreamSynchronize");
   };
 
+  // Both runs below start from poisoned buffers, so a value the second run does not write is a NaN there, not the first
+  // run's.
+  act.poison(stream);
   reset_x();
   run_block(w, b, stream);
   check(hipStreamSynchronize(stream), "hipStreamSynchronize");
@@ -268,6 +272,23 @@ int run(const std::vector<int>& rows, int iters) {
     std::printf("NaN in the block's output: not timing.\n");
     (void)hipStreamDestroy(stream);
     return 1;
+  }
+
+  // The packed path has no replay of its own: it must give the row-major path's bits, K order being the same on both.
+  {
+    act.poison(stream);
+    reset_x();
+    run_block(in.weights(), b, stream);
+    check(hipStreamSynchronize(stream), "hipStreamSynchronize");
+    const std::vector<bf16_bits> row_major = act.x.download();
+    std::size_t differ = 0;
+    for (std::size_t i = 0; i < out.size(); ++i) differ += out[i] != row_major[i];
+    std::printf("  %-24s %s (%zu of %zu values differ from the row-major path)\n", "packed block", differ == 0 ? "ok" : "FAILED", differ, out.size());
+    if (differ != 0) {
+      std::printf("Packed and row-major blocks differ: not timing.\n");
+      (void)hipStreamDestroy(stream);
+      return 1;
+    }
   }
 
   std::vector<std::vector<double>> op_ms(kBlockOps);

@@ -52,6 +52,10 @@ if(HIP_BLOCK_TARGET STREQUAL "nvidia")
   target_compile_definitions(hip_block_bench PRIVATE HIP_BLOCK_TARGET_NAME="nvidia")
   target_compile_options(hip_block_bench PRIVATE ${HIP_BLOCK_WARN})
 
+  add_executable(hip_block_replay replay.cpp)
+  target_link_libraries(hip_block_replay PRIVATE hip_block_kernels CUDA::cudart)
+  target_compile_options(hip_block_replay PRIVATE ${HIP_BLOCK_WARN})
+
   # The engine: a build of this tree's mossinfer_core (README.md), at a build directory of the same CUDA toolchain.
   set(MOSSINFER_ENGINE_BUILD_DIR "" CACHE PATH "Build directory holding libmossinfer_core.a")
   get_filename_component(HIP_BLOCK_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
@@ -77,6 +81,14 @@ else()
   target_link_options(hip_block_bench PRIVATE -L${ROCM_PATH}/lib -Wl,-rpath,${ROCM_PATH}/lib)
   target_link_libraries(hip_block_bench PRIVATE amdhip64)
 
+  add_executable(hip_block_replay replay.cpp block_kernels.hip)
+  target_compile_definitions(hip_block_replay PRIVATE __HIP_PLATFORM_AMD__=1 HIP_BLOCK_LEAF_ROCWMMA)
+  target_include_directories(hip_block_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(hip_block_replay SYSTEM PRIVATE ${ROCM_PATH}/include)
+  set_property(SOURCE replay.cpp PROPERTY COMPILE_OPTIONS ${HIP_BLOCK_WARN})
+  target_link_options(hip_block_replay PRIVATE -L${ROCM_PATH}/lib -Wl,-rpath,${ROCM_PATH}/lib)
+  target_link_libraries(hip_block_replay PRIVATE amdhip64)
+
   # The device build on its own: the assembly and linked code object that check_device.sh reads.
   set(HIP_BLOCK_DEVICE_ARGS -x hip -std=c++17 -O3 ${HIP_BLOCK_HIP_FLAGS} --cuda-device-only -D__HIP_PLATFORM_AMD__=1
       -DHIP_BLOCK_LEAF_ROCWMMA -I${CMAKE_CURRENT_SOURCE_DIR} -isystem ${ROCM_PATH}/include)
@@ -90,6 +102,6 @@ else()
     COMMAND ${CMAKE_CXX_COMPILER} ${HIP_BLOCK_DEVICE_ARGS} --no-gpu-bundle-output -o block_kernels.co ${HIP_BLOCK_SRC}
     COMMENT "Device code object for ${HIP_BLOCK_TARGET}")
   add_custom_target(hip_block_device_check ALL
-    COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/check_device.sh ${ROCM_PATH}/lib/llvm/bin block_kernels.s block_kernels.co
+    COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/check_device.sh ${ROCM_PATH}/lib/llvm/bin ${HIP_BLOCK_TARGET} block_kernels.s block_kernels.co
     DEPENDS block_kernels.s block_kernels.co VERBATIM)
 endif()

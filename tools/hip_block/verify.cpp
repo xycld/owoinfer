@@ -4,10 +4,11 @@
 // says nothing about WMMA, which does not run here, and nothing about rocWMMA's lane layout.
 //
 //   hip_block_verify                                 synthetic inputs: shapes with tails, edge inputs, whole blocks
-//   hip_block_verify --real [--weights DIR] [--golden DIR]   real block weights and activations captured from the
-//                                                    engine's forward, at the 1024^2 golden shape (DIR defaults:
+//   hip_block_verify --real [--weights DIR] [--golden DIR] [--dump DIR]   real block weights and activations captured
+//                                                    from the engine's forward, at the 1024^2 golden shape (DIR defaults:
 //                                                    $MOSS_WEIGHTS, whose base/ holds moss.mossidx, and $MOSS_GOLDEN,
-//                                                    the directory of the golden .npy files)
+//                                                    the directory of the golden .npy files). --dump writes E13's blocks
+//                                                    for hip_block_replay, with the scalar leaf's per-op figures.
 //
 // Tensor-core and scalar accumulation are not bit-compatible, so outputs differ in the last place where an fp32 rounding
 // difference crosses a bf16 rounding boundary. Raw ULP distances also grow without limit on outputs near zero: a sum that
@@ -37,6 +38,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -45,6 +47,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <map>
 #include <optional>
 #include <span>
@@ -124,6 +127,8 @@ std::int32_t ulp_distance(bf16_bits a, bf16_bits b) {
 }
 
 int g_failures = 0;
+std::string g_dump_dir;  // --dump: the E13 real blocks' weights, inputs and engine outputs, for hip_block_replay
+std::vector<std::string> g_dumped;  // the block directories written under it
 
 void print_header() {
   std::printf("| %-40s | %10s | %8s | %3s | %3s | %5s | %6s | %5s | %6s |\n", "case", "values", "same %", "p50", "p99", "p99.9",
@@ -731,6 +736,89 @@ void check_edges(mi::kernels::Gemm& engine, void* ws, hipStream_t s) {
   with("all scores -Inf, 129-token row", [&](AttentionInput& in) { all_negative(in, 117, 246, 120); });  // five softmax steps
 }
 
+// Edge inputs through run_block_op's attention, on the packed path that run_block takes and on the row-major one, each
+// against the engine: the packer's zero tails, its per-sequence groups and the rescale's NaN test, which the edge rows above
+// (attention() without packing) do not reach. q, k, v are one [tokens, 3 kDim] QKV as the block holds it.
+void check_attention_op_edges(hipStream_t s) {
+  const std::vector<int> lengths = {33, 37, 64, 16, 129, 1};
+  const std::vector<std::int32_t> cu = cumulative(lengths);
+  const int tokens = cu.back(), max_seqlen = *std::max_element(lengths.begin(), lengths.end());
+  const auto n = static_cast<std::size_t>(tokens);
+  constexpr std::size_t ld = 3 * kDim;
+  const Bits base = synth_bf16(91, n * ld, 0);
+  DevBuffer<std::int32_t> cu_dev(cu.size());
+  cu_dev.upload(cu);
+  const Tensor cu_t = Tensor::view(cu_dev.get(), DType::kI32, mi::Device::kCUDA, {static_cast<std::int64_t>(cu.size())});
+  const std::size_t lse_bytes = mi::attention::flash_fwd_workspace_bytes(tokens, kHeads);
+  DevBuffer<float> lse(lse_bytes / sizeof(float));
+  BlockActivations pro(tokens);
+  const BlockBuffers packed = pro.buffers(nullptr, nullptr, cu_dev.get(), static_cast<int>(lengths.size()), max_seqlen, tokens);
+  BlockBuffers row_major = packed;
+  row_major.pack = nullptr;
+  row_major.pack_attn = nullptr;
+  // Attention reads no weight; a packed QKV weight is what selects the packed path.
+  const DevBuffer<bf16_bits> unread(1);
+  BlockWeights w{};
+  w.qkv_packed = unread.get();
+  const auto idx = [&](std::size_t row, int part, int head, int dim) {
+    return row * ld + static_cast<std::size_t>(part) * kDim + static_cast<std::size_t>(head) * kHeadDim + static_cast<std::size_t>(dim);
+  };
+  const auto run = [&](const std::string& name, const std::function<void(Bits&)>& edit) {
+    Bits in = base;
+    edit(in);
+    Buf qkv = device_bits(in);
+    Buf ref(n * kDim);
+    const auto l = static_cast<std::int64_t>(tokens);
+    mi::attention::flash_fwd(heads_of(qkv.get(), l, kHeads, ld), heads_of(qkv.get() + kDim, l, kHeads, ld), heads_of(qkv.get() + 2 * kDim, l, kHeads, ld),
+                             heads_of(ref.get(), l, kHeads, kDim), cu_t, cu_t, max_seqlen, false, kScale, lse.get(), lse_bytes, s);
+    sync(s);
+    const Bits ref_h = ref.download();
+    for (const bool use_packed : {true, false}) {
+      pro.poison(s);
+      pro.qkv.upload(in);
+      run_block_op(3, w, use_packed ? packed : row_major, s);
+      sync(s);
+      report(std::string("op 3 ") + (use_packed ? "packed" : "row-major") + " [" + name + "]", ref_h, pro.attn.download(), Gate::kAccumulated);
+    }
+  };
+  run("plain", [](Bits&) {});
+  run("NaN k", [&](Bits& in) { in[idx(40, 1, 3, 7)] = kNanBits; });
+  run("NaN v", [&](Bits& in) { in[idx(40, 2, 3, 7)] = kNanBits; });
+  run("NaN q", [&](Bits& in) { in[idx(40, 0, 3, 7)] = kNanBits; });
+  run("Inf k", [&](Bits& in) { in[idx(40, 1, 3, 7)] = kInfBits; });
+  run("Inf v", [&](Bits& in) { in[idx(40, 2, 3, 7)] = kInfBits; });
+  run("Inf q", [&](Bits& in) { in[idx(40, 0, 3, 7)] = kInfBits; });
+  // The next sequence's first token NaN or Inf in every head: it must not reach this sequence through its tail.
+  run("NaN v, row 1's first", [&](Bits& in) {
+    for (int h = 0; h < kHeads; ++h) {
+      for (int d = 0; d < kHeadDim; ++d) in[idx(33, 2, h, d)] = kNanBits;
+    }
+  });
+  run("Inf k, row 1's first", [&](Bits& in) {
+    for (int h = 0; h < kHeads; ++h) {
+      for (int d = 0; d < kHeadDim; ++d) in[idx(33, 1, h, d)] = kInfBits;
+    }
+  });
+  run("all k of row 2 zero", [&](Bits& in) {
+    for (std::size_t r = 70; r < 134; ++r) std::fill_n(in.begin() + static_cast<std::ptrdiff_t>(r * ld + kDim), kDim, bf16_bits{0});
+  });
+  // The 33-token row's last query row is a tile of one row, over two key steps. Its scores all -Inf at head 0 make the
+  // second step's rescale NaN.
+  run("-Inf scores, 1-row tile", [&](Bits& in) {
+    in[idx(32, 0, 0, 7)] = kInfBits;
+    for (int j = 0; j < 33; ++j) in[idx(static_cast<std::size_t>(j), 1, 0, 7)] = to_bf16(-1.0f);
+  });
+  // The first step walked is the row's last key: all NaN at head 0, so the second step starts from a NaN maximum.
+  run("last key all NaN", [&](Bits& in) {
+    for (int d = 0; d < kHeadDim; ++d) in[idx(32, 1, 0, d)] = kNanBits;
+  });
+  // Every score -Inf for a full tile of 16 query rows of the 64-token row, over its four key steps.
+  run("-Inf scores, full tile", [&](Bits& in) {
+    for (int r = 70; r < 86; ++r) in[idx(static_cast<std::size_t>(r), 0, 0, 7)] = kInfBits;
+    for (int j = 70; j < 134; ++j) in[idx(static_cast<std::size_t>(j), 1, 0, 7)] = to_bf16(-1.0f);
+  });
+}
+
 // One block run: real or synthetic weights and inputs, device side, at the run's first token.
 struct BlockCase {
   std::string name;
@@ -753,10 +841,11 @@ void check_block(const BlockCase& c, mi::kernels::Gemm& engine, void* ws, const 
   const int tokens = cu.back();
   const auto l = static_cast<std::int64_t>(tokens);
   const auto n = static_cast<std::size_t>(tokens);
-  const BlockActivations pro(tokens);
+  BlockActivations pro(tokens);
   DevBuffer<std::int32_t> cu_dev(cu.size());
   cu_dev.upload(cu);
-  const BlockWeights& w = c.w;
+  const PackedWeights packed_weights(c.w, s);
+  const BlockWeights w = packed_weights.apply(c.w);
   const md::BlockTensors& bt = c.bt;
   const BlockBuffers buffers = pro.buffers(c.rope, c.mod, cu_dev.get(), static_cast<int>(c.lengths.size()), max_seqlen, tokens);
 
@@ -769,7 +858,8 @@ void check_block(const BlockCase& c, mi::kernels::Gemm& engine, void* ws, const 
   const auto copy = [&](bf16_bits* to, const bf16_bits* from, std::size_t count) {
     check(hipMemcpyAsync(to, from, count * sizeof(bf16_bits), hipMemcpyDeviceToDevice, s), "hipMemcpyAsync");
   };
-  // Prototype ops read buffers set to the engine's state: each op's inputs are restored from the engine's buffers.
+  // Prototype ops read buffers set to the engine's state: before each op every buffer the ops write is poisoned, then its
+  // inputs are restored from the engine's buffers.
   const auto restore = [&](const Buf& to, const Buf& from) { copy(to.get(), from.get(), to.size()); };
   copy(fused_x.get(), c.x_init, fused_x.size());
   const md::FusedBlockBuffers fb{mat(fused_x.get(), l, kDim), mat(fused_y.get(), l, kDim), mat(big.get(), l, md::kOpByOpBigCols),
@@ -796,6 +886,20 @@ void check_block(const BlockCase& c, mi::kernels::Gemm& engine, void* ws, const 
 
   // Per-op chain on the engine's activations.
   print_header();
+  const bool dumping = !g_dump_dir.empty() && c.real && c.name.find("E13") != std::string::npos;
+  fs::path dump_path;
+  if (dumping) {
+    std::string dir_name = c.name.substr(c.name.rfind("block"));
+    std::replace(dir_name.begin(), dir_name.end(), ' ', '_');
+    dump_path = fs::path(g_dump_dir) / dir_name;
+  }
+  if (dumping) fs::create_directories(dump_path);
+  const auto dump_bits = [&](const char* name, const Bits& v) {
+    if (!dumping) return;
+    std::ofstream f(dump_path / (std::string(name) + ".bin"), std::ios::binary);
+    f.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size() * sizeof(bf16_bits)));
+    if (!f) throw std::runtime_error(std::string("cannot write ") + name);
+  };
   const auto mod = [&](int i) { return c.mod + static_cast<std::int64_t>(i) * kDim; };
   Buf ex(n * kDim), ey(n * kDim), eqkv(n * 3 * kDim), eattn(n * kDim), effn(n * kFfnDim);
   copy(ex.get(), c.x_init, ex.size());
@@ -806,31 +910,56 @@ void check_block(const BlockCase& c, mi::kernels::Gemm& engine, void* ws, const 
     check(hipMemcpy(h.data(), p, count * sizeof(bf16_bits), hipMemcpyDeviceToHost), "hipMemcpy");
     return h;
   };
+  std::array<Agreement, kBlockOps> scalar_figures{};  // for the dump: what hip_block_replay compares, on this leaf
   const auto op_out = [&](int op, Gate gate, const Buf& ref, const Buf& got, int p999_limit = 1) {
     sync(s);
     const Bits ref_h = ref.download(), got_h = got.download();
     report(block_op_name(op), ref_h, got_h, gate, {}, p999_limit);
+    if (dumping) {
+      const std::size_t row_len = ref_h.size() / n;
+      scalar_figures[static_cast<std::size_t>(op)] = agreement(ref_h, got_h, row_len, op == 2 ? 2 * kDim : row_len);  // qk_norm_rope: q and k
+    }
     return std::make_pair(ref_h, got_h);
   };
 
+  pro.poison(s);
   restore(pro.x, ex);
   mi::kernels::rms_norm_modulate_moss(tx, bt.norm1, vec(mod(1), kDim), vec(mod(0), kDim), ty, s);
   run_block_op(0, w, buffers, s);
   op_out(0, Gate::kExact, ey, pro.y);
+  if (dumping) {
+    const auto hd = [&](const char* name, const bf16_bits* p, std::size_t count) { dump_bits(name, host(p, count)); };
+    hd("norm1", w.norm1, kDim);
+    hd("norm2", w.norm2, kDim);
+    hd("q_norm", w.q_norm, kHeadDim);
+    hd("k_norm", w.k_norm, kHeadDim);
+    hd("w_qkv", w.qkv, std::size_t{3} * kDim * kDim);
+    hd("w_o", w.o, std::size_t{kDim} * kDim);
+    hd("w_up_gate", w.up_gate, std::size_t{2} * kFfnDim * kDim);
+    hd("w_down", w.down, std::size_t{kDim} * kFfnDim);
+    hd("rope", c.rope, n * kHeadDim);
+    hd("mod", c.mod, std::size_t{6} * kDim);
+    dump_bits("x0", ex.download());
+    dump_bits("y0", ey.download());
+  }
 
+  pro.poison(s);
   restore(pro.y, ey);
   engine.linear(tq, ty, bt.qkv, nullptr, ws, mi::kernels::Gemm::kWorkspaceBytes, s);
   run_block_op(1, w, buffers, s);
   {
     const auto [ref_h, got_h] = op_out(1, Gate::kAccumulated, eqkv, pro.qkv);
     report_gemm_outliers(ref_h, got_h, ey.download(), kDim, host(w.qkv, std::size_t{3} * kDim * kDim), kDim, 3 * kDim, kDim);
+    dump_bits("qkv1", ref_h);
   }
 
+  pro.poison(s);
   restore(pro.qkv, eqkv);
   mi::kernels::fused::qk_norm_rope_moss(tq, kHeads, bt.q_norm, bt.k_norm, mat(c.rope, l, kHeadDim), s);
   run_block_op(2, w, buffers, s);
-  op_out(2, Gate::kExact, eqkv, pro.qkv);
+  dump_bits("qkv2", op_out(2, Gate::kExact, eqkv, pro.qkv).first);
 
+  pro.poison(s);
   restore(pro.qkv, eqkv);
   mi::attention::flash_fwd(heads_of(eqkv.get(), l, kHeads, 3 * kDim), heads_of(eqkv.get() + kDim, l, kHeads, 3 * kDim),
                            heads_of(eqkv.get() + 2 * kDim, l, kHeads, 3 * kDim), heads_of(eattn.get(), l, kHeads, kDim), cu_tensor, cu_tensor,
@@ -839,43 +968,51 @@ void check_block(const BlockCase& c, mi::kernels::Gemm& engine, void* ws, const 
   {
     const auto [ref_h, got_h] = op_out(3, Gate::kAccumulated, eattn, pro.attn);
     const Bits qkv_h = eqkv.download();
+    dump_bits("attn", ref_h);
     report_attention_outliers(ref_h, got_h, qkv_h.data(), qkv_h.data() + kDim, qkv_h.data() + 2 * kDim, 3 * kDim, kDim, cu, cu);
   }
 
   const Bits x_before_o = ex.download();
+  pro.poison(s);
   restore(pro.attn, eattn);
   restore(pro.x, ex);
   mi::kernels::fused::gemm_gated_residual(tx, ta, bt.o, vec(mod(2), kDim), s);
   run_block_op(4, w, buffers, s);
   {
     const auto [ref_h, got_h] = op_out(4, Gate::kFlipChecked, ex, pro.x);
+    dump_bits("x4", ref_h);
     const Bits attn_h = eattn.download(), o_h = host(w.o, std::size_t{kDim} * kDim), gate_h = host(mod(2), kDim);
     report_gated_outliers(ref_h, got_h, x_before_o, kDim, attn_h, kDim, o_h, kDim, gate_h.data(), kDim, kDim);
     check_gated_flips(ref_h, got_h, x_before_o, kDim, attn_h, kDim, o_h, kDim, gate_h.data(), kDim, kDim);
   }
 
+  pro.poison(s);
   restore(pro.x, ex);
   mi::kernels::rms_norm_modulate_moss(tx, bt.norm2, vec(mod(4), kDim), vec(mod(3), kDim), ty, s);
   run_block_op(5, w, buffers, s);
-  op_out(5, Gate::kExact, ey, pro.y);
+  dump_bits("y5", op_out(5, Gate::kExact, ey, pro.y).first);
 
+  pro.poison(s);
   restore(pro.y, ey);
   mi::kernels::fused::gemm_situ_glu(tf, ty, bt.up_gate, s);
   run_block_op(6, w, buffers, s);
   {
     const auto [ref_h, got_h] = op_out(6, Gate::kFlipChecked, effn, pro.ffn, c.real ? 2 : 1);
+    dump_bits("ffn", ref_h);
     const Bits y_h = ey.download(), up_gate_h = host(w.up_gate, std::size_t{2} * kFfnDim * kDim);
     report_situ_outliers(ref_h, got_h, y_h, kDim, up_gate_h, kDim, kFfnDim, kDim);
     check_situ_flips(ref_h, got_h, y_h, kDim, up_gate_h, kDim, kFfnDim, kDim);
   }
 
   const Bits x_before_down = ex.download();
+  pro.poison(s);
   restore(pro.ffn, effn);
   restore(pro.x, ex);
   mi::kernels::fused::gemm_gated_residual(tx, tf, bt.down, vec(mod(5), kDim), s);
   run_block_op(7, w, buffers, s);
   {
     const auto [ref_h, got_h] = op_out(7, Gate::kFlipChecked, ex, pro.x);
+    dump_bits("x7", ref_h);
     const Bits ffn_h = effn.download(), down_h = host(w.down, std::size_t{kDim} * kFfnDim), gate_h = host(mod(5), kDim);
     report_gated_outliers(ref_h, got_h, x_before_down, kDim, ffn_h, kFfnDim, down_h, kFfnDim, gate_h.data(), kDim, kFfnDim);
     report_gated_worst(ref_h, got_h, x_before_down, kDim, ffn_h, kFfnDim, down_h, kFfnDim, gate_h.data(), kDim, kFfnDim);
@@ -955,6 +1092,7 @@ void check_block(const BlockCase& c, mi::kernels::Gemm& engine, void* ws, const 
   }
 
   // The whole prototype block on its own outputs.
+  pro.poison(s);
   copy(pro.x.get(), c.x_init, pro.x.size());
   run_block(w, buffers, s);
   sync(s);
@@ -963,6 +1101,19 @@ void check_block(const BlockCase& c, mi::kernels::Gemm& engine, void* ws, const 
     limits.same_min = control->same_pct - 5.0;
     limits.p99_max = std::max(16, 2 * control->p99);
     limits.scaled_max = std::max(16.0, 2.0 * control->scaled);
+    if (dumping) {
+      // hip_block_replay's read_meta has the format.
+      std::ofstream meta(dump_path / "meta.txt");
+      meta << std::setprecision(10) << kDumpFormat << "\nrows " << c.lengths.size();
+      for (const int len : c.lengths) meta << ' ' << len;
+      meta << "\nblock " << limits.same_min << ' ' << limits.p99_max << ' ' << limits.scaled_max << '\n';
+      for (int op = 0; op < kBlockOps; ++op) {
+        const Agreement& a = scalar_figures[static_cast<std::size_t>(op)];
+        meta << "op " << op << ' ' << a.same << ' ' << a.p99 << ' ' << a.p999 << ' ' << a.scaled << ' ' << a.min_row_same << '\n';
+      }
+      if (!meta) throw std::runtime_error("cannot write " + (dump_path / "meta.txt").string());
+      g_dumped.push_back(dump_path.filename().string());
+    }
   }
   report("whole block, final x", final_engine, pro.x.download(), Gate::kBlock, limits);
   if (control.has_value()) {
@@ -1073,6 +1224,8 @@ std::vector<bf16_bits> read_mod_and_capture(mi::weights::ModelIndex& index, cons
 }
 
 int run_real(const fs::path& bundle, const fs::path& golden, hipStream_t s) {
+  // A dump is complete once its manifest is written, at the end; until then hip_block_replay refuses it.
+  if (!g_dump_dir.empty()) fs::remove(fs::path(g_dump_dir) / "manifest.txt");
   mi::weights::ModelIndex index = mi::weights::load_index(bundle / "moss.mossidx", bundle);
   md::install_fused_check(md::check_fused_gemms(s));
   const md::FusedRouteSnapshot snapshot = md::fused_route_snapshot();
@@ -1128,6 +1281,17 @@ int run_real(const fs::path& bundle, const fs::path& golden, hipStream_t s) {
       check_block({"real, " + c.name + ", block " + std::to_string(b), w, bt, x.get(), rope.get(), mod.get(), lengths, &expected, true}, engine, ws, snapshot, s);
     }
   }
+  if (!g_dump_dir.empty()) {
+    if (g_failures != 0 || g_dumped.empty()) {
+      std::printf("\nno manifest.txt in %s: a failed run is no reference for hip_block_replay\n", g_dump_dir.c_str());
+    } else {
+      std::ofstream manifest(fs::path(g_dump_dir) / "manifest.txt");
+      manifest << kDumpFormat << '\n';
+      for (const std::string& d : g_dumped) manifest << d << '\n';
+      if (!manifest) throw std::runtime_error("cannot write manifest.txt in " + g_dump_dir);
+      std::printf("\ndumped %zu blocks to %s\n", g_dumped.size(), g_dump_dir.c_str());
+    }
+  }
   std::printf("\n%s (%d failed checks)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
@@ -1158,6 +1322,7 @@ int run_synthetic(hipStream_t s) {
   std::printf("\nEdge inputs.\n");
   print_header();
   check_edges(engine, ws.get(), s);
+  check_attention_op_edges(s);
 
   synthetic_block("Block, 1024^2 shape", {4378, 4106}, engine, ws.get(), snapshot, s);
   synthetic_block("Block, varlen", {4000, 2601, 17, 1000}, engine, ws.get(), snapshot, s);
@@ -1179,14 +1344,20 @@ int main(int argc, char** argv) {
     const std::string arg = argv[i];
     if (arg == "--real") {
       real = true;
+    } else if (arg == "--dump" && i + 1 < argc) {
+      g_dump_dir = argv[++i];
     } else if (arg == "--weights" && i + 1 < argc) {
       weights = argv[++i];
     } else if (arg == "--golden" && i + 1 < argc) {
       golden = argv[++i];
     } else {
-      std::fprintf(stderr, "usage: %s [--real [--weights DIR] [--golden DIR]]\n", argv[0]);
+      std::fprintf(stderr, "usage: %s [--real [--weights DIR] [--golden DIR] [--dump DIR]]\n", argv[0]);
       return 1;
     }
+  }
+  if (!g_dump_dir.empty() && !real) {
+    std::fprintf(stderr, "--dump needs --real: it writes the real blocks\n");
+    return 1;
   }
   try {
     int devices = 0;

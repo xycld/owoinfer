@@ -41,7 +41,7 @@ build-hip-gfx1201/hip_block_bench            # RDNA4; build-hip-gfx1100 for RDNA
 build-hip-gfx1201/hip_block_bench --rows 4378,4106 --iters 5    # the defaults
 ```
 
-`hip_block_bench` prints the device name, then a known-answer check of every kernel against a host replay of its op order, with tails on every axis, then runs one block and looks for NaNs. It refuses to time a block that fails either. Then it prints min and median milliseconds per op and for the whole block, on synthetic 1024²-shaped activations: E13's 8484 tokens, two rows of 4378 and 4106 (about 0.8 GiB). Exit status: 0 ran, 1 error, known-answer failure or NaN, 2 no usable device.
+`hip_block_bench` prints the device name, then a known-answer check of every kernel against a host replay of its op order, with tails on every axis, then runs one block, looks for NaNs, and requires the packed path to give the row-major path's bits. Both block runs start with NaN in every buffer the ops write, so a value one path does not write is a NaN in its output, not the other run's. It refuses to time a block that fails any of these. The replay check is the row-major path; `hip_block_replay` below is the one that compares with the engine. Then it prints min and median milliseconds per op and for the whole block, on synthetic 1024²-shaped activations: E13's 8484 tokens, two rows of 4378 and 4106 (about 1.2 GiB of buffers, packed weights and pack buffers included). Exit status: 0 ran, 1 error, known-answer failure or NaN, 2 no usable device.
 
 On a machine where an iGPU is device 0, select the card with `HIP_VISIBLE_DEVICES`: the bench runs on device 0 of what it sees.
 
@@ -62,9 +62,9 @@ The known-answer limits, against the replays (`same` is the share of outputs wit
 
 ## Verify test
 
-`build-hip-nvidia/hip_block_verify` needs a CUDA device with about 2 GiB free. It runs the same inputs through the engine's kernels (`run_block_fused` and the individual kernels, from `libmossinfer_core.a`) and through the prototype with the scalar leaf, and prints per-op error distributions in bf16 ULPs. It checks the kernels' logic above the leaf, and nothing about WMMA or rocWMMA's lane layout. The cases are shapes with tails on M, N and K; varlen attention with rows of different lengths and with query lengths different from key lengths; edge inputs (a zero row, a NaN, an Inf, denormals, per-row magnitudes across a wide range, attention scores all -Inf); and whole blocks over two and four rows.
+`build-hip-nvidia/hip_block_verify` needs a CUDA device with about 2 GiB free. It runs the same inputs through the engine's kernels (`run_block_fused` and the individual kernels, from `libmossinfer_core.a`) and through the prototype with the scalar leaf, and prints per-op error distributions in bf16 ULPs. It checks the kernels' logic above the leaf, and nothing about WMMA or rocWMMA's lane layout. Block rows run the packed path that `run_block` uses, and the op-level shapes the row-major one. Before each of a block row's ops and before its whole block, every buffer the ops write holds NaN, so an output the prototype does not write fails as a NaN on one side rather than passing as the engine's value left there. The cases are shapes with tails on M, N and K; varlen attention with rows of different lengths and with query lengths different from key lengths; edge inputs (a zero row, a NaN, an Inf, denormals, per-row magnitudes across a wide range, attention scores all -Inf); attention's edge inputs again through `run_block_op`, packed and row-major (a NaN or Inf in q, k or v, also at the next sequence's first token, a sequence's keys all zero, every score -Inf in a one-row tile and in a full tile, the last key all NaN), which reach the packer and the rescale's NaN test; and whole blocks over two and four rows.
 
-`hip_block_verify --real --weights DIR --golden DIR` (or `MOSS_WEIGHTS`, `MOSS_GOLDEN`) runs blocks 1, 21, 22, 23 and 41 on their real weights and on activations captured from the engine's forward at the 1024² golden shape, needing about 3 GiB. `DIR` for `--weights` holds `base/moss.mossidx`; `--golden` holds the golden `.npy` files. Blocks stream during the capture, so the DiT need not fit. It also runs the engine's block with one op at a time replaced by the prototype's.
+`hip_block_verify --real --weights DIR --golden DIR` (or `MOSS_WEIGHTS`, `MOSS_GOLDEN`) runs blocks 1, 21, 22, 23 and 41 on their real weights and on activations captured from the engine's forward at the 1024² golden shape, needing about 4 GiB (3.9 measured on the 4090). `DIR` for `--weights` holds `base/moss.mossidx`; `--golden` holds the golden `.npy` files. Blocks stream during the capture, so the DiT need not fit. It also runs the engine's block with one op at a time replaced by the prototype's.
 
 `scaled` is the largest error in ULPs of max(|engine|, rms of the op's output). Raw ULP distances grow without limit on outputs that nearly cancel, since such a sum keeps the absolute error of its large terms. The gates, each also failing on a NaN on one side only:
 
@@ -84,60 +84,89 @@ These rules changed after results were in, in this order:
 4. The flip check above was added after SiTU reached scaled 5 on one value in 7e7 with the block's two-row shape, and the last block's gated residual reached 32 on real activations. Plain scaled <= 4 fails on both.
 5. The fixed block gate failed on real activations at blocks 21 to 41, and SiTU's p99.9 reached 2 at block 41. The real-activation block gate above and SiTU's limit of 2 replaced them. These limits were set after seeing those results.
 6. A second review showed a wrong control passing: with its QKV zeroed, `--real` exited 0 because the limits opened with it. The control's own gates above were added, with the floor of 50 % set after seeing healthy controls at 69.9 % and up and the zeroed one under 5 %. The same review showed an Inf on one side passing the flip-checked rows, which now fail, and a correct `rsqrt` able to fail the bench's known answer, which raised two ULP limits from 1 to 3.
+7. A third review showed outputs the prototype never wrote passing as the engine's values left in the buffers, and whole wrong token rows passing replay. Every buffer the ops write is now poisoned with NaN before each op and block, and replay gained its row and scaled limits (below), their margins chosen after seeing the scalar leaf's figures, two other accumulation orders and the review's row mutants. The scaled limit was first max(8, 2 x the scalar leaf's); the card's earlier block-41 down gemm + gated (64) met that exactly, and no mutant needed it, so it is max(16, 4 x).
 
-## First run on an AMD card
+## On an AMD card
 
-An RX 9060 XT (gfx1200, 32 CUs, 16 GB of GDDR6 on a 128-bit bus, 4 MB L2, 32 MB L3) with ROCm 7.16 and rocWMMA 2.2.1, on a Ryzen 5 3500 host. Synthetic activations, one session, so these times are a first reading rather than a benchmark.
+An RX 9060 XT (gfx1200, 32 CUs, 16 GB of GDDR6 on a 128-bit bus, 4 MB L2, 32 MB L3), ROCm 7.16, rocWMMA 2.2.1. One block at E13's 8484 tokens takes 109 ms on synthetic activations (min of 10, median 109) and 104 ms on real weights, against the engine's 31.3 ms on an RTX 4090 Laptop (E13). A 42-block step would take about 4.4 s against 1.33 s. The first build took 415 ms on one machine and 422 ms on another with the same card (Ryzen 5 3500, i7-8700), so the host is not what sets these times.
 
-The known-answer check passes on the first run: fragment load and store order, `__shared__` memory and barriers do what the kernels assume on this chip.
+| Op | First build, ms | Now, ms |
+|---|---|---|
+| norm1 + norm2 + qk_norm_rope | 2.0 | 2.0 |
+| qkv gemm | 77.0 | 9.7 |
+| attention | 97.6 | 64.3 |
+| o gemm + gated | 18.1 | 3.9 |
+| up_gate gemm + SiTU | 149.5 | 18.5 |
+| down gemm + gated | 67.3 | 10.4 |
+| whole block | 415 | 109 |
 
-| Kernel | Same | Worst ULPs | Limit |
-|---|---|---|---|
-| rms_norm_modulate | 100 % | 0.00 | 3 |
-| qk_norm_rope | 100 % | 0.12 | 3 |
-| gemm | 100 % | 0.50 | 1 |
-| gemm_gated_residual | 100 % | 0.50 | 1 |
-| gemm_situ_glu | 100 % | 0.50 | 1.5 |
-| attention | 99.995 % | 0.50 | 1 |
+On NVIDIA's scalar leaf, none of what took it there changes a bit: the old and new kernels give identical outputs for every op on the dump's real inputs, for both whole blocks, and for tail shapes and denormal attention (the third review's old-against-new harness). On the card, the new kernels pass the gates against the engine below; old against new has not run there. The card's check that the packed path gives the row-major path's bits cannot see a change both paths share: the fence, the all-lane softmax, the rescale skip, the four-wide reads, the block order and the tiles. The changes:
 
-One whole block at E13's 8484 tokens gives no NaN in 26062848 values. Its outputs have not been compared with the engine's: the known answers are small shapes against host replays.
+- **Packed operands.** A strided fragment load makes its 32 lanes touch 16 cache lines and a packed one 8, with the same instructions (one 16-byte load per lane). Packing is cheap, 0.3 ms at K 3072 and 0.9 ms at K 8192, when it walks along the row groups. Walking across them took 23 ms at K 8192.
+- **All of a step's loads before its WMMAs.** They overlap in flight. A load before each group of WMMAs stalls them: 39.8 TFLOPS against 63.3 at the same tile and block.
+- **Tiles in 2D blocks of about 4 MB per operand**, in one dispatch. Tile order cannot change an output, as K still ascends within a tile.
+- **`__syncthreads` replaced by a wavefront fence.** It emitted a cache invalidate at every call, and a workgroup here is one wave.
+- **Softmax on all 32 lanes** rather than one per row, each row's sum still in column order; four values per read from `__shared__` memory; and no accumulator trip through `__shared__` memory when no row's maximum changed, as a rescale of exactly 1 is then the only thing it could apply.
+- **Tiles retuned with all of that in place:** GEMM 32x48, SiTU 48x16.
 
-It is slow. One block takes 415 ms (min of 10, median 449 ms) against the engine's 31.3 ms on an RTX 4090 Laptop (E13), so a 42-block step would take about 17 s against 1.33 s.
+The QKV walk alone, in throwaway tests with every accumulator stored, 48x64 tiles. "Loads first" issues all of a K step's fragment loads before its WMMAs; "load per group" loads before each group of WMMAs:
 
-| Op | Min ms | GFLOP | TFLOPS |
-|---|---|---|---|
-| norm1 + norm2 + qk_norm_rope | 2.0 | | |
-| qkv gemm | 77.0 | 480 | 6.2 |
-| attention | 97.6 | | |
-| o gemm + gated | 18.1 | 160 | 8.8 |
-| up_gate gemm + SiTU | 149.5 | 854 | 5.7 |
-| down gemm + gated | 67.3 | 427 | 6.3 |
+| Test | Loads | TFLOPS |
+|---|---|---|
+| Paper peak: 32 CUs x 1024 FLOP per clock x 3.46 GHz | | about 113 |
+| WMMA on registers, tiles 1x1 to 4x4 fragments | | 54 to 96 |
+| Strided, raster | first | 9.2 |
+| Strided, raster | per group | 8.3 |
+| Strided, 2D blocks of 4x4 tiles | first | 15.4 |
+| Packed, raster | first | 22.5 |
+| Packed, raster | per group | 15.4 |
+| Packed, 2D blocks of 13x10 tiles | per group | 39.8 |
+| Packed, 2D blocks of 13x10 tiles | first | 63.3 |
+| The same with FP8, INT8 operands, speed only (values not meaningful) | first | 93, 100 |
 
-The limit is reading the operands, not WMMA. Separate tests of a 16x16x16 walk, with every accumulator stored:
+Attention is now most of the block. Removing parts of it, timing only: scores about 10 ms, V about 20, the accumulator trip about 10, and about 25 in the softmax's per-row loops and `__shared__` memory traffic. Replacing `exp2f` with `v_exp_f32` changes little. Attention at 32 rows per wave is slower and spills. Reserving 16 KB more `__shared__` memory changed nothing, which suggests it does not limit waves; I did not confirm the reservation survived compilation.
 
-| Test | TFLOPS |
-|---|---|
-| Paper peak: 32 CUs x 1024 FLOP per clock x 3.46 GHz | about 113 |
-| WMMA on registers, tiles 1x1 to 4x4 fragments | 54 to 96 |
-| 48x64 tile, QKV's work wrapped onto 0.7 MB of operands (fits L2) | 32.7 |
-| The same, 6.7 MB, then 13.6 MB | 31.4, 17.2 |
-| The same, 27 MB, 54 MB, then QKV's full 108 MB | 11.0, 10.6, 9.6 |
-| Best tile at the QKV shape without spills, 48x64 | 8.2 |
-| 32x48, as these kernels are built | 6.3 |
+Not tried: 8-bit in the real kernels, where the bf16 path's rounding points would not carry over; fragments shared through `__shared__` memory by several waves; `swmmac`'s K of 32; packed output from the op before each GEMM, which would remove the pack; summing each softmax row in partial sums across lanes, then across them, as FlashAttention does (per-thread partials, then `quad_allreduce`). That is closer to the engine than the one lane per row in column order now, and likely cheaper. A tree of four in place of the column order, which no test rejects, already moves attention's same against the engine from 99.4171 to 99.4394 % at block 1 and from 99.1279 to 99.1336 % at block 41. It needs the card for timing.
 
-- At 32x48 the walk reads about 330 GB/s, which is about what I expect from this bus (20 Gbps assumed, about 320 GB/s). The operands are far larger than L2 and L3, so almost nothing is reused. Larger tiles lower the bytes per FLOP, but past 48x64 they gain nothing, and 64x96 and 96x64 spill.
-- Even in cache the rate stops at about 32 TFLOPS, a third of the rate on registers, so fragment loading has its own limit, not yet explained.
-- K panels did not help as tried. Splitting K into panels that fit in cache, accumulators through memory between them, is bit-identical to the unblocked walk (0 of 77856768 values) and no faster: 8.1, 8.0, 6.3, 7.3, 4.6 and 2.7 TFLOPS at panels of 3072 down to 96.
-- Not tried: 8-bit WMMA, which reads half the bytes per multiply; fragments shared through `__shared__` memory by several waves; `swmmac`'s K of 32; packed operands; tuning attention's tile.
+### Against the engine, on the card
+
+`hip_block_verify --real --dump DIR` writes the E13-shaped blocks' weights, inputs and engine outputs (about 1 GB per block), each block's `meta.txt` with the whole block's limits from that run's control and the scalar leaf's own per-op figures against the engine, and last a `manifest.txt` listing the blocks. A run that fails writes no manifest. `hip_block_replay DIR [--iters N]` runs them on any device, needing about 2 GiB. It refuses a directory without a manifest (an interrupted dump, or one from before this format), a manifest that lists no block or a block that is missing, and a `meta.txt` of the earlier format. Before each op and before the whole block, every buffer the ops write holds NaN. Each op runs on the engine's input and is compared with the engine's output, `qk_norm_rope` over q and k only, under:
+
+- same >= 99 % and p99.9 <= 1, 2 for the three GEMMs with an epilogue. These are verify's accumulated gate, apart from that 2: verify allows it for SiTU on real activations only, and holds the gated residuals to 1 with its flip check, which needs the exact sums and is not ported.
+- scaled <= max(16, 4 x the scalar leaf's). A backstop: every wrong-row mutant below that exceeds it also fails the row limit. It is wide because a gated residual near cancellation moves by many ULPs for one flipped bit: the card's block-41 down gemm + gated reached 64, twice the scalar leaf's 32, and a limit of 2x would have left it no margin.
+- the lowest same % of any token row >= the scalar leaf's lowest minus 15 points. One wrong token row is 0.012 % of an op at this shape, too few values for same or p99.9 to see.
+
+Then the whole block on its own outputs, under the limits of that run's control.
+
+The row margin is wide because the card cannot be recalibrated from here. On NVIDIA, two other accumulation orders in the scalar leaf (each fragment's 16 products summed as a tree, or K descending) move the lowest row by at most 0.07 points, and the card's per-op same is within 0.07 points of the scalar leaf's. The third review's wrong-row mutants (below) reach at most 41.5 % in their row, against limits of 80.3 to 85. The scalar leaf's lowest rows on the dump: attention 96.58 and 95.28 % (blocks 1 and 41), the GEMM ops 99.34 to 99.80 %, the norms and `qk_norm_rope` 100 %.
+
+The card ran the earlier replay, without the poisoning, the row limit, the scaled limit and the q-and-k-only comparison. On the RX 9060 XT, exit 0:
+
+| Op, against the engine | Block 1: same %, p99.9, scaled | Block 41: same %, p99.9, scaled |
+|---|---|---|
+| norm1 | 99.9998, 0, 2 | 100, 0, 2 |
+| qkv gemm | 99.853, 1, 1 | 99.739, 1, 1 |
+| qk_norm_rope | 99.9997, 0, 2 | 99.9998, 0, 1 |
+| attention | 99.417, 1, 1.25 | 99.196, 1, 2 |
+| o gemm + gated | 99.970, 0, 1 | 99.954, 0, 2 |
+| norm2 | 99.9997, 0, 4 | 99.9996, 0, 2 |
+| up_gate gemm + SiTU | 99.738, 1, 4 | 99.607, 2, 5 |
+| down gemm + gated | 99.942, 0, 2 | 99.869, 1, 64 |
+| whole block, final x | 83.28 (limit 79.28), 64, 2 | 67.91 (limit 64.93), 320, 64 (limit 128) |
+
+The scalar leaf under the same comparison gives 83.30 and 68.17 for the whole block, so WMMA's rounding sits as close to the engine's as an exact fp32 walk does. The norms and `qk_norm_rope` are not bit-exact on the card as they are on NVIDIA: AMD's `rsqrt` flips a few low bits, in about 3 values in 10^6. Against the new limits, every figure of that run passes: scaled at most half its limit (block 41's down gemm + gated, 64 against 4 x 32 = 128; the norms' 2 to 4 against 16), same at least 0.196 points over 99 %, p99.9 within its limit (SiTU at block 41 at its 2). That run did not compute row figures, so the row limit has no card data yet, and its `qk_norm_rope` figure is over q, k and v.
 
 ## Verified
 
 On an RTX 4090 Laptop (sm_89), CUDA 13, ROCm 7.2.4 headers. Inputs are synthetic unless the line says real.
 
-- Both AMD targets compile with warnings as errors and link against `libamdhip64`, and each has 34 `v_wmma_f32_16x16x16_bf16` instructions (6 per GEMM kernel, 4 in SiTU, 18 in attention). Every kernel reports wave size 32, maximum flat workgroup size 32, no scratch and no spills, and `check_device.sh` fails if a kernel in the metadata goes unchecked or a GEMM or attention kernel holds no WMMA. The code objects have no undefined symbols.
+- gfx1100, gfx1200 and gfx1201 compile with warnings as errors and link against `libamdhip64`, with 12 `v_wmma_f32_16x16x16_bf16` per GEMM and SiTU kernel, and 34 in attention (48 on gfx1100). Every kernel reports wave size 32, maximum flat workgroup size 32, no scratch and no spills. The code objects have no undefined symbols. `check_device.sh`, given the target by CMake, fails if a kernel in the metadata goes unchecked, if a kernel's name is not one of the eight it lists, or if its WMMA count differs from the one listed for that target. The third review's edited assemblies fail it: a kernel renamed to contain `pack_`, an argument type renamed `pack_Args`, WMMAs removed from SiTU or attention, and a build whose packed walk holds no WMMA (6, 6, 6 and 18 left by the row-major path). The script before this check passed three of those five.
+- The zero-padded tail copies are read by a fragment load that can be a FLAT load: the copy and the operand merge into one generic pointer. After the packed path removed `__syncthreads`, nothing waited for the copy's DS writes before that load. `leaf::pad_barrier()` waits for them (a release fence at workgroup scope for `__shared__` memory). In the assembly that adds 34 `s_wait_dscnt 0x0` on gfx1200 and gfx1201, and 55 `s_waitcnt lgkmcnt(0)` on gfx1100, each at the end of a padded copy, before the block holding the FLAT load (or the DS load, where the compiler kept the pointer in `__shared__` memory). Nothing else changes, apart from two `s_delay_alu` scheduling hints in the GEMM kernels' row-major loads on gfx12. The pack, norm and RoPE kernels' assembly is identical, and so is every instruction of the packed path.
 - The AMD binaries exit with status 2 and a message on a machine with no AMD device.
+- A workgroup count wrong for SiTU, found while building the packed path, ran half the tiles and passed every check on the card, packed against row-major included, with the known answer's F inside one tile. Only the engine comparison caught it. The known answer's F now spans tiles.
 - `hip_block_verify` and `hip_block_verify --real` pass all their gates, exit status 0.
-- Fifteen mutants on scratch copies, nine in the kernels' rounding and six in the block driver, each make `hip_block_verify` and `--real` exit 1 against the engine. No mutant fails in synthetic mode only. See [Mutants](#mutants).
+- Mutants on scratch copies of the packed path, from the third review and re-run after its fixes: see [Mutants](#mutants).
+- The old and new kernels on the scalar leaf, through the third review's old-against-new harness after its fixes: every op on the dump's inputs, both whole blocks, tail shapes and denormal attention give identical bits, on the packed path and on the row-major one.
 - `rms_norm_modulate` from 16 rows and `qk_norm_rope` match the engine bit for bit in every case, real activations and edge inputs included.
 - Below 16 rows `rms_norm_modulate` is not bit-exact: the engine's block width grows there and the prototype keeps its sum order. Over 400 seeds, 3 to 5 values in 10^6 differ at 7 to 15 rows of 3072, up to 128 raw ULPs and 2 scaled. None differed in the tests at 1 to 5 rows. The DiT does not run fewer than 16 tokens at an image of 64x64 or more.
 - On real activations, the GEMM ops differ from the engine in 0.03 to 0.4 % of outputs and attention in 0.6 to 0.9 %. Per-op p99.9 is at most 1 except SiTU at block 41 (2), and scaled at most 5 except the last block's gated residual (32).
@@ -152,7 +181,7 @@ On an RTX 4090 Laptop (sm_89), CUDA 13, ROCm 7.2.4 headers. Inputs are synthetic
 
 - Edge inputs agree between engine and prototype, NaN placement included, with one exception: query rows up to 2^60, where |S * log2_scale| passes about 2^31. There both are wrong. The fp32 FMA of softmax's exponent leaves a rounding residual beyond `exp2f`'s range, so a row's largest score weighs 0 or Inf instead of 1: at row 187, head 15, dim 0, the engine gives 0, the prototype NaN, the fp32 replay NaN, the fp64 replay -0.4648. Rows up to 2^20 pass every gate. The 2^60 case is printed and not gated.
 - `device_math.h`'s bf16 conversions equal `__float2bfloat16_rn` over all 2^32 fp32 inputs and `__bfloat162float` over all 2^16 bf16 inputs. NaN inputs give NaN with different payload bits.
-- Other tile constants (GEMM 16x32, SiTU 48x32, attention 32 rows) gave the same bits as the defaults with the scalar leaf.
+- Other tile constants gave the same bits on the card as far as tried (the QKV walk at 16x16 to 64x64, 0 of 77856768 values differ between packed and strided at every tile and block size).
 - Valid changes of accumulation order in the scalar leaf: a tree of each 16 products, then added, passes verify, `--real` and the bench; K descending passes `--real` and the bench and fails one synthetic row, attention over query rows 2^-20 to 2^20, at p99.9 of 2 against 1. Verify runs only this fixed leaf, so that row can't reject a card. These change only the order of additions, and say nothing about denormal handling or AMD's math.
 - On the review's CPU emulation of rocWMMA, 30 ops on verify-style shapes are byte-identical between the scalar leaf, gfx1100 and gfx1201, and 13 leaf and kernel mutants are detected on both targets. Its model accumulates K ascending with host math.
 
@@ -185,51 +214,53 @@ These limits were set after seeing results, and the prototype passes by 3.2 to 4
 
 ## Mutants
 
-Rounding mutants in `--real`, over its 7 real cases. Each fails its own op's row in all 7. Same % is that row's range:
+The third review ran 51 mutants on scratch copies of the packed path through `hip_block_verify`, the bench and `hip_block_replay` on the scalar leaf, and 26 of them through `--real`. The rounding mutants each fail their own op's row in all 7 `--real` cases, and verify, the bench and replay:
 
-| Mutant | Own row failing | Same % | Whole-block rows failing | Bench |
-|---|---|---|---|---|
-| Gated, no rbf after gate multiply | o and down gemm+gated | 76.0 to 89.7 | 7 of 7 | fails |
-| Gated, no rbf(ab) | o and down gemm+gated | 85.9 to 93.9 | 7 of 7 | fails |
-| SiTU h, g unrounded | up_gate gemm+situ | 78.0 to 81.5 | 5 of 7 | fails |
-| SiTU inner rbfs removed | up_gate gemm+situ | 54.7 to 59.1 | 7 of 7 | fails |
-| Attention row_sum over rounded weights | attention | 95.7 to 97.3 | 2 of 7 | fails |
-| Norm, no rbf after x*r | norm1 and norm2 | 77.7 to 84.0 | 7 of 7 | fails |
-| Modulate, no rbf before shift | norm1 and norm2 | 64.5 to 74.9 | 7 of 7 | fails |
-| RoPE products unrounded | qk_norm_rope | 89.1 to 89.6 | 7 of 7 | fails |
-| Rescale 0.4 % too large | attention | 5.8 to 64.8 | 7 of 7 | fails |
+| Mutant | Whole-block rows failing in `--real` |
+|---|---|
+| Gated, no rbf after the gate multiply | 7 of 7 |
+| SiTU h and g unrounded | 5 of 7 |
+| Norm, no rbf after x*r | 7 of 7 |
+| RoPE products unrounded | 7 of 7 |
+| Attention row_sum over rounded weights | 2 of 7 |
+| Rescale 0.4 % too large | 7 of 7 |
 
-Both SiTU mutants fail on `same < 99 %`, and p99.9 reaches 3 against the real limit of 2 in some rows. In synthetic mode the row_sum mutant fails 23 attention rows and 0 of 2 whole-block rows.
+The packing and walking mutants are caught by verify and replay: a wrong first group of a sequence, a key step off by one in K or V, the rescale test always false or skipping rows, V's columns at the wrong offset, wrong weight groups, `pack_rows` too short, the max and sum loops dropping values, a stale P tail, a packer lane mismatch. Block orders that drop tiles pass the bench and fail verify and replay. Removing the GEMM pack's zero fill fails by an illegal memory access on NVIDIA. Chain mutant c, `run_block` in the order 0, 1, 2, 3, 5, 4, 6, 7, fails verify, `--real` and replay (whole block 7.08 and 0.55 % same) and passes the bench.
 
-Chaining mutants, applied to the host block driver in `block_kernels.hip`:
+What passed every test in that review, and what catches it after its fixes (the output buffers poisoned with NaN, replay's row and scaled limits, verify's attention edge rows through `run_block_op`), re-run on the fixed code:
 
-| Mutant | Whole-block rows failing, same %: synthetic | `--real` | Per-op rows that also fail | Bench |
-|---|---|---|---|---|
-| a. o gemm's residual written to y, so x keeps its pre-attention values | 2 of 2, 2.3 | 7 of 7, 0.4 to 4.9 | o gemm+gated | exit 0 |
-| b. norm2 with norm1's shift and scale | 2 of 2, 2.0 | 7 of 7, 0.2 to 1.7 | norm2 | exit 0 |
-| c. norm2 run before the gated residual, so up_gate gets the earlier x | 2 of 2, 7.1 | 7 of 7, 0.5 to 7.3 | none | exit 0 |
-| d1. rope read one token row late | 2 of 2, 21.8 to 24.5 | 7 of 7, 12.2 to 28.1 | qk_norm_rope | exit 0 |
-| d2. boundary between rows one token early | 2 of 2, 75.4 to 75.9 | 6 of 7, 14.6 to 70.4 | attention (6 of 7) | exit 0 |
-| e. down's gate taken from o's | 2 of 2, 2.1 | 7 of 7, 0.7 to 6.5 | down gemm+gated | exit 0 |
+| Mutant | Before | Now |
+|---|---|---|
+| Attention tile's last row not written | passed replay | replay: NaN mismatch in attention and the whole block, both blocks |
+| SiTU tile's last row not written | passed replay | replay: the same |
+| A SiTU row not written on the row-major path only | passed the bench, 0 values differ | bench: 3072 values differ |
+| One QKV row zeroed | passed replay at block 1 | replay, both blocks: that row 0 % same, scaled 255 |
+| One attention row x 1.02 | passed replay | replay, both blocks: row 0 % |
+| One SiTU row x 2 | passed replay at block 1 | replay, both blocks: row 0 %, scaled 247 and 255 |
+| One token without RoPE | passed replay | replay, both blocks: row 32.8 and 33.5 %, scaled 805 and 1486 |
+| 40 norm rows 0.39 % large | passed replay at block 41 | replay, both blocks: rows 28.3 to 41.5 %; at block 41 only the row limit fails it |
+| Rescale test ignoring NaN (`< 1`) | passed all | verify: op 3 with every score -Inf in a one-row tile and in a full tile, packed and row-major |
+| Attention pack's zero fill removed | passed all | verify: op 3 packed with a NaN or Inf in v, and the NaN v at the next sequence's first token; a synthetic block's attention and whole-block rows |
+| Packer and kernel grouping sequences by 16 tokens | passed all | verify: op 3 packed, plain and NaN k, scaled 255 |
 
-- Mutant a is the nearest equivalent of the wrong residual: the driver's residual is x itself, updated in place, so x before attention's norm is the right buffer.
-- Mutant c is the only one that only the block gate catches. It changes `run_block`'s order, while the per-op rows call `run_block_op` on buffers set from the engine, and those see the others.
-- Block 22 passes under d2, with the unmodified build's numbers (72.3556 % same, attention 99.4094 %). It runs the cond row alone, so there is no boundary to move.
-- At E13's block 41, d2 fails the block gate on scaled alone (864 against 128). Its same of 66.64 % and p99 of 24 are inside the limits of 64.93 % and 34.
+Still passing every test: the row sum reversed or summed as a tree of four (no test fixes the order of that sum; see "Not tried"), and three changes that cannot change an output: the accumulator trip taken at every step, the row-major tail walking all 32 rows of its tile, and dropping the last workgroup, which has no tile at the dump's shape (the bench's known answer and verify fail it).
 
-The bench's known-answer check does not catch chaining mutants: all six exit 0, as it tests kernels and only looks for NaNs in a whole block. Chaining is covered only by `hip_block_verify` on NVIDIA. The driver is host code shared by all targets, so that coverage applies to the AMD builds' driver, and not to anything that happens on a card.
+The bench's known-answer check tests kernels, not the block driver, and the bench passes chaining mutants. Chaining is covered by `hip_block_verify` on NVIDIA and by `hip_block_replay` on any device. The driver is host code shared by all targets.
 
 ## Not verified
 
-Only gfx1200 has run this, in the session above; gfx1100 and gfx1201 have only been compiled.
+Only gfx1200 has run this, and for two sessions; gfx1100 and gfx1201 have only been compiled.
 
-- Whether WMMA's results at full shapes are within a few ULPs of the engine's. The known answers are small shapes against host replays, and the whole block is only checked for NaNs.
+- A whole 42-block step, a VAE or a text encoder on AMD. The 4.4 s is 42 times one block.
+- The old kernels against the new on the card. The bit-for-bit result is the scalar leaf's on NVIDIA.
+- Anything after the third review's fixes on a card: the poisoned buffers, replay's row and scaled limits, `pad_barrier()`'s wait and the edge rows all ran on NVIDIA only.
+- That a wavefront fence is enough on every chip: it holds on gfx1200, where the checks above pass. It relies on a workgroup being one wave, which `check_device.sh` checks statically.
 - rocWMMA's fragment load and store order on RDNA3 and on gfx1201. An independent review checked its lane and K mapping on a CPU emulation derived from rocWMMA's own layouts, and the known-answer check confirms it on gfx1200.
 - `exp2f`, `expf`, `tanhf` and `rsqrt` accuracy in AMD's device libraries beyond the known-answer inputs, where they stayed within the limits on gfx1200.
-- Any time or rate on another AMD chip, and whether the limits above can be lifted. The tile constants are untuned, fragment loads compile to flat loads, `__syncthreads` emits a cache invalidate in single-wave kernels (`global_inv` on gfx1201, `buffer_gl0_inv` on gfx1100), and attention moves its output accumulators through `__shared__` memory on every key step.
+- Any time or rate on another AMD chip. The tile constants and the 4 MB block are tuned on this chip only.
 - Whether the known-answer limits suit other cards: they come from the scalar leaf and a model of math-library flips, and gfx1200 passes well inside them.
 - NaN, Inf and denormals through WMMA and AMD's math. The known-answer inputs contain none of these, so a card that flushes denormals passes it and shows nothing about them.
-- The kernels write `__shared__` buffers right after a collective read of them with no barrier between (`mma_leaf.h`). That holds in hardware for one wave and is a data race in LLVM's terms. The scheduled assembly has not been inspected for reordering at these points, and the emulation adds barriers there, so it does not test this.
+- The kernels write `__shared__` buffers right after a collective read of them with no barrier between (`mma_leaf.h`). That holds in hardware for one wave and is a data race in LLVM's terms. The third review read the scheduled MIR of every kernel on gfx1100 and gfx1200: no `__shared__` read follows a write to the same buffer without a fence between, the fences stay in source order, and where a buffer is read then rewritten the read stays first. That is the compiler's order only: the fence emits no instruction, so the argument rests on a wave's DS operations completing in order, which no card run has tested apart from the checks passing on gfx1200. The emulation adds barriers there, so it does not test this either.
 - Other `gfx11xx` and `gfx12xx` chips, and Windows.
 
-The attention tile of 16 rows per wave uses 238 VGPRs on gfx1100 and 213 on gfx1201 with no spills. 32 rows per wave spills to scratch on gfx1100.
+The attention tile of 16 rows per wave uses 241 VGPRs on gfx1100 and 249 on gfx1200 and gfx1201 with no spills, close to the limit. 32 rows per wave spills.

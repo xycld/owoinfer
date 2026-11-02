@@ -33,6 +33,15 @@ inline constexpr int kFfnDim = 8192;
 // the running maximum over the steps so far. 32 is FlashAttention's hdim128 128x32 tile, which the engine runs on sm_89.
 inline constexpr int kAttentionStepN = 32;
 
+// Packed operands: 16 x 16 fragments contiguous, for rows grouped in 16s and columns in 16s: element (r, c) at
+//   to[(r / 16 * (cols / 16) + c / 16) * 256 + r % 16 * 16 + c % 16]
+// A fragment load then touches 8 cache lines rather than 16, which on RDNA4 is most of the GEMMs' time. Rows past `rows` up
+// to `rows_padded` read as zero. to: [ceil(rows_padded / 16) * 16, cols]; cols a multiple of 16. Weights are packed the
+// same way, their N as the rows.
+inline constexpr int kPackRowsMultiple = 96;  // a multiple of the GEMM tiles' M: a tile's last fragments stay inside the buffer
+void pack_fragments(bf16_bits* to, const bf16_bits* from, std::int64_t ld, std::int64_t rows, std::int64_t rows_padded, int cols,
+                    hipStream_t stream);
+
 // Which leaf this build runs, e.g. for a benchmark's output.
 const char* leaf_name();
 
@@ -70,6 +79,9 @@ struct AttentionArgs {
   int max_seqlen;
   int heads;
   float scale;  // SDPA's 1 / sqrt(head_dim) for the DiT
+  // Set by run_block_op: q, k and v as packed [q | k | v] rows of 3 kDim columns, grouped per sequence, heads kHeadDim
+  // apart, q at column 0, k at kDim, v at 2 kDim. The pointers above then only give the output and the lengths.
+  const bf16_bits* packed = nullptr;
 };
 void attention(const AttentionArgs& a, hipStream_t stream);
 
@@ -92,6 +104,11 @@ struct BlockWeights {
   const bf16_bits* o;
   const bf16_bits* up_gate;
   const bf16_bits* down;
+  // The GEMM weights as pack_fragments' layout. Null: run_block_op walks the row-major weights above.
+  const bf16_bits* qkv_packed = nullptr;
+  const bf16_bits* o_packed = nullptr;
+  const bf16_bits* up_gate_packed = nullptr;
+  const bf16_bits* down_packed = nullptr;
 };
 
 // One run of `tokens` tokens: x, y [tokens, kDim]; qkv [tokens, 3 kDim]; attn [tokens, kDim]; ffn [tokens, kFfnDim];
@@ -108,6 +125,10 @@ struct BlockBuffers {
   int batch;
   int max_seqlen;
   int tokens;
+  // Used with packed weights. pack: [ceil(tokens / kPackRowsMultiple) * kPackRowsMultiple, kFfnDim]. pack_attn:
+  // [tokens + 32 * batch, 3 kDim].
+  bf16_bits* pack = nullptr;
+  bf16_bits* pack_attn = nullptr;
 };
 
 // The block's ops, in order, so a caller can time each one.
