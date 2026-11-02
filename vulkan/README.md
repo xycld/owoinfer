@@ -112,12 +112,23 @@ deviation from the same goldens when one of its kernels changes (the worse of SD
 
 | Prompt | Tokens | Cosine, coop | Cosine, plain | Cosine, torch | Mean row rel. L2, coop | plain | torch |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| g_fridge cond | 62 | 0.9998972 | 0.9998746 | 0.9998949 | 1.29e-2 | 1.32e-2 | 1.29e-2 |
+| g_fridge cond | 62 | 0.9998786 | 0.9999012 | 0.9998949 | 1.32e-2 | 1.27e-2 | 1.29e-2 |
 | g_fridge uncond | 10 | 0.9998012 | 0.9997889 | 0.9998333 | 1.84e-2 | 1.90e-2 | 1.60e-2 |
-| g_short cond | 29 | 0.9998692 | 0.9998715 | 0.9999026 | 1.47e-2 | 1.50e-2 | 1.33e-2 |
-| g_layout cond | 172 | 0.9998756 | 0.9998911 | 0.9998857 | 1.45e-2 | 1.38e-2 | 1.44e-2 |
+| g_short cond | 29 | 0.9998910 | 0.9997967 | 0.9999026 | 1.40e-2 | 1.65e-2 | 1.33e-2 |
+| g_layout cond | 172 | 0.9998827 | 0.9998885 | 0.9998857 | 1.43e-2 | 1.40e-2 | 1.44e-2 |
 | g_layout uncond | 16 | 0.9998486 | 0.9998133 | 0.9998634 | 1.64e-2 | 1.81e-2 | 1.52e-2 |
-| g_long4096 cond | 4096 | 0.9985798 | | 0.9992133 | 2.19e-2 | | 1.89e-2 |
+| g_long4096 cond | 4096 | 0.9985149 | 0.9984682 | 0.9992133 | 2.29e-2 | 2.32e-2 | 1.89e-2 |
 
 Differences grow over the 32 layers until they reach torch's own sensitivity to a kernel change; after the first layer
 they are at the level of one bf16 rounding (layer 0, row relative L2 at most 7.1e-3 on both paths).
+
+Times on that GPU with nothing else running, the weights read from a drive that held little of them in the page cache
+(about 2.5 GB/s with four readers), which bounds the short prompts:
+
+| Prompts | Tokens | Coop: encode, of it compute | Plain: encode, of it compute |
+|---|---:|---:|---:|
+| g_fridge cond + uncond | 72 | 6.7 s, 0.6 s | 6.8 s, 2.8 s |
+| g_long4096 cond + uncond | 4112 | 8.4 s, 7.2 s | 186 s, 185 s |
+
+At 4112 tokens on the cooperative-matrix path the GEMMs take 5.6 s of the 7.2 s, attention 0.7 s and the gated delta rule
+0.8 s (`--profile`).
