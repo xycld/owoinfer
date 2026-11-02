@@ -1,4 +1,4 @@
-// Runs one DiT block's plain compute kernels on real weights and activations, and compares each output with the engine's
+// Runs one DiT block's kernels on real weights and activations, and compares each output with the engine's
 // own, captured from its forward at the 1024x1024 golden case. Reads files only, so it needs no CUDA.
 // Usage: vulkan_block_real DIR [--device N]
 #include <algorithm>
@@ -78,15 +78,22 @@ bool compare(const std::vector<bits>& got, const std::vector<bits>& engine) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::printf("usage: %s DIR [--device N]\n", argv[0]);
+    std::printf("usage: %s DIR [--device N] [--path coop|plain]\n", argv[0]);
     return 2;
   }
   const fs::path dir = argv[1];
-  const int device_index = argc >= 4 && std::string(argv[2]) == "--device" ? std::atoi(argv[3]) : -1;
+  int device_index = -1;
+  std::string path_name;
+  for (int i = 2; i + 1 < argc; i += 2) {
+    const std::string arg = argv[i];
+    if (arg == "--device") device_index = std::atoi(argv[i + 1]);
+    else if (arg == "--path") path_name = argv[i + 1];
+  }
   try {
     Device device(device_index);
-    std::printf("device %u: %s\n", device.info().index, device.info().name.c_str());
-    const BlockKernels kernels(device);
+    const BlockKernels kernels = path_name.empty() ? BlockKernels(device)
+                                                   : BlockKernels(device, path_name == "plain" ? BlockPath::kPlain : BlockPath::kCoop);
+    std::printf("device %u: %s, path %s\n", device.info().index, device.info().name.c_str(), block_path_name(kernels.path()));
 
     std::vector<std::int32_t> lengths;
     struct Case {
