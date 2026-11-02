@@ -1,92 +1,69 @@
 # Vulkan backend
 
-The fallback for hardware the engine does not otherwise support. CUDA stays the path on every GPU it supports. This is a
-standalone project for now: it links no engine code and nothing here affects the engine's build. Design and research:
-[design](../docs/vulkan-backend-design.md), [research](../docs/vulkan-backend-research.md).
+The fallback for GPUs the CUDA engine does not support: `moss-infer generate --backend vulkan` (user guide:
+[docs/vulkan.md](../docs/vulkan.md)). CUDA stays the path on every GPU it supports. This directory builds on its own,
+without CUDA, for the backend's checks and benchmarks; the engine builds it in with `-DMOSSINFER_VULKAN=ON`
+(`cmake/modules/vulkan.cmake`, tools off).
 
-What exists is the device runtime, the GEMM and one DiT block's kernels. It cannot generate images yet: the text encoder, the VAE, the DiT's outer layers and the pipeline are still to come.
+Every model runs on one of two kernel paths, chosen per device and reported:
+
+| Path | Needs | |
+|---|---|---|
+| `coop` | Vulkan 1.3, `VK_KHR_cooperative_matrix` with `VK_KHR_shader_bfloat16` (16x16x16 bf16 x bf16 -> f32 in subgroup scope), compute subgroup size 32 with vote and shuffle, 40 KiB of shared memory | `Capabilities::coop_bf16` |
+| `plain` | Vulkan 1.2, buffer device addresses, 64-bit integers, 32 KiB of shared memory | every other device; no cooperative matrices, 16-bit arithmetic or particular subgroup size |
+
+The Vulkan loader is opened at run time (`vk_api.h`), so nothing links against it.
 
 ## Build and check
 
 ```sh
-cmake -S vulkan -B build-vulkan
+cmake -S vulkan -B build-vulkan -G Ninja
 cmake --build build-vulkan
-build-vulkan/vulkan_check --list          # each device, and which GEMM it gets
-build-vulkan/vulkan_check                 # checks against an fp64 CPU reference, then the engine's shapes
-build-vulkan/vulkan_check --path plain --no-bench
+build-vulkan/vulkan_check --list                 # each device, and why a device gets the plain path
+build-vulkan/vulkan_block_check [--path plain]   # the DiT block's kernels against host replays, then one block's timing
+build-vulkan/vulkan_block_real DIR               # real blocks against the engine's output (files captured from its forward)
+build-vulkan/vulkan_dit_run MODEL/transformer tests/golden g_fridge_1024 [--steps N] [--dit-budget GiB]
+build-vulkan/vulkan_te_kernel_check              # the text encoder's kernels against host replays
+build-vulkan/vulkan_te_check --golden tests/golden
+build-vulkan/vulkan_vae_check                    # the VAE's kernels, then the golden latent against the golden PNG
 ```
 
-It needs the Vulkan headers and loader, and `glslc`. Shaders compile into the binary. The exit code is non-zero when a check
-fails. A check poisons C and uses strides larger than the rows, so a write past a row or past M fails it.
+It needs the Vulkan headers with `VK_KHR_shader_bfloat16`, a `glslc` that compiles `GL_EXT_bfloat16`, and zlib for the
+VAE check. Shaders compile into the binary. Every check exits non-zero on a failure, and passes under the Khronos
+validation layer and on llvmpipe (Mesa's CPU driver: 8-wide subgroups, 32 KiB of shared memory, the plain path).
+`MI_VK_PIPELINE_STATS=1` prints each pipeline's registers and spills where the driver reports them.
 
-## GEMM
+## DiT
 
-`C[M,N] = A[M,K] * B[N,K]^T`, with B in the engine's weight layout, f32 accumulation and f32 output. M and N are free.
+`block.h` holds one DiT block's kernels on both paths, with the engine's rounding points: RMSNorm with modulation, the
+GEMMs with bias, gated-residual and SiTU-GLU epilogues, QK norm with RoPE, and flash attention (an online softmax over
+32-key steps; the `coop` one rescales its output only when a row's maximum grew). `dit.h` runs the whole
+MOSSImageTransformer on them: the time embedding and shared modulation, the text refiner, the joint sequences of the CFG
+rows with per-row skipped blocks, and the head.
 
-| Path | Used when | Inputs | K |
-|---|---|---|---|
-| Cooperative matrix (`gemm_coop.comp`) | the device has 16x16x16 f16 x f16 -> f32 in subgroup scope, a compute subgroup size fixable at 32, and 24 KiB of shared memory | f16 | multiple of 16 |
-| Plain compute (`gemm_plain.comp`) | every other device with Vulkan 1.2, buffer device addresses and 64-bit integers | f16 or bf16 | multiple of 4 |
+The blocks that do not fit next to the activations (from `VK_EXT_memory_budget`) stay in host memory. Two device slots
+alternate: each streamed block is copied on the transfer queue while the block before it runs. Every op over many
+tokens runs in token ranges of at most 200 GFLOP (`coop`) or 20 GFLOP (`plain`) per submit, attention in query ranges,
+so a slow device does not trip a display driver's watchdog. Neither changes a bit of the result.
 
-`--list` says why a device gets the plain path. The plain shader declares only `Shader`, `Int64` and
-`PhysicalStorageBufferAddresses`: it reads 32-bit words, so it needs no 16-bit support and does not depend on the subgroup
-size.
+Against the engine's own output on real blocks of the 1024x1024 golden case (captured from its forward):
 
-## Results
+| Block | Path | Same bits | Max scaled ULPs | Cosine |
+|---:|---|---:|---:|---:|
+| 1 | coop | 98.14 % | 1.00 | 0.999999999 |
+| 22 | coop | 96.16 % | 2.00 | 0.999999989 |
+| 41 | coop | 98.56 % | 32.00 | 0.999999919 |
 
-TFLOPS on an RTX 4090 Laptop, driver 615.78, with cuBLASLt (f16 inputs, f32 compute) on the same GPU. M = 8222 is the DiT at
-1024x1024 with CFG.
+The `coop` GEMMs round like the tensor cores, hence so many identical bits. Step 0 of g_fridge_1024 against the official
+pipeline: cosine 0.999976 (cond) and 0.999983 (uncond, block 22 skipped); the CUDA engine's test asks for 0.99988.
 
-| Shape (M x N x K) | Cooperative matrix | Plain | cuBLASLt |
-|---|---:|---:|---:|
-| 8222 x 9216 x 3072 (QKV) | 27.0 | 1.39 | 52.6 |
-| 8222 x 3072 x 3072 (projection) | 33.1 | 1.62 | 57.4 |
-| 8222 x 16384 x 3072 (up/gate) | 23.5 | 1.14 | 45.5 |
-| 8222 x 3072 x 8192 (down) | 24.3 | 1.52 | 70.1 |
-| 282 x 12288 x 4096 (text encoder) | 27.3 | 1.02 | 59.5 |
-| 282 x 4096 x 12288 (text encoder) | 18.1 | | 52.2 |
+## VAE
 
-Checks pass on that GPU on both paths, and through the plain path on llvmpipe (Mesa's CPU driver, 8-wide subgroups, 32 KiB of
-shared memory), with core validation clean.
-
-## DiT block
-
-`block.h` is the plain compute path of one bf16 DiT block: RMSNorm with modulation, the GEMMs with their gated residual and SiTU-GLU epilogues, QK norm with RoPE, and varlen attention with an online softmax. It has the engine's rounding points and needs no cooperative matrices, 16-bit support or particular subgroup size.
-
-```sh
-build-vulkan/vulkan_block_check            # each kernel against a host replay of its op order, then one block
-build-vulkan/vulkan_block_real DIR         # real blocks against the engine's output, from files captured from its forward
-```
-
-On real weights and activations at the 1024x1024 golden case, against the engine:
-
-| Block | Same bits | p99 scaled ULPs | Max scaled ULPs | Cosine |
-|---:|---:|---:|---:|---:|
-| 1 | 83.98 % | 0.06 | 2.00 | 0.999999977 |
-| 22 | 72.36 % | 0.25 | 4.00 | 0.999999867 |
-| 41 | 69.23 % | 1.00 | 96.00 | 0.999997331 |
-
-Bits differ because fp32 scalar and tensor-core accumulation are not bit-compatible. Known-answer checks pass on an RTX 4090 Laptop and on llvmpipe. One block of 8484 tokens takes about 2 s on that GPU through this path, against 31 ms for the engine, so about 86 s per CFG step at 1024x1024.
-
-## Numerics
-
-The cooperative-matrix path rounds like the tensor cores: its error matches cuBLASLt on the same data up to K = 1040 and is
-biased toward zero. At K = 4096 it reaches 8.1e-4 against cuBLASLt's 1.3e-4, on values near 80. The plain path has no such
-bias.
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `runtime.h`, `runtime.cpp` | device selection, capabilities, buffers, pipelines, barriers |
-| `gemm.h`, `gemm.cpp` | path selection, argument checks, dispatch |
-| `block.h`, `block.cpp` | one DiT block's plain compute kernels |
-| `half.h` | host fp16 and bf16 conversions |
-| `shaders/` | compute shaders |
-| `tools/vulkan_check.cpp` | device list, GEMM checks, timing |
-| `tools/vulkan_block_check.cpp` | the block's kernels against host replays, one block's timing |
-| `tools/vulkan_block_real.cpp` | real blocks against the engine's captured output |
-| `tools/probe.py` | a device's cooperative-matrix shapes and heaps, using only the Vulkan loader (no headers) |
+`vae.h` is the FLUX.2 decoder from the final latents to RGB8. Its convolutions round both operands to TF32 as cuDNN does
+(on `coop` each TF32 operand is two exact bf16 pieces), so every product is torch's and only the fp32 accumulation order
+differs; GroupNorm, the mid attention and the upsampling follow the engine. It decodes in one piece: about 1.6 GiB at
+1024x1024. The golden latent against the official pipeline's PNG: 69.39 dB (`coop`), 69.35 dB (`plain`), 99.25 % of the
+bytes identical and none off by more than 1, as the CUDA engine's reference decode.
 
 ## Text encoder
 
@@ -132,3 +109,19 @@ Times on that GPU with nothing else running, the weights read from a drive that 
 
 At 4112 tokens on the cooperative-matrix path the GEMMs take 5.6 s of the 7.2 s, attention 0.7 s and the gated delta rule
 0.8 s (`--profile`).
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `vk_api.h`, `vk_api.cpp` | the Vulkan functions, resolved from the loader at run time |
+| `runtime.h`, `runtime.cpp` | device selection, capabilities, buffers, pipelines, barriers, transfer-queue copies |
+| `block.h`, `block.cpp` | the DiT block's kernels on both paths |
+| `dit.h`, `dit.cpp` | the DiT: text refiner, forward, block streaming |
+| `text_encoder.h`, `te_kernels.h` and their `.cpp` | the Qwen3.5 text encoder |
+| `vae.h`, `vae.cpp` | the FLUX.2 VAE decoder |
+| `generate.h`, `generate.cpp` | text to image: the three models one after another, CFG and the official Euler step |
+| `gemm.h`, `gemm.cpp` | the standalone f16 GEMM of the first bring-up (`vulkan_check`) |
+| `safetensors.h`, `npy.h`, `half.h` | readers and conversions |
+| `shaders/` | compute shaders |
+| `tools/` | checks and benchmarks |
