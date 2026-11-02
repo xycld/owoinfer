@@ -66,7 +66,7 @@ class Dit {
                                           float timestep, const std::vector<Row>& rows);
 
   // Milliseconds of the last forward(), summed per op kind over its blocks (block_op_name order), then the rest (which
-  // includes last_copy_ms(), the streamed blocks' copies).
+  // includes last_copy_ms(), the time spent issuing streamed blocks' copies; they then run alongside the compute).
   const std::vector<double>& last_op_ms() const { return op_ms_; }
   double last_copy_ms() const { return last_copy_ms_; }
 
@@ -81,8 +81,18 @@ class Dit {
   int resident_blocks_ = 0;
   double max_gflop_ = 0;
   std::vector<const Buffer*> host_blocks_;  // per block: its host copy when streamed, else null
-  std::unique_ptr<Buffer> slot_;           // the device slot streamed blocks run from
-  int streamed_layer_ = -1;                // the block the slot holds
+  // Streamed blocks alternate between two device slots: block k's copy runs on the transfer queue while block k - 1
+  // computes.
+  struct Slot {
+    int layer = -1;            // the block the slot holds or is receiving
+    std::uint64_t ticket = 0;  // its copy, until retired
+    bool gpu_waited = false;   // a run has waited for that copy on the device
+  };
+  std::unique_ptr<Buffer> slots_[2];
+  Slot slot_state_[2];
+  std::vector<int> slot_of_;  // per block: its slot when streamed, else -1
+  void issue_copy(int layer);
+  int next_streamed(int layer) const;
   double last_copy_ms_ = 0.0;
   std::vector<std::unique_ptr<Buffer>> owned_;
   std::vector<BlockWeights> blocks_;

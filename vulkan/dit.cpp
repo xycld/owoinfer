@@ -81,7 +81,8 @@ Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::pat
       offsets.push_back(total);
       total += (t.bytes + 255) / 256 * 256;
     }
-    owned_.push_back(std::make_unique<Buffer>(device_, total, kind));
+    // Host copies of streamed blocks are read by the transfer queue.
+    owned_.push_back(std::make_unique<Buffer>(device_, total, kind, kind == Buffer::Kind::kStaging));
     Buffer& buf = *owned_.back();
     for (std::size_t i = 0; i < names.size(); ++i) {
       const std::uint64_t bytes = index.at(names[i]).bytes;
@@ -142,9 +143,9 @@ Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::pat
   int resident = kDiTLayers;
   if (options.device_budget > 0) {
     const std::uint64_t free = options.device_budget > weight_bytes_ ? options.device_budget - weight_bytes_ : 0;
-    // A streamed block needs the slot too.
+    // Streamed blocks need two slots: the next one copies while the current one runs.
     resident = free >= kDiTLayers * block_bytes ? kDiTLayers
-                                                : static_cast<int>(free > block_bytes ? free / block_bytes - 1 : 0);
+                                                : static_cast<int>(free > 2 * block_bytes ? free / block_bytes - 2 : 0);
   }
   for (int l = 0; l < kDiTLayers; ++l) {
     const bool on_device = l < resident;
@@ -152,19 +153,50 @@ Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::pat
     if (on_device) {
       blocks_.push_back(block_weights(owned_.back()->address(), o));
       host_blocks_.push_back(nullptr);
+      slot_of_.push_back(-1);
     } else {
-      if (!slot_) {
-        slot_ = std::make_unique<Buffer>(device_, block_bytes);
+      const int s = (l - resident) % 2;
+      if (!slots_[s]) {
+        slots_[s] = std::make_unique<Buffer>(device_, block_bytes, Buffer::Kind::kDevice, true);
         weight_bytes_ += block_bytes;
       }
-      blocks_.push_back(block_weights(slot_->address(), o));
+      blocks_.push_back(block_weights(slots_[s]->address(), o));
       host_blocks_.push_back(owned_.back().get());
+      slot_of_.push_back(s);
     }
   }
   resident_blocks_ = resident;
 }
 
-Dit::~Dit() = default;
+Dit::~Dit() {
+  // Copies still in flight read host buffers this destructor frees.
+  for (Slot& s : slot_state_) {
+    if (s.ticket != 0) device_.host_wait(s.ticket);
+  }
+}
+
+void Dit::issue_copy(int layer) {
+  if (layer < 0 || host_blocks_[static_cast<std::size_t>(layer)] == nullptr) return;
+  Slot& s = slot_state_[slot_of_[static_cast<std::size_t>(layer)]];
+  if (s.layer == layer) return;
+  if (s.ticket != 0) {  // a copy nobody ran from (the next forward skipped it): retire it
+    device_.host_wait(s.ticket);
+    if (!s.gpu_waited) {
+      device_.gpu_wait(s.ticket);
+      device_.run([](VkCommandBuffer) {});
+    }
+  }
+  const Buffer& host = *host_blocks_[static_cast<std::size_t>(layer)];
+  s = {layer, device_.copy_async(host, 0, *slots_[slot_of_[static_cast<std::size_t>(layer)]], 0, host.bytes()), false};
+}
+
+int Dit::next_streamed(int layer) const {
+  for (int k = 1; k <= kDiTLayers; ++k) {
+    const int l = (layer + k) % kDiTLayers;
+    if (host_blocks_[static_cast<std::size_t>(l)] != nullptr) return l;
+  }
+  return -1;
+}
 
 void Dit::run_block_op(int op, const BlockWeights& w, const BlockBuffers& b) {
   // Multiply-adds per token, x2 for FLOP; attention's per query token over its sequence's keys.
@@ -377,16 +409,29 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
       const BlockBuffers b{at(x, off[r0] * kDim * kBf16), y_->address(), qkv_->address(), attn_->address(), ffn_->address(),
                            at(rope, off[r0] * kHead * kBf16), mod_->address(), cu,
                            static_cast<std::uint32_t>(off[r1] - off[r0])};
-      if (const Buffer* host = host_blocks_[static_cast<std::size_t>(l)]; host != nullptr && streamed_layer_ != l) {
+      Slot* slot = nullptr;
+      if (host_blocks_[static_cast<std::size_t>(l)] != nullptr) {
+        // This block's copy (issued while the previous streamed block ran, or now), then the next one's into the other
+        // slot, which runs on the transfer queue while this block computes.
         const double t0 = now_ms();
-        device_.run([&](VkCommandBuffer cb) { record_copy(cb, *host, 0, *slot_, 0, host->bytes()); });
-        streamed_layer_ = l;
+        issue_copy(l);
+        slot = &slot_state_[slot_of_[static_cast<std::size_t>(l)]];
+        if (!slot->gpu_waited) {
+          device_.gpu_wait(slot->ticket);
+          slot->gpu_waited = true;
+        }
+        const int next = next_streamed(l);
+        if (next != l) issue_copy(next);
         copy_ms += now_ms() - t0;
       }
       for (int op = 0; op < kBlockOps; ++op) {
         const double t0 = now_ms();
         run_block_op(op, blocks_[static_cast<std::size_t>(l)], b);
         op_ms_[static_cast<std::size_t>(op)] += now_ms() - t0;
+      }
+      if (slot != nullptr && slot->ticket != 0) {
+        device_.host_wait(slot->ticket);  // completed: the block's first op waited for it on the device
+        slot->ticket = 0;
       }
       r0 = r1;
     }
