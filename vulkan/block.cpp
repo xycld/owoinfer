@@ -80,7 +80,7 @@ void require(bool condition, const std::string& message) {
   if (!condition) throw std::invalid_argument("vulkan block: " + message);
 }
 
-constexpr std::uint32_t kGemmTileRows = 8, kGemmTileCols = 32;
+constexpr std::uint32_t kGemmTileRows = 128, kGemmTileCols = 128;
 
 void dispatch_gemm(const Pipeline& pipeline, BlockPath path, GemmMode mode, VkCommandBuffer cb, const GemmPush& push) {
   const std::uint32_t align = path == BlockPath::kCoop ? 8 : 4;
@@ -93,7 +93,8 @@ void dispatch_gemm(const Pipeline& pipeline, BlockPath path, GemmMode mode, VkCo
     const std::uint32_t cols = mode == kSitu ? kCoopTileCols / 2 : kCoopTileCols;
     pipeline.dispatch(cb, &push, (push.n + cols - 1) / cols, (push.m + kCoopTileRows - 1) / kCoopTileRows);
   } else {
-    pipeline.dispatch(cb, &push, (push.n + kGemmTileCols - 1) / kGemmTileCols, (push.m + kGemmTileRows - 1) / kGemmTileRows);
+    const std::uint32_t cols = mode == kSitu ? kGemmTileCols / 2 : kGemmTileCols;
+    pipeline.dispatch(cb, &push, (push.n + cols - 1) / cols, (push.m + kGemmTileRows - 1) / kGemmTileRows);
   }
   compute_barrier(cb);
 }

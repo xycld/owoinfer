@@ -14,7 +14,7 @@ const std::uint32_t kPlainSpirv[] = {
 };
 
 constexpr std::uint32_t kCoopTile = 64;
-constexpr std::uint32_t kPlainTileRows = 8, kPlainTileCols = 32;
+constexpr std::uint32_t kPlainTileRows = 128, kPlainTileCols = 128;
 constexpr std::uint32_t kCoopSubgroup = 32;
 
 struct Push {

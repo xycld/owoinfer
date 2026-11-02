@@ -1,11 +1,20 @@
 #include "runtime.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
 namespace mi::vk {
 namespace {
+
+// MI_VK_PIPELINE_STATS=1 prints the driver's statistics of every pipeline (registers, spills, ...), where the device has
+// VK_KHR_pipeline_executable_properties. A debugging aid; off by default.
+bool pipeline_stats_requested() {
+  const char* v = std::getenv("MI_VK_PIPELINE_STATS");
+  return v != nullptr && v[0] == '1';
+}
 
 // gemm_coop.comp's shared memory: an f16 A and B tile of 64x32, and an f32 output tile of 64x64.
 constexpr std::uint32_t kCoopSharedBytes = 2 * 64 * 32 * 2 + 64 * 64 * 4;
@@ -230,6 +239,16 @@ Device::Device(int index) {
     features.pNext = &v12;  // a Vulkan 1.2 device need not know the 1.3 structure
   }
 
+  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+  if (pipeline_stats_requested() && has_extension(physical_, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+    executable.pipelineExecutableInfo = VK_TRUE;
+    executable.pNext = features.pNext;
+    features.pNext = &executable;
+    extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    pipeline_stats_ = true;
+  }
+
   const float priority = 1.0f;
   VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
   queue_info.queueFamilyIndex = family;
@@ -393,8 +412,42 @@ Pipeline::Pipeline(Device& device, const std::uint32_t* spirv, std::size_t spirv
     info.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
   }
   info.layout = layout_;
+  if (device_.pipeline_stats()) info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
   check(vkCreateComputePipelines(device_.handle(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline_),
         "vkCreateComputePipelines");
+  if (device_.pipeline_stats()) print_statistics(spirv_bytes);
+}
+
+void Pipeline::print_statistics(std::size_t spirv_bytes) const {
+  auto properties = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
+      vkGetDeviceProcAddr(device_.handle(), "vkGetPipelineExecutablePropertiesKHR"));
+  auto statistics = reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(
+      vkGetDeviceProcAddr(device_.handle(), "vkGetPipelineExecutableStatisticsKHR"));
+  if (properties == nullptr || statistics == nullptr) return;
+  VkPipelineInfoKHR pipeline_info{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+  pipeline_info.pipeline = pipeline_;
+  std::uint32_t count = 0;
+  properties(device_.handle(), &pipeline_info, &count, nullptr);
+  std::vector<VkPipelineExecutablePropertiesKHR> executables(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+  properties(device_.handle(), &pipeline_info, &count, executables.data());
+  for (std::uint32_t e = 0; e < count; ++e) {
+    VkPipelineExecutableInfoKHR executable{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+    executable.pipeline = pipeline_;
+    executable.executableIndex = e;
+    std::uint32_t n = 0;
+    statistics(device_.handle(), &executable, &n, nullptr);
+    std::vector<VkPipelineExecutableStatisticKHR> stats(n, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+    statistics(device_.handle(), &executable, &n, stats.data());
+    std::fprintf(stderr, "pipeline (SPIR-V %zu bytes) %s:", spirv_bytes, executables[e].name);
+    for (const auto& s : stats) {
+      if (s.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR) {
+        std::fprintf(stderr, " %s=%llu", s.name, static_cast<unsigned long long>(s.value.u64));
+      } else if (s.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR) {
+        std::fprintf(stderr, " %s=%lld", s.name, static_cast<long long>(s.value.i64));
+      }
+    }
+    std::fprintf(stderr, "\n");
+  }
 }
 
 Pipeline::~Pipeline() {

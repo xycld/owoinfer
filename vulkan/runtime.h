@@ -54,6 +54,7 @@ class Device {
   void run(const std::function<void(VkCommandBuffer)>& record);
 
   VkDevice handle() const { return device_; }
+  bool pipeline_stats() const { return pipeline_stats_; }
   std::uint32_t find_memory_type(std::uint32_t type_bits, VkMemoryPropertyFlags flags) const;
 
  private:
@@ -64,6 +65,7 @@ class Device {
   VkCommandPool pool_ = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memory_{};
   DeviceInfo info_;
+  bool pipeline_stats_ = false;
 };
 
 // A device-local storage buffer with a device address, or a host-visible staging buffer.
@@ -105,6 +107,7 @@ class Pipeline {
   void dispatch(VkCommandBuffer cb, const void* push, std::uint32_t x, std::uint32_t y) const;
 
  private:
+  void print_statistics(std::size_t spirv_bytes) const;
   Device& device_;
   VkShaderModule module_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_ = VK_NULL_HANDLE;
