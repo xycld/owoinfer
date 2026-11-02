@@ -1,5 +1,6 @@
 # Tag vX.Y.Z (a release) or vX.Y.Z-rcN, N >= 1 (a release candidate, published as a pre-release that does not become
-# "latest"): build and check all four standard flavours and the Windows CUDA 13 SM75 flavour (build.yml), then publish
+# "latest"): build and check all four standard flavours, the Windows CUDA 13 SM75 flavour and the Linux CUDA 12 SM70
+# flavour (build.yml), then publish
 # their archives (the full package and the -system-cuda variant of each) and a SHA256SUMS file as a GitHub release.
 # X.Y.Z must equal the MI_VERSION_* of
 # include/mossinfer/mossinfer.h and an rc must come before vX.Y.Z (.github/scripts/release_version.py), the tagged
