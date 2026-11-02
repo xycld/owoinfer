@@ -67,7 +67,7 @@ struct GdnStatePush {
 };
 struct AttentionPush {
   std::uint64_t q, k, v, o;
-  std::uint32_t ldq, ldk, ldv, ldo, hsq, hsk, hsv, hso, q_first, group;
+  std::uint32_t ldq, ldk, ldv, ldo, hsq, hsk, hsv, hso, q_first, row_end, group;
   float log2_scale;
 };
 struct GateMulPush {
@@ -236,14 +236,14 @@ void TeKernels::record_attention(VkCommandBuffer cb, const TeAttentionArgs& a) c
   require(a.ldq % 4 == 0 && a.ldk % 4 == 0 && a.ldv % 4 == 0 && a.ldo % 4 == 0 && a.hsq % 4 == 0 && a.hsk % 4 == 0 &&
               a.hsv % 4 == 0 && a.hso % 4 == 0,
           "attention: strides must be multiples of 4");
-  require(a.group >= 1 && a.heads % a.group == 0 && a.rows <= kMaxGroups,
-          "attention: bad head grouping or too many rows");
+  require(a.group >= 1 && a.heads % a.group == 0 && a.q_first % 16 == 0 && a.rows / 16 < kMaxGroups,
+          "attention: bad head grouping, q_first not a multiple of 16, or too many rows");
   if (a.rows == 0) return;
   // In double then rounded, as FlashAttention (float * M_LOG2E).
   const float log2_scale = static_cast<float>(static_cast<double>(a.scale) * 1.4426950408889634074);
-  const AttentionPush push{a.q,   a.k,   a.v,   a.o,   a.ldq,     a.ldk,   a.ldv,     a.ldo,
-                           a.hsq, a.hsk, a.hsv, a.hso, a.q_first, a.group, log2_scale};
-  attention_->dispatch(cb, &push, a.heads, a.rows);
+  const AttentionPush push{a.q,   a.k,   a.v,   a.o,       a.ldq,              a.ldk,   a.ldv,     a.ldo,
+                           a.hsq, a.hsk, a.hsv, a.hso,     a.q_first,          a.q_first + a.rows, a.group, log2_scale};
+  attention_->dispatch(cb, &push, a.heads, (a.rows + 15) / 16);
   compute_barrier(cb);
 }
 

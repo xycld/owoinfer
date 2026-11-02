@@ -53,7 +53,7 @@ struct GdnArgs {
 };
 
 // One sequence: q, k, v and o point at its first row. Query head h reads key/value head h / group. Rows q_first ..
-// q_first + rows - 1 of the sequence are computed, each over keys 0 .. its own index.
+// q_first + rows - 1 of the sequence are computed, each over keys 0 .. its own index; q_first is a multiple of 16.
 struct TeAttentionArgs {
   VkDeviceAddress q = 0, k = 0, v = 0, o = 0;
   std::uint32_t ldq = 0, ldk = 0, ldv = 0, ldo = 0;

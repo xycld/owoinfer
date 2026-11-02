@@ -1,17 +1,20 @@
 // Causal scaled-dot-product attention over one sequence for the text encoder's full-attention layers: head_dim 256, query
-// head h reading key/value head h / group, bf16 in and out, fp32 online softmax, any device. One query row of one head per
-// workgroup of 32 lanes; row i attends to keys 0 .. i, in steps of 32 walked from the last down to the first, as
-// FlashAttention's reverse iteration:
-//   S = q * K_step^T                     (lane c: key c of the step, dims ascending, each product and sum rounded)
+// head h reading key/value head h / group, bf16 in and out, fp32 online softmax, any device. A workgroup of 64 takes 16
+// query rows of one head and walks the key tiles of 16 that they see, from the last down to the first, as
+// FlashAttention's reverse iteration; tiles align with the rows, so each row's first tile holds its own key:
+//   S = q * K_tile^T                     (dims ascending, each product and sum rounded; keys past the row masked)
 //   max, row_sum and acc_o rescaled to the new maximum
-//   P = bf16(exp2(S * log2_scale - max * log2_scale)), row_sum += P before rounding
-//   acc_o += P * V_step                  (lane l: dims 4l .. 4l + 3 and 128 + 4l .. 128 + 4l + 3)
-// and out = bf16(acc_o / row_sum). Rows q_first .. q_first + gl_NumWorkGroups.y - 1 of the sequence.
+//   P = bf16(exp2(S * log2_scale - max * log2_scale)), row_sum += P before rounding, keys ascending
+//   acc_o += P * V_tile                  (keys ascending)
+// and out = bf16(acc_o / row_sum). Invocation t computes S for row t / 4, keys t % 4 + 4 j, and holds output dims
+// 4t .. 4t + 3 of all 16 rows. Q, K and V tiles sit in shared memory with rows padded by 8 bytes against bank conflicts.
+// Rows q_first .. row_end - 1 of the sequence, q_first a multiple of 16; q, k, v and o point at its first row.
 #version 460
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
 #include "te_common.glsl"
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
   uint64_t q;
@@ -26,109 +29,123 @@ layout(push_constant) uniform PC {
   uint hsk;
   uint hsv;
   uint hso;
-  uint q_first;  // within the sequence; q, k, v and o point at its first row
-  uint group;    // query heads per key/value head
+  uint q_first;
+  uint row_end;
+  uint group;  // query heads per key/value head
   float log2_scale;
 } pc;
 
-const uint STEP = 32u;
+const uint BR = 16u;  // query rows per workgroup
+const uint BC = 16u;  // keys per tile
+const uint W = 64u;   // uvec2 (4 bf16) per 256-dim row
+const uint WP = 65u;  // padded
+const uint SP = 17u;  // padded S row
 
-shared vec4 q_shared[64];
-shared float s_shared[STEP];
-shared float w_shared[STEP];
-shared float p_shared[STEP];
-shared float max_scaled_shared;
-shared float rescale_shared;
-shared float inv_sum_shared;
+shared uvec2 q_tile[BR * WP];
+shared uvec2 k_tile[BC * WP];
+shared uvec2 v_tile[BC * WP];
+shared float s_tile[BR * SP];
+shared float rescale_shared[BR];
+shared float inv_sum_shared[BR];
+
+const float NEG_INF = uintBitsToFloat(0xff800000u);
 
 void main() {
-  const uint lane = gl_LocalInvocationIndex;
+  const uint t = gl_LocalInvocationIndex;
   const uint head = gl_WorkGroupID.x, kv_head = head / pc.group;
-  const uint row = pc.q_first + gl_WorkGroupID.y;
-  const uint seqlen_k = row + 1u;
+  const uint i0 = pc.q_first + gl_WorkGroupID.y * BR;
+  const uint n_keys = min(i0 + BR, pc.row_end);  // keys any valid row of the block sees
 
-  Words qrow = Words(pc.q + (uint64_t(row) * pc.ldq + uint64_t(head) * pc.hsq) * 2ul);
-  q_shared[lane] = f4(qrow.d[lane]);
-  q_shared[lane + 32u] = f4(qrow.d[lane + 32u]);
-  barrier();
+  for (uint e = t; e < BR * W; e += 64u) {
+    const uint r = e / W, w = e % W;
+    uvec2 val = uvec2(0u);
+    if (i0 + r < pc.row_end) val = Words(pc.q + (uint64_t(i0 + r) * pc.ldq + uint64_t(head) * pc.hsq) * 2ul).d[w];
+    q_tile[r * WP + w] = val;
+  }
 
   const uint64_t k_head = pc.k + uint64_t(kv_head) * pc.hsk * 2ul;
   const uint64_t v_head = pc.v + uint64_t(kv_head) * pc.hsv * 2ul;
-  const uint64_t ldk_bytes = uint64_t(pc.ldk) * 2ul, ldv_bytes = uint64_t(pc.ldv) * 2ul;
+  const uint my_row = t / 4u, my_cols = t % 4u;
 
-  precise vec4 acc_lo = vec4(0.0), acc_hi = vec4(0.0);
-  float row_max = 0.0, row_sum = 0.0;  // lane 0's
-  const uint steps = (seqlen_k + STEP - 1u) / STEP;
-  for (uint step_plus_1 = steps; step_plus_1 > 0u; --step_plus_1) {
-    const uint step_index = step_plus_1 - 1u;
-    const bool first = step_plus_1 == steps;
-    const uint n0 = step_index * STEP;
-    const uint cols = min(STEP, seqlen_k - n0);
+  precise vec4 acc[BR];
+  [[unroll]] for (uint r = 0u; r < BR; ++r) acc[r] = vec4(0.0);
+  float row_max = 0.0, row_sum = 0.0;  // of row t, for t < 16
 
-    if (lane < cols) {
-      Words key = Words(k_head + uint64_t(n0 + lane) * ldk_bytes);
+  const uint tiles = (n_keys + BC - 1u) / BC;
+  for (uint tile_plus_1 = tiles; tile_plus_1 > 0u; --tile_plus_1) {
+    const uint j0 = (tile_plus_1 - 1u) * BC;
+    const bool first = tile_plus_1 == tiles;
+    barrier();  // the previous tile's readers are done
+    for (uint e = t; e < BC * W; e += 64u) {
+      const uint c = e / W, w = e % W;
+      uvec2 kv = uvec2(0u), vv = uvec2(0u);
+      if (j0 + c < n_keys) {
+        kv = Words(k_head + uint64_t(j0 + c) * pc.ldk * 2ul).d[w];
+        vv = Words(v_head + uint64_t(j0 + c) * pc.ldv * 2ul).d[w];
+      }
+      k_tile[c * WP + w] = kv;
+      v_tile[c * WP + w] = vv;
+    }
+    barrier();
+
+    [[unroll]] for (uint jj = 0u; jj < 4u; ++jj) {
+      const uint c = my_cols + 4u * jj;
       precise float s = 0.0;
-      for (uint g = 0u; g < 64u; ++g) {
-        const vec4 q4 = q_shared[g];
-        const vec4 k4 = f4(key.d[g]);
+      for (uint w = 0u; w < W; ++w) {
+        const vec4 q4 = f4(q_tile[my_row * WP + w]);
+        const vec4 k4 = f4(k_tile[c * WP + w]);
         s = s + q4.x * k4.x;
         s = s + q4.y * k4.y;
         s = s + q4.z * k4.z;
         s = s + q4.w * k4.w;
       }
-      s_shared[lane] = s;
+      const bool masked = j0 + c > i0 + my_row || j0 + c >= n_keys;
+      s_tile[my_row * SP + c] = masked ? NEG_INF : s;
     }
     barrier();
 
-    if (lane == 0u) {
-      const float prev = row_max;
-      float cur = first ? s_shared[0] : max(prev, s_shared[0]);
-      for (uint c = 1u; c < cols; ++c) cur = max(cur, s_shared[c]);
-      row_max = cur;
-      if (first) {
-        rescale_shared = 1.0;
-        row_sum = 0.0;
-      } else {
-        precise const float diff = (prev - cur) * pc.log2_scale;
-        const float rescale = exp2(diff);
-        rescale_shared = rescale;
+    if (t < BR) {
+      float cur = first ? NEG_INF : row_max;
+      for (uint c = 0u; c < BC; ++c) cur = max(cur, s_tile[t * SP + c]);
+      float rescale = 1.0;
+      precise float sum = 0.0;
+      if (!first) {
+        precise const float diff = (row_max - cur) * pc.log2_scale;
+        rescale = exp2(diff);
         precise const float scaled = row_sum * rescale;
-        row_sum = scaled;
+        sum = scaled;
       }
-      precise const float max_scaled = cur * pc.log2_scale;
-      max_scaled_shared = max_scaled;
-    }
-    barrier();
-
-    float w = 0.0;
-    if (lane < cols) w = exp2(fma(s_shared[lane], pc.log2_scale, -max_scaled_shared));
-    w_shared[lane] = w;
-    p_shared[lane] = uintBitsToFloat(bf(w) << 16);
-    if (!first) {
-      precise const vec4 lo = acc_lo * rescale_shared, hi = acc_hi * rescale_shared;
-      acc_lo = lo;
-      acc_hi = hi;
-    }
-    barrier();
-
-    if (lane == 0u) {
-      precise float sum = row_sum;
-      for (uint c = 0u; c < cols; ++c) sum = sum + w_shared[c];
+      row_max = cur;
+      precise const float max_scaled = isinf(cur) ? 0.0 : cur * pc.log2_scale;
+      for (uint c = 0u; c < BC; ++c) {
+        const float s = s_tile[t * SP + c];
+        // FlashAttention's one fused step; a device without a fused fma rounds it twice, within the bf16 weight's error.
+        const float w = isinf(s) ? 0.0 : exp2(fma(s, pc.log2_scale, -max_scaled));
+        sum = sum + w;
+        s_tile[t * SP + c] = uintBitsToFloat(bf(w) << 16);
+      }
       row_sum = sum;
-    }
-    for (uint c = 0u; c < cols; ++c) {
-      Words val = Words(v_head + uint64_t(n0 + c) * ldv_bytes);
-      const float p = p_shared[c];
-      acc_lo = acc_lo + p * f4(val.d[lane]);
-      acc_hi = acc_hi + p * f4(val.d[lane + 32u]);
+      rescale_shared[t] = rescale;
     }
     barrier();
+
+    if (!first) {
+      [[unroll]] for (uint r = 0u; r < BR; ++r) {
+        precise const vec4 scaled = acc[r] * rescale_shared[r];
+        acc[r] = scaled;
+      }
+    }
+    for (uint c = 0u; c < BC; ++c) {
+      const vec4 v4 = f4(v_tile[c * WP + t]);
+      [[unroll]] for (uint r = 0u; r < BR; ++r) acc[r] = acc[r] + s_tile[r * SP + c] * v4;
+    }
   }
 
-  if (lane == 0u) inv_sum_shared = (row_sum == 0.0 || isnan(row_sum)) ? 1.0 : 1.0 / row_sum;
+  if (t < BR) inv_sum_shared[t] = (row_sum == 0.0 || isnan(row_sum)) ? 1.0 : 1.0 / row_sum;
   barrier();
-  precise const vec4 lo = acc_lo * inv_sum_shared, hi = acc_hi * inv_sum_shared;
-  Words out_row = Words(pc.o + (uint64_t(row) * pc.ldo + uint64_t(head) * pc.hso) * 2ul);
-  out_row.d[lane] = bf4(lo);
-  out_row.d[lane + 32u] = bf4(hi);
+  [[unroll]] for (uint r = 0u; r < BR; ++r) {
+    if (i0 + r >= pc.row_end) continue;
+    precise const vec4 result = acc[r] * inv_sum_shared[r];
+    Words(pc.o + (uint64_t(i0 + r) * pc.ldo + uint64_t(head) * pc.hso) * 2ul).d[t] = bf4(result);
+  }
 }

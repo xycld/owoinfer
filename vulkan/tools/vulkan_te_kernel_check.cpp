@@ -626,7 +626,7 @@ bool check_gdn(Device& device, const TeKernels& k) {
 
 std::vector<float> replay_attention_row(const bits* q, const bits* k, int ldk, const bits* v, int ldv, int seqlen_k,
                                         float scale) {
-  constexpr int D = 256, kStep = 32;
+  constexpr int D = 256, kStep = 16;
   const float log2_scale = static_cast<float>(static_cast<double>(scale) * 1.4426950408889634074);
   std::vector<float> acc(D, 0.0f);
   std::array<float, kStep> s{}, p{};
@@ -698,7 +698,7 @@ bool check_attention(Device& device, const TeKernels& k) {
     a.heads = heads;
     a.group = heads / kv_heads;
     // Two pieces of rows, as the encoder splits long sequences.
-    const std::uint32_t split = static_cast<std::uint32_t>(len) / 2;
+    const std::uint32_t split = static_cast<std::uint32_t>(len) / 2 / 16 * 16;
     device.run([&](VkCommandBuffer cb) {
       if (split > 0) {
         a.q_first = 0;

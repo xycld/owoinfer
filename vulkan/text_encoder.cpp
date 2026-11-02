@@ -542,7 +542,7 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
           a.scale = 0.0625f;
           // Query rows in pieces: row i costs about 4 * 256 * (i + 1) FLOP per head.
           const double per_row = 4.0 * kTeHeadDim * kTeHeads * len;
-          const auto step = static_cast<std::uint32_t>(std::max(1.0, std::floor(sub.budget() / per_row)));
+          const auto step = std::max(16u, static_cast<std::uint32_t>(std::floor(sub.budget() / per_row)) / 16 * 16);
           for (std::uint32_t r0 = 0; r0 < len; r0 += step) {
             a.q_first = r0;
             a.rows = std::min(step, len - r0);
