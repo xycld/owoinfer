@@ -27,6 +27,7 @@
 #include "pipeline/report_json.h"
 #include "planner/planner.h"
 #include "tools/cli/commands.h"
+#include "tools/cli/vulkan_backend.h"
 #include "util/json.h"
 #include "util/path.h"
 
@@ -56,10 +57,15 @@ constexpr const char* kUsage =
     "                           [--cfg-truncation X] [--step-cache off|fbcache] [--step-cache-threshold X]\n"
     "                           [--control <file> [--control-scale S] [--control-image <kind>=<png|jpg>\n"
     "                            [--control-strength X] [--control-start X] [--control-end X]]...]\n"
+    "                           [--backend cuda|vulkan [--vulkan-device N] [--vulkan-kernels coop|plain]]\n"
     "                           [--reference <png|jpg>]... [--reference-max-edge N]\n"
     "                           [--lora-placement default|merge|side_branch]\n"
     "`moss-infer check` takes the same options (-o optional): it checks them and plans the request as generate would,\n"
     "without loading weights or writing anything, and prints the verdict as JSON (exit 0 accepted, 1 refused).\n"
+    "--backend vulkan (builds with -DMOSSINFER_VULKAN=ON) runs on Vulkan instead of CUDA, for GPUs the CUDA engine does\n"
+    "not support: txt2img with the bf16 model files and the official sampler and schedule only, much slower than CUDA.\n"
+    "--vulkan-device picks a device (default: the first usable one, discrete first); --vulkan-kernels picks the bf16\n"
+    "cooperative-matrix kernels or the plain ones (default: coop where the device has them). Both are reported.\n"
     "Flags override values read from --params. At least one of -o / --latent-out is required;\n"
     "without -o the VAE decode is skipped. --vram-budget caps the process's GPU memory (CUDA context included).\n"
     "Each --then-prompt generates one more image in the same engine session (same settings, warm models and\n"
@@ -343,6 +349,8 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
   std::optional<double> strength;
   std::string hires;
   bool distill = false, distill_dataspace = false;
+  std::string backend = "cuda";
+  VulkanRun vulkan;
   json::Value pdoc;
   const json::Value* pobj = nullptr;  // the parameters object of --params
   int distill_steps = 0;
@@ -489,6 +497,12 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
       else if (f == "--reference") reference_images.push_back(path_arg(v, f));
       else if (f == "--reference-max-edge") req.references.max_edge = to_int32(f, v);
       else if (f == "--lora-placement") req.lora_placement = lora::parse_placement(v);
+      else if (f == "--backend") {
+        if (v != "cuda" && v != "vulkan") throw std::invalid_argument("--backend takes cuda or vulkan");
+        backend = v;
+      }
+      else if (f == "--vulkan-device") vulkan.device = to_int32(f, v);
+      else if (f == "--vulkan-kernels") vulkan.kernels = v;
       else throw std::invalid_argument("unknown flag " + f);
     }
   } catch (const std::invalid_argument& e) {
@@ -580,12 +594,46 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
     return 1;
   }
   req.decode = !out_png.empty() || (check && out_latent.empty());  // check: a PNG unless only --latent-out is given
+  if (check && backend != "cuda") {
+    std::cerr << "moss-infer check: --backend vulkan is not supported by check\n";
+    return 2;
+  }
   if (check) return run_check(options, req, then_prompts, !preview_png.empty(), quiet);
   pipeline::validate(req);
   for (const std::string& p : then_prompts) {
     pipeline::Request f = req;
     f.prompt = p;
     pipeline::validate(f);
+  }
+
+  if ((given("--vulkan-device") || given("--vulkan-kernels")) && backend != "vulkan") {
+    std::cerr << "moss-infer generate: --vulkan-device and --vulkan-kernels need --backend vulkan\n" << kUsage;
+    return 2;
+  }
+  if (backend == "vulkan") {
+    // CUDA-only settings are refused rather than ignored.
+    for (const char* f : {"--mode", "--vram-budget", "--vram-reserve", "--host-ram-budget", "--cache-dir", "--then-prompt",
+                          "--direct-io", "--buffered-io", "--te-host-pin", "--cert-dir", "--dit-blocks", "--dit", "--te",
+                          "--vae", "--preview", "--tier", "--attention", "--json-report", "--time-embedding", "--distill",
+                          "--lora-placement"}) {
+      if (given(f)) {
+        std::cerr << "moss-infer generate: " << f << " is not supported with --backend vulkan\n";
+        return 2;
+      }
+    }
+    try {
+      vulkan.out_png = out_png;
+      vulkan.quiet = quiet;
+      const std::vector<float> latents = run_vulkan_generate(req, vulkan);
+      if (!out_latent.empty()) write_npy_f32(out_latent, latents, {moss_dit::kLatentChannels, req.height / 16, req.width / 16});
+    } catch (const std::invalid_argument& e) {
+      std::cerr << "moss-infer generate: " << e.what() << "\n";
+      return 2;
+    } catch (const std::exception& e) {
+      std::cerr << "moss-infer generate: " << e.what() << "\n";
+      return 1;
+    }
+    return 0;
   }
 
   std::signal(SIGINT, on_sigint);

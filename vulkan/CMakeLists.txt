@@ -39,6 +39,14 @@ add_library(mossinfer_vulkan STATIC runtime.cpp gemm.cpp block.cpp dit.cpp safet
 target_include_directories(mossinfer_vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${_spirv_dir})
 target_link_libraries(mossinfer_vulkan PUBLIC Vulkan::Vulkan)
 
+# Built into the engine (cmake/modules/vulkan.cmake), the tools are off unless asked for.
+if(NOT DEFINED MOSSINFER_VULKAN_TOOLS)
+  set(MOSSINFER_VULKAN_TOOLS ON)
+endif()
+if(NOT MOSSINFER_VULKAN_TOOLS)
+  return()
+endif()
+
 add_executable(vulkan_check tools/vulkan_check.cpp)
 target_link_libraries(vulkan_check PRIVATE mossinfer_vulkan)
 
