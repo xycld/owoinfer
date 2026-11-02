@@ -1,0 +1,32 @@
+// fp32 transpose: out[c, r] = in[r, c] for in [R, Cc] (row stride ld_in) and out [Cc, R] (row stride ld_out), through
+// 32 x 33 shared tiles. Workgroup (x, y) moves the tile at columns 32 x, rows 32 y.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t in_;
+  uint64_t out_;
+  uint R;
+  uint Cc;
+  uint ld_in;
+  uint ld_out;
+} pc;
+
+shared float tile[32 * 33];
+
+void main() {
+  const uint c0 = gl_WorkGroupID.x * 32u, r0 = gl_WorkGroupID.y * 32u;
+  const uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+  for (uint i = ty; i < 32u; i += 8u) {
+    const uint r = r0 + i, c = c0 + tx;
+    if (r < pc.R && c < pc.Cc) tile[i * 33u + tx] = Floats(pc.in_ + (uint64_t(r) * pc.ld_in + c) * 4ul).d[0];
+  }
+  barrier();
+  for (uint i = ty; i < 32u; i += 8u) {
+    const uint c = c0 + i, r = r0 + tx;
+    if (r < pc.R && c < pc.Cc) Floats(pc.out_ + (uint64_t(c) * pc.ld_out + r) * 4ul).d[0] = tile[tx * 33u + i];
+  }
+}

@@ -50,3 +50,22 @@ target_link_libraries(vulkan_block_check PRIVATE mossinfer_vulkan)
 # One real block against the engine's captured output.
 add_executable(vulkan_block_real tools/vulkan_block_real.cpp)
 target_link_libraries(vulkan_block_real PRIVATE mossinfer_vulkan)
+
+# The FLUX.2 VAE decoder (vae.h): its cooperative-matrix kernel needs Vulkan 1.3, the rest loads on Vulkan 1.2.
+set(_spirv_block ${_spirv_files})
+_mi_add_shader(vae_conv_coop vulkan1.3)
+foreach(shader IN ITEMS vae_conv_plain vae_gn_stats vae_gn_finalize vae_gn_apply vae_softmax vae_transpose
+                        vae_latent_unpack vae_rgb8)
+  _mi_add_shader(${shader} vulkan1.2)
+endforeach()
+set(_spirv_vae ${_spirv_files})
+list(REMOVE_ITEM _spirv_vae ${_spirv_block})
+add_library(mossinfer_vulkan_vae STATIC vae.cpp safetensors.cpp ${_spirv_vae})
+target_include_directories(mossinfer_vulkan_vae PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${_spirv_dir})
+target_link_libraries(mossinfer_vulkan_vae PUBLIC mossinfer_vulkan)
+
+# Kernels against host replays, then the real decoder against the reference pipeline's PNG (zlib reads and writes PNGs).
+find_package(ZLIB REQUIRED)
+add_executable(vulkan_vae_check tools/vulkan_vae_check.cpp)
+target_compile_options(vulkan_vae_check PRIVATE -ffp-contract=off)
+target_link_libraries(vulkan_vae_check PRIVATE mossinfer_vulkan_vae ZLIB::ZLIB)

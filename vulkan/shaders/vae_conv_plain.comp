@@ -1,0 +1,152 @@
+// The VAE's convolutions and fp32 GEMMs without cooperative matrices, 16-bit types or a particular subgroup size:
+//   out[m, n] = (sum_k A[m, k] * B[n, k] + bias[n]) + residual[m, n]      (each + rounded separately, as the reference)
+// with fp32 operands and accumulators, K ascending. TF32 rounds both operands to TF32 (half away from zero) first, as
+// cuDNN's TF32 convolution does; their products are then exact in fp32, so only the accumulation order differs from it.
+// A and B are addressed as in vae_conv_coop.comp: TAPS 9 / 1 is a 3x3 / 1x1 convolution over an NHWC input of C channels
+// for an H x W output (UPSAMPLE: read through a nearest 2x upsample of an H/2 x W/2 input), TAPS 0 a row-major A with
+// stride lda; B is row-major [N, K]. K, C, lda and ldb are multiples of 4. M and N are free.
+//
+// 256 invocations as 16 x 16; a workgroup computes a tile of 16 TM rows x 16 TN columns, invocation (x, y) the rows
+// y + 16 i and columns x + 16 j. K walks in steps of 16 through shared memory, the next step loading into registers.
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint TAPS = 9;
+layout(constant_id = 1) const bool UPSAMPLE = false;
+layout(constant_id = 2) const bool TF32 = true;
+layout(constant_id = 3) const uint TM = 4;  // 1..8
+layout(constant_id = 4) const uint TN = 4;  // 1..4
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Vec4s { vec4 d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t a;
+  uint64_t b;
+  uint64_t out_;
+  uint64_t bias;
+  uint64_t residual;
+  uint M;
+  uint N;
+  uint K;
+  uint lda;
+  uint ldb;
+  uint ldo;
+  uint H;
+  uint W;
+  uint C;
+  uint m0;
+} pc;
+
+const uint BM = 16u * TM;
+const uint BN = 16u * TN;
+const uint BK = 16u;
+// [k][row], rows padded by 4 so the transposed stores of 4 k values spread over banks.
+shared float As[BK * (BM + 4u)];
+shared float Bs[BK * (BN + 4u)];
+
+float tf32(float v) {
+  const uint u = floatBitsToUint(v);
+  if ((u & 0x7f800000u) == 0x7f800000u) return v;
+  return uintBitsToFloat((u + 0x1000u) & 0xffffe000u);
+}
+vec4 round4(vec4 v) { return TF32 ? vec4(tf32(v.x), tf32(v.y), tf32(v.z), tf32(v.w)) : v; }
+
+vec4 load_a(uint m, uint k) {
+  if (m >= pc.M || k >= pc.K) return vec4(0.0);
+  uint64_t at;
+  if (TAPS == 0u) {
+    at = uint64_t(m) * pc.lda + k;
+  } else {
+    const uint tap = k / pc.C, c = k - tap * pc.C;
+    if (TAPS == 1u) {
+      at = uint64_t(m) * pc.C + c;
+    } else {
+      const uint oy = m / pc.W, ox = m - oy * pc.W;
+      const int iy = int(oy) + int(tap / 3u) - 1, ix = int(ox) + int(tap % 3u) - 1;
+      if (iy < 0 || ix < 0 || iy >= int(pc.H) || ix >= int(pc.W)) return vec4(0.0);
+      if (UPSAMPLE) {
+        at = (uint64_t(uint(iy) >> 1) * (pc.W >> 1) + (uint(ix) >> 1)) * pc.C + c;
+      } else {
+        at = (uint64_t(iy) * pc.W + uint(ix)) * pc.C + c;
+      }
+    }
+  }
+  return round4(Vec4s(pc.a + at * 4ul).d[0]);
+}
+
+vec4 load_b(uint n, uint k) {
+  if (n >= pc.N || k >= pc.K) return vec4(0.0);
+  return round4(Vec4s(pc.b + (uint64_t(n) * pc.ldb + k) * 4ul).d[0]);
+}
+
+// Chunks of 4 k values: BM * 4 of A (invocation i takes chunks i and i + 256) and BN * 4 <= 256 of B per step.
+const uint A_CHUNKS = (BM * 4u + 255u) / 256u;
+
+void main() {
+  const uint t = gl_LocalInvocationIndex;
+  const uint tx = t % 16u, ty = t / 16u;
+  const uint m_base = pc.m0 + gl_WorkGroupID.y * BM;
+  const uint n_base = gl_WorkGroupID.x * BN;
+
+  float acc[8][4];
+  [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+    [[unroll]] for (uint j = 0u; j < 4u; ++j) acc[i][j] = 0.0;
+  }
+
+  vec4 ra[2], rb[1];
+  const uint steps = (pc.K + BK - 1u) / BK;
+  for (uint step = 0u; step < steps; ++step) {
+    const uint k0 = step * BK;
+    [[unroll]] for (uint q = 0u; q < 2u; ++q) {
+      const uint chunk = t + q * 256u;
+      if (q < A_CHUNKS && chunk < BM * 4u) ra[q] = load_a(m_base + chunk / 4u, k0 + (chunk % 4u) * 4u);
+    }
+    if (t < BN * 4u) rb[0] = load_b(n_base + t / 4u, k0 + (t % 4u) * 4u);
+    barrier();  // the previous step's reads of As and Bs are done
+    [[unroll]] for (uint q = 0u; q < 2u; ++q) {
+      const uint chunk = t + q * 256u;
+      if (q < A_CHUNKS && chunk < BM * 4u) {
+        const uint row = chunk / 4u, kk = (chunk % 4u) * 4u;
+        As[(kk + 0u) * (BM + 4u) + row] = ra[q].x;
+        As[(kk + 1u) * (BM + 4u) + row] = ra[q].y;
+        As[(kk + 2u) * (BM + 4u) + row] = ra[q].z;
+        As[(kk + 3u) * (BM + 4u) + row] = ra[q].w;
+      }
+    }
+    if (t < BN * 4u) {
+      const uint row = t / 4u, kk = (t % 4u) * 4u;
+      Bs[(kk + 0u) * (BN + 4u) + row] = rb[0].x;
+      Bs[(kk + 1u) * (BN + 4u) + row] = rb[0].y;
+      Bs[(kk + 2u) * (BN + 4u) + row] = rb[0].z;
+      Bs[(kk + 3u) * (BN + 4u) + row] = rb[0].w;
+    }
+    barrier();
+    for (uint k = 0u; k < BK; ++k) {
+      float av[8], bv[4];
+      [[unroll]] for (uint i = 0u; i < 8u; ++i) av[i] = i < TM ? As[k * (BM + 4u) + ty + 16u * i] : 0.0;
+      [[unroll]] for (uint j = 0u; j < 4u; ++j) bv[j] = j < TN ? Bs[k * (BN + 4u) + tx + 16u * j] : 0.0;
+      [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+          if (i < TM && j < TN) acc[i][j] += av[i] * bv[j];
+        }
+      }
+    }
+  }
+
+  [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+    const uint m = m_base + ty + 16u * i;
+    if (i >= TM || m >= pc.M) continue;
+    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+      const uint n = n_base + tx + 16u * j;
+      if (j >= TN || n >= pc.N) continue;
+      const uint64_t at = uint64_t(m) * pc.ldo + n;
+      precise float y = acc[i][j];
+      if (pc.bias != 0ul) y = y + Floats(pc.bias).d[n];
+      if (pc.residual != 0ul) y = y + Floats(pc.residual + at * 4ul).d[0];
+      Floats(pc.out_ + at * 4ul).d[0] = y;
+    }
+  }
+}
