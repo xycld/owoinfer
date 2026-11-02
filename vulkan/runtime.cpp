@@ -274,6 +274,23 @@ Device::~Device() {
   if (instance_ != VK_NULL_HANDLE) vkDestroyInstance(instance_, nullptr);
 }
 
+std::uint64_t Device::free_device_memory() const {
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+  VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+  const bool has_budget = has_extension(physical_, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+  if (has_budget) properties.pNext = &budget;
+  vkGetPhysicalDeviceMemoryProperties2(physical_, &properties);
+  std::uint64_t best = 0;
+  for (std::uint32_t i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
+    const VkMemoryHeap& heap = properties.memoryProperties.memoryHeaps[i];
+    if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) continue;
+    std::uint64_t free = heap.size;
+    if (has_budget) free = budget.heapBudget[i] > budget.heapUsage[i] ? budget.heapBudget[i] - budget.heapUsage[i] : 0;
+    best = std::max(best, free);
+  }
+  return best;
+}
+
 std::uint32_t Device::find_memory_type(std::uint32_t type_bits, VkMemoryPropertyFlags flags) const {
   for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i) {
     if ((type_bits & (1u << i)) != 0 && (memory_.memoryTypes[i].propertyFlags & flags) == flags) return i;

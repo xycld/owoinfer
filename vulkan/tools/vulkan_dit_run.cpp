@@ -2,6 +2,7 @@
 // pipeline's, tests/golden), with CFG and the official Euler step on the host in fp32, and compares step 0's predictions
 // and the final latent with the golden ones. Writes the final latent as .npy for the VAE.
 // Usage: vulkan_dit_run TRANSFORMER_DIR GOLDEN_DIR CASE [--steps N] [--out FILE.npy] [--path coop|plain] [--device N]
+//                       [--dit-budget GiB]   (device memory for the weights; the blocks past it stream)
 //   GOLDEN_DIR is tests/golden, CASE e.g. g_fridge_1024; the case's cfg and uncond skip layers are 3.0 and {22}.
 #include <algorithm>
 #include <bit>
@@ -73,6 +74,7 @@ int main(int argc, char** argv) {
   const fs::path transformer = argv[1], golden = argv[2];
   const std::string name = argv[3];
   int steps = -1, device_index = -1;
+  double budget_gib = 0;
   fs::path out_path;
   std::string path_name;
   for (int i = 4; i < argc; ++i) {
@@ -81,6 +83,7 @@ int main(int argc, char** argv) {
     else if (arg == "--out" && i + 1 < argc) out_path = argv[++i];
     else if (arg == "--path" && i + 1 < argc) path_name = argv[++i];
     else if (arg == "--device" && i + 1 < argc) device_index = std::atoi(argv[++i]);
+    else if (arg == "--dit-budget" && i + 1 < argc) budget_gib = std::atof(argv[++i]);
     else {
       std::printf("unknown argument %s\n", arg.c_str());
       return 2;
@@ -104,8 +107,12 @@ int main(int argc, char** argv) {
                                                    : BlockKernels(device, path_name == "plain" ? BlockPath::kPlain : BlockPath::kCoop);
     std::printf("device %u: %s, path %s\n", device.info().index, device.info().name.c_str(), block_path_name(kernels.path()));
     double t0 = now_s();
-    Dit dit(device, kernels, transformer);
-    std::printf("weights: %.2f GiB in %.1f s\n", static_cast<double>(dit.weight_bytes()) / (1u << 30), now_s() - t0);
+    DitOptions options;
+    options.device_budget = static_cast<std::uint64_t>(budget_gib * (1u << 30));
+    Dit dit(device, kernels, transformer, options);
+    std::printf("weights: %.2f GiB on the device, %.2f GiB in host memory (%d of %d blocks resident), loaded in %.1f s\n",
+                static_cast<double>(dit.weight_bytes()) / (1u << 30), static_cast<double>(dit.host_weight_bytes()) / (1u << 30),
+                dit.resident_blocks(), kDiTLayers, now_s() - t0);
 
     std::vector<std::unique_ptr<Buffer>> texts;
     std::vector<Dit::Row> rows;
@@ -144,7 +151,7 @@ int main(int argc, char** argv) {
       const std::vector<double>& ms = dit.last_op_ms();
       std::printf("step %2d: %.2f s (", s, dt_s);
       for (int op = 0; op < kBlockOps; ++op) std::printf("%s %.0f, ", block_op_name(op), ms[static_cast<std::size_t>(op)]);
-      std::printf("rest %.0f ms)\n", ms[kBlockOps]);
+      std::printf("rest %.0f ms, of which block copies %.0f ms)\n", ms[kBlockOps], dit.last_copy_ms());
       std::fflush(stdout);
     }
     if (steps == total_steps) {

@@ -50,6 +50,10 @@ class Device {
 
   const DeviceInfo& info() const { return info_; }
 
+  // Device-local memory this process can still allocate: the driver's budget minus its usage where the device has
+  // VK_EXT_memory_budget, else the size of the largest device-local heap.
+  std::uint64_t free_device_memory() const;
+
   // Records into one command buffer, submits it and waits.
   void run(const std::function<void(VkCommandBuffer)>& record);
 

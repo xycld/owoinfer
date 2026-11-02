@@ -51,7 +51,15 @@ GenerateResult generate(Device& device, BlockPath path, const GenerateRequest& r
   {
     double t0 = now_s();
     const BlockKernels kernels(device, path);
-    Dit dit(device, kernels, r.model_dir / "transformer");
+    // Blocks past what the device can hold with this run's activations stream from host memory.
+    std::uint64_t tokens = 0;
+    for (const auto& e : embeds) tokens += std::uint64_t{lh} * lw + e.size() / kDiTTextDim;
+    constexpr std::uint64_t kReserve = std::uint64_t{512} << 20;  // pipelines, command buffers, the driver
+    const std::uint64_t free = device.free_device_memory(), need = Dit::activation_bytes(tokens, std::uint64_t{lh} * lw) + kReserve;
+    DitOptions options;
+    options.device_budget = free > need ? free - need : 1;
+    Dit dit(device, kernels, r.model_dir / "transformer", options);
+    out.dit_resident_blocks = dit.resident_blocks();
     std::vector<std::unique_ptr<Buffer>> texts;
     std::vector<Dit::Row> rows;
     for (std::size_t i = 0; i < embeds.size(); ++i) {

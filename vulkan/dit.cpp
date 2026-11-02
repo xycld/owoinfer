@@ -62,12 +62,14 @@ std::vector<std::uint16_t> rope_table(std::uint32_t height, std::uint32_t width,
   return out;
 }
 
-Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::path& transformer_dir)
+Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::path& transformer_dir, const DitOptions& options)
     : device_(device), kernels_(kernels) {
   const st::Index index(transformer_dir);
   std::vector<std::byte> host;
-  // Uploads tensors into one new buffer, each at a 256-byte aligned offset; returns their addresses.
-  const auto load = [&](const std::vector<std::string>& names, const std::vector<std::vector<std::int64_t>>& shapes) {
+  // Places tensors in one new buffer, each at a 256-byte aligned offset, and uploads them (or, for a host buffer, reads
+  // them straight into its mapping); returns their offsets.
+  const auto place = [&](const std::vector<std::string>& names, const std::vector<std::vector<std::int64_t>>& shapes,
+                         Buffer::Kind kind) {
     std::vector<VkDeviceSize> offsets;
     VkDeviceSize total = 0;
     for (std::size_t i = 0; i < names.size(); ++i) {
@@ -77,16 +79,26 @@ Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::pat
       offsets.push_back(total);
       total += (t.bytes + 255) / 256 * 256;
     }
-    owned_.push_back(std::make_unique<Buffer>(device_, total));
+    owned_.push_back(std::make_unique<Buffer>(device_, total, kind));
     Buffer& buf = *owned_.back();
-    weight_bytes_ += total;
-    std::vector<VkDeviceAddress> addresses;
     for (std::size_t i = 0; i < names.size(); ++i) {
-      host.resize(index.at(names[i]).bytes);
-      index.read_into(names[i], host.data(), host.size());
-      buf.upload(host.data(), host.size(), offsets[i]);
-      addresses.push_back(buf.address() + offsets[i]);
+      const std::uint64_t bytes = index.at(names[i]).bytes;
+      if (kind == Buffer::Kind::kStaging) {
+        index.read_into(names[i], static_cast<std::byte*>(buf.mapped()) + offsets[i], bytes);
+      } else {
+        host.resize(bytes);
+        index.read_into(names[i], host.data(), host.size());
+        buf.upload(host.data(), host.size(), offsets[i]);
+      }
     }
+    if (kind == Buffer::Kind::kDevice) weight_bytes_ += total;
+    else host_weight_bytes_ += total;
+    return offsets;
+  };
+  const auto load = [&](const std::vector<std::string>& names, const std::vector<std::vector<std::int64_t>>& shapes) {
+    const std::vector<VkDeviceSize> offsets = place(names, shapes, Buffer::Kind::kDevice);
+    std::vector<VkDeviceAddress> addresses;
+    for (const VkDeviceSize o : offsets) addresses.push_back(owned_.back()->address() + o);
     return addresses;
   };
   const std::int64_t d = kDim, f = kFfn;
@@ -109,19 +121,57 @@ Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::pat
     text_blocks_.push_back({t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13]});
   }
 
-  for (int l = 0; l < kDiTLayers; ++l) {
+  // Blocks: the first `resident` in device memory, the rest in host memory, each copied into one device slot before it
+  // runs. q, k and v sit back to back (256-aligned sizes of 18 MiB each), so they form the [9216, 3072] QKV weight.
+  const std::vector<std::vector<std::int64_t>> block_shapes = {{d}, {d}, {kHead}, {kHead}, {d, d}, {d, d}, {d, d}, {d, d},
+                                                                {2 * f, d}, {d, f}};
+  const auto block_names = [](int l) {
     const std::string p = "layers." + std::to_string(l) + ".";
-    // q, k and v load back to back, 256-aligned sizes of 18 MiB each, so they form the [9216, 3072] QKV weight.
-    auto t = load({p + "norm1.weight", p + "norm2.weight", p + "q_norm.weight", p + "k_norm.weight", p + "proj.q.weight",
-                   p + "proj.k.weight", p + "proj.v.weight", p + "proj.o.weight", p + "proj.ffn_up_gate.weight",
-                   p + "proj.ffn_down.weight"},
-                  {{d}, {d}, {kHead}, {kHead}, {d, d}, {d, d}, {d, d}, {d, d}, {2 * f, d}, {d, f}});
-    if (t[5] != t[4] + kDim * kDim * kBf16 || t[6] != t[5] + kDim * kDim * kBf16) fail("q, k and v are not contiguous");
-    blocks_.push_back({t[0], t[1], t[2], t[3], t[4], t[7], t[8], t[9]});
+    return std::vector<std::string>{p + "norm1.weight", p + "norm2.weight", p + "q_norm.weight", p + "k_norm.weight",
+                                    p + "proj.q.weight", p + "proj.k.weight", p + "proj.v.weight", p + "proj.o.weight",
+                                    p + "proj.ffn_up_gate.weight", p + "proj.ffn_down.weight"};
+  };
+  const auto block_weights = [&](VkDeviceAddress base, const std::vector<VkDeviceSize>& o) {
+    if (o[5] != o[4] + kDim * kDim * kBf16 || o[6] != o[5] + kDim * kDim * kBf16) fail("q, k and v are not contiguous");
+    return BlockWeights{base + o[0], base + o[1], base + o[2], base + o[3], base + o[4], base + o[7], base + o[8], base + o[9]};
+  };
+  VkDeviceSize block_bytes = 0;
+  for (const std::string& n : block_names(0)) block_bytes += (index.at(n).bytes + 255) / 256 * 256;
+  int resident = kDiTLayers;
+  if (options.device_budget > 0) {
+    const std::uint64_t free = options.device_budget > weight_bytes_ ? options.device_budget - weight_bytes_ : 0;
+    // A streamed block needs the slot too.
+    resident = free >= kDiTLayers * block_bytes ? kDiTLayers
+                                                : static_cast<int>(free > block_bytes ? free / block_bytes - 1 : 0);
   }
+  for (int l = 0; l < kDiTLayers; ++l) {
+    const bool on_device = l < resident;
+    const std::vector<VkDeviceSize> o = place(block_names(l), block_shapes, on_device ? Buffer::Kind::kDevice : Buffer::Kind::kStaging);
+    if (on_device) {
+      blocks_.push_back(block_weights(owned_.back()->address(), o));
+      host_blocks_.push_back(nullptr);
+    } else {
+      if (!slot_) {
+        slot_ = std::make_unique<Buffer>(device_, block_bytes);
+        weight_bytes_ += block_bytes;
+      }
+      blocks_.push_back(block_weights(slot_->address(), o));
+      host_blocks_.push_back(owned_.back().get());
+    }
+  }
+  resident_blocks_ = resident;
 }
 
 Dit::~Dit() = default;
+
+std::uint64_t Dit::activation_bytes(std::uint64_t tokens, std::uint64_t hw) {
+  // forward(): x, y and attn [tokens, 3072]; qkv [tokens, 9216]; ffn [tokens, 8192]; rope [tokens, 128]; the video tokens
+  // and the head's projection [hw, 128]; the modulation and time scratch. encode_text() reuses them for a prompt no longer
+  // than the joint sequence, with its own up, gate [S, 8192] and embeddings [S, 4096].
+  const std::uint64_t per_token = (3 * kDim + kQkv + kFfn + kHead) * kBf16;
+  return tokens * per_token + 2 * hw * kDiTLatentChannels * kBf16 + 2 * tokens * kFfn * kBf16 +
+         tokens * kDiTTextDim * kBf16 + (8 * kDim + 2 * kDim + kDiTFreqDim) * kBf16;
+}
 
 Buffer& Dit::scratch(std::unique_ptr<Buffer>& slot, VkDeviceSize bytes) {
   if (!slot || slot->bytes() < bytes) {
@@ -218,6 +268,7 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
   const std::uint64_t total = off.back();
   op_ms_.assign(kBlockOps + 1, 0.0);
   const double t_start = now_ms();
+  double copy_ms = 0.0;
 
   Buffer& x = scratch(x_, total * kDim * kBf16);
   scratch(y_, total * kDim * kBf16);
@@ -264,6 +315,12 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
       const BlockBuffers b{at(x, off[r0] * kDim * kBf16), y_->address(), qkv_->address(), attn_->address(), ffn_->address(),
                            at(rope, off[r0] * kHead * kBf16), mod_->address(), cu,
                            static_cast<std::uint32_t>(off[r1] - off[r0])};
+      if (const Buffer* host = host_blocks_[static_cast<std::size_t>(l)]; host != nullptr && streamed_layer_ != l) {
+        const double t0 = now_ms();
+        device_.run([&](VkCommandBuffer cb) { record_copy(cb, *host, 0, *slot_, 0, host->bytes()); });
+        streamed_layer_ = l;
+        copy_ms += now_ms() - t0;
+      }
       for (int op = 0; op < kBlockOps; ++op) {
         const double t0 = now_ms();
         device_.run([&](VkCommandBuffer cb) { record_block_op(kernels_, cb, op, blocks_[static_cast<std::size_t>(l)], b); });
@@ -291,6 +348,7 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
   double blocks = 0.0;
   for (int op = 0; op < kBlockOps; ++op) blocks += op_ms_[static_cast<std::size_t>(op)];
   op_ms_[kBlockOps] = now_ms() - t_start - blocks;
+  last_copy_ms_ = copy_ms;
   return out;
 }
 

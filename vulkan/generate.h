@@ -36,6 +36,7 @@ struct GenerateResult {
   std::vector<std::uint8_t> rgb;  // [height, width, 3]
   std::vector<float> latents;     // the final latents, f32 [128, height / 16, width / 16]
   double text_encoder_s = 0, dit_load_s = 0, denoise_s = 0, vae_s = 0;
+  int dit_resident_blocks = 0;  // of 42; the rest streamed from host memory every step
 };
 
 // path: the DiT's and text encoder's kernels (kCoop needs Capabilities::coop_bf16); the VAE follows it.

@@ -26,15 +26,27 @@ inline constexpr int kDiTLatentChannels = 128;
 
 using SkipSet = std::bitset<kDiTLayers>;
 
+struct DitOptions {
+  // Device memory the weights may take; 0: every block resident. Blocks past the budget stay in host memory (mapped,
+  // host-coherent) and are copied into one device slot right before they run, so a device with too little memory for
+  // the 9.5 GiB of weights still runs the DiT, at the cost of moving those blocks over the bus every step.
+  std::uint64_t device_budget = 0;
+};
+
 class Dit {
  public:
   // transformer_dir: the model's transformer/ directory (config.json and the sharded safetensors).
-  Dit(Device& device, const BlockKernels& kernels, const std::filesystem::path& transformer_dir);
+  Dit(Device& device, const BlockKernels& kernels, const std::filesystem::path& transformer_dir,
+      const DitOptions& options = {});
   ~Dit();
   Dit(const Dit&) = delete;
   Dit& operator=(const Dit&) = delete;
 
-  std::uint64_t weight_bytes() const { return weight_bytes_; }
+  std::uint64_t weight_bytes() const { return weight_bytes_; }  // device memory, the streaming slot included
+  std::uint64_t host_weight_bytes() const { return host_weight_bytes_; }
+  int resident_blocks() const { return resident_blocks_; }
+  // Device memory of the activations of one forward() over `tokens` joint tokens and an h x w latent grid.
+  static std::uint64_t activation_bytes(std::uint64_t tokens, std::uint64_t hw);
 
   // The text refiner on one prompt's text-encoder output, bf16 bits [length, 4096]: device bf16 [length, 3072].
   std::unique_ptr<Buffer> encode_text(const std::vector<std::uint16_t>& embeds, std::uint32_t length);
@@ -49,20 +61,23 @@ class Dit {
   std::vector<std::vector<float>> forward(const std::vector<float>& latents, std::uint32_t height, std::uint32_t width,
                                           float timestep, const std::vector<Row>& rows);
 
-  // Milliseconds of the last forward(), summed per op kind over its blocks (block_op_name order), then the rest.
+  // Milliseconds of the last forward(), summed per op kind over its blocks (block_op_name order), then the rest (which
+  // includes last_copy_ms(), the streamed blocks' copies).
   const std::vector<double>& last_op_ms() const { return op_ms_; }
+  double last_copy_ms() const { return last_copy_ms_; }
 
  private:
-  struct Weight;
-  struct TextBlock;
-  struct Scratch;
-
   Buffer& scratch(std::unique_ptr<Buffer>& slot, VkDeviceSize bytes);
   void time_modulation(float timestep);
 
   Device& device_;
   const BlockKernels& kernels_;
-  std::uint64_t weight_bytes_ = 0;
+  std::uint64_t weight_bytes_ = 0, host_weight_bytes_ = 0;
+  int resident_blocks_ = 0;
+  std::vector<const Buffer*> host_blocks_;  // per block: its host copy when streamed, else null
+  std::unique_ptr<Buffer> slot_;           // the device slot streamed blocks run from
+  int streamed_layer_ = -1;                // the block the slot holds
+  double last_copy_ms_ = 0.0;
   std::vector<std::unique_ptr<Buffer>> owned_;
   std::vector<BlockWeights> blocks_;
   struct Globals {
