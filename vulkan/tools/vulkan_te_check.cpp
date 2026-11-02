@@ -2,9 +2,9 @@
 // raw outputs of decoder layers 0, 3 and 31 (te_layerNN, before the final norm) and last_hidden_state (te_last_hidden)
 // with them: cosine over the sequence, worst row cosine, row relative L2, share of identical bf16 bits, worst bf16 ULPs
 // scaled to max(|golden|, rms(golden) / 64), NaN count. The cond and uncond prompts of a case are encoded in one call;
-// --iters repeats the call for timing; --profile submits each op alone and prints seconds per kind of op. Exit status: 0
-// ran without NaN, 1 otherwise.
-// Usage: vulkan_te_check [--device N] [--path coop|plain] [--weights DIR] [--golden DIR] [--case ID]... [--iters N] [--profile]
+// --iters repeats the call for timing; --profile submits each op alone and prints seconds per kind of op. Exit status:
+// 0 ran without NaN, 1 otherwise. Usage: vulkan_te_check [--device N] [--path coop|plain] [--weights DIR] [--golden
+// DIR] [--case ID]... [--iters N] [--profile]
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -64,8 +64,9 @@ Metrics compare(const std::uint16_t* got, const std::vector<float>& ref) {
 }
 
 void print(const std::string& what, const Metrics& m) {
-  std::printf("  %-16s cos %.7f  min row cos %.6f  row relL2 max %.3e mean %.3e  same %6.2f %%  max %.1f ULPs  %zu NaN\n",
-              what.c_str(), m.cosine, m.min_row_cosine, m.max_row_rel, m.mean_row_rel, m.same_pct, m.max_ulps, m.nans);
+  std::printf(
+      "  %-16s cos %.7f  min row cos %.6f  row relL2 max %.3e mean %.3e  same %6.2f %%  max %.1f ULPs  %zu NaN\n",
+      what.c_str(), m.cosine, m.min_row_cosine, m.max_row_rel, m.mean_row_rel, m.same_pct, m.max_ulps, m.nans);
 }
 
 std::vector<float> golden(const std::string& dir, const std::string& key, const std::string& what, std::size_t rows) {
@@ -100,7 +101,10 @@ int main(int argc, char** argv) {
     } else if (arg == "--iters" && i + 1 < argc) {
       iters = std::max(1, std::atoi(argv[++i]));
     } else {
-      std::printf("usage: %s [--device N] [--path coop|plain] [--weights DIR] [--golden DIR] [--case ID]... [--iters N] [--profile]\n", argv[0]);
+      std::printf(
+          "usage: %s [--device N] [--path coop|plain] [--weights DIR] [--golden DIR] [--case ID]... [--iters N] "
+          "[--profile]\n",
+          argv[0]);
       return 2;
     }
   }
@@ -114,7 +118,8 @@ int main(int argc, char** argv) {
     const BlockPath path = path_name.empty() ? (device.info().caps.coop_bf16 ? BlockPath::kCoop : BlockPath::kPlain)
                                              : (path_name == "coop" ? BlockPath::kCoop : BlockPath::kPlain);
     TextEncoder encoder(device, weights, path, options);
-    std::printf("device %u: %s, path %s\n", device.info().index, device.info().name.c_str(), block_path_name(encoder.path()));
+    std::printf("device %u: %s, path %s\n", device.info().index, device.info().name.c_str(),
+                block_path_name(encoder.path()));
     bool ok = true;
     for (const std::string& id : cases) {
       const std::vector<std::string> keys = {id + ".cond", id + ".uncond"};
@@ -134,10 +139,11 @@ int main(int argc, char** argv) {
       for (int it = 0; it < iters; ++it) {
         out = encoder.encode(seqs, it == 0 ? hook : TeLayerHook{});
         const TextEncoderStats& s = encoder.last_stats();
-        std::printf("%s: %u tokens, encode %.3f s (embed %.3f, file reads %.3f in the reader thread, waiting for them %.3f, "
-                    "uploads %.3f, compute %.3f, %d submits), device %.1f MiB, host staging %.1f MiB\n",
-                    id.c_str(), s.tokens, s.total_s, s.embed_s, s.read_s, s.read_wait_s, s.upload_s, s.compute_s, s.submits,
-                    static_cast<double>(s.device_bytes) / (1 << 20), static_cast<double>(s.staging_bytes) / (1 << 20));
+        std::printf(
+            "%s: %u tokens, encode %.3f s (embed %.3f, file reads %.3f in the reader thread, waiting for them %.3f, "
+            "uploads %.3f, compute %.3f, %d submits), device %.1f MiB, host staging %.1f MiB\n",
+            id.c_str(), s.tokens, s.total_s, s.embed_s, s.read_s, s.read_wait_s, s.upload_s, s.compute_s, s.submits,
+            static_cast<double>(s.device_bytes) / (1 << 20), static_cast<double>(s.staging_bytes) / (1 << 20));
         for (const auto& [op, seconds] : s.op_seconds) std::printf("  %-24s %8.3f s\n", op.c_str(), seconds);
       }
       std::size_t row0 = 0;

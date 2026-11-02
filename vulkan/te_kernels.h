@@ -1,7 +1,7 @@
-// The Qwen3.5 text encoder's kernels other than its GEMMs (those are BlockKernels'), in the engine's op order and rounding
-// points (src/models/qwen35_text, src/kernels/gdn, src/kernels/basic). Plain compute: no cooperative matrices, 16-bit
-// arithmetic or particular subgroup size, so both paths use them. Arguments are device addresses; strides are in elements.
-// Each record_* adds its own barrier.
+// The Qwen3.5 text encoder's kernels other than its GEMMs (those are BlockKernels'), in the engine's op order and
+// rounding points (src/models/qwen35_text, src/kernels/gdn, src/kernels/basic). Plain compute: no cooperative matrices,
+// 16-bit arithmetic or particular subgroup size, so both paths use them. Arguments are device addresses; strides are in
+// elements. Each record_* adds its own barrier.
 #pragma once
 
 #include <cstdint>
@@ -18,11 +18,12 @@ inline constexpr int kGdnHeadDim = 128;
 inline constexpr int kGdnConvDim = 2 * kGdnKeyHeads * kGdnHeadDim + kGdnValueHeads * kGdnHeadDim;  // [q | k | v], 8192
 inline constexpr int kGdnChunk = 64;
 
-// torch's threads per row for a last-dim fp32 reduction of `rows` rows of length d (setReduceConfig, 4-wide vector loads,
-// 512 threads at most). Throws where torch would split a row across warps, which the norm does not reproduce.
+// torch's threads per row for a last-dim fp32 reduction of `rows` rows of length d (setReduceConfig, 4-wide vector
+// loads, 512 threads at most). Throws where torch would split a row across warps, which the norm does not reproduce.
 std::uint32_t torch_reduce_threads(std::uint64_t rows, std::uint32_t d);
 
-// Rows are (token, head) pairs: row (t, h) of x starts at x + t * ldx + h * hsx, likewise out and gate. out may alias x.
+// Rows are (token, head) pairs: row (t, h) of x starts at x + t * ldx + h * hsx, likewise out and gate. out may alias
+// x.
 struct RmsNormArgs {
   VkDeviceAddress x = 0, weight = 0, gate = 0, out = 0;
   std::uint32_t ldx = 0, hsx = 0, ldo = 0, hso = 0, ldg = 0, hsg = 0;
@@ -80,8 +81,8 @@ class TeKernels {
   // (c / block) * block_stride + c % block.
   enum class GateMul { kSilu, kSigmoid };
   void record_gate_mul(VkCommandBuffer cb, GateMul op, VkDeviceAddress a, std::uint32_t lda, VkDeviceAddress b,
-                       std::uint32_t ldb, VkDeviceAddress out, std::uint32_t ldo, std::uint32_t rows, std::uint32_t cols,
-                       std::uint32_t block, std::uint32_t block_stride) const;
+                       std::uint32_t ldb, VkDeviceAddress out, std::uint32_t ldo, std::uint32_t rows,
+                       std::uint32_t cols, std::uint32_t block, std::uint32_t block_stride) const;
 
  private:
   std::unique_ptr<Pipeline> norm_, norm_gated_, conv_, gates_, gdn_qk_, gdn_chunk_, gdn_solve_, gdn_state_, attention_,

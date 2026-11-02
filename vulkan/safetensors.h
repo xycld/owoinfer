@@ -27,7 +27,7 @@ class File {
   const std::string& path() const { return path_; }
   const std::vector<TensorInfo>& tensors() const { return tensors_; }
   const TensorInfo* find(const std::string& name) const;  // null if absent
-  const TensorInfo& at(const std::string& name) const;     // throws if absent
+  const TensorInfo& at(const std::string& name) const;    // throws if absent
 
   // `bytes` bytes of tensor `t` from byte `rel` of it into `dst`.
   void read(const TensorInfo& t, void* dst, std::uint64_t rel, std::uint64_t bytes) const;

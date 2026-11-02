@@ -1,5 +1,5 @@
-// Reader for NumPy .npy files (format versions 1-3): little-endian, C-order arrays of fixed-size numeric dtypes. A copy of
-// the engine's util/npy, header-only and without its helpers, for the checks that compare against golden data.
+// Reader for NumPy .npy files (format versions 1-3): little-endian, C-order arrays of fixed-size numeric dtypes. A copy
+// of the engine's util/npy, header-only and without its helpers, for the checks that compare against golden data.
 #pragma once
 
 #include <charconv>
@@ -33,7 +33,10 @@ struct Array {
   template <typename T>
   std::vector<T> to_vector() const {
     static_assert(std::is_arithmetic_v<T>);
-    constexpr char kind = std::is_same_v<T, bool> ? 'b' : std::is_floating_point_v<T> ? 'f' : std::is_signed_v<T> ? 'i' : 'u';
+    constexpr char kind = std::is_same_v<T, bool>       ? 'b'
+                          : std::is_floating_point_v<T> ? 'f'
+                          : std::is_signed_v<T>         ? 'i'
+                                                        : 'u';
     if (dtype != kind + std::to_string(sizeof(T))) {
       throw std::runtime_error("npy: array of dtype " + dtype + " read as " + kind + std::to_string(sizeof(T)));
     }
@@ -130,7 +133,8 @@ inline Array load(const std::filesystem::path& path) {
   std::size_t pos = 0;
   while (pos < shape.size()) {
     const std::size_t next = shape.find(',', pos);
-    const std::string_view item = shape.substr(pos, next == std::string_view::npos ? std::string_view::npos : next - pos);
+    const std::string_view item =
+        shape.substr(pos, next == std::string_view::npos ? std::string_view::npos : next - pos);
     const std::size_t first = item.find_first_not_of(' ');
     if (first != std::string_view::npos) {
       const std::size_t last = item.find_last_not_of(' ');
@@ -151,7 +155,8 @@ inline Array load(const std::filesystem::path& path) {
   }
   if (bytes > file_size - static_cast<std::uint64_t>(in.tellg())) fail(path, "truncated data");
   arr.data.resize(static_cast<std::size_t>(bytes));
-  if (!in.read(reinterpret_cast<char*>(arr.data.data()), static_cast<std::streamsize>(bytes))) fail(path, "truncated data");
+  if (!in.read(reinterpret_cast<char*>(arr.data.data()), static_cast<std::streamsize>(bytes)))
+    fail(path, "truncated data");
   return arr;
 }
 

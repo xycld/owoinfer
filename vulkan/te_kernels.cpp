@@ -119,7 +119,8 @@ GdnWorkspace GdnWorkspace::at(VkDeviceAddress base, std::uint32_t tokens) {
   const auto align = [](std::uint64_t v) { return (v + 255) & ~std::uint64_t{255}; };
   const std::uint64_t t = tokens;
   const std::uint64_t key = align(kGdnKeyHeads * t * kGdnHeadDim * 4), per_head = align(kGdnValueHeads * t * 4),
-                      chunk = align(kGdnValueHeads * t * kGdnChunk * 4), value = align(kGdnValueHeads * t * kGdnHeadDim * 4);
+                      chunk = align(kGdnValueHeads * t * kGdnChunk * 4),
+                      value = align(kGdnValueHeads * t * kGdnHeadDim * 4);
   GdnWorkspace ws{};
   ws.qn = base;
   ws.kn = ws.qn + key;
@@ -158,9 +159,22 @@ void TeKernels::record_rms_norm(VkCommandBuffer cb, const RmsNormArgs& a) const 
   if (a.tokens == 0) return;
   const std::uint64_t rows = static_cast<std::uint64_t>(a.tokens) * a.heads;
   const float factor = static_cast<float>(rows) / static_cast<float>(rows * a.d);
-  const NormPush push{a.x,   a.weight, a.gated ? a.gate : 0, a.out,  a.gated ? 0 : a.rope, a.ldx,
-                      a.hsx, a.ldo,    a.hso,                a.ldg,  a.hsg,                a.rope_ld,
-                      a.d,   torch_reduce_threads(rows, a.d), factor, a.eps};
+  const NormPush push{a.x,
+                      a.weight,
+                      a.gated ? a.gate : 0,
+                      a.out,
+                      a.gated ? 0 : a.rope,
+                      a.ldx,
+                      a.hsx,
+                      a.ldo,
+                      a.hso,
+                      a.ldg,
+                      a.hsg,
+                      a.rope_ld,
+                      a.d,
+                      torch_reduce_threads(rows, a.d),
+                      factor,
+                      a.eps};
   (a.gated ? norm_gated_ : norm_)->dispatch(cb, &push, a.heads, a.tokens);
   compute_barrier(cb);
 }
@@ -175,7 +189,8 @@ void TeKernels::record_conv_silu(VkCommandBuffer cb, VkDeviceAddress x, std::uin
 }
 
 void TeKernels::record_gates(VkCommandBuffer cb, VkDeviceAddress ba, std::uint32_t ldba, VkDeviceAddress a_log,
-                             VkDeviceAddress dt_bias, VkDeviceAddress g, VkDeviceAddress beta, std::uint32_t tokens) const {
+                             VkDeviceAddress dt_bias, VkDeviceAddress g, VkDeviceAddress beta,
+                             std::uint32_t tokens) const {
   require(ldba % 2 == 0, "gates: the stride must be even");
   if (tokens == 0) return;
   const GatesPush push{ba, a_log, dt_bias, g, beta, ldba, tokens};
@@ -199,7 +214,8 @@ void TeKernels::record_gated_delta_rule(VkCommandBuffer cb, const GdnArgs& a) co
     }
   };
   for_each([&](std::uint32_t row0, std::uint32_t len, std::uint32_t chunks) {
-    const GdnChunkPush push{a.ws.qn, a.ws.kn, a.g, a.beta, a.ws.gcum, a.ws.eg, a.ws.el, a.ws.a, a.ws.attn, tokens, row0, len};
+    const GdnChunkPush push{a.ws.qn, a.ws.kn, a.g,       a.beta, a.ws.gcum, a.ws.eg,
+                            a.ws.el, a.ws.a,  a.ws.attn, tokens, row0,      len};
     gdn_chunk_->dispatch(cb, &push, chunks, kGdnValueHeads);
   });
   compute_barrier(cb);
@@ -209,7 +225,8 @@ void TeKernels::record_gated_delta_rule(VkCommandBuffer cb, const GdnArgs& a) co
   });
   compute_barrier(cb);
   for_each([&](std::uint32_t row0, std::uint32_t len, std::uint32_t) {
-    const GdnStatePush push{a.ws.qn, a.ws.kn, a.ws.gcum, a.ws.eg, a.ws.el, a.ws.attn, a.ws.u, a.ws.w, a.out, tokens, row0, len};
+    const GdnStatePush push{a.ws.qn, a.ws.kn, a.ws.gcum, a.ws.eg, a.ws.el, a.ws.attn,
+                            a.ws.u,  a.ws.w,  a.out,     tokens,  row0,    len};
     gdn_state_->dispatch(cb, &push, kGdnHeadDim / 16, kGdnValueHeads);
   });
   compute_barrier(cb);
@@ -219,11 +236,13 @@ void TeKernels::record_attention(VkCommandBuffer cb, const TeAttentionArgs& a) c
   require(a.ldq % 4 == 0 && a.ldk % 4 == 0 && a.ldv % 4 == 0 && a.ldo % 4 == 0 && a.hsq % 4 == 0 && a.hsk % 4 == 0 &&
               a.hsv % 4 == 0 && a.hso % 4 == 0,
           "attention: strides must be multiples of 4");
-  require(a.group >= 1 && a.heads % a.group == 0 && a.rows <= kMaxGroups, "attention: bad head grouping or too many rows");
+  require(a.group >= 1 && a.heads % a.group == 0 && a.rows <= kMaxGroups,
+          "attention: bad head grouping or too many rows");
   if (a.rows == 0) return;
   // In double then rounded, as FlashAttention (float * M_LOG2E).
   const float log2_scale = static_cast<float>(static_cast<double>(a.scale) * 1.4426950408889634074);
-  const AttentionPush push{a.q, a.k, a.v, a.o, a.ldq, a.ldk, a.ldv, a.ldo, a.hsq, a.hsk, a.hsv, a.hso, a.q_first, a.group, log2_scale};
+  const AttentionPush push{a.q,   a.k,   a.v,   a.o,   a.ldq,     a.ldk,   a.ldv,     a.ldo,
+                           a.hsq, a.hsk, a.hsv, a.hso, a.q_first, a.group, log2_scale};
   attention_->dispatch(cb, &push, a.heads, a.rows);
   compute_barrier(cb);
 }

@@ -26,25 +26,26 @@ double seconds_since(Clock::time_point t0) { return std::chrono::duration<double
 
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("vulkan text encoder: " + what); }
 
-constexpr std::uint32_t kQkvDim = 2 * kTeHeads * kTeHeadDim + 2 * kTeKvHeads * kTeHeadDim;  // [q|gate per head] k v: 10240
-constexpr std::uint32_t kQgDim = 2 * kTeHeads * kTeHeadDim;                                  // 8192
-constexpr std::uint32_t kKvDim = kTeKvHeads * kTeHeadDim;                                    // 1024
-constexpr std::uint32_t kValueDim = kGdnValueHeads * kGdnHeadDim;                            // 4096
-constexpr std::uint32_t kQkvzDim = kGdnConvDim + kValueDim;                                  // 12288
-constexpr std::uint32_t kGateUpDim = 2 * kTeIntermediate;                                    // 24576
+constexpr std::uint32_t kQkvDim =
+    2 * kTeHeads * kTeHeadDim + 2 * kTeKvHeads * kTeHeadDim;       // [q|gate per head] k v: 10240
+constexpr std::uint32_t kQgDim = 2 * kTeHeads * kTeHeadDim;        // 8192
+constexpr std::uint32_t kKvDim = kTeKvHeads * kTeHeadDim;          // 1024
+constexpr std::uint32_t kValueDim = kGdnValueHeads * kGdnHeadDim;  // 4096
+constexpr std::uint32_t kQkvzDim = kGdnConvDim + kValueDim;        // 12288
+constexpr std::uint32_t kGateUpDim = 2 * kTeIntermediate;          // 24576
 constexpr std::uint32_t kRopeDim = 64;
 constexpr std::uint32_t kMaxTokens = 65535;
 
 std::uint64_t align256(std::uint64_t v) { return (v + 255) & ~std::uint64_t{255}; }
 
-// Qwen3_5TextRotaryEmbedding inv_freq for rotary dim 64, theta 1e7, as torch computes it on the CPU (kernels/basic/rope.h).
+// Qwen3_5TextRotaryEmbedding inv_freq for rotary dim 64, theta 1e7, as torch's CPU computes it (kernels/basic/rope.h).
 constexpr std::uint32_t kRopeInvFreqBits[32] = {
     0x3f800000, 0x3f1ab32b, 0x3ebaf81b, 0x3e61f835, 0x3e088d77, 0x3da50956, 0x3d47763f, 0x3cf11177,
     0x3c91ad39, 0x3c301052, 0x3bd4ca15, 0x3b80967d, 0x3b1b690d, 0x3abbd3ed, 0x3a6301e2, 0x3a092e02,
     0x39a5cb60, 0x394860c1, 0x38f22ce2, 0x3892587e, 0x3830df52, 0x37d5c441, 0x37812dab, 0x371c1fc4,
     0x36bcb0c1, 0x36640cc6, 0x3609cf4a, 0x35a68e4c, 0x35494c57, 0x34f3499d, 0x3493048e, 0x3431af44};
 
-// Rows [cos(32) | sin(32)] of positions 0 .. len - 1: fp32 phase = position * inv_freq, then cos and sin rounded to bf16.
+// Rows [cos(32) | sin(32)] of positions 0 .. len - 1: fp32 phase = position * inv_freq, cos and sin rounded to bf16.
 std::vector<std::uint16_t> rope_table(std::uint32_t len) {
   std::vector<std::uint16_t> out(static_cast<std::size_t>(len) * kRopeDim);
   for (std::uint32_t p = 0; p < len; ++p) {
@@ -198,7 +199,8 @@ struct TextEncoder::Impl {
                                                                   const std::vector<std::int64_t>& shape) const {
     const auto it = tensors.find(name);
     if (it == tensors.end()) fail("no tensor " + name);
-    if (it->second.second->dtype != "BF16" || it->second.second->shape != shape) fail("tensor " + name + " has an unexpected dtype or shape");
+    if (it->second.second->dtype != "BF16" || it->second.second->shape != shape)
+      fail("tensor " + name + " has an unexpected dtype or shape");
     return it->second;
   }
 
@@ -206,7 +208,7 @@ struct TextEncoder::Impl {
     LayerPlan l;
     l.full_attention = i % 4 == 3;
     const std::string p = "language_model.layers." + std::to_string(i) + ".";
-    // Tensors in one group are placed back to back; their sizes are multiples of 256 bytes, so the alignment adds no gap.
+    // Tensors of one group are placed back to back: their sizes are multiples of 256 bytes, so alignment adds no gap.
     const auto add = [&](const std::string& name, const std::vector<std::int64_t>& shape) {
       const auto& [file, t] = lookup(p + name, shape);
       if (t->bytes % 256 != 0 && shape.size() == 2) fail("tensor " + t->name + " is not a multiple of 256 bytes");
@@ -248,10 +250,11 @@ struct TextEncoder::Impl {
     return gflop * 1e9;
   }
 
-  std::vector<std::vector<std::uint16_t>> encode(const std::vector<std::vector<std::int32_t>>& seqs, const TeLayerHook& hook);
+  std::vector<std::vector<std::uint16_t>> encode(const std::vector<std::vector<std::int32_t>>& seqs,
+                                                 const TeLayerHook& hook);
 
-  // A layer's tensors into `dst` at their offsets, in chunks of 16 MiB that `reader_threads` threads take in turn: several
-  // reads in flight are what a cold NVMe drive needs to reach its speed.
+  // A layer's tensors into `dst` at their offsets, in chunks of 16 MiB that `reader_threads` threads take in turn:
+  // several reads in flight are what a cold NVMe drive needs to reach its speed.
   void read_layer(const LayerPlan& l, std::byte* dst) const {
     constexpr std::uint64_t kChunk = std::uint64_t{16} << 20;
     struct Chunk {
@@ -260,7 +263,8 @@ struct TextEncoder::Impl {
     };
     std::vector<Chunk> chunks;
     for (const Piece& p : l.pieces) {
-      for (std::uint64_t rel = 0; rel < p.tensor->bytes; rel += kChunk) chunks.push_back({&p, rel, std::min(kChunk, p.tensor->bytes - rel)});
+      for (std::uint64_t rel = 0; rel < p.tensor->bytes; rel += kChunk)
+        chunks.push_back({&p, rel, std::min(kChunk, p.tensor->bytes - rel)});
     }
     std::atomic<std::size_t> next{0};
     std::vector<std::exception_ptr> errors(static_cast<std::size_t>(std::max(1, options.reader_threads)));
@@ -311,9 +315,11 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
   for (const auto& s : seqs) {
     if (s.empty()) throw std::invalid_argument("vulkan text encoder: empty sequence");
     for (const std::int32_t id : s) {
-      if (id < 0 || id >= kTeVocab) throw std::invalid_argument("vulkan text encoder: token id " + std::to_string(id) + " outside the vocabulary");
+      if (id < 0 || id >= kTeVocab)
+        throw std::invalid_argument("vulkan text encoder: token id " + std::to_string(id) + " outside the vocabulary");
     }
-    if (static_cast<std::uint64_t>(cu.back()) + s.size() > kMaxTokens) throw std::invalid_argument("vulkan text encoder: more than 65535 tokens");
+    if (static_cast<std::uint64_t>(cu.back()) + s.size() > kMaxTokens)
+      throw std::invalid_argument("vulkan text encoder: more than 65535 tokens");
     cu.push_back(cu.back() + static_cast<std::int32_t>(s.size()));
     max_len = std::max(max_len, static_cast<std::uint32_t>(s.size()));
   }
@@ -412,17 +418,19 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
       if (rows >= 128) rows -= rows % 128;
       return rows;
     };
-    const auto linear = [&](const char* name, VkDeviceAddress out, std::uint32_t ldo, VkDeviceAddress in, std::uint32_t ldi, VkDeviceAddress w,
-                          std::uint32_t n, std::uint32_t k) {
+    const auto linear = [&](const char* name, VkDeviceAddress out, std::uint32_t ldo, VkDeviceAddress in,
+                            std::uint32_t ldi, VkDeviceAddress w, std::uint32_t n, std::uint32_t k) {
       const std::uint32_t step = rows_per_piece(n, k);
       for (std::uint32_t m0 = 0; m0 < T; m0 += step) {
         const std::uint32_t m = std::min(step, T - m0);
         sub.add(name, 2.0 * m * n * k, [=, this](VkCommandBuffer cb) {
-          gemm.record_gemm(cb, bf(out, std::uint64_t{m0} * ldo), ldo, bf(in, std::uint64_t{m0} * ldi), ldi, w, k, m, n, k);
+          gemm.record_gemm(cb, bf(out, std::uint64_t{m0} * ldo), ldo, bf(in, std::uint64_t{m0} * ldi), ldi, w, k, m, n,
+                           k);
         });
       }
     };
-    const auto linear_residual = [&](const char* name, VkDeviceAddress in, std::uint32_t ldi, VkDeviceAddress w, std::uint32_t k) {
+    const auto linear_residual = [&](const char* name, VkDeviceAddress in, std::uint32_t ldi, VkDeviceAddress w,
+                                     std::uint32_t k) {
       const std::uint32_t step = rows_per_piece(kTeHidden, k);
       for (std::uint32_t m0 = 0; m0 < T; m0 += step) {
         const std::uint32_t m = std::min(step, T - m0);
@@ -464,7 +472,8 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
     };
     // Layer j's staging -> device copy, on the transfer queue where there is one.
     const auto copy = [&](int j) {
-      in_flight.push_back(device.copy_async(*staging[j % 2], 0, *weights[j % 2], 0, layers[static_cast<std::size_t>(j)].bytes));
+      in_flight.push_back(
+          device.copy_async(*staging[j % 2], 0, *weights[j % 2], 0, layers[static_cast<std::size_t>(j)].bytes));
       return in_flight.back();
     };
     // Blocks until layer j's copy is done, then hands its staging slot back to the reader.
@@ -546,8 +555,8 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
         });
         linear_residual("gemm o+residual", attn, kTeHidden, W(l.o), kTeHidden);
       } else {
-        const VkDeviceAddress qkvz = sa + gs.qkvz, ba = sa + gs.ba, conv = sa + gs.conv, g = sa + gs.g, beta = sa + gs.beta,
-                              core = sa + gs.core;
+        const VkDeviceAddress qkvz = sa + gs.qkvz, ba = sa + gs.ba, conv = sa + gs.conv, g = sa + gs.g,
+                              beta = sa + gs.beta, core = sa + gs.core;
         linear("gemm qkv|z", qkvz, kQkvzDim, ha, kTeHidden, W(l.qkvz), kQkvzDim, kTeHidden);
         linear("gemm b|a", ba, 64, ha, kTeHidden, W(l.ba), 64, kTeHidden);
         for_each_sequence([&](std::uint32_t s0, std::uint32_t len) {
@@ -564,7 +573,7 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
         ga.out = core;
         ga.ws = GdnWorkspace::at(sa + gs.ws, T);
         ga.cu = cu;
-        // Per token and value head: the chunk products (2 x 64 x 128), the solve (256 x 64) and the scan (about 6 x 128 x 128).
+        // A rough count per token and value head of the chunk products, the solve and the scan; only sizes the submits.
         const double gdn_flop = 2.0 * T * kGdnValueHeads * (2.0 * 64 * 128 * 2 + 256.0 * 64 + 6.0 * 128 * 128);
         sub.add("gates+gated delta rule", gdn_flop, [=, this](VkCommandBuffer cb) {
           te.record_gates(cb, ba, 64, W(l.a_log), W(l.dt_bias), g, beta, T);
@@ -583,7 +592,8 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
           a.heads = kGdnValueHeads;
           a.d = kGdnHeadDim;
           a.gated = true;
-          sub.add("gated rms_norm", 12.0 * len * kValueDim, [=, this](VkCommandBuffer cb) { te.record_rms_norm(cb, a); });
+          sub.add("gated rms_norm", 12.0 * len * kValueDim,
+                  [=, this](VkCommandBuffer cb) { te.record_rms_norm(cb, a); });
         });
         linear_residual("gemm out+residual", core, kValueDim, W(l.gdn_out), kValueDim);
       }
@@ -607,7 +617,8 @@ std::vector<std::vector<std::uint16_t>> TextEncoder::Impl::encode(const std::vec
     std::vector<std::uint16_t> out(static_cast<std::size_t>(T) * kTeHidden);
     h.download(out.data(), out.size() * 2);
     for (std::size_t i = 0; i + 1 < cu.size(); ++i) {
-      result.emplace_back(out.begin() + std::ptrdiff_t{cu[i]} * kTeHidden, out.begin() + std::ptrdiff_t{cu[i + 1]} * kTeHidden);
+      result.emplace_back(out.begin() + std::ptrdiff_t{cu[i]} * kTeHidden,
+                          out.begin() + std::ptrdiff_t{cu[i + 1]} * kTeHidden);
     }
   } catch (...) {
     stop_reader();

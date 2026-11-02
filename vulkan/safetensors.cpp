@@ -135,11 +135,21 @@ class Parser {
         if (i_ >= s_.size()) break;
         const char e = s_[i_++];
         switch (e) {
-          case 'n': c = '\n'; break;
-          case 't': c = '\t'; break;
-          case 'r': c = '\r'; break;
-          case 'b': c = '\b'; break;
-          case 'f': c = '\f'; break;
+          case 'n':
+            c = '\n';
+            break;
+          case 't':
+            c = '\t';
+            break;
+          case 'r':
+            c = '\r';
+            break;
+          case 'b':
+            c = '\b';
+            break;
+          case 'f':
+            c = '\f';
+            break;
           case 'u': {
             // Names here are ASCII; other code points are kept as UTF-8 of the BMP value.
             if (i_ + 4 > s_.size()) fail("bad \\u escape");
@@ -157,7 +167,9 @@ class Parser {
             }
             continue;
           }
-          default: c = e; break;
+          default:
+            c = e;
+            break;
         }
       }
       out += c;

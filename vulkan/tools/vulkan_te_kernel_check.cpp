@@ -1,8 +1,8 @@
-// Checks the text encoder's kernels (te_kernels.h) against host replays of their op order, on small shapes with tails and
-// several sequences, and the gated delta rule also against an fp64 token-by-token recurrence. `same` is the share of
-// outputs with the replay's bits; ULPs are bf16 ULPs of max(|replay|, floor), fp32 ULPs for fp32 outputs. The replays use
-// the host's exp, sqrt and division, which differ from the device's in the last bits of fp32. Exit status: 0 passed, 1
-// failed. Usage: vulkan_te_kernel_check [--device N]
+// Checks the text encoder's kernels (te_kernels.h) against host replays of their op order, on small shapes with tails
+// and several sequences, and the gated delta rule also against an fp64 token-by-token recurrence. `same` is the share
+// of outputs with the replay's bits; ULPs are bf16 ULPs of max(|replay|, floor), fp32 ULPs for fp32 outputs. The
+// replays use the host's exp, sqrt and division, which differ from the device's in the last bits of fp32. Exit status:
+// 0 passed, 1 failed. Usage: vulkan_te_kernel_check [--device N]
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -106,8 +106,8 @@ bool report_f32(const char* name, const std::vector<float>& got, const std::vect
   }
   const double same_pct = 100.0 * static_cast<double>(same) / static_cast<double>(got.size());
   const bool ok = nans == 0 && worst <= max_ulps;
-  std::printf("  %-26s %s (%zu values, %.3f %% same; worst %.2f fp32 ULPs, limit %.1f; %zu NaN)\n", name, ok ? "ok" : "FAILED",
-              got.size(), same_pct, worst, max_ulps, nans);
+  std::printf("  %-26s %s (%zu values, %.3f %% same; worst %.2f fp32 ULPs, limit %.1f; %zu NaN)\n", name,
+              ok ? "ok" : "FAILED", got.size(), same_pct, worst, max_ulps, nans);
   return ok;
 }
 
@@ -146,9 +146,9 @@ float host_inv_rms(const bits* row, int d, int bw, float factor, float eps) {
 }
 
 // x and out [tokens][heads] rows at (t * ld + h * hs); the replay of te_rms_norm.
-std::vector<bits> replay_norm(const std::vector<bits>& x, int ldx, int hsx, const std::vector<bits>& w, const std::vector<bits>* gate,
-                              int ldg, int hsg, const std::vector<bits>* table, std::vector<bits> out, int ldo, int hso,
-                              int tokens, int heads, int d) {
+std::vector<bits> replay_norm(const std::vector<bits>& x, int ldx, int hsx, const std::vector<bits>& w,
+                              const std::vector<bits>* gate, int ldg, int hsg, const std::vector<bits>* table,
+                              std::vector<bits> out, int ldo, int hso, int tokens, int heads, int d) {
   const std::uint64_t rows = static_cast<std::uint64_t>(tokens) * heads;
   const int bw = static_cast<int>(torch_reduce_threads(rows, static_cast<std::uint32_t>(d)));
   const float factor = static_cast<float>(rows) / static_cast<float>(rows * d);
@@ -201,8 +201,9 @@ bool check_norms(Device& device, const TeKernels& k) {
     a.tokens = static_cast<std::uint32_t>(tokens);
     a.d = d;
     device.run([&](VkCommandBuffer cb) { k.record_rms_norm(cb, a); });
-    std::vector<bits> want = replay_norm(x_h, ld, 0, w_h, nullptr, 0, 0, nullptr,
-                                         std::vector<bits>(static_cast<std::size_t>(tokens) * ld, 0x7fc0), ld, 0, tokens, 1, d);
+    std::vector<bits> want =
+        replay_norm(x_h, ld, 0, w_h, nullptr, 0, 0, nullptr,
+                    std::vector<bits>(static_cast<std::size_t>(tokens) * ld, 0x7fc0), ld, 0, tokens, 1, d);
     std::vector<bits> got = read<bits>(*out, want.size());
     // Compare the rows only, not the stride's padding (which must stay untouched: NaN both sides).
     std::vector<bits> g2, w2;
@@ -232,7 +233,8 @@ bool check_norms(Device& device, const TeKernels& k) {
       }
     }
     auto qkv = device_buffer(device, qkv_h), qwb = device_buffer(device, qw), kwb = device_buffer(device, kw),
-         table = device_buffer(device, table_h), q = device_buffer(device, std::vector<bits>(static_cast<std::size_t>(tokens) * heads * d));
+         table = device_buffer(device, table_h),
+         q = device_buffer(device, std::vector<bits>(static_cast<std::size_t>(tokens) * heads * d));
     RmsNormArgs qa;
     qa.x = qkv->address();
     qa.ldx = ld;
@@ -255,8 +257,9 @@ bool check_norms(Device& device, const TeKernels& k) {
       k.record_rms_norm(cb, qa);
       k.record_rms_norm(cb, ka);
     });
-    const auto q_want = replay_norm(qkv_h, ld, 2 * d, qw, nullptr, 0, 0, &table_h,
-                                    std::vector<bits>(static_cast<std::size_t>(tokens) * heads * d), heads * d, d, tokens, heads, d);
+    const auto q_want =
+        replay_norm(qkv_h, ld, 2 * d, qw, nullptr, 0, 0, &table_h,
+                    std::vector<bits>(static_cast<std::size_t>(tokens) * heads * d), heads * d, d, tokens, heads, d);
     std::vector<bits> k_in(qkv_h.begin() + 2 * heads * d, qkv_h.end());
     k_in.resize(qkv_h.size());
     const auto k_want = replay_norm(k_in, ld, d, kw, nullptr, 0, 0, &table_h, k_in, ld, d, tokens, kv_heads, d);
@@ -267,9 +270,11 @@ bool check_norms(Device& device, const TeKernels& k) {
         k_got.push_back(qkv_got[static_cast<std::size_t>(t) * ld + 2 * heads * d + c]);
         k_ref.push_back(k_want[static_cast<std::size_t>(t) * ld + c]);
       }
-      for (int c = 0; c < 2 * heads * d; ++c) ok = ok && qkv_got[static_cast<std::size_t>(t) * ld + c] == qkv_h[static_cast<std::size_t>(t) * ld + c];
+      for (int c = 0; c < 2 * heads * d; ++c)
+        ok = ok && qkv_got[static_cast<std::size_t>(t) * ld + c] == qkv_h[static_cast<std::size_t>(t) * ld + c];
     }
-    const std::string qn = "q norm+rope, " + std::to_string(tokens) + " tokens", kn = "k norm+rope in place, " + std::to_string(tokens);
+    const std::string qn = "q norm+rope, " + std::to_string(tokens) + " tokens",
+                      kn = "k norm+rope in place, " + std::to_string(tokens);
     ok = report(qn.c_str(), read<bits>(*q, q_want.size()), widen(q_want), {1.0, 0.0}) && ok;
     ok = report(kn.c_str(), k_got, widen(k_ref), {1.0, 0.0}) && ok;
   }
@@ -277,8 +282,8 @@ bool check_norms(Device& device, const TeKernels& k) {
   // The gated norm in place over 128-wide heads, the gate in another buffer's rows.
   {
     constexpr int tokens = 7, heads = 5, d = 128, ld = heads * d, ldg = 3 * ld;
-    const auto x_h = synth_bf16(300, static_cast<std::size_t>(tokens) * ld, 0), g_h = synth_bf16(301, static_cast<std::size_t>(tokens) * ldg, 1),
-               w_h = synth_bf16(302, d, 0);
+    const auto x_h = synth_bf16(300, static_cast<std::size_t>(tokens) * ld, 0),
+               g_h = synth_bf16(301, static_cast<std::size_t>(tokens) * ldg, 1), w_h = synth_bf16(302, d, 0);
     auto x = device_buffer(device, x_h), g = device_buffer(device, g_h), w = device_buffer(device, w_h);
     RmsNormArgs a;
     a.x = a.out = x->address();
@@ -309,7 +314,8 @@ bool check_conv_gates(Device& device, const TeKernels& k) {
   constexpr int ch = kGdnConvDim, ldx = ch + 4096, ldy = ch;
   int total = 0;
   for (const int l : lengths) total += l;
-  const auto x_h = synth_bf16(400, static_cast<std::size_t>(total) * ldx, 1), w_h = synth_bf16(401, static_cast<std::size_t>(ch) * 4, -1);
+  const auto x_h = synth_bf16(400, static_cast<std::size_t>(total) * ldx, 1),
+             w_h = synth_bf16(401, static_cast<std::size_t>(ch) * 4, -1);
   auto x = device_buffer(device, x_h), w = device_buffer(device, w_h),
        y = device_buffer(device, std::vector<bits>(static_cast<std::size_t>(total) * ldy));
   std::vector<double> want(static_cast<std::size_t>(total) * ldy);
@@ -317,8 +323,8 @@ bool check_conv_gates(Device& device, const TeKernels& k) {
   for (const int len : lengths) {
     const int start = s0;
     device.run([&](VkCommandBuffer cb) {
-      k.record_conv_silu(cb, x->address() + 2ull * start * ldx, ldx, w->address(), y->address() + 2ull * start * ldy, ldy,
-                         static_cast<std::uint32_t>(len));
+      k.record_conv_silu(cb, x->address() + 2ull * start * ldx, ldx, w->address(), y->address() + 2ull * start * ldy,
+                         ldy, static_cast<std::uint32_t>(len));
     });
     for (int t = 0; t < len; ++t) {
       for (int c = 0; c < ch; ++c) {
@@ -326,7 +332,8 @@ bool check_conv_gates(Device& device, const TeKernels& k) {
         for (int kk = 0; kk < 4; ++kk) {
           const int src = t - 3 + kk;
           if (src < 0) continue;
-          acc = std::fma(from_bf16(w_h[static_cast<std::size_t>(c) * 4 + kk]), from_bf16(x_h[static_cast<std::size_t>(start + src) * ldx + c]), acc);
+          acc = std::fma(from_bf16(w_h[static_cast<std::size_t>(c) * 4 + kk]),
+                         from_bf16(x_h[static_cast<std::size_t>(start + src) * ldx + c]), acc);
         }
         want[static_cast<std::size_t>(start + t) * ldy + c] = from_bf16(to_bf16(silu(rbf(acc))));
       }
@@ -342,12 +349,15 @@ bool check_conv_gates(Device& device, const TeKernels& k) {
                dt_h = synth_bf16(412, 32, 2);
     auto ba = device_buffer(device, ba_h), alog = device_buffer(device, alog_h), dt = device_buffer(device, dt_h);
     Buffer g(device, tokens * 32 * 4), beta(device, tokens * 32 * 2);
-    device.run([&](VkCommandBuffer cb) { k.record_gates(cb, ba->address(), ld, alog->address(), dt->address(), g.address(), beta.address(), tokens); });
+    device.run([&](VkCommandBuffer cb) {
+      k.record_gates(cb, ba->address(), ld, alog->address(), dt->address(), g.address(), beta.address(), tokens);
+    });
     std::vector<float> g_want(tokens * 32);
     std::vector<double> beta_want(tokens * 32);
     for (int t = 0; t < tokens; ++t) {
       for (int h = 0; h < 32; ++h) {
-        const float b = from_bf16(ba_h[static_cast<std::size_t>(t) * ld + h]), a = from_bf16(ba_h[static_cast<std::size_t>(t) * ld + 32 + h]);
+        const float b = from_bf16(ba_h[static_cast<std::size_t>(t) * ld + h]),
+                    a = from_bf16(ba_h[static_cast<std::size_t>(t) * ld + 32 + h]);
         beta_want[static_cast<std::size_t>(t) * 32 + h] = rbf(sigmoid(b));
         const float xx = a + from_bf16(dt_h[static_cast<std::size_t>(h)]);
         const float sp = xx > 20.0f ? xx : std::log1p(std::exp(xx));
@@ -362,32 +372,36 @@ bool check_conv_gates(Device& device, const TeKernels& k) {
   {
     constexpr int rows = 9, cols = 520, ld = 2 * cols + 8;
     const auto gu_h = synth_bf16(420, static_cast<std::size_t>(rows) * ld, 1);
-    auto gu = device_buffer(device, gu_h), out = device_buffer(device, std::vector<bits>(static_cast<std::size_t>(rows) * cols));
+    auto gu = device_buffer(device, gu_h),
+         out = device_buffer(device, std::vector<bits>(static_cast<std::size_t>(rows) * cols));
     device.run([&](VkCommandBuffer cb) {
-      k.record_gate_mul(cb, TeKernels::GateMul::kSilu, gu->address(), ld, gu->address() + 2ull * cols, ld, out->address(), cols, rows,
-                        cols, cols, 0);
+      k.record_gate_mul(cb, TeKernels::GateMul::kSilu, gu->address(), ld, gu->address() + 2ull * cols, ld,
+                        out->address(), cols, rows, cols, cols, 0);
     });
     std::vector<double> want(static_cast<std::size_t>(rows) * cols);
     for (int r = 0; r < rows; ++r) {
       for (int c = 0; c < cols; ++c) {
-        const float g = from_bf16(gu_h[static_cast<std::size_t>(r) * ld + c]), u = from_bf16(gu_h[static_cast<std::size_t>(r) * ld + cols + c]);
+        const float g = from_bf16(gu_h[static_cast<std::size_t>(r) * ld + c]),
+                    u = from_bf16(gu_h[static_cast<std::size_t>(r) * ld + cols + c]);
         want[static_cast<std::size_t>(r) * cols + c] = rbf(rbf(silu(g)) * u);
       }
     }
     ok = report("silu_mul", read<bits>(*out, want.size()), want, {1.0, 0.0}) && ok;
 
     constexpr int heads = 3, hd = 256, ldq = 2 * heads * hd + 16, lda = heads * hd;
-    const auto qg_h = synth_bf16(421, static_cast<std::size_t>(rows) * ldq, 2), a_h = synth_bf16(422, static_cast<std::size_t>(rows) * lda, 0);
+    const auto qg_h = synth_bf16(421, static_cast<std::size_t>(rows) * ldq, 2),
+               a_h = synth_bf16(422, static_cast<std::size_t>(rows) * lda, 0);
     auto qg = device_buffer(device, qg_h), at = device_buffer(device, a_h);
     device.run([&](VkCommandBuffer cb) {
-      k.record_gate_mul(cb, TeKernels::GateMul::kSigmoid, at->address(), lda, qg->address() + 2ull * hd, ldq, at->address(), lda, rows,
-                        lda, hd, 2 * hd);
+      k.record_gate_mul(cb, TeKernels::GateMul::kSigmoid, at->address(), lda, qg->address() + 2ull * hd, ldq,
+                        at->address(), lda, rows, lda, hd, 2 * hd);
     });
     std::vector<double> want2(static_cast<std::size_t>(rows) * lda);
     for (int r = 0; r < rows; ++r) {
       for (int c = 0; c < lda; ++c) {
         const float g = from_bf16(qg_h[static_cast<std::size_t>(r) * ldq + (c / hd) * 2 * hd + hd + c % hd]);
-        want2[static_cast<std::size_t>(r) * lda + c] = rbf(from_bf16(a_h[static_cast<std::size_t>(r) * lda + c]) * rbf(sigmoid(g)));
+        want2[static_cast<std::size_t>(r) * lda + c] =
+            rbf(from_bf16(a_h[static_cast<std::size_t>(r) * lda + c]) * rbf(sigmoid(g)));
       }
     }
     ok = report("sigmoid_mul in place", read<bits>(*at, want2.size()), want2, {1.0, 0.0}) && ok;
@@ -400,8 +414,8 @@ bool check_conv_gates(Device& device, const TeKernels& k) {
 constexpr int kKeyDim = kGdnKeyHeads * kGdnHeadDim;
 
 // The engine's chunked rule op by op (chunk_rule.cu): bf16 [T, 32, 128] out.
-std::vector<double> replay_gdn(const std::vector<bits>& qkv, int ld, const std::vector<float>& g, const std::vector<bits>& beta,
-                               const std::vector<int>& cu) {
+std::vector<double> replay_gdn(const std::vector<bits>& qkv, int ld, const std::vector<float>& g,
+                               const std::vector<bits>& beta, const std::vector<int>& cu) {
   const int T = cu.back();
   constexpr int D = kGdnHeadDim, C = kGdnChunk;
   std::vector<float> qn(static_cast<std::size_t>(kGdnKeyHeads) * T * D), kn(qn.size());
@@ -420,7 +434,8 @@ std::vector<double> replay_gdn(const std::vector<bits>& qkv, int ld, const std::
         }
         const float inv = 1.0f / std::sqrt(lanes[0] + 1e-6f);
         float* dst = (which == 0 ? qn : kn).data() + (static_cast<std::size_t>(kh) * T + t) * D;
-        for (int d = 0; d < D; ++d) dst[d] = which == 0 ? (from_bf16(x[d]) * inv) * 0.08838834764831845f : from_bf16(x[d]) * inv;
+        for (int d = 0; d < D; ++d)
+          dst[d] = which == 0 ? (from_bf16(x[d]) * inv) * 0.08838834764831845f : from_bf16(x[d]) * inv;
       }
     }
   }
@@ -443,7 +458,8 @@ std::vector<double> replay_gdn(const std::vector<bits>& qkv, int ld, const std::
         }
         for (int i = 0; i < C; ++i) {
           eg[static_cast<std::size_t>(i)] = std::exp(gc[static_cast<std::size_t>(i)]);
-          el[static_cast<std::size_t>(i)] = std::exp(gc[static_cast<std::size_t>(n - 1)] - gc[static_cast<std::size_t>(i)]);
+          el[static_cast<std::size_t>(i)] =
+              std::exp(gc[static_cast<std::size_t>(n - 1)] - gc[static_cast<std::size_t>(i)]);
         }
         std::vector<float> a(C * C, 0.0f), attn(C * C, 0.0f);
         for (int i = 0; i < n; ++i) {
@@ -488,7 +504,8 @@ std::vector<double> replay_gdn(const std::vector<bits>& qkv, int ld, const std::
         for (int i = 0; i < n; ++i) {
           for (int c = 0; c < D; ++c) {
             float o = u[static_cast<std::size_t>(i) * D + c];
-            for (int j = 0; j <= i; ++j) o = std::fma(attn[static_cast<std::size_t>(i) * C + j], vn[static_cast<std::size_t>(j) * D + c], o);
+            for (int j = 0; j <= i; ++j)
+              o = std::fma(attn[static_cast<std::size_t>(i) * C + j], vn[static_cast<std::size_t>(j) * D + c], o);
             out[(static_cast<std::size_t>(t0 + i) * 32 + h) * D + c] = o;
           }
         }
@@ -496,7 +513,9 @@ std::vector<double> replay_gdn(const std::vector<bits>& qkv, int ld, const std::
         for (int d = 0; d < D; ++d) {
           for (int c = 0; c < D; ++c) {
             float upd = 0.0f;
-            for (int j = 0; j < n; ++j) upd = std::fma(K(t0 + j, d) * el[static_cast<std::size_t>(j)], vn[static_cast<std::size_t>(j) * D + c], upd);
+            for (int j = 0; j < n; ++j)
+              upd = std::fma(K(t0 + j, d) * el[static_cast<std::size_t>(j)], vn[static_cast<std::size_t>(j) * D + c],
+                             upd);
             S[static_cast<std::size_t>(d) * D + c] = std::fma(S[static_cast<std::size_t>(d) * D + c], cd, upd);
           }
         }
@@ -507,8 +526,8 @@ std::vector<double> replay_gdn(const std::vector<bits>& qkv, int ld, const std::
 }
 
 // torch_recurrent_gated_delta_rule in fp64: the algorithm the chunked form rearranges.
-std::vector<double> recurrent_gdn(const std::vector<bits>& qkv, int ld, const std::vector<float>& g, const std::vector<bits>& beta,
-                                  const std::vector<int>& cu) {
+std::vector<double> recurrent_gdn(const std::vector<bits>& qkv, int ld, const std::vector<float>& g,
+                                  const std::vector<bits>& beta, const std::vector<int>& cu) {
   constexpr int D = kGdnHeadDim;
   std::vector<double> out(static_cast<std::size_t>(cu.back()) * 32 * D);
   for (std::size_t s = 0; s + 1 < cu.size(); ++s) {
@@ -567,7 +586,8 @@ bool check_gdn(Device& device, const TeKernels& k) {
     beta_h[i] = to_bf16(sigmoid(from_bf16(bs[i])));
   }
   auto qkv = device_buffer(device, qkv_h), g = device_buffer(device, g_h), beta = device_buffer(device, beta_h);
-  Buffer out(device, static_cast<std::size_t>(T) * 32 * kGdnHeadDim * 2), ws(device, GdnWorkspace::bytes(static_cast<std::uint32_t>(T)));
+  Buffer out(device, static_cast<std::size_t>(T) * 32 * kGdnHeadDim * 2),
+      ws(device, GdnWorkspace::bytes(static_cast<std::uint32_t>(T)));
   GdnArgs a;
   a.qkv = qkv->address();
   a.ldqkv = ld;
@@ -596,14 +616,16 @@ bool check_gdn(Device& device, const TeKernels& k) {
     worst_replay = std::max(worst_replay, std::sqrt(diff_replay / ref));
   }
   const bool alg_ok = worst < 1e-2;
-  std::printf("  %-26s %s (worst row rel-L2 %.3e vs fp64 recurrence, limit 1e-2; fp32 replay before bf16 rounding %.3e)\n",
-              "gated delta rule algorithm", alg_ok ? "ok" : "FAILED", worst, worst_replay);
+  std::printf(
+      "  %-26s %s (worst row rel-L2 %.3e vs fp64 recurrence, limit 1e-2; fp32 replay before bf16 rounding %.3e)\n",
+      "gated delta rule algorithm", alg_ok ? "ok" : "FAILED", worst, worst_replay);
   return ok && alg_ok;
 }
 
 // ---- attention ----
 
-std::vector<float> replay_attention_row(const bits* q, const bits* k, int ldk, const bits* v, int ldv, int seqlen_k, float scale) {
+std::vector<float> replay_attention_row(const bits* q, const bits* k, int ldk, const bits* v, int ldv, int seqlen_k,
+                                        float scale) {
   constexpr int D = 256, kStep = 32;
   const float log2_scale = static_cast<float>(static_cast<double>(scale) * 1.4426950408889634074);
   std::vector<float> acc(D, 0.0f);
@@ -659,7 +681,8 @@ bool check_attention(Device& device, const TeKernels& k) {
   for (const int l : lengths) cu.push_back(cu.back() + l);
   const auto T = static_cast<std::size_t>(cu.back());
   const auto q_h = synth_bf16(600, T * ldq, 1), kv_h = synth_bf16(601, T * ldkv, 1);
-  auto q = device_buffer(device, q_h), kv = device_buffer(device, kv_h), o = device_buffer(device, std::vector<bits>(T * ldo));
+  auto q = device_buffer(device, q_h), kv = device_buffer(device, kv_h),
+       o = device_buffer(device, std::vector<bits>(T * ldo));
   std::vector<double> want(T * ldo);
   for (std::size_t s = 0; s < lengths.size(); ++s) {
     const int r0 = cu[s], len = lengths[s];
@@ -691,7 +714,8 @@ bool check_attention(Device& device, const TeKernels& k) {
       for (int r = 0; r < len; ++r) {
         const auto row = replay_attention_row(q_h.data() + static_cast<std::size_t>(r0 + r) * ldq + h * D,
                                               kv_h.data() + static_cast<std::size_t>(r0) * ldkv + kvh * D, ldkv,
-                                              kv_h.data() + static_cast<std::size_t>(r0) * ldkv + (kv_heads + kvh) * D, ldkv, r + 1, 0.0625f);
+                                              kv_h.data() + static_cast<std::size_t>(r0) * ldkv + (kv_heads + kvh) * D,
+                                              ldkv, r + 1, 0.0625f);
         std::copy(row.begin(), row.end(), want.begin() + static_cast<std::ptrdiff_t>((r0 + r) * ldo + h * D));
       }
     }
@@ -714,7 +738,8 @@ int main(int argc, char** argv) {
   }
   try {
     Device device(device_index);
-    std::printf("device %u: %s\ntext encoder kernels against host replays:\n", device.info().index, device.info().name.c_str());
+    std::printf("device %u: %s\ntext encoder kernels against host replays:\n", device.info().index,
+                device.info().name.c_str());
     const TeKernels kernels(device);
     bool ok = check_norms(device, kernels);
     ok = check_conv_gates(device, kernels) && ok;
