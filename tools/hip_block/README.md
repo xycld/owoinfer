@@ -7,7 +7,7 @@ One kernel source, `block_kernels.hip`, builds three ways. They differ in the le
 | Target | Compiler | Leaf |
 |---|---|---|
 | `gfx1100` (RDNA3) | ROCm clang | rocWMMA, `v_wmma_f32_16x16x16_bf16` |
-| `gfx1201` (RDNA4) | ROCm clang | rocWMMA, `v_wmma_f32_16x16x16_bf16` |
+| `gfx1200`, `gfx1201` (RDNA4) | ROCm clang | rocWMMA, `v_wmma_f32_16x16x16_bf16` |
 | `nvidia` | nvcc with HIP's NVIDIA headers | scalar: the exact bf16*bf16 product in fp32, then add, K ascending |
 
 All kernels launch workgroups of 32 threads (`dim3(32,1,1)`): one wave on AMD, one warp on NVIDIA. Fragments load straight from global memory. `__shared__` memory holds what must cross lanes: accumulators on their way out and through the softmax's per-row rescale, per-row reductions, the RoPE pairing, and zero-padded copies of tails that end inside a fragment. Tile sizes are the named constants at the top of `block_kernels.hip`. `kAttnStepN` is part of the numerics, as it sets where softmax weights are rounded; 32 is the tile the engine runs on sm_89.
@@ -84,6 +84,51 @@ These rules changed after results were in, in this order:
 4. The flip check above was added after SiTU reached scaled 5 on one value in 7e7 with the block's two-row shape, and the last block's gated residual reached 32 on real activations. Plain scaled <= 4 fails on both.
 5. The fixed block gate failed on real activations at blocks 21 to 41, and SiTU's p99.9 reached 2 at block 41. The real-activation block gate above and SiTU's limit of 2 replaced them. These limits were set after seeing those results.
 6. A second review showed a wrong control passing: with its QKV zeroed, `--real` exited 0 because the limits opened with it. The control's own gates above were added, with the floor of 50 % set after seeing healthy controls at 69.9 % and up and the zeroed one under 5 %. The same review showed an Inf on one side passing the flip-checked rows, which now fail, and a correct `rsqrt` able to fail the bench's known answer, which raised two ULP limits from 1 to 3.
+
+## First run on an AMD card
+
+An RX 9060 XT (gfx1200, 32 CUs, 16 GB of GDDR6 on a 128-bit bus, 4 MB L2, 32 MB L3) with ROCm 7.16 and rocWMMA 2.2.1, on a Ryzen 5 3500 host. Synthetic activations, one session, so these times are a first reading rather than a benchmark.
+
+The known-answer check passes on the first run: fragment load and store order, `__shared__` memory and barriers do what the kernels assume on this chip.
+
+| Kernel | Same | Worst ULPs | Limit |
+|---|---|---|---|
+| rms_norm_modulate | 100 % | 0.00 | 3 |
+| qk_norm_rope | 100 % | 0.12 | 3 |
+| gemm | 100 % | 0.50 | 1 |
+| gemm_gated_residual | 100 % | 0.50 | 1 |
+| gemm_situ_glu | 100 % | 0.50 | 1.5 |
+| attention | 99.995 % | 0.50 | 1 |
+
+One whole block at E13's 8484 tokens gives no NaN in 26062848 values. Its outputs have not been compared with the engine's: the known answers are small shapes against host replays.
+
+It is slow. One block takes 415 ms (min of 10, median 449 ms) against the engine's 31.3 ms on an RTX 4090 Laptop (E13), so a 42-block step would take about 17 s against 1.33 s.
+
+| Op | Min ms | GFLOP | TFLOPS |
+|---|---|---|---|
+| norm1 + norm2 + qk_norm_rope | 2.0 | | |
+| qkv gemm | 77.0 | 480 | 6.2 |
+| attention | 97.6 | | |
+| o gemm + gated | 18.1 | 160 | 8.8 |
+| up_gate gemm + SiTU | 149.5 | 854 | 5.7 |
+| down gemm + gated | 67.3 | 427 | 6.3 |
+
+The limit is reading the operands, not WMMA. Separate tests of a 16x16x16 walk, with every accumulator stored:
+
+| Test | TFLOPS |
+|---|---|
+| Paper peak: 32 CUs x 1024 FLOP per clock x 3.46 GHz | about 113 |
+| WMMA on registers, tiles 1x1 to 4x4 fragments | 54 to 96 |
+| 48x64 tile, QKV's work wrapped onto 0.7 MB of operands (fits L2) | 32.7 |
+| The same, 6.7 MB, then 13.6 MB | 31.4, 17.2 |
+| The same, 27 MB, 54 MB, then QKV's full 108 MB | 11.0, 10.6, 9.6 |
+| Best tile at the QKV shape without spills, 48x64 | 8.2 |
+| 32x48, as these kernels are built | 6.3 |
+
+- At 32x48 the walk reads about 330 GB/s, which is about what I expect from this bus (20 Gbps assumed, about 320 GB/s). The operands are far larger than L2 and L3, so almost nothing is reused. Larger tiles lower the bytes per FLOP, but past 48x64 they gain nothing, and 64x96 and 96x64 spill.
+- Even in cache the rate stops at about 32 TFLOPS, a third of the rate on registers, so fragment loading has its own limit, not yet explained.
+- K panels did not help as tried. Splitting K into panels that fit in cache, accumulators through memory between them, is bit-identical to the unblocked walk (0 of 77856768 values) and no faster: 8.1, 8.0, 6.3, 7.3, 4.6 and 2.7 TFLOPS at panels of 3072 down to 96.
+- Not tried: 8-bit WMMA, which reads half the bytes per multiply; fragments shared through `__shared__` memory by several waves; `swmmac`'s K of 32; packed operands; tuning attention's tile.
 
 ## Verified
 
@@ -176,13 +221,13 @@ The bench's known-answer check does not catch chaining mutants: all six exit 0, 
 
 ## Not verified
 
-No AMD device has run any of this:
+Only gfx1200 has run this, in the session above; gfx1100 and gfx1201 have only been compiled.
 
-- WMMA's execution, its accumulation rounding, and whether its results are within a few ULPs of the engine's.
-- rocWMMA's fragment load and store order on silicon. An independent review checked its lane and K mapping on a CPU emulation derived from rocWMMA's own layouts, which shows the kernels agree with rocWMMA and not that rocWMMA agrees with silicon. The known-answer check tests this on a card.
-- `__shared__` memory and `__syncthreads` behaviour in a 32-thread workgroup on AMD, `exp2f`, `expf`, `tanhf` and `rsqrt` accuracy in AMD's device libraries, and how they compare with the NVIDIA ones.
-- Any time or rate on AMD. The tile constants are untuned, fragment loads compile to flat loads, `__syncthreads` emits a cache invalidate in single-wave kernels (`global_inv` on gfx1201, `buffer_gl0_inv` on gfx1100), and attention moves its output accumulators through `__shared__` memory on every key step.
-- Whether the known-answer limits suit a card: they come from the scalar leaf and a model of math-library flips.
+- Whether WMMA's results at full shapes are within a few ULPs of the engine's. The known answers are small shapes against host replays, and the whole block is only checked for NaNs.
+- rocWMMA's fragment load and store order on RDNA3 and on gfx1201. An independent review checked its lane and K mapping on a CPU emulation derived from rocWMMA's own layouts, and the known-answer check confirms it on gfx1200.
+- `exp2f`, `expf`, `tanhf` and `rsqrt` accuracy in AMD's device libraries beyond the known-answer inputs, where they stayed within the limits on gfx1200.
+- Any time or rate on another AMD chip, and whether the limits above can be lifted. The tile constants are untuned, fragment loads compile to flat loads, `__syncthreads` emits a cache invalidate in single-wave kernels (`global_inv` on gfx1201, `buffer_gl0_inv` on gfx1100), and attention moves its output accumulators through `__shared__` memory on every key step.
+- Whether the known-answer limits suit other cards: they come from the scalar leaf and a model of math-library flips, and gfx1200 passes well inside them.
 - NaN, Inf and denormals through WMMA and AMD's math. The known-answer inputs contain none of these, so a card that flushes denormals passes it and shows nothing about them.
 - The kernels write `__shared__` buffers right after a collective read of them with no barrier between (`mma_leaf.h`). That holds in hardware for one wave and is a data race in LLVM's terms. The scheduled assembly has not been inspected for reordering at these points, and the emulation adds barriers there, so it does not test this.
 - Other `gfx11xx` and `gfx12xx` chips, and Windows.

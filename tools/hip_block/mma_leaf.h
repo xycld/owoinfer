@@ -1,6 +1,6 @@
 // The swappable leaf of every GEMM and of attention: a 16x16x16 bf16 multiply with fp32 accumulators, per wave.
 //
-//   HIP_BLOCK_LEAF_ROCWMMA (AMD gfx1100, gfx1201)  rocWMMA fragments, v_wmma_f32_16x16x16_bf16
+//   HIP_BLOCK_LEAF_ROCWMMA (AMD gfx11xx, gfx12xx)  rocWMMA fragments, v_wmma_f32_16x16x16_bf16
 //   otherwise (NVIDIA verify build)                scalar: the exact bf16*bf16 product in fp32, then add, ascending K
 //
 // rocWMMA does not compile under nvcc, and its fragments' lane layouts are private and differ between RDNA3 and RDNA4.

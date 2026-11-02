@@ -1,14 +1,14 @@
 # Standalone: the engine's CMakeLists.txt does not know this directory. Configure once per target (README.md).
-#   -DHIP_BLOCK_TARGET=gfx1100|gfx1201  rocWMMA leaf, ROCm's clang, links libamdhip64
+#   -DHIP_BLOCK_TARGET=gfx1100|gfx1200|gfx1201  rocWMMA leaf, ROCm's clang, links libamdhip64
 #   -DHIP_BLOCK_TARGET=nvidia           scalar leaf, nvcc with HIP's NVIDIA headers; adds the engine comparison test
 cmake_minimum_required(VERSION 3.28)
 
-set(HIP_BLOCK_TARGET "" CACHE STRING "Device target: gfx1100, gfx1201 or nvidia")
+set(HIP_BLOCK_TARGET "" CACHE STRING "Device target: gfx1100, gfx1200, gfx1201 or nvidia")
 set(ROCM_PATH "$ENV{ROCM_PATH}" CACHE PATH "ROCm root, the directory holding include/hip and lib/llvm")
 option(HIP_BLOCK_WERROR "Treat warnings as errors" ON)
 
-if(NOT HIP_BLOCK_TARGET MATCHES "^(gfx1100|gfx1201|nvidia)$")
-  message(FATAL_ERROR "Set HIP_BLOCK_TARGET to gfx1100, gfx1201 or nvidia (got '${HIP_BLOCK_TARGET}')")
+if(NOT HIP_BLOCK_TARGET MATCHES "^(gfx1100|gfx1200|gfx1201|nvidia)$")
+  message(FATAL_ERROR "Set HIP_BLOCK_TARGET to gfx1100, gfx1200, gfx1201 or nvidia (got '${HIP_BLOCK_TARGET}')")
 endif()
 if(NOT EXISTS "${ROCM_PATH}/include/hip/hip_runtime.h")
   message(FATAL_ERROR "ROCM_PATH (cache variable or environment) must hold include/hip/hip_runtime.h (got '${ROCM_PATH}')")
