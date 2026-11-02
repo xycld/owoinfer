@@ -174,8 +174,8 @@ int main(int argc, char** argv) {
                                        : Gemm(device, GemmPath::kPlain);
 
     // One tile; tails in M, N and K; several bands with a partial last one; the largest row-count tile boundaries.
-    const std::vector<Shape> checks = {{1, 1, 16, 1},       {3, 8, 16, 1},        {64, 64, 64, 1},   {65, 65, 48, 1},
-                                       {67, 136, 1040, 1},  {129, 256, 4096, 1},  {128, 640, 64, 1}, {94, 643, 64, 1},
+    const std::vector<Shape> checks = {{1, 4, 16, 1},       {3, 8, 16, 1},        {64, 64, 64, 1},   {65, 68, 48, 1},
+                                       {67, 136, 1040, 1},  {129, 256, 4096, 1},  {128, 640, 64, 1}, {94, 644, 64, 1},
                                        {1030, 9216, 64, 1}, {1025, 136, 1040, 1}, {512, 512, 512, 1}};
     bool ok = true;
     for (const Shape& s : checks) ok = check_gemm(device, gemm, s, InputType::kF16) && ok;

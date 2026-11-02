@@ -1,0 +1,63 @@
+// out[rows,d] = bf16(bf16(bf16(bf16(rms_norm(x)) * w) * bf16(1 + scale)) + shift); w, scale, shift: [d]. x and out are
+// bf16 with strides that are multiples of 4, and d is a multiple of 4. One row per workgroup. The fp32 mean of squares is
+// summed in the order of torch's reduce kernel: 32 lanes of 4 running values, then a halving tree.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t x;
+  uint64_t weight;
+  uint64_t scale;
+  uint64_t shift;
+  uint64_t out_;
+  uint ldx;
+  uint ldo;
+  uint d;
+  float factor;
+} pc;
+
+shared float red[32];
+
+// In Vulkan GLSL barrier() also makes shared memory available and visible, at workgroup scope. memoryBarrierShared() would
+// add device scope, which needs a feature this shader otherwise has no use for.
+void sync_shared() { barrier(); }
+
+void main() {
+  const uint t = gl_LocalInvocationIndex;
+  const uint64_t row = gl_WorkGroupID.x;
+  Words X = Words(pc.x + row * pc.ldx * 2ul);
+  const uint groups = pc.d / 4u;
+
+  precise vec4 acc = vec4(0.0);
+  for (uint g = t; g < groups; g += 32u) {
+    const vec4 v = f4(X.d[g]);
+    acc = acc + v * v;
+  }
+  precise const float total = acc.x + acc.y + acc.z + acc.w;
+  red[t] = total;
+  sync_shared();
+  for (uint off = 16u; off > 0u; off >>= 1) {
+    if (t < off) {
+      precise const float sum = red[t] + red[t + off];
+      red[t] = sum;
+    }
+    sync_shared();
+  }
+  precise const float mean = red[0] * pc.factor;
+  precise const float mean_eps = mean + 1e-6;
+  const float r = inversesqrt(mean_eps);
+
+  Words O = Words(pc.out_ + row * pc.ldo * 2ul);
+  Words W = Words(pc.weight), S = Words(pc.scale), H = Words(pc.shift);
+  for (uint g = t; g < groups; g += 32u) {
+    precise const vec4 normed = f4(X.d[g]) * r;
+    precise const vec4 y = rbf4(normed) * f4(W.d[g]);
+    precise const vec4 one_plus = 1.0 + f4(S.d[g]);
+    precise const vec4 scaled = rbf4(y) * rbf4(one_plus);
+    precise const vec4 shifted = rbf4(scaled) + f4(H.d[g]);
+    O.d[g] = bf4(shifted);
+  }
+}

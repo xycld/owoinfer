@@ -14,12 +14,16 @@ const std::uint32_t kPlainSpirv[] = {
 };
 
 constexpr std::uint32_t kCoopTile = 64;
-constexpr std::uint32_t kPlainTile = 8;
+constexpr std::uint32_t kPlainTileRows = 8, kPlainTileCols = 32;
 constexpr std::uint32_t kCoopSubgroup = 32;
 
 struct Push {
   std::uint64_t a, b, c;
   std::uint32_t m, n, k, lda, ldb, ldc;
+};
+struct PlainPush {
+  std::uint64_t a, b, out, gate;
+  std::uint32_t m, n, k, lda, ldb, ldo;
 };
 
 void require(bool condition, const std::string& message) {
@@ -42,10 +46,10 @@ Gemm::Gemm(Device& device, GemmPath path) : path_(path) {
     }
     coop_ = std::make_unique<Pipeline>(device, kCoopSpirv, sizeof(kCoopSpirv), sizeof(Push), kCoopSubgroup);
   } else {
-    plain_f16_ = std::make_unique<Pipeline>(device, kPlainSpirv, sizeof(kPlainSpirv), sizeof(Push), 0,
-                                            std::vector<std::uint32_t>{0});
-    plain_bf16_ = std::make_unique<Pipeline>(device, kPlainSpirv, sizeof(kPlainSpirv), sizeof(Push), 0,
-                                             std::vector<std::uint32_t>{1});
+    plain_f16_ = std::make_unique<Pipeline>(device, kPlainSpirv, sizeof(kPlainSpirv), sizeof(PlainPush), 0,
+                                            std::vector<std::uint32_t>{0, 0});
+    plain_bf16_ = std::make_unique<Pipeline>(device, kPlainSpirv, sizeof(kPlainSpirv), sizeof(PlainPush), 0,
+                                             std::vector<std::uint32_t>{1, 0});
   }
 }
 
@@ -62,14 +66,17 @@ void Gemm::record(VkCommandBuffer cb, const GemmArgs& args, InputType input) con
   require((args.n - 1ull) * args.ldb + args.k <= args.b->bytes() / 2, "B is too small");
   require((args.m - 1ull) * args.ldc + args.n <= args.c->bytes() / 4, "C is too small");
   require(path_ == GemmPath::kPlain || input == InputType::kF16, "the cooperative-matrix path takes f16 inputs");
+  require(path_ == GemmPath::kCoop || args.n % 4 == 0, "the plain path needs N to be a multiple of 4");
 
-  const Push push{args.a->address(), args.b->address(), args.c->address(), args.m, args.n, args.k, args.lda, args.ldb,
-                  args.ldc};
   if (path_ == GemmPath::kCoop) {
+    const Push push{args.a->address(), args.b->address(), args.c->address(), args.m, args.n, args.k, args.lda, args.ldb,
+                    args.ldc};
     coop_->dispatch(cb, &push, tiles(args.n, kCoopTile), tiles(args.m, kCoopTile));
   } else {
+    const PlainPush push{args.a->address(), args.b->address(), args.c->address(), 0, args.m, args.n, args.k, args.lda,
+                         args.ldb, args.ldc};
     const Pipeline& pipeline = input == InputType::kBF16 ? *plain_bf16_ : *plain_f16_;
-    pipeline.dispatch(cb, &push, tiles(args.n, kPlainTile), tiles(args.m, kPlainTile));
+    pipeline.dispatch(cb, &push, tiles(args.n, kPlainTileCols), tiles(args.m, kPlainTileRows));
   }
   compute_barrier(cb);
 }

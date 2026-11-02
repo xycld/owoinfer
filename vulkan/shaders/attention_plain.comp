@@ -1,0 +1,135 @@
+// Scaled-dot-product attention over one sequence, head_dim 128, non-causal, bf16 in and out, fp32 online softmax. One query
+// row of one head per workgroup, 32 lanes. Key tokens walk from the last step of 32 down to step 0, as FlashAttention's
+// reverse iteration:
+//   S = q * K_step^T
+//   row_max, row_sum and acc_o rescaled to the new maximum
+//   P = bf16(exp2(S * log2_scale - max * log2_scale)), row_sum += P before rounding
+//   acc_o += P * V_step^T
+// and at the end out = bf16(acc_o / row_sum). Lane c owns key c of each step for S and P, and dims 4c..4c+3 for acc_o.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t q;
+  uint64_t k;
+  uint64_t v;
+  uint64_t o;
+  uint ldq;
+  uint ldk;
+  uint ldv;
+  uint ldo;
+  uint hsq;
+  uint hsk;
+  uint hsv;
+  uint hso;
+  uint q_row0;
+  uint k_row0;
+  uint seqlen_k;
+  float log2_scale;
+} pc;
+
+const uint STEP = 32u;
+
+shared vec4 q_shared[32];
+shared float s_shared[STEP];
+shared float w_shared[STEP];
+shared float p_shared[STEP];
+shared float max_scaled_shared;
+shared float rescale_shared;
+shared float inv_sum_shared;
+
+// In Vulkan GLSL barrier() also makes shared memory available and visible, at workgroup scope. memoryBarrierShared() would
+// add device scope, which needs a feature this shader otherwise has no use for.
+void sync_shared() { barrier(); }
+
+void main() {
+  const uint lane = gl_LocalInvocationIndex;
+  const uint head = gl_WorkGroupID.x;
+  const uint64_t q_row = uint64_t(pc.q_row0) + gl_WorkGroupID.y;
+  const uint64_t k_row0 = pc.k_row0;
+
+  q_shared[lane] = f4(Words(pc.q + (q_row * pc.ldq + uint64_t(head) * pc.hsq) * 2ul).d[lane]);
+  sync_shared();
+
+  const uint64_t k_head = pc.k + (k_row0 * pc.ldk + uint64_t(head) * pc.hsk) * 2ul;
+  const uint64_t v_head = pc.v + (k_row0 * pc.ldv + uint64_t(head) * pc.hsv) * 2ul;
+  const uint64_t ldk_bytes = uint64_t(pc.ldk) * 2ul, ldv_bytes = uint64_t(pc.ldv) * 2ul;
+
+  precise vec4 acc = vec4(0.0);
+  float row_max = 0.0, row_sum = 0.0;  // lane 0's
+  const uint steps = (pc.seqlen_k + STEP - 1u) / STEP;
+  for (uint step_plus_1 = steps; step_plus_1 > 0u; --step_plus_1) {
+    const uint step_index = step_plus_1 - 1u;
+    const bool first = step_plus_1 == steps;
+    const uint n0 = step_index * STEP;
+    const uint cols = min(STEP, pc.seqlen_k - n0);
+
+    if (lane < cols) {
+      Words key = Words(k_head + uint64_t(n0 + lane) * ldk_bytes);
+      precise float s = 0.0;
+      for (uint g = 0u; g < 32u; ++g) {
+        const vec4 q4 = q_shared[g];
+        const vec4 k4 = f4(key.d[g]);
+        s = s + q4.x * k4.x;
+        s = s + q4.y * k4.y;
+        s = s + q4.z * k4.z;
+        s = s + q4.w * k4.w;
+      }
+      s_shared[lane] = s;
+    }
+    sync_shared();
+
+    if (lane == 0u) {
+      const float prev = row_max;
+      float cur = first ? s_shared[0] : max(prev, s_shared[0]);
+      for (uint c = 1u; c < cols; ++c) cur = max(cur, s_shared[c]);
+      row_max = cur;
+      if (first) {
+        rescale_shared = 1.0;
+        row_sum = 0.0;
+      } else {
+        precise const float diff = (prev - cur) * pc.log2_scale;
+        const float rescale = exp2(diff);
+        rescale_shared = rescale;
+        precise const float scaled = row_sum * rescale;
+        row_sum = scaled;
+      }
+      precise const float max_scaled = isinf(cur) && cur < 0.0 ? 0.0 : cur * pc.log2_scale;
+      max_scaled_shared = max_scaled;
+    }
+    sync_shared();
+
+    float w = 0.0;
+    if (lane < cols) {
+      // FlashAttention's one fused step; a device without a fused fma rounds it twice, within the bf16 weight's error.
+      w = exp2(fma(s_shared[lane], pc.log2_scale, -max_scaled_shared));
+    }
+    w_shared[lane] = w;
+    p_shared[lane] = uintBitsToFloat(bf(w) << 16);
+    if (!first) {
+      precise const vec4 rescaled = acc * rescale_shared;
+      acc = rescaled;
+    }
+    sync_shared();
+
+    if (lane == 0u) {
+      precise float sum = row_sum;
+      for (uint c = 0u; c < cols; ++c) sum = sum + w_shared[c];
+      row_sum = sum;
+    }
+
+    for (uint c = 0u; c < cols; ++c) {
+      const vec4 v4 = f4(Words(v_head + uint64_t(n0 + c) * ldv_bytes).d[lane]);
+      acc = acc + p_shared[c] * v4;
+    }
+    sync_shared();
+  }
+
+  if (lane == 0u) inv_sum_shared = (row_sum == 0.0 || isnan(row_sum)) ? 1.0 : 1.0 / row_sum;
+  sync_shared();
+  precise const vec4 result = acc * inv_sum_shared;
+  Words(pc.o + (q_row * pc.ldo + uint64_t(head) * pc.hso) * 2ul).d[lane] = bf4(result);
+}
