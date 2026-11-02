@@ -1,0 +1,178 @@
+// out[M,N] = A[M,K] * B[N,K]^T on bf16 cooperative matrices with fp32 accumulators: the DiT's linears on devices with
+// VK_KHR_shader_bfloat16 fragments. A and B are row-major bf16; lda, ldb and ldo are multiples of 8, and N and K are
+// multiples of 8. M is free. MODE, as in gemm_plain.comp:
+//   0: out is f32
+//   1: out is bf16
+//   2: out[m,n] += bf16(bf16(ab) * gate[n]), gated residual, bf16 in place
+//   3: out[m,n] = situ(bf16(A * B[n]), bf16(A * B[N + n])), SiTU-GLU over the stored [hidden | gate] weight, bf16
+//
+// One workgroup per 128x128 tile of the product: 256 invocations, 8 full subgroups of 32, which the pipeline must require.
+// Subgroup s owns rows 32 (s % 4) .. +32 and the columns 32 (s / 4) .. +32 of each half of the tile, so in MODE 3, where the
+// first half holds 64 hidden columns and the second the same 64 gate columns, each subgroup owns both factors of its
+// outputs. K walks in steps of 32 through two shared-memory stages: the next step's tiles load into registers while the
+// current one multiplies. Rows of the stages are padded to 80 bytes, so 8 rows of 16 bytes fall in distinct banks.
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const int MODE = 1;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Vec4s { uvec4 d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t a;
+  uint64_t b;
+  uint64_t out_;
+  uint64_t gate;
+  uint M;
+  uint N;
+  uint K;
+  uint lda;
+  uint ldb;
+  uint ldo;
+} pc;
+
+const uint BM = 128u;
+const uint BN = 128u;        // rows of B per tile; MODE 3 covers BN / 2 output columns
+const uint BK = 32u;
+const uint ROW = 5u;         // uvec4 per staged row: 4 of data, 1 of padding
+const uint STAGE = BM * ROW; // uvec4 per staged operand
+const uint BAND = 8u;        // output tiles walk bands of N tiles, so a band of B stays in cache while every M tile passes
+const uint STAGING = 64u;    // uvec4 per 16x16 fp32 fragment in the epilogue
+
+// Stage s of A at s * 2 * STAGE, of B at (s * 2 + 1) * STAGE. The epilogue reuses the start: 2 fragments per subgroup.
+shared uvec4 smem[4u * STAGE];
+
+#define FRAG_A coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define FRAG_B coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+uint b_row(uint n_base, uint r) {
+  if (MODE != 3) return n_base + r;
+  return r < BN / 2u ? n_base + r : pc.N + n_base + (r - BN / 2u);
+}
+bool b_valid(uint n_base, uint r) { return (MODE == 3 ? n_base + r % (BN / 2u) : n_base + r) < pc.N; }
+
+// Invocation i loads chunk i % 4 of rows i / 4 and i / 4 + 64 of the A and B tiles at k0.
+void load_tiles(uint m_base, uint n_base, uint k0, out uvec4 ra[2], out uvec4 rb[2]) {
+  const uint i = gl_LocalInvocationIndex;
+  const uint chunk = i % 4u;
+  const uint k = k0 + chunk * 8u;
+  const bool k_ok = k < pc.K;
+  [[unroll]] for (uint h = 0u; h < 2u; ++h) {
+    const uint r = i / 4u + h * 64u;
+    const uint m = m_base + r;
+    ra[h] = uvec4(0u);
+    if (k_ok && m < pc.M) ra[h] = Vec4s(pc.a + (uint64_t(m) * pc.lda + k) * 2ul).d[0];
+    rb[h] = uvec4(0u);
+    if (k_ok && b_valid(n_base, r)) rb[h] = Vec4s(pc.b + (uint64_t(b_row(n_base, r)) * pc.ldb + k) * 2ul).d[0];
+  }
+}
+
+void store_tiles(uint stage, const uvec4 ra[2], const uvec4 rb[2]) {
+  const uint i = gl_LocalInvocationIndex;
+  [[unroll]] for (uint h = 0u; h < 2u; ++h) {
+    const uint at = (i / 4u + h * 64u) * ROW + i % 4u;
+    smem[stage * 2u * STAGE + at] = ra[h];
+    smem[(stage * 2u + 1u) * STAGE + at] = rb[h];
+  }
+}
+
+// Within a subgroup only: the staging fragments are private to it.
+void sync_subgroup() {
+  subgroupMemoryBarrierShared();
+  subgroupBarrier();
+}
+
+vec4 staged(uint base, uint row, uint col4) { return uintBitsToFloat(smem[base + row * 4u + col4]); }
+
+void main() {
+  const uint num_m = (pc.M + BM - 1u) / BM;
+  const uint cols_per_tile = MODE == 3 ? BN / 2u : BN;
+  const uint num_n = (pc.N + cols_per_tile - 1u) / cols_per_tile;
+  const uint id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  const uint per_band = num_m * BAND;
+  const uint band = id / per_band;
+  const uint pos = id - band * per_band;
+  const uint width = min(BAND, num_n - band * BAND);
+  const uint m_base = (pos / width) * BM;
+  const uint n_base = (band * BAND + pos % width) * cols_per_tile;
+
+  const uint sg = gl_SubgroupID;
+  const uint row0 = (sg % 4u) * 32u;
+  const uint col0 = (sg / 4u) * 32u;
+
+  ACC acc[2][4];
+  [[unroll]] for (uint r = 0u; r < 2u; ++r) {
+    [[unroll]] for (uint c = 0u; c < 4u; ++c) acc[r][c] = ACC(0.0);
+  }
+
+  const uint steps = (pc.K + BK - 1u) / BK;
+  uvec4 ra[2], rb[2];
+  load_tiles(m_base, n_base, 0u, ra, rb);
+  store_tiles(0u, ra, rb);
+  barrier();
+  for (uint step = 0u; step < steps; ++step) {
+    const bool more = step + 1u < steps;
+    if (more) load_tiles(m_base, n_base, (step + 1u) * BK, ra, rb);
+    const uint a_base = (step & 1u) * 2u * STAGE, b_base = a_base + STAGE;
+    [[unroll]] for (uint kk = 0u; kk < BK / 16u; ++kk) {
+      FRAG_A fa[2];
+      FRAG_B fb[4];
+      [[unroll]] for (uint r = 0u; r < 2u; ++r) {
+        coopMatLoad(fa[r], smem, a_base + (row0 + r * 16u) * ROW + kk * 2u, ROW, gl_CooperativeMatrixLayoutRowMajor);
+      }
+      [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+        const uint col = (c / 2u) * (BN / 2u) + col0 + (c % 2u) * 16u;
+        coopMatLoad(fb[c], smem, b_base + col * ROW + kk * 2u, ROW, gl_CooperativeMatrixLayoutColumnMajor);
+      }
+      [[unroll]] for (uint r = 0u; r < 2u; ++r) {
+        [[unroll]] for (uint c = 0u; c < 4u; ++c) acc[r][c] = coopMatMulAdd(fa[r], fb[c], acc[r][c]);
+      }
+    }
+    if (more) store_tiles((step + 1u) & 1u, ra, rb);
+    barrier();
+  }
+
+  // Epilogue: each 16x16 fragment goes through the subgroup's staging, then lane l writes 8 outputs of row l / 2.
+  const uint base0 = sg * 2u * STAGING, base1 = base0 + STAGING;
+  const uint lane = gl_SubgroupInvocationID;
+  const uint frow = lane / 2u, fcol = (lane % 2u) * 8u;
+  [[unroll]] for (uint r = 0u; r < 2u; ++r) {
+    const uint m = m_base + row0 + r * 16u + frow;
+    [[unroll]] for (uint c = 0u; c < (MODE == 3 ? 2u : 4u); ++c) {
+      coopMatStore(acc[r][c], smem, base0, 4u, gl_CooperativeMatrixLayoutRowMajor);
+      if (MODE == 3) coopMatStore(acc[r][c + 2u], smem, base1, 4u, gl_CooperativeMatrixLayoutRowMajor);
+      sync_subgroup();
+      const vec4 lo = staged(base0, frow, fcol / 4u), hi = staged(base0, frow, fcol / 4u + 1u);
+      const uint n = n_base + (MODE == 3 ? 0u : (c / 2u) * (BN / 2u)) + col0 + (c % 2u) * 16u + fcol;
+      if (m < pc.M && n < pc.N) {
+        const uint64_t at = uint64_t(m) * pc.ldo + n;
+        if (MODE == 0) {
+          Vec4s(pc.out_ + at * 4ul).d[0] = floatBitsToUint(lo);
+          Vec4s(pc.out_ + at * 4ul + 16ul).d[0] = floatBitsToUint(hi);
+        } else if (MODE == 1) {
+          Vec4s(pc.out_ + at * 2ul).d[0] = uvec4(bf4(lo), bf4(hi));
+        } else if (MODE == 2) {
+          Vec4s target = Vec4s(pc.out_ + at * 2ul);
+          const uvec4 old = target.d[0];
+          const uvec4 g = Vec4s(pc.gate + uint64_t(n) * 2ul).d[0];
+          precise const vec4 gated_lo = rbf4(lo) * f4(g.xy), gated_hi = rbf4(hi) * f4(g.zw);
+          precise const vec4 sum_lo = f4(old.xy) + rbf4(gated_lo), sum_hi = f4(old.zw) + rbf4(gated_hi);
+          target.d[0] = uvec4(bf4(sum_lo), bf4(sum_hi));
+        } else {
+          const vec4 g_lo = staged(base1, frow, fcol / 4u), g_hi = staged(base1, frow, fcol / 4u + 1u);
+          Vec4s(pc.out_ + at * 2ul).d[0] =
+              uvec4(bf4(situ(rbf4(lo), rbf4(g_lo))), bf4(situ(rbf4(hi), rbf4(g_hi))));
+        }
+      }
+      sync_subgroup();
+    }
+  }
+}

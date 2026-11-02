@@ -1,0 +1,252 @@
+// Scaled-dot-product attention over one sequence on bf16 cooperative matrices: head_dim 128, non-causal, bf16 in and out,
+// fp32 online softmax, the same steps as attention_plain.comp and FlashAttention:
+//   S = q * K_step^T                                            (fragments, fp32 accumulators)
+//   max = max(max, rowmax(S)); rescale = exp2((old max - max) * log2_scale); row_sum *= rescale; acc_o *= rescale
+//   p = exp2(S * log2_scale - max * log2_scale); row_sum += p; P = bf16(p)
+//   acc_o += P * V_step                                         (fragments, fp32 accumulators)
+// and at the end out = bf16(acc_o * (1 / row_sum)). Key steps walk from the last down to the first, as FlashAttention's.
+//
+// One workgroup per 64 query rows of one head: 128 invocations, 4 full subgroups of 32, which the pipeline must require.
+// Subgroup s owns query rows 16 s .. +16; lane l owns row l / 2 and keys or columns of half l % 2 of it. A key step is 32
+// keys, staged in shared memory with the V step. Accumulators have no row access in cooperative matrices, so S and the
+// output pass through the subgroup's staging, and acc_o goes there for a rescale only when a row's maximum grew.
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Vec4s { uvec4 d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t q;
+  uint64_t k;
+  uint64_t v;
+  uint64_t o;
+  uint ldq;
+  uint ldk;
+  uint ldv;
+  uint ldo;
+  uint hsq;
+  uint hsk;
+  uint hsv;
+  uint hso;
+  uint q_row0;
+  uint k_row0;
+  uint seqlen_q;
+  uint seqlen_k;
+  float log2_scale;
+} pc;
+
+const uint D = 128u;
+const uint ROWS = 64u;      // query rows per workgroup
+const uint STEP = 32u;      // keys per step
+const uint KV_ROW = 17u;    // uvec4 per staged K or V row: 16 of data, 1 of padding
+const uint S_ROW = 9u;      // uvec4 per staging row: 32 floats and 4 of padding
+const uint P_ROW = 5u;      // uvec4 per P row: 32 bf16 and 8 of padding
+const uint SK = 0u;
+const uint SV = SK + STEP * KV_ROW;
+const uint SS = SV + STEP * KV_ROW;
+const uint SP = SS + 4u * 16u * S_ROW;
+const uint TOTAL = SP + 4u * 16u * P_ROW;
+
+// Q is staged once through the K and V region before the first step: 64 rows of 17 uvec4 fit in 2 * 32 rows.
+shared uvec4 smem[TOTAL];
+
+#define FRAG_A coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define FRAG_B coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+void sync_subgroup() {
+  subgroupMemoryBarrierShared();
+  subgroupBarrier();
+}
+
+// Invocation i loads chunks i % 16 of rows i / 16 + 8 j, j = 0..3, of the K and V steps at key n0.
+void load_kv(uint64_t k_head, uint64_t v_head, uint n0, uint cols, out uvec4 rk[4], out uvec4 rv[4]) {
+  const uint i = gl_LocalInvocationIndex;
+  [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+    const uint r = i / 16u + 8u * j;
+    rk[j] = uvec4(0u);
+    rv[j] = uvec4(0u);
+    if (r < cols) {
+      rk[j] = Vec4s(k_head + (uint64_t(n0 + r) * pc.ldk) * 2ul).d[i % 16u];
+      rv[j] = Vec4s(v_head + (uint64_t(n0 + r) * pc.ldv) * 2ul).d[i % 16u];
+    }
+  }
+}
+
+void store_kv(const uvec4 rk[4], const uvec4 rv[4]) {
+  const uint i = gl_LocalInvocationIndex;
+  [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+    const uint at = (i / 16u + 8u * j) * KV_ROW + i % 16u;
+    smem[SK + at] = rk[j];
+    smem[SV + at] = rv[j];
+  }
+}
+
+void main() {
+  const uint head = gl_WorkGroupID.x;
+  const uint q_first = gl_WorkGroupID.y * ROWS;
+  const uint sg = gl_SubgroupID;
+  const uint lane = gl_SubgroupInvocationID;
+  const uint frow = lane / 2u, half_ = lane % 2u;
+  const uint i = gl_LocalInvocationIndex;
+
+  // Q rows q_first .. +64 through the K and V region, zero past the sequence.
+  [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+    const uint r = i / 16u + 8u * j;
+    uvec4 v = uvec4(0u);
+    if (q_first + r < pc.seqlen_q) {
+      const uint64_t row = uint64_t(pc.q_row0 + q_first + r);
+      v = Vec4s(pc.q + (row * pc.ldq + uint64_t(head) * pc.hsq) * 2ul).d[i % 16u];
+    }
+    smem[SK + r * KV_ROW + i % 16u] = v;
+  }
+  barrier();
+  FRAG_A fq[8];
+  [[unroll]] for (uint d = 0u; d < 8u; ++d) {
+    coopMatLoad(fq[d], smem, SK + sg * 16u * KV_ROW + d * 2u, KV_ROW, gl_CooperativeMatrixLayoutRowMajor);
+  }
+  barrier();
+
+  const uint64_t k_head = pc.k + (uint64_t(pc.k_row0) * pc.ldk + uint64_t(head) * pc.hsk) * 2ul;
+  const uint64_t v_head = pc.v + (uint64_t(pc.k_row0) * pc.ldv + uint64_t(head) * pc.hsv) * 2ul;
+  const uint steps = (pc.seqlen_k + STEP - 1u) / STEP;
+
+  ACC acc[8];
+  [[unroll]] for (uint d = 0u; d < 8u; ++d) acc[d] = ACC(0.0);
+  float row_max = 0.0, row_sum = 0.0;  // of row frow, the same in both lanes of the row
+
+  const uint ss = SS + sg * 16u * S_ROW, sp = SP + sg * 16u * P_ROW;
+  uvec4 rk[4], rv[4];
+  load_kv(k_head, v_head, (steps - 1u) * STEP, pc.seqlen_k - (steps - 1u) * STEP, rk, rv);
+  store_kv(rk, rv);
+  barrier();
+
+  for (uint step_plus_1 = steps; step_plus_1 > 0u; --step_plus_1) {
+    const uint step_index = step_plus_1 - 1u;
+    const bool first = step_plus_1 == steps;
+    const uint n0 = step_index * STEP;
+    const uint cols = min(STEP, pc.seqlen_k - n0);
+    if (step_index > 0u) load_kv(k_head, v_head, n0 - STEP, STEP, rk, rv);
+
+    // S = q K^T: 16 rows by 32 keys.
+    ACC s[2];
+    [[unroll]] for (uint c = 0u; c < 2u; ++c) {
+      s[c] = ACC(0.0);
+      [[unroll]] for (uint d = 0u; d < 8u; ++d) {
+        FRAG_B fk;
+        coopMatLoad(fk, smem, SK + c * 16u * KV_ROW + d * 2u, KV_ROW, gl_CooperativeMatrixLayoutColumnMajor);
+        s[c] = coopMatMulAdd(fq[d], fk, s[c]);
+      }
+      coopMatStore(s[c], smem, ss + c * 4u, S_ROW, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    sync_subgroup();
+
+    // Lane: row frow, keys 16 half_ .. +16.
+    float sv[16];
+    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+      const vec4 v4 = uintBitsToFloat(smem[ss + frow * S_ROW + half_ * 4u + j]);
+      sv[4u * j] = v4.x;
+      sv[4u * j + 1u] = v4.y;
+      sv[4u * j + 2u] = v4.z;
+      sv[4u * j + 3u] = v4.w;
+    }
+    float cur = first ? -1.0 / 0.0 : row_max;
+    [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+      if (16u * half_ + j < cols) cur = max(cur, sv[j]);
+    }
+    cur = max(cur, subgroupShuffleXor(cur, 1u));
+    float rescale = 1.0;
+    if (!first) {
+      precise const float diff = (row_max - cur) * pc.log2_scale;
+      rescale = exp2(diff);
+      precise const float scaled = row_sum * rescale;
+      row_sum = scaled;
+    }
+    row_max = cur;
+    precise const float max_scaled = isinf(cur) && cur < 0.0 ? 0.0 : cur * pc.log2_scale;
+    precise float part = 0.0;
+    uint p_bits[8];
+    [[unroll]] for (uint j = 0u; j < 8u; ++j) p_bits[j] = 0u;
+    [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+      float w = 0.0;
+      if (16u * half_ + j < cols) w = exp2(fma(sv[j], pc.log2_scale, -max_scaled));
+      part = part + w;
+      p_bits[j / 2u] |= bf(w) << (16u * (j % 2u));
+    }
+    precise const float total = row_sum + (part + subgroupShuffleXor(part, 1u));
+    row_sum = first ? part + subgroupShuffleXor(part, 1u) : total;
+    smem[sp + frow * P_ROW + half_ * 2u] = uvec4(p_bits[0], p_bits[1], p_bits[2], p_bits[3]);
+    smem[sp + frow * P_ROW + half_ * 2u + 1u] = uvec4(p_bits[4], p_bits[5], p_bits[6], p_bits[7]);
+
+    // acc_o *= rescale, through the staging two fragments at a time, when some row's maximum grew.
+    if (subgroupAny(rescale != 1.0)) {
+      [[unroll]] for (uint pair = 0u; pair < 4u; ++pair) {
+        coopMatStore(acc[2u * pair], smem, ss, S_ROW, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc[2u * pair + 1u], smem, ss + 4u, S_ROW, gl_CooperativeMatrixLayoutRowMajor);
+        sync_subgroup();
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+          const uint at = ss + frow * S_ROW + half_ * 4u + j;
+          precise const vec4 scaled = uintBitsToFloat(smem[at]) * rescale;
+          smem[at] = floatBitsToUint(scaled);
+        }
+        sync_subgroup();
+        coopMatLoad(acc[2u * pair], smem, ss, S_ROW, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(acc[2u * pair + 1u], smem, ss + 4u, S_ROW, gl_CooperativeMatrixLayoutRowMajor);
+        sync_subgroup();
+      }
+    }
+    sync_subgroup();
+
+    // acc_o += P V: P is 16 rows by 32 keys, V 32 keys by 128 columns.
+    FRAG_A fp[2];
+    [[unroll]] for (uint c = 0u; c < 2u; ++c) {
+      coopMatLoad(fp[c], smem, sp + c * 2u, P_ROW, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    [[unroll]] for (uint d = 0u; d < 8u; ++d) {
+      [[unroll]] for (uint c = 0u; c < 2u; ++c) {
+        FRAG_B fv;
+        coopMatLoad(fv, smem, SV + c * 16u * KV_ROW + d * 2u, KV_ROW, gl_CooperativeMatrixLayoutRowMajor);
+        acc[d] = coopMatMulAdd(fp[c], fv, acc[d]);
+      }
+    }
+    barrier();
+    if (step_index > 0u) {
+      store_kv(rk, rv);
+      barrier();
+    }
+  }
+
+  // out = bf16(acc_o * (1 / row_sum)), through the staging two fragments at a time.
+  const float inv_sum = (row_sum == 0.0 || isnan(row_sum)) ? 1.0 : 1.0 / row_sum;
+  const uint q_local = q_first + sg * 16u + frow;
+  const bool write = q_local < pc.seqlen_q;
+  const uint64_t out_row = pc.o + ((uint64_t(pc.q_row0) + q_local) * pc.ldo + uint64_t(head) * pc.hso) * 2ul;
+  [[unroll]] for (uint pair = 0u; pair < 4u; ++pair) {
+    coopMatStore(acc[2u * pair], smem, ss, S_ROW, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc[2u * pair + 1u], smem, ss + 4u, S_ROW, gl_CooperativeMatrixLayoutRowMajor);
+    sync_subgroup();
+    uvec4 packed[2];
+    [[unroll]] for (uint j = 0u; j < 2u; ++j) {
+      precise const vec4 a = uintBitsToFloat(smem[ss + frow * S_ROW + half_ * 4u + 2u * j]) * inv_sum;
+      precise const vec4 b = uintBitsToFloat(smem[ss + frow * S_ROW + half_ * 4u + 2u * j + 1u]) * inv_sum;
+      packed[j] = uvec4(bf4(a), bf4(b));
+    }
+    // Columns 32 pair + 16 half_ .. +16 of this head: two uvec4 of 8 bf16.
+    if (write) {
+      Vec4s out_v = Vec4s(out_row + uint64_t(32u * pair + 16u * half_) * 2ul);
+      out_v.d[0] = packed[0];
+      out_v.d[1] = packed[1];
+    }
+    sync_subgroup();
+  }
+}

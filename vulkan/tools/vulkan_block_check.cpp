@@ -262,8 +262,9 @@ bool check_norms(Device& device, const BlockKernels& kernels) {
   return report("qk_norm_rope", read(*qkv, want.size()), rope_ref, {3.0, 1.0}) && ok;
 }
 
-bool check_gemms(Device& device, const BlockKernels& kernels) {
-  constexpr int m = 37, n = 104, k = 40, f = 24, ld = 3 * k;
+// m, n and k: tails on every axis of both paths' tiles; the larger shape also crosses tiles and bands of tiles.
+bool check_gemms(Device& device, const BlockKernels& kernels, int m, int n, int k, int f) {
+  const int ld = 3 * k;
   const auto x_h = synth_bf16(21, static_cast<std::size_t>(m) * ld, 0), w_h = synth_bf16(22, static_cast<std::size_t>(n) * k, -2),
              gate_h = synth_bf16(23, n, -2), res_h = synth_bf16(24, static_cast<std::size_t>(m) * n, 0);
   auto x = device_buffer(device, x_h), w = device_buffer(device, w_h), gate = device_buffer(device, gate_h),
@@ -282,6 +283,7 @@ bool check_gemms(Device& device, const BlockKernels& kernels) {
       situ[static_cast<std::size_t>(r) * f + c] = host_situ(h, g);
     }
   }
+  std::printf("  GEMMs at M %d, N %d, K %d, SiTU F %d\n", m, n, k, f);
   device.run([&](VkCommandBuffer cb) { kernels.record_gemm(cb, out->address(), n, x->address(), ld, w->address(), k, m, n, k); });
   bool ok = report("gemm", read(*out, plain.size()), plain, {1.0, 1.0 / 64.0});
   out->upload(res_h.data(), res_h.size() * 2);
@@ -374,6 +376,7 @@ bool run_block(Device& device, const BlockKernels& kernels, const std::vector<in
 int main(int argc, char** argv) {
   int device_index = -1, iters = 3;
   bool block = true;
+  std::string path_name;
   std::vector<int> rows = {4378, 4106};
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -381,6 +384,8 @@ int main(int argc, char** argv) {
       device_index = std::atoi(argv[++i]);
     } else if (arg == "--iters" && i + 1 < argc) {
       iters = std::atoi(argv[++i]);
+    } else if (arg == "--path" && i + 1 < argc) {
+      path_name = argv[++i];
     } else if (arg == "--no-block") {
       block = false;
     } else if (arg == "--rows" && i + 1 < argc) {
@@ -389,16 +394,24 @@ int main(int argc, char** argv) {
       std::string item;
       while (std::getline(ss, item, ',')) rows.push_back(std::atoi(item.c_str()));
     } else {
-      std::printf("usage: %s [--device N] [--rows L1,L2,...] [--iters N] [--no-block]\n", argv[0]);
+      std::printf("usage: %s [--device N] [--path coop|plain] [--rows L1,L2,...] [--iters N] [--no-block]\n", argv[0]);
       return 2;
     }
   }
   try {
     Device device(device_index);
     std::printf("device %u: %s\nknown-answer check against host replays:\n", device.info().index, device.info().name.c_str());
-    const BlockKernels kernels(device);
+    if (!path_name.empty() && path_name != "coop" && path_name != "plain") {
+      std::printf("--path takes coop or plain\n");
+      return 2;
+    }
+    const BlockKernels kernels = path_name.empty() ? BlockKernels(device)
+                                                   : BlockKernels(device, path_name == "coop" ? BlockPath::kCoop : BlockPath::kPlain);
+    std::printf("path: %s%s%s\n", block_path_name(kernels.path()), device.info().caps.coop_bf16 ? "" : " (no coop: ",
+                device.info().caps.coop_bf16 ? "" : (device.info().caps.coop_bf16_reason + ")").c_str());
     bool ok = check_norms(device, kernels);
-    ok = check_gemms(device, kernels) && ok;
+    ok = check_gemms(device, kernels, 37, 104, 40, 24) && ok;
+    ok = check_gemms(device, kernels, 300, 1048, 264, 520) && ok;
     ok = check_attention(device, kernels) && ok;
     if (!ok) {
       std::printf("known-answer check FAILED: not timing.\n");

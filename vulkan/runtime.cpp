@@ -10,7 +10,9 @@ namespace {
 // gemm_coop.comp's shared memory: an f16 A and B tile of 64x32, and an f32 output tile of 64x64.
 constexpr std::uint32_t kCoopSharedBytes = 2 * 64 * 32 * 2 + 64 * 64 * 4;
 constexpr std::uint32_t kCoopSubgroup = 32;
-constexpr std::uint32_t kCoopSubgroupsPerWorkgroup = 4;
+constexpr std::uint32_t kCoopSubgroupsPerWorkgroup = 8;
+// The bf16 DiT kernels' largest shared memory: gemm_bf16_coop.comp's two stages of 128x32 A and B tiles, rows padded to 80 B.
+constexpr std::uint32_t kCoopBf16SharedBytes = 4 * 128 * 80;
 
 void check(VkResult result, const char* what) {
   if (result != VK_SUCCESS) throw std::runtime_error(std::string(what) + " failed: VkResult " + std::to_string(result));
@@ -44,8 +46,9 @@ bool has_extension(VkPhysicalDevice physical, const char* name) {
                      [&](const VkExtensionProperties& e) { return std::strcmp(e.extensionName, name) == 0; });
 }
 
-std::string why_no_coop(VkInstance instance, VkPhysicalDevice physical, const VkPhysicalDeviceProperties& properties,
-                        Capabilities& caps) {
+// What both cooperative-matrix paths need: Vulkan 1.3, the extension and feature, 16-bit storage, the memory model, and a
+// compute subgroup size fixable at 32 with 8 per workgroup. Empty when the device has all of it.
+std::string why_no_coop_base(VkPhysicalDevice physical, const VkPhysicalDeviceProperties& properties, Capabilities& caps) {
   if (properties.apiVersion < VK_API_VERSION_1_3) return "needs Vulkan 1.3";
   VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
   VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p13};
@@ -70,27 +73,65 @@ std::string why_no_coop(VkInstance instance, VkPhysicalDevice physical, const Vk
     return "cannot fix the compute subgroup size at 32 (device range " + std::to_string(p13.minSubgroupSize) + "-" +
            std::to_string(p13.maxSubgroupSize) + ")";
   }
-  if (p13.maxComputeWorkgroupSubgroups < kCoopSubgroupsPerWorkgroup) return "needs 4 subgroups per workgroup";
-  if (properties.limits.maxComputeSharedMemorySize < kCoopSharedBytes) {
-    return "needs " + std::to_string(kCoopSharedBytes) + " bytes of shared memory";
-  }
+  if (p13.maxComputeWorkgroupSubgroups < kCoopSubgroupsPerWorkgroup) return "needs 8 subgroups per workgroup";
+  return {};
+}
 
+std::vector<VkCooperativeMatrixPropertiesKHR> coop_shapes(VkInstance instance, VkPhysicalDevice physical) {
   auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
       vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
-  if (query == nullptr) return "no cooperative matrix query";
+  if (query == nullptr) return {};
   std::uint32_t count = 0;
-  if (query(physical, &count, nullptr) != VK_SUCCESS) return "cooperative matrix query failed";
+  if (query(physical, &count, nullptr) != VK_SUCCESS) return {};
   std::vector<VkCooperativeMatrixPropertiesKHR> shapes(count);
   for (auto& s : shapes) s.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
-  if (query(physical, &count, shapes.data()) != VK_SUCCESS) return "cooperative matrix query failed";
-  const bool has_shape = std::any_of(shapes.begin(), shapes.end(), [](const VkCooperativeMatrixPropertiesKHR& s) {
-    return s.MSize == 16 && s.NSize == 16 && s.KSize == 16 && s.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-           s.BType == VK_COMPONENT_TYPE_FLOAT16_KHR && s.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
-           s.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.saturatingAccumulation == VK_FALSE &&
-           s.scope == VK_SCOPE_SUBGROUP_KHR;
+  if (query(physical, &count, shapes.data()) != VK_SUCCESS) return {};
+  return shapes;
+}
+
+bool has_shape(const std::vector<VkCooperativeMatrixPropertiesKHR>& shapes, VkComponentTypeKHR input) {
+  return std::any_of(shapes.begin(), shapes.end(), [&](const VkCooperativeMatrixPropertiesKHR& s) {
+    return s.MSize == 16 && s.NSize == 16 && s.KSize == 16 && s.AType == input && s.BType == input &&
+           s.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+           s.saturatingAccumulation == VK_FALSE && s.scope == VK_SCOPE_SUBGROUP_KHR;
   });
-  if (!has_shape) return "no 16x16x16 f16 x f16 -> f32 cooperative matrix in subgroup scope";
-  return {};
+}
+
+void describe_coop(VkInstance instance, VkPhysicalDevice physical, const VkPhysicalDeviceProperties& properties,
+                   Capabilities& caps) {
+  const std::string base = why_no_coop_base(physical, properties, caps);
+  const std::vector<VkCooperativeMatrixPropertiesKHR> shapes =
+      base.empty() ? coop_shapes(instance, physical) : std::vector<VkCooperativeMatrixPropertiesKHR>{};
+  const std::uint32_t shared = properties.limits.maxComputeSharedMemorySize;
+
+  caps.coop_reason = base;
+  if (caps.coop_reason.empty() && shared < kCoopSharedBytes) {
+    caps.coop_reason = "needs " + std::to_string(kCoopSharedBytes) + " bytes of shared memory";
+  }
+  if (caps.coop_reason.empty() && !has_shape(shapes, VK_COMPONENT_TYPE_FLOAT16_KHR)) {
+    caps.coop_reason = "no 16x16x16 f16 x f16 -> f32 cooperative matrix in subgroup scope";
+  }
+  caps.coop = caps.coop_reason.empty();
+
+  caps.coop_bf16_reason = base;
+  if (caps.coop_bf16_reason.empty() && !has_extension(physical, VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME)) {
+    caps.coop_bf16_reason = "no VK_KHR_shader_bfloat16";
+  }
+  if (caps.coop_bf16_reason.empty()) {
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR bf16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &bf16};
+    vkGetPhysicalDeviceFeatures2(physical, &features);
+    if (bf16.shaderBFloat16Type == 0 || bf16.shaderBFloat16CooperativeMatrix == 0) {
+      caps.coop_bf16_reason = "no bf16 cooperative matrices";
+    }
+  }
+  if (caps.coop_bf16_reason.empty() && shared < kCoopBf16SharedBytes) {
+    caps.coop_bf16_reason = "needs " + std::to_string(kCoopBf16SharedBytes) + " bytes of shared memory";
+  }
+  if (caps.coop_bf16_reason.empty() && !has_shape(shapes, VK_COMPONENT_TYPE_BFLOAT16_KHR)) {
+    caps.coop_bf16_reason = "no 16x16x16 bf16 x bf16 -> f32 cooperative matrix in subgroup scope";
+  }
+  caps.coop_bf16 = caps.coop_bf16_reason.empty();
 }
 
 DeviceInfo describe(VkInstance instance, VkPhysicalDevice physical, std::uint32_t index) {
@@ -112,8 +153,7 @@ DeviceInfo describe(VkInstance instance, VkPhysicalDevice physical, std::uint32_
   vkGetPhysicalDeviceFeatures2(physical, &features);
   if (v12.bufferDeviceAddress == 0) info.unusable_reason = "no bufferDeviceAddress";
   if (features.features.shaderInt64 == 0) info.unusable_reason = "no shaderInt64";
-  info.caps.coop_reason = why_no_coop(instance, physical, properties, info.caps);
-  info.caps.coop = info.caps.coop_reason.empty();
+  describe_coop(instance, physical, properties, info.caps);
   return info;
 }
 
@@ -171,8 +211,15 @@ Device::Device(int index) {
   VkPhysicalDeviceVulkan11Features v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &v12};
   VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
   features.features.shaderInt64 = VK_TRUE;
+  VkPhysicalDeviceShaderBfloat16FeaturesKHR bf16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR};
+  bf16.shaderBFloat16Type = VK_TRUE;
+  bf16.shaderBFloat16CooperativeMatrix = VK_TRUE;
   std::vector<const char*> extensions;
-  if (info_.caps.coop) {
+  if (info_.caps.coop_bf16) {
+    coop.pNext = &bf16;
+    extensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+  }
+  if (info_.caps.coop || info_.caps.coop_bf16) {
     v12.pNext = &v13;
     v12.shaderFloat16 = VK_TRUE;
     v12.vulkanMemoryModel = VK_TRUE;

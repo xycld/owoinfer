@@ -15,9 +15,13 @@ namespace mi::vk {
 // What a device offers beyond the base requirements (Vulkan 1.2, buffer device addresses, 64-bit integers).
 struct Capabilities {
   // The cooperative-matrix GEMM can run: 16x16x16 f16 x f16 -> f32 in subgroup scope, a compute subgroup size fixable at
-  // 32 with 4 per workgroup, and its shared memory. Otherwise `coop_reason` says why not.
+  // 32 with 8 per workgroup, and its shared memory. Otherwise `coop_reason` says why not.
   bool coop = false;
   std::string coop_reason;
+  // The DiT block's cooperative-matrix kernels can run: the same subgroup and memory-model requirements, with
+  // VK_KHR_shader_bfloat16 fragments and a 16x16x16 bf16 x bf16 -> f32 shape. Otherwise `coop_bf16_reason` says why not.
+  bool coop_bf16 = false;
+  std::string coop_bf16_reason;
   std::uint32_t shared_memory_bytes = 0;
   std::uint32_t min_subgroup = 0, max_subgroup = 0;
 };

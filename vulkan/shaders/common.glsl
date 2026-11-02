@@ -23,4 +23,25 @@ uint bf(float v) {
 uvec2 bf4(vec4 v) { return uvec2(bf(v.x) | (bf(v.y) << 16), bf(v.z) | (bf(v.w) << 16)); }
 vec4 rbf4(vec4 v) { return f4(bf4(v)); }
 
+// exp(-2 |x|) stays in range where GLSL's tanh may divide infinities; beyond 12 the result rounds to 1 in fp32 anyway.
+vec4 tanh_safe(vec4 x) {
+  const vec4 e = exp(-2.0 * min(abs(x), vec4(12.0)));
+  precise const vec4 t = (1.0 - e) / (1.0 + e);
+  return sign(x) * t;
+}
+
+vec4 situ(vec4 h, vec4 g) {
+  const float inv25 = 1.0 / 25.0;  // torch divides by a CPU scalar as a multiply by its fp32 reciprocal
+  precise const vec4 g_quarter = g * 0.25;
+  const vec4 tanh_g = rbf4(tanh_safe(rbf4(g_quarter)));
+  precise const vec4 four_tanh = 4.0 * tanh_g;
+  precise const vec4 sigmoid = 1.0 / (1.0 + exp(-g));
+  precise const vec4 left = rbf4(four_tanh) * rbf4(sigmoid);
+  precise const vec4 h_scaled = h * inv25;
+  const vec4 tanh_h = rbf4(tanh_safe(rbf4(h_scaled)));
+  precise const vec4 right = 25.0 * tanh_h;
+  precise const vec4 product = rbf4(left) * rbf4(right);
+  return product;
+}
+
 #endif

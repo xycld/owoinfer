@@ -7,8 +7,9 @@
 //   y    = rms_norm_modulate(x, norm2, scale_f, shift_f)
 //   ffn  = situ(bf16(y * Wup^T), bf16(y * Wgate^T))
 //   x   += bf16(bf16(ffn * Wdown^T) * gate_f)
-// It runs on any device the runtime accepts, needs no cooperative matrices, and does not depend on the subgroup size.
-// Operands are device addresses with row strides that are multiples of 4 elements. Each record_* adds its own barrier.
+// Two paths. kPlain runs on any device the runtime accepts, needs no cooperative matrices, and does not depend on the
+// subgroup size; its operands need row strides that are multiples of 4 elements. kCoop runs the GEMMs on bf16 cooperative
+// matrices (Capabilities::coop_bf16) and needs strides, N and K that are multiples of 8. Each record_* adds its own barrier.
 #pragma once
 
 #include <cstdint>
@@ -33,10 +34,17 @@ struct AttentionArgs {
   float scale;  // SDPA's 1 / sqrt(head_dim) for the DiT
 };
 
+enum class BlockPath { kCoop, kPlain };
+const char* block_path_name(BlockPath path);
+
 class BlockKernels {
  public:
+  // kCoop where the device has it, unless `path` names one. Throws if the device cannot run the path asked for.
   explicit BlockKernels(Device& device);
+  BlockKernels(Device& device, BlockPath path);
   ~BlockKernels();
+
+  BlockPath path() const { return path_; }
 
   void record_norm_modulate(VkCommandBuffer cb, VkDeviceAddress x, std::uint32_t ldx, VkDeviceAddress weight,
                             VkDeviceAddress scale, VkDeviceAddress shift, VkDeviceAddress out, std::uint32_t ldo,
@@ -55,6 +63,7 @@ class BlockKernels {
   void record_attention(VkCommandBuffer cb, const AttentionArgs& args) const;
 
  private:
+  BlockPath path_;
   std::unique_ptr<Pipeline> gemm_bf16_, gemm_gated_, gemm_situ_, norm_modulate_, qk_norm_rope_, attention_;
 };
 
