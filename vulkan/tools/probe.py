@@ -1,8 +1,7 @@
 """Lists a Vulkan device's cooperative-matrix shapes and memory heaps, using only the Vulkan loader.
 
-The C++ tool needs Vulkan headers and an import library; this script needs neither (ctypes only), so it works on a
-machine with just the GPU driver installed. It is how the capability table in docs/vulkan-backend-research.md was
-produced.
+The C++ tools need the Vulkan headers to build; this script needs nothing but Python (ctypes), so it works on a
+machine with just the GPU driver installed, e.g. to see whether a device has the bf16 shape the coop kernels use.
 
     py -3 probe.py
 """
