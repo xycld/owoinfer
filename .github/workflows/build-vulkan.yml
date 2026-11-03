@@ -49,33 +49,56 @@ jobs:
           sudo apt-get clean
           echo "CXX=g++-12" >> "$GITHUB_ENV"
 
-      - name: Vulkan SDK (Linux)
-        if: matrix.platform == 'linux'
+      # The SDK (330 MB on Linux, 290 MB on Windows) is cached per version: LunarG's server can be slow from the runners.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: sdk-cache
+        with:
+          path: ${{ runner.temp }}/vulkan-sdk
+          key: vulkan-sdk-${{ matrix.os }}-${{ env.VULKAN_SDK_VERSION }}-v1
+
+      - name: Vulkan SDK download (Linux)
+        if: matrix.platform == 'linux' && steps.sdk-cache.outputs.cache-hit != 'true'
         run: |
           f="vulkansdk-linux-x86_64-$VULKAN_SDK_VERSION.tar.xz"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$f" "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/linux/$f"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 15 --connect-timeout 30 -o "$RUNNER_TEMP/$f" \
+            "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/linux/$f"
           echo "${{ matrix.sdk_sha256 }}  $RUNNER_TEMP/$f" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/vulkan-sdk"
           tar -xJf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/vulkan-sdk"
-          sdk="$RUNNER_TEMP/vulkan-sdk/$VULKAN_SDK_VERSION/x86_64"
-          echo "VULKAN_SDK=$sdk" >> "$GITHUB_ENV"
-          echo "$sdk/bin" >> "$GITHUB_PATH"
-          "$sdk/bin/glslc" --version
+          rm "$RUNNER_TEMP/$f"
 
-      - name: Vulkan SDK (Windows)
-        if: matrix.platform == 'windows'
+      - name: Vulkan SDK download (Windows)
+        if: matrix.platform == 'windows' && steps.sdk-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $f = "vulkansdk-windows-X64-$env:VULKAN_SDK_VERSION.exe"
           $exe = Join-Path $env:RUNNER_TEMP $f
-          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/$f" -OutFile $exe
+          curl.exe -fsSL --retry 5 --retry-all-errors --retry-delay 15 --connect-timeout 30 -o $exe `
+            "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/$f"
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
           $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
           if ($hash -ne "${{ matrix.sdk_sha256 }}") { throw "SHA-256 mismatch: $hash" }
-          $root = Join-Path $env:RUNNER_TEMP "VulkanSDK"
+          $root = Join-Path $env:RUNNER_TEMP "vulkan-sdk"
           Start-Process -FilePath $exe -Wait -NoNewWindow -ArgumentList @("--root", $root, "--accept-licenses", "--default-answer", "--confirm-command", "install")
-          "VULKAN_SDK=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "$root\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          & "$root\Bin\glslc.exe" --version
+          Remove-Item $exe
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/vulkan-sdk
+          key: ${{ steps.sdk-cache.outputs.cache-primary-key }}
+
+      - name: Vulkan SDK environment
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = linux ]; then
+            sdk="$RUNNER_TEMP/vulkan-sdk/$VULKAN_SDK_VERSION/x86_64"; bin="$sdk/bin"
+          else
+            sdk="$RUNNER_TEMP/vulkan-sdk"; bin="$sdk/Bin"
+          fi
+          echo "VULKAN_SDK=$sdk" >> "$GITHUB_ENV"
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/glslc" --version
 
       - name: Configure
         shell: bash
