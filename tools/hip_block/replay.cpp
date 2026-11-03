@@ -74,15 +74,17 @@ void print_row(const char* name, const Agreement& r, double scaled_limit, const 
 // A whole token row gone wrong is 0.012 % of an op at E13's shape, too few values for same or p99.9 to see; the row limit
 // sees it. kRowMargin is wide because the card cannot be recalibrated here. On NVIDIA, two other accumulation orders in the
 // scalar leaf (each fragment's 16 products as a tree, or K descending) moved the lowest row by at most 0.36 points (K
-// descending, block 41's attention, 95.28 to 95.64), and the card's per-op same was within 0.07 points of the scalar
-// leaf's. The third review's wrong-row mutants reach at most 41.5 % in their row (40 norm rows 0.39 % large), 33.5 % for
-// one token without RoPE, 0 % for a row x 1.02 or a zeroed QKV row.
+// descending, block 41's attention, 95.28 to 95.64). On the RX 9060 XT the per-op same is within 0.07 points of the scalar
+// leaf's, and so is the lowest row in the GEMM and attention ops; in the norms and qk_norm_rope, where AMD's rsqrt flips low
+// bits, the lowest row is 99.06 to 99.92 % against the scalar leaf's 100. The third review's wrong-row mutants reach at
+// most 41.5 % in their row (40 norm rows 0.39 % large), 33.5 % for one token without RoPE, 0 % for a row x 1.02 or a zeroed
+// QKV row.
 constexpr double kRowMargin = 15.0;
 // A wrong fragment or column (the shape a fragment layout bug takes) is too few values for same, p99.9 or a row, and moves
 // each by a few ULPs, under the scaled limit: one attention fragment x 1.03 reaches scaled 8, one down column x 1.06 13. It
 // does put outputs above scaled 4 where a correct op puts none or few. On the dump, the scalar leaf puts 0 there in every op
 // but block 41's SiTU (1) and down gemm + gated (31); the two other accumulation orders put 0, 1 and 29 or 30 there; the
-// card's earlier run has scaled <= 4, so 0, in every op but those two. The review's fragment and column mutants put 186 and
+// RX 9060 XT puts 0 in every op but those two, where it puts 1 and 49. The review's fragment and column mutants put 186 and
 // 80 (attention fragment), 38 and 13 (QKV fragment), 11 and 8464 (down column) there, at blocks 1 and 41. The floor must sit
 // under 11 and the factor at 4 or more; 8 and 8 leave 8x over the other orders' counts.
 constexpr std::size_t kCountFloor = 8;

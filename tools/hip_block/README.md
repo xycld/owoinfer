@@ -90,7 +90,7 @@ These rules changed after results were in, in this order:
 
 ## On an AMD card
 
-An RX 9060 XT (gfx1200, 32 CUs, 16 GB of GDDR6 on a 128-bit bus, 4 MB L2, 32 MB L3), ROCm 7.16, rocWMMA 2.2.1. One block at E13's 8484 tokens takes 109 ms on synthetic activations (min of 10, median 109) and 104 ms on real weights, against the engine's 31.3 ms on an RTX 4090 Laptop (E13). A 42-block step would take about 4.4 s against 1.33 s. The first build took 415 ms on one machine and 422 ms on another with the same card (Ryzen 5 3500, i7-8700), so the host is not what sets these times.
+An RX 9060 XT (gfx1200, 32 CUs, 16 GB of GDDR6 on a 128-bit bus, 4 MB L2, 32 MB L3), ROCm 7.16, rocWMMA 2.2.1; the run after the third review used ROCm 10.1 (AMD clang 24). One block at E13's 8484 tokens takes 109 ms on synthetic activations (min of 10, median 109) and 104 ms on real weights (105 ms under ROCm 10.1, median of 10), against the engine's 31.3 ms on an RTX 4090 Laptop (E13). A 42-block step would take about 4.4 s against 1.33 s. The first build took 415 ms on one machine and 422 ms on another with the same card (Ryzen 5 3500, i7-8700), so the host is not what sets these times.
 
 | Op | First build, ms | Now, ms |
 |---|---|---|
@@ -102,7 +102,7 @@ An RX 9060 XT (gfx1200, 32 CUs, 16 GB of GDDR6 on a 128-bit bus, 4 MB L2, 32 MB 
 | down gemm + gated | 67.3 | 10.4 |
 | whole block | 415 | 109 |
 
-On NVIDIA's scalar leaf, none of what took it there changes a bit: the old and new kernels give identical outputs for every op on the dump's real inputs, for both whole blocks, and for tail shapes and denormal attention (the third review's old-against-new harness). On the card, the new kernels pass the gates against the engine below; old against new has not run there. The card's check that the packed path gives the row-major path's bits cannot see a change both paths share: the fence, the all-lane softmax, the rescale skip, the four-wide reads, the block order and the tiles. The changes:
+None of what took it there changes a bit, on NVIDIA's scalar leaf or on the card's WMMA: the old and new kernels give identical outputs for every op on the dump's real inputs, for both whole blocks, and for tail shapes and denormal attention, on the packed path and on the row-major one (the third review's old-against-new harness; 24 of 24 outputs identical on the card). On the card the new kernels with `__syncthreads` in place of the wavefront fence, and with the accumulator trip taken at every step in place of the rescale skip, give the same bits too. The changes:
 
 - **Packed operands.** A strided fragment load makes its 32 lanes touch 16 cache lines and a packed one 8, with the same instructions (one 16-byte load per lane). Packing is cheap, 0.3 ms at K 3072 and 0.9 ms at K 8192, when it walks along the row groups. Walking across them took 23 ms at K 8192.
 - **All of a step's loads before its WMMAs.** They overlap in flight. A load before each group of WMMAs stalls them: 39.8 TFLOPS against 63.3 at the same tile and block.
@@ -149,27 +149,35 @@ Outputs above scaled 4, per op, blocks 1 and 41 (others 0 everywhere):
 |---|---|---|---|
 | scalar leaf | 0, 1 | 0, 31 | 8, 8; 8, 248 |
 | tree of 16 / K descending | 0, 1 / 0, 1 | 0, 30 / 0, 29 | |
-| card, earlier run | 0, unknown (scaled 5) | 0, unknown (scaled 64) | |
+| card | 0, 1 | 0, 49 | |
 
-The card's count is known to be 0 wherever its scaled was 4 or less. The third review's fragment and column mutants put, at blocks 1 and 41: one attention output fragment x 1.03, 186 and 80 (scaled 8); 16 columns of one 32-row QKV tile x 1.03, 38 and 13 (scaled 7 and 6); one down output column x 1.06, 11 and 8464 (scaled 13 and 32). All six exceed the count limit, and none fails another per-op limit. The floor must stay under 11 for the down column at block 1, and the factor at 4 or more over block 41's down; 8 and 8 leave 8x over the other accumulation orders' counts.
+The card's count is 0 in every other op (the whole block has no count limit). The third review's fragment and column mutants put, at blocks 1 and 41: one attention output fragment x 1.03, 186 and 80 (scaled 8); 16 columns of one 32-row QKV tile x 1.03, 38 and 13 (scaled 7 and 6); one down output column x 1.06, 11 and 8464 (scaled 13 and 32). All six exceed the count limit, and none fails another per-op limit. The floor must stay under 11 for the down column at block 1, and the factor at 4 or more over block 41's down; 8 and 8 leave 8x over the other accumulation orders' counts.
 
-The card ran the earlier replay, without the poisoning, the row limit, the scaled limit and the q-and-k-only comparison. On the RX 9060 XT, exit 0:
+On the RX 9060 XT under ROCm 10.1, the current replay (poisoned buffers, every limit above), PASS, exit 0. Each cell is same %, p99.9, scaled, lowest row's same %, outputs above scaled 4; the row limits are 80.3 to 85:
 
-| Op, against the engine | Block 1: same %, p99.9, scaled | Block 41: same %, p99.9, scaled |
+| Op, against the engine | Block 1 | Block 41 |
 |---|---|---|
-| norm1 | 99.9998, 0, 2 | 100, 0, 2 |
-| qkv gemm | 99.853, 1, 1 | 99.739, 1, 1 |
-| qk_norm_rope | 99.9997, 0, 2 | 99.9998, 0, 1 |
-| attention | 99.417, 1, 1.25 | 99.196, 1, 2 |
-| o gemm + gated | 99.970, 0, 1 | 99.954, 0, 2 |
-| norm2 | 99.9997, 0, 4 | 99.9996, 0, 2 |
-| up_gate gemm + SiTU | 99.738, 1, 4 | 99.607, 2, 5 |
-| down gemm + gated | 99.942, 0, 2 | 99.869, 1, 64 |
+| norm1 | 99.9998, 0, 2, 99.48, 0 | 100, 0, 2, 99.77, 0 |
+| qkv gemm | 99.8532, 1, 1, 99.67, 0 | 99.7393, 1, 1, 99.48, 0 |
+| qk_norm_rope, q and k | 99.9996, 0, 2, 99.92, 0 | 99.9997, 0, 1, 99.85, 0 |
+| attention | 99.4170, 1, 1.25, 96.61, 0 | 99.1964, 1, 2, 95.35, 0 |
+| o gemm + gated | 99.9703, 0, 1, 99.80, 0 | 99.9535, 0, 2, 99.77, 0 |
+| norm2 | 99.9997, 0, 4, 99.06, 0 | 99.9996, 0, 2, 99.15, 0 |
+| up_gate gemm + SiTU | 99.7375, 1, 4, 99.51, 0 | 99.6067, 2, 5 (limit 20), 99.29, 1 |
+| down gemm + gated | 99.9415, 0, 2, 99.71, 0 | 99.8687, 1, 64 (limit 128), 99.48, 49 (limit 248) |
 | whole block, final x | 83.28 (limit 79.28), 64, 2 | 67.91 (limit 64.93), 320, 64 (limit 128) |
 
-The scalar leaf under the same comparison gives 83.30 and 68.17 for the whole block, so WMMA's rounding sits as close to the engine's as an exact fp32 walk does. The norms and `qk_norm_rope` are not bit-exact on the card as they are on NVIDIA: AMD's `rsqrt` flips a few low bits, in about 3 values in 10^6. Against the new limits, every figure of that run passes: scaled at most half its limit (block 41's down gemm + gated, 64 against 4 x 32 = 128; the norms' 2 to 4 against 16), same at least 0.196 points over 99 %, p99.9 within its limit. qkv gemm and attention at both blocks (1 of 1) and SiTU at block 41 (2 of 2) sit exactly at their p99.9 limits, with the same p99.9 as the scalar leaf. For this card and toolchain that is a regression gate: on another ROCm or chip, a flip there is a reason to look closer, not by itself a defect. That run did not compute row figures, so the row limit has no card data yet, and its `qk_norm_rope` figure is over q, k and v.
+Every same %, p99.9 and scaled figure of the earlier run on ROCm 7.16 is the same here, apart from `qk_norm_rope`, which that run compared over q, k and v; it had no row or count figures. Its whole block took 103.3 and 103.7 ms, against 104.6 and 105.1 here (min of 10). The scalar leaf under the same comparison gives 83.30 and 68.17 for the whole block, so WMMA's rounding sits as close to the engine's as an exact fp32 walk does. The card's lowest rows in the GEMM and attention ops are within 0.07 points of the scalar leaf's (attention 96.61 and 95.35 % against 96.58 and 95.28); in the norms and `qk_norm_rope` they are 99.06 to 99.92 % against its 100. The norms and `qk_norm_rope` are not bit-exact on the card as they are on NVIDIA: AMD's `rsqrt` flips a few low bits, in about 3 values in 10^6. Scaled is at most half its limit, same at least 0.196 points over 99 %, the lowest rows 14.1 to 15.1 points over theirs, and the counts under a fifth of theirs. qkv gemm and attention at both blocks (1 of 1) and SiTU at block 41 (2 of 2) sit exactly at their p99.9 limits, with the same p99.9 as the scalar leaf. For this card and toolchain that is a regression gate: on another ROCm or chip, a flip there is a reason to look closer, not by itself a defect.
 
 ## Verified
+
+On the RX 9060 XT (gfx1200), ROCm 10.1, after the third review's fixes:
+
+- The old and new kernels, both built for WMMA, give identical bits in 24 of 24 outputs: every op on the dump's real inputs, both whole blocks, tail shapes (14219240 values) and three denormal attention configurations, on the packed path and on the row-major one. So do the new kernels with `__syncthreads` in place of the wavefront fence, and with the accumulator trip at every step in place of the rescale skip.
+- The bench's known-answer check passes, and the packed block gives the row-major block's bits (0 of 26062848 values differ). `hip_block_replay` passes against the engine, above.
+- A probe of 201703392 threads over 1 to 2000000 workgroups, three times each: every thread's lane equals its `threadIdx` and its exec mask is full, so a workgroup is one whole wave.
+- `check_device.sh` on the card's compiler: the same WMMA count per kernel as ROCm 7.2.4's (12, 12, 12 and 34), no scratch, no spills, wave size and workgroup size 32, no undefined symbols. Attention uses 252 VGPRs there against 249.
+- Informational: with no fence at all, the bits are the same as with it, and the time too (110.9 ms against 110.8 in one bench run). Identical bits in one run are no argument for removing the fence.
 
 On an RTX 4090 Laptop (sm_89), CUDA 13, ROCm 7.2.4 headers. Inputs are synthetic unless the line says real.
 
@@ -265,18 +273,17 @@ The bench's known-answer check tests kernels, not the block driver, and the benc
 
 ## Not verified
 
-Only gfx1200 has run this, and for two sessions; gfx1100 and gfx1201 have only been compiled.
+Only gfx1200 has run this, in three sessions; gfx1100 and gfx1201 have only been compiled.
 
 - A whole 42-block step, a VAE or a text encoder on AMD. The 4.4 s is 42 times one block.
-- The old kernels against the new on the card. The bit-for-bit result is the scalar leaf's on NVIDIA.
-- Anything after the third review's fixes on a card: the poisoned buffers, replay's row and scaled limits, `pad_barrier()`'s wait and the edge rows all ran on NVIDIA only.
+- `hip_block_verify` on a card: its edge rows, attention's through the packed path included, ran on NVIDIA's scalar leaf only. The card ran the old-against-new harness's tail shapes and denormal attention, not NaN or Inf inputs.
 - That a wavefront fence is enough on every chip: it holds on gfx1200, where the checks above pass. It relies on a workgroup being one wave, which `check_device.sh` checks statically.
 - rocWMMA's fragment load and store order on RDNA3 and on gfx1201. An independent review checked its lane and K mapping on a CPU emulation derived from rocWMMA's own layouts, and the known-answer check confirms it on gfx1200.
 - `exp2f`, `expf`, `tanhf` and `rsqrt` accuracy in AMD's device libraries beyond the known-answer inputs, where they stayed within the limits on gfx1200.
 - Any time or rate on another AMD chip. The tile constants and the 4 MB block are tuned on this chip only.
 - Whether the known-answer limits suit other cards: they come from the scalar leaf and a model of math-library flips, and gfx1200 passes well inside them.
 - NaN, Inf and denormals through WMMA and AMD's math. The known-answer inputs contain none of these, so a card that flushes denormals passes it and shows nothing about them.
-- The kernels write `__shared__` buffers right after a collective read of them with no barrier between (`mma_leaf.h`). That holds in hardware for one wave and is a data race in LLVM's terms. The third review read the scheduled MIR of every kernel on gfx1100 and gfx1200: no `__shared__` read follows a write to the same buffer without a fence between, the fences stay in source order, and where a buffer is read then rewritten the read stays first. That is the compiler's order only: the fence emits no instruction, so the argument rests on a wave's DS operations completing in order, which no card run has tested apart from the checks passing on gfx1200. The emulation adds barriers there, so it does not test this either.
+- The kernels write `__shared__` buffers right after a collective read of them with no barrier between (`mma_leaf.h`). That holds in hardware for one wave and is a data race in LLVM's terms. The third review read the scheduled MIR of every kernel on gfx1100 and gfx1200: no `__shared__` read follows a write to the same buffer without a fence between, the fences stay in source order, and where a buffer is read then rewritten the read stays first. That is the compiler's order only: the fence emits no instruction, so the argument rests on a wave's DS operations completing in order, which no card run has tested apart from the checks passing on gfx1200, `__syncthreads` giving the fence's bits there, and the one-wave probe. The emulation adds barriers there, so it does not test this either.
 - Other `gfx11xx` and `gfx12xx` chips, and Windows.
 
 The attention tile of 16 rows per wave uses 241 VGPRs on gfx1100 and 249 on gfx1200 and gfx1201 with no spills, close to the limit. 32 rows per wave spills.
