@@ -96,9 +96,12 @@ jobs:
           export LD_LIBRARY_PATH="$VULKAN_SDK/lib"
           export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
           build-vulkan/moss-infer-vulkan --list-devices
-          build-vulkan/vulkan_block_check --no-block
-          build-vulkan/vulkan_te_kernel_check
-          build-vulkan/vulkan_vae_check --kat-only
+          # Every check runs, so one run reports all failures.
+          status=0
+          build-vulkan/vulkan_block_check --no-block || status=1
+          build-vulkan/vulkan_te_kernel_check || status=1
+          build-vulkan/vulkan_vae_check --kat-only || status=1
+          exit $status
 
       - name: Package
         shell: bash

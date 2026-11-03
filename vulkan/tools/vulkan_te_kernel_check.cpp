@@ -365,7 +365,9 @@ bool check_conv_gates(Device& device, const TeKernels& k) {
       }
     }
     ok = report("gates beta", read<bits>(beta, beta_want.size()), beta_want, {1.0, 0.0}) && ok;
-    ok = report_f32("gates g", read<float>(g, g_want.size()), g_want, 8.0) && ok;
+    // exp_f and log1p_f are fma polynomials, and Vulkan lets fma round twice (SPIR-V's Fma inherits the precision of a
+    // multiply then an add): lavapipe on LLVM 15 does, and lands up to 17 fp32 ULPs off, about 1e-6 relative.
+    ok = report_f32("gates g", read<float>(g, g_want.size()), g_want, 32.0) && ok;
   }
 
   // silu(gate) * up from one [gate | up] row, and the attention gate over 256-wide heads of a [q | gate] layout.
