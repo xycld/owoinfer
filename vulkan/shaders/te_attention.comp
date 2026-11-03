@@ -48,7 +48,7 @@ shared float s_tile[BR * SP];
 shared float rescale_shared[BR];
 shared float inv_sum_shared[BR];
 
-const float NEG_INF = uintBitsToFloat(0xff800000u);
+#define NEG_INF uintBitsToFloat(0xff800000u)
 
 void main() {
   const uint t = gl_LocalInvocationIndex;

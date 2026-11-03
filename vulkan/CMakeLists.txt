@@ -10,8 +10,16 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)  # the CPU reference is unusably slow unoptimized
 endif()
 
-find_package(Vulkan REQUIRED COMPONENTS glslc)
+# The Vulkan headers and glslc, from $VULKAN_SDK first. No loader library: vk_api.cpp opens it at run time.
+find_path(MI_VULKAN_INCLUDE_DIR vulkan/vulkan_core.h
+          HINTS "$ENV{VULKAN_SDK}/include" "$ENV{VULKAN_SDK}/Include" REQUIRED)
+file(STRINGS ${MI_VULKAN_INCLUDE_DIR}/vulkan/vulkan_core.h _mi_bf16 REGEX "VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME")
+if(NOT _mi_bf16)
+  message(FATAL_ERROR "${MI_VULKAN_INCLUDE_DIR}/vulkan/vulkan_core.h has no VK_KHR_shader_bfloat16: use a newer Vulkan SDK")
+endif()
 find_program(GLSL_COMPILER NAMES glslc HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin" REQUIRED)
+add_library(mi_vulkan_headers INTERFACE)
+target_include_directories(mi_vulkan_headers SYSTEM INTERFACE ${MI_VULKAN_INCLUDE_DIR})
 
 # Shaders become SPIR-V word lists compiled into the binary, so nothing beyond it ships.
 set(_spirv_dir ${CMAKE_CURRENT_BINARY_DIR}/spirv)
@@ -43,7 +51,7 @@ target_include_directories(mossinfer_vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} P
 set_target_properties(mossinfer_vulkan PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
 # Headers only: vk_api.cpp opens the loader at run time, so nothing links against it.
 find_package(Threads REQUIRED)
-target_link_libraries(mossinfer_vulkan PUBLIC Vulkan::Headers Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(mossinfer_vulkan PUBLIC mi_vulkan_headers Threads::Threads ${CMAKE_DL_LIBS})
 
 # The Qwen3.5 text encoder (text_encoder.h): its own kernels on top of the DiT block's GEMMs.
 set(_te_spirv_files "")
