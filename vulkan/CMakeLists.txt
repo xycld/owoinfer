@@ -1,7 +1,8 @@
-# The Vulkan backend, the fallback for hardware the engine does not otherwise support. A standalone project for now: it
-# links no engine code, and nothing here affects the engine's build. See README.md.
+# The Vulkan backend and moss-infer-vulkan, the standalone program for GPUs the CUDA engine does not support. Its own
+# project, built without CUDA; the engine's build does not include it. See README.md.
 cmake_minimum_required(VERSION 3.20)
-project(mossinfer_vulkan LANGUAGES CXX)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/version.cmake)  # MOSSINFER_VERSION, from the C header
+project(mossinfer_vulkan VERSION ${MOSSINFER_VERSION} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -73,10 +74,55 @@ target_sources(mossinfer_vulkan PRIVATE vae.cpp generate.cpp ${_spirv_vae})
 # generate.cpp's CFG and Euler step round like the engine's kernels: no contraction.
 set_source_files_properties(generate.cpp PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/fp:precise,-ffp-contract=off>")
 
-# Built into the engine (cmake/modules/vulkan.cmake), the tools are off unless asked for.
-if(NOT DEFINED MOSSINFER_VULKAN_TOOLS)
-  set(MOSSINFER_VULKAN_TOOLS ON)
+# moss-infer-vulkan, the standalone program: the backend plus the engine's host sources it shares with moss-infer (the
+# tokenizer, the seed's initial noise, the schedule, the PNG writer), compiled here so that nothing needs CUDA.
+set(_engine_src ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+add_library(mossinfer_vulkan_host STATIC
+  ${_engine_src}/tokenizer/qwen_bpe.cpp ${_engine_src}/tokenizer/unicode.cpp ${_engine_src}/tokenizer/prompt_tokens.cpp
+  ${_engine_src}/pipeline/samplers/initial_noise.cpp ${_engine_src}/pipeline/rng_torch_compat.cpp
+  ${_engine_src}/pipeline/samplers/schedules.cpp ${_engine_src}/pipeline/png_writer.cpp ${_engine_src}/util/json.cpp
+  ${_engine_src}/util/regular_file.cpp ${_engine_src}/util/replaceable_file.cpp)
+target_include_directories(mossinfer_vulkan_host PUBLIC ${_engine_src} ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_executable(moss-infer-vulkan tools/moss_infer_vulkan.cpp)
+target_link_libraries(moss-infer-vulkan PRIVATE mossinfer_vulkan mossinfer_vulkan_host)
+if(MSVC)
+  target_compile_options(mossinfer_vulkan_host PRIVATE /utf-8)
+  target_compile_options(moss-infer-vulkan PRIVATE /utf-8)
 endif()
+# Release packages run on any glibc distribution of the build's age or newer, without its libstdc++.
+option(MOSSINFER_STATIC_LIBSTDCXX "Link libstdc++ and libgcc statically into moss-infer-vulkan (Linux packages)" OFF)
+if(MOSSINFER_STATIC_LIBSTDCXX AND NOT MSVC)
+  target_link_options(moss-infer-vulkan PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+
+# Package: the program and the license files. No Vulkan loader ships: the GPU driver provides it.
+install(TARGETS moss-infer-vulkan RUNTIME DESTINATION bin)
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../LICENSE ${CMAKE_CURRENT_SOURCE_DIR}/../NOTICE
+              ${CMAKE_CURRENT_SOURCE_DIR}/../THIRD_PARTY_NOTICES.md ${CMAKE_CURRENT_SOURCE_DIR}/../docs/vulkan.md
+        DESTINATION share/doc/mossinfer)
+if(WIN32)
+  set(_mi_platform windows)
+elseif(APPLE)
+  set(_mi_platform macos)
+else()
+  set(_mi_platform linux)
+endif()
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _mi_arch)
+if(_mi_arch STREQUAL "amd64")
+  set(_mi_arch x86_64)
+endif()
+set(CPACK_PACKAGE_NAME mossinfer-vulkan)
+set(CPACK_PACKAGE_VERSION ${MOSSINFER_VERSION})
+set(CPACK_PACKAGE_FILE_NAME "mossinfer-${MOSSINFER_VERSION}-${_mi_platform}-vulkan-${_mi_arch}")
+if(WIN32)
+  set(CPACK_GENERATOR ZIP)
+else()
+  set(CPACK_GENERATOR TGZ)
+endif()
+include(CPack)
+
+# The checks and benchmarks; a release build turns them off.
+option(MOSSINFER_VULKAN_TOOLS "Build the Vulkan backend's checks and benchmarks" ON)
 if(NOT MOSSINFER_VULKAN_TOOLS)
   return()
 endif()
