@@ -1,8 +1,9 @@
 # Vulkan backend
 
-`moss-infer generate --backend vulkan` runs MOSS-Image on Vulkan instead of CUDA. It is the fallback for GPUs the CUDA
-engine does not support (AMD, Intel, older NVIDIA cards) and is much slower than CUDA. On a supported NVIDIA GPU, use
-the default CUDA backend.
+`moss-infer-vulkan` runs MOSS-Image on Vulkan. It is the fallback for GPUs the CUDA engine does not support (AMD, Intel,
+older NVIDIA cards): a standalone program in its own package (`mossinfer-VERSION-linux-vulkan-x86_64.tar.gz`,
+`mossinfer-VERSION-windows-vulkan-x86_64.zip`) that needs a Vulkan driver and neither CUDA nor an NVIDIA driver. It is
+slower than CUDA; on a supported NVIDIA GPU, use `moss-infer`.
 
 It runs txt2img with the official Base and SFT bf16 files, the official euler sampler and schedule and classifier-free
 guidance with the uncond skip layers. The tier is `reference`. Everything else is refused with a message that names
@@ -11,13 +12,17 @@ the lossy accelerators, quantized or GGUF files, and the CUDA memory options. Th
 and the schedule are the engine's own, so a seed gives the same inputs as on CUDA.
 
 ```sh
-moss-infer generate --backend vulkan --tier reference --model MOSS-Image/base \
-  --prompt "a red apple on a wooden table" --size 1024x1024 -o apple.png
+moss-infer-vulkan --model MOSS-Image/base --prompt "a red apple on a wooden table" --size 1024x1024 -o apple.png
+moss-infer-vulkan --list-devices
 ```
 
-`--vulkan-device N` picks a device (default: the first usable one, a discrete GPU first). `--vulkan-kernels coop|plain`
-picks the kernels (default: `coop` where the device has them). The device and kernels are printed at the start of
-every run.
+The flags are those of `moss-infer generate` that the backend runs, with the same defaults (`--negative`, `--size`,
+`--width`, `--height`, `--steps`, `--cfg`, `--shift`, `--seed`, `--skip-layers`, `--max-seq`, `--latent-out`,
+`--no-metadata`, `--quiet`; `--tier` accepts `reference`). `--device N` picks a device (default: the first usable one, a
+discrete GPU first) and `--kernels coop|plain` the kernels (default: `coop` where the device has them); both are printed
+at the start of every run. Progress goes to stderr one line per event: `text encoder`, `denoise <step>/<steps>
+<seconds>`, `vae`, then a `done:` summary. The exit status is 0 on success, 2 for a usage error or an unsupported
+request, 1 for any other failure.
 
 ## Kernels
 
@@ -52,19 +57,22 @@ Against the official PyTorch pipeline's golden data at 1024x1024 (`tests/golden/
 Whole images keep the composition and the text but not the pixels: 50 sampling steps magnify any difference. The
 golden 1024x1024 case through `moss-infer` ends with a final latent at cosine 0.974 to the official pipeline's (the CUDA
 backend: 0.992, being nearly bit-identical to torch op by op) and an image at 30.8 dB PSNR. That is the sampler's
-sensitivity, not an error of the backend: the same Vulkan steps run on torch's own text embeddings instead of the Vulkan
+sensitivity, not an error of the backend: the same Vulkan steps on torch's own text embeddings instead of the Vulkan
 encoder's (cosine 0.9998 apart, about torch's own variation when one of its kernels changes) end 0.971 apart from each
-other. A 512x512, 20-step image with seed 7 is 45.97 dB PSNR from the CUDA backend's image of the same command.
+other. A 512x512, 20-step image with seed 7 is 32.9 dB PSNR from the CUDA engine's image of the same command: the same apple,
+details redrawn.
 
 ## Building
 
-The backend is off by default. It needs Vulkan headers that define `VK_KHR_shader_bfloat16` and a `glslc` that compiles
-`GL_EXT_bfloat16`, as in a current Vulkan SDK. The binaries load the Vulkan loader at run time, so a build with the
-backend still starts on a machine without Vulkan and only `--backend vulkan` reports it missing.
+`vulkan/` is its own CMake project and needs no CUDA: Vulkan headers that define `VK_KHR_shader_bfloat16` and a `glslc`
+that compiles `GL_EXT_bfloat16`, as in the Vulkan SDK 1.4.357 the release builds use. The program opens the Vulkan
+loader at run time, so it links nothing of Vulkan.
 
 ```sh
-cmake --preset linux-cuda13 -DMOSSINFER_VULKAN=ON
-cmake --build --preset linux-cuda13
+cmake -S vulkan -B build-vulkan -G Ninja -DMOSSINFER_VULKAN_TOOLS=OFF
+cmake --build build-vulkan
+cpack --config build-vulkan/CPackConfig.cmake -B build-vulkan
 ```
 
-The backend's own checks and benchmarks build from `vulkan/` alone, without CUDA; see [vulkan/README.md](../vulkan/README.md).
+With the tools on (the default) it also builds the backend's checks and benchmarks; see
+[vulkan/README.md](../vulkan/README.md).

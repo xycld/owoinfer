@@ -1,9 +1,9 @@
 # Vulkan backend
 
-The fallback for GPUs the CUDA engine does not support: `moss-infer generate --backend vulkan` (user guide:
-[docs/vulkan.md](../docs/vulkan.md)). CUDA stays the path on every GPU it supports. This directory builds on its own,
-without CUDA, for the backend's checks and benchmarks; the engine builds it in with `-DMOSSINFER_VULKAN=ON`
-(`cmake/modules/vulkan.cmake`, tools off).
+The fallback for GPUs the CUDA engine does not support: `moss-infer-vulkan`, a standalone program built from this
+directory without CUDA (user guide: [docs/vulkan.md](../docs/vulkan.md)). CUDA stays the path on every GPU it supports.
+The program compiles in the engine's host sources it shares with `moss-infer` (tokenizer, initial noise, schedule, PNG
+writer); the engine's own build does not include this directory.
 
 Every model runs on one of two kernel paths, chosen per device and reported:
 
@@ -124,4 +124,5 @@ At 4112 tokens on the cooperative-matrix path the GEMMs take 5.6 s of the 7.2 s,
 | `gemm.h`, `gemm.cpp` | the standalone f16 GEMM of the first bring-up (`vulkan_check`) |
 | `safetensors.h`, `npy.h`, `half.h` | readers and conversions |
 | `shaders/` | compute shaders |
+| `tools/moss_infer_vulkan.cpp` | the program |
 | `tools/` | checks and benchmarks |
