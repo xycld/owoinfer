@@ -1,0 +1,117 @@
+# Reusable build of moss-infer-vulkan, the standalone Vulkan program (vulkan/), called by ci.yml and release.yml. Per
+# platform: the pinned Vulkan SDK (headers and glslc, checked against LunarG's SHA-256), configure and build vulkan/,
+# the CPack archive. On Linux also the backend's checks, run on lavapipe (Mesa's CPU Vulkan driver: the plain kernels)
+# with the Khronos validation layer from the SDK, since hosted runners have no GPU. No CUDA is involved.
+name: build-vulkan
+
+on:
+  workflow_call:
+    inputs:
+      retention-days:
+        description: Days to keep the uploaded packages
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+
+env:
+  VULKAN_SDK_VERSION: 1.4.357.0
+
+jobs:
+  vulkan:
+    name: ${{ matrix.platform }}-vulkan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+            sdk_sha256: 0f09bf6a0625e346bf004be70b92907e934a4c76606b323441b2baf3a5a0e66d
+          - os: windows-2022
+            platform: windows
+            sdk_sha256: 81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: lukka/get-cmake@fffaaafeea488556c2c12dad60690008bc1caacb # v4.4.2
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        if: matrix.platform == 'windows'
+
+      - name: Toolchain and lavapipe (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-12 zlib1g-dev mesa-vulkan-drivers libvulkan1
+          sudo apt-get clean
+          echo "CXX=g++-12" >> "$GITHUB_ENV"
+
+      - name: Vulkan SDK (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          f="vulkansdk-linux-x86_64-$VULKAN_SDK_VERSION.tar.xz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$f" "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/linux/$f"
+          echo "${{ matrix.sdk_sha256 }}  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/vulkan-sdk"
+          tar -xJf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/vulkan-sdk"
+          sdk="$RUNNER_TEMP/vulkan-sdk/$VULKAN_SDK_VERSION/x86_64"
+          echo "VULKAN_SDK=$sdk" >> "$GITHUB_ENV"
+          echo "$sdk/bin" >> "$GITHUB_PATH"
+          "$sdk/bin/glslc" --version
+
+      - name: Vulkan SDK (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $f = "vulkansdk-windows-X64-$env:VULKAN_SDK_VERSION.exe"
+          $exe = Join-Path $env:RUNNER_TEMP $f
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/$f" -OutFile $exe
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
+          if ($hash -ne "${{ matrix.sdk_sha256 }}") { throw "SHA-256 mismatch: $hash" }
+          $root = Join-Path $env:RUNNER_TEMP "VulkanSDK"
+          Start-Process -FilePath $exe -Wait -NoNewWindow -ArgumentList @("--root", $root, "--accept-licenses", "--default-answer", "--confirm-command", "install")
+          "VULKAN_SDK=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$root\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & "$root\Bin\glslc.exe" --version
+
+      - name: Configure
+        shell: bash
+        run: |
+          tools=OFF
+          extra=""
+          if [ "${{ matrix.platform }}" = linux ]; then tools=ON; extra="-DMOSSINFER_STATIC_LIBSTDCXX=ON"; fi
+          cmake -S vulkan -B build-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release -DMOSSINFER_VULKAN_TOOLS=$tools $extra
+
+      - name: Build
+        run: cmake --build build-vulkan
+
+      - name: Checks on lavapipe (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          export VK_DRIVER_FILES="$(ls /usr/share/vulkan/icd.d/lvp_icd.*.json | head -n 1)"
+          export VK_LAYER_PATH="$VULKAN_SDK/share/vulkan/explicit_layer.d"
+          export LD_LIBRARY_PATH="$VULKAN_SDK/lib"
+          export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
+          build-vulkan/moss-infer-vulkan --list-devices
+          build-vulkan/vulkan_block_check --no-block
+          build-vulkan/vulkan_te_kernel_check
+          build-vulkan/vulkan_vae_check --kat-only
+
+      - name: Package
+        shell: bash
+        run: |
+          cd build-vulkan
+          cpack
+          ls -l mossinfer-*-vulkan-*
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mossinfer-vulkan-${{ matrix.platform }}
+          path: |
+            build-vulkan/mossinfer-*-vulkan-*.zip
+            build-vulkan/mossinfer-*-vulkan-*.tar.gz
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: error
