@@ -1,4 +1,5 @@
-# Standalone: the engine's CMakeLists.txt does not know this directory. Configure once per target (README.md).
+# Standalone: the engine's CMakeLists.txt does not know this directory. Configure once per target (README.md). The kernels
+# are the HIP backend's (../../hip); this project builds its checks against them.
 #   -DHIP_BLOCK_TARGET=gfx1100|gfx1200|gfx1201  rocWMMA leaf, ROCm's clang, links libamdhip64
 #   -DHIP_BLOCK_TARGET=nvidia           scalar leaf, nvcc with HIP's NVIDIA headers; adds the engine comparison test
 cmake_minimum_required(VERSION 3.28)
@@ -18,6 +19,9 @@ if(HIP_BLOCK_TARGET MATCHES "^gfx")
 endif()
 
 project(hip_block LANGUAGES CXX)
+
+get_filename_component(HIP_BACKEND_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../hip" ABSOLUTE)
+set(HIP_BLOCK_SRC ${HIP_BACKEND_DIR}/block_kernels.hip)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -39,11 +43,11 @@ if(HIP_BLOCK_TARGET STREQUAL "nvidia")
   find_package(CUDAToolkit REQUIRED)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-  set_source_files_properties(block_kernels.hip verify_kernels.cu PROPERTIES LANGUAGE CUDA)
+  set_source_files_properties(${HIP_BLOCK_SRC} verify_kernels.cu PROPERTIES LANGUAGE CUDA)
 
-  add_library(hip_block_kernels OBJECT block_kernels.hip verify_kernels.cu)
+  add_library(hip_block_kernels OBJECT ${HIP_BLOCK_SRC} verify_kernels.cu)
   target_compile_definitions(hip_block_kernels PUBLIC __HIP_PLATFORM_NVIDIA__=1)
-  target_include_directories(hip_block_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(hip_block_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${HIP_BACKEND_DIR})
   target_include_directories(hip_block_kernels SYSTEM PUBLIC ${ROCM_PATH}/include ${CUDAToolkit_INCLUDE_DIRS})
   target_compile_options(hip_block_kernels PRIVATE -Xcompiler=-Wall)
 
@@ -70,20 +74,20 @@ if(HIP_BLOCK_TARGET STREQUAL "nvidia")
 else()
   set(HIP_BLOCK_HIP_FLAGS --rocm-path=${ROCM_PATH} --hip-path=${ROCM_PATH} --offload-arch=${HIP_BLOCK_TARGET})
 
-  add_executable(hip_block_bench bench.cpp block_kernels.hip)
-  set_source_files_properties(block_kernels.hip PROPERTIES LANGUAGE CXX)
+  add_executable(hip_block_bench bench.cpp ${HIP_BLOCK_SRC})
+  set_source_files_properties(${HIP_BLOCK_SRC} PROPERTIES LANGUAGE CXX)
   target_compile_definitions(hip_block_bench PRIVATE __HIP_PLATFORM_AMD__=1 HIP_BLOCK_LEAF_ROCWMMA
                                                      HIP_BLOCK_TARGET_NAME="${HIP_BLOCK_TARGET}")
-  target_include_directories(hip_block_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(hip_block_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${HIP_BACKEND_DIR})
   target_include_directories(hip_block_bench SYSTEM PRIVATE ${ROCM_PATH}/include)
   set_property(SOURCE bench.cpp PROPERTY COMPILE_OPTIONS ${HIP_BLOCK_WARN})
-  set_property(SOURCE block_kernels.hip PROPERTY COMPILE_OPTIONS -x hip -std=c++17 ${HIP_BLOCK_HIP_FLAGS} ${HIP_BLOCK_WARN})
+  set_property(SOURCE ${HIP_BLOCK_SRC} PROPERTY COMPILE_OPTIONS -x hip -std=c++17 ${HIP_BLOCK_HIP_FLAGS} ${HIP_BLOCK_WARN})
   target_link_options(hip_block_bench PRIVATE -L${ROCM_PATH}/lib -Wl,-rpath,${ROCM_PATH}/lib)
   target_link_libraries(hip_block_bench PRIVATE amdhip64)
 
-  add_executable(hip_block_replay replay.cpp block_kernels.hip)
+  add_executable(hip_block_replay replay.cpp ${HIP_BLOCK_SRC})
   target_compile_definitions(hip_block_replay PRIVATE __HIP_PLATFORM_AMD__=1 HIP_BLOCK_LEAF_ROCWMMA)
-  target_include_directories(hip_block_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(hip_block_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${HIP_BACKEND_DIR})
   target_include_directories(hip_block_replay SYSTEM PRIVATE ${ROCM_PATH}/include)
   set_property(SOURCE replay.cpp PROPERTY COMPILE_OPTIONS ${HIP_BLOCK_WARN})
   target_link_options(hip_block_replay PRIVATE -L${ROCM_PATH}/lib -Wl,-rpath,${ROCM_PATH}/lib)
@@ -91,10 +95,9 @@ else()
 
   # The device build on its own: the assembly and linked code object that check_device.sh reads.
   set(HIP_BLOCK_DEVICE_ARGS -x hip -std=c++17 -O3 ${HIP_BLOCK_HIP_FLAGS} --cuda-device-only -D__HIP_PLATFORM_AMD__=1
-      -DHIP_BLOCK_LEAF_ROCWMMA -I${CMAKE_CURRENT_SOURCE_DIR} -isystem ${ROCM_PATH}/include)
-  set(HIP_BLOCK_SRC ${CMAKE_CURRENT_SOURCE_DIR}/block_kernels.hip)
-  set(HIP_BLOCK_DEPS ${HIP_BLOCK_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/mma_leaf.h ${CMAKE_CURRENT_SOURCE_DIR}/device_math.h
-      ${CMAKE_CURRENT_SOURCE_DIR}/hip_block.h)
+      -DHIP_BLOCK_LEAF_ROCWMMA -I${HIP_BACKEND_DIR} -isystem ${ROCM_PATH}/include)
+  set(HIP_BLOCK_DEPS ${HIP_BLOCK_SRC} ${HIP_BACKEND_DIR}/mma_leaf.h ${HIP_BACKEND_DIR}/device_math.h
+      ${HIP_BACKEND_DIR}/hip_block.h ${HIP_BACKEND_DIR}/gemm_tile.h)
   add_custom_command(OUTPUT block_kernels.s DEPENDS ${HIP_BLOCK_DEPS}
     COMMAND ${CMAKE_CXX_COMPILER} ${HIP_BLOCK_DEVICE_ARGS} -S -o block_kernels.s ${HIP_BLOCK_SRC}
     COMMENT "Device assembly for ${HIP_BLOCK_TARGET}")
@@ -102,6 +105,6 @@ else()
     COMMAND ${CMAKE_CXX_COMPILER} ${HIP_BLOCK_DEVICE_ARGS} --no-gpu-bundle-output -o block_kernels.co ${HIP_BLOCK_SRC}
     COMMENT "Device code object for ${HIP_BLOCK_TARGET}")
   add_custom_target(hip_block_device_check ALL
-    COMMAND ${CMAKE_COMMAND} -E env --unset=HIP_BLOCK_WMMA_COUNTS sh ${CMAKE_CURRENT_SOURCE_DIR}/check_device.sh ${ROCM_PATH}/lib/llvm/bin ${HIP_BLOCK_TARGET} block_kernels.s block_kernels.co
+    COMMAND ${CMAKE_COMMAND} -E env --unset=HIP_BLOCK_WMMA_COUNTS sh ${HIP_BACKEND_DIR}/check_device.sh ${ROCM_PATH}/lib/llvm/bin ${HIP_BLOCK_TARGET} block_kernels.s block_kernels.co
     DEPENDS block_kernels.s block_kernels.co VERBATIM)
 endif()

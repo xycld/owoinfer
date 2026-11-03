@@ -1,5 +1,6 @@
 #!/bin/sh
-# Static check of an AMD device build, from its assembly and linked code object:
+# Static check of an AMD device build of one kernel source (block_kernels.hip, dit_kernels.hip), from its assembly and
+# linked code object:
 #   check_device.sh <llvm bin dir> <arch> <file.s> <code object>
 # Prints each kernel's v_wmma_f32_16x16x16_bf16 count and resources, and the code object's undefined symbols. Fails if
 # there are undefined symbols, if a kernel's name is not one of the kernels below or its WMMA count is not the one listed
@@ -49,6 +50,12 @@ esac
     want["void " ns "gemm_kernel<(" ns "Epilogue)1>(" ns "GemmArgs)"] = 12
     want[ns "gemm_situ_kernel(" ns "GemmArgs)"] = 12
     want[ns "attention_kernel(" ns "AttnArgs)"] = attention
+    # dit_kernels.hip: the bias epilogues of the same GEMM kernel, the text refiner norm, SiLU and SiTU-GLU.
+    want["void " ns "gemm_kernel<(" ns "Epilogue)2>(" ns "GemmArgs)"] = 12
+    want["void " ns "gemm_kernel<(" ns "Epilogue)3>(" ns "GemmArgs)"] = 12
+    want[ns "rms_norm_kernel(" ns "PlainNormArgs)"] = 0
+    want[ns "silu_kernel(" ns "UnaryArgs)"] = 0
+    want[ns "situ_glu_kernel(" ns "SituGluArgs)"] = 0
   }
   /^[^ \t.#;].*:[ \t]*(;.*)?$/ { name = $0; sub(/:[ \t]*(;.*)?$/, "", name); current = name }
   /v_wmma_f32_16x16x16_bf16/ { wmma[current]++; total++ }

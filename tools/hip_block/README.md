@@ -2,6 +2,8 @@
 
 A standalone HIP port of the bf16 exact path of one MOSS DiT block (`src/models/moss_dit/dit_block_fused.h`): RMSNorm with modulation, the QKV GEMM, per-head QK norm + RoPE, varlen joint attention (head_dim 128, non-causal, fp32 online softmax, bf16 in and out), and the gated-residual and SiTU-GLU GEMMs. It does not use the engine's HAL and the main build does not know this directory.
 
+The kernels are the HIP backend's and live in [`hip/`](../../hip/README.md): `block_kernels.hip`, the GEMM walk and GEMM kernel it shares with the backend's other kernels (`gemm_tile.h`), `mma_leaf.h`, `device_math.h`, `hip_block.h` and `check_device.sh`. This directory holds their checks (bench, replay, verify) and builds them against those sources.
+
 One kernel source, `block_kernels.hip`, builds three ways. They differ in the leaf in `mma_leaf.h`, a 16x16x16 bf16 multiply with fp32 accumulators:
 
 | Target | Compiler | Leaf |
@@ -10,7 +12,7 @@ One kernel source, `block_kernels.hip`, builds three ways. They differ in the le
 | `gfx1200`, `gfx1201` (RDNA4) | ROCm clang | rocWMMA, `v_wmma_f32_16x16x16_bf16` |
 | `nvidia` | nvcc with HIP's NVIDIA headers | scalar: the exact bf16*bf16 product in fp32, then add, K ascending |
 
-All kernels launch workgroups of 32 threads (`dim3(32,1,1)`): one wave on AMD, one warp on NVIDIA. Fragments load straight from global memory. `__shared__` memory holds what must cross lanes: accumulators on their way out and through the softmax's per-row rescale, per-row reductions, the RoPE pairing, and zero-padded copies of tails that end inside a fragment. Tile sizes are the named constants at the top of `block_kernels.hip`. `kAttnStepN` is part of the numerics, as it sets where softmax weights are rounded; 32 is the tile the engine runs on sm_89.
+All kernels launch workgroups of 32 threads (`dim3(32,1,1)`): one wave on AMD, one warp on NVIDIA. Fragments load straight from global memory. `__shared__` memory holds what must cross lanes: accumulators on their way out and through the softmax's per-row rescale, per-row reductions, the RoPE pairing, and zero-padded copies of tails that end inside a fragment. Tile sizes are the named constants at the top of `gemm_tile.h` (GEMM) and `block_kernels.hip` (SiTU, attention). `kAttnStepN` is part of the numerics, as it sets where softmax weights are rounded; 32 is the tile the engine runs on sm_89.
 
 ## Building
 

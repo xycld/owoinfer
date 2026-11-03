@@ -62,5 +62,15 @@ __device__ __forceinline__ float rsqrt(float x) { return rsqrtf(x); }
 
 // torch: 1 / (1 + exp(-x)) in fp32 with IEEE division.
 __device__ __forceinline__ float sigmoid_f32(float x) { return div(1.0f, add(1.0f, expf(-x))); }
+// torch's SiLU: x / (1 + exp(-x)) in fp32 with IEEE division.
+__device__ __forceinline__ float silu_f32(float x) { return div(x, add(1.0f, expf(-x))); }
+
+// MOSS _situ (P:66-67) on bf16 values: the bf16 gate factor of g times the bf16 hidden factor of h, in fp32.
+__device__ __forceinline__ float situ_value(float h, float g) {
+  constexpr float kInv25 = 1.0f / 25.0f;  // torch divides by a CPU scalar as a multiply by its fp32 reciprocal
+  const float left = rbf(mul(rbf(mul(4.0f, rbf(tanhf(rbf(mul(g, 0.25f)))))), rbf(sigmoid_f32(g))));
+  const float right = rbf(mul(25.0f, rbf(tanhf(rbf(mul(h, kInv25))))));
+  return mul(left, right);
+}
 
 }  // namespace hip_block::detail
