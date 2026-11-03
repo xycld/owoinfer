@@ -49,7 +49,12 @@ Against the official PyTorch pipeline's golden data at 1024x1024 (`tests/golden/
 | DiT, step 0 prediction | cosine 0.999976 (cond), 0.999983 (uncond); the CUDA engine's test asks for 0.99988 |
 | VAE decode of the golden latent | PSNR 69.4 dB against the golden PNG, 99.25 % identical bytes, max difference 1 |
 
-A 512x512, 20-step image with seed 7 is 45.97 dB PSNR from the CUDA backend's image of the same command.
+Whole images keep the composition and the text but not the pixels: 50 sampling steps magnify any difference. The
+golden 1024x1024 case through `moss-infer` ends with a final latent at cosine 0.974 to the official pipeline's (the CUDA
+backend: 0.992, being nearly bit-identical to torch op by op) and an image at 30.8 dB PSNR. That is the sampler's
+sensitivity, not an error of the backend: the same Vulkan steps run on torch's own text embeddings instead of the Vulkan
+encoder's (cosine 0.9998 apart, about torch's own variation when one of its kernels changes) end 0.971 apart from each
+other. A 512x512, 20-step image with seed 7 is 45.97 dB PSNR from the CUDA backend's image of the same command.
 
 ## Building
 
