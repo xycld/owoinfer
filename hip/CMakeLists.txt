@@ -37,10 +37,10 @@ endif()
 list(APPEND MI_HIP_WARN -ffp-contract=off)
 
 # Kernel sources. block_kernels.hip is the DiT block (tools/hip_block checks it against the engine); dit_kernels.hip the
-# DiT's other ops.
-set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip)
-set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h)
-set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp)
+# DiT's other ops; vae_kernels.hip the VAE decoder's.
+set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip vae_kernels.hip)
+set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h vae_kernels.h)
+set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp vae.cpp)
 
 if(HIP_TARGET STREQUAL "nvidia")
   set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures of the NVIDIA build")
@@ -118,3 +118,9 @@ target_link_libraries(hip_dit_kernel_check PRIVATE mossinfer_hip)
 add_executable(hip_dit_run tools/hip_dit_run.cpp)
 target_compile_options(hip_dit_run PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_dit_run PRIVATE mossinfer_hip)
+
+# The VAE decoder's kernels against host replays, then golden latents against the reference pipeline's PNGs (zlib).
+find_package(ZLIB REQUIRED)
+add_executable(hip_vae_check tools/hip_vae_check.cpp)
+target_compile_options(hip_vae_check PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_vae_check PRIVATE mossinfer_hip ZLIB::ZLIB)

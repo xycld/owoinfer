@@ -1,5 +1,5 @@
 #!/bin/sh
-# Static check of an AMD device build of one kernel source (block_kernels.hip, dit_kernels.hip), from its assembly and
+# Static check of an AMD device build of one kernel source (block_kernels.hip, dit_kernels.hip, vae_kernels.hip), from its assembly and
 # linked code object:
 #   check_device.sh <llvm bin dir> <arch> <file.s> <code object>
 # Prints each kernel's v_wmma_f32_16x16x16_bf16 count and resources, and the code object's undefined symbols. Fails if
@@ -19,7 +19,9 @@ code_object=$4
 
 # WMMA instructions per kernel as ROCm 7.2.4's clang emits this source: the GEMM and SiTU kernels 6 on each path, packed
 # and row-major; attention 16 in its packed score walk and the rest in the row-major walk and P x V, unrolled further on
-# gfx1100. A change of source or compiler that moves them must update this table.
+# gfx1100. vae_kernels.hip's, the same on every target: a convolution's K step is 2 x 3 fragments times its piece products
+# (4 TF32, 3 TF32 without lo x lo, 9 fp32), piece_gemm's 2 x 6 fragments times 6. A change of source or compiler that
+# moves them must update this table.
 case $arch in
   gfx1100) attention=48 ;;
   gfx1200 | gfx1201) attention=34 ;;
@@ -56,6 +58,26 @@ esac
     want[ns "rms_norm_kernel(" ns "PlainNormArgs)"] = 0
     want[ns "silu_kernel(" ns "UnaryArgs)"] = 0
     want[ns "situ_glu_kernel(" ns "SituGluArgs)"] = 0
+    # vae_kernels.hip: the VAE decoder convolutions and linears, attention, GroupNorm and the pipeline ends.
+    vs = "hip_vae::(anonymous namespace)::"
+    conv = "(" vs "ConvKernelArgs)"
+    want["void " vs "conv_kernel<1, false, 4>" conv] = 24
+    want["void " vs "conv_kernel<1, false, 3>" conv] = 18
+    want["void " vs "conv_kernel<9, false, 4>" conv] = 24
+    want["void " vs "conv_kernel<9, false, 3>" conv] = 18
+    want["void " vs "conv_kernel<9, true, 4>" conv] = 24
+    want["void " vs "conv_kernel<9, true, 3>" conv] = 18
+    want["void " vs "conv_kernel<1, false, 9>" conv] = 54
+    want[vs "piece_gemm_kernel(" vs "PieceGemmArgs)"] = 72
+    want[vs "conv_narrow_kernel(" vs "NarrowArgs)"] = 0
+    want["void " vs "split_pack_kernel<true>(" vs "SplitArgs)"] = 0
+    want["void " vs "split_pack_kernel<false>(" vs "SplitArgs)"] = 0
+    want[vs "softmax_pack_kernel(" vs "SoftmaxArgs)"] = 0
+    want[vs "gn_accumulate_kernel(" vs "GnAccumArgs)"] = 0
+    want[vs "gn_finalize_kernel(" vs "GnFinalizeArgs)"] = 0
+    want[vs "gn_apply_kernel(" vs "GnApplyArgs)"] = 0
+    want[vs "latent_unpack_kernel(" vs "UnpackArgs)"] = 0
+    want[vs "rgb8_kernel(" vs "Rgb8Args)"] = 0
   }
   /^[^ \t.#;].*:[ \t]*(;.*)?$/ { name = $0; sub(/:[ \t]*(;.*)?$/, "", name); current = name }
   /v_wmma_f32_16x16x16_bf16/ { wmma[current]++; total++ }

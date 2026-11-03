@@ -19,12 +19,15 @@ A binary runs only on its target's ISA. Every kernel launches workgroups of one 
 | `mma_leaf.h`, `device_math.h` | The 16x16x16 leaf, and the bf16 conversions and rounded fp32 operations every kernel uses. |
 | `runtime.h` | `mi::hip`: device listing and choice, device and pinned host buffers, streams, events, error checks. |
 | `safetensors.h`, `npy.h`, `half.h` | Host-only: the safetensors reader (one file or a sharded directory), the `.npy` reader and writer of the checks, fp16/bf16 conversions. |
+| `vae.h`, `vae.cpp` | The FLUX.2 VAE decoder at the engine's reference precision: the final latents [128, h, w] to RGB8 [16h, 16w, 3]. `workspace_bytes(h, w)` is its device memory (1.50 GiB at 1024x1024, 3.04 GiB at 1456x1456, 6.02 GiB at 2048x2048, plus 113 MB of weights); `decode()` refuses a size the device cannot hold, or past the kernels' limits, before it runs. |
+| `vae_kernels.h`, `vae_kernels.hip` | The decoder's kernels. The products run on the bf16 leaf over bf16 pieces of the fp32 operands, whose products are exact: the convolutions multiply the TF32-rounded operands exactly (2 pieces each), the attention's linears the fp32 operands (3 each), the attention's scores and P V are fp32-accurate; GroupNorm uses the engine's exact statistics. |
 | `check_device.sh` | Static check of an AMD device build from its assembly and code object (below). |
 | `tools/hip_check.cpp` | The runtime's smoke test. |
+| `tools/hip_vae_check.cpp` | The VAE: each kernel against host replays, golden latents against the reference pipeline's PNGs (PSNR, identical bytes), non-square decodes against a host replay of the whole decoder, the size limits. Needs zlib. |
 
 ## Building
 
-`ROCM_PATH` is the ROCm root holding `include/hip` and `lib/llvm`, as a CMake cache variable or in the environment.
+`ROCM_PATH` is the ROCm root holding `include/hip` and `lib/llvm`, as a CMake cache variable or in the environment. `tools/hip_vae_check` also needs zlib (`zlib1g-dev` or `zlib-devel`).
 
 ```sh
 cmake -S hip -B build-hip-gfx1200 -G Ninja -DHIP_TARGET=gfx1200   # gfx1100, gfx1201 likewise
