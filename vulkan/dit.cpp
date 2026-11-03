@@ -65,7 +65,7 @@ std::vector<std::uint16_t> rope_table(std::uint32_t height, std::uint32_t width,
 
 Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::path& transformer_dir, const DitOptions& options)
     : device_(device), kernels_(kernels) {
-  max_gflop_ = options.submit_gflop > 0 ? options.submit_gflop : kernels.path() == BlockPath::kCoop ? 200.0 : 20.0;
+  max_gflop_ = options.submit_gflop > 0 ? options.submit_gflop : kernels.path() != BlockPath::kPlain ? 200.0 : 20.0;
   const st::Index index(transformer_dir);
   std::vector<std::byte> host;
   // Places tensors in one new buffer, each at a 256-byte aligned offset, and uploads them (or, for a host buffer, reads

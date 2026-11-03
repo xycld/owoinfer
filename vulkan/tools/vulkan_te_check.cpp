@@ -3,7 +3,7 @@
 // with them: cosine over the sequence, worst row cosine, row relative L2, share of identical bf16 bits, worst bf16 ULPs
 // scaled to max(|golden|, rms(golden) / 64), NaN count. The cond and uncond prompts of a case are encoded in one call;
 // --iters repeats the call for timing; --profile submits each op alone and prints seconds per kind of op. Exit status:
-// 0 ran without NaN, 1 otherwise. Usage: vulkan_te_check [--device N] [--path coop|plain] [--weights DIR] [--golden
+// 0 ran without NaN, 1 otherwise. Usage: vulkan_te_check [--device N] [--path coop|coop-f16|plain] [--weights DIR] [--golden
 // DIR] [--case ID]... [--iters N] [--profile]
 #include <algorithm>
 #include <cmath>
@@ -102,21 +102,21 @@ int main(int argc, char** argv) {
       iters = std::max(1, std::atoi(argv[++i]));
     } else {
       std::printf(
-          "usage: %s [--device N] [--path coop|plain] [--weights DIR] [--golden DIR] [--case ID]... [--iters N] "
+          "usage: %s [--device N] [--path coop|coop-f16|plain] [--weights DIR] [--golden DIR] [--case ID]... [--iters N] "
           "[--profile]\n",
           argv[0]);
       return 2;
     }
   }
   if (cases.empty()) cases.emplace_back("g_fridge_1024");
-  if (!path_name.empty() && path_name != "coop" && path_name != "plain") {
-    std::printf("--path takes coop or plain\n");
+  if (!path_name.empty() && path_name != "coop" && path_name != "coop-f16" && path_name != "plain") {
+    std::printf("--path takes coop, coop-f16 or plain\n");
     return 2;
   }
   try {
     Device device(device_index);
-    const BlockPath path = path_name.empty() ? (device.info().caps.coop_bf16 ? BlockPath::kCoop : BlockPath::kPlain)
-                                             : (path_name == "coop" ? BlockPath::kCoop : BlockPath::kPlain);
+    const BlockPath path =
+        path_name.empty() ? default_block_path(device.info().caps) : block_path_from_name(path_name);
     TextEncoder encoder(device, weights, path, options);
     std::printf("device %u: %s, path %s\n", device.info().index, device.info().name.c_str(),
                 block_path_name(encoder.path()));

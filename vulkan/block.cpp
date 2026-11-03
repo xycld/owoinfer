@@ -29,11 +29,28 @@ const std::uint32_t kAttentionSpirv[] = {
 const std::uint32_t kAttentionCoopSpirv[] = {
 #include "attention_coop.spv.inc"
 };
+const std::uint32_t kGemmCoopF16Spirv[] = {
+#include "gemm_f16_coop.spv.inc"
+};
+const std::uint32_t kAttentionCoopF16Spirv[] = {
+#include "attention_f16_coop.spv.inc"
+};
+const std::uint32_t kRowScaleSpirv[] = {
+#include "row_scale.spv.inc"
+};
 
 struct GemmPush {
   std::uint64_t a, b, out, gate;
   std::uint32_t m, n, k, lda, ldb, ldo;
+  std::uint64_t a_exponents, b_exponents;  // kCoopF16 only: per row of A and of B
 };
+struct RowScalePush {
+  std::uint64_t a, exponents;
+  std::uint32_t m, k, lda;
+  std::uint32_t pad = 0;  // sizeof is pushed: no indeterminate bytes
+};
+constexpr std::uint32_t kRowScaleRows = 8;         // rows per row_scale.comp workgroup
+constexpr std::uint32_t kMaxF16GemmRows = 1u << 20;  // rows of A, and of B, that row_exponents_ holds
 struct NormPush {
   std::uint64_t x, weight, scale, shift, out;
   std::uint32_t ldx, ldo, d;
@@ -68,6 +85,10 @@ std::unique_ptr<Pipeline> gemm_pipeline(Device& device, BlockPath path, GemmMode
     return std::make_unique<Pipeline>(device, kGemmCoopSpirv, sizeof(kGemmCoopSpirv), sizeof(GemmPush), kCoopSubgroup,
                                       std::vector<std::uint32_t>{m});
   }
+  if (path == BlockPath::kCoopF16) {
+    return std::make_unique<Pipeline>(device, kGemmCoopF16Spirv, sizeof(kGemmCoopF16Spirv), sizeof(GemmPush),
+                                      kCoopSubgroup, std::vector<std::uint32_t>{m});
+  }
   return std::make_unique<Pipeline>(device, kGemmSpirv, sizeof(kGemmSpirv), sizeof(GemmPush), 0,
                                     std::vector<std::uint32_t>{1u, m});
 }
@@ -78,34 +99,79 @@ void require(bool condition, const std::string& message) {
 
 constexpr std::uint32_t kGemmTileRows = 128, kGemmTileCols = 128;
 
-void dispatch_gemm(const Pipeline& pipeline, BlockPath path, GemmMode mode, VkCommandBuffer cb, const GemmPush& push) {
-  const std::uint32_t align = path == BlockPath::kCoop ? 8 : 4;
-  require(push.m > 0 && push.n > 0 && push.k > 0, "bad GEMM shape");
-  require(push.n % align == 0 && push.k % align == 0 && push.lda % align == 0 && push.ldb % align == 0 &&
-              push.ldo % align == 0,
+bool is_coop(BlockPath path) { return path != BlockPath::kPlain; }
+
+}  // namespace
+
+const char* block_path_name(BlockPath path) {
+  switch (path) {
+    case BlockPath::kCoop: return "coop";
+    case BlockPath::kCoopF16: return "coop-f16";
+    case BlockPath::kPlain: return "plain";
+  }
+  return "?";
+}
+
+BlockPath block_path_from_name(const std::string& name) {
+  if (name == "coop") return BlockPath::kCoop;
+  if (name == "coop-f16") return BlockPath::kCoopF16;
+  if (name == "plain") return BlockPath::kPlain;
+  throw std::invalid_argument("kernels must be coop, coop-f16 or plain, not \"" + name + "\"");
+}
+
+BlockPath default_block_path(const Capabilities& caps) {
+  return caps.coop_bf16 ? BlockPath::kCoop : caps.coop_f16 ? BlockPath::kCoopF16 : BlockPath::kPlain;
+}
+
+std::string no_coop_reason(const Capabilities& caps) {
+  if (caps.coop_bf16 || caps.coop_f16) return {};
+  if (caps.coop_bf16_reason == caps.coop_f16_reason) return caps.coop_bf16_reason;
+  return "bf16: " + caps.coop_bf16_reason + "; f16: " + caps.coop_f16_reason;
+}
+
+void BlockKernels::dispatch_gemm(const Pipeline& pipeline, std::uint32_t mode, VkCommandBuffer cb, VkDeviceAddress a,
+                                 VkDeviceAddress b, VkDeviceAddress out, VkDeviceAddress gate, std::uint32_t m,
+                                 std::uint32_t n, std::uint32_t k, std::uint32_t lda, std::uint32_t ldb,
+                                 std::uint32_t ldo) const {
+  const std::uint32_t align = is_coop(path_) ? 8 : 4;
+  require(m > 0 && n > 0 && k > 0, "bad GEMM shape");
+  require(n % align == 0 && k % align == 0 && lda % align == 0 && ldb % align == 0 && ldo % align == 0,
           "GEMM N, K and strides must be multiples of " + std::to_string(align));
-  if (path == BlockPath::kCoop) {
+  GemmPush push{a, b, out, gate, m, n, k, lda, ldb, ldo, 0, 0};
+  if (path_ == BlockPath::kCoopF16) {
+    const std::uint32_t b_rows = mode == kSitu ? 2 * n : n;
+    require(m <= kMaxF16GemmRows && b_rows <= kMaxF16GemmRows,
+            "GEMM M and N must be at most " + std::to_string(kMaxF16GemmRows) + " on coop-f16");
+    push.a_exponents = row_exponents_->address();
+    push.b_exponents = push.a_exponents + VkDeviceAddress{kMaxF16GemmRows} * 4;
+    for (const RowScalePush& scale : {RowScalePush{a, push.a_exponents, m, k, lda}, RowScalePush{b, push.b_exponents, b_rows, k, ldb}}) {
+      const std::uint32_t groups = (scale.m + kRowScaleRows - 1) / kRowScaleRows, x = std::min<std::uint32_t>(groups, 65535);
+      row_scale_->dispatch(cb, &scale, x, (groups + x - 1) / x);
+    }
+    compute_barrier(cb);
+  }
+  if (is_coop(path_)) {
     // The shader numbers tiles y * x_count + x and walks them in bands of N tiles.
     const std::uint32_t cols = mode == kSitu ? kCoopTileCols / 2 : kCoopTileCols;
-    pipeline.dispatch(cb, &push, (push.n + cols - 1) / cols, (push.m + kCoopTileRows - 1) / kCoopTileRows);
+    pipeline.dispatch(cb, &push, (n + cols - 1) / cols, (m + kCoopTileRows - 1) / kCoopTileRows);
   } else {
     const std::uint32_t cols = mode == kSitu ? kGemmTileCols / 2 : kGemmTileCols;
-    pipeline.dispatch(cb, &push, (push.n + cols - 1) / cols, (push.m + kGemmTileRows - 1) / kGemmTileRows);
+    pipeline.dispatch(cb, &push, (n + cols - 1) / cols, (m + kGemmTileRows - 1) / kGemmTileRows);
   }
   compute_barrier(cb);
 }
 
-}  // namespace
-
-const char* block_path_name(BlockPath path) { return path == BlockPath::kCoop ? "coop" : "plain"; }
-
-BlockKernels::BlockKernels(Device& device)
-    : BlockKernels(device, device.info().caps.coop_bf16 ? BlockPath::kCoop : BlockPath::kPlain) {}
+BlockKernels::BlockKernels(Device& device) : BlockKernels(device, default_block_path(device.info().caps)) {}
 
 BlockKernels::BlockKernels(Device& device, BlockPath path) : path_(path) {
-  if (path == BlockPath::kCoop && !device.info().caps.coop_bf16) {
-    throw std::runtime_error(device.info().name + " cannot run the cooperative-matrix DiT block: " +
-                             device.info().caps.coop_bf16_reason);
+  const Capabilities& caps = device.info().caps;
+  if (path == BlockPath::kCoop && !caps.coop_bf16) {
+    throw std::runtime_error(device.info().name + " cannot run the bf16 cooperative-matrix kernels: " +
+                             caps.coop_bf16_reason);
+  }
+  if (path == BlockPath::kCoopF16 && !caps.coop_f16) {
+    throw std::runtime_error(device.info().name + " cannot run the f16 cooperative-matrix kernels: " +
+                             caps.coop_f16_reason);
   }
   gemm_bf16_ = gemm_pipeline(device, path, kBF16);
   gemm_gated_ = gemm_pipeline(device, path, kGated);
@@ -121,6 +187,11 @@ BlockKernels::BlockKernels(Device& device, BlockPath path) : path_(path) {
   if (path == BlockPath::kCoop) {
     attention_ = std::make_unique<Pipeline>(device, kAttentionCoopSpirv, sizeof(kAttentionCoopSpirv),
                                             sizeof(AttentionPush), kCoopSubgroup);
+  } else if (path == BlockPath::kCoopF16) {
+    attention_ = std::make_unique<Pipeline>(device, kAttentionCoopF16Spirv, sizeof(kAttentionCoopF16Spirv),
+                                            sizeof(AttentionPush), kCoopSubgroup);
+    row_scale_ = std::make_unique<Pipeline>(device, kRowScaleSpirv, sizeof(kRowScaleSpirv), sizeof(RowScalePush));
+    row_exponents_ = std::make_unique<Buffer>(device, VkDeviceSize{kMaxF16GemmRows} * 4 * 2);
   } else {
     attention_ = std::make_unique<Pipeline>(device, kAttentionSpirv, sizeof(kAttentionSpirv), sizeof(AttentionPush));
   }
@@ -143,33 +214,33 @@ void BlockKernels::record_norm_modulate(VkCommandBuffer cb, VkDeviceAddress x, s
 void BlockKernels::record_gemm(VkCommandBuffer cb, VkDeviceAddress out, std::uint32_t ldo, VkDeviceAddress x,
                                std::uint32_t ldx, VkDeviceAddress w, std::uint32_t ldw, std::uint32_t m, std::uint32_t n,
                                std::uint32_t k) const {
-  dispatch_gemm(*gemm_bf16_, path_, kBF16, cb, GemmPush{x, w, out, 0, m, n, k, ldx, ldw, ldo});
+  dispatch_gemm(*gemm_bf16_, kBF16, cb, x, w, out, 0, m, n, k, ldx, ldw, ldo);
 }
 
 void BlockKernels::record_gemm_gated_residual(VkCommandBuffer cb, VkDeviceAddress residual, std::uint32_t ldr,
                                               VkDeviceAddress x, std::uint32_t ldx, VkDeviceAddress w, std::uint32_t ldw,
                                               VkDeviceAddress gate, std::uint32_t m, std::uint32_t n,
                                               std::uint32_t k) const {
-  dispatch_gemm(*gemm_gated_, path_, kGated, cb, GemmPush{x, w, residual, gate, m, n, k, ldx, ldw, ldr});
+  dispatch_gemm(*gemm_gated_, kGated, cb, x, w, residual, gate, m, n, k, ldx, ldw, ldr);
 }
 
 void BlockKernels::record_gemm_situ_glu(VkCommandBuffer cb, VkDeviceAddress out, std::uint32_t ldo, VkDeviceAddress x,
                                         std::uint32_t ldx, VkDeviceAddress w_up_gate, std::uint32_t ldw, std::uint32_t m,
                                         std::uint32_t f, std::uint32_t k) const {
-  dispatch_gemm(*gemm_situ_, path_, kSitu, cb, GemmPush{x, w_up_gate, out, 0, m, f, k, ldx, ldw, ldo});
+  dispatch_gemm(*gemm_situ_, kSitu, cb, x, w_up_gate, out, 0, m, f, k, ldx, ldw, ldo);
 }
 
 void BlockKernels::record_gemm_bias(VkCommandBuffer cb, VkDeviceAddress out, std::uint32_t ldo, VkDeviceAddress x,
                                     std::uint32_t ldx, VkDeviceAddress w, std::uint32_t ldw, VkDeviceAddress bias,
                                     std::uint32_t m, std::uint32_t n, std::uint32_t k) const {
-  dispatch_gemm(*gemm_bias_, path_, kBias, cb, GemmPush{x, w, out, bias, m, n, k, ldx, ldw, ldo});
+  dispatch_gemm(*gemm_bias_, kBias, cb, x, w, out, bias, m, n, k, ldx, ldw, ldo);
 }
 
 void BlockKernels::record_gemm_bias_residual(VkCommandBuffer cb, VkDeviceAddress residual, std::uint32_t ldr,
                                              VkDeviceAddress x, std::uint32_t ldx, VkDeviceAddress w, std::uint32_t ldw,
                                              VkDeviceAddress bias, std::uint32_t m, std::uint32_t n,
                                              std::uint32_t k) const {
-  dispatch_gemm(*gemm_bias_residual_, path_, kBiasResidual, cb, GemmPush{x, w, residual, bias, m, n, k, ldx, ldw, ldr});
+  dispatch_gemm(*gemm_bias_residual_, kBiasResidual, cb, x, w, residual, bias, m, n, k, ldx, ldw, ldr);
 }
 
 void BlockKernels::record_norm(VkCommandBuffer cb, VkDeviceAddress x, std::uint32_t ldx, VkDeviceAddress weight,
@@ -213,7 +284,7 @@ void BlockKernels::record_attention(VkCommandBuffer cb, const AttentionArgs& a) 
   require(a.cu_q.size() == a.cu_k.size() && a.cu_q.size() >= 2, "attention: cu_q and cu_k must describe the same batch");
   // In double then rounded, as FlashAttention (float * M_LOG2E): keeps the exp2 argument bit-identical.
   const float log2_scale = static_cast<float>(static_cast<double>(a.scale) * 1.4426950408889634074);
-  if (path_ == BlockPath::kCoop) {
+  if (is_coop(path_)) {
     require(a.ldq % 8 == 0 && a.ldk % 8 == 0 && a.ldv % 8 == 0 && a.ldo % 8 == 0 && a.hsq % 8 == 0 && a.hsk % 8 == 0 &&
                 a.hsv % 8 == 0 && a.hso % 8 == 0,
             "attention: strides must be multiples of 8 on the cooperative-matrix path");
@@ -225,7 +296,7 @@ void BlockKernels::record_attention(VkCommandBuffer cb, const AttentionArgs& a) 
     const AttentionPush push{a.q, a.k, a.v, a.o, a.ldq, a.ldk, a.ldv, a.ldo, a.hsq, a.hsk, a.hsv, a.hso,
                              static_cast<std::uint32_t>(a.cu_q[b]), static_cast<std::uint32_t>(a.cu_k[b]),
                              static_cast<std::uint32_t>(seqlen_q), static_cast<std::uint32_t>(seqlen_k), log2_scale};
-    const std::uint32_t rows = path_ == BlockPath::kCoop ? kCoopAttentionRows : kPlainAttentionRows;
+    const std::uint32_t rows = is_coop(path_) ? kCoopAttentionRows : kPlainAttentionRows;
     attention_->dispatch(cb, &push, a.heads, (static_cast<std::uint32_t>(seqlen_q) + rows - 1) / rows);
   }
   compute_barrier(cb);

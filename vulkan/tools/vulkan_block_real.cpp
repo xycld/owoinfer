@@ -78,7 +78,7 @@ bool compare(const std::vector<bits>& got, const std::vector<bits>& engine) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::printf("usage: %s DIR [--device N] [--path coop|plain]\n", argv[0]);
+    std::printf("usage: %s DIR [--device N] [--path coop|coop-f16|plain]\n", argv[0]);
     return 2;
   }
   const fs::path dir = argv[1];
@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
   try {
     Device device(device_index);
     const BlockKernels kernels = path_name.empty() ? BlockKernels(device)
-                                                   : BlockKernels(device, path_name == "plain" ? BlockPath::kPlain : BlockPath::kCoop);
+                                                   : BlockKernels(device, block_path_from_name(path_name));
     std::printf("device %u: %s, path %s\n", device.info().index, device.info().name.c_str(), block_path_name(kernels.path()));
 
     std::vector<std::int32_t> lengths;

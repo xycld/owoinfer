@@ -26,21 +26,28 @@ set(_spirv_dir ${CMAKE_CURRENT_BINARY_DIR}/spirv)
 file(MAKE_DIRECTORY ${_spirv_dir})
 set(_spirv_files "")
 # The cooperative-matrix shader needs Vulkan 1.3; the rest must also load on Vulkan 1.2 devices, which reject newer SPIR-V.
-function(_mi_add_shader shader target_env)
+# _mi_add_shader_as(source output target_env [-DNAME ...]) builds shaders/<source>.comp into <output>.spv.inc.
+function(_mi_add_shader_as shader output target_env)
   set(_source ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.comp)
-  set(_output ${_spirv_dir}/${shader}.spv.inc)
+  set(_output ${_spirv_dir}/${output}.spv.inc)
   add_custom_command(
     OUTPUT ${_output}
-    COMMAND ${GLSL_COMPILER} --target-env=${target_env} -fshader-stage=comp -O -mfmt=num
+    COMMAND ${GLSL_COMPILER} --target-env=${target_env} -fshader-stage=comp -O -mfmt=num ${ARGN}
             -I${CMAKE_CURRENT_SOURCE_DIR}/shaders ${_source} -o ${_output}
     DEPENDS ${_source} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.glsl
-    COMMENT "glslc ${shader}.comp")
+    COMMENT "glslc ${shader}.comp -> ${output}")
   set(_spirv_files ${_spirv_files} ${_output} PARENT_SCOPE)
+endfunction()
+function(_mi_add_shader shader target_env)
+  _mi_add_shader_as(${shader} ${shader} ${target_env})
+  set(_spirv_files ${_spirv_files} PARENT_SCOPE)
 endfunction()
 _mi_add_shader(gemm_coop vulkan1.3)
 _mi_add_shader(gemm_bf16_coop vulkan1.3)
 _mi_add_shader(attention_coop vulkan1.3)
-foreach(shader IN ITEMS gemm_plain norm_modulate qk_norm_rope attention_plain elementwise)
+_mi_add_shader_as(gemm_bf16_coop gemm_f16_coop vulkan1.3 -DF16)
+_mi_add_shader_as(attention_coop attention_f16_coop vulkan1.3 -DF16)
+foreach(shader IN ITEMS gemm_plain norm_modulate qk_norm_rope attention_plain elementwise row_scale)
   _mi_add_shader(${shader} vulkan1.2)
 endforeach()
 

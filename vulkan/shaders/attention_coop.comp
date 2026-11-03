@@ -10,10 +10,23 @@
 // Subgroup s owns query rows 16 s .. +16; lane l owns row l / 2 and keys or columns of half l % 2 of it. A key step is 32
 // keys, staged in shared memory with the V step. Accumulators have no row access in cooperative matrices, so S and the
 // output pass through the subgroup's staging, and acc_o goes there for a rescale only when a row's maximum grew.
+//
+// Built with F16 (attention_f16_coop.spv) for devices with f16 fragments only: q, k and v convert to f16 unscaled as they
+// are staged, and P enters as bf16(p) * 2^15 (p <= 1, so it stays an f16 normal down to 2^-29), undone with 1 / row_sum.
 #version 460
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
+#ifdef F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#define ELEM float16_t
+#define TO_FRAG(v, scale) bf8_to_f16(v, scale)
+const float P_SCALE = 32768.0;
+#else
 #extension GL_EXT_bfloat16 : require
+#define ELEM bfloat16_t
+#define TO_FRAG(v, scale) (v)
+const float P_SCALE = 1.0;
+#endif
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_vote : require
 #extension GL_KHR_shader_subgroup_shuffle : require
@@ -60,8 +73,8 @@ const uint TOTAL = SP + 4u * 16u * P_ROW;
 // Q is staged once through the K and V region before the first step: 64 rows of 17 uvec4 fit in 2 * 32 rows.
 shared uvec4 smem[TOTAL];
 
-#define FRAG_A coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
-#define FRAG_B coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define FRAG_A coopmat<ELEM, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define FRAG_B coopmat<ELEM, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 
 void sync_subgroup() {
@@ -87,8 +100,8 @@ void store_kv(const uvec4 rk[4], const uvec4 rv[4]) {
   const uint i = gl_LocalInvocationIndex;
   [[unroll]] for (uint j = 0u; j < 4u; ++j) {
     const uint at = (i / 16u + 8u * j) * KV_ROW + i % 16u;
-    smem[SK + at] = rk[j];
-    smem[SV + at] = rv[j];
+    smem[SK + at] = TO_FRAG(rk[j], 1.0);
+    smem[SV + at] = TO_FRAG(rv[j], 1.0);
   }
 }
 
@@ -108,7 +121,7 @@ void main() {
       const uint64_t row = uint64_t(pc.q_row0 + q_first + r);
       v = Vec4s(pc.q + (row * pc.ldq + uint64_t(head) * pc.hsq) * 2ul).d[i % 16u];
     }
-    smem[SK + r * KV_ROW + i % 16u] = v;
+    smem[SK + r * KV_ROW + i % 16u] = TO_FRAG(v, 1.0);
   }
   barrier();
   FRAG_A fq[8];
@@ -185,8 +198,8 @@ void main() {
     }
     precise const float total = row_sum + (part + subgroupShuffleXor(part, 1u));
     row_sum = first ? part + subgroupShuffleXor(part, 1u) : total;
-    smem[sp + frow * P_ROW + half_ * 2u] = uvec4(p_bits[0], p_bits[1], p_bits[2], p_bits[3]);
-    smem[sp + frow * P_ROW + half_ * 2u + 1u] = uvec4(p_bits[4], p_bits[5], p_bits[6], p_bits[7]);
+    smem[sp + frow * P_ROW + half_ * 2u] = TO_FRAG(uvec4(p_bits[0], p_bits[1], p_bits[2], p_bits[3]), P_SCALE);
+    smem[sp + frow * P_ROW + half_ * 2u + 1u] = TO_FRAG(uvec4(p_bits[4], p_bits[5], p_bits[6], p_bits[7]), P_SCALE);
 
     // Every lane has read S from the staging before the rescale overwrites it.
     sync_subgroup();
@@ -229,7 +242,8 @@ void main() {
   }
 
   // out = bf16(acc_o * (1 / row_sum)), through the staging two fragments at a time.
-  const float inv_sum = (row_sum == 0.0 || isnan(row_sum)) ? 1.0 : 1.0 / row_sum;
+  // F16: times 2^-15 for P's scale; a power of two, so (acc_o * inv_sum) rounds as without it.
+  const float inv_sum = ((row_sum == 0.0 || isnan(row_sum)) ? 1.0 : 1.0 / row_sum) * (1.0 / P_SCALE);
   const uint q_local = q_first + sg * 16u + frow;
   const bool write = q_local < pc.seqlen_q;
   const uint64_t out_row = pc.o + ((uint64_t(pc.q_row0) + q_local) * pc.ldo + uint64_t(head) * pc.hso) * 2ul;

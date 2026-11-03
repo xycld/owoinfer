@@ -5,11 +5,12 @@ directory without CUDA (user guide: [docs/vulkan.md](../docs/vulkan.md)). CUDA s
 The program compiles in the engine's host sources it shares with `moss-infer` (tokenizer, initial noise, schedule, PNG
 writer); the engine's own build does not include this directory.
 
-Every model runs on one of two kernel paths, chosen per device and reported:
+Every model runs on one of three kernel paths, chosen per device (the first the device has) and reported:
 
 | Path | Needs | |
 |---|---|---|
 | `coop` | Vulkan 1.3, `VK_KHR_cooperative_matrix` with `VK_KHR_shader_bfloat16` (16x16x16 bf16 x bf16 -> f32 in subgroup scope), compute subgroup size 32 with vote and shuffle, 40 KiB of shared memory | `Capabilities::coop_bf16` |
+| `coop-f16` | the same with 16x16x16 f16 x f16 -> f32 instead of bf16 fragments; the VAE runs `plain` | `Capabilities::coop_f16` |
 | `plain` | Vulkan 1.2, buffer device addresses, 64-bit integers, 32 KiB of shared memory | every other device; no cooperative matrices, 16-bit arithmetic or particular subgroup size |
 
 The Vulkan loader is opened at run time (`vk_api.h`), so nothing links against it.
@@ -20,7 +21,7 @@ The Vulkan loader is opened at run time (`vk_api.h`), so nothing links against i
 cmake -S vulkan -B build-vulkan -G Ninja
 cmake --build build-vulkan
 build-vulkan/vulkan_check --list                 # each device, and why a device gets the plain path
-build-vulkan/vulkan_block_check [--path plain]   # the DiT block's kernels against host replays, then one block's timing
+build-vulkan/vulkan_block_check [--path P]       # the DiT block's kernels against host replays, then one block's timing
 build-vulkan/vulkan_block_real DIR               # real blocks against the engine's output (files captured from its forward)
 build-vulkan/vulkan_dit_run MODEL/transformer tests/golden g_fridge_1024 [--steps N] [--dit-budget GiB]
 build-vulkan/vulkan_te_kernel_check              # the text encoder's kernels against host replays
@@ -35,7 +36,7 @@ validation layer and on llvmpipe (Mesa's CPU driver: 8-wide subgroups, 32 KiB of
 
 ## DiT
 
-`block.h` holds one DiT block's kernels on both paths, with the engine's rounding points: RMSNorm with modulation, the
+`block.h` holds one DiT block's kernels on every path, with the engine's rounding points: RMSNorm with modulation, the
 GEMMs with bias, gated-residual and SiTU-GLU epilogues, QK norm with RoPE, and flash attention (an online softmax over
 32-key steps; the `coop` one rescales its output only when a row's maximum grew). `dit.h` runs the whole
 MOSSImageTransformer on them: the time embedding and shared modulation, the text refiner, the joint sequences of the CFG
@@ -57,6 +58,16 @@ Against the engine's own output on real blocks of the 1024x1024 golden case (cap
 The `coop` GEMMs round like the tensor cores, hence so many identical bits. Step 0 of g_fridge_1024 against the official
 pipeline: cosine 0.999976 (cond) and 0.999983 (uncond, block 22 skipped); the CUDA engine's test asks for 0.99988.
 
+`coop-f16` runs the `coop` kernels built with `F16`. The operands stay bf16 in memory and become f16 as they are
+staged: `row_scale.comp` finds, per row of each GEMM's A and B, the power of two that puts the row's largest value in
+[2^15, 2^16), where every bf16 value is an f16 value; the GEMM scales the rows by it on load and the accumulators back
+before the epilogue, all exactly, so every product is the bf16 one while the values are above 2^-29 of their row's
+largest. Attention converts q, k and v unscaled (bits lost below 2^-14, infinite above 65504) and feeds P as
+bf16(p) * 2^15. On the 4090 it gives the table above to
+the digit (98.14 %, 96.16 %, 98.56 %), step 0 at 0.999976 and 0.999985, and the text encoder's figures of `coop`;
+`vulkan_block_check` adds a GEMM case whose rows span 2^-90 to 2^100. Its staging conversions and row scans cost
+about 7 % of a 512x512 step there, nothing measurable at 1024x1024.
+
 ## VAE
 
 `vae.h` is the FLUX.2 decoder from the final latents to RGB8. Its convolutions round both operands to TF32 as cuDNN does
@@ -69,7 +80,7 @@ bytes identical and none off by more than 1, as the CUDA engine's reference deco
 
 `text_encoder.h` runs the Qwen3.5 text encoder (`Qwen3_5Model(input_ids).last_hidden_state`, bf16 [S, 4096] per prompt)
 for several prompts at once. Its GEMMs are `BlockKernels`' on either path. Its own kernels (`te_kernels.h`) need no
-cooperative matrices, 16-bit arithmetic or particular subgroup size, so both paths share them: the Qwen RMSNorms (with
+cooperative matrices, 16-bit arithmetic or particular subgroup size, so every path shares them: the Qwen RMSNorms (with
 torch's reduction order for the row count, and RoPE fused into the q/k norm), conv1d with SiLU, the GatedDeltaNet gates,
 the engine's chunked gated delta rule in fp32 (four kernels, each within 32 KiB of shared memory), causal grouped-query
 attention at head_dim 256, and the gated products. Weights stream from the safetensors files: four threads read layer
@@ -116,7 +127,7 @@ At 4112 tokens on the cooperative-matrix path the GEMMs take 5.6 s of the 7.2 s,
 |---|---|
 | `vk_api.h`, `vk_api.cpp` | the Vulkan functions, resolved from the loader at run time |
 | `runtime.h`, `runtime.cpp` | device selection, capabilities, buffers, pipelines, barriers, transfer-queue copies |
-| `block.h`, `block.cpp` | the DiT block's kernels on both paths |
+| `block.h`, `block.cpp` | the DiT block's kernels on every path |
 | `dit.h`, `dit.cpp` | the DiT: text refiner, forward, block streaming |
 | `text_encoder.h`, `te_kernels.h` and their `.cpp` | the Qwen3.5 text encoder |
 | `vae.h`, `vae.cpp` | the FLUX.2 VAE decoder |

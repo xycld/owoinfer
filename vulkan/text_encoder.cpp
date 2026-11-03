@@ -246,7 +246,7 @@ struct TextEncoder::Impl {
   }
 
   double budget() const {
-    const double gflop = options.submit_gflop > 0 ? options.submit_gflop : (path == BlockPath::kCoop ? 200.0 : 20.0);
+    const double gflop = options.submit_gflop > 0 ? options.submit_gflop : (path != BlockPath::kPlain ? 200.0 : 20.0);
     return gflop * 1e9;
   }
 
@@ -291,7 +291,7 @@ struct TextEncoder::Impl {
 };
 
 TextEncoder::TextEncoder(Device& device, const std::filesystem::path& dir)
-    : TextEncoder(device, dir, device.info().caps.coop_bf16 ? BlockPath::kCoop : BlockPath::kPlain) {}
+    : TextEncoder(device, dir, default_block_path(device.info().caps)) {}
 
 TextEncoder::TextEncoder(Device& device, const std::filesystem::path& dir, BlockPath path, TextEncoderOptions options)
     : impl_(std::make_unique<Impl>(device, dir, path, options)) {}

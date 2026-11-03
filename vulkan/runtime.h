@@ -23,6 +23,10 @@ struct Capabilities {
   // VK_KHR_shader_bfloat16 fragments and a 16x16x16 bf16 x bf16 -> f32 shape. Otherwise `coop_bf16_reason` says why not.
   bool coop_bf16 = false;
   std::string coop_bf16_reason;
+  // The same kernels on f16 fragments (16x16x16 f16 x f16 -> f32), for devices without bf16 ones: the bf16 operands
+  // convert to f16 as they are staged. Otherwise `coop_f16_reason` says why not.
+  bool coop_f16 = false;
+  std::string coop_f16_reason;
   std::uint32_t shared_memory_bytes = 0;
   std::uint32_t min_subgroup = 0, max_subgroup = 0;
   // The largest single buffer and allocation the device takes (maxBufferSize on Vulkan 1.3, maxMemoryAllocationSize).

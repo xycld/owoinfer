@@ -37,15 +37,16 @@ constexpr const char* kUsage =
     "usage: moss-infer-vulkan --model <bundle_dir> --prompt <text> [-o <out.png>] [--latent-out <latents.npy>]\n"
     "                         [--negative <text>] [--size <W>x<H>] [--width N] [--height N] [--steps N] [--cfg X]\n"
     "                         [--shift X] [--seed N|-1] [--skip-layers \"22\"] [--max-seq N] [--tier reference]\n"
-    "                         [--device N] [--kernels coop|plain] [--no-metadata] [--quiet]\n"
+    "                         [--device N] [--kernels coop|coop-f16|plain] [--no-metadata] [--quiet]\n"
     "       moss-infer-vulkan --list-devices\n"
     "Text to image with MOSS-Image Base or SFT (the bundle's bf16 files) on a Vulkan GPU, with the official euler sampler\n"
     "and schedule: the fallback for GPUs the CUDA engine (moss-infer) does not support. The flags mean what they mean for\n"
     "`moss-infer generate`; the defaults are the same (1024x1024, 50 steps, cfg 3, shift 5, seed 42, skip layers 22).\n"
     "At least one of -o / --latent-out is required; without -o the VAE decode is skipped. --device picks a Vulkan device\n"
-    "(default: the first usable one, a discrete GPU first); --kernels picks the bf16 cooperative-matrix kernels or the\n"
-    "plain ones (default: coop where the device has them). The device and kernels are printed at the start. Progress goes\n"
-    "to stderr one line per event: `text encoder`, `denoise <step>/<steps> <seconds>`, `vae`, then a summary.\n";
+    "(default: the first usable one, a discrete GPU first); --kernels picks the cooperative-matrix kernels on bf16 or f16\n"
+    "fragments or the plain ones (default: the first of those the device has). The device and kernels are printed at the\n"
+    "start. Progress goes to stderr one line per event: `text encoder`, `denoise <step>/<steps> <seconds>`, `vae`, then\n"
+    "a summary.\n";
 
 struct Args {
   fs::path model, out_png, out_latent;
@@ -166,7 +167,9 @@ Args parse(const std::vector<std::string>& argv) {
   if (a.shift <= 0) usage("--shift must be > 0");
   if (a.seed < -1 || a.seed >= (std::int64_t{1} << 53)) usage("--seed must be -1 (random) or in [0, 2^53)");
   if (a.max_seq < 1 || a.max_seq > static_cast<int>(tok::kMossMaxSequenceLength)) usage("--max-seq must be in [1, 4096]");
-  if (!a.kernels.empty() && a.kernels != "coop" && a.kernels != "plain") usage("--kernels takes coop or plain");
+  if (!a.kernels.empty() && a.kernels != "coop" && a.kernels != "coop-f16" && a.kernels != "plain") {
+    usage("--kernels takes coop, coop-f16 or plain");
+  }
   return a;
 }
 
@@ -178,10 +181,10 @@ int list_devices() {
                 d.discrete ? " discrete" : "");
     if (!d.unusable_reason.empty()) {
       std::printf("  unusable: %s\n", d.unusable_reason.c_str());
-    } else if (d.caps.coop_bf16) {
-      std::printf("  kernels: coop\n");
     } else {
-      std::printf("  kernels: plain (no coop: %s)\n", d.caps.coop_bf16_reason.c_str());
+      const std::string no_coop = vk::no_coop_reason(d.caps);
+      std::printf("  kernels: %s%s\n", vk::block_path_name(vk::default_block_path(d.caps)),
+                  no_coop.empty() ? "" : (" (no coop: " + no_coop + ")").c_str());
     }
   }
   return 0;
@@ -190,13 +193,18 @@ int list_devices() {
 int run(const Args& a) {
   vk::Device device(a.device);
   const vk::Capabilities& caps = device.info().caps;
-  const vk::BlockPath path = a.kernels.empty() ? (caps.coop_bf16 ? vk::BlockPath::kCoop : vk::BlockPath::kPlain)
-                             : a.kernels == "coop" ? vk::BlockPath::kCoop
-                                                   : vk::BlockPath::kPlain;
+  const vk::BlockPath path = a.kernels.empty() ? vk::default_block_path(caps) : vk::block_path_from_name(a.kernels);
+  // An explicit choice the device cannot run is an unsupported request (exit 2), refused before anything loads.
+  if (path == vk::BlockPath::kCoop && !caps.coop_bf16) {
+    throw std::invalid_argument(device.info().name + " cannot run --kernels coop: " + caps.coop_bf16_reason);
+  }
+  if (path == vk::BlockPath::kCoopF16 && !caps.coop_f16) {
+    throw std::invalid_argument(device.info().name + " cannot run --kernels coop-f16: " + caps.coop_f16_reason);
+  }
   // Always reported: the plain kernels are much slower, and which ones ran should be visible.
+  const std::string no_coop = vk::no_coop_reason(caps);
   std::fprintf(stderr, "vulkan: device %u, %s; kernels: %s%s\n", device.info().index, device.info().name.c_str(),
-               vk::block_path_name(path),
-               path == vk::BlockPath::kPlain && !caps.coop_bf16 ? (" (no coop: " + caps.coop_bf16_reason + ")").c_str() : "");
+               vk::block_path_name(path), no_coop.empty() ? "" : (" (no coop: " + no_coop + ")").c_str());
 
   const tok::Tokenizer tokenizer = tok::Tokenizer::load(a.model / "tokenizer" / "tokenizer.json");
   vk::GenerateRequest g;

@@ -7,13 +7,18 @@
 //   y    = rms_norm_modulate(x, norm2, scale_f, shift_f)
 //   ffn  = situ(bf16(y * Wup^T), bf16(y * Wgate^T))
 //   x   += bf16(bf16(ffn * Wdown^T) * gate_f)
-// Two paths. kPlain runs on any device the runtime accepts, needs no cooperative matrices, and does not depend on the
-// subgroup size; its operands need row strides that are multiples of 4 elements. kCoop runs the GEMMs on bf16 cooperative
-// matrices (Capabilities::coop_bf16) and needs strides, N and K that are multiples of 8. Each record_* adds its own barrier.
+// Three paths. kPlain runs on any device the runtime accepts, needs no cooperative matrices, and does not depend on the
+// subgroup size; its operands need row strides that are multiples of 4 elements. kCoop runs the GEMMs and the attention on
+// bf16 cooperative matrices (Capabilities::coop_bf16) and needs strides, N and K that are multiples of 8. kCoopF16 runs the
+// same kernels on f16 fragments (Capabilities::coop_f16) for devices without bf16 ones: a bf16 value is an f16 value
+// while it is inside f16's normal range, so the operands convert exactly as they are staged, with every row of a GEMM's
+// A and B scaled by a power of two that brings its largest value to [2^15, 2^16) and the output scaled back (all exact);
+// q, k and v convert unscaled, and P enters P V as bf16(p) * 2^15. Each record_* adds its own barrier.
 #pragma once
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "runtime.h"
@@ -34,8 +39,14 @@ struct AttentionArgs {
   float scale;  // SDPA's 1 / sqrt(head_dim) for the DiT
 };
 
-enum class BlockPath { kCoop, kPlain };
-const char* block_path_name(BlockPath path);
+enum class BlockPath { kCoop, kCoopF16, kPlain };
+const char* block_path_name(BlockPath path);  // "coop", "coop-f16", "plain"
+// The path named so; throws std::invalid_argument for any other name.
+BlockPath block_path_from_name(const std::string& name);
+// The fastest path the device has: kCoop, then kCoopF16, then kPlain.
+BlockPath default_block_path(const Capabilities& caps);
+// Why the device has no cooperative-matrix path (empty when it has one).
+std::string no_coop_reason(const Capabilities& caps);
 
 class BlockKernels {
  public:
@@ -77,9 +88,17 @@ class BlockKernels {
   void record_attention(VkCommandBuffer cb, const AttentionArgs& args) const;
 
  private:
+  void dispatch_gemm(const Pipeline& pipeline, std::uint32_t mode, VkCommandBuffer cb, VkDeviceAddress a,
+                     VkDeviceAddress b, VkDeviceAddress out, VkDeviceAddress gate, std::uint32_t m, std::uint32_t n,
+                     std::uint32_t k, std::uint32_t lda, std::uint32_t ldb, std::uint32_t ldo) const;
+
   BlockPath path_;
   std::unique_ptr<Pipeline> gemm_bf16_, gemm_gated_, gemm_situ_, gemm_bias_, gemm_bias_residual_, norm_modulate_,
       qk_norm_rope_, attention_, silu_, situ_;
+  // kCoopF16: the per-row power-of-two exponents of the GEMM's A and B, written by row_scale_ before each GEMM (the GEMMs
+  // run one after another, each behind a barrier, so one buffer serves them all).
+  std::unique_ptr<Pipeline> row_scale_;
+  std::unique_ptr<Buffer> row_exponents_;
 };
 
 struct BlockWeights {

@@ -13,10 +13,22 @@
 // first half holds 64 hidden columns and the second the same 64 gate columns, each subgroup owns both factors of its
 // outputs. K walks in steps of 32 through two shared-memory stages: the next step's tiles load into registers while the
 // current one multiplies. Rows of the stages are padded to 80 bytes, so 8 rows of 16 bytes fall in distinct banks.
+//
+// Built with F16 (gemm_f16_coop.spv) for devices with f16 fragments only: A and B are still bf16 in memory and become f16
+// as they are staged. Row m of A is scaled by 2^-a_exponents[m] and row j of B by 2^-b_exponents[j] (row_scale.comp, which
+// puts each row's largest value in [2^15, 2^16)), and the accumulators are scaled back by both before the epilogue, so
+// every product is the bf16 path's exactly while the scaled operands are f16 normals (values above 2^-29 of their row's
+// largest). The scaling back is one combined exponent, applied in two exact halves (scaled_back).
 #version 460
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
+#ifdef F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#define ELEM float16_t
+#else
 #extension GL_EXT_bfloat16 : require
+#define ELEM bfloat16_t
+#endif
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_GOOGLE_include_directive : require
@@ -26,6 +38,8 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(constant_id = 0) const int MODE = 1;
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer Vec4s { uvec4 d[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Ints { int d[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Int4s { ivec4 d[]; };
 
 layout(push_constant) uniform PC {
   uint64_t a;
@@ -38,6 +52,8 @@ layout(push_constant) uniform PC {
   uint lda;
   uint ldb;
   uint ldo;
+  uint64_t a_exponents;  // F16 only
+  uint64_t b_exponents;  // F16 only
 } pc;
 
 const uint BM = 128u;
@@ -51,8 +67,8 @@ const uint STAGING = 64u;    // uvec4 per 16x16 fp32 fragment in the epilogue
 // Stage s of A at s * 2 * STAGE, of B at (s * 2 + 1) * STAGE. The epilogue reuses the start: 2 fragments per subgroup.
 shared uvec4 smem[4u * STAGE];
 
-#define FRAG_A coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
-#define FRAG_B coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define FRAG_A coopmat<ELEM, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define FRAG_B coopmat<ELEM, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 
 uint b_row(uint n_base, uint r) {
@@ -60,6 +76,9 @@ uint b_row(uint n_base, uint r) {
   return r < BN / 2u ? n_base + r : pc.N + n_base + (r - BN / 2u);
 }
 bool b_valid(uint n_base, uint r) { return (MODE == 3 ? n_base + r % (BN / 2u) : n_base + r) < pc.N; }
+
+// F16: 2^-exponent of the A and B rows this invocation loads.
+float a_scale[2], b_scale[2];
 
 // Invocation i loads chunk i % 4 of rows i / 4 and i / 4 + 64 of the A and B tiles at k0.
 void load_tiles(uint m_base, uint n_base, uint k0, out uvec4 ra[2], out uvec4 rb[2]) {
@@ -74,7 +93,41 @@ void load_tiles(uint m_base, uint n_base, uint k0, out uvec4 ra[2], out uvec4 rb
     if (k_ok && m < pc.M) ra[h] = Vec4s(pc.a + (uint64_t(m) * pc.lda + k) * 2ul).d[0];
     rb[h] = uvec4(0u);
     if (k_ok && b_valid(n_base, r)) rb[h] = Vec4s(pc.b + (uint64_t(b_row(n_base, r)) * pc.ldb + k) * 2ul).d[0];
+#ifdef F16
+    ra[h] = bf8_to_f16(ra[h], a_scale[h]);
+    rb[h] = bf8_to_f16(rb[h], b_scale[h]);
+#endif
   }
+}
+
+// F16: the exponents that undo A's scaling in output row m and B's in output columns j .. j + 3 (j a multiple of 4 below
+// the row count of B).
+int row_exponent(uint m) {
+#ifdef F16
+  return m < pc.M ? Ints(pc.a_exponents).d[m] : 0;
+#else
+  return 0;
+#endif
+}
+ivec4 col_exponents(uint j) {
+#ifdef F16
+  return Int4s(pc.b_exponents + uint64_t(j) * 4ul).d[0];
+#else
+  return ivec4(0);
+#endif
+}
+
+// v * 2^e, as two multiplies by 2^(e/2) and 2^(e - e/2): e lies in [-252, 224] and each half in fp32's range, and the
+// intermediate lies between v and the result, so it overflows or underflows only where the result does. Exact.
+vec4 scaled_back(vec4 v, ivec4 e) {
+#ifdef F16
+  const ivec4 h = e / 2;
+  precise const vec4 once = v * uintBitsToFloat(uvec4(127 + h) << 23);
+  precise const vec4 twice = once * uintBitsToFloat(uvec4(127 + (e - h)) << 23);
+  return twice;
+#else
+  return v;
+#endif
 }
 
 void store_tiles(uint stage, const uvec4 ra[2], const uvec4 rb[2]) {
@@ -115,6 +168,18 @@ void main() {
     [[unroll]] for (uint c = 0u; c < 4u; ++c) acc[r][c] = ACC(0.0);
   }
 
+  [[unroll]] for (uint h = 0u; h < 2u; ++h) {
+    const uint r = gl_LocalInvocationIndex / 4u + h * 64u;
+    const uint m = m_base + r;
+#ifdef F16
+    a_scale[h] = m < pc.M ? pow2(-Ints(pc.a_exponents).d[m]) : 1.0;
+    b_scale[h] = b_valid(n_base, r) ? pow2(-Ints(pc.b_exponents).d[b_row(n_base, r)]) : 1.0;
+#else
+    a_scale[h] = 1.0;
+    b_scale[h] = 1.0;
+#endif
+  }
+
   const uint steps = (pc.K + BK - 1u) / BK;
   uvec4 ra[2], rb[2];
   load_tiles(m_base, n_base, 0u, ra, rb);
@@ -148,13 +213,15 @@ void main() {
   const uint frow = lane / 2u, fcol = (lane % 2u) * 8u;
   [[unroll]] for (uint r = 0u; r < 2u; ++r) {
     const uint m = m_base + row0 + r * 16u + frow;
+    const int e_row = row_exponent(m);
     [[unroll]] for (uint c = 0u; c < (MODE == 3 ? 2u : 4u); ++c) {
       coopMatStore(acc[r][c], smem, base0, 4u, gl_CooperativeMatrixLayoutRowMajor);
       if (MODE == 3) coopMatStore(acc[r][c + 2u], smem, base1, 4u, gl_CooperativeMatrixLayoutRowMajor);
       sync_subgroup();
-      const vec4 lo = staged(base0, frow, fcol / 4u), hi = staged(base0, frow, fcol / 4u + 1u);
       const uint n = n_base + (MODE == 3 ? 0u : (c / 2u) * (BN / 2u)) + col0 + (c % 2u) * 16u + fcol;
       if (m < pc.M && n < pc.N) {
+        const vec4 lo = scaled_back(staged(base0, frow, fcol / 4u), e_row + col_exponents(n));
+        const vec4 hi = scaled_back(staged(base0, frow, fcol / 4u + 1u), e_row + col_exponents(n + 4u));
         const uint64_t at = uint64_t(m) * pc.ldo + n;
         if (MODE == 0) {
           Vec4s(pc.out_ + at * 4ul).d[0] = floatBitsToUint(lo);
@@ -169,7 +236,8 @@ void main() {
           precise const vec4 sum_lo = f4(old.xy) + rbf4(gated_lo), sum_hi = f4(old.zw) + rbf4(gated_hi);
           target.d[0] = uvec4(bf4(sum_lo), bf4(sum_hi));
         } else if (MODE == 3) {
-          const vec4 g_lo = staged(base1, frow, fcol / 4u), g_hi = staged(base1, frow, fcol / 4u + 1u);
+          const vec4 g_lo = scaled_back(staged(base1, frow, fcol / 4u), e_row + col_exponents(pc.N + n));
+          const vec4 g_hi = scaled_back(staged(base1, frow, fcol / 4u + 1u), e_row + col_exponents(pc.N + n + 4u));
           Vec4s(pc.out_ + at * 2ul).d[0] =
               uvec4(bf4(situ(rbf4(lo), rbf4(g_lo))), bf4(situ(rbf4(hi), rbf4(g_hi))));
         } else {

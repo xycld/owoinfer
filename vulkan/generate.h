@@ -42,7 +42,8 @@ struct GenerateResult {
   int dit_resident_blocks = 0;  // of 42; the rest streamed from host memory every step
 };
 
-// path: the DiT's and text encoder's kernels (kCoop needs Capabilities::coop_bf16); the VAE follows it.
+// path: the DiT's and text encoder's kernels (kCoop needs Capabilities::coop_bf16, kCoopF16 coop_f16); the VAE runs
+// kCoop on kCoop and kPlain otherwise (its cooperative-matrix kernels need bf16 fragments).
 GenerateResult generate(Device& device, BlockPath path, const GenerateRequest& request);
 
 }  // namespace mi::vk

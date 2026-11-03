@@ -23,11 +23,28 @@ uint bf(float v) {
 uvec2 bf4(vec4 v) { return uvec2(bf(v.x) | (bf(v.y) << 16), bf(v.z) | (bf(v.w) << 16)); }
 vec4 rbf4(vec4 v) { return f4(bf4(v)); }
 
+// 2^e as an fp32, exact for e in [-126, 127] (exp2 need not be).
+float pow2(int e) { return uintBitsToFloat(uint(127 + e) << 23); }
+
+// Eight bf16 (a uvec4 of pairs) times `scale`, a power of two, as eight f16 in the same packing. Exact while each product
+// is an f16 normal or zero; the coop-f16 kernels pick the scales so that the large values are.
+uvec4 bf8_to_f16(uvec4 v, float scale) {
+  uvec4 r;
+  for (uint j = 0u; j < 4u; ++j) {
+    r[j] = packHalf2x16(vec2(uintBitsToFloat(v[j] << 16), uintBitsToFloat(v[j] & 0xffff0000u)) * scale);
+  }
+  return r;
+}
+
 // exp(-2 |x|) stays in range where GLSL's tanh may divide infinities; beyond 12 the result rounds to 1 in fp32 anyway.
+// Below 1/16 the subtraction 1 - e cancels (to 0 for |x| under 2^-25), so there the series x - x^3/3 + 2x^5/15 takes
+// over, whose first omitted term is under 2^-27 of the result.
 vec4 tanh_safe(vec4 x) {
   const vec4 e = exp(-2.0 * min(abs(x), vec4(12.0)));
   precise const vec4 t = (1.0 - e) / (1.0 + e);
-  return sign(x) * t;
+  precise const vec4 x2 = x * x;
+  precise const vec4 series = x * (1.0 + x2 * (-1.0 / 3.0 + x2 * (2.0 / 15.0)));
+  return mix(sign(x) * t, series, lessThan(abs(x), vec4(0.0625)));
 }
 
 vec4 situ(vec4 h, vec4 g) {

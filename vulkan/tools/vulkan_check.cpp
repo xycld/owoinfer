@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "block.h"
 #include "gemm.h"
 #include "half.h"
 #include "runtime.h"
@@ -127,6 +128,10 @@ void print_devices() {
     std::printf("  shared memory %u bytes, subgroup size %u-%u\n", d.caps.shared_memory_bytes, d.caps.min_subgroup,
                 d.caps.max_subgroup);
     std::printf("  GEMM: %s\n", d.caps.coop ? "cooperative matrix" : ("plain compute (" + d.caps.coop_reason + ")").c_str());
+    const std::string no_coop = mi::vk::no_coop_reason(d.caps);
+    std::printf("  model kernels: %s%s\n", mi::vk::block_path_name(mi::vk::default_block_path(d.caps)),
+                no_coop.empty() ? "" : (" (" + no_coop + ")").c_str());
+    if (d.caps.coop_f16 && !d.caps.coop_bf16) std::printf("  no bf16 fragments: %s\n", d.caps.coop_bf16_reason.c_str());
   }
 }
 

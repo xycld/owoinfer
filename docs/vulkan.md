@@ -19,8 +19,8 @@ moss-infer-vulkan --list-devices
 The flags are those of `moss-infer generate` that the backend runs, with the same defaults (`--negative`, `--size`,
 `--width`, `--height`, `--steps`, `--cfg`, `--shift`, `--seed`, `--skip-layers`, `--max-seq`, `--latent-out`,
 `--no-metadata`, `--quiet`; `--tier` accepts `reference`). `--device N` picks a device (default: the first usable one, a
-discrete GPU first) and `--kernels coop|plain` the kernels (default: `coop` where the device has them); both are printed
-at the start of every run. Progress goes to stderr one line per event: `text encoder`, `denoise <step>/<steps>
+discrete GPU first) and `--kernels coop|coop-f16|plain` the kernels (default: the first in that order the device has);
+both are printed at the start of every run. Progress goes to stderr one line per event: `text encoder`, `denoise <step>/<steps>
 <seconds>`, `vae`, then a `done:` summary. The exit status is 0 on success, 2 for a usage error or an unsupported
 request, 1 for any other failure.
 
@@ -29,7 +29,14 @@ request, 1 for any other failure.
 | Kernels | Needs | Used for |
 |---|---|---|
 | `coop` | Vulkan 1.3, `VK_KHR_cooperative_matrix` and `VK_KHR_shader_bfloat16` with 16x16x16 bf16 fragments, a compute subgroup size fixable at 32, 40 KiB of shared memory | GEMMs, attention and the VAE's convolutions on matrix cores |
+| `coop-f16` | the same with 16x16x16 f16 fragments instead of bf16 ones | devices with matrix cores but no bf16 fragments (Mesa's RADV exposes them only on RDNA4, for one): the GEMMs and attention on matrix cores, the VAE as `plain` |
 | `plain` | Vulkan 1.2, buffer device addresses, 64-bit integers, 32 KiB of shared memory | every other device; no cooperative matrices, 16-bit arithmetic or particular subgroup size |
+
+`coop-f16` computes what `coop` computes. The weights and activations stay bf16; each GEMM operand row is scaled by a
+power of two that brings it into f16's range as it is loaded, where a bf16 value is an f16 value, and the result is
+scaled back, so the products are the same. Only attention's q, k and v convert unscaled: their rare values below 2^-14
+lose bits, and a value above 65504 would become infinite (the model's stay far below). On the golden case's text encoder and on real DiT blocks it gives the same figures as `coop`, and the
+same step 0 accuracy below; whole images then differ as any two backends' do (see below).
 
 ## Memory
 

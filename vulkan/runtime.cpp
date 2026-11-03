@@ -20,7 +20,8 @@ bool pipeline_stats_requested() {
 constexpr std::uint32_t kCoopSharedBytes = 2 * 64 * 32 * 2 + 64 * 64 * 4;
 constexpr std::uint32_t kCoopSubgroup = 32;
 constexpr std::uint32_t kCoopSubgroupsPerWorkgroup = 8;
-// The bf16 DiT kernels' largest shared memory: gemm_bf16_coop.comp's two stages of 128x32 A and B tiles, rows padded to 80 B.
+// The DiT kernels' largest shared memory (bf16 and f16 fragments alike): gemm_bf16_coop.comp's two stages of 128x32 A and
+// B tiles, rows padded to 80 B.
 constexpr std::uint32_t kCoopBf16SharedBytes = 4 * 128 * 80;
 
 void check(VkResult result, const char* what) {
@@ -151,6 +152,15 @@ void describe_coop(VkInstance instance, VkPhysicalDevice physical, const VkPhysi
     caps.coop_bf16_reason = "no 16x16x16 bf16 x bf16 -> f32 cooperative matrix in subgroup scope";
   }
   caps.coop_bf16 = caps.coop_bf16_reason.empty();
+
+  caps.coop_f16_reason = base;
+  if (caps.coop_f16_reason.empty() && shared < kCoopBf16SharedBytes) {
+    caps.coop_f16_reason = "needs " + std::to_string(kCoopBf16SharedBytes) + " bytes of shared memory";
+  }
+  if (caps.coop_f16_reason.empty() && !has_shape(shapes, VK_COMPONENT_TYPE_FLOAT16_KHR)) {
+    caps.coop_f16_reason = "no 16x16x16 f16 x f16 -> f32 cooperative matrix in subgroup scope";
+  }
+  caps.coop_f16 = caps.coop_f16_reason.empty();
 }
 
 DeviceInfo describe(VkInstance instance, VkPhysicalDevice physical, std::uint32_t index) {
@@ -262,7 +272,7 @@ Device::Device(int index) {
     coop.pNext = &bf16;
     extensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
   }
-  if (info_.caps.coop || info_.caps.coop_bf16) {
+  if (info_.caps.coop || info_.caps.coop_bf16 || info_.caps.coop_f16) {
     v12.pNext = &v13;
     v12.shaderFloat16 = VK_TRUE;
     v12.vulkanMemoryModel = VK_TRUE;

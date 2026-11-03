@@ -1,7 +1,7 @@
 // Runs the DiT's sampling loop on Vulkan from a golden case's text-encoder outputs and initial noise (the official PyTorch
 // pipeline's, tests/golden), with CFG and the official Euler step on the host in fp32, and compares step 0's predictions
 // and the final latent with the golden ones. Writes the final latent as .npy for the VAE.
-// Usage: vulkan_dit_run TRANSFORMER_DIR GOLDEN_DIR CASE [--steps N] [--out FILE.npy] [--path coop|plain] [--device N]
+// Usage: vulkan_dit_run TRANSFORMER_DIR GOLDEN_DIR CASE [--steps N] [--out FILE.npy] [--path coop|coop-f16|plain] [--device N]
 //                       [--dit-budget GiB]   (device memory for the weights; the blocks past it stream)
 //                       [--submit-gflop X]   (work per submit; 0: the path's default)
 //   GOLDEN_DIR is tests/golden, CASE e.g. g_fridge_1024; the case's cfg and uncond skip layers are 3.0 and {22}.
@@ -68,7 +68,7 @@ double now_s() {
 
 int main(int argc, char** argv) {
   if (argc < 4) {
-    std::printf("usage: %s TRANSFORMER_DIR GOLDEN_DIR CASE [--steps N] [--out FILE.npy] [--path coop|plain] [--device N]\n",
+    std::printf("usage: %s TRANSFORMER_DIR GOLDEN_DIR CASE [--steps N] [--out FILE.npy] [--path coop|coop-f16|plain] [--device N]\n",
                 argv[0]);
     return 2;
   }
@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
 
     Device device(device_index);
     const BlockKernels kernels = path_name.empty() ? BlockKernels(device)
-                                                   : BlockKernels(device, path_name == "plain" ? BlockPath::kPlain : BlockPath::kCoop);
+                                                   : BlockKernels(device, block_path_from_name(path_name));
     std::printf("device %u: %s, path %s\n", device.info().index, device.info().name.c_str(), block_path_name(kernels.path()));
     double t0 = now_s();
     DitOptions options;

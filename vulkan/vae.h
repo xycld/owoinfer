@@ -10,7 +10,7 @@
 // plain fp32 on the other. GroupNorm statistics are fp32 per chunk of pixels (mean and sum of squared deviations), merged
 // pairwise. Accumulation orders differ from cuDNN's and torch's, so outputs are close to the engine's, not bit-identical.
 //
-// Two paths, chosen as BlockKernels does: kCoop runs the convolutions and GEMMs on bf16 cooperative matrices
+// Two paths (generate() runs kCoop with BlockPath::kCoop, kPlain with the others): kCoop runs the convolutions and GEMMs on bf16 cooperative matrices
 // (Capabilities::coop_bf16), splitting each fp32 operand into bf16 pieces whose products are exact (TF32 = 2 pieces);
 // kPlain needs no cooperative matrices, 16-bit types or particular subgroup size.
 //

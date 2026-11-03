@@ -195,15 +195,24 @@ struct Limit {
   double floor_of_rms;
 };
 
-bool report(const char* name, const std::vector<bits>& got, const std::vector<double>& ref, Limit limit) {
-  const double floor_mag = rms_of(ref) * limit.floor_of_rms;
+// row_len > 0: the floor below which errors count as at that magnitude is taken per row of row_len values instead of over
+// the whole output, for outputs whose rows differ in scale by many orders of magnitude.
+bool report(const char* name, const std::vector<bits>& got, const std::vector<double>& ref, Limit limit,
+            std::size_t row_len = 0) {
+  const std::size_t len = row_len > 0 ? row_len : std::max<std::size_t>(ref.size(), 1);
   double worst = 0.0;
   std::size_t nans = 0, same = 0;
-  for (std::size_t i = 0; i < got.size(); ++i) {
-    const float g = from_bf16(got[i]);
-    if (std::isnan(g)) ++nans;
-    same += got[i] == to_bf16(static_cast<float>(ref[i]));
-    worst = std::max(worst, ulps_off(g, ref[i], floor_mag));
+  for (std::size_t row = 0; row * len < got.size(); ++row) {
+    const std::size_t first = row * len, last = std::min(got.size(), first + len);
+    const double floor_mag = rms_of(std::vector<double>(ref.begin() + static_cast<std::ptrdiff_t>(first),
+                                                        ref.begin() + static_cast<std::ptrdiff_t>(last))) *
+                             limit.floor_of_rms;
+    for (std::size_t i = first; i < last; ++i) {
+      const float g = from_bf16(got[i]);
+      if (std::isnan(g)) ++nans;
+      same += g == from_bf16(to_bf16(static_cast<float>(ref[i])));  // by value: -0 and +0 are the same
+      worst = std::max(worst, ulps_off(g, ref[i], floor_mag));
+    }
   }
   const double same_pct = 100.0 * static_cast<double>(same) / static_cast<double>(got.size());
   const bool ok = nans == 0 && worst <= limit.ulps && same_pct >= kMinSamePercent;
@@ -288,10 +297,22 @@ bool check_norms(Device& device, const BlockKernels& kernels) {
 }
 
 // m, n and k: tails on every axis of both paths' tiles; the larger shape also crosses tiles and bands of tiles.
-bool check_gemms(Device& device, const BlockKernels& kernels, int m, int n, int k, int f) {
+// wide_rows: row r of x is scaled by 2^e, e cycling through values far outside f16's range, which the coop-f16 path must
+// bring in range row by row (and which the other paths take as they are).
+bool check_gemms(Device& device, const BlockKernels& kernels, int m, int n, int k, int f, bool wide_rows = false) {
   const int ld = 3 * k;
-  const auto x_h = synth_bf16(21, static_cast<std::size_t>(m) * ld, 0), w_h = synth_bf16(22, static_cast<std::size_t>(n) * k, -2),
-             gate_h = synth_bf16(23, n, -2), res_h = synth_bf16(24, static_cast<std::size_t>(m) * n, 0);
+  auto x_h = synth_bf16(21, static_cast<std::size_t>(m) * ld, 0);
+  const auto w_h = synth_bf16(22, static_cast<std::size_t>(n) * k, -2), gate_h = synth_bf16(23, n, -2),
+             res_h = synth_bf16(24, static_cast<std::size_t>(m) * n, 0);
+  if (wide_rows) {
+    constexpr int kExponents[] = {0, 24, -40, 60, -90, 17, 100, -20};
+    for (int r = 0; r < m; ++r) {
+      for (int c = 0; c < ld; ++c) {
+        bits& v = x_h[static_cast<std::size_t>(r) * ld + c];
+        v = to_bf16(std::ldexp(from_bf16(v), kExponents[r % 8]));
+      }
+    }
+  }
   auto x = device_buffer(device, x_h), w = device_buffer(device, w_h), gate = device_buffer(device, gate_h),
        out = device_buffer(device, std::vector<bits>(static_cast<std::size_t>(m) * n));
   std::vector<double> plain(static_cast<std::size_t>(m) * n), gated(plain.size()), situ(static_cast<std::size_t>(m) * f);
@@ -308,14 +329,15 @@ bool check_gemms(Device& device, const BlockKernels& kernels, int m, int n, int 
       situ[static_cast<std::size_t>(r) * f + c] = host_situ(h, g);
     }
   }
-  std::printf("  GEMMs at M %d, N %d, K %d, SiTU F %d\n", m, n, k, f);
+  const std::size_t rows_n = wide_rows ? static_cast<std::size_t>(n) : 0, rows_f = wide_rows ? static_cast<std::size_t>(f) : 0;
+  std::printf("  GEMMs at M %d, N %d, K %d, SiTU F %d%s\n", m, n, k, f, wide_rows ? ", rows scaled by 2^-90 .. 2^100" : "");
   device.run([&](VkCommandBuffer cb) { kernels.record_gemm(cb, out->address(), n, x->address(), ld, w->address(), k, m, n, k); });
-  bool ok = report("gemm", read(*out, plain.size()), plain, {1.0, 1.0 / 64.0});
+  bool ok = report("gemm", read(*out, plain.size()), plain, {1.0, 1.0 / 64.0}, rows_n);
   out->upload(res_h.data(), res_h.size() * 2);
   device.run([&](VkCommandBuffer cb) {
     kernels.record_gemm_gated_residual(cb, out->address(), n, x->address(), ld, w->address(), k, gate->address(), m, n, k);
   });
-  ok = report("gemm_gated_residual", read(*out, plain.size()), gated, {1.0, 1.0}) && ok;
+  ok = report("gemm_gated_residual", read(*out, plain.size()), gated, {1.0, 1.0}, rows_n) && ok;
   std::vector<double> biased(plain.size()), biased_res(plain.size());
   for (int r = 0; r < m; ++r) {
     for (int c = 0; c < n; ++c) {
@@ -328,16 +350,16 @@ bool check_gemms(Device& device, const BlockKernels& kernels, int m, int n, int 
   device.run([&](VkCommandBuffer cb) {
     kernels.record_gemm_bias(cb, out->address(), n, x->address(), ld, w->address(), k, gate->address(), m, n, k);
   });
-  ok = report("gemm_bias", read(*out, plain.size()), biased, {1.0, 1.0 / 64.0}) && ok;
+  ok = report("gemm_bias", read(*out, plain.size()), biased, {1.0, 1.0 / 64.0}, rows_n) && ok;
   out->upload(res_h.data(), res_h.size() * 2);
   device.run([&](VkCommandBuffer cb) {
     kernels.record_gemm_bias_residual(cb, out->address(), n, x->address(), ld, w->address(), k, gate->address(), m, n, k);
   });
   // Two roundings: bf16(ab + bias) can land one ULP of its own off when ab differs in the last bits, then the sum rounds.
-  ok = report("gemm_bias_residual", read(*out, plain.size()), biased_res, {1.5, 1.0}) && ok;
+  ok = report("gemm_bias_residual", read(*out, plain.size()), biased_res, {1.5, 1.0}, rows_n) && ok;
   auto ffn = device_buffer(device, std::vector<bits>(static_cast<std::size_t>(m) * f));
   device.run([&](VkCommandBuffer cb) { kernels.record_gemm_situ_glu(cb, ffn->address(), f, x->address(), ld, w->address(), k, m, f, k); });
-  return report("gemm_situ_glu", read(*ffn, situ.size()), situ, {1.5, 1.0}) && ok;
+  return report("gemm_situ_glu", read(*ffn, situ.size()), situ, {1.5, 1.0}, rows_f) && ok;
 }
 
 bool check_attention(Device& device, const BlockKernels& kernels) {
@@ -438,24 +460,25 @@ int main(int argc, char** argv) {
       std::string item;
       while (std::getline(ss, item, ',')) rows.push_back(std::atoi(item.c_str()));
     } else {
-      std::printf("usage: %s [--device N] [--path coop|plain] [--rows L1,L2,...] [--iters N] [--no-block]\n", argv[0]);
+      std::printf("usage: %s [--device N] [--path coop|coop-f16|plain] [--rows L1,L2,...] [--iters N] [--no-block]\n", argv[0]);
       return 2;
     }
   }
   try {
     Device device(device_index);
     std::printf("device %u: %s\nknown-answer check against host replays:\n", device.info().index, device.info().name.c_str());
-    if (!path_name.empty() && path_name != "coop" && path_name != "plain") {
-      std::printf("--path takes coop or plain\n");
+    if (!path_name.empty() && path_name != "coop" && path_name != "coop-f16" && path_name != "plain") {
+      std::printf("--path takes coop, coop-f16 or plain\n");
       return 2;
     }
     const BlockKernels kernels = path_name.empty() ? BlockKernels(device)
-                                                   : BlockKernels(device, path_name == "coop" ? BlockPath::kCoop : BlockPath::kPlain);
-    std::printf("path: %s%s%s\n", block_path_name(kernels.path()), device.info().caps.coop_bf16 ? "" : " (no coop: ",
-                device.info().caps.coop_bf16 ? "" : (device.info().caps.coop_bf16_reason + ")").c_str());
+                                                   : BlockKernels(device, block_path_from_name(path_name));
+    const std::string no_coop = no_coop_reason(device.info().caps);
+    std::printf("path: %s%s\n", block_path_name(kernels.path()), no_coop.empty() ? "" : (" (no coop: " + no_coop + ")").c_str());
     bool ok = check_norms(device, kernels);
     ok = check_gemms(device, kernels, 37, 104, 40, 24) && ok;
     ok = check_gemms(device, kernels, 300, 1048, 264, 520) && ok;
+    ok = check_gemms(device, kernels, 300, 1048, 264, 520, true) && ok;
     ok = check_attention(device, kernels) && ok;
     if (!ok) {
       std::printf("known-answer check FAILED: not timing.\n");
