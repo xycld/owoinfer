@@ -32,6 +32,8 @@ cmake -S tools/hip_block -B build-hip-nvidia -G Ninja -DHIP_BLOCK_TARGET=nvidia 
 cmake --build build-hip-nvidia -j4
 ```
 
+The AMD builds' device check (`check_device.sh`, run by CMake with the target) fails unless each kernel holds the number of `v_wmma_f32_16x16x16_bf16` it lists for that target. Those counts are what ROCm 7.2.4's clang emits for this source; another ROCm may unroll differently and emit other counts, which then need checking in its assembly and updating in the script.
+
 `build-*/` is ignored by git. ROCm's libraries must be on the loader path at run time if they are not installed system-wide: `LD_LIBRARY_PATH=$ROCM_PATH/lib:$ROCM_PATH/lib/llvm/lib`, plus the directory holding `libnuma` and `libdrm` where those are unpacked with ROCm.
 
 ## Running on a card
@@ -84,7 +86,7 @@ These rules changed after results were in, in this order:
 4. The flip check above was added after SiTU reached scaled 5 on one value in 7e7 with the block's two-row shape, and the last block's gated residual reached 32 on real activations. Plain scaled <= 4 fails on both.
 5. The fixed block gate failed on real activations at blocks 21 to 41, and SiTU's p99.9 reached 2 at block 41. The real-activation block gate above and SiTU's limit of 2 replaced them. These limits were set after seeing those results.
 6. A second review showed a wrong control passing: with its QKV zeroed, `--real` exited 0 because the limits opened with it. The control's own gates above were added, with the floor of 50 % set after seeing healthy controls at 69.9 % and up and the zeroed one under 5 %. The same review showed an Inf on one side passing the flip-checked rows, which now fail, and a correct `rsqrt` able to fail the bench's known answer, which raised two ULP limits from 1 to 3.
-7. A third review showed outputs the prototype never wrote passing as the engine's values left in the buffers, and whole wrong token rows passing replay. Every buffer the ops write is now poisoned with NaN before each op and block, and replay gained its row and scaled limits (below), their margins chosen after seeing the scalar leaf's figures, two other accumulation orders and the review's row mutants. The scaled limit was first max(8, 2 x the scalar leaf's); the card's earlier block-41 down gemm + gated (64) met that exactly, and no mutant needed it, so it is max(16, 4 x).
+7. A third review showed outputs the prototype never wrote passing as the engine's values left in the buffers, and whole wrong token rows passing replay. Every buffer the ops write is now poisoned with NaN before each op and block, and replay gained its row and scaled limits (below), their margins chosen after seeing the scalar leaf's figures, two other accumulation orders and the review's row mutants. The scaled limit was first max(8, 2 x the scalar leaf's); the card's earlier block-41 down gemm + gated (64) met that exactly, and no mutant needed it, so it is max(16, 4 x). A later round showed one wrong fragment or column passing replay; the count of outputs above scaled 4 was added, its floor and factor chosen after seeing the scalar leaf's counts, two other accumulation orders' counts and those mutants'.
 
 ## On an AMD card
 
@@ -130,15 +132,26 @@ Not tried: 8-bit in the real kernels, where the bf16 path's rounding points woul
 
 ### Against the engine, on the card
 
-`hip_block_verify --real --dump DIR` writes the E13-shaped blocks' weights, inputs and engine outputs (about 1 GB per block), each block's `meta.txt` with the whole block's limits from that run's control and the scalar leaf's own per-op figures against the engine, and last a `manifest.txt` listing the blocks. A run that fails writes no manifest. `hip_block_replay DIR [--iters N]` runs them on any device, needing about 2 GiB. It refuses a directory without a manifest (an interrupted dump, or one from before this format), a manifest that lists no block or a block that is missing, and a `meta.txt` of the earlier format. Before each op and before the whole block, every buffer the ops write holds NaN. Each op runs on the engine's input and is compared with the engine's output, `qk_norm_rope` over q and k only, under:
+`hip_block_verify --real --dump DIR` writes the E13-shaped blocks' weights, inputs and engine outputs (about 1 GB per block), each block's `meta.txt` with the whole block's limits from that run's control and the scalar leaf's own per-op figures against the engine, and last a `manifest.txt` listing the blocks. A run that fails writes no manifest. `hip_block_replay DIR [--iters N]` runs them on any device, needing about 2 GiB. It refuses a directory without a manifest (an interrupted dump, or one of an earlier format), a manifest that lists no block or a block that is missing, and a `meta.txt` of an earlier format (format 3 added the count below). Before each op and before the whole block, every buffer the ops write holds NaN. Each op runs on the engine's input and is compared with the engine's output, `qk_norm_rope` over q and k only, under:
 
 - same >= 99 % and p99.9 <= 1, 2 for the three GEMMs with an epilogue. These are verify's accumulated gate, apart from that 2: verify allows it for SiTU on real activations only, and holds the gated residuals to 1 with its flip check, which needs the exact sums and is not ported.
 - scaled <= max(16, 4 x the scalar leaf's). A backstop: every wrong-row mutant below that exceeds it also fails the row limit. It is wide because a gated residual near cancellation moves by many ULPs for one flipped bit: the card's block-41 down gemm + gated reached 64, twice the scalar leaf's 32, and a limit of 2x would have left it no margin.
 - the lowest same % of any token row >= the scalar leaf's lowest minus 15 points. One wrong token row is 0.012 % of an op at this shape, too few values for same or p99.9 to see.
+- the count of outputs above scaled 4 <= max(8, 8 x the scalar leaf's count). A wrong 16x16 fragment or a wrong column, the shape a fragment layout bug takes, is too few values for the row limit and moves each by a few ULPs, under the scaled limit; it does put outputs above scaled 4 where a correct op puts none or few.
 
 Then the whole block on its own outputs, under the limits of that run's control.
 
-The row margin is wide because the card cannot be recalibrated from here. On NVIDIA, two other accumulation orders in the scalar leaf (each fragment's 16 products summed as a tree, or K descending) move the lowest row by at most 0.07 points, and the card's per-op same is within 0.07 points of the scalar leaf's. The third review's wrong-row mutants (below) reach at most 41.5 % in their row, against limits of 80.3 to 85. The scalar leaf's lowest rows on the dump: attention 96.58 and 95.28 % (blocks 1 and 41), the GEMM ops 99.34 to 99.80 %, the norms and `qk_norm_rope` 100 %.
+The row margin is wide because the card cannot be recalibrated from here. On NVIDIA, two other accumulation orders in the scalar leaf (each fragment's 16 products summed as a tree, or K descending) move the lowest row by at most 0.36 points (K descending, block 41 attention 95.28 to 95.64), and the card's per-op same is within 0.07 points of the scalar leaf's. The third review's wrong-row mutants (below) reach at most 41.5 % in their row, against limits of 80.3 to 85. The scalar leaf's lowest rows on the dump: attention 96.58 and 95.28 % (blocks 1 and 41), the GEMM ops 99.34 to 99.80 %, the norms and `qk_norm_rope` 100 %.
+
+Outputs above scaled 4, per op, blocks 1 and 41 (others 0 everywhere):
+
+| | up_gate gemm + SiTU | down gemm + gated | count limit |
+|---|---|---|---|
+| scalar leaf | 0, 1 | 0, 31 | 8, 8; 8, 248 |
+| tree of 16 / K descending | 0, 1 / 0, 1 | 0, 30 / 0, 29 | |
+| card, earlier run | 0, unknown (scaled 5) | 0, unknown (scaled 64) | |
+
+The card's count is known to be 0 wherever its scaled was 4 or less. The third review's fragment and column mutants put, at blocks 1 and 41: one attention output fragment x 1.03, 186 and 80 (scaled 8); 16 columns of one 32-row QKV tile x 1.03, 38 and 13 (scaled 7 and 6); one down output column x 1.06, 11 and 8464 (scaled 13 and 32). All six exceed the count limit, and none fails another per-op limit. The floor must stay under 11 for the down column at block 1, and the factor at 4 or more over block 41's down; 8 and 8 leave 8x over the other accumulation orders' counts.
 
 The card ran the earlier replay, without the poisoning, the row limit, the scaled limit and the q-and-k-only comparison. On the RX 9060 XT, exit 0:
 
@@ -154,7 +167,7 @@ The card ran the earlier replay, without the poisoning, the row limit, the scale
 | down gemm + gated | 99.942, 0, 2 | 99.869, 1, 64 |
 | whole block, final x | 83.28 (limit 79.28), 64, 2 | 67.91 (limit 64.93), 320, 64 (limit 128) |
 
-The scalar leaf under the same comparison gives 83.30 and 68.17 for the whole block, so WMMA's rounding sits as close to the engine's as an exact fp32 walk does. The norms and `qk_norm_rope` are not bit-exact on the card as they are on NVIDIA: AMD's `rsqrt` flips a few low bits, in about 3 values in 10^6. Against the new limits, every figure of that run passes: scaled at most half its limit (block 41's down gemm + gated, 64 against 4 x 32 = 128; the norms' 2 to 4 against 16), same at least 0.196 points over 99 %, p99.9 within its limit (SiTU at block 41 at its 2). That run did not compute row figures, so the row limit has no card data yet, and its `qk_norm_rope` figure is over q, k and v.
+The scalar leaf under the same comparison gives 83.30 and 68.17 for the whole block, so WMMA's rounding sits as close to the engine's as an exact fp32 walk does. The norms and `qk_norm_rope` are not bit-exact on the card as they are on NVIDIA: AMD's `rsqrt` flips a few low bits, in about 3 values in 10^6. Against the new limits, every figure of that run passes: scaled at most half its limit (block 41's down gemm + gated, 64 against 4 x 32 = 128; the norms' 2 to 4 against 16), same at least 0.196 points over 99 %, p99.9 within its limit. qkv gemm and attention at both blocks (1 of 1) and SiTU at block 41 (2 of 2) sit exactly at their p99.9 limits, with the same p99.9 as the scalar leaf. For this card and toolchain that is a regression gate: on another ROCm or chip, a flip there is a reason to look closer, not by itself a defect. That run did not compute row figures, so the row limit has no card data yet, and its `qk_norm_rope` figure is over q, k and v.
 
 ## Verified
 
@@ -242,6 +255,9 @@ What passed every test in that review, and what catches it after its fixes (the 
 | Rescale test ignoring NaN (`< 1`) | passed all | verify: op 3 with every score -Inf in a one-row tile and in a full tile, packed and row-major |
 | Attention pack's zero fill removed | passed all | verify: op 3 packed with a NaN or Inf in v, and the NaN v at the next sequence's first token; a synthetic block's attention and whole-block rows |
 | Packer and kernel grouping sequences by 16 tokens | passed all | verify: op 3 packed, plain and NaN k, scaled 255 |
+| One attention output fragment (16 rows, 16 dims of one head) x 1.03 | passed replay | replay, both blocks: 186 and 80 outputs above scaled 4, limit 8 |
+| 16 columns of one 32-row QKV tile x 1.03 | passed replay | replay, both blocks: 38 and 13 above scaled 4, limit 8 |
+| One down output column x 1.06 | passed replay | replay, both blocks: 11 above scaled 4 against 8, and 8464 against 248 |
 
 Still passing every test: the row sum reversed or summed as a tree of four (no test fixes the order of that sum; see "Not tried"), and three changes that cannot change an output: the accumulator trip taken at every step, the row-major tail walking all 32 rows of its tile, and dropping the last workgroup, which has no tile at the dump's shape (the bench's known answer and verify fail it).
 

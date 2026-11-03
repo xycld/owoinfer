@@ -210,18 +210,20 @@ std::array<T, kHeadDim> replay_attention_row(const bf16_bits* q, const bf16_bits
 }
 
 // The first line of a dump's manifest.txt and of each block's meta.txt (hip_block_verify --real --dump, hip_block_replay).
-// Format 1 had neither file's header, nor a manifest, nor the scalar leaf's per-op figures.
-inline constexpr const char* kDumpFormat = "hip_block dump format 2";
+// Format 1 had neither file's header, nor a manifest, nor the scalar leaf's per-op figures; format 2 had no count of outputs
+// above scaled 4.
+inline constexpr const char* kDumpFormat = "hip_block dump format 3";
 
 // One op's output against a reference, both [rows, row_len] bf16 bits, over the first `cols` columns of each row (for
 // qk_norm_rope: q and k, without the v it leaves alone). same: % of values with equal bits, NaN on both sides counting as
 // equal. p99, p99.9: percentiles of the ULP distance. scaled: the largest error in ULPs of max(|ref|, the compared values'
 // rms), Inf when one side is infinite and the other not. min_row_same: the lowest same % of one token row, which sees a
-// whole row gone wrong when it is too few values for same and p99.9 (a row of 8484 is 0.012 %).
+// whole row gone wrong when it is too few values for same and p99.9 (a row of 8484 is 0.012 %). above4: how many values are
+// above scaled 4 (Inf on one side included), which sees a wrong fragment or column: one 16 x 16 fragment is 0.001 % of an op.
 struct Agreement {
   double same = 0.0, scaled = 0.0, min_row_same = 100.0;
   std::int32_t p99 = 0, p999 = 0;
-  std::size_t nan_mismatch = 0;
+  std::size_t nan_mismatch = 0, above4 = 0;
 };
 inline Agreement agreement(const std::vector<bf16_bits>& ref, const std::vector<bf16_bits>& got, std::size_t row_len, std::size_t cols) {
   if (ref.empty() || ref.size() != got.size() || row_len == 0 || ref.size() % row_len != 0 || cols == 0 || cols > row_len) {
@@ -263,12 +265,17 @@ inline Agreement agreement(const std::vector<bf16_bits>& ref, const std::vector<
       row_same += d == 0;
       const double x = from_bf16(rb), y = from_bf16(gb);
       if (!std::isfinite(x) || !std::isfinite(y)) {
-        if (x != y) a.scaled = INFINITY;
+        if (x != y) {
+          a.scaled = INFINITY;
+          ++a.above4;
+        }
         continue;
       }
       int e = 0;
       (void)std::frexp(std::max(std::abs(x), rms), &e);
-      a.scaled = std::max(a.scaled, std::abs(x - y) / std::ldexp(1.0, e - 8));
+      const double err = std::abs(x - y) / std::ldexp(1.0, e - 8);
+      a.scaled = std::max(a.scaled, err);
+      a.above4 += err > 4.0;
     }
     same += row_same;
     a.min_row_same = std::min(a.min_row_same, 100.0 * static_cast<double>(row_same) / static_cast<double>(cols));

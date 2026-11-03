@@ -1109,7 +1109,7 @@ void check_block(const BlockCase& c, mi::kernels::Gemm& engine, void* ws, const 
       meta << "\nblock " << limits.same_min << ' ' << limits.p99_max << ' ' << limits.scaled_max << '\n';
       for (int op = 0; op < kBlockOps; ++op) {
         const Agreement& a = scalar_figures[static_cast<std::size_t>(op)];
-        meta << "op " << op << ' ' << a.same << ' ' << a.p99 << ' ' << a.p999 << ' ' << a.scaled << ' ' << a.min_row_same << '\n';
+        meta << "op " << op << ' ' << a.same << ' ' << a.p99 << ' ' << a.p999 << ' ' << a.scaled << ' ' << a.min_row_same << ' ' << a.above4 << '\n';
       }
       if (!meta) throw std::runtime_error("cannot write " + (dump_path / "meta.txt").string());
       g_dumped.push_back(dump_path.filename().string());
