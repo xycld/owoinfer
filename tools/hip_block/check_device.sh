@@ -7,6 +7,9 @@
 # spills to it (its fragments did not stay in registers), if a kernel's wave size or maximum flat workgroup size is not 32
 # (the kernels depend on one workgroup being one wave, mma_leaf.h), if a kernel uses a dynamic stack, if a kernel in the
 # metadata went unchecked, or if the code object cannot be read.
+# HIP_BLOCK_WMMA_COUNTS=report: for another ROCm, whose clang may emit other counts. A kernel whose count differs prints
+# "COUNT MISMATCH: <kernel> n vs expected m" and, if it still holds some WMMA, does not fail the check. A GEMM, SiTU or
+# attention kernel with none, and every other condition above, still fails it.
 set -eu
 llvm_bin=$1
 arch=$2
@@ -25,7 +28,17 @@ case $arch in
     ;;
 esac
 
-"$llvm_bin/llvm-cxxfilt" <"$asm" | awk -v attention="$attention" '
+report=0
+case ${HIP_BLOCK_WMMA_COUNTS:-} in
+  "") ;;
+  report) report=1 ;;
+  *)
+    echo "check_device.sh: HIP_BLOCK_WMMA_COUNTS must be unset or report (got '$HIP_BLOCK_WMMA_COUNTS')"
+    exit 1
+    ;;
+esac
+
+"$llvm_bin/llvm-cxxfilt" <"$asm" | awk -v attention="$attention" -v report="$report" '
   BEGIN {
     ns = "hip_block::(anonymous namespace)::"
     want[ns "pack_kernel(" ns "PackArgs)"] = 0
@@ -52,14 +65,19 @@ esac
     checked++
     expected = (kernel in want) ? want[kernel] : "none"
     printf "%-5d wmma (expected %s) | wave %s | max workgroup %s | %3d VGPRs, %d spilled | LDS %6d B | scratch %d B | %s\n", wmma[kernel], expected, $2, max_wg, vgpr, spill, lds, scratch, kernel
-    if (expected == "none" || wmma[kernel] + 0 != expected) bad = 1
+    if (expected == "none") bad = 1
+    else if (wmma[kernel] + 0 != expected) {
+      mismatch[++mismatches] = sprintf("COUNT MISMATCH: %s %d vs expected %d", kernel, wmma[kernel], expected)
+      if (!report || wmma[kernel] + 0 == 0) bad = 1  # no WMMA at all is not a toolchain difference
+    }
     if (scratch == "" || spill == "" || scratch != 0 || spill != 0) bad = 1
     if (dynamic != "false") bad = 1
     scratch = spill = dynamic = ""  # a field missing from the next kernel must not inherit this value
     if ($2 != 32 || max_wg != 32) bad = 1
   }
   END {
-    printf "%d v_wmma_f32_16x16x16_bf16 in total, %d of %d kernels checked\n", total, checked, kernels
+    for (i = 1; i <= mismatches; ++i) print mismatch[i]
+    printf "%d v_wmma_f32_16x16x16_bf16 in total, %d of %d kernels checked%s\n", total, checked, kernels, report ? "; counts not enforced (report mode)" : ""
     exit (kernels == 0 || checked != kernels || bad)
   }
 '

@@ -32,7 +32,7 @@ cmake -S tools/hip_block -B build-hip-nvidia -G Ninja -DHIP_BLOCK_TARGET=nvidia 
 cmake --build build-hip-nvidia -j4
 ```
 
-The AMD builds' device check (`check_device.sh`, run by CMake with the target) fails unless each kernel holds the number of `v_wmma_f32_16x16x16_bf16` it lists for that target. Those counts are what ROCm 7.2.4's clang emits for this source; another ROCm may unroll differently and emit other counts, which then need checking in its assembly and updating in the script.
+The AMD builds' device check (`check_device.sh`, run by CMake with the target) fails unless each kernel holds the number of `v_wmma_f32_16x16x16_bf16` it lists for that target. Those counts are what ROCm 7.2.4's clang emits for this source; another ROCm may unroll differently and emit other counts, which then need checking in its assembly and updating in the script. With `HIP_BLOCK_WMMA_COUNTS=report` the script prints `COUNT MISMATCH: <kernel> n vs expected m` for each such kernel and leaves those out of its exit status as long as the kernel holds some WMMA. A GEMM, SiTU or attention kernel with none still fails it, as does every other check (wave size and workgroup size 32, no scratch or spills, no dynamic stack, only known kernels, no undefined symbols). That mode is for recording another toolchain's counts; CMake unsets the variable for its device check, so a build always enforces them.
 
 `build-*/` is ignored by git. ROCm's libraries must be on the loader path at run time if they are not installed system-wide: `LD_LIBRARY_PATH=$ROCM_PATH/lib:$ROCM_PATH/lib/llvm/lib`, plus the directory holding `libnuma` and `libdrm` where those are unpacked with ROCm.
 

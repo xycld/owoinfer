@@ -102,6 +102,6 @@ else()
     COMMAND ${CMAKE_CXX_COMPILER} ${HIP_BLOCK_DEVICE_ARGS} --no-gpu-bundle-output -o block_kernels.co ${HIP_BLOCK_SRC}
     COMMENT "Device code object for ${HIP_BLOCK_TARGET}")
   add_custom_target(hip_block_device_check ALL
-    COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/check_device.sh ${ROCM_PATH}/lib/llvm/bin ${HIP_BLOCK_TARGET} block_kernels.s block_kernels.co
+    COMMAND ${CMAKE_COMMAND} -E env --unset=HIP_BLOCK_WMMA_COUNTS sh ${CMAKE_CURRENT_SOURCE_DIR}/check_device.sh ${ROCM_PATH}/lib/llvm/bin ${HIP_BLOCK_TARGET} block_kernels.s block_kernels.co
     DEPENDS block_kernels.s block_kernels.co VERBATIM)
 endif()
