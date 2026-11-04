@@ -59,6 +59,7 @@ esac
     want[ns "rms_norm_kernel(" ns "PlainNormArgs)"] = 0
     want[ns "silu_kernel(" ns "UnaryArgs)"] = 0
     want[ns "situ_glu_kernel(" ns "SituGluArgs)"] = 0
+    want[ns "rope_table_kernel(" ns "RopeArgs)"] = 0
     # te_kernels.hip: the text encoder norms, GatedDeltaNet, causal attention and SiLU product; its GEMMs are the
     # gemm_kernel instances above.
     want[ns "te_rms_norm_kernel(" ns "TeNormArgs)"] = 0

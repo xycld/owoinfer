@@ -123,6 +123,14 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     try {
       loaded.emplace(device, r.model_dir / "transformer", options);
     } catch (const std::runtime_error& e) {
+      if (std::strstr(e.what(), "hip dit: a device budget of") != nullptr) {
+        // The Dit refuses, before its blocks load, a budget below its globals, refiner and two streaming slots.
+        std::snprintf(msg, sizeof msg,
+                      "%s leaves %.2f GiB of device memory for the DiT's weights beside %.2f GiB for the DiT at %ux%u, "
+                      "less than the DiT takes with every block streamed (%s)",
+                      budget, gib(dit_budget), gib(need), r.width, r.height, e.what());
+        throw std::runtime_error(msg);
+      }
       if (std::strstr(e.what(), "hipHostMalloc") == nullptr) throw;
       // A block is its GEMM weights in bf16, about 0.21 GiB (its norms are small); streamed ones live in pinned host memory.
       constexpr std::uint64_t kBlockBytes =

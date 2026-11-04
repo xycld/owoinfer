@@ -4,12 +4,26 @@
 // Usage: hip_dit_run TRANSFORMER_DIR GOLDEN_DIR CASE [--steps N] [--out FILE.npy] [--device N]
 //                    [--dit-budget GiB]   (device memory for the weights; the blocks past it stream)
 //                    [--time-ops]         (per-op device times of each step)
-//   GOLDEN_DIR is tests/golden, CASE e.g. g_fridge_1024; the case's cfg and uncond skip layers are 3.0 and {22}.
-// Exit status: 0 when step 0's cond and uncond predictions both reach cosine 0.99988 against the golden ones (the CUDA
-// engine's own test asks that), 1 otherwise or on an error, 2 without a usable device.
+//                    [--expect FILE.npy]  (the latent after the steps run must have exactly these bits)
+//   GOLDEN_DIR is tests/golden, CASE e.g. g_fridge_1024. The case's cfg comes from GOLDEN_DIR/cases.json and the uncond
+//   row's skipped blocks from CASE/dit_step0_uncond.skip.json, as the engine's test reads them.
+// Gates, each failing the run:
+//   - step 0, cond and uncond against the golden predictions: cosine >= 0.99988 (the CUDA engine's own test's) and rms of
+//     the difference <= 0.0155 of the golden rms (what that cosine allows between vectors of equal norm, sqrt(2 (1 - c)));
+//   - a NaN in any step's predictions or latent;
+//   - with every step run, the final latent against the golden one: cosine >= 0.95 and rms difference <= 0.316 of the
+//     golden rms (sqrt(2 x 0.05)). A gross-error gate: 50 steps of sampling amplify small differences, so a correct DiT
+//     lands well below step 0's agreement. The Vulkan DiT on these golden text-encoder outputs reaches 0.957 (coop) and
+//     0.971 (plain), and two runs differing only in their text encoder (cosine 0.9998 between those) ended 0.9706 apart;
+//     the CUDA engine reaches 0.992. The bound was set from those, before any HIP figure;
+//   - with --expect, any bit of the latent after the steps differing from the file's.
+// Exit status: 0 when every gate passes, 1 otherwise or on an error, 2 without a usable device.
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <sstream>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -21,13 +35,30 @@
 #include "hip_block.h"
 #include "npy.h"
 #include "runtime.h"
+#include "util/json.h"
 
 namespace {
 
 using namespace mi::hip;
 namespace fs = std::filesystem;
 
-constexpr double kStep0Cosine = 0.99988;
+constexpr double kStep0Cosine = 0.99988, kStep0RelRms = 0.0155;
+constexpr double kFinalCosine = 0.95, kFinalRelRms = 0.316;
+
+mi::json::Value read_json(const fs::path& p) {
+  std::ifstream in(p, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot open " + p.string());
+  std::stringstream ss;
+  ss << in.rdbuf();
+  return mi::json::parse(ss.str());
+}
+
+bool has_nan(const std::vector<float>& v) {
+  for (const float x : v) {
+    if (std::isnan(x)) return true;
+  }
+  return false;
+}
 
 std::vector<float> load_f32(const fs::path& p) { return npy::load(p).to_vector<float>(); }
 
@@ -74,7 +105,7 @@ int main(int argc, char** argv) {
   int steps = -1, device_index = -1;
   double budget_gib = 0;
   bool time_ops = false;
-  fs::path out_path;
+  fs::path out_path, expect_path;
   for (int i = 4; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--steps" && i + 1 < argc) steps = std::atoi(argv[++i]);
@@ -82,6 +113,7 @@ int main(int argc, char** argv) {
     else if (arg == "--device" && i + 1 < argc) device_index = std::atoi(argv[++i]);
     else if (arg == "--dit-budget" && i + 1 < argc) budget_gib = std::atof(argv[++i]);
     else if (arg == "--time-ops") time_ops = true;
+    else if (arg == "--expect" && i + 1 < argc) expect_path = argv[++i];
     else {
       std::printf("unknown argument %s\n", arg.c_str());
       return 1;
@@ -100,11 +132,33 @@ int main(int argc, char** argv) {
     const auto height = static_cast<std::uint32_t>(noise.shape[2]), width = static_cast<std::uint32_t>(noise.shape[3]);
     std::vector<float> latents = noise.to_vector<float>();
     const std::vector<float> sigmas = load_f32(dir / "sigmas.npy"), timesteps = load_f32(dir / "timesteps.npy");
+    if (timesteps.empty() || sigmas.size() != timesteps.size() + 1) {
+      throw std::runtime_error("sigmas.npy must hold one value more than timesteps.npy");
+    }
     const int total_steps = static_cast<int>(timesteps.size());
     if (steps < 0 || steps > total_steps) steps = total_steps;
-    constexpr float kCfg = 3.0f;
+    // The case's cfg (cases.json) and the uncond row's skipped blocks (its skip.json, which must agree with cases.json).
+    const mi::json::Value* entry = nullptr;
+    const mi::json::Value cases = read_json(golden / "cases.json");
+    for (const mi::json::Value& c : cases.as_array()) {
+      if (c.at("id").as_string() == name) entry = &c;
+    }
+    if (entry == nullptr) throw std::runtime_error(name + " is not in " + (golden / "cases.json").string());
+    const auto cfg = static_cast<float>(entry->at("cfg").as_double());
     SkipSet uncond_skip;
-    uncond_skip.set(22);
+    std::string skip_text;
+    const mi::json::Value skip_json = read_json(dir / "dit_step0_uncond.skip.json");
+    for (const mi::json::Value& l : skip_json.as_array()) {
+      const std::int64_t layer = l.as_int();
+      if (layer < 0 || layer >= kDiTLayers) throw std::runtime_error("skip layer out of range");
+      uncond_skip.set(static_cast<std::size_t>(layer));
+      skip_text += (skip_text.empty() ? "" : ",") + std::to_string(layer);
+    }
+    SkipSet listed;
+    for (const mi::json::Value& l : entry->at("uncond_skip_layers").as_array()) listed.set(static_cast<std::size_t>(l.as_int()));
+    if (listed != uncond_skip) throw std::runtime_error("skip.json and cases.json name different uncond skip layers");
+    std::printf("case %s: %ux%u latent, %d of %d steps, cfg %.2f, uncond skips {%s}\n", name.c_str(), height, width, steps,
+                total_steps, static_cast<double>(cfg), skip_text.c_str());
 
     Device device(device_index);
     std::printf("device %d: %s (%s), build %s, leaf %s, %.2f GiB free\n", device.info().index, device.info().name.c_str(),
@@ -134,7 +188,7 @@ int main(int argc, char** argv) {
       rows.push_back({&texts.back(), length, std::string(which) == "uncond" ? uncond_skip : SkipSet{}});
     }
 
-    bool pass = false;  // set by step 0
+    bool pass = steps > 0;
     const std::size_t n = latents.size();
     double total_s = 0;
     for (int s = 0; s < steps; ++s) {
@@ -143,19 +197,26 @@ int main(int argc, char** argv) {
       const double dt_s = now_s() - t0;
       total_s += dt_s;
       if (s == 0) {
-        std::printf("step 0 against the golden predictions (pass: cosine >= %.5f):\n", kStep0Cosine);
+        std::printf("step 0 against the golden predictions (pass: cosine >= %.5f, rms diff <= %.4f of golden):\n", kStep0Cosine,
+                    kStep0RelRms);
         const Compare c = compare(pred[0], load_f32(dir / "dit_step0_cond.npy"));
         const Compare u = compare(pred[1], load_f32(dir / "dit_step0_uncond.npy"));
         print("cond", c);
-        print("uncond (skips 22)", u);
-        pass = c.cosine >= kStep0Cosine && u.cosine >= kStep0Cosine && c.nans == 0 && u.nans == 0;
+        print(("uncond (skips " + skip_text + ")").c_str(), u);
+        for (const Compare& x : {c, u}) {
+          pass = pass && x.cosine >= kStep0Cosine && x.rms_diff <= kStep0RelRms * x.rms_ref && x.nans == 0;
+        }
+      }
+      if (has_nan(pred[0]) || has_nan(pred[1])) {
+        std::printf("step %d: NaN in a prediction\n", s);
+        pass = false;
       }
       // CFG then the official Euler step, the engine's op order (sampler_kernels.cu): u + g (c - u); x + h v.
       const float h = static_cast<float>(static_cast<double>(sigmas[static_cast<std::size_t>(s) + 1]) -
                                          static_cast<double>(sigmas[static_cast<std::size_t>(s)]));
       for (std::size_t i = 0; i < n; ++i) {
         const float diff = pred[0][i] - pred[1][i];
-        const float scaled = kCfg * diff;
+        const float scaled = cfg * diff;
         const float v = pred[1][i] + scaled;
         const float step = h * v;
         latents[i] = latents[i] + step;
@@ -169,11 +230,29 @@ int main(int argc, char** argv) {
       }
       std::printf("\n");
       std::fflush(stdout);
+      if (has_nan(latents)) {
+        std::printf("step %d: NaN in the latent\n", s);
+        pass = false;
+      }
     }
     std::printf("%d steps in %.1f s, %.2f s per step\n", steps, total_s, steps > 0 ? total_s / steps : 0.0);
     if (steps == total_steps) {
-      std::printf("final latent against the golden one:\n");
-      print("final latent", compare(latents, load_f32(dir / "final_latent.npy")));
+      std::printf("final latent against the golden one (pass: cosine >= %.2f, rms diff <= %.3f of golden):\n", kFinalCosine,
+                  kFinalRelRms);
+      const Compare f = compare(latents, load_f32(dir / "final_latent.npy"));
+      print("final latent", f);
+      pass = pass && f.cosine >= kFinalCosine && f.rms_diff <= kFinalRelRms * f.rms_ref && f.nans == 0;
+    }
+    if (!expect_path.empty()) {
+      const npy::Array e = npy::load(expect_path);
+      const std::vector<float> want = e.to_vector<float>();
+      std::size_t differ = want.size() == latents.size() ? 0 : latents.size();
+      if (differ == 0) {
+        for (std::size_t i = 0; i < want.size(); ++i) differ += std::memcmp(&want[i], &latents[i], sizeof(float)) != 0;
+      }
+      std::printf("latent after %d steps against %s: %zu of %zu values differ in their bits\n", steps,
+                  expect_path.string().c_str(), differ, latents.size());
+      pass = pass && differ == 0;
     }
     if (!out_path.empty()) {
       npy::save(out_path, "<f4", {1, kDiTLatentChannels, height, width}, latents.data(), latents.size() * sizeof(float));

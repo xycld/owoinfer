@@ -18,10 +18,9 @@ constexpr std::int64_t kDim = kDiTDim, kFfn = kDiTFfnDim, kHead = kDiTHeadDim, k
 constexpr std::size_t kBf16 = 2;
 constexpr std::size_t kAlign = 256;
 
-// The RoPE band frequencies 1 / 10000^(i / 16), as the reference builds them in fp32 on the CPU (kernels/basic/rope.h).
-constexpr std::uint32_t kBandBits[16] = {0x3f800000, 0x3f0ff59a, 0x3ea1e89b, 0x3e361887, 0x3dcccccd, 0x3d6655c2,
-                                         0x3d0186e3, 0x3c91ad39, 0x3c23d70a, 0x3bb8449c, 0x3b4f3e38, 0x3ae91528,
-                                         0x3a83126f, 0x3a136a16, 0x39a5cb60, 0x393a7753};
+// The longest forward the engine runs (dit_block_fused.h's kMaxRunRows): the cond, uncond and SLG rows of a 4.2 MP
+// image, each with a 4096-token prompt. MossDit::forward refuses more joint tokens, and so does this one.
+constexpr std::uint64_t kMaxRunRows = 3 * (4'200'000 / 256 + 4096);
 
 bf16 to_bf16(float v) {
   const auto u = std::bit_cast<std::uint32_t>(v);
@@ -73,31 +72,6 @@ constexpr BlockLayout block_layout() {
 constexpr BlockLayout kBlock = block_layout();
 
 }  // namespace
-
-std::vector<std::uint16_t> rope_table(std::uint32_t height, std::uint32_t width, std::uint32_t text_length) {
-  const std::uint64_t hw = std::uint64_t{height} * width, n = hw + text_length;
-  const float h_mid = static_cast<float>((static_cast<double>(height) - 1.0) / 2.0);
-  const float w_mid = static_cast<float>((static_cast<double>(width) - 1.0) / 2.0);
-  std::vector<std::uint16_t> out(n * kHead);
-  for (std::uint64_t r = 0; r < n; ++r) {
-    for (std::uint32_t p = 0; p < 64; ++p) {
-      const std::uint32_t axis = p >> 4, band = p & 15;
-      float coord = 0.0f;
-      if (r < hw) {
-        if (axis == 1) coord = static_cast<float>(text_length);
-        if (axis == 2) coord = static_cast<float>(r / width) - h_mid;
-        if (axis == 3) coord = static_cast<float>(r % width) - w_mid;
-      } else if (axis == 1) {
-        coord = static_cast<float>(r - hw);
-      }
-      const float phase = coord * std::bit_cast<float>(kBandBits[band]);
-      // sinf and cosf to fp32 as torch's CUDA kernel; the host's are correctly rounded or within an ulp, and bf16 hides that.
-      out[r * kHead + p] = to_bf16(std::sin(phase));
-      out[r * kHead + 64 + p] = to_bf16(std::cos(phase));
-    }
-  }
-  return out;
-}
 
 Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const DitOptions& options)
     : device_(device), options_(options) {
@@ -164,6 +138,12 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
                                                                {2 * f, d}, {d, f}};
   int resident = kDiTLayers;
   if (options.device_budget > 0) {
+    // The globals and the refiner stay resident, and streaming needs its two slots: a budget below that cannot hold.
+    if (options.device_budget < weight_bytes_ + 2 * kBlock.bytes) {
+      fail("a device budget of " + std::to_string(options.device_budget) + " bytes is below the " +
+           std::to_string(weight_bytes_ + 2 * kBlock.bytes) +
+           " the DiT takes at least (its embedders, modulations and text refiner, and two block slots)");
+    }
     const std::uint64_t free = options.device_budget > weight_bytes_ ? options.device_budget - weight_bytes_ : 0;
     // Streamed blocks need two slots: the next one copies while the current one runs.
     resident = free >= kDiTLayers * kBlock.bytes ? kDiTLayers
@@ -260,7 +240,8 @@ void Dit::mark(int what) {
 DeviceBuffer Dit::encode_text(const std::vector<std::uint16_t>& embeds, std::uint32_t length) {
   if (length == 0 || embeds.size() != std::size_t{length} * kDiTTextDim) fail("encode_text: embeds must be [length, 4096]");
   device_.make_current();
-  stream_.synchronize();  // the scratch below may still be in use by earlier work
+  // Work queued earlier may still use the scratch buffers resized below, which a reallocation would free under it.
+  stream_.synchronize();
   const std::size_t s = length;
   const hipStream_t st = stream_.get();
   DeviceBuffer& e = scratch(embeds_, s * kDiTTextDim * kBf16);
@@ -271,14 +252,14 @@ DeviceBuffer Dit::encode_text(const std::vector<std::uint16_t>& embeds, std::uin
   DeviceBuffer& up_gate = scratch(up_gate_, s * 2 * kFfn * kBf16);
   DeviceBuffer& ffn = scratch(ffn_, s * kFfn * kBf16);
   DeviceBuffer& rope = scratch(rope_, s * kHead * kBf16);
-  const std::vector<std::uint16_t> table = rope_table(0, 0, length);
-  rope.upload(table.data(), table.size() * kBf16);
   DeviceBuffer& cu = scratch(cu_, 2 * sizeof(std::int32_t));
   const std::int32_t cu_host[2] = {0, static_cast<std::int32_t>(length)};
   cu.upload(cu_host, sizeof(cu_host));
   DeviceBuffer out(s * kDim * kBf16);
   const int m = static_cast<int>(length);
   bf16* x = out.as<bf16>();
+
+  hip_block::rope_table(rope.as<bf16>(), 0, 0, m, st);  // the text rows of the joint table (P:251)
 
   hip_block::gemm_bias(x, kDim, e.as<bf16>(), kDiTTextDim, g_.text_w, kDiTTextDim, g_.text_b, m, kDim, kDiTTextDim, st);  // P:120
   for (const TextBlock& b : text_blocks_) {  // _TextBlock.forward, P:104-110
@@ -299,8 +280,9 @@ DeviceBuffer Dit::encode_text(const std::vector<std::uint16_t>& embeds, std::uin
   return out;
 }
 
-void Dit::time_modulation(float timestep) {
-  // P:232-241: a float64 sinusoid rounded to fp32 then bf16 (the .float() and back are exact), then the bf16 MLP.
+void Dit::stage_time(float timestep) {
+  // P:232-241: a float64 sinusoid rounded to fp32 then bf16 (the .float() and back are exact); time_modulation() runs the
+  // bf16 MLP on it.
   constexpr int kHalf = kDiTFreqDim / 2;
   std::vector<bf16> emb(kDiTFreqDim);
   for (int i = 0; i < kHalf; ++i) {
@@ -309,12 +291,15 @@ void Dit::time_modulation(float timestep) {
     emb[static_cast<std::size_t>(i)] = to_bf16(static_cast<float>(std::cos(phase)));
     emb[static_cast<std::size_t>(kHalf + i)] = to_bf16(static_cast<float>(std::sin(phase)));
   }
-  DeviceBuffer& t_in = scratch(t_in_, kDiTFreqDim * kBf16);
-  t_in.upload(emb.data(), emb.size() * kBf16);
-  DeviceBuffer& hidden = scratch(hidden_, kDim * kBf16);
-  DeviceBuffer& time = scratch(time_, kDim * kBf16);
-  DeviceBuffer& mod = scratch(mod_, 6 * kDim * kBf16);
-  DeviceBuffer& head = scratch(head_, 2 * kDim * kBf16);
+  scratch(t_in_, kDiTFreqDim * kBf16).upload(emb.data(), emb.size() * kBf16);
+  scratch(hidden_, kDim * kBf16);
+  scratch(time_, kDim * kBf16);
+  scratch(mod_, 6 * kDim * kBf16);
+  scratch(head_, 2 * kDim * kBf16);
+}
+
+void Dit::time_modulation() {
+  DeviceBuffer &t_in = t_in_, &hidden = hidden_, &time = time_, &mod = mod_, &head = head_;
   const hipStream_t st = stream_.get();
   hip_block::gemm_bias(hidden.as<bf16>(), kDim, t_in.as<bf16>(), kDiTFreqDim, g_.time0_w, kDiTFreqDim, g_.time0_b, 1, kDim,
                        kDiTFreqDim, st);
@@ -336,8 +321,12 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
     off.push_back(off.back() + hw + r.length);
   }
   const std::uint64_t total = off.back();
+  if (total > kMaxRunRows) {
+    fail("forward: a forward of " + std::to_string(total) + " joint tokens exceeds " + std::to_string(kMaxRunRows));
+  }
   device_.make_current();
-  stream_.synchronize();  // uploads below go to buffers earlier work may still read
+  // Work queued earlier may still use the scratch buffers resized below, which a reallocation would free under it.
+  stream_.synchronize();
   const hipStream_t st = stream_.get();
   events_used_ = 0;
   op_ms_.clear();
@@ -361,10 +350,6 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
     for (std::uint32_t c = 0; c < kDiTLatentChannels; ++c) host_tokens[p * kDiTLatentChannels + c] = to_bf16(latents[c * hw + p]);
   }
   tokens.upload(host_tokens.data(), host_tokens.size() * kBf16);
-  for (std::size_t r = 0; r < rows.size(); ++r) {
-    const std::vector<bf16> table = rope_table(height, width, rows[r].length);
-    rope.upload(table.data(), table.size() * kBf16, off[r] * kHead * kBf16);
-  }
 
   // Each block's runs: the maximal runs of consecutive rows that execute it, each one varlen batch over its contiguous
   // tokens. Their sequence offsets go to the device once.
@@ -389,9 +374,15 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
   }
   DeviceBuffer& cu = scratch(cu_, cu_host.size() * sizeof(std::int32_t));
   cu.upload(cu_host.data(), cu_host.size() * sizeof(std::int32_t));
+  stage_time(timestep);
 
+  // Every host upload is done: from here on the host only queues work (time_ops measures the device from here).
   mark(-1);
-  time_modulation(timestep);
+  time_modulation();
+  for (std::size_t r = 0; r < rows.size(); ++r) {
+    hip_block::rope_table(at(rope, off[r] * kHead * kBf16), static_cast<int>(height), static_cast<int>(width),
+                          static_cast<int>(rows[r].length), st);
+  }
   hip_block::gemm_bias(at(x, 0), kDim, tokens.as<bf16>(), kDiTLatentChannels, g_.video_w, kDiTLatentChannels, g_.video_b,
                        static_cast<int>(hw), kDim, kDiTLatentChannels, st);
   for (std::size_t r = 0; r < rows.size(); ++r) {
