@@ -1,0 +1,44 @@
+// Gated products of the text encoder, bf16, per element as torch eager:
+//   MODE 0, Qwen3_5MLP:            out = bf16(bf16(silu(a)) * b)
+//   MODE 1, the attention gate:    out = bf16(a * bf16(sigmoid(b)))
+// Column c of a row reads a[c], b[(c / block) * block_stride + c % block] and writes out[c]; rows have strides lda, ldb and
+// ldo. cols, block, block_stride and the strides are multiples of 4. out may alias a. Invocation: 4 columns of row
+// gl_WorkGroupID.y.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "te_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const int MODE = 0;
+
+layout(push_constant) uniform PC {
+  uint64_t a;
+  uint64_t b;
+  uint64_t out_;
+  uint lda;
+  uint ldb;
+  uint ldo;
+  uint cols;
+  uint block;
+  uint block_stride;
+} pc;
+
+void main() {
+  const uint c = gl_GlobalInvocationID.x * 4u;
+  if (c >= pc.cols) return;
+  const uint64_t r = gl_WorkGroupID.y;
+  const uint cb = (c / pc.block) * pc.block_stride + c % pc.block;
+  const vec4 a = f4(Words(pc.a + (r * pc.lda + c) * 2ul).d[0]);
+  const vec4 b = f4(Words(pc.b + (r * pc.ldb + cb) * 2ul).d[0]);
+  vec4 y;
+  if (MODE == 0) {
+    const vec4 act = rbf4(vec4(silu_f(a.x), silu_f(a.y), silu_f(a.z), silu_f(a.w)));
+    precise const vec4 product = act * b;
+    y = product;
+  } else {
+    const vec4 gate = rbf4(vec4(sigmoid_f(b.x), sigmoid_f(b.y), sigmoid_f(b.z), sigmoid_f(b.w)));
+    precise const vec4 product = a * gate;
+    y = product;
+  }
+  Words(pc.out_ + (r * pc.ldo + c) * 2ul).d[0] = bf4(y);
+}

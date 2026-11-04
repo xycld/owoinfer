@@ -1,0 +1,68 @@
+// In place, per head: q and k = rope(rms_norm(.)). qkv: [tokens, >= 2 * heads * 128] bf16 with q heads then k heads;
+// q_norm, k_norm: [128]; table: [tokens, 128] RoPE rows, [sin(64) | cos(64)]. One (token, q-or-k head) per workgroup: lane l
+// holds dims 4l..4l+3, and RoPE pairs dim d < 64 with d + 64 through shared memory.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t qkv;
+  uint64_t q_norm;
+  uint64_t k_norm;
+  uint64_t table;
+  uint ld;
+  uint table_ld;
+  uint heads;
+  float factor;
+} pc;
+
+shared float red[32];
+shared vec4 norm_shared[32];
+
+// In Vulkan GLSL barrier() also makes shared memory available and visible, at workgroup scope. memoryBarrierShared() would
+// add device scope, which needs a feature this shader otherwise has no use for.
+void sync_shared() { barrier(); }
+
+void main() {
+  const uint lane = gl_LocalInvocationIndex;
+  const uint head = gl_WorkGroupID.x;
+  const uint64_t token = gl_WorkGroupID.y;
+  Words row = Words(pc.qkv + (token * pc.ld + uint64_t(head) * 128ul) * 2ul);
+  Words weight = Words(head < pc.heads ? pc.q_norm : pc.k_norm);
+
+  const vec4 x = f4(row.d[lane]);
+  precise const vec4 squares = x * x;
+  precise const float total = squares.x + squares.y + squares.z + squares.w;
+  red[lane] = total;
+  sync_shared();
+  for (uint off = 16u; off > 0u; off >>= 1) {
+    if (lane < off) {
+      precise const float sum = red[lane] + red[lane + off];
+      red[lane] = sum;
+    }
+    sync_shared();
+  }
+  precise const float mean = red[0] * pc.factor;
+  precise const float mean_eps = mean + 1e-6;
+  const float r = inversesqrt(mean_eps);
+
+  precise const vec4 normed = x * r;
+  precise const vec4 weighted = rbf4(normed) * f4(weight.d[lane]);
+  const vec4 y = rbf4(weighted);
+  norm_shared[lane] = y;
+  sync_shared();
+
+  const vec4 other = norm_shared[lane ^ 16u];
+  Words tab = Words(pc.table + token * pc.table_ld * 2ul);
+  const uint pair = lane & 15u;
+  const vec4 si = f4(tab.d[pair]), co = f4(tab.d[pair + 16u]);
+  const bool lo_half = lane < 16u;
+  const vec4 lo = lo_half ? y : other, hi = lo_half ? other : y;
+  // moss_rope_apply's rotate_pair: lo' = lo*cos + (-hi)*sin, hi' = hi*cos + lo*sin, each op rounded.
+  precise const vec4 a = (lo_half ? lo : hi) * co;
+  precise const vec4 b = lo_half ? -hi * si : lo * si;
+  precise const vec4 rotated = rbf4(a) + rbf4(b);
+  row.d[lane] = bf4(rotated);
+}

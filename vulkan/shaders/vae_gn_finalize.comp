@@ -1,0 +1,50 @@
+// GroupNorm statistics, pass 2: merges the chunks' {count, mean, m2} of one group (Chan et al.'s pairwise update) and
+// writes stats[g] = {mean, rstd} with rstd = 1 / sqrt(m2 / count + eps), the biased variance as GroupNorm uses. One
+// workgroup per group: invocation t merges chunks t, t + 256, ... in order, then a halving tree.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t part;
+  uint64_t stats;
+  uint chunks;
+  float eps;
+} pc;
+
+shared vec3 red[256];
+
+vec3 merge(vec3 a, vec3 b) {
+  if (a.x == 0.0) return b;
+  if (b.x == 0.0) return a;
+  precise const float n = a.x + b.x;
+  precise const float delta = b.y - a.y;
+  precise const float mean = a.y + delta * (b.x / n);
+  precise const float m2 = a.z + b.z + delta * delta * (a.x * (b.x / n));
+  return vec3(n, mean, m2);
+}
+
+void main() {
+  const uint g = gl_WorkGroupID.x, t = gl_LocalInvocationIndex;
+  vec3 acc = vec3(0.0);
+  for (uint c = t; c < pc.chunks; c += 256u) {
+    Floats p = Floats(pc.part + (uint64_t(c) * 32u + g) * 16ul);
+    acc = merge(acc, vec3(p.d[0], p.d[1], p.d[2]));
+  }
+  red[t] = acc;
+  barrier();
+  for (uint off = 128u; off > 0u; off >>= 1) {
+    if (t < off) red[t] = merge(red[t], red[t + off]);
+    barrier();
+  }
+  if (t == 0u) {
+    const vec3 r = red[0];
+    precise const float var = r.z / r.x;
+    precise const float var_eps = var + pc.eps;
+    Floats s = Floats(pc.stats + uint64_t(g) * 8ul);
+    s.d[0] = r.y;
+    s.d[1] = 1.0 / sqrt(var_eps);
+  }
+}

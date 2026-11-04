@@ -1,7 +1,8 @@
 # Tag vX.Y.Z (a release) or vX.Y.Z-rcN, N >= 1 (a release candidate, published as a pre-release that does not become
 # "latest"): build and check all four standard flavours, the Windows CUDA 13 SM75 flavour and the Linux CUDA 12 SM70
-# flavour (build.yml), then publish
-# their archives (the full package and the -system-cuda variant of each) and a SHA256SUMS file as a GitHub release.
+# flavour (build.yml) and moss-infer-vulkan for Linux and Windows (build-vulkan.yml), then publish
+# their archives (the full package and the -system-cuda variant of each CUDA flavour, one archive per Vulkan platform)
+# and a SHA256SUMS file as a GitHub release.
 # X.Y.Z must equal the MI_VERSION_* of
 # include/mossinfer/mossinfer.h and an rc must come before vX.Y.Z (.github/scripts/release_version.py), the tagged
 # commit must be on main with a successful ci run (.github/scripts/release_gate.sh), and the release must not exist
@@ -92,9 +93,15 @@ jobs:
     with:
       retention-days: 30
 
+  vulkan:
+    needs: version
+    uses: ./.github/workflows/build-vulkan.yml
+    with:
+      retention-days: 30
+
   # Checks and gathers the release assets with a read-only token; on a dispatch its artifact is the dry run's result.
   package:
-    needs: [version, build]
+    needs: [version, build, vulkan]
     runs-on: ubuntu-22.04
     env:
       ARCHIVE_VERSION: ${{ needs.version.outputs.archive_version }}
@@ -112,7 +119,7 @@ jobs:
           for full in mossinfer-*.zip mossinfer-*.tar.gz; do
             [ -f "$full" ] || continue
             case "$full" in "mossinfer-$ARCHIVE_VERSION-"*) ;; *) echo "$full is not version $ARCHIVE_VERSION"; exit 1 ;; esac
-            case "$full" in *-system-cuda.*) continue ;; esac
+            case "$full" in *-system-cuda.* | *-vulkan-*) continue ;; esac
             case "$full" in *.tar.gz) ext="tar.gz"; base="${full%.tar.gz}" ;; *) ext="zip"; base="${full%.zip}" ;; esac
             test -f "$base-system-cuda.$ext" || { echo "missing $base-system-cuda.$ext"; exit 1; }
             n=$((n + 1))
@@ -125,6 +132,9 @@ jobs:
           sm70="mossinfer-$ARCHIVE_VERSION-linux-cu12-x86_64-sm70.zip"
           test -f "$sm70" || { echo "missing SM70 package $sm70"; exit 1; }
           test -f "${sm70%.zip}-system-cuda.zip" || { echo "missing SM70 system-CUDA package"; exit 1; }
+          for vk in "mossinfer-$ARCHIVE_VERSION-linux-vulkan-x86_64.tar.gz" "mossinfer-$ARCHIVE_VERSION-windows-vulkan-x86_64.zip"; do
+            test -f "$vk" || { echo "missing Vulkan package $vk"; exit 1; }
+          done
       - name: SHA256SUMS
         shell: bash
         working-directory: dist

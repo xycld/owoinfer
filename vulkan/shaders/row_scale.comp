@@ -1,0 +1,57 @@
+// The power-of-two exponent of each bf16 GEMM input row for the coop-f16 kernels: exponents[m] = e such that the row's
+// largest magnitude times 2^-e lies in [2^15, 2^16), where every bf16 value is an f16 value (the largest bf16 below 2^16
+// is 65280, f16's largest is 65504), from the row's finite values (an infinity or NaN converts as itself); zero for a
+// row without a finite nonzero value. In [-126, 112], so 2^-e and the GEMM's two halves of a scaling back are fp32 values.
+// K is a multiple of 8, lda of 8.
+//
+// A workgroup of 256 invocations takes 8 rows, 32 invocations per row; no subgroup operations.
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Vec4s { uvec4 d[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Ints { int d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t a;
+  uint64_t exponents;
+  uint M;
+  uint K;
+  uint lda;
+} pc;
+
+shared uint largest[256];
+
+// The larger finite bf16 magnitude (its bits without the sign, which order as the magnitudes do) of the two in a word.
+uint finite(uint mag) { return mag >= 0x7f80u ? 0u : mag; }
+uint word_max(uint w) { return max(finite(w & 0x7fffu), finite((w >> 16) & 0x7fffu)); }
+
+void main() {
+  const uint i = gl_LocalInvocationIndex;
+  const uint row = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 8u + i / 32u;
+  const uint lane = i % 32u;
+  uint m = 0u;
+  if (row < pc.M) {
+    Vec4s r = Vec4s(pc.a + uint64_t(row) * pc.lda * 2ul);
+    for (uint c = lane; c < pc.K / 8u; c += 32u) {
+      const uvec4 v = r.d[c];
+      m = max(m, max(max(word_max(v.x), word_max(v.y)), max(word_max(v.z), word_max(v.w))));
+    }
+  }
+  largest[i] = m;
+  barrier();
+  [[unroll]] for (uint width = 16u; width > 0u; width /= 2u) {
+    if (lane < width) largest[i] = max(largest[i], largest[i + width]);
+    barrier();
+  }
+  if (lane == 0u && row < pc.M) {
+    const uint top = largest[i];
+    const int biased = int(top >> 7);  // bf16 exponent field
+    int e = 0;
+    if (top != 0u) e = max(biased - 127 - 15, -126);
+    Ints(pc.exponents).d[row] = e;
+  }
+}

@@ -1,0 +1,85 @@
+// GroupNorm statistics, pass 1: per chunk of pixels of an NHWC fp32 tensor [P, C] and per group of C / 32 channels, the
+// chunk's element count, mean and sum of squared deviations from that mean (two passes over the chunk, so there is no
+// cancellation): part[(chunk * 32 + g) * 4 + {0, 1, 2}] = {count, mean, m2}. vae_gn_finalize.comp merges the chunks.
+// C is a multiple of 4 (and of 32) up to 1024. One chunk of `ppc` pixels per workgroup, dispatched as x + y * x_count.
+// With quads = C / 4 and rows = 256 / quads, invocation t < quads * rows owns channels 4 (t % quads) .. +4 of the pixels
+// p0 + t / quads, + rows, ...; per-channel sums meet in shared memory and are summed per group in a fixed order.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Vec4s { vec4 d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t x;
+  uint64_t part;
+  uint pixels;
+  uint C;
+  uint ppc;     // pixels per chunk
+  uint chunks;
+} pc;
+
+shared float red[1024];
+shared float gmean[32];
+
+void main() {
+  const uint chunk = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  if (chunk >= pc.chunks) return;  // uniform per workgroup
+  const uint t = gl_LocalInvocationIndex;
+  const uint quads = pc.C / 4u, rows = 256u / quads, cpg = pc.C / 32u;
+  const bool in_tile = t < quads * rows;
+  const uint quad = t % quads, row = t / quads;
+  const uint p0 = chunk * pc.ppc, p1 = min(p0 + pc.ppc, pc.pixels);
+
+  vec4 s = vec4(0.0);
+  if (in_tile) {
+    for (uint p = p0 + row; p < p1; p += rows) s += Vec4s(pc.x + (uint64_t(p) * pc.C + quad * 4u) * 4ul).d[0];
+  }
+  if (in_tile) {
+    red[row * pc.C + quad * 4u + 0u] = s.x;
+    red[row * pc.C + quad * 4u + 1u] = s.y;
+    red[row * pc.C + quad * 4u + 2u] = s.z;
+    red[row * pc.C + quad * 4u + 3u] = s.w;
+  }
+  barrier();
+  const float count = float((p1 - p0) * cpg);
+  if (t < 32u) {
+    float sum = 0.0;
+    for (uint r = 0u; r < rows; ++r) {
+      for (uint c = t * cpg; c < (t + 1u) * cpg; ++c) sum += red[r * pc.C + c];
+    }
+    gmean[t] = sum / count;
+  }
+  barrier();
+
+  vec4 q = vec4(0.0);
+  if (in_tile) {
+    const uint c0 = quad * 4u;
+    const vec4 mu = vec4(gmean[c0 / cpg], gmean[(c0 + 1u) / cpg], gmean[(c0 + 2u) / cpg], gmean[(c0 + 3u) / cpg]);
+    for (uint p = p0 + row; p < p1; p += rows) {
+      const vec4 d = Vec4s(pc.x + (uint64_t(p) * pc.C + c0) * 4ul).d[0] - mu;
+      q += d * d;
+    }
+  }
+  barrier();  // the group sums are done with red
+  if (in_tile) {
+    red[row * pc.C + quad * 4u + 0u] = q.x;
+    red[row * pc.C + quad * 4u + 1u] = q.y;
+    red[row * pc.C + quad * 4u + 2u] = q.z;
+    red[row * pc.C + quad * 4u + 3u] = q.w;
+  }
+  barrier();
+  if (t < 32u) {
+    float m2 = 0.0;
+    for (uint r = 0u; r < rows; ++r) {
+      for (uint c = t * cpg; c < (t + 1u) * cpg; ++c) m2 += red[r * pc.C + c];
+    }
+    Floats out_ = Floats(pc.part + (uint64_t(chunk) * 32u + t) * 16ul);
+    out_.d[0] = count;
+    out_.d[1] = gmean[t];
+    out_.d[2] = m2;
+    out_.d[3] = 0.0;
+  }
+}

@@ -1,0 +1,45 @@
+// GroupNorm apply on an NHWC fp32 tensor [P, C] (C a multiple of 32 and 4), in place or not:
+//   y = x * a + b with a = rstd * gamma[c], b = -a * mean + beta[c]  (torch's fused GroupNorm parameters)
+// then, with SILU, y / (1 + exp(-y)) as torch's silu. One invocation per 4 channels of one pixel, dispatched as
+// x + y * x_count workgroups of 256.
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Vec4s { vec4 d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t x;
+  uint64_t y;
+  uint64_t stats;  // [32] {mean, rstd}
+  uint64_t gamma;  // [C]
+  uint64_t beta;   // [C]
+  uint quads;      // P * C / 4
+  uint C;
+  uint silu;
+} pc;
+
+void main() {
+  const uint i = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationIndex;
+  if (i >= pc.quads) return;
+  const uint c0 = (i % (pc.C / 4u)) * 4u, cpg = pc.C / 32u;
+  const vec4 v = Vec4s(pc.x + uint64_t(i) * 16ul).d[0];
+  Floats st = Floats(pc.stats), gm = Floats(pc.gamma), bt = Floats(pc.beta);
+  vec4 r;
+  [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+    const uint c = c0 + j, g = c / cpg;
+    precise const float a = st.d[2u * g + 1u] * gm.d[c];
+    const float b = fma(-a, st.d[2u * g], bt.d[c]);
+    float y = fma(a, v[j], b);
+    if (pc.silu != 0u) {
+      precise const float denom = 1.0 + exp(-y);
+      precise const float s = y / denom;
+      y = s;
+    }
+    r[j] = y;
+  }
+  Vec4s(pc.y + uint64_t(i) * 16ul).d[0] = r;
+}

@@ -1,0 +1,30 @@
+// Row-local bf16 ops the DiT needs besides the block's, n elements, n a multiple of 4. MODE:
+//   0: out = bf16(silu(a)), silu(x) = x / (1 + exp(-x)) in fp32 (torch's SiLU)
+//   1: out = bf16(situ(a, b)), the text refiner's SiTU over separate hidden (a) and gate (b) tensors
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const int MODE = 0;
+
+layout(push_constant) uniform PC {
+  uint64_t a;
+  uint64_t b;
+  uint64_t out_;
+  uint n;
+} pc;
+
+void main() {
+  // A 2-D grid where one dimension would pass 65535 workgroups (the guaranteed limit).
+  const uint i = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 64u) + gl_GlobalInvocationID.x;
+  if (i * 4u >= pc.n) return;
+  const vec4 a = f4(Words(pc.a).d[i]);
+  if (MODE == 0) {
+    precise const vec4 denominator = 1.0 + exp(-a);
+    precise const vec4 y = a / denominator;
+    Words(pc.out_).d[i] = bf4(y);
+  } else {
+    Words(pc.out_).d[i] = bf4(situ(a, f4(Words(pc.b).d[i])));
+  }
+}

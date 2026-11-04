@@ -28,3 +28,7 @@ jobs:
     with:
       retention-days: 7
       sccache-recache: ${{ inputs.recache == true }}
+  vulkan:
+    uses: ./.github/workflows/build-vulkan.yml
+    with:
+      retention-days: 7
