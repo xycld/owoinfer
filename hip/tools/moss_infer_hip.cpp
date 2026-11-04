@@ -313,9 +313,10 @@ int run(const Args& a) {
     pipeline::write_png_rgb8(a.out_png, r.rgb, static_cast<int>(r.width), static_cast<int>(r.height), text);
   }
   if (!a.quiet) {
-    std::fprintf(stderr, "done: seed %llu; text encoder %.1f s, DiT load %.1f s (%d of 42 blocks on the device), denoise %.1f s "
-                         "(%.2f s/step), VAE %.1f s\n",
-                 static_cast<unsigned long long>(seed), r.text_encoder_s, r.dit_load_s, r.dit_resident_blocks, r.denoise_s,
+    std::fprintf(stderr, "done: seed %llu; text encoder %.1f s, DiT load %.1f s (%d of 42 blocks on the device, %.2f GiB free "
+                         "beside them), denoise %.1f s (%.2f s/step), VAE %.1f s\n",
+                 static_cast<unsigned long long>(seed), r.text_encoder_s, r.dit_load_s, r.dit_resident_blocks,
+                 static_cast<double>(r.dit_free_bytes) / static_cast<double>(1ull << 30), r.denoise_s,
                  r.denoise_s / static_cast<double>(g.timesteps.size()), r.vae_s);
   }
   return 0;

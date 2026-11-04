@@ -50,6 +50,13 @@ class Dit {
   std::uint64_t weight_bytes() const { return weight_bytes_; }  // device memory, the streaming slots included
   std::uint64_t host_weight_bytes() const { return host_weight_bytes_; }
   int resident_blocks() const { return resident_blocks_; }
+  // Device memory of one block's packed weights, resident or in a streaming slot (the pinned host memory of a streamed
+  // one is the same).
+  static std::uint64_t block_bytes();
+  // The least device memory the weights take under a budget: the globals and the text refiner, and the two slots.
+  static std::uint64_t minimum_weight_bytes();
+  // The blocks a DitOptions::device_budget keeps on the device, as the constructor chooses them (0: all 42).
+  static int resident_blocks_for(std::uint64_t device_budget);
   // Device memory of forward()'s activations over `tokens` joint tokens of `rows` rows on an h x w = hw latent grid.
   static std::uint64_t activation_bytes(std::uint64_t tokens, std::uint64_t rows, std::uint64_t hw);
 

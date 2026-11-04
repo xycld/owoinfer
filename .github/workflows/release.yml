@@ -1,8 +1,8 @@
 # Tag vX.Y.Z (a release) or vX.Y.Z-rcN, N >= 1 (a release candidate, published as a pre-release that does not become
 # "latest"): build and check all four standard flavours, the Windows CUDA 13 SM75 flavour and the Linux CUDA 12 SM70
-# flavour (build.yml) and moss-infer-vulkan for Linux and Windows (build-vulkan.yml), then publish
-# their archives (the full package and the -system-cuda variant of each CUDA flavour, one archive per Vulkan platform)
-# and a SHA256SUMS file as a GitHub release.
+# flavour (build.yml), moss-infer-vulkan for Linux and Windows (build-vulkan.yml) and moss-infer-hip for Linux
+# (build-hip.yml), then publish their archives (the full package and the -system-cuda variant of each CUDA flavour, one
+# archive per Vulkan platform, the HIP archive) and a SHA256SUMS file as a GitHub release.
 # X.Y.Z must equal the MI_VERSION_* of
 # include/mossinfer/mossinfer.h and an rc must come before vX.Y.Z (.github/scripts/release_version.py), the tagged
 # commit must be on main with a successful ci run (.github/scripts/release_gate.sh), and the release must not exist
@@ -99,9 +99,15 @@ jobs:
     with:
       retention-days: 30
 
+  hip:
+    needs: version
+    uses: ./.github/workflows/build-hip.yml
+    with:
+      retention-days: 30
+
   # Checks and gathers the release assets with a read-only token; on a dispatch its artifact is the dry run's result.
   package:
-    needs: [version, build, vulkan]
+    needs: [version, build, vulkan, hip]
     runs-on: ubuntu-22.04
     env:
       ARCHIVE_VERSION: ${{ needs.version.outputs.archive_version }}
@@ -119,7 +125,7 @@ jobs:
           for full in mossinfer-*.zip mossinfer-*.tar.gz; do
             [ -f "$full" ] || continue
             case "$full" in "mossinfer-$ARCHIVE_VERSION-"*) ;; *) echo "$full is not version $ARCHIVE_VERSION"; exit 1 ;; esac
-            case "$full" in *-system-cuda.* | *-vulkan-*) continue ;; esac
+            case "$full" in *-system-cuda.* | *-vulkan-* | *-hip-*) continue ;; esac
             case "$full" in *.tar.gz) ext="tar.gz"; base="${full%.tar.gz}" ;; *) ext="zip"; base="${full%.zip}" ;; esac
             test -f "$base-system-cuda.$ext" || { echo "missing $base-system-cuda.$ext"; exit 1; }
             n=$((n + 1))
@@ -135,6 +141,8 @@ jobs:
           for vk in "mossinfer-$ARCHIVE_VERSION-linux-vulkan-x86_64.tar.gz" "mossinfer-$ARCHIVE_VERSION-windows-vulkan-x86_64.zip"; do
             test -f "$vk" || { echo "missing Vulkan package $vk"; exit 1; }
           done
+          hip="mossinfer-$ARCHIVE_VERSION-linux-hip-x86_64.tar.gz"
+          test -f "$hip" || { echo "missing HIP package $hip"; exit 1; }
       - name: SHA256SUMS
         shell: bash
         working-directory: dist

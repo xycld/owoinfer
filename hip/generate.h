@@ -1,7 +1,8 @@
 // Text to image on the HIP backend: the text encoder, the DiT's sampling loop with CFG and the official Euler step, and
-// the VAE decode. The VAE's weights (about 0.1 GiB) load first and stay, so a decode the device cannot hold is refused
-// before anything runs; the text encoder streams its layers and is freed before the DiT loads; the DiT is freed before
-// the VAE decodes. Memory the run cannot have is refused before the first step, with the sizes. The caller supplies what the engine computes on the host for any
+// the VAE decode. The VAE's weights (about 0.1 GiB) load first and stay; the text encoder streams its layers and is freed
+// before the DiT loads; the DiT is freed before the VAE decodes. Memory the run cannot have (the decode, the DiT's
+// activations and weights, the streamed blocks' pinned host memory) is refused with the sizes before the text encoder
+// runs, and the DiT's part again when it loads. The caller supplies what the engine computes on the host for any
 // backend: token ids (tokenizer and chat template), the initial noise (the seed's torch-compatible draw) and the
 // schedule, so a seed gives the same inputs as on CUDA.
 #pragma once
@@ -44,6 +45,7 @@ struct GenerateResult {
   std::vector<float> latents;     // the final latents, f32 [128, height / 16, width / 16]
   double text_encoder_s = 0, dit_load_s = 0, denoise_s = 0, vae_s = 0;
   int dit_resident_blocks = 0;  // of 42; the rest streamed from host memory every step
+  std::uint64_t dit_free_bytes = 0;  // device memory free once the DiT's weights loaded, for its activations
 };
 
 GenerateResult generate(Device& device, const GenerateRequest& request);

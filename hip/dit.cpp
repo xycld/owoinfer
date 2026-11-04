@@ -71,7 +71,44 @@ constexpr BlockLayout block_layout() {
 }
 constexpr BlockLayout kBlock = block_layout();
 
+// The shapes of the tensors the constructor loads into its two kinds of resident buffers, in their order: the globals
+// (embedders, time embedding, modulations, head, the refiner's projection), and each of the two refiner blocks.
+std::vector<std::vector<std::int64_t>> global_shapes() {
+  const std::int64_t d = kDim;
+  return {{d, kDiTLatentChannels}, {d}, {d, kDiTFreqDim}, {d}, {d, d}, {d}, {6 * d, d}, {6 * d}, {2 * d, d}, {2 * d},
+          {d}, {kDiTLatentChannels, d}, {d, kDiTTextDim}, {d}};
+}
+std::vector<std::vector<std::int64_t>> text_block_shapes() {
+  const std::int64_t d = kDim, f = kFfn;
+  return {{d}, {d}, {kHead}, {kHead}, {3 * d, d}, {3 * d}, {d, d}, {d}, {f, d}, {f, d}, {f}, {f}, {d, f}, {d}};
+}
+// A buffer of bf16 tensors of these shapes, each at a kAlign-aligned offset.
+std::uint64_t buffer_bytes(const std::vector<std::vector<std::int64_t>>& shapes) {
+  std::uint64_t total = 0;
+  for (const auto& s : shapes) {
+    std::uint64_t n = kBf16;
+    for (const std::int64_t e : s) n *= static_cast<std::uint64_t>(e);
+    total += aligned(n);
+  }
+  return total;
+}
+
 }  // namespace
+
+std::uint64_t Dit::block_bytes() { return kBlock.bytes; }
+
+std::uint64_t Dit::minimum_weight_bytes() {
+  return buffer_bytes(global_shapes()) + 2 * buffer_bytes(text_block_shapes()) + 2 * kBlock.bytes;
+}
+
+int Dit::resident_blocks_for(std::uint64_t device_budget) {
+  if (device_budget == 0) return kDiTLayers;
+  const std::uint64_t globals = buffer_bytes(global_shapes()) + 2 * buffer_bytes(text_block_shapes());
+  const std::uint64_t free = device_budget > globals ? device_budget - globals : 0;
+  // Streamed blocks need two slots: the next one copies while the current one runs.
+  return free >= kDiTLayers * kBlock.bytes ? kDiTLayers
+                                           : static_cast<int>(free > 2 * kBlock.bytes ? free / kBlock.bytes - 2 : 0);
+}
 
 Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const DitOptions& options)
     : device_(device), options_(options) {
@@ -111,8 +148,7 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
                        "shared_block_modulation.bias", "video_head_modulation.weight", "video_head_modulation.bias",
                        "final_norm_video.weight", "final_linear_video.weight", "text_embedder.proj.weight",
                        "text_embedder.proj.bias"},
-                      {{d, kDiTLatentChannels}, {d}, {d, kDiTFreqDim}, {d}, {d, d}, {d}, {6 * d, d}, {6 * d}, {2 * d, d}, {2 * d},
-                       {d}, {kDiTLatentChannels, d}, {d, kDiTTextDim}, {d}});
+                      global_shapes());
   g_ = {a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13]};
 
   // The refiner's ffn_up and ffn_gate (and their biases) back to back form the [hidden | gate] weight of one GEMM, as the
@@ -122,7 +158,7 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
     const auto t = load({p + "norm1.weight", p + "norm2.weight", p + "q_norm.weight", p + "k_norm.weight", p + "qkv.weight",
                          p + "qkv.bias", p + "proj.weight", p + "proj.bias", p + "ffn_up.weight", p + "ffn_gate.weight",
                          p + "ffn_up.bias", p + "ffn_gate.bias", p + "ffn_down.weight", p + "ffn_down.bias"},
-                        {{d}, {d}, {kHead}, {kHead}, {3 * d, d}, {3 * d}, {d, d}, {d}, {f, d}, {f, d}, {f}, {f}, {d, f}, {d}});
+                        text_block_shapes());
     if (t[9] != t[8] + f * d || t[11] != t[10] + f) fail("the refiner's ffn_up and ffn_gate are not contiguous");
     text_blocks_.push_back({t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[10], t[12], t[13]});
   }
@@ -136,19 +172,13 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
   };
   const std::vector<std::vector<std::int64_t>> block_shapes = {{d}, {d}, {kHead}, {kHead}, {d, d}, {d, d}, {d, d}, {d, d},
                                                                {2 * f, d}, {d, f}};
-  int resident = kDiTLayers;
-  if (options.device_budget > 0) {
-    // The globals and the refiner stay resident, and streaming needs its two slots: a budget below that cannot hold.
-    if (options.device_budget < weight_bytes_ + 2 * kBlock.bytes) {
-      fail("a device budget of " + std::to_string(options.device_budget) + " bytes is below the " +
-           std::to_string(weight_bytes_ + 2 * kBlock.bytes) +
-           " the DiT takes at least (its embedders, modulations and text refiner, and two block slots)");
-    }
-    const std::uint64_t free = options.device_budget > weight_bytes_ ? options.device_budget - weight_bytes_ : 0;
-    // Streamed blocks need two slots: the next one copies while the current one runs.
-    resident = free >= kDiTLayers * kBlock.bytes ? kDiTLayers
-                                                 : static_cast<int>(free > 2 * kBlock.bytes ? free / kBlock.bytes - 2 : 0);
+  // The globals and the refiner stay resident, and streaming needs its two slots: a budget below that cannot hold.
+  if (options.device_budget > 0 && options.device_budget < minimum_weight_bytes()) {
+    fail("a device budget of " + std::to_string(options.device_budget) + " bytes is below the " +
+         std::to_string(minimum_weight_bytes()) +
+         " the DiT takes at least (its embedders, modulations and text refiner, and two block slots)");
   }
+  const int resident = resident_blocks_for(options.device_budget);
   HostBuffer staging(resident > 0 ? kBlock.bytes : 0);
   std::vector<bf16> row_major;
   for (int l = 0; l < kDiTLayers; ++l) {

@@ -158,7 +158,7 @@ if(MI_HIP_AMD)
   endif()
   install(TARGETS moss-infer-hip RUNTIME DESTINATION bin)
   install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../LICENSE ${CMAKE_CURRENT_SOURCE_DIR}/../NOTICE
-                ${CMAKE_CURRENT_SOURCE_DIR}/../THIRD_PARTY_NOTICES.md
+                ${CMAKE_CURRENT_SOURCE_DIR}/../THIRD_PARTY_NOTICES.md ${CMAKE_CURRENT_SOURCE_DIR}/../docs/hip.md
           DESTINATION share/doc/mossinfer)
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _mi_arch)
   if(_mi_arch STREQUAL "amd64")
@@ -166,7 +166,14 @@ if(MI_HIP_AMD)
   endif()
   set(CPACK_PACKAGE_NAME mossinfer-hip)
   set(CPACK_PACKAGE_VERSION ${MOSSINFER_VERSION})
+  # The release name for the release's three architectures; a build of fewer names them, so it cannot pass for it.
+  set(_mi_hip_archs ${HIP_TARGET})
+  list(SORT _mi_hip_archs)
   set(CPACK_PACKAGE_FILE_NAME "mossinfer-${MOSSINFER_VERSION}-linux-hip-${_mi_arch}")
+  if(NOT _mi_hip_archs STREQUAL "gfx1100;gfx1200;gfx1201")
+    list(JOIN _mi_hip_archs "-" _mi_hip_suffix)
+    string(APPEND CPACK_PACKAGE_FILE_NAME "-${_mi_hip_suffix}")
+  endif()
   set(CPACK_GENERATOR TGZ)
   include(CPack)
 endif()
