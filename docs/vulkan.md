@@ -57,7 +57,8 @@ driver's watchdog on a slow GPU.
 
 ## Accuracy
 
-Against the official PyTorch pipeline's golden data at 1024x1024 (`tests/golden/g_fridge_1024`), on the `coop` path:
+Against the official PyTorch pipeline's golden data at 1024x1024 (`tests/golden/g_fridge_1024`), on the `coop` path. All
+figures on this page come from an RTX 4090 Laptop GPU (every path); CI runs the kernel checks on lavapipe (`plain`).
 
 | Stage | Result |
 |---|---|
