@@ -81,13 +81,34 @@ The DiT keeps as many of its 42 blocks on the device as fit beside the run's act
 default in the device's free memory, with `--vram-budget` within that budget less the VAE's weights. The other blocks
 stay in pinned host memory (about 0.21 GiB each, 8.8 GiB for all 42) and are copied into one of two device slots while
 the block before them runs, every step. The DiT's embedders, modulations and text refiner and the two slots stay on the
-device whatever the budget, about 1.03 GiB. A streamed run gives the resident run's result bit for bit (verified on
-the NVIDIA build: two DiT steps at 1024x1024, and whole 256x256 and 512x512 runs). With `--vram-budget` the VAE's decode
-must also fit in the budget.
+device whatever the budget, about 1.03 GiB. A streamed run gives the resident run's result bit for bit (on the RX 9060
+XT: whole 512x512 and 1024x1024 runs with 2 to 17 blocks resident). With `--vram-budget` the VAE's decode must also fit
+in the budget.
 
 A run the device or the budget cannot hold is refused before the text encoder runs, with the sizes: a decode that does
 not fit, activations that do not fit, a budget below the DiT's minimum, or less available host memory than the
 streamed blocks pin. The DiT's part is checked again with the memory free when it loads.
+
+## Speed and quality
+
+On a Radeon RX 9060 XT (16 GiB), Base, 1024x1024, 50 steps, cfg 3:
+
+| Stage | Time |
+|---|---|
+| Text encoder | 4.1 s |
+| DiT load | 5.6 s |
+| Denoise | 4.24 s per step, 212 s |
+| VAE decode | 0.9 s |
+
+With `--vram-budget 6` (17 of 42 blocks on the device) a step takes 4.43 s, with `--vram-budget 3` (2 blocks) 4.57 s.
+A 512x512 step takes 0.71 s, a 1456x1456 step 14.3 s.
+
+Against the official pipeline's golden case (fridge prompt, seed 42): the DiT's first step gives cosine 0.99998 on
+both the cond and the uncond row, the text encoder stays within 2.5 times torch's own kernel-swap noise on every
+golden prompt, and the DiT alone, run 50 steps on the golden text-encoder output, ends at cosine 0.987 of the golden
+final latent. End to end the final latent is at 0.957, the same image with small layout shifts: at cfg 3 the sampler
+amplifies any rounding difference in the text encoder's output (the CUDA engine's DiT fed torch's text-encoder output
+diverges as far from its own run).
 
 ## Building
 
