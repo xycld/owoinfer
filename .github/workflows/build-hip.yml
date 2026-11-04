@@ -1,0 +1,97 @@
+# Reusable build of moss-infer-hip, the standalone ROCm program (hip/), called by ci.yml and release.yml. Linux x86-64
+# only, in AMD's ROCm 7.2.4 development container pinned by digest (ROCm's clang, the HIP runtime and headers), with
+# rocWMMA's headers and LLVM's dev tools from the container's ROCm 7.2.4 apt repository: one binary for gfx1100, gfx1200
+# and gfx1201, warnings as errors, the device check of every kernel source on every architecture (part of the build),
+# the checks and tools compiled, then the CPack archive and its program's RUNPATH, --version and --list-devices. Hosted
+# runners have no AMD GPU, so nothing runs a kernel here. No CUDA is involved.
+name: build-hip
+
+on:
+  workflow_call:
+    inputs:
+      retention-days:
+        description: Days to keep the uploaded package
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+
+jobs:
+  hip:
+    name: linux-hip
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    # The ROCm the release builds with: its clang emits the WMMA counts check_device.sh expects. Pulled by the runner
+    # (about 1 GB compressed); no cache is needed beyond it.
+    container:
+      image: rocm/dev-ubuntu-22.04:7.2.4@sha256:a50a8547101ac9e7c35848ff609a56335214b789b468c9eb05dcd006a4a38c25
+    defaults:
+      run:
+        shell: bash
+    env:
+      ROCM_PATH: /opt/rocm
+      # The container's ROCm 7.2.4 apt repository: rocWMMA's headers, and the LLVM tools check_device.sh reads the device
+      # code with (llvm-cxxfilt, llvm-nm), which the container's compiler package leaves out.
+      ROCWMMA_VERSION: 2.2.0.70204-93~22.04
+      ROCM_LLVM_DEV_VERSION: 22.0.0.26084.70204-93~22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # unzip: get-cmake extracts its Ninja download with it, and the image has none.
+      - name: rocWMMA headers, LLVM tools, zlib and unzip
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends "rocwmma-dev=$ROCWMMA_VERSION" \
+            "rocm-llvm-dev=$ROCM_LLVM_DEV_VERSION" zlib1g-dev binutils unzip
+          apt-get clean
+          "$ROCM_PATH/lib/llvm/bin/clang++" --version
+          cat "$ROCM_PATH/.info/version"
+
+      - uses: lukka/get-cmake@fffaaafeea488556c2c12dad60690008bc1caacb # v4.4.2
+
+      - name: Configure
+        run: |
+          cmake -S hip -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release "-DHIP_TARGET=gfx1100;gfx1200;gfx1201" \
+            -DROCM_PATH="$ROCM_PATH" -DMOSSINFER_STATIC_LIBSTDCXX=ON
+
+      # The build runs check_device.sh on every kernel source for every architecture (mossinfer_hip_device_check).
+      - name: Build
+        run: |
+          cmake --build build-hip --parallel 4 2>&1 | tee build-hip/build.log
+          test "${PIPESTATUS[0]}" = 0
+          checks=$(grep -c "kernels checked" build-hip/build.log)
+          echo "device checks: $checks"
+          test "$checks" -eq 12
+
+      - name: Package
+        run: |
+          cd build-hip
+          cpack
+          ls -l mossinfer-*-hip-*
+
+      # The archive's program: RUNPATH /opt/rocm/lib and nothing of the build tree, ROCm 7's HIP runtime, no libstdc++
+      # of the build's; it starts, and with no GPU in the container it lists no device and exits 0.
+      - name: Package check
+        run: |
+          mkdir pkg
+          tar -xzf build-hip/mossinfer-*-linux-hip-x86_64.tar.gz -C pkg
+          exe=$(echo pkg/mossinfer-*-linux-hip-x86_64/bin/moss-infer-hip)
+          readelf -d "$exe" | tee dynamic.txt
+          grep -Fq "Library runpath: [/opt/rocm/lib]" dynamic.txt
+          grep -Fq "Shared library: [libamdhip64.so.7]" dynamic.txt
+          if grep -Fq "Shared library: [libstdc++" dynamic.txt; then echo "libstdc++ is linked dynamically"; exit 1; fi
+          ls pkg/mossinfer-*-linux-hip-x86_64/share/doc/mossinfer/hip.md
+          version=$("$exe" --version)
+          echo "$version"
+          [[ "$version" == *"(kernels: gfx1100,gfx1200,gfx1201)" ]]
+          devices=$("$exe" --list-devices)
+          echo "$devices"
+          [ "$devices" = "no HIP devices" ]
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mossinfer-hip-linux
+          path: build-hip/mossinfer-*-linux-hip-x86_64.tar.gz
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: error

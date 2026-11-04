@@ -67,7 +67,7 @@ These are designed and partly built. The launcher can prepare for them now (see 
 |---|---|
 | GPUs with compute capability below 8.0 unless the build enables `MOSSINFER_SM75` (GTX 16xx, RTX 20xx and older) | not supported without that option: the engine needs bf16 tensor cores. With `-DMOSSINFER_SM75=ON` compute capability 7.5 runs (fp16 GEMMs + exact attention); older than 7.5 stays unsupported |
 | GPUs with compute capability 9.x, 10.x or 11.x (H100/H200, B200/GB200 and similar) | not supported: no kernels are built for them |
-| AMD, Intel and Apple GPUs; CPU-only machines; macOS | not supported |
+| AMD, Intel and Apple GPUs; CPU-only machines; macOS | not supported by the engine. Separate programs in their own packages run txt2img at the reference tier: `moss-infer-hip` on AMD Radeon RX 7900 (gfx1100) and RX 9000 (gfx1200, gfx1201) GPUs with ROCm 7 on Linux ([hip.md](hip.md)), `moss-infer-vulkan` on other Vulkan GPUs ([vulkan.md](vulkan.md)) |
 | 32-bit systems | not supported |
 | One generation split across several GPUs | not supported. One engine per GPU is the intended pattern (not yet tested on multi-GPU machines). |
 | Several generations at once on one engine | not supported: queue them in the launcher |

@@ -32,3 +32,7 @@ jobs:
     uses: ./.github/workflows/build-vulkan.yml
     with:
       retention-days: 7
+  hip:
+    uses: ./.github/workflows/build-hip.yml
+    with:
+      retention-days: 7
