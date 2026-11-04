@@ -48,8 +48,9 @@ before them runs. So a GPU with less than the DiT's 9.5 GiB still runs it, at th
 The VAE decodes the whole image at once: about 1.6 GiB at 1024x1024, 3.1 GiB at 1456x1456 and 6 GiB at 2048x2048. A
 decode the device cannot hold is refused before the text encoder runs. The text encoder and the DiT are on the device
 one after the other, never together. `--vram-budget GiB` caps the device memory of the VAE and the DiT (their weights,
-the DiT's activations and the decode), as `moss-infer generate`'s does: the DiT's blocks past it stream, and a run whose
-activations or decode it cannot hold is refused before the text encoder runs.
+the DiT's activations and the decode), as `moss-infer generate`'s does: the DiT's blocks past it stream, and a run it
+cannot hold with every block streamed, or whose decode it cannot hold, is refused before the text encoder runs. With
+`-o` the VAE's weights (about 0.1 GiB) count against it.
 
 Long operations are split into submits of bounded work, so no submit runs long enough to trip the Windows display
 driver's watchdog on a slow GPU.

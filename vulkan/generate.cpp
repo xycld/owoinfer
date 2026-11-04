@@ -72,18 +72,20 @@ GenerateResult generate(Device& device, BlockPath path, const GenerateRequest& r
     }
   }
 
-  // A budget that cannot hold the DiT's activations (one text token per prompt token) is refused before any work.
+  // The least device memory the DiT runs in: its activations (one text token per prompt token, as the text encoder
+  // gives), the weights with every block streamed, and the reserve. A budget that cannot hold it is refused before any
+  // work, and again (should the lengths differ) before the DiT loads, rather than exceeded.
   constexpr std::uint64_t kReserve = std::uint64_t{512} << 20;  // pipelines, command buffers, the driver
+  const auto refuse_dit = [&](std::uint64_t least) {
+    throw std::runtime_error("the DiT at " + std::to_string(r.width) + "x" + std::to_string(r.height) + " needs at least " +
+                             std::to_string(least >> 20) + " MiB of device memory (its activations, every block streamed); " +
+                             std::to_string(available() >> 20) + " MiB are free" + budget_note());
+  };
   if (r.vram_budget != 0) {
     std::uint64_t tokens = std::uint64_t{lh} * lw + r.cond_ids.size();
     if (cfg) tokens += std::uint64_t{lh} * lw + r.uncond_ids.size();
-    const std::uint64_t need = Dit::activation_bytes(tokens, std::uint64_t{lh} * lw) + kReserve;
-    if (need > available()) {
-      throw std::runtime_error("the DiT at " + std::to_string(r.width) + "x" + std::to_string(r.height) + " needs " +
-                               std::to_string(need >> 20) + " MiB of device memory for its activations; " +
-                               std::to_string(available() >> 20) + " MiB are free" +
-                               budget_note());
-    }
+    const std::uint64_t least = Dit::activation_bytes(tokens, std::uint64_t{lh} * lw) + kReserve + Dit::minimum_weight_bytes();
+    if (least > available()) refuse_dit(least);
   }
 
   // Text encoder: streamed layer by layer, freed before the DiT loads.
@@ -107,6 +109,7 @@ GenerateResult generate(Device& device, BlockPath path, const GenerateRequest& r
     std::uint64_t tokens = 0;
     for (const auto& e : embeds) tokens += std::uint64_t{lh} * lw + e.size() / kDiTTextDim;
     const std::uint64_t free = available(), need = Dit::activation_bytes(tokens, std::uint64_t{lh} * lw) + kReserve;
+    if (r.vram_budget != 0 && need + Dit::minimum_weight_bytes() > free) refuse_dit(need + Dit::minimum_weight_bytes());
     DitOptions options;
     options.device_budget = free > need ? free - need : 1;
     Dit dit(device, kernels, r.model_dir / "transformer", options);

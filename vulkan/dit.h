@@ -49,6 +49,8 @@ class Dit {
   std::uint64_t weight_bytes() const { return weight_bytes_; }  // device memory, the streaming slot included
   std::uint64_t host_weight_bytes() const { return host_weight_bytes_; }
   int resident_blocks() const { return resident_blocks_; }
+  // Device memory of the weights with every block streamed: the global tensors, the text refiner and the two block slots.
+  static std::uint64_t minimum_weight_bytes();
   // Device memory of the activations of one forward() over `tokens` joint tokens and an h x w latent grid.
   static std::uint64_t activation_bytes(std::uint64_t tokens, std::uint64_t hw);
 
