@@ -4,7 +4,7 @@
 #include <utility>
 
 #ifndef MI_HIP_TARGET
-#error "MI_HIP_TARGET must name the build's device target (CMakeLists.txt)"
+#error "MI_HIP_TARGET must name the build's device targets, comma-separated (CMakeLists.txt)"
 #endif
 
 namespace mi::hip {
@@ -28,8 +28,11 @@ DeviceInfo describe(int index) {
 #if defined(__HIP_PLATFORM_AMD__)
   d.arch = p.gcnArchName;
   if (const std::size_t colon = d.arch.find(':'); colon != std::string::npos) d.arch.resize(colon);
-  // A code object runs only on the ISA it was compiled for.
-  if (d.arch != MI_HIP_TARGET) d.unusable_reason = "this build's kernels are for " MI_HIP_TARGET ", the device is " + d.arch;
+  // A code object runs only on the ISA it was compiled for; MI_HIP_TARGET lists the binary's, comma-separated.
+  const std::string targets = "," MI_HIP_TARGET ",";
+  if (d.arch.empty() || targets.find("," + d.arch + ",") == std::string::npos) {
+    d.unusable_reason = "this build's kernels are for " MI_HIP_TARGET ", the device is " + d.arch;
+  }
 #else
   d.arch = "sm_" + std::to_string(p.major) + std::to_string(p.minor);
   // The build holds the kernels for MI_HIP_CUDA_ARCH and its PTX, which runs on that compute capability and newer.
@@ -107,13 +110,20 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& o) noexcept {
 void DeviceBuffer::upload(const void* src, std::size_t bytes, std::size_t offset) {
   if (offset > bytes_ || bytes > bytes_ - offset) throw std::runtime_error("hip: upload past the end of a device buffer");
   if (bytes == 0) return;
+  // hipMemcpy is ordered with neither non-blocking streams nor, from pageable memory, the DMA it starts: wait for every
+  // stream before (a kernel may still read the old contents) and after (the next kernel must see the new ones).
+  check(hipDeviceSynchronize(), "hipDeviceSynchronize before an upload");
   check(hipMemcpy(static_cast<char*>(p_) + offset, src, bytes, hipMemcpyHostToDevice), "hipMemcpy to the device");
+  check(hipDeviceSynchronize(), "hipDeviceSynchronize after an upload");
 }
 
 void DeviceBuffer::download(void* dst, std::size_t bytes, std::size_t offset) const {
   if (offset > bytes_ || bytes > bytes_ - offset) throw std::runtime_error("hip: download past the end of a device buffer");
   if (bytes == 0) return;
+  // Every stream's writes first; the host has the bytes when this returns.
+  check(hipDeviceSynchronize(), "hipDeviceSynchronize before a download");
   check(hipMemcpy(dst, static_cast<const char*>(p_) + offset, bytes, hipMemcpyDeviceToHost), "hipMemcpy to the host");
+  check(hipDeviceSynchronize(), "hipDeviceSynchronize after a download");
 }
 
 void DeviceBuffer::fill(int byte, hipStream_t stream) {

@@ -8,7 +8,7 @@ MOSS-Image's native kernels for AMD GPUs through ROCm, and the same sources thro
 | `gfx1200`, `gfx1201` (RDNA4) | ROCm clang | rocWMMA, `v_wmma_f32_16x16x16_bf16` |
 | `nvidia` | nvcc with HIP's NVIDIA headers | scalar: the exact bf16*bf16 product in fp32, then add, K ascending |
 
-A binary runs only on its target's ISA. Every kernel launches workgroups of one wave (32 threads) and depends on that (`mma_leaf.h`).
+An AMD build holds a code object for each architecture in `HIP_TARGET` (a CMake list) and runs on those only; the release package's `moss-infer-hip` holds all three. It needs ROCm 7 at run time (`libamdhip64.so.7`). Every kernel launches workgroups of one wave (32 threads) and depends on that (`mma_leaf.h`).
 
 ## Files
 
@@ -27,18 +27,19 @@ A binary runs only on its target's ISA. Every kernel launches workgroups of one 
 
 ## Building
 
-`ROCM_PATH` is the ROCm root holding `include/hip` and `lib/llvm`, as a CMake cache variable or in the environment. `tools/hip_vae_check` also needs zlib (`zlib1g-dev` or `zlib-devel`).
+`ROCM_PATH` is the ROCm 7 root holding `include/hip` and `lib/llvm`, as a CMake cache variable or in the environment. `tools/hip_vae_check` also needs zlib (`zlib1g-dev` or `zlib-devel`).
 
 ```sh
-cmake -S hip -B build-hip-gfx1200 -G Ninja -DHIP_TARGET=gfx1200   # gfx1100, gfx1201 likewise
-cmake --build build-hip-gfx1200 -j4
+cmake -S hip -B build-hip-amd -G Ninja "-DHIP_TARGET=gfx1100;gfx1200;gfx1201"   # or one of them
+cmake --build build-hip-amd -j4
+cpack --config build-hip-amd/CPackConfig.cmake  # mossinfer-<version>-linux-hip-x86_64.tar.gz: moss-infer-hip, licences
 cmake -S hip -B build-hip-nvidia -G Ninja -DHIP_TARGET=nvidia     # CMAKE_CUDA_ARCHITECTURES, default 89
 cmake --build build-hip-nvidia -j4
-build-hip-gfx1200/hip_check --list    # the devices HIP sees and whether this build runs on each
-build-hip-gfx1200/hip_check           # copies and a known-answer GEMM on the first usable device
+build-hip-amd/hip_check --list    # the devices HIP sees and whether this build runs on each
+build-hip-amd/hip_check           # copies and a known-answer GEMM on the first usable device
 ```
 
-Warnings are errors (`MI_HIP_WERROR`). An AMD build compiles each kernel source a second time on its own, device only and with the library's flags, and runs `check_device.sh` on the assembly and code object: each kernel must hold the number of `v_wmma_f32_16x16x16_bf16` the script lists for that target, use wave size and workgroup size 32, no scratch, no spills and no dynamic stack, be one of the kernels the script knows, and the code object must have no undefined symbols. The counts are ROCm 7.2.4's; `tools/hip_block/README.md` says how to record another toolchain's. At run time ROCm's libraries must be on the loader path if they are not installed system-wide: `LD_LIBRARY_PATH=$ROCM_PATH/lib:$ROCM_PATH/lib/llvm/lib`.
+Warnings are errors (`MI_HIP_WERROR`). An AMD build compiles each kernel source a second time on its own for each architecture, device only and with the library's flags, and runs `check_device.sh` on each assembly and code object: each kernel must hold the number of `v_wmma_f32_16x16x16_bf16` the script lists for that architecture, use wave size and workgroup size 32, no scratch, no spills and no dynamic stack, be one of the kernels the script knows, and the code object must have no undefined symbols. The counts are ROCm 7.2.4's; `tools/hip_block/README.md` says how to record another toolchain's. The executables find `libamdhip64` in `$ROCM_PATH/lib` in the build tree; the installed `moss-infer-hip` looks in `/opt/rocm/lib`, then on the loader path (`LD_LIBRARY_PATH` for a ROCm installed elsewhere).
 
 `hip_check` exits 0 when every check passes, 1 on a failure and 2 when no device runs this build (an AMD build on a machine without that GPU, for one). A device whose architecture is not the build's target is listed with the reason and never chosen.
 
