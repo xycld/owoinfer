@@ -4,7 +4,7 @@
 //     1 ULP).
 //   - rms_norm (plain at 1 to 17 rows, where torch's threads per row change; with the RoPE on q and k head views; gated
 //     in place), conv1d+SiLU over sequences of 1 to 70 tokens, the gates (softplus past its threshold, exp underflow),
-//     silu_mul, causal GQA attention with and without the output gate: bf16 outputs at >= 99 % the replay's bits and
+//     silu_mul, causal GQA attention (the output gate against the ungated run's own output): bf16 outputs at >= 99 % the replay's bits and
 //     within 1 ULP of max(|replay|, floor). The replays use the host's exp, rsqrt and division, which may differ from the
 //     device's in the last bit of fp32, which a rounding point can carry into a bf16 output.
 //   - the chunked gated delta rule over sequences of 1, 5, 64, 65, 130 and 300 tokens (chunk tails and several chunks),
@@ -715,6 +715,10 @@ void check_attention(Rng& rng, hipStream_t stream) {
   const auto q = spread_bits(rng, z(T) * ldq, -3, 1), kv = spread_bits(rng, z(T) * ldkv, -3, 1), gate = spread_bits(rng, z(T) * ldg, -3, 3);
   const auto o0 = spread_bits(rng, z(T) * ldo, 0, 0);
   DeviceBuffer qd = upload(q), kvd = upload(kv), gd = upload(gate), cud = upload(cu);
+  // The gated run is checked against the ungated run's own output: the gate is applied to the bf16 attention output,
+  // so a 1-ULP difference there (the matrix cores' summation order is not the replay's) scales and rounds again, up to
+  // 2 ULPs of the gated value. The ungated run bounds the attention; the gated run checks the gate on top of it.
+  std::vector<bits> ungated;
   for (const bool gated : {false, true}) {
     DeviceBuffer od = upload(o0);
     te::AttentionArgs a;
@@ -748,16 +752,18 @@ void check_attention(Rng& rng, hipStream_t stream) {
           auto row = replay_attention_row(q.data() + z(r0 + r) * ldq + z(h * HD), kv.data() + z(r0) * ldkv + z(kvh * HD), ldkv,
                                           kv.data() + z(r0) * ldkv + z((kv_heads + kvh) * HD), ldkv, key_end, r, 0.0625f);
           for (int c = 0; c < HD; ++c) {
-            float o = rbf(row[z(c)]);
-            if (gated) o = o * rbf(sigmoid(fb(gate[z(r0 + r) * ldg + z(h * 2 * HD + HD + c)])));
-            want[z(r0 + r) * ldo + z(h * HD + c)] = o;
-            mask[z(r0 + r) * ldo + z(h * HD + c)] = 1;
+            const size_t i = z(r0 + r) * ldo + z(h * HD + c);
+            want[i] = gated ? fb(ungated[i]) * rbf(sigmoid(fb(gate[z(r0 + r) * ldg + z(h * 2 * HD + HD + c)])))
+                            : rbf(row[z(c)]);
+            mask[i] = 1;
           }
         }
       }
     }
-    report(std::string("causal GQA attention, 4 sequences") + (gated ? ", gated" : ""), download<bits>(od, want.size()), want,
-           {1.0, 1.0}, mask);
+    const std::vector<bits> got = download<bits>(od, want.size());
+    report(gated ? "causal GQA attention, 4 sequences, gate on the ungated output" : "causal GQA attention, 4 sequences", got,
+           want, {1.0, 1.0}, mask);
+    if (!gated) ungated = got;
   }
 }
 
