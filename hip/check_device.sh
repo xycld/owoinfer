@@ -1,6 +1,6 @@
 #!/bin/sh
-# Static check of an AMD device build of one kernel source (block_kernels.hip, dit_kernels.hip), from its assembly and
-# linked code object:
+# Static check of an AMD device build of one kernel source (block_kernels.hip, dit_kernels.hip, te_kernels.hip), from its
+# assembly and linked code object:
 #   check_device.sh <llvm bin dir> <arch> <file.s> <code object>
 # Prints each kernel's v_wmma_f32_16x16x16_bf16 count and resources, and the code object's undefined symbols. Fails if
 # there are undefined symbols, if a kernel's name is not one of the kernels below or its WMMA count is not the one listed
@@ -19,7 +19,8 @@ code_object=$4
 
 # WMMA instructions per kernel as ROCm 7.2.4's clang emits this source: the GEMM and SiTU kernels 6 on each path, packed
 # and row-major; attention 16 in its packed score walk and the rest in the row-major walk and P x V, unrolled further on
-# gfx1100. A change of source or compiler that moves them must update this table.
+# gfx1100; the text encoder's causal attention 4 in its score walk and 16 in P x V. A change of source or compiler that
+# moves them must update this table.
 case $arch in
   gfx1100) attention=48 ;;
   gfx1200 | gfx1201) attention=34 ;;
@@ -57,6 +58,18 @@ esac
     want[ns "silu_kernel(" ns "UnaryArgs)"] = 0
     want[ns "situ_glu_kernel(" ns "SituGluArgs)"] = 0
     want[ns "rope_table_kernel(" ns "RopeArgs)"] = 0
+    # te_kernels.hip: the text encoder norms, GatedDeltaNet, causal attention and SiLU product; its GEMMs are the
+    # gemm_kernel instances above.
+    want[ns "te_rms_norm_kernel(" ns "TeNormArgs)"] = 0
+    want[ns "te_rope_table_kernel(" ns "RopeArgs)"] = 0
+    want[ns "te_conv_silu_kernel(" ns "ConvArgs)"] = 0
+    want[ns "te_gates_kernel(" ns "GatesArgs)"] = 0
+    want[ns "te_gdn_qk_kernel(" ns "GdnArgs)"] = 0
+    want[ns "te_gdn_chunk_kernel(" ns "GdnArgs)"] = 0
+    want[ns "te_gdn_solve_kernel(" ns "GdnArgs)"] = 0
+    want[ns "te_gdn_state_kernel(" ns "GdnArgs)"] = 0
+    want[ns "te_attention_kernel(" ns "TeAttnArgs)"] = 20
+    want[ns "te_silu_mul_kernel(" ns "SiluMulArgs)"] = 0
   }
   /^[^ \t.#;].*:[ \t]*(;.*)?$/ { name = $0; sub(/:[ \t]*(;.*)?$/, "", name); current = name }
   /v_wmma_f32_16x16x16_bf16/ { wmma[current]++; total++ }

@@ -37,10 +37,10 @@ endif()
 list(APPEND MI_HIP_WARN -ffp-contract=off)
 
 # Kernel sources. block_kernels.hip is the DiT block (tools/hip_block checks it against the engine); dit_kernels.hip the
-# DiT's other ops.
-set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip)
-set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h)
-set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp)
+# DiT's other ops; te_kernels.hip the text encoder's.
+set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip te_kernels.hip)
+set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h te_kernels.h)
+set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp text_encoder.cpp)
 
 if(HIP_TARGET STREQUAL "nvidia")
   set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures of the NVIDIA build")
@@ -122,3 +122,14 @@ target_include_directories(mi_hip_engine_json SYSTEM PUBLIC ${CMAKE_CURRENT_SOUR
 add_executable(hip_dit_run tools/hip_dit_run.cpp)
 target_compile_options(hip_dit_run PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_dit_run PRIVATE mossinfer_hip mi_hip_engine_json)
+
+# te_kernels.h's ops against host replays of their op order, and the gated delta rule against an fp64 recurrence.
+add_executable(hip_te_kernel_check tools/hip_te_kernel_check.cpp)
+target_compile_options(hip_te_kernel_check PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_te_kernel_check PRIVATE mossinfer_hip)
+
+# The text encoder against the official pipeline's golden hidden states; it reads cases.json and the torch noise floor
+# with the engine's JSON reader (mi_hip_engine_json above).
+add_executable(hip_te_check tools/hip_te_check.cpp)
+target_compile_options(hip_te_check PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_te_check PRIVATE mossinfer_hip mi_hip_engine_json)
