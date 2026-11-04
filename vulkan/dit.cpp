@@ -16,6 +16,26 @@ namespace {
 constexpr std::uint32_t kDim = kDiTDim, kFfn = kDiTFfnDim, kHead = kDiTHeadDim, kQkv = 3 * kDiTDim;
 constexpr VkDeviceSize kBf16 = 2;
 
+// The bf16 tensors the constructor loads, in its order: the global ones, one text refiner block, one DiT block.
+using Shapes = std::vector<std::vector<std::int64_t>>;
+constexpr std::int64_t kD = kDim, kF = kFfn, kH = kHead;
+const Shapes kGlobalShapes = {{kD, kDiTLatentChannels}, {kD}, {kD, kDiTFreqDim}, {kD}, {kD, kD}, {kD}, {6 * kD, kD},
+                              {6 * kD}, {2 * kD, kD}, {2 * kD}, {kD}, {kDiTLatentChannels, kD}, {kD, kDiTTextDim}, {kD}};
+const Shapes kTextBlockShapes = {{kD}, {kD}, {kH}, {kH}, {3 * kD, kD}, {3 * kD}, {kD, kD}, {kD},
+                                 {kF, kD}, {kF}, {kF, kD}, {kF}, {kD, kF}, {kD}};
+const Shapes kBlockShapes = {{kD}, {kD}, {kH}, {kH}, {kD, kD}, {kD, kD}, {kD, kD}, {kD, kD}, {2 * kF, kD}, {kD, kF}};
+
+// Device bytes of tensors placed at 256-byte aligned offsets, as the constructor places them.
+std::uint64_t placed_bytes(const Shapes& shapes) {
+  std::uint64_t total = 0;
+  for (const auto& shape : shapes) {
+    std::uint64_t n = kBf16;
+    for (const std::int64_t e : shape) n *= static_cast<std::uint64_t>(e);
+    total += (n + 255) / 256 * 256;
+  }
+  return total;
+}
+
 // The RoPE band frequencies 1 / 10000^(i / 16), as the reference builds them in fp32 on the CPU (kernels/basic/rope.h).
 constexpr std::uint32_t kBandBits[16] = {0x3f800000, 0x3f0ff59a, 0x3ea1e89b, 0x3e361887, 0x3dcccccd, 0x3d6655c2,
                                          0x3d0186e3, 0x3c91ad39, 0x3c23d70a, 0x3bb8449c, 0x3b4f3e38, 0x3ae91528,
@@ -104,15 +124,12 @@ Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::pat
     for (const VkDeviceSize o : offsets) addresses.push_back(owned_.back()->address() + o);
     return addresses;
   };
-  const std::int64_t d = kDim, f = kFfn;
-
   auto a = load({"video_embedder.weight", "video_embedder.bias", "time_embedding.0.weight", "time_embedding.0.bias",
                  "time_embedding.2.weight", "time_embedding.2.bias", "shared_block_modulation.weight",
                  "shared_block_modulation.bias", "video_head_modulation.weight", "video_head_modulation.bias",
                  "final_norm_video.weight", "final_linear_video.weight", "text_embedder.proj.weight",
                  "text_embedder.proj.bias"},
-                {{d, kDiTLatentChannels}, {d}, {d, kDiTFreqDim}, {d}, {d, d}, {d}, {6 * d, d}, {6 * d}, {2 * d, d}, {2 * d},
-                 {d}, {kDiTLatentChannels, d}, {d, kDiTTextDim}, {d}});
+                kGlobalShapes);
   g_ = {a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13]};
 
   for (int b = 0; b < 2; ++b) {
@@ -120,14 +137,12 @@ Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::pat
     auto t = load({p + "norm1.weight", p + "norm2.weight", p + "q_norm.weight", p + "k_norm.weight", p + "qkv.weight",
                    p + "qkv.bias", p + "proj.weight", p + "proj.bias", p + "ffn_up.weight", p + "ffn_up.bias",
                    p + "ffn_gate.weight", p + "ffn_gate.bias", p + "ffn_down.weight", p + "ffn_down.bias"},
-                  {{d}, {d}, {kHead}, {kHead}, {3 * d, d}, {3 * d}, {d, d}, {d}, {f, d}, {f}, {f, d}, {f}, {d, f}, {d}});
+                  kTextBlockShapes);
     text_blocks_.push_back({t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13]});
   }
 
   // Blocks: the first `resident` in device memory, the rest in host memory, each copied into one device slot before it
   // runs. q, k and v sit back to back (256-aligned sizes of 18 MiB each), so they form the [9216, 3072] QKV weight.
-  const std::vector<std::vector<std::int64_t>> block_shapes = {{d}, {d}, {kHead}, {kHead}, {d, d}, {d, d}, {d, d}, {d, d},
-                                                                {2 * f, d}, {d, f}};
   const auto block_names = [](int l) {
     const std::string p = "layers." + std::to_string(l) + ".";
     return std::vector<std::string>{p + "norm1.weight", p + "norm2.weight", p + "q_norm.weight", p + "k_norm.weight",
@@ -138,8 +153,7 @@ Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::pat
     if (o[5] != o[4] + kDim * kDim * kBf16 || o[6] != o[5] + kDim * kDim * kBf16) fail("q, k and v are not contiguous");
     return BlockWeights{base + o[0], base + o[1], base + o[2], base + o[3], base + o[4], base + o[7], base + o[8], base + o[9]};
   };
-  VkDeviceSize block_bytes = 0;
-  for (const std::string& n : block_names(0)) block_bytes += (index.at(n).bytes + 255) / 256 * 256;
+  const VkDeviceSize block_bytes = placed_bytes(kBlockShapes);
   int resident = kDiTLayers;
   if (options.device_budget > 0) {
     const std::uint64_t free = options.device_budget > weight_bytes_ ? options.device_budget - weight_bytes_ : 0;
@@ -149,7 +163,7 @@ Dit::Dit(Device& device, const BlockKernels& kernels, const std::filesystem::pat
   }
   for (int l = 0; l < kDiTLayers; ++l) {
     const bool on_device = l < resident;
-    const std::vector<VkDeviceSize> o = place(block_names(l), block_shapes, on_device ? Buffer::Kind::kDevice : Buffer::Kind::kStaging);
+    const std::vector<VkDeviceSize> o = place(block_names(l), kBlockShapes, on_device ? Buffer::Kind::kDevice : Buffer::Kind::kStaging);
     if (on_device) {
       blocks_.push_back(block_weights(owned_.back()->address(), o));
       host_blocks_.push_back(nullptr);
@@ -245,6 +259,10 @@ void Dit::run_block_op(int op, const BlockWeights& w, const BlockBuffers& b) {
     part.tokens = std::min(chunk, b.tokens - t0);
     device_.run([&](VkCommandBuffer cb) { record_block_op(kernels_, cb, op, w, part); });
   }
+}
+
+std::uint64_t Dit::minimum_weight_bytes() {
+  return placed_bytes(kGlobalShapes) + 2 * placed_bytes(kTextBlockShapes) + 2 * placed_bytes(kBlockShapes);
 }
 
 std::uint64_t Dit::activation_bytes(std::uint64_t tokens, std::uint64_t hw) {

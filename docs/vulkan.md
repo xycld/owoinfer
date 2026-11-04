@@ -8,7 +8,7 @@ slower than CUDA; on a supported NVIDIA GPU, use `moss-infer`.
 It runs txt2img with the official Base and SFT bf16 files, the official euler sampler and schedule and classifier-free
 guidance with the uncond skip layers. The tier is `reference`. Everything else is refused with a message that names
 the option: other samplers and schedulers, LoRAs, img2img and inpainting, hires fix, control adapters, references,
-the lossy accelerators, quantized or GGUF files, and the CUDA memory options. The tokenizer, the seed's initial noise
+the lossy accelerators, quantized or GGUF files, and the CUDA memory options other than `--vram-budget`. The tokenizer, the seed's initial noise
 and the schedule are the engine's own, so a seed gives the same inputs as on CUDA.
 
 ```sh
@@ -18,11 +18,12 @@ moss-infer-vulkan --list-devices
 
 The flags are those of `moss-infer generate` that the backend runs, with the same defaults (`--negative`, `--size`,
 `--width`, `--height`, `--steps`, `--cfg`, `--shift`, `--seed`, `--skip-layers`, `--max-seq`, `--latent-out`,
-`--no-metadata`, `--quiet`; `--tier` accepts `reference`). `--device N` picks a device (default: the first usable one, a
+`--no-metadata`, `--quiet`, `--vram-budget`; `--tier` accepts `reference`), checked with the engine's limits and
+messages (at most 4.2 megapixels and 4096 pixels on a side, at most 10000 steps). `--device N` picks a device (default: the first usable one, a
 discrete GPU first) and `--kernels coop|coop-f16|plain` the kernels (default: the first in that order the device has);
 both are printed at the start of every run. Progress goes to stderr one line per event: `text encoder`, `denoise <step>/<steps>
 <seconds>`, `vae`, then a `done:` summary. The exit status is 0 on success, 2 for a usage error or an unsupported
-request, 1 for any other failure.
+request, 1 for any other failure. `--help` prints the usage to stdout, `--version` the version.
 
 ## Kernels
 
@@ -46,7 +47,10 @@ of its 42 blocks on the device as fit next to the run's activations, from the dr
 before them runs. So a GPU with less than the DiT's 9.5 GiB still runs it, at the cost of host memory and bus traffic.
 The VAE decodes the whole image at once: about 1.6 GiB at 1024x1024, 3.1 GiB at 1456x1456 and 6 GiB at 2048x2048. A
 decode the device cannot hold is refused before the text encoder runs. The text encoder and the DiT are on the device
-one after the other, never together.
+one after the other, never together. `--vram-budget GiB` caps the device memory of the VAE and the DiT (their weights,
+the DiT's activations and the decode), as `moss-infer generate`'s does: the DiT's blocks past it stream, and a run it
+cannot hold with every block streamed, or whose decode it cannot hold, is refused before the text encoder runs. With
+`-o` the VAE's weights (about 0.1 GiB) count against it.
 
 Long operations are split into submits of bounded work, so no submit runs long enough to trip the Windows display
 driver's watchdog on a slow GPU.
