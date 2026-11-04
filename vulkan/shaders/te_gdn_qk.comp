@@ -1,0 +1,61 @@
+// The gated delta rule's q and k in fp32, as the engine's chunk prep: q = x * rsqrt(sum(x^2) + 1e-6) * 128^-0.5 and
+// k = x * rsqrt(sum(x^2) + 1e-6) per 128-wide key head of the conv output (q heads at column 0, k heads at column 2048).
+// Lane l sums its 4 squares with fused multiply-adds, then the 32 partial sums take a halving tree (the same sum as a
+// butterfly of shuffles). qn, kn: f32 [16][tokens][128]. Workgroup (key head, token).
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "te_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t qkv;
+  uint64_t qn;
+  uint64_t kn;
+  uint ldqkv;
+  uint tokens;
+} pc;
+
+const float Q_SCALE = 0.08838834764831845;  // 128^-0.5 in fp32
+const uint KEY_DIM = 2048u;
+
+shared float red_q[32];
+shared float red_k[32];
+
+void main() {
+  const uint lane = gl_LocalInvocationIndex;
+  const uint head = gl_WorkGroupID.x;
+  const uint64_t t = gl_WorkGroupID.y;
+  Words row = Words(pc.qkv + t * pc.ldqkv * 2ul);
+  const vec4 q = f4(row.d[head * 32u + lane]);
+  const vec4 k = f4(row.d[(KEY_DIM + head * 128u) / 4u + lane]);
+  precise float sq = 0.0, sk = 0.0;
+  sq = fma(q.x, q.x, sq);
+  sq = fma(q.y, q.y, sq);
+  sq = fma(q.z, q.z, sq);
+  sq = fma(q.w, q.w, sq);
+  sk = fma(k.x, k.x, sk);
+  sk = fma(k.y, k.y, sk);
+  sk = fma(k.z, k.z, sk);
+  sk = fma(k.w, k.w, sk);
+  red_q[lane] = sq;
+  red_k[lane] = sk;
+  barrier();
+  for (uint off = 16u; off > 0u; off >>= 1) {
+    if (lane < off) {
+      precise const float a = red_q[lane] + red_q[lane + off];
+      precise const float b = red_k[lane] + red_k[lane + off];
+      red_q[lane] = a;
+      red_k[lane] = b;
+    }
+    barrier();
+  }
+  precise const float q_sum = red_q[0] + 1e-6;
+  precise const float k_sum = red_k[0] + 1e-6;
+  const float iq = inversesqrt(q_sum), ik = inversesqrt(k_sum);
+  precise const vec4 qo = (q * iq) * Q_SCALE;
+  precise const vec4 ko = k * ik;
+  const uint64_t at = (uint64_t(head) * pc.tokens + t) * 128ul + lane * 4u;
+  Vec4f(pc.qn + at * 4ul).d[0] = qo;
+  Vec4f(pc.kn + at * 4ul).d[0] = ko;
+}

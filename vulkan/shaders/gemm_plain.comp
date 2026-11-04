@@ -1,0 +1,156 @@
+// out[M,N] = A[M,K] * B[N,K]^T without cooperative matrices, for any device with buffer device addresses and 64-bit
+// integers: fp32 fused multiply-adds with K ascending, inputs f16 or bf16. A and B are row-major with strides lda and ldb,
+// both multiples of 4. M is free; N and K are multiples of 4. It does not depend on the subgroup size.
+//
+// One workgroup of 256 invocations per 128x128 tile of the product. Invocation (tx, ty) = (i % 16, i / 16) owns rows
+// 4 ty .. +4 and 64 + 4 ty .. +4 and columns 4 tx .. +4 and 64 + 4 tx .. +4 of the tile, so in MODE 3, where the first half
+// of the tile's B rows holds 64 hidden columns and the second the same 64 gate columns, each invocation owns both factors
+// of its outputs. K walks in steps of 8 through two shared-memory stages of fp32 (17 KiB): the next step loads into
+// registers while the current one multiplies. MODE:
+//   0: out is f32
+//   1: out is bf16
+//   2: out[m,n] += bf16(bf16(ab) * gate[n]), gated residual, bf16 in place
+//   3: out[m,n] = situ(bf16(A * B[n]), bf16(A * B[N + n])), SiTU-GLU over the stored [hidden | gate] weight, bf16
+//   4: out[m,n] = bf16(ab + bias[n]), nn.Linear with a bias (bias in `gate`), bf16
+//   5: out[m,n] += bf16(ab + bias[n]), the same then a residual add, bf16 in place
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const bool INPUT_BF16 = true;
+layout(constant_id = 1) const int MODE = 0;
+
+layout(push_constant) uniform PC {
+  uint64_t a;
+  uint64_t b;
+  uint64_t out_;
+  uint64_t gate;
+  uint M;
+  uint N;
+  uint K;
+  uint lda;
+  uint ldb;
+  uint ldo;
+} pc;
+
+const uint BM = 128u;
+const uint BN = 128u;  // rows of B per tile; MODE 3 covers BN / 2 output columns
+const uint BK = 8u;
+const uint LINE = 132u;  // floats per staged k: 128 and 4 of padding
+const uint STAGE = BK * LINE;
+
+// [stage][k][m] for A and [stage][k][n] for B: k-major, so 4 rows or columns at one k are 4 adjacent floats.
+shared float sa[2u * STAGE];
+shared float sb[2u * STAGE];
+
+vec4 decode(uvec2 w) { return INPUT_BF16 ? f4(w) : vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y)); }
+
+uint b_row(uint n_base, uint r) {
+  if (MODE != 3) return n_base + r;
+  return r < BN / 2u ? n_base + r : pc.N + n_base + (r - BN / 2u);
+}
+bool b_valid(uint n_base, uint r) { return (MODE == 3 ? n_base + r % (BN / 2u) : n_base + r) < pc.N; }
+
+// Invocation i loads 4 elements, k = k0 + 4 (i % 2) .. +4, of row i / 2 of the A tile and of the B tile.
+void load(uint m_base, uint n_base, uint k0, out vec4 ra, out vec4 rb) {
+  const uint i = gl_LocalInvocationIndex;
+  const uint r = i / 2u, k = k0 + (i % 2u) * 4u;
+  ra = vec4(0.0);
+  rb = vec4(0.0);
+  if (k < pc.K) {
+    const uint m = m_base + r;
+    if (m < pc.M) ra = decode(Words(pc.a + (uint64_t(m) * pc.lda + k) * 2ul).d[0]);
+    if (b_valid(n_base, r)) rb = decode(Words(pc.b + (uint64_t(b_row(n_base, r)) * pc.ldb + k) * 2ul).d[0]);
+  }
+}
+
+void store(uint stage, vec4 ra, vec4 rb) {
+  const uint i = gl_LocalInvocationIndex;
+  const uint r = i / 2u, k = (i % 2u) * 4u;
+  // Element (k + j, r): a transposing store, conflict-free since the two k halves of a subgroup sit 16 banks apart.
+  [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+    const uint f = stage * STAGE + (k + j) * LINE + r;
+    sa[f] = ra[j];
+    sb[f] = rb[j];
+  }
+}
+
+void main() {
+  const uint i = gl_LocalInvocationIndex;
+  const uint tx = i % 16u, ty = i / 16u;
+  const uint cols_per_tile = MODE == 3 ? BN / 2u : BN;
+  const uint m_base = gl_WorkGroupID.y * BM, n_base = gl_WorkGroupID.x * cols_per_tile;
+
+  vec4 acc[8][2];  // [row r: 4 ty + r % 4 + 64 (r / 4)][column group g: 4 tx + 64 g]
+  [[unroll]] for (uint r = 0u; r < 8u; ++r) {
+    acc[r][0] = vec4(0.0);
+    acc[r][1] = vec4(0.0);
+  }
+
+  const uint steps = (pc.K + BK - 1u) / BK;
+  vec4 ra, rb;
+  load(m_base, n_base, 0u, ra, rb);
+  store(0u, ra, rb);
+  barrier();
+  for (uint step = 0u; step < steps; ++step) {
+    const bool more = step + 1u < steps;
+    if (more) load(m_base, n_base, (step + 1u) * BK, ra, rb);
+    const uint base = (step & 1u) * STAGE;
+    [[unroll]] for (uint k = 0u; k < BK; ++k) {
+      const uint line = base + k * LINE;
+      const uint ar = line + 4u * ty, bc = line + 4u * tx;
+      const vec4 a_lo = vec4(sa[ar], sa[ar + 1u], sa[ar + 2u], sa[ar + 3u]);
+      const vec4 a_hi = vec4(sa[ar + 64u], sa[ar + 65u], sa[ar + 66u], sa[ar + 67u]);
+      const vec4 b_lo = vec4(sb[bc], sb[bc + 1u], sb[bc + 2u], sb[bc + 3u]);
+      const vec4 b_hi = vec4(sb[bc + 64u], sb[bc + 65u], sb[bc + 66u], sb[bc + 67u]);
+      [[unroll]] for (uint r = 0u; r < 4u; ++r) {
+        acc[r][0] = fma(vec4(a_lo[r]), b_lo, acc[r][0]);
+        acc[r][1] = fma(vec4(a_lo[r]), b_hi, acc[r][1]);
+        acc[r + 4u][0] = fma(vec4(a_hi[r]), b_lo, acc[r + 4u][0]);
+        acc[r + 4u][1] = fma(vec4(a_hi[r]), b_hi, acc[r + 4u][1]);
+      }
+    }
+    if (more) store((step + 1u) & 1u, ra, rb);
+    barrier();
+  }
+
+  [[unroll]] for (uint r = 0u; r < 8u; ++r) {
+    const uint m = m_base + 4u * ty + r % 4u + 64u * (r / 4u);
+    if (m >= pc.M) continue;
+    [[unroll]] for (uint g = 0u; g < (MODE == 3 ? 1u : 2u); ++g) {
+      const uint n = n_base + 4u * tx + 64u * g;
+      if (n >= pc.N) continue;
+      const vec4 v = acc[r][g];
+      const uint64_t at = uint64_t(m) * pc.ldo + n;
+      if (MODE == 0) {
+        Floats out_f = Floats(pc.out_ + at * 4ul);
+        out_f.d[0] = v.x;
+        out_f.d[1] = v.y;
+        out_f.d[2] = v.z;
+        out_f.d[3] = v.w;
+        continue;
+      }
+      Words out_w = Words(pc.out_ + at * 2ul);
+      if (MODE == 1) {
+        out_w.d[0] = bf4(v);
+      } else if (MODE == 2) {
+        const vec4 gate = f4(Words(pc.gate + uint64_t(n) * 2ul).d[0]);
+        precise const vec4 gated = rbf4(v) * gate;
+        precise const vec4 sum = f4(out_w.d[0]) + rbf4(gated);
+        out_w.d[0] = bf4(sum);
+      } else if (MODE == 3) {
+        out_w.d[0] = bf4(situ(rbf4(v), rbf4(acc[r][1])));
+      } else {
+        precise const vec4 biased = v + f4(Words(pc.gate + uint64_t(n) * 2ul).d[0]);
+        if (MODE == 4) {
+          out_w.d[0] = bf4(biased);
+        } else {
+          precise const vec4 sum = f4(out_w.d[0]) + rbf4(biased);
+          out_w.d[0] = bf4(sum);
+        }
+      }
+    }
+  }
+}

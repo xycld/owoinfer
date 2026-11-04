@@ -1,0 +1,112 @@
+// The Qwen3.5 RMSNorms over rows of d bf16 values, one row per workgroup of 32 invocations, any device:
+//   MODE 0, Qwen3_5RMSNorm:      out = bf16(x * rsqrt(mean(x^2) + eps) * (1 + w))
+//   MODE 1, Qwen3_5RMSNormGated: out = bf16(bf16(w * bf16(x * rsqrt(mean(x^2) + eps))) * silu(gate))
+// MODE 0 with a table also applies the text RoPE to the first 64 dims of the row: pairs (c, c + 32), c < 32, rotated by the
+// table row [cos(32) | sin(32)] of the row's token, each product and the sum rounded to bf16 (apply_rotary_pos_emb).
+//
+// Rows are (token, head) pairs: workgroup (head, token) reads x + token * ldx + head * hsx, and likewise out and gate. out
+// may alias x. The mean of squares is summed in the order of torch's reduce kernel for `bw` threads per row (a power of
+// two from 32 to 512): virtual thread v sums 4 running squares over the vec4 groups v, v + bw, ..., adds them left to
+// right, the bw partial sums halve down to 32 and then take a shuffle-down tree.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "te_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const int MODE = 0;
+
+layout(push_constant) uniform PC {
+  uint64_t x;
+  uint64_t weight;
+  uint64_t gate;
+  uint64_t out_;
+  uint64_t table;  // 0: no RoPE
+  uint ldx;
+  uint hsx;
+  uint ldo;
+  uint hso;
+  uint ldg;
+  uint hsg;
+  uint table_ld;
+  uint d;
+  uint bw;
+  float factor;  // torch's MeanOps factor: rows / (rows * d) in fp32
+  float eps;
+} pc;
+
+shared float red[512];
+shared vec4 rope_in[16];
+
+void main() {
+  const uint lane = gl_LocalInvocationIndex;
+  const uint64_t head = gl_WorkGroupID.x;
+  const uint64_t token = gl_WorkGroupID.y;
+  Words X = Words(pc.x + (token * pc.ldx + head * pc.hsx) * 2ul);
+  const uint groups = pc.d / 4u;
+
+  for (uint v = lane; v < pc.bw; v += 32u) {
+    precise vec4 acc = vec4(0.0);
+    for (uint g = v; g < groups; g += pc.bw) {
+      const vec4 e = f4(X.d[g]);
+      acc = acc + e * e;
+    }
+    precise const float total = ((acc.x + acc.y) + acc.z) + acc.w;
+    red[v] = total;
+  }
+  barrier();
+  for (uint off = pc.bw / 2u; off >= 32u; off >>= 1) {
+    for (uint v = lane; v < off; v += 32u) {
+      precise const float sum = red[v] + red[v + off];
+      red[v] = sum;
+    }
+    barrier();
+  }
+  for (uint off = 16u; off > 0u; off >>= 1) {
+    if (lane < off) {
+      precise const float sum = red[lane] + red[lane + off];
+      red[lane] = sum;
+    }
+    barrier();
+  }
+  precise const float mean = red[0] * pc.factor;
+  precise const float mean_eps = mean + pc.eps;
+  const float r = inversesqrt(mean_eps);
+
+  Words O = Words(pc.out_ + (token * pc.ldo + head * pc.hso) * 2ul);
+  Words W = Words(pc.weight);
+  const bool rope = MODE == 0 && pc.table != 0ul;
+  for (uint g = lane; g < groups; g += 32u) {
+    precise const vec4 xn = f4(X.d[g]) * r;
+    vec4 y;
+    if (MODE == 0) {
+      precise const vec4 one_plus = 1.0 + f4(W.d[g]);
+      precise const vec4 scaled = xn * one_plus;
+      y = scaled;
+    } else {
+      const vec4 gv = f4(Words(pc.gate + (token * pc.ldg + head * pc.hsg) * 2ul).d[g]);
+      precise const vec4 weighted = f4(W.d[g]) * rbf4(xn);
+      const vec4 act = vec4(silu_f(gv.x), silu_f(gv.y), silu_f(gv.z), silu_f(gv.w));
+      precise const vec4 gated = rbf4(weighted) * act;
+      y = gated;
+    }
+    if (rope && g < 16u) {
+      rope_in[g] = rbf4(y);
+    } else {
+      O.d[g] = bf4(y);
+    }
+  }
+  if (rope) {
+    barrier();
+    if (lane < 16u) {
+      Words T = Words(pc.table + token * pc.table_ld * 2ul);
+      const uint pair = lane & 7u;
+      const vec4 co = f4(T.d[pair]), si = f4(T.d[pair + 8u]);
+      const vec4 lo = rope_in[pair], hi = rope_in[pair + 8u];
+      const bool first_half = lane < 8u;
+      precise const vec4 a = (first_half ? lo : hi) * co;
+      precise const vec4 b = first_half ? -hi * si : lo * si;
+      precise const vec4 rotated = rbf4(a) + rbf4(b);
+      O.d[lane] = bf4(rotated);
+    }
+  }
+}

@@ -1,0 +1,151 @@
+// Causal scaled-dot-product attention over one sequence for the text encoder's full-attention layers: head_dim 256, query
+// head h reading key/value head h / group, bf16 in and out, fp32 online softmax, any device. A workgroup of 64 takes 16
+// query rows of one head and walks the key tiles of 16 that they see, from the last down to the first, as
+// FlashAttention's reverse iteration; tiles align with the rows, so each row's first tile holds its own key:
+//   S = q * K_tile^T                     (dims ascending, each product and sum rounded; keys past the row masked)
+//   max, row_sum and acc_o rescaled to the new maximum
+//   P = bf16(exp2(S * log2_scale - max * log2_scale)), row_sum += P before rounding, keys ascending
+//   acc_o += P * V_tile                  (keys ascending)
+// and out = bf16(acc_o / row_sum). Invocation t computes S for row t / 4, keys t % 4 + 4 j, and holds output dims
+// 4t .. 4t + 3 of all 16 rows. Q, K and V tiles sit in shared memory with rows padded by 8 bytes against bank conflicts.
+// Rows q_first .. row_end - 1 of the sequence, q_first a multiple of 16; q, k, v and o point at its first row.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#include "te_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t q;
+  uint64_t k;
+  uint64_t v;
+  uint64_t o;
+  uint ldq;
+  uint ldk;
+  uint ldv;
+  uint ldo;
+  uint hsq;
+  uint hsk;
+  uint hsv;
+  uint hso;
+  uint q_first;
+  uint row_end;
+  uint group;  // query heads per key/value head
+  float log2_scale;
+} pc;
+
+const uint BR = 16u;  // query rows per workgroup
+const uint BC = 16u;  // keys per tile
+const uint W = 64u;   // uvec2 (4 bf16) per 256-dim row
+const uint WP = 65u;  // padded
+const uint SP = 17u;  // padded S row
+
+shared uvec2 q_tile[BR * WP];
+shared uvec2 k_tile[BC * WP];
+shared uvec2 v_tile[BC * WP];
+shared float s_tile[BR * SP];
+shared float rescale_shared[BR];
+shared float inv_sum_shared[BR];
+
+#define NEG_INF uintBitsToFloat(0xff800000u)
+
+void main() {
+  const uint t = gl_LocalInvocationIndex;
+  const uint head = gl_WorkGroupID.x, kv_head = head / pc.group;
+  const uint i0 = pc.q_first + gl_WorkGroupID.y * BR;
+  const uint n_keys = min(i0 + BR, pc.row_end);  // keys any valid row of the block sees
+
+  for (uint e = t; e < BR * W; e += 64u) {
+    const uint r = e / W, w = e % W;
+    uvec2 val = uvec2(0u);
+    if (i0 + r < pc.row_end) val = Words(pc.q + (uint64_t(i0 + r) * pc.ldq + uint64_t(head) * pc.hsq) * 2ul).d[w];
+    q_tile[r * WP + w] = val;
+  }
+
+  const uint64_t k_head = pc.k + uint64_t(kv_head) * pc.hsk * 2ul;
+  const uint64_t v_head = pc.v + uint64_t(kv_head) * pc.hsv * 2ul;
+  const uint my_row = t / 4u, my_cols = t % 4u;
+
+  precise vec4 acc[BR];
+  [[unroll]] for (uint r = 0u; r < BR; ++r) acc[r] = vec4(0.0);
+  float row_max = 0.0, row_sum = 0.0;  // of row t, for t < 16
+
+  const uint tiles = (n_keys + BC - 1u) / BC;
+  for (uint tile_plus_1 = tiles; tile_plus_1 > 0u; --tile_plus_1) {
+    const uint j0 = (tile_plus_1 - 1u) * BC;
+    const bool first = tile_plus_1 == tiles;
+    barrier();  // the previous tile's readers are done
+    for (uint e = t; e < BC * W; e += 64u) {
+      const uint c = e / W, w = e % W;
+      uvec2 kv = uvec2(0u), vv = uvec2(0u);
+      if (j0 + c < n_keys) {
+        kv = Words(k_head + uint64_t(j0 + c) * pc.ldk * 2ul).d[w];
+        vv = Words(v_head + uint64_t(j0 + c) * pc.ldv * 2ul).d[w];
+      }
+      k_tile[c * WP + w] = kv;
+      v_tile[c * WP + w] = vv;
+    }
+    barrier();
+
+    [[unroll]] for (uint jj = 0u; jj < 4u; ++jj) {
+      const uint c = my_cols + 4u * jj;
+      precise float s = 0.0;
+      for (uint w = 0u; w < W; ++w) {
+        const vec4 q4 = f4(q_tile[my_row * WP + w]);
+        const vec4 k4 = f4(k_tile[c * WP + w]);
+        s = s + q4.x * k4.x;
+        s = s + q4.y * k4.y;
+        s = s + q4.z * k4.z;
+        s = s + q4.w * k4.w;
+      }
+      const bool masked = j0 + c > i0 + my_row || j0 + c >= n_keys;
+      s_tile[my_row * SP + c] = masked ? NEG_INF : s;
+    }
+    barrier();
+
+    if (t < BR) {
+      float cur = first ? NEG_INF : row_max;
+      for (uint c = 0u; c < BC; ++c) cur = max(cur, s_tile[t * SP + c]);
+      float rescale = 1.0;
+      precise float sum = 0.0;
+      if (!first) {
+        precise const float diff = (row_max - cur) * pc.log2_scale;
+        rescale = exp2(diff);
+        precise const float scaled = row_sum * rescale;
+        sum = scaled;
+      }
+      row_max = cur;
+      precise const float max_scaled = isinf(cur) ? 0.0 : cur * pc.log2_scale;
+      for (uint c = 0u; c < BC; ++c) {
+        const float s = s_tile[t * SP + c];
+        // FlashAttention's one fused step; a device without a fused fma rounds it twice, within the bf16 weight's error.
+        const float w = isinf(s) ? 0.0 : exp2(fma(s, pc.log2_scale, -max_scaled));
+        sum = sum + w;
+        s_tile[t * SP + c] = uintBitsToFloat(bf(w) << 16);
+      }
+      row_sum = sum;
+      rescale_shared[t] = rescale;
+    }
+    barrier();
+
+    if (!first) {
+      [[unroll]] for (uint r = 0u; r < BR; ++r) {
+        precise const vec4 scaled = acc[r] * rescale_shared[r];
+        acc[r] = scaled;
+      }
+    }
+    for (uint c = 0u; c < BC; ++c) {
+      const vec4 v4 = f4(v_tile[c * WP + t]);
+      [[unroll]] for (uint r = 0u; r < BR; ++r) acc[r] = acc[r] + s_tile[r * SP + c] * v4;
+    }
+  }
+
+  if (t < BR) inv_sum_shared[t] = (row_sum == 0.0 || isnan(row_sum)) ? 1.0 : 1.0 / row_sum;
+  barrier();
+  [[unroll]] for (uint r = 0u; r < BR; ++r) {
+    if (i0 + r >= pc.row_end) continue;
+    precise const vec4 result = acc[r] * inv_sum_shared[r];
+    Words(pc.o + (uint64_t(i0 + r) * pc.ldo + uint64_t(head) * pc.hso) * 2ul).d[t] = bf4(result);
+  }
+}

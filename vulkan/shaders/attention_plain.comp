@@ -1,0 +1,209 @@
+// Scaled-dot-product attention over one sequence without cooperative matrices, head_dim 128, non-causal, bf16 in and out,
+// fp32 online softmax, FlashAttention's steps:
+//   S = q * K_step^T
+//   max = max(max, rowmax(S)); rescale = exp2((old max - max) * log2_scale); row_sum *= rescale; acc_o *= rescale
+//   p = exp2(S * log2_scale - max * log2_scale); row_sum += p; P = bf16(p)
+//   acc_o += P * V_step
+// and at the end out = bf16(acc_o * (1 / row_sum)). Key steps of 32 walk from the last down to the first, as
+// FlashAttention's reverse iteration. It needs no subgroup operations or 16-bit arithmetic, and 30 KiB of shared memory.
+//
+// One workgroup of 128 invocations per 32 query rows of one head. Invocation t computes S for rows 2 (t / 8) .. +2 and
+// keys 4 (t % 8) .. +4; holds acc_o for the same two rows and columns 16 (t % 8) .. +16; and runs the softmax of row t / 4
+// over keys 8 (t % 4) .. +8, the four parts of a row meeting through shared memory.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#include "common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32s { uint d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t q;
+  uint64_t k;
+  uint64_t v;
+  uint64_t o;
+  uint ldq;
+  uint ldk;
+  uint ldv;
+  uint ldo;
+  uint hsq;
+  uint hsk;
+  uint hsv;
+  uint hso;
+  uint q_row0;
+  uint k_row0;
+  uint seqlen_q;
+  uint seqlen_k;
+  float log2_scale;
+} pc;
+
+const uint ROWS = 32u;
+const uint STEP = 32u;
+const uint WORDS = 64u;   // uints per 128-dim bf16 row
+const uint STRIDE = 65u;  // staged row stride in uints: odd, so 8 rows at one column fall in 8 banks
+
+shared uint sq[ROWS * STRIDE];
+shared uint sk[STEP * STRIDE];
+shared uint sv[STEP * STRIDE];
+shared float ss[ROWS * (STEP + 1u)];
+shared float part_max[ROWS * 4u];
+shared float part_sum[ROWS * 4u];
+shared float row_scale[ROWS];
+shared float row_inv[ROWS];
+
+void sync_shared() { barrier(); }
+
+// Invocation t stages words 16 (t % 4) .. +16 of key rows t / 4 of the K and V steps at key n0.
+void load_kv(uint64_t k_head, uint64_t v_head, uint n0, uint cols, out uint rk[16], out uint rv[16]) {
+  const uint t = gl_LocalInvocationIndex;
+  const uint r = t / 4u, w0 = (t % 4u) * 16u;
+  [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+    rk[j] = 0u;
+    rv[j] = 0u;
+  }
+  if (r < cols) {
+    U32s krow = U32s(k_head + uint64_t(n0 + r) * pc.ldk * 2ul), vrow = U32s(v_head + uint64_t(n0 + r) * pc.ldv * 2ul);
+    [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+      rk[j] = krow.d[w0 + j];
+      rv[j] = vrow.d[w0 + j];
+    }
+  }
+}
+
+void store_kv(const uint rk[16], const uint rv[16]) {
+  const uint t = gl_LocalInvocationIndex;
+  const uint at = (t / 4u) * STRIDE + (t % 4u) * 16u;
+  [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+    sk[at + j] = rk[j];
+    sv[at + j] = rv[j];
+  }
+}
+
+vec2 pair(uint w) { return uintBitsToFloat(uvec2(w << 16, w & 0xffff0000u)); }
+
+void main() {
+  const uint t = gl_LocalInvocationIndex;
+  const uint head = gl_WorkGroupID.x;
+  const uint q_first = gl_WorkGroupID.y * ROWS;
+  const uint pr = t / 8u, quad = t % 8u;     // S and acc_o: rows 2 pr, 2 pr + 1
+  const uint srow = t / 4u, spart = t % 4u;  // softmax: row srow, keys 8 spart .. +8
+
+  // Q rows q_first .. +32, zero past the sequence.
+  {
+    const uint r = t / 4u, w0 = (t % 4u) * 16u;
+    const bool valid = q_first + r < pc.seqlen_q;
+    U32s qrow = U32s(pc.q + ((uint64_t(pc.q_row0) + q_first + r) * pc.ldq + uint64_t(head) * pc.hsq) * 2ul);
+    [[unroll]] for (uint j = 0u; j < 16u; ++j) sq[r * STRIDE + w0 + j] = valid ? qrow.d[w0 + j] : 0u;
+  }
+
+  const uint64_t k_head = pc.k + (uint64_t(pc.k_row0) * pc.ldk + uint64_t(head) * pc.hsk) * 2ul;
+  const uint64_t v_head = pc.v + (uint64_t(pc.k_row0) * pc.ldv + uint64_t(head) * pc.hsv) * 2ul;
+  const uint steps = (pc.seqlen_k + STEP - 1u) / STEP;
+
+  float acc[2][16];
+  [[unroll]] for (uint r = 0u; r < 2u; ++r) {
+    [[unroll]] for (uint c = 0u; c < 16u; ++c) acc[r][c] = 0.0;
+  }
+  float row_max = 0.0, row_sum = 0.0;  // of row srow, kept alike by its four softmax invocations
+
+  uint rk[16], rv[16];
+  load_kv(k_head, v_head, (steps - 1u) * STEP, pc.seqlen_k - (steps - 1u) * STEP, rk, rv);
+  store_kv(rk, rv);
+  sync_shared();
+
+  for (uint step_plus_1 = steps; step_plus_1 > 0u; --step_plus_1) {
+    const uint step_index = step_plus_1 - 1u;
+    const bool first = step_plus_1 == steps;
+    const uint n0 = step_index * STEP;
+    const uint cols = min(STEP, pc.seqlen_k - n0);
+    if (step_index > 0u) load_kv(k_head, v_head, n0 - STEP, STEP, rk, rv);
+
+    // S: rows 2 pr + i, keys 4 quad + j.
+    float s[2][4];
+    [[unroll]] for (uint i = 0u; i < 2u; ++i) {
+      [[unroll]] for (uint j = 0u; j < 4u; ++j) s[i][j] = 0.0;
+    }
+    for (uint w = 0u; w < WORDS; ++w) {
+      const vec2 q0 = pair(sq[(2u * pr) * STRIDE + w]), q1 = pair(sq[(2u * pr + 1u) * STRIDE + w]);
+      [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+        const vec2 kk = pair(sk[(4u * quad + j) * STRIDE + w]);
+        s[0][j] = fma(q0.y, kk.y, fma(q0.x, kk.x, s[0][j]));
+        s[1][j] = fma(q1.y, kk.y, fma(q1.x, kk.x, s[1][j]));
+      }
+    }
+    [[unroll]] for (uint i = 0u; i < 2u; ++i) {
+      [[unroll]] for (uint j = 0u; j < 4u; ++j) ss[(2u * pr + i) * (STEP + 1u) + 4u * quad + j] = s[i][j];
+    }
+    sync_shared();
+
+    // Softmax of row srow over keys 8 spart .. +8.
+    float mine = -1.0 / 0.0;
+    [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+      if (8u * spart + j < cols) mine = max(mine, ss[srow * (STEP + 1u) + 8u * spart + j]);
+    }
+    part_max[srow * 4u + spart] = mine;
+    sync_shared();
+    float cur = first ? -1.0 / 0.0 : row_max;
+    [[unroll]] for (uint p = 0u; p < 4u; ++p) cur = max(cur, part_max[srow * 4u + p]);
+    float rescale = 1.0;
+    if (!first) {
+      precise const float diff = (row_max - cur) * pc.log2_scale;
+      rescale = exp2(diff);
+    }
+    row_max = cur;
+    precise const float max_scaled = isinf(cur) && cur < 0.0 ? 0.0 : cur * pc.log2_scale;
+    precise float part = 0.0;
+    [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+      const uint at = srow * (STEP + 1u) + 8u * spart + j;
+      float w = 0.0;
+      if (8u * spart + j < cols) w = exp2(fma(ss[at], pc.log2_scale, -max_scaled));
+      part = part + w;
+      ss[at] = uintBitsToFloat(bf(w) << 16);
+    }
+    part_sum[srow * 4u + spart] = part;
+    if (spart == 0u) row_scale[srow] = rescale;
+    sync_shared();
+    precise const float step_sum = (part_sum[srow * 4u] + part_sum[srow * 4u + 1u]) +
+                                   (part_sum[srow * 4u + 2u] + part_sum[srow * 4u + 3u]);
+    precise const float scaled_sum = row_sum * rescale;
+    row_sum = first ? step_sum : scaled_sum + step_sum;
+
+    // acc_o = acc_o * rescale + P V for rows 2 pr + i, columns 16 quad .. +16.
+    if (!first) {
+      [[unroll]] for (uint i = 0u; i < 2u; ++i) {
+        const float r = row_scale[2u * pr + i];
+        [[unroll]] for (uint c = 0u; c < 16u; ++c) acc[i][c] *= r;
+      }
+    }
+    for (uint j = 0u; j < cols; ++j) {
+      const float p0 = ss[(2u * pr) * (STEP + 1u) + j], p1 = ss[(2u * pr + 1u) * (STEP + 1u) + j];
+      [[unroll]] for (uint c = 0u; c < 8u; ++c) {
+        const vec2 vv = pair(sv[j * STRIDE + 8u * quad + c]);
+        acc[0][2u * c] = fma(p0, vv.x, acc[0][2u * c]);
+        acc[0][2u * c + 1u] = fma(p0, vv.y, acc[0][2u * c + 1u]);
+        acc[1][2u * c] = fma(p1, vv.x, acc[1][2u * c]);
+        acc[1][2u * c + 1u] = fma(p1, vv.y, acc[1][2u * c + 1u]);
+      }
+    }
+    sync_shared();
+    if (step_index > 0u) {
+      store_kv(rk, rv);
+      sync_shared();
+    }
+  }
+
+  if (spart == 0u) row_inv[srow] = (row_sum == 0.0 || isnan(row_sum)) ? 1.0 : 1.0 / row_sum;
+  sync_shared();
+  [[unroll]] for (uint i = 0u; i < 2u; ++i) {
+    const uint q_local = q_first + 2u * pr + i;
+    if (q_local >= pc.seqlen_q) continue;
+    const float inv = row_inv[2u * pr + i];
+    U32s orow = U32s(pc.o + ((uint64_t(pc.q_row0) + q_local) * pc.ldo + uint64_t(head) * pc.hso) * 2ul);
+    [[unroll]] for (uint c = 0u; c < 8u; ++c) {
+      precise const float lo = acc[i][2u * c] * inv, hi = acc[i][2u * c + 1u] * inv;
+      orow.d[8u * quad + c] = bf(lo) | (bf(hi) << 16);
+    }
+  }
+}

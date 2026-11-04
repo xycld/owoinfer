@@ -1,0 +1,58 @@
+// Row softmax of attention scores in place: s[r, :L] (row stride ld) -> exp(s * scale - max * scale) / sum, the
+// probabilities SDPA multiplies V by. fp32; one workgroup per row, dispatched as x + y * x_count; three passes over the
+// row (max, sum, write), each a strided per-invocation loop and a halving tree.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t s;
+  uint rows;
+  uint L;
+  uint ld;
+  float scale;
+} pc;
+
+shared float red[256];
+
+void main() {
+  const uint row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  if (row >= pc.rows) return;  // uniform per workgroup
+  const uint t = gl_LocalInvocationIndex;
+  Floats S = Floats(pc.s + uint64_t(row) * pc.ld * 4ul);
+
+  float m = -3.402823466e38;
+  for (uint j = t; j < pc.L; j += 256u) m = max(m, S.d[j]);
+  red[t] = m;
+  barrier();
+  for (uint off = 128u; off > 0u; off >>= 1) {
+    if (t < off) red[t] = max(red[t], red[t + off]);
+    barrier();
+  }
+  precise const float shift = red[0] * pc.scale;
+  barrier();
+
+  float sum = 0.0;
+  for (uint j = t; j < pc.L; j += 256u) {
+    precise const float z = S.d[j] * pc.scale - shift;
+    sum += exp(z);
+  }
+  red[t] = sum;
+  barrier();
+  for (uint off = 128u; off > 0u; off >>= 1) {
+    if (t < off) {
+      precise const float v = red[t] + red[t + off];
+      red[t] = v;
+    }
+    barrier();
+  }
+  const float inv = 1.0 / red[0];
+
+  for (uint j = t; j < pc.L; j += 256u) {
+    precise const float z = S.d[j] * pc.scale - shift;
+    precise const float p = exp(z) * inv;
+    S.d[j] = p;
+  }
+}

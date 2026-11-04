@@ -1,0 +1,30 @@
+// The pipeline's latent de-normalization and unpack (pipeline_moss_image.py:430-436):
+//   y[2i + p, 2j + q, c] = z[4c + 2p + q, i, j] * scale[4c + 2p + q] + mean[4c + 2p + q]
+// for z [128, h, w] fp32 NCHW and y [2h, 2w, 32] fp32 NHWC, with scale = sqrt(var + eps) formed on the host (correctly
+// rounded, as torch) and the * and + rounded separately. One invocation per output element.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t z;
+  uint64_t scale;
+  uint64_t mean;
+  uint64_t y;
+  uint h;
+  uint w;
+} pc;
+
+void main() {
+  const uint o = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationIndex;
+  if (o >= pc.h * pc.w * 128u) return;
+  const uint c = o % 32u, px = o / 32u;
+  const uint ox = px % (2u * pc.w), oy = px / (2u * pc.w);
+  const uint ch = 4u * c + 2u * (oy & 1u) + (ox & 1u);
+  const float v = Floats(pc.z + ((uint64_t(ch) * pc.h + oy / 2u) * pc.w + ox / 2u) * 4ul).d[0];
+  precise const float scaled = v * Floats(pc.scale).d[ch];
+  precise const float shifted = scaled + Floats(pc.mean).d[ch];
+  Floats(pc.y + uint64_t(o) * 4ul).d[0] = shifted;
+}

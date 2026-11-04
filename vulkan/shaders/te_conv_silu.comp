@@ -1,0 +1,38 @@
+// GatedDeltaNet's causal depthwise conv1d (kernel 4) and SiLU over one sequence, as gdn::causal_conv1d_silu:
+//   acc = sum_k w[c][k] * x[t - 3 + k][c]   (fused multiply-adds, k ascending, rows before the sequence are zero)
+//   y   = bf16(v / (1 + exp(-v))), v = bf16(acc)
+// x: bf16 rows of the sequence, stride ldx; w: bf16 [channels][4]; y: bf16 rows, stride ldy. Invocation i handles channels
+// 4i .. 4i + 3 of token gl_WorkGroupID.y. x and y must not overlap.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "te_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+  uint64_t x;
+  uint64_t w;
+  uint64_t y;
+  uint ldx;
+  uint ldy;
+  uint channels;
+} pc;
+
+void main() {
+  const uint group = gl_GlobalInvocationID.x;
+  if (group * 4u >= pc.channels) return;
+  const int t = int(gl_WorkGroupID.y);
+  Words W = Words(pc.w + uint64_t(group) * 32ul);  // 4 channels x 4 taps
+  const vec4 w0 = f4(W.d[0]), w1 = f4(W.d[1]), w2 = f4(W.d[2]), w3 = f4(W.d[3]);
+  precise vec4 acc = vec4(0.0);
+  for (int k = 0; k < 4; ++k) {
+    const int src = t - 3 + k;
+    if (src < 0) continue;
+    const vec4 xv = f4(Words(pc.x + uint64_t(src) * pc.ldx * 2ul).d[group]);
+    const vec4 wk = vec4(w0[k], w1[k], w2[k], w3[k]);
+    acc = fma(wk, xv, acc);
+  }
+  const vec4 v = rbf4(acc);
+  const vec4 y = vec4(silu_f(v.x), silu_f(v.y), silu_f(v.z), silu_f(v.w));
+  Words(pc.y + uint64_t(t) * pc.ldy * 2ul).d[group] = bf4(y);
+}

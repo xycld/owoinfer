@@ -1,0 +1,120 @@
+// C[M,N] = A[M,K] * B[N,K]^T on cooperative matrices: f16 inputs, f32 accumulate, f32 output. A and B are row-major with
+// strides lda and ldb, both multiples of 4; C has stride ldc. M and N are free, K is a multiple of 16.
+//
+// One workgroup per 64x64 output tile: 128 invocations, exactly 4 full subgroups of 32, which the pipeline must require.
+// Each subgroup owns a 32x32 quarter. A and B tiles of 32 K are staged in shared memory, so each element is read from
+// global memory once per workgroup. Anything past M or N stages as zero and is never written, so no padding is needed.
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer F16Vec { f16vec4 d[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32 { float d[]; };
+
+layout(push_constant) uniform PC {
+  uint64_t a;
+  uint64_t b;
+  uint64_t c;
+  uint M;
+  uint N;
+  uint K;
+  uint lda;
+  uint ldb;
+  uint ldc;
+} pc;
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BK = 32u;
+const uint BAND = 8u;  // output tiles walk bands of N tiles, so a band of B stays in cache while every M tile passes
+const uint INVOCATIONS = 128u;
+
+shared float16_t sa[BM * BK];
+shared float16_t sb[BN * BK];
+shared float sc[BM * BN];
+
+void sync_shared() {
+  controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsShared,
+                 gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
+}
+
+void main() {
+  const uint num_m = (pc.M + BM - 1u) / BM;
+  const uint num_n = (pc.N + BN - 1u) / BN;
+  const uint id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  const uint per_band = num_m * BAND;
+  const uint band = id / per_band;
+  const uint pos = id - band * per_band;
+  const uint width = min(BAND, num_n - band * BAND);
+  const uint m_base = (pos / width) * BM;
+  const uint n_base = (band * BAND + pos % width) * BN;
+
+  const uint invocation = gl_LocalInvocationIndex;
+  const uint row0 = (gl_SubgroupID >> 1) * 32u;
+  const uint col0 = (gl_SubgroupID & 1u) * 32u;
+
+  coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00, acc01, acc10, acc11;
+  const float zero = 0.0;
+  acc00 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zero);
+  acc01 = acc00;
+  acc10 = acc00;
+  acc11 = acc00;
+
+  for (uint k0 = 0u; k0 < pc.K; k0 += BK) {
+    const uint fragments = min(BK, pc.K - k0) / 16u;
+    const uint vectors = fragments * 4u;
+    const f16vec4 none = f16vec4(0.0hf);
+    for (uint i = invocation; i < BM * BK / 4u; i += INVOCATIONS) {
+      const uint line = i / 8u;
+      const uint element = i % 8u;
+      const uint at = line * BK + element * 4u;
+      const uint m = m_base + line;
+      f16vec4 v = none;
+      if (m < pc.M && element < vectors) v = F16Vec(pc.a + (uint64_t(m) * pc.lda + k0) * 2ul).d[element];
+      sa[at] = v.x;
+      sa[at + 1u] = v.y;
+      sa[at + 2u] = v.z;
+      sa[at + 3u] = v.w;
+      const uint n = n_base + line;
+      f16vec4 w = none;
+      if (n < pc.N && element < vectors) w = F16Vec(pc.b + (uint64_t(n) * pc.ldb + k0) * 2ul).d[element];
+      sb[at] = w.x;
+      sb[at + 1u] = w.y;
+      sb[at + 2u] = w.z;
+      sb[at + 3u] = w.w;
+    }
+    sync_shared();
+    for (uint f = 0u; f < fragments; ++f) {
+      const uint k = f * 16u;
+      coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa0, fa1;
+      coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb0, fb1;
+      coopMatLoad(fa0, sa, row0 * BK + k, BK, gl_CooperativeMatrixLayoutRowMajor);
+      coopMatLoad(fa1, sa, (row0 + 16u) * BK + k, BK, gl_CooperativeMatrixLayoutRowMajor);
+      coopMatLoad(fb0, sb, col0 * BK + k, BK, gl_CooperativeMatrixLayoutColumnMajor);
+      coopMatLoad(fb1, sb, (col0 + 16u) * BK + k, BK, gl_CooperativeMatrixLayoutColumnMajor);
+      acc00 = coopMatMulAdd(fa0, fb0, acc00);
+      acc01 = coopMatMulAdd(fa0, fb1, acc01);
+      acc10 = coopMatMulAdd(fa1, fb0, acc10);
+      acc11 = coopMatMulAdd(fa1, fb1, acc11);
+    }
+    sync_shared();
+  }
+
+  coopMatStore(acc00, sc, row0 * BN + col0, BN, gl_CooperativeMatrixLayoutRowMajor);
+  coopMatStore(acc01, sc, row0 * BN + col0 + 16u, BN, gl_CooperativeMatrixLayoutRowMajor);
+  coopMatStore(acc10, sc, (row0 + 16u) * BN + col0, BN, gl_CooperativeMatrixLayoutRowMajor);
+  coopMatStore(acc11, sc, (row0 + 16u) * BN + col0 + 16u, BN, gl_CooperativeMatrixLayoutRowMajor);
+  sync_shared();
+  for (uint i = invocation; i < BM * BN; i += INVOCATIONS) {
+    const uint m = m_base + i / BN;
+    const uint n = n_base + i % BN;
+    if (m < pc.M && n < pc.N) F32(pc.c + (uint64_t(m) * pc.ldc + n) * 4ul).d[0] = sc[i];
+  }
+}
