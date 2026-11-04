@@ -98,10 +98,10 @@ On the scalar leaf a step takes 590 to 720 s on that GPU, over 90 % of it in att
 On a Radeon RX 9060 XT (gfx1200), built on the card with its ROCm (HIP 7.16, AMD clang 24), 2026-11-04:
 
 - `check_device.sh` on the four kernel sources with the expected WMMA counts; `hip_check`, `hip_dit_kernel_check` (`rms_norm` at every row count from 1 to 16 included) and `hip_te_kernel_check` pass.
-- `hip_dit_run` step 0: g_fridge_1024 0.999975845 / 0.999983823 (rms 0.00726 / 0.00581), g_fridge_1456 0.999978707 / 0.999985122. 50 steps of g_fridge_1024 on the golden text-encoder outputs: final latent cosine 0.98658, rms diff 0.143 of the golden rms. 4.25 s per step at 1024x1024, 14.3 s at 1456x1456.
+- `hip_dit_run` step 0: g_fridge_1024 0.999975845 / 0.999983823 (rms 0.00726 / 0.00581), g_fridge_1456 0.999978707 / 0.999985122. 50 steps of g_fridge_1024 on the golden text-encoder outputs: final latent cosine 0.98658, rms diff 0.143 of the golden rms. `hip_dit_run` takes 4.25 s per step at 1024x1024, 14.3 s at 1456x1456.
 - Per-op device time of a 1024x1024 step (ms): attention 2331, up_gate GEMM+SiTU 754, down GEMM 441, qkv GEMM 403, o GEMM 167, the rest 82.
 - `hip_te_check` on every golden sequence: within 2.5x of torch's floor; the 4096-token prompt at 2.18x (layer 31) and 2.07x (last hidden).
-- `moss-infer-hip` g_fridge_1024 end to end, 50 steps: final latent cosine 0.957 to the golden one, PNG 26.9 dB, the same image. Streamed runs (2 and 17 blocks resident) give the resident latent byte for byte. The CI's release package (ROCm 7.2.4) gives the card build's latent byte for byte at 512x512.
+- `moss-infer-hip` g_fridge_1024 end to end, 50 steps: final latent cosine 0.957 to the golden one, PNG 26.9 dB, the same image with small layout shifts. Streamed runs (5 blocks resident at 512x512, 2 and 17 at 1024x1024) give the resident latent byte for byte. The CI's release package (ROCm 7.2.4) gives the card build's latent byte for byte at 512x512.
 
 ## Not verified
 

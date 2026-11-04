@@ -178,7 +178,7 @@ if(MI_HIP_AMD)
   include(CPack)
 endif()
 
-# The checks and tools; a release build turns them off.
+# The checks and tools; the release build compiles them too, and installs only moss-infer-hip.
 option(MOSSINFER_HIP_TOOLS "Build the HIP backend's checks and benchmarks" ON)
 if(NOT MOSSINFER_HIP_TOOLS)
   return()

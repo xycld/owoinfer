@@ -82,7 +82,7 @@ default in the device's free memory, with `--vram-budget` within that budget les
 stay in pinned host memory (about 0.21 GiB each, 8.8 GiB for all 42) and are copied into one of two device slots while
 the block before them runs, every step. The DiT's embedders, modulations and text refiner and the two slots stay on the
 device whatever the budget, about 1.03 GiB. A streamed run gives the resident run's result bit for bit (on the RX 9060
-XT: whole 512x512 and 1024x1024 runs with 2 to 17 blocks resident). With `--vram-budget` the VAE's decode must also fit
+XT: whole runs at 512x512 with 5 blocks resident and at 1024x1024 with 2 and 17). With `--vram-budget` the VAE's decode must also fit
 in the budget.
 
 A run the device or the budget cannot hold is refused before the text encoder runs, with the sizes: a decode that does
@@ -107,8 +107,8 @@ Against the official pipeline's golden case (fridge prompt, seed 42): the DiT's 
 both the cond and the uncond row, the text encoder stays within 2.5 times torch's own kernel-swap noise on every
 golden prompt, and the DiT alone, run 50 steps on the golden text-encoder output, ends at cosine 0.987 of the golden
 final latent. End to end the final latent is at 0.957, the same image with small layout shifts: at cfg 3 the sampler
-amplifies any rounding difference in the text encoder's output (the CUDA engine's DiT fed torch's text-encoder output
-diverges as far from its own run).
+amplifies any rounding difference in the text encoder's output (the CUDA engine's DiT fed torch's text-encoder output,
+at cosine 0.99992 to the engine's own, ends at cosine 0.97 of the engine's own run).
 
 ## Building
 

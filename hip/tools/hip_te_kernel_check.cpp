@@ -4,8 +4,8 @@
 //     1 ULP).
 //   - rms_norm (plain at 1 to 17 rows, where torch's threads per row change; with the RoPE on q and k head views; gated
 //     in place), conv1d+SiLU over sequences of 1 to 70 tokens, the gates (softplus past its threshold, exp underflow),
-//     silu_mul, causal GQA attention (the output gate against the ungated run's own output): bf16 outputs at >= 99 % the replay's bits and
-//     within 1 ULP of max(|replay|, floor). The replays use the host's exp, rsqrt and division, which may differ from the
+//     silu_mul, causal GQA attention (its output gate on the ungated run's own output): bf16 outputs at >= 99 % the
+//     replay's bits and within 1 ULP of max(|replay|, floor). The replays use the host's exp, rsqrt and division, which may differ from the
 //     device's in the last bit of fp32, which a rounding point can carry into a bf16 output.
 //   - the chunked gated delta rule over sequences of 1, 5, 64, 65, 130 and 300 tokens (chunk tails and several chunks),
 //     and over 70 and 300 tokens with decays down to e^-20 per token (a chunk's cumulative decay underflows exp): the
@@ -761,7 +761,7 @@ void check_attention(Rng& rng, hipStream_t stream) {
       }
     }
     const std::vector<bits> got = download<bits>(od, want.size());
-    report(gated ? "causal GQA attention, 4 sequences, gate on the ungated output" : "causal GQA attention, 4 sequences", got,
+    report(gated ? "causal GQA attention, gated (on ungated)" : "causal GQA attention, 4 sequences", got,
            want, {1.0, 1.0}, mask);
     if (!gated) ungated = got;
   }
