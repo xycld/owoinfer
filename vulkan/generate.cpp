@@ -43,6 +43,19 @@ GenerateResult generate(Device& device, BlockPath path, const GenerateRequest& r
     vae.emplace(device, r.model_dir / "vae" / "diffusion_pytorch_model.safetensors",
                 path == BlockPath::kCoop ? VaePath::kCoop : VaePath::kPlain);
   }
+  // What the DiT's activations and blocks and the VAE's decode may take: the device's free memory, within the budget
+  // less the VAE's weights (held through the run).
+  const std::uint64_t vae_weights = vae ? vae->weight_bytes() : 0;
+  const auto available = [&] {
+    const std::uint64_t free = device.free_device_memory();
+    if (r.vram_budget == 0) return free;
+    return std::min(free, r.vram_budget > vae_weights ? r.vram_budget - vae_weights : 0);
+  };
+  // ", within --vram-budget N MiB" when the budget, not the device, sets available().
+  const auto budget_note = [&]() -> std::string {
+    if (r.vram_budget == 0 || available() >= device.free_device_memory()) return "";
+    return " within --vram-budget " + std::to_string(r.vram_budget >> 20) + " MiB";
+  };
   if (r.decode) {
     const Capabilities& caps = device.info().caps;
     const std::uint64_t need = vae->workspace_bytes(lh, lw), largest = vae->largest_buffer_bytes(lh, lw);
@@ -52,10 +65,24 @@ GenerateResult generate(Device& device, BlockPath path, const GenerateRequest& r
                                std::to_string(largest >> 20) + " MiB buffer; " + device.info().name + " takes at most " +
                                std::to_string(limit >> 20) + " MiB");
     }
-    if (need > device.free_device_memory()) {
+    if (need > available()) {
       throw std::runtime_error("the VAE decode at " + std::to_string(r.width) + "x" + std::to_string(r.height) + " needs " +
                                std::to_string(need >> 20) + " MiB of device memory; " + device.info().name + " has " +
-                               std::to_string(device.free_device_memory() >> 20) + " MiB free");
+                               std::to_string(available() >> 20) + " MiB free" + budget_note());
+    }
+  }
+
+  // A budget that cannot hold the DiT's activations (one text token per prompt token) is refused before any work.
+  constexpr std::uint64_t kReserve = std::uint64_t{512} << 20;  // pipelines, command buffers, the driver
+  if (r.vram_budget != 0) {
+    std::uint64_t tokens = std::uint64_t{lh} * lw + r.cond_ids.size();
+    if (cfg) tokens += std::uint64_t{lh} * lw + r.uncond_ids.size();
+    const std::uint64_t need = Dit::activation_bytes(tokens, std::uint64_t{lh} * lw) + kReserve;
+    if (need > available()) {
+      throw std::runtime_error("the DiT at " + std::to_string(r.width) + "x" + std::to_string(r.height) + " needs " +
+                               std::to_string(need >> 20) + " MiB of device memory for its activations; " +
+                               std::to_string(available() >> 20) + " MiB are free" +
+                               budget_note());
     }
   }
 
@@ -79,8 +106,7 @@ GenerateResult generate(Device& device, BlockPath path, const GenerateRequest& r
     // Blocks past what the device can hold with this run's activations stream from host memory.
     std::uint64_t tokens = 0;
     for (const auto& e : embeds) tokens += std::uint64_t{lh} * lw + e.size() / kDiTTextDim;
-    constexpr std::uint64_t kReserve = std::uint64_t{512} << 20;  // pipelines, command buffers, the driver
-    const std::uint64_t free = device.free_device_memory(), need = Dit::activation_bytes(tokens, std::uint64_t{lh} * lw) + kReserve;
+    const std::uint64_t free = available(), need = Dit::activation_bytes(tokens, std::uint64_t{lh} * lw) + kReserve;
     DitOptions options;
     options.device_budget = free > need ? free - need : 1;
     Dit dit(device, kernels, r.model_dir / "transformer", options);

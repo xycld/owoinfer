@@ -1,6 +1,6 @@
 // moss-infer-vulkan: text to image on the Vulkan backend, a standalone program for GPUs the CUDA engine does not support.
 // It needs neither CUDA nor an NVIDIA driver, only a Vulkan driver. Its flags are those of `moss-infer generate` that the
-// backend runs; the tokenizer, the seed's initial noise, the schedule and the PNG writer are the engine's own sources,
+// backend runs, checked as the engine checks them; the tokenizer, the seed's initial noise, the schedule and the PNG writer are the engine's own sources,
 // so a seed gives the same inputs as on CUDA. Exit status: 0 done, 1 failed, 2 a usage error or an unsupported request.
 #include <chrono>
 #include <cmath>
@@ -27,33 +27,46 @@
 #include "tokenizer/prompt_tokens.h"
 #include "tokenizer/qwen_bpe.h"
 #include "util/path.h"
+#include "util/regular_file.h"
 
 namespace {
 
 namespace fs = std::filesystem;
 using namespace mi;
 
+// pipeline.h's request bounds (kMaxSide, kMaxPixels, kMaxSteps, kMaxSeed, kMaxVramBytes), which validate() applies;
+// pipeline.h itself needs the CUDA headers.
+constexpr int kMaxSide = 4096;
+constexpr std::int64_t kMaxPixels = 4'200'000;
+constexpr int kMaxSteps = 10000;
+constexpr std::int64_t kMaxSeed = std::int64_t{1} << 53;
+constexpr double kMaxVramBytes = static_cast<double>(std::uint64_t{1024} << 30);
+
 constexpr const char* kUsage =
     "usage: moss-infer-vulkan --model <bundle_dir> --prompt <text> [-o <out.png>] [--latent-out <latents.npy>]\n"
     "                         [--negative <text>] [--size <W>x<H>] [--width N] [--height N] [--steps N] [--cfg X]\n"
     "                         [--shift X] [--seed N|-1] [--skip-layers \"22\"] [--max-seq N] [--tier reference]\n"
-    "                         [--device N] [--kernels coop|coop-f16|plain] [--no-metadata] [--quiet]\n"
-    "       moss-infer-vulkan --list-devices\n"
+    "                         [--device N] [--kernels coop|coop-f16|plain] [--vram-budget GiB] [--no-metadata]\n"
+    "                         [--quiet]\n"
+    "       moss-infer-vulkan --list-devices | --version | --help\n"
     "Text to image with MOSS-Image Base or SFT (the bundle's bf16 files) on a Vulkan GPU, with the official euler sampler\n"
     "and schedule: the fallback for GPUs the CUDA engine (moss-infer) does not support. The flags mean what they mean for\n"
     "`moss-infer generate`; the defaults are the same (1024x1024, 50 steps, cfg 3, shift 5, seed 42, skip layers 22).\n"
     "At least one of -o / --latent-out is required; without -o the VAE decode is skipped. --device picks a Vulkan device\n"
     "(default: the first usable one, a discrete GPU first); --kernels picks the cooperative-matrix kernels on bf16 or f16\n"
-    "fragments or the plain ones (default: the first of those the device has). The device and kernels are printed at the\n"
-    "start. Progress goes to stderr one line per event: `text encoder`, `denoise <step>/<steps> <seconds>`, `vae`, then\n"
+    "fragments or the plain ones (default: the first of those the device has). --vram-budget caps the device memory of\n"
+    "the VAE and the DiT: their weights, the DiT's activations and the VAE's decode; the DiT's blocks past it stream from\n"
+    "host memory every step (default: what the device has free). A run the budget or the device cannot hold is refused\n"
+    "before the text encoder runs. The device and kernels are printed at the start. Progress goes to stderr one line per event: `text encoder`, `denoise <step>/<steps> <seconds>`, `vae`, then\n"
     "a summary.\n";
 
 struct Args {
   fs::path model, out_png, out_latent;
   std::string prompt, negative;
-  bool have_prompt = false, metadata = true, quiet = false, list = false;
+  bool have_prompt = false, metadata = true, quiet = false, list = false, help = false, version = false;
   int width = 1024, height = 1024, steps = 50, max_seq = 4096, device = -1;
   double cfg = 3.0, shift = 5.0;
+  std::uint64_t vram_budget = 0;
   std::int64_t seed = 42;
   std::vector<int> skip = {22};
   std::string kernels;
@@ -110,6 +123,15 @@ std::vector<int> layers(const std::string& v) {
   return out;
 }
 
+// pipeline::vram_option_bytes: GiB to bytes, with its bounds and messages.
+std::uint64_t vram_bytes(const std::string& flag, double gib) {
+  if (!std::isfinite(gib) || gib <= 0) usage(flag + " must be a finite positive number.");
+  const double bytes = gib * static_cast<double>(std::uint64_t{1} << 30);
+  if (!(bytes <= kMaxVramBytes)) usage(flag + " must be at most 1024 GiB.");
+  if (bytes < static_cast<double>(std::uint64_t{1} << 20)) usage(flag + " must be at least 1 MiB.");
+  return static_cast<std::uint64_t>(bytes);
+}
+
 Args parse(const std::vector<std::string>& argv) {
   Args a;
   for (std::size_t i = 1; i < argv.size(); ++i) {
@@ -126,7 +148,14 @@ Args parse(const std::vector<std::string>& argv) {
       a.list = true;
       continue;
     }
-    if (f == "-h" || f == "--help") usage("");
+    if (f == "-h" || f == "--help") {
+      a.help = true;
+      return a;
+    }
+    if (f == "--version") {
+      a.version = true;
+      return a;
+    }
     if (i + 1 >= argv.size()) usage(f + " needs a value");
     const std::string& v = argv[++i];
     if (f == "--model") a.model = util::path_from_utf8(v);
@@ -150,6 +179,7 @@ Args parse(const std::vector<std::string>& argv) {
     else if (f == "--max-seq") a.max_seq = int32(f, v);
     else if (f == "--device") a.device = int32(f, v);
     else if (f == "--kernels") a.kernels = v;
+    else if (f == "--vram-budget") a.vram_budget = vram_bytes(f, number(f, v));
     else if (f == "--tier") {
       // The backend runs the bf16 files exactly as the reference tier does; the lossy tiers need the CUDA kernels.
       if (v != "reference") usage("moss-infer-vulkan runs --tier reference only");
@@ -159,14 +189,23 @@ Args parse(const std::vector<std::string>& argv) {
   if (a.list) return a;
   if (a.model.empty() || !a.have_prompt) usage("--model and --prompt are required");
   if (a.out_png.empty() && a.out_latent.empty()) usage("at least one of -o / --latent-out is required");
-  if (a.width < 16 || a.height < 16 || a.width % 16 != 0 || a.height % 16 != 0 || a.width > 4096 || a.height > 4096) {
-    usage("width and height must be multiples of 16 in [16, 4096]");
+  if (a.device < -1) usage("--device takes a device index, or -1 for the first usable device");
+  // pipeline::validate()'s checks and messages, for the settings this program takes.
+  if (tok::python_strip(a.prompt).empty()) usage("Enter a prompt.");
+  if (a.height <= 0 || a.width <= 0 || a.height % 16 != 0 || a.width % 16 != 0) {
+    usage("Height and width must be positive multiples of 16.");
   }
-  if (a.steps < 1 || a.steps > 1000) usage("--steps must be in [1, 1000]");
-  if (a.cfg < 0) usage("--cfg must be >= 0");
-  if (a.shift <= 0) usage("--shift must be > 0");
-  if (a.seed < -1 || a.seed >= (std::int64_t{1} << 53)) usage("--seed must be -1 (random) or in [0, 2^53)");
-  if (a.max_seq < 1 || a.max_seq > static_cast<int>(tok::kMossMaxSequenceLength)) usage("--max-seq must be in [1, 4096]");
+  if (a.height > kMaxSide || a.width > kMaxSide) usage("Height and width must be at most " + std::to_string(kMaxSide) + ".");
+  if (std::int64_t{a.height} * a.width > kMaxPixels) {
+    usage("Image size must be at most 4.2 megapixels (e.g. 2048x2048); the model is meant for 0.25 to 4 megapixels.");
+  }
+  if (a.steps < 1) usage("Steps and image count must be positive.");
+  if (a.steps > kMaxSteps) usage("Steps must be at most " + std::to_string(kMaxSteps) + ".");
+  if (a.cfg < 0 || a.shift <= 0) usage("CFG must be finite and nonnegative; shift must be finite and positive.");
+  if (a.seed < -1 || a.seed >= kMaxSeed) usage("Seed must be -1 (random) or an integer from 0 to 2^53-1 (browser-safe range).");
+  if (a.max_seq < 1 || a.max_seq > static_cast<int>(tok::kMossMaxSequenceLength)) {
+    usage("Maximum text length must be between 1 and 4096.");
+  }
   if (!a.kernels.empty() && a.kernels != "coop" && a.kernels != "coop-f16" && a.kernels != "plain") {
     usage("--kernels takes coop, coop-f16 or plain");
   }
@@ -238,6 +277,7 @@ int run(const Args& a) {
   g.timesteps = schedule.timesteps;
   g.cfg = static_cast<float>(a.cfg);
   for (const int l : a.skip) g.uncond_skip.set(static_cast<std::size_t>(l));
+  g.vram_budget = a.vram_budget;
   g.decode = !a.out_png.empty();
   if (!a.out_latent.empty()) {
     g.on_latents = [&](const std::vector<float>& latents) {
@@ -271,7 +311,7 @@ int run(const Args& a) {
       m.engine_version = std::to_string(MI_VERSION_MAJOR) + "." + std::to_string(MI_VERSION_MINOR) + "." +
                          std::to_string(MI_VERSION_PATCH);
       m.tier = "reference";
-      m.models.push_back({"bundle", util::path_utf8(a.model.filename()), ""});
+      m.models.push_back({"bundle", util::path_utf8(util::path_key(a.model).filename()), ""});
       m.prompt = a.prompt;
       m.negative_prompt = a.negative;
       m.sampler = "euler";
@@ -282,6 +322,7 @@ int run(const Args& a) {
       m.seed = seed;
       m.width = a.width;
       m.height = a.height;
+      m.extra.emplace_back("noise_layout", pipeline::noise_layout_name(pipeline::NoiseLayout::kOfficial));
       m.extra.emplace_back("backend", std::string("vulkan ") + vk::block_path_name(path));
       text = pipeline::generation_text_chunks(m);
     }
@@ -304,6 +345,14 @@ int run_main(const std::vector<std::string>& argv) {
     if (e.what()[0] != '\0') std::fprintf(stderr, "moss-infer-vulkan: %s\n", e.what());
     std::fputs(kUsage, stderr);
     return 2;
+  }
+  if (a.help) {
+    std::fputs(kUsage, stdout);
+    return 0;
+  }
+  if (a.version) {
+    std::printf("moss-infer-vulkan %d.%d.%d\n", MI_VERSION_MAJOR, MI_VERSION_MINOR, MI_VERSION_PATCH);
+    return 0;
   }
   try {
     return a.list ? list_devices() : run(a);

@@ -28,6 +28,9 @@ struct GenerateRequest {
   float cfg = 3.0f;
   SkipSet uncond_skip;
   bool decode = true;  // false: stop at the final latents
+  // Device memory the VAE and the DiT may use, in bytes: their weights, the DiT's activations and the VAE's decode; the
+  // DiT's blocks past it stream from host memory. 0: what the device has free. A decode it cannot hold is refused first.
+  std::uint64_t vram_budget = 0;
   // Called with the final latents before the decode.
   std::function<void(const std::vector<float>& latents)> on_latents;
   // stage: "text encoder", "denoise", "vae"; done of total within it.
