@@ -68,7 +68,12 @@ class DeviceBuffer {
   }
   std::size_t bytes() const { return bytes_; }
 
-  // Synchronous copies; offset in bytes from the start of this buffer.
+  // Copies synchronous with respect to the host and every stream; offset in bytes from the start of this buffer. Each
+  // waits for all work queued on the buffer's device (the one current when it was allocated, whichever device is current
+  // at the call) before it copies, and returns once the copy has landed: no kernel queued earlier on any stream still
+  // reads (upload) or writes (download) the buffer, and a kernel queued afterwards on any stream, non-blocking ones
+  // included, sees the new contents. They cost a device-wide synchronization each: for copies that overlap kernels, use a
+  // HostBuffer, copy_async and events.
   void upload(const void* src, std::size_t bytes, std::size_t offset = 0);
   void download(void* dst, std::size_t bytes, std::size_t offset = 0) const;
   // Stream-ordered fill with a byte value.
@@ -77,6 +82,7 @@ class DeviceBuffer {
  private:
   void* p_ = nullptr;
   std::size_t bytes_ = 0;
+  int device_ = 0;  // the device current at allocation
 };
 
 // Page-locked host memory: the source of asynchronous host-to-device copies.
@@ -135,7 +141,8 @@ class Event {
   hipEvent_t e_ = nullptr;
 };
 
-// Asynchronous copy on `stream`; host memory must be a HostBuffer's for the copy to overlap.
+// Asynchronous copy on `stream`, ordered with that stream only: other streams order against it with Events. Host
+// memory must be a HostBuffer's for the copy to overlap kernels, and must stay unchanged until the copy completes.
 void copy_async(void* dst, const void* src, std::size_t bytes, hipStream_t stream);
 
 }  // namespace mi::hip

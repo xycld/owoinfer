@@ -56,6 +56,7 @@ esac
     want[ns "rms_norm_kernel(" ns "PlainNormArgs)"] = 0
     want[ns "silu_kernel(" ns "UnaryArgs)"] = 0
     want[ns "situ_glu_kernel(" ns "SituGluArgs)"] = 0
+    want[ns "rope_table_kernel(" ns "RopeArgs)"] = 0
   }
   /^[^ \t.#;].*:[ \t]*(;.*)?$/ { name = $0; sub(/:[ \t]*(;.*)?$/, "", name); current = name }
   /v_wmma_f32_16x16x16_bf16/ { wmma[current]++; total++ }

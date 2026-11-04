@@ -114,7 +114,11 @@ add_executable(hip_dit_kernel_check tools/hip_dit_kernel_check.cpp)
 target_compile_options(hip_dit_kernel_check PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_dit_kernel_check PRIVATE mossinfer_hip)
 
+# The engine's JSON reader, for hip_dit_run's case files: built as the engine builds it, without this project's warnings.
+add_library(mi_hip_engine_json OBJECT ${CMAKE_CURRENT_SOURCE_DIR}/../src/util/json.cpp)
+target_include_directories(mi_hip_engine_json SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
 # The DiT's sampling loop from a golden case; CFG and Euler on the host round like the engine's kernels.
 add_executable(hip_dit_run tools/hip_dit_run.cpp)
 target_compile_options(hip_dit_run PRIVATE ${MI_HIP_WARN})
-target_link_libraries(hip_dit_run PRIVATE mossinfer_hip)
+target_link_libraries(hip_dit_run PRIVATE mossinfer_hip mi_hip_engine_json)

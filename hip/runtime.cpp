@@ -87,8 +87,28 @@ void Device::make_current() const { check(hipSetDevice(info_.index), "hipSetDevi
 
 void Device::synchronize() const { check(hipDeviceSynchronize(), "hipDeviceSynchronize"); }
 
+namespace {
+
+// Makes `device` current for its lifetime, then restores the calling thread's device.
+class DeviceScope {
+ public:
+  explicit DeviceScope(int device) {
+    check(hipGetDevice(&previous_), "hipGetDevice");
+    if (device != previous_) check(hipSetDevice(device), "hipSetDevice");
+  }
+  ~DeviceScope() { (void)hipSetDevice(previous_); }
+  DeviceScope(const DeviceScope&) = delete;
+  DeviceScope& operator=(const DeviceScope&) = delete;
+
+ private:
+  int previous_ = 0;
+};
+
+}  // namespace
+
 DeviceBuffer::DeviceBuffer(std::size_t bytes) : bytes_(bytes) {
   if (bytes == 0) return;
+  check(hipGetDevice(&device_), "hipGetDevice");
   check(hipMalloc(&p_, bytes), ("hipMalloc of " + std::to_string(bytes) + " bytes").c_str());
 }
 
@@ -96,24 +116,36 @@ DeviceBuffer::~DeviceBuffer() {
   if (p_ != nullptr) (void)hipFree(p_);
 }
 
-DeviceBuffer::DeviceBuffer(DeviceBuffer&& o) noexcept : p_(std::exchange(o.p_, nullptr)), bytes_(std::exchange(o.bytes_, 0)) {}
+DeviceBuffer::DeviceBuffer(DeviceBuffer&& o) noexcept
+    : p_(std::exchange(o.p_, nullptr)), bytes_(std::exchange(o.bytes_, 0)), device_(o.device_) {}
 
 DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& o) noexcept {
   std::swap(p_, o.p_);
   std::swap(bytes_, o.bytes_);
+  std::swap(device_, o.device_);
   return *this;
 }
 
 void DeviceBuffer::upload(const void* src, std::size_t bytes, std::size_t offset) {
   if (offset > bytes_ || bytes > bytes_ - offset) throw std::runtime_error("hip: upload past the end of a device buffer");
   if (bytes == 0) return;
+  // hipMemcpy is ordered with neither non-blocking streams nor, from pageable memory, the DMA it starts: wait for every
+  // stream of the buffer's device before (a kernel may still read the old contents) and after (the next kernel must see
+  // the new ones).
+  const DeviceScope scope(device_);
+  check(hipDeviceSynchronize(), "hipDeviceSynchronize before an upload");
   check(hipMemcpy(static_cast<char*>(p_) + offset, src, bytes, hipMemcpyHostToDevice), "hipMemcpy to the device");
+  check(hipDeviceSynchronize(), "hipDeviceSynchronize after an upload");
 }
 
 void DeviceBuffer::download(void* dst, std::size_t bytes, std::size_t offset) const {
   if (offset > bytes_ || bytes > bytes_ - offset) throw std::runtime_error("hip: download past the end of a device buffer");
   if (bytes == 0) return;
+  // Every stream's writes on the buffer's device first; the host has the bytes when this returns.
+  const DeviceScope scope(device_);
+  check(hipDeviceSynchronize(), "hipDeviceSynchronize before a download");
   check(hipMemcpy(dst, static_cast<const char*>(p_) + offset, bytes, hipMemcpyDeviceToHost), "hipMemcpy to the host");
+  check(hipDeviceSynchronize(), "hipDeviceSynchronize after a download");
 }
 
 void DeviceBuffer::fill(int byte, hipStream_t stream) {

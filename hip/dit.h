@@ -81,7 +81,8 @@ class Dit {
         *down_w, *down_b;
   };
   DeviceBuffer& scratch(DeviceBuffer& b, std::size_t bytes);
-  void time_modulation(float timestep);
+  void stage_time(float timestep);  // the time sinusoid to the device, the time scratch sized
+  void time_modulation();            // the time MLP and both modulations, on the stream
   void mark(int what);  // time_ops: an event on the stream, its interval since the last one counted as `what`
 
   Device& device_;
@@ -106,9 +107,5 @@ class Dit {
   std::size_t events_used_ = 0;
   std::vector<double> op_ms_;
 };
-
-// The RoPE table rows of one joint sequence (P:178-185), bf16 bits [height * width + text_length, 128]: sin of the 64
-// phases, then their cos. height = width = 0 gives the text rows alone.
-std::vector<std::uint16_t> rope_table(std::uint32_t height, std::uint32_t width, std::uint32_t text_length);
 
 }  // namespace mi::hip
